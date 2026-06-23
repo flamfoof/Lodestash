@@ -33,7 +33,7 @@ Principle: **the search/retrieve loop must work end-to-end before polishing any 
 
 ---
 
-## Phase 2 — Unity ingestion (the real input)
+## Phase 2 — Unity ingestion (the primary input)
 **Goal:** import real Unity libraries.
 
 - `.unitypackage` untar (pure Rust gzip+tar); `.meta` YAML parse → GUID, importer type, **labels**
@@ -82,8 +82,8 @@ filter/search by category.
 
 ---
 
-## Phase 5 — MCP & engine retrieval (use it in the engine)
-**Goal:** pull assets into Unity/Unreal and via AI.
+## Phase 5 — MCP & Unity retrieval (use it in the engine)
+**Goal:** pull assets into Unity and via AI.
 
 - Loopback **HTTP/JSON API** (`/v1/`, 127.0.0.1 + per-session token) over `lodestash-core`.
 - **MCP server** (`rmcp`, stdio): the §2 surface in [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md);
@@ -91,15 +91,17 @@ filter/search by category.
 - **Unity plugin** (UPM C# `EditorWindow`): browse over REST, import into `Assets/` via
   `AssetDatabase`.
 - Job system for long ops; surface versioning + `get_server_info`.
+- *(Unreal plugin is deferred to Phase 6.)*
 
 **Exit criteria:** from Claude/Claude Code, search the catalog and export an asset; from the Unity
-editor window, browse and import an asset into the open project.
+editor window, browse and import an asset into the open Unity project.
 
 ---
 
-## Phase 6 — Unreal & polish (best-effort + refinement)
-- **Unreal**: CUE4Parse sidecar for `.pak`/IoStore extraction (best-effort; AES/`.usmap` are the
-  user's responsibility); Unreal editor Slate plugin (browse+import into `/Content`).
+## Phase 6 — Unreal & polish (Unreal is best-effort + refinement)
+- **Unreal ingestion**: CUE4Parse sidecar for `.pak`/IoStore extraction (best-effort; AES/`.usmap` are
+  the user's responsibility).
+- **Unreal editor plugin**: Slate tab (browse+import into `/Content`).
 - Optional UI-polish track: evaluate **Slint** (same wgpu architecture) or **Tauri+three.js** if visual
   fidelity becomes a priority.
 - Optional **OpenShape** native-3D similarity (Python sidecar) for shape search.
@@ -125,7 +127,7 @@ editor window, browse and import an asset into the open project.
 | Image tags | **WD v3** (ONNX) | Ollama VLM captions; Claude vision (API) |
 | MCP | **rmcp** (stdio) | optional Streamable HTTP |
 | Engine API | loopback **HTTP/JSON** (token) | — |
-| Plugins | Unity UPM C#; Unreal C++/Python | thin REST clients |
+| Plugins | **Unity UPM C#** (primary); Unreal C++/Python (planned) | thin REST clients |
 
 ---
 
@@ -151,4 +153,5 @@ editor window, browse and import an asset into the open project.
 A user can: add their folders and `.unitypackage`/Asset-Store packs → view models, play audio, view
 textures → search by keyword, tag-filter, and natural language → auto-tag locally (or via Claude) and
 map onto a clean taxonomy → and **pull a chosen asset into an open Unity project**, both from the
-desktop UI and from Claude via MCP — entirely on their own PC.
+desktop UI and from Claude via MCP — entirely on their own PC. (Unreal support is a later-phase
+addition; v1 is Unity-focused.)

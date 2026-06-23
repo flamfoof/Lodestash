@@ -4,7 +4,8 @@ This document covers the system architecture, the component breakdown, the data 
 **language/stack decision** with the alternatives that were considered.
 
 Guiding purpose (from the project brief): a **local PC tool whose main job is to identify and
-retrieve assets for use in Unity/Unreal**, using a tagging/identification system as the means.
+retrieve assets for use in Unity** (Unreal support planned for a later phase), using a
+tagging/identification system as the means.
 
 ---
 
@@ -94,8 +95,8 @@ optional Python sidecar if/when added — but it is not on the critical path.
 └──────────────────────────────┼───────────────────┼───────────────────┼──────────────────┼───────────┘
                                │                   │                   │                  │
                      ┌─────────┴──────┐   ┌────────┴────────┐  ┌────────┴───────┐ ┌────────┴─────────┐
-                     │ Python sidecar │   │ ONNX models /   │  │ Claude Desktop │ │ Unity & Unreal   │
-                     │ (UnityPy)      │   │ Ollama / Cloud  │  │ Claude Code /  │ │ editor plugins   │
+                     │ Python sidecar │   │ ONNX models /   │  │ Claude Desktop │ │ Unity (primary)  │
+                     │ (UnityPy)      │   │ Ollama / Cloud  │  │ Claude Code /  │ │ (Unreal: planned) │
                      │  [optional]    │   │ API (opt-in)    │  │ IDE MCP clients│ │ (browse+import)  │
                      └────────────────┘   └─────────────────┘  └────────────────┘ └──────────────────┘
 ```
@@ -148,12 +149,13 @@ preview, tag, collection, and export tools so AI clients can find and retrieve a
 
 ### 3.6 Local HTTP API (`lodestash-api`)
 Loopback-only (`127.0.0.1`) JSON API with a per-session bearer token. The deterministic integration
-surface for the Unity/Unreal plugins and any scripting. Versioned (`/v1/`).
+surface for the Unity plugin (and the Unreal plugin when added) and any scripting. Versioned (`/v1/`).
 
 ### 3.7 Engine plugins
-- **Unity**: UPM C# package with an `EditorWindow` that browses the catalog over the HTTP API and
-  imports a chosen asset into `Assets/` (`AssetDatabase.ImportAsset` + refresh).
-- **Unreal**: C++/Python Slate editor tab that imports into `/Content` via the asset import subsystems.
+- **Unity** (primary): UPM C# package with an `EditorWindow` that browses the catalog over the HTTP API
+  and imports a chosen asset into `Assets/` (`AssetDatabase.ImportAsset` + refresh).
+- **Unreal** (planned, later phase): C++/Python Slate editor tab that imports into `/Content` via the
+  asset import subsystems.
 
 Both are **thin REST clients**. Detail in [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md).
 
@@ -184,7 +186,7 @@ Query (text, optional semantic toggle, filters)
   → BM25 (FTS5) ⊕ vector KNN (sqlite-vec)  → RRF fuse  → (optional rerank)
   → results grid with thumbnails
   → preview (3D / audio / image)
-  → "Import to engine":  GUI/plugin → HTTP API export → write into Assets/ or /Content
+  → "Import to engine":  GUI/plugin → HTTP API export → write into Assets/ (Unity; /Content for Unreal later)
                           or:  AI client → MCP export_asset → resource_link → plugin fetch
 ```
 
@@ -230,8 +232,8 @@ lodestash/
 ├─ sidecar/
 │  └─ unitypy/          # optional Python UnityPy extractor (bundled)
 ├─ plugins/
-│  ├─ unity/            # UPM C# package
-│  └─ unreal/           # .uplugin C++/Python
+│  ├─ unity/            # UPM C# package (primary)
+│  └─ unreal/           # .uplugin C++/Python (planned)
 └─ docs/
 ```
 

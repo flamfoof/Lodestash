@@ -3,7 +3,8 @@
 > **Lodestash** = *lodestone* (it guides you to the right asset) + *stash* (the asset store you draw from).
 
 A **local-first desktop application** that catalogs, previews, tags, and — most importantly —
-**lets you and your AI tools find and pull the right asset into Unity or Unreal fast.**
+**lets you and your AI tools find and pull the right asset into Unity fast.** (Unreal support is
+planned but secondary — Unity is the primary target.)
 
 It runs entirely on your PC. Nothing about your asset libraries has to leave the machine.
 
@@ -12,17 +13,17 @@ It runs entirely on your PC. Nothing about your asset libraries has to leave the
 ## What it is (and its main purpose)
 
 The headline job is **identification and retrieval**: you have thousands of bought/downloaded
-Unity & Unreal assets — 3D models, audio, and images/textures — scattered across asset packs and
+Unity assets — 3D models, audio, and images/textures — scattered across asset packs and
 folders, and you can never find the one you need. Lodestash indexes all of them, understands what they
 *are* (via AI tagging + embeddings), and gives you fast keyword + semantic + tag-filtered search,
-plus a one-click / one-tool-call path to bring a chosen asset **into the open engine project**.
+plus a one-click / one-tool-call path to bring a chosen asset **into your open Unity project**.
 
 Tagging and AI identification exist **to serve search and retrieval** — that ordering drives every
 design decision in this spec.
 
 ### Core capabilities
 - **Ingest** large asset libraries — by folder, or from Unity packages (`.unitypackage`), and
-  (best-effort) compiled bundles and Unreal `.pak`/IoStore archives.
+  (best-effort) compiled Unity bundles. Unreal `.pak`/IoStore support is planned for a later phase.
 - **Tap your Unity Asset Store library directly** — auto-discover Unity's download cache, browse
   everything you own by publisher/category, and unpack + ingest one or many packages on demand
   (no running Editor required).
@@ -45,9 +46,9 @@ design decision in this spec.
   canonical project vocabulary (Environment / Props / Characters / SFX / Music / …).
 - **MCP server** so Claude, Claude Code, Cursor, and other AI clients can search the catalog and
   retrieve assets directly.
-- **Selective engine import**: Unity & Unreal editor plugins that browse the catalog and import
+- **Selective engine import**: a **Unity editor plugin** that browses the catalog and imports
   **only the asset(s) you pick — plus their dependencies — never the whole package**, pulling from
-  many libraries at once.
+  many libraries at once. (An Unreal plugin is planned for a later phase.)
 
 ---
 
@@ -87,7 +88,7 @@ alternatives (Tauri+three.js, pure-Python/PySide6).
 | Dedup | **BLAKE3** (exact) + pHash/blockhash + Chromaprint (near-dup) |
 | MCP server | **rmcp** (Rust), in-process, stdio default |
 | Engine API | loopback **HTTP/JSON** (127.0.0.1 + token) |
-| Engine plugins | Unity (UPM C# `EditorWindow`), Unreal (C++/Python Slate) |
+| Engine plugins | **Unity** (UPM C# `EditorWindow`) — primary; Unreal (C++/Python Slate) — planned |
 
 ---
 
@@ -97,11 +98,11 @@ alternatives (Tauri+three.js, pure-Python/PySide6).
 |---|---|
 | [`docs/USER-GUIDE.md`](docs/USER-GUIDE.md) | **Start here:** step-by-step guide for users (download-don't-import, run identification first, search, import) |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | System architecture, components, data flow, the language decision & alternatives |
-| [`docs/INGESTION.md`](docs/INGESTION.md) | Import pipeline, Unity/Unreal formats, viewers/players, thumbnailing |
+| [`docs/INGESTION.md`](docs/INGESTION.md) | Import pipeline, Unity formats (primary), Unreal formats (planned), viewers/players, thumbnailing |
 | [`docs/AI-PIPELINE.md`](docs/AI-PIPELINE.md) | Tagging & embeddings per modality; local-vs-API abstraction |
 | [`docs/AI-MODELS-BY-GPU.md`](docs/AI-MODELS-BY-GPU.md) | **User guide:** which local AI models to run per GPU VRAM tier (CPU / 4 / 6 / 8 / 12 / 16 / 24 GB / cloud) |
 | [`docs/DATA-MODEL.md`](docs/DATA-MODEL.md) | SQLite schema, hybrid search, the mapping library, dedup |
-| [`docs/MCP-AND-ENGINES.md`](docs/MCP-AND-ENGINES.md) | MCP surface + Unity/Unreal/Claude integration |
+| [`docs/MCP-AND-ENGINES.md`](docs/MCP-AND-ENGINES.md) | MCP surface + Unity (primary) / Unreal (planned) / Claude integration |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Phased build plan, milestones, risks |
 
 ---

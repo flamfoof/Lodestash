@@ -2,9 +2,10 @@
 
 How assets get into the catalog, and how they are viewed/played once there.
 
-Guiding principle: **prefer raw source files; deep-parse Unity/Unreal serialized formats only when
-there is no source.** The most common inputs (Asset-Store packs, project folders) are dominated by
-standard FBX/PNG/WAV, which load far more robustly than re-derived blobs.
+Guiding principle: **prefer raw source files; deep-parse Unity serialized formats only when there is
+no source.** The most common inputs (Asset-Store packs, project folders) are dominated by standard
+FBX/PNG/WAV, which load far more robustly than re-derived blobs. **Unity is the primary ingestion
+target;** Unreal `.pak`/IoStore support is planned for a later phase (§7).
 
 ---
 
@@ -16,7 +17,7 @@ standard FBX/PNG/WAV, which load far more robustly than re-derived blobs.
 | **`.unitypackage`** | **gzip+tar** of GUID folders; each holds `asset` (the original file bytes), `asset.meta` (YAML), `pathname` (real path) | Untar in pure Rust; `pathname`→real path/ext, `asset`→file, `.meta`→GUID/type/**labels**. Payloads are usually raw FBX/PNG/WAV. |
 | **Asset Store library** (downloaded) | Your purchases, cached as `.unitypackage` under `Asset Store-5.x/<Publisher>/<Category>/` | **Auto-discovered, browsable, and unpacked one-or-many on demand — see §2.** |
 | **Compiled bundle** (`.bundle`, `.unity3d`, `.assets`, `.resS`) / Addressables | Unity SerializedFile (binary), LZ4/LZMA, often stripped names/TypeTree | **Python sidecar (UnityPy)** → extract & convert. The hard 20%. |
-| **Unreal `.pak` / IoStore (`.utoc`+`.ucas`)** | Cooked UE packages; may be AES-encrypted, may need `.usmap` | **Phase 2, best-effort** via CUE4Parse (see §7). |
+| **Unreal `.pak` / IoStore (`.utoc`+`.ucas`)** | Cooked UE packages; may be AES-encrypted, may need `.usmap` | **Planned, later phase, best-effort** via CUE4Parse (see §7). Not in initial scope. |
 
 The user adds one or more **import sources** (roots). Each is recorded; the catalog references files
 in place and is **never destructive**.
@@ -186,7 +187,7 @@ All three previews share the single **wgpu** device used by the egui UI.
 
 ---
 
-## 7. Unreal (Phase 2, best-effort)
+## 7. Unreal (planned, later phase — best-effort)
 
 - Formats: `.uasset`+`.uexp`+`.ubulk`, `.umap`; `.pak`; IoStore `.utoc`+`.ucas` (often AES-encrypted;
   UE5 stripped builds frequently need `.usmap` type mappings).
@@ -203,7 +204,8 @@ All three previews share the single **wgpu** device used by the egui UI.
 - Every **compressed texture** variant (rare ASTC block sizes, Crunch variants) decoding successfully.
 - **Wwise** audio (separate from the FMOD/FSB path supported initially).
 - Reliable **rig/animation/material** round-tripping.
-- Unreal parity with Unity.
+- Unreal parity with Unity (Unreal support is a later-phase, best-effort addition).
 
-Position the product around the **user's owned Asset-Store packs and project folders** — where the
-robust 80% is simply: untar → use the embedded raw FBX/PNG/WAV → harvest `.meta` labels.
+Position the product around the **user's owned Unity Asset-Store packs and Unity project folders** —
+where the robust 80% is simply: untar → use the embedded raw FBX/PNG/WAV → harvest `.meta` labels.
+Unreal ingestion is a later-phase addition.

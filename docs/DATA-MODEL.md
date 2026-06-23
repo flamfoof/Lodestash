@@ -39,7 +39,7 @@ CREATE TABLE import_source (
   uuid            TEXT NOT NULL UNIQUE,
   name            TEXT NOT NULL,
   root_path       TEXT NOT NULL,
-  kind            TEXT NOT NULL,          -- 'folder' | 'unitypackage' | 'bundle' | 'unreal_pak' | ...
+  kind            TEXT NOT NULL,          -- 'folder' | 'unitypackage' | 'bundle' | 'unreal_pak' (planned) | ...
   last_scanned_at INTEGER,
   watch_enabled   INTEGER NOT NULL DEFAULT 1
 );
@@ -210,7 +210,7 @@ alt labels, broader/narrower, match relations), simplified.
 
 Separates **raw tags** (observations) from **canonical categories** (interpretation) — so you can
 re-map non-destructively without touching the underlying tags, and swap whole mapping libraries
-(e.g. a generic map vs. a per-project UE5 vocab).
+(e.g. a generic map vs. a per-project Unity vocab).
 
 ```sql
 -- A named, swappable mapping library (= SKOS concept scheme)

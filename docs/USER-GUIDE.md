@@ -1,8 +1,8 @@
 # Lodestash — User Guide (Getting Started)
 
 Lodestash is your **local asset hub**: it catalogs everything you own, lets you **search by tag or by
-plain-language description**, preview it, and **pull just what you need into Unity/Unreal** — without
-ever importing whole asset packs into your project.
+plain-language description**, preview it, and **pull just what you need into Unity** — without
+ever importing whole asset packs into your project. (Unreal support is planned for a later phase.)
 
 Follow these steps in order. **Step 3 (run identification) matters most — do it before you search.**
 
@@ -82,9 +82,9 @@ Click any result to **view the 3D model** (orbit around it), **play the audio** 
 
 ---
 
-## Step 6 — Bring it into your engine (the bridge)
+## Step 6 — Bring it into Unity (the bridge)
 
-With your Unity (or Unreal) project open and the Lodestash plugin panel active:
+With your Unity project open and the Lodestash plugin panel active:
 
 1. Search/preview inside the panel (same catalog).
 2. **Select one or more assets** — even from different packs at once.

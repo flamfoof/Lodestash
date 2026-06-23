@@ -1,7 +1,8 @@
 # MCP Server & Engine Integration
 
-How AI clients (Claude, Claude Code, IDEs) and the Unity/Unreal editors find and retrieve assets from
-the catalog. This is where "identify and retrieve into the engine" is delivered.
+How AI clients (Claude, Claude Code, IDEs) and the **Unity editor** find and retrieve assets from the
+catalog. This is where "identify and retrieve into the engine" is delivered. **Unity is the primary
+integration target;** Unreal editor integration is planned for a later phase (§4).
 
 Verify MCP protocol specifics against the current spec (revision **2025-11-25**) and Claude specifics
 against the `claude-api` skill before implementing.
@@ -16,15 +17,15 @@ against the `claude-api` skill before implementing.
                          └───▲───────────────────────────────▲───────────────┘
               MCP (stdio)    │ in-process            in-process│   HTTP (127.0.0.1 + token)
           ┌──────────────────┴─────┐                  ┌────────┴──────────────────────┐
-          │ AI clients             │                  │ Unity & Unreal editor plugins  │
-          │ (Claude Desktop/Code,  │                  │ (deterministic browse + import)│
+          │ AI clients             │                  │ Unity editor plugin (primary)  │
+          │ (Claude Desktop/Code,  │                  │ (Unreal: planned, later phase) │
           │  Cursor, IDE MCP)      │                  └────────────────────────────────┘
           └────────────────────────┘
 ```
 
 - **MCP** is the **AI control plane** — for LLM clients that reason and decide which assets to pull.
-- **Local HTTP/JSON API** is the **deterministic integration plane** — for the engine plugins and any
-  scripting. Plugins do **not** speak MCP.
+- **Local HTTP/JSON API** is the **deterministic integration plane** — for the Unity plugin and any
+  scripting. Plugins do **not** speak MCP. (Unreal plugin will use the same API when added.)
 - Both are thin frontends over the same `lodestash-core` operations — implemented once.
 
 ---
@@ -86,7 +87,7 @@ Realistic agent loop: *"find low-poly stylized rocks under 5k tris, show the top
 
 ---
 
-## 3. Unity integration
+## 3. Unity integration (primary)
 
 > **Two directions.** (1) Lodestash reads the Unity **Asset Store download cache directly off disk — no
 > Editor required** — to browse, unpack, and ingest your owned library ([`INGESTION.md`](INGESTION.md)
@@ -110,7 +111,7 @@ Realistic agent loop: *"find low-poly stylized rocks under 5k tris, show the top
 
 ---
 
-## 4. Unreal integration (Phase 2)
+## 4. Unreal integration (planned, later phase)
 
 - **Plugin**: `.uplugin` with a C++ editor module (Slate tab) and/or **Python Editor Scripting**;
   import into `/Content` via `UAssetImportTask` / `FAssetToolsModule` / `EditorAssetLibrary`.
@@ -151,10 +152,11 @@ version; plugins check on connect and degrade gracefully.
 
 - **MCP server**: `rmcp`, in-process, stdio default — the surface in §2, previews as `image` blocks +
   `resource_link`s, never inline large binaries.
-- **Engine plugins**: thin clients over the loopback HTTP API, importing into `Assets/` / `/Content`;
-  reuse the same core operations as MCP.
+- **Engine plugins**: **Unity** is primary — a thin client over the loopback HTTP API, importing into
+  `Assets/`; Unreal plugin is planned for a later phase. Both reuse the same core operations as MCP.
 - **One backend, two planes**: MCP for the AI, REST for deterministic tooling.
 
-**Top risks**: editors must be open/listening; main-thread import constraints; Epic's Unreal MCP is
-experimental and shifting; community Unity servers are unofficial. Mitigate by keeping MCP as the
-AI-control plane and REST as the reliable engine plane over one shared backend.
+**Top risks**: editors must be open/listening; main-thread import constraints; community Unity
+servers are unofficial; Epic's Unreal MCP is experimental and shifting (and Unreal support is a
+later-phase addition anyway). Mitigate by keeping MCP as the AI-control plane and REST as the
+reliable engine plane over one shared backend.
