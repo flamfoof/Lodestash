@@ -101,6 +101,7 @@ alternatives (Tauri+three.js, pure-Python/PySide6).
 | [`docs/INGESTION.md`](docs/INGESTION.md) | Import pipeline, Unity formats (primary), Unreal formats (planned), viewers/players, thumbnailing |
 | [`docs/AI-PIPELINE.md`](docs/AI-PIPELINE.md) | Tagging & embeddings per modality; local-vs-API abstraction |
 | [`docs/AI-MODELS-BY-GPU.md`](docs/AI-MODELS-BY-GPU.md) | **User guide:** which local AI models to run per GPU VRAM tier (CPU / 4 / 6 / 8 / 12 / 16 / 24 GB / cloud) |
+| [`docs/DESIGN-GUIDELINES.md`](docs/DESIGN-GUIDELINES.md) | **Design system** for devs & designers — dark-mode JRPG theme, tokens, components, icons (+ live [`design/style-guide.html`](docs/design/style-guide.html), [`design/icons.svg`](docs/design/icons.svg)) |
 | [`docs/DATA-MODEL.md`](docs/DATA-MODEL.md) | SQLite schema, hybrid search, the mapping library, dedup |
 | [`docs/MCP-AND-ENGINES.md`](docs/MCP-AND-ENGINES.md) | MCP surface + Unity (primary) / Unreal (planned) / Claude integration |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Phased build plan, milestones, risks |
