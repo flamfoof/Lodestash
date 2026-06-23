@@ -1,0 +1,30 @@
+# Rust build output
+/target/
+**/target/
+
+# AI model files (downloaded per AI-MODELS-BY-GPU.md, not committed)
+/models/
+*.onnx
+*.onnx_data
+*.gguf
+*.safetensors
+*.bin
+
+# Lodestash runtime data / catalog / caches
+/cache/
+/.lodestash/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp

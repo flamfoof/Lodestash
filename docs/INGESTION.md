@@ -1,0 +1,209 @@
+# Ingestion, Formats, Viewing & Playback
+
+How assets get into the catalog, and how they are viewed/played once there.
+
+Guiding principle: **prefer raw source files; deep-parse Unity/Unreal serialized formats only when
+there is no source.** The most common inputs (Asset-Store packs, project folders) are dominated by
+standard FBX/PNG/WAV, which load far more robustly than re-derived blobs.
+
+---
+
+## 1. Input types & how they arrive
+
+| Input | What it really is | Handling |
+|---|---|---|
+| **Raw project folder / extracted pack** | `Assets/`-style tree of FBX/OBJ/glTF/PNG/TGA/WAV/OGG + `.meta` | Walk it; load source files directly. **Richest, easiest path.** |
+| **`.unitypackage`** | **gzip+tar** of GUID folders; each holds `asset` (the original file bytes), `asset.meta` (YAML), `pathname` (real path) | Untar in pure Rust; `pathname`→real path/ext, `asset`→file, `.meta`→GUID/type/**labels**. Payloads are usually raw FBX/PNG/WAV. |
+| **Asset Store library** (downloaded) | Your purchases, cached as `.unitypackage` under `Asset Store-5.x/<Publisher>/<Category>/` | **Auto-discovered, browsable, and unpacked one-or-many on demand — see §2.** |
+| **Compiled bundle** (`.bundle`, `.unity3d`, `.assets`, `.resS`) / Addressables | Unity SerializedFile (binary), LZ4/LZMA, often stripped names/TypeTree | **Python sidecar (UnityPy)** → extract & convert. The hard 20%. |
+| **Unreal `.pak` / IoStore (`.utoc`+`.ucas`)** | Cooked UE packages; may be AES-encrypted, may need `.usmap` | **Phase 2, best-effort** via CUE4Parse (see §7). |
+
+The user adds one or more **import sources** (roots). Each is recorded; the catalog references files
+in place and is **never destructive**.
+
+---
+
+## 2. Asset Store Library integration (direct Unity download-cache access)
+
+The user's **downloaded Unity Asset Store library is a first-class import source** — point Lodestash at it
+once and it browses everything you own and unpacks/ingests any package(s) on demand. This needs **no
+running Unity Editor**: Lodestash reads the on-disk download cache directly, and `.unitypackage` is just
+gzip+tar (pure Rust, no sidecar for the common case).
+
+### Where the cache lives (verified, current in Unity 6)
+The Package Manager stores downloaded Asset Store packages under an `Asset Store-5.x` root, in a
+publisher/category/package tree:
+
+```
+<cache-root>/Asset Store-5.x/<Publisher>/<Category>/<Package>.unitypackage
+```
+
+| OS | Default cache root |
+|---|---|
+| **Windows** | `%APPDATA%\Roaming\Unity\Asset Store-5.x`  (`C:\Users\<you>\AppData\Roaming\Unity\Asset Store-5.x`) |
+| **macOS** | `~/Library/Unity/Asset Store-5.x` |
+| **Linux** | `~/.local/share/unity3d/Asset Store-5.x` |
+
+The location is **user-relocatable**, so discovery checks, in order:
+1. The **`ASSETSTORE_CACHE_PATH`** environment variable (Unity's override).
+2. The default per-OS path above.
+3. A path the user points at manually (Package Manager → Preferences → My Assets → Cache Location can
+   move it — honor a custom root).
+
+### Browse without unpacking (cheap)
+The folder tree already encodes **Publisher / Category / Package name** for free. Enumerate it to
+present the whole owned library — publisher, category, name, version, size, on-disk path — *without*
+extracting anything. The `.unitypackage` can be peeked for an embedded `preview.png` and counts for a
+richer listing.
+
+### Unpack & ingest one or many (on demand)
+Selecting one or multiple packages enqueues a **batch unpack+ingest** job (via the job engine):
+- `.unitypackage` → **gzip+tar** extract in pure Rust (no Editor, no Python sidecar for the common case).
+- Per GUID folder: `pathname` → real path, `asset` → original file bytes, `asset.meta` → GUID, importer
+  type, and **`labels`** (seed tags).
+- Route raw FBX/PNG/WAV to direct loaders; Unity-native blobs to the UnityPy sidecar.
+- Ingest assets into the catalog **linked back to their origin `package`** (publisher/category/version)
+  so you can filter/search "everything from pack X." See [`DATA-MODEL.md`](DATA-MODEL.md) §7.
+
+### Non-destructive & live
+- **Never modify the cache.** Lodestash extracts into its own managed workspace (or reads in place) and
+  references originals; the Asset Store cache is read-only to us.
+- **Watch** the cache root (`notify`) so newly downloaded purchases appear automatically; detect
+  re-downloaded/updated packages by `.unitypackage` content hash + version.
+
+### Scope notes
+- **Owned-but-not-downloaded (Unity account registry) — optional, best-effort, low priority.** This
+  section covers **downloaded** packages (the cache). To also list what you *own but haven't downloaded*
+  there is **no official consumer API**; the only routes are the Editor's **My Assets** (Package
+  Manager) or **unofficially** querying the My Assets web endpoint (`assetstore.unity.com/account/assets`)
+  with the user's logged-in Unity **session cookie** (a `kharma_session`-style token). Lodestash can offer
+  an opt-in **"Unity account sync"** that — with the user's consent and login — pulls the owned list +
+  basic metadata (name, publisher, thumbnail, package id) and shows those as **"owned, not downloaded"**
+  ghost entries (`status='discovered'`) with a one-click "download in Editor" hint. It does **not** get
+  asset *contents* (those exist only once downloaded). Caveats: unofficial, may break when Unity changes
+  the endpoint, and ToS-grey — hence opt-in and low priority.
+- **Two directions** to the Unity story: **cache → Lodestash** (this section, ingest) and **Lodestash → open
+  project** (the editor plugin imports a chosen asset into `Assets/`, see
+  [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md)).
+
+---
+
+## 3. Ingestion pipeline (staged)
+
+```
+1. Crawl        enumerate files (path, size, mtime) under each source root
+2. Detect       classify by magic bytes (+ extension): unitypackage / bundle / source / archive
+3. Unpack       .unitypackage → gzip+tar extract; map GUID→pathname; read .meta (GUID, importer type, labels)
+4. Route        recognized source format → direct loader
+                Unity-native / compiled bundle → Python sidecar (UnityPy)
+5. Normalize    mesh → cached .glb (Assimp/FBX2glTF);  texture → PNG (decode BCn/ASTC/Crunch);
+                audio → WAV/OGG (FSB5 via fsb5 when needed)
+6. Metadata     tris/verts, materials, bone count (3D); dims/channels/colorspace (image); duration/rate (audio)
+7. Hash         BLAKE3 (exact dedup, move detection) + perceptual hash (image pHash / audio Chromaprint)
+8. Persist      insert asset + asset_file rows; update FTS (one transaction)
+9. Enqueue      thumbnail · embed · AI-tag · map  (background jobs)
+```
+
+Steps 5–9 run as background jobs with progress; the asset appears in the grid immediately with a
+placeholder thumbnail.
+
+### Key extraction facts
+- **`.unitypackage` needs no Unity library** — stdlib gzip+tar recovers the original files. Harvest
+  the `.meta` **`labels:`** field — publishers/users already tag assets there; it is the single most
+  valuable pre-existing metadata and seeds the tag index for free.
+- **Compressed textures** require decoding: **`texture2ddecoder`** (Rust crate; BCn/DXT, ASTC, ETC,
+  PVRTC), **`decrunch`** for Crunch, plus ASTC/ETC helpers. Expect a long-tail of rare format/version
+  combos that fail — provide an "unsupported format" fallback rather than promising 100%.
+- **Audio** in Unity is usually FMOD **FSB5** inside `.resS`; extract via the sidecar's `fsb5` path.
+  **Wwise** (`.bnk`/`.wem`) is separate middleware — flag as limited/out-of-scope initially.
+- **Skinned meshes, animation, materials/shaders** round-trip least reliably; treat as best-effort and
+  center the viewer on static geometry + textures + audio first.
+
+### Content vs non-content classification
+Asset packs are full of things that aren't browseable *content* — scripts, DLLs, editor extensions,
+shaders, assembly definitions, demo scenes, data objects. Lodestash **classifies every file and flags
+non-content so it stays out of content searches**:
+- **By extension/type**: `.cs`/`.js` scripts, `.dll`, `.asmdef`/`.asmref`, `.shader`/`.cginc`/`.hlsl`/
+  `.compute`, `.unity` scenes, editor-only folders (`Editor/`, `Gizmos/`) → `is_content=0`.
+- **By Unity importer** (from `.meta`): `MonoImporter`, `PluginImporter`, `AssemblyDefinitionImporter`,
+  and `ScriptedImporter`/`DefaultImporter` for non-media → non-content.
+- **Tool-only packages**: if a package contains *only* non-content (e.g. an editor utility, a shader
+  pack, a C# library), flag the whole `package` so it's hidden by default.
+- Non-content rows are **kept, not deleted** (so re-scans stay stable and the user can opt to show
+  them), but excluded from the default grid and search. Stored as `asset.content_kind` + `is_content=0`
+  (see [`DATA-MODEL.md`](DATA-MODEL.md)).
+
+---
+
+## 4. Normalization targets
+
+| Source | Normalized to | Tooling |
+|---|---|---|
+| FBX / OBJ / DAE / glTF | **glTF/GLB** (cached) | `russimp` (Assimp, BSD) or `FBX2glTF`; runtime only ever renders glTF |
+| Texture2D / DDS / KTX / TGA / PSD | **PNG** (display) | `image` + `image_dds` (BCn) + `psd`; `texture2ddecoder`/`decrunch` for Unity-compressed |
+| EXR / HDR | float → tone-mapped PNG for thumbs; float kept for viewer | `image` (EXR/HDR) |
+| AudioClip / FSB5 | **WAV/OGG** | UnityPy + `python-fsb5` (sidecar); `symphonia` for re-decode |
+
+**Normalize-to-glTF on import** is the load-bearing decision for 3D: it decouples the renderer and
+thumbnailer from format hell (FBX is proprietary) and is identical across all viewers.
+
+---
+
+## 5. Viewing & playback (preview pane)
+
+All three previews share the single **wgpu** device used by the egui UI.
+
+### 3D models
+- **Renderer**: `three-d` on shared wgpu — orbit camera, PBR materials, lighting, environment.
+- **Input**: cached glTF (from normalization). Show tris/verts/material/bone counts alongside.
+- **Thumbnails**: offscreen render-to-texture (a hero 3/4 view) on a worker task → on-disk cache.
+  Multiview renders (4–8 orbit views) double as input to the 3D tagging pipeline (see
+  [`AI-PIPELINE.md`](AI-PIPELINE.md)).
+
+### Audio
+- **Decode**: `symphonia` (WAV/FLAC/MP3/OGG-Vorbis/AAC) → PCM.
+- **Playback**: `rodio` (play/pause/seek/volume). `kira` if fancy scrubbing is wanted later.
+- **Waveform**: downsample PCM to per-pixel min/max peaks; draw with the egui painter. The same peak
+  buckets render a small waveform PNG thumbnail.
+
+### Images / textures
+- **Decode**: `image` (PNG/JPG/TGA/BMP/GIF/WebP/TIFF/DDS/HDR/EXR) + `image_dds` (BCn) + `psd`.
+- **Display**: upload to a GPU texture; let the GPU handle large images, mip selection, min/mag
+  filtering. Tone-mapping/exposure control for float EXR/HDR. Channel toggles for normal/roughness/alpha.
+- **Material grouping**: detect PBR map sets by filename (`_n`/`_normal`, `_rough`, `_orm`, …) and
+  hue heuristics; present albedo + maps as one "material" asset.
+
+---
+
+## 6. Thumbnail / preview generation
+
+- Generated **asynchronously** into an on-disk cache keyed by `content_hash + params`; the grid shows
+  placeholders and swaps thumbnails in as jobs complete.
+- **3D** → offscreen wgpu render-to-texture (no window needed). **Audio** → waveform PNG.
+  **Image** → downscaled (Lanczos), float tone-mapped first.
+- CPU-bound decode/resize runs on the `rayon` pool; GPU renders on worker tasks feeding the shared
+  device. This pipeline is what keeps large libraries responsive.
+
+---
+
+## 7. Unreal (Phase 2, best-effort)
+
+- Formats: `.uasset`+`.uexp`+`.ubulk`, `.umap`; `.pak`; IoStore `.utoc`+`.ucas` (often AES-encrypted;
+  UE5 stripped builds frequently need `.usmap` type mappings).
+- Tooling: **CUE4Parse** (C#, Apache-2.0) is the only realistic embeddable foundation — texture→PNG,
+  sound→WAV, static/skeletal mesh→glTF. Runs as its own sidecar (mirrors the Python/UnityPy pattern).
+- **Scope honestly**: extract-to-viewable only, no project reconstruction; AES keys & `.usmap` are the
+  user's responsibility; format churn makes this inherently fragile. Do not promise Unity parity.
+
+---
+
+## 8. Things not to promise
+
+- Clean extraction from arbitrary **shipped games** (stripped names/TypeTree → partial, unlabeled output).
+- Every **compressed texture** variant (rare ASTC block sizes, Crunch variants) decoding successfully.
+- **Wwise** audio (separate from the FMOD/FSB path supported initially).
+- Reliable **rig/animation/material** round-tripping.
+- Unreal parity with Unity.
+
+Position the product around the **user's owned Asset-Store packs and project folders** — where the
+robust 80% is simply: untar → use the embedded raw FBX/PNG/WAV → harvest `.meta` labels.

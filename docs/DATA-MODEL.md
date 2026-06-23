@@ -1,0 +1,360 @@
+# Data Model, Search & the Mapping Library
+
+The storage backbone, the schema, hybrid search, the user-defined "mapping library," and dedup.
+
+---
+
+## 1. Storage stack
+
+| Concern | Choice | Why |
+|---|---|---|
+| Relational backbone | **SQLite** (WAL) | Single file, transactional, OLTP-shaped (insert on scan, update tags, fetch one asset, filter) — exactly this workload. Standard for desktop local storage; `rusqlite` in Rust. |
+| Full-text | **FTS5** (BM25 built in) | Same file, same transactions, zero extra deps. |
+| Vector / ANN | **sqlite-vec** | Lives in the same file; brute-force KNN is comfortably fast at this scale (~100k @ 768-d in tens of ms with pre-filtering) and supports **metadata filter + KNN in one query**. |
+| Upgrade seam | **LanceDB** behind a `VectorIndex` trait | Disk-based ANN + native hybrid if vectors exceed ~500k–1M. |
+| Exact dedup | **BLAKE3** | Fast parallel content hash; powers dedup + move/rename detection. |
+| Near-dup | **pHash/blockhash** (image), **Chromaprint** (audio) | Hamming-distance matching for variants. |
+
+**The decisive property:** relational rows + FTS index + vector index live **in one SQLite file**, so a
+single transaction keeps all three consistent. A separate vector DB cannot give that for free — it
+would need a reconciliation/outbox job. That atomicity outweighs the raw throughput of a dedicated
+vector DB at this scale.
+
+Run with `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, a generous page cache.
+
+---
+
+## 2. Schema (SQLite DDL)
+
+Catalog-only — original files are referenced, never modified. Integer rowids (FTS5/sqlite-vec
+friendly) plus a stable `uuid` per entity for cross-library portability.
+
+```sql
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+
+-- ---------- Sources / libraries ----------
+CREATE TABLE import_source (
+  id              INTEGER PRIMARY KEY,
+  uuid            TEXT NOT NULL UNIQUE,
+  name            TEXT NOT NULL,
+  root_path       TEXT NOT NULL,
+  kind            TEXT NOT NULL,          -- 'folder' | 'unitypackage' | 'bundle' | 'unreal_pak' | ...
+  last_scanned_at INTEGER,
+  watch_enabled   INTEGER NOT NULL DEFAULT 1
+);
+
+-- ---------- Media-type taxonomy ----------
+CREATE TABLE media_type (
+  id    INTEGER PRIMARY KEY,
+  code  TEXT NOT NULL UNIQUE,             -- 'model_3d' | 'texture' | 'audio' | 'image'
+  label TEXT NOT NULL
+);
+
+-- ---------- Logical asset ----------
+CREATE TABLE asset (
+  id              INTEGER PRIMARY KEY,
+  uuid            TEXT NOT NULL UNIQUE,
+  source_id       INTEGER NOT NULL REFERENCES import_source(id),
+  media_type_id   INTEGER NOT NULL REFERENCES media_type(id),
+  name            TEXT NOT NULL,
+  description     TEXT,
+  primary_file_id INTEGER,                -- the "main" file
+  content_hash    TEXT,                   -- BLAKE3 of primary file (exact dedup)
+  unity_guid      TEXT,                   -- harvested from .meta when present
+  is_content      INTEGER NOT NULL DEFAULT 1,  -- 0 = tool/script/editor-only (hidden from default search)
+  content_kind    TEXT,                   -- 'model_3d'|'audio'|'image'|'material'|'prefab'|'script'|'dll'|'shader'|'editor_tool'|'data'|'other'
+  status          TEXT NOT NULL DEFAULT 'discovered', -- lifecycle: discovered→indexed→identified→confirmed
+  embedding_dirty INTEGER NOT NULL DEFAULT 1,
+  created_at      INTEGER NOT NULL,
+  updated_at      INTEGER NOT NULL,
+  deleted_at      INTEGER                 -- soft delete
+);
+CREATE INDEX idx_asset_source ON asset(source_id);
+CREATE INDEX idx_asset_media  ON asset(media_type_id);
+CREATE INDEX idx_asset_hash   ON asset(content_hash);
+CREATE INDEX idx_asset_dirty  ON asset(embedding_dirty) WHERE embedding_dirty=1;
+CREATE INDEX idx_asset_content ON asset(is_content) WHERE is_content=1;
+CREATE INDEX idx_asset_status  ON asset(status);
+
+-- ---------- Physical files (LODs, variants, PBR maps) ----------
+CREATE TABLE asset_file (
+  id              INTEGER PRIMARY KEY,
+  asset_id        INTEGER NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+  rel_path        TEXT NOT NULL,          -- relative to import_source.root_path
+  role            TEXT,                   -- 'mesh'|'lod0'|'albedo'|'normal'|'variant'|'preview'
+  ext             TEXT,
+  size_bytes      INTEGER,
+  mtime           INTEGER,                -- cheap change detection
+  content_hash    TEXT,                   -- BLAKE3 per file
+  perceptual_hash TEXT,                   -- pHash (image) / chromaprint (audio)
+  missing         INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(asset_id, rel_path)
+);
+CREATE INDEX idx_file_hash  ON asset_file(content_hash);
+CREATE INDEX idx_file_phash ON asset_file(perceptual_hash);
+CREATE INDEX idx_file_asset ON asset_file(asset_id);
+
+-- ---------- Tags (raw vocabulary) ----------
+CREATE TABLE tag (
+  id        INTEGER PRIMARY KEY,
+  name      TEXT NOT NULL,
+  norm_name TEXT NOT NULL UNIQUE,         -- lowercased/trimmed for matching
+  namespace TEXT                          -- optional: 'color','style','genre'
+);
+CREATE TABLE asset_tag (
+  asset_id   INTEGER NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+  tag_id     INTEGER NOT NULL REFERENCES tag(id),
+  source     TEXT NOT NULL,               -- 'manual' | 'ai' | 'imported'
+  confidence REAL,                        -- 0..1 (null for manual)
+  model_id   TEXT,                        -- which model produced an 'ai' tag
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (asset_id, tag_id, source)
+);
+CREATE INDEX idx_assettag_tag ON asset_tag(tag_id);
+
+-- ---------- Collections ----------
+CREATE TABLE collection (
+  id         INTEGER PRIMARY KEY,
+  uuid       TEXT NOT NULL UNIQUE,
+  name       TEXT NOT NULL,
+  parent_id  INTEGER REFERENCES collection(id),
+  is_smart   INTEGER NOT NULL DEFAULT 0,  -- saved-search collection
+  query_json TEXT
+);
+CREATE TABLE collection_asset (
+  collection_id INTEGER NOT NULL REFERENCES collection(id) ON DELETE CASCADE,
+  asset_id      INTEGER NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+  added_at      INTEGER NOT NULL,
+  PRIMARY KEY (collection_id, asset_id)
+);
+
+-- ---------- Embeddings (multi-model, multi-modality) ----------
+CREATE TABLE embedding_meta (
+  asset_id   INTEGER NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+  model_id   TEXT NOT NULL,               -- 'siglip2-so400m' | 'clap-htsat' ...
+  modality   TEXT NOT NULL,               -- 'image' | 'audio' | 'text'
+  dim        INTEGER NOT NULL,
+  version    INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (asset_id, model_id)
+);
+
+-- Vector store (sqlite-vec); rowid == asset_id keeps joins trivial.
+CREATE VIRTUAL TABLE vec_asset USING vec0(
+  asset_id      INTEGER PRIMARY KEY,
+  embedding     FLOAT[768],
+  media_type_id INTEGER partition key,    -- shard by media type for faster KNN
+  source_id     INTEGER,                  -- metadata filter column
+  +model_id     TEXT
+);
+
+-- Full-text search (FTS5 external-content over asset)
+CREATE VIRTUAL TABLE asset_fts USING fts5(
+  name, description, tags_concat,         -- denormalized tag string
+  content='asset', content_rowid='id',
+  tokenize='unicode61 remove_diacritics 2'
+);
+-- AFTER INSERT/UPDATE/DELETE triggers keep asset_fts in lockstep (omitted for brevity).
+```
+
+Filter + ANN in one query:
+
+```sql
+SELECT asset_id, distance
+FROM vec_asset
+WHERE embedding MATCH :query_vec
+  AND k = 100
+  AND media_type_id = :mt          -- partition-key prefilter
+  AND source_id IN (:s1, :s2);     -- metadata filter
+```
+
+> KNN `WHERE` supports `= != < <= > >= BETWEEN IN` — **not** `LIKE`/`GLOB`/`NULL`.
+
+---
+
+## 3. Hybrid search
+
+**Pattern: structural pre-filter → two retrievers → Reciprocal Rank Fusion → optional rerank.**
+
+> **The two user-facing modes** map onto this engine: **Search by Tags** = pure structural retrieval
+> (FTS/BM25 over names/tags + tag/category/media-type filters, *no* vector step) — fast, exact,
+> deterministic. **Search with AI** = the full hybrid path including the semantic vector retriever, so a
+> plain-language description finds assets even when no tag matches. Both default to `is_content=1`
+> (non-content hidden); AI search also requires `status IN ('identified','confirmed')` (only
+> AI-processed assets have embeddings). The category filter is `media_type` ∈ {Models, Sounds, Images}.
+
+1. **Pre-filter** (relational `WHERE`): media_type, collection, source, **tag set**, **mapped
+   category**. Shrinks the candidate set first; pushed into the retrieval (sqlite-vec metadata cols /
+   LanceDB scalar indexes). Tag/category filters are **hard boolean constraints**, not ranking signals.
+2. **Two ranked retrievals** over the filtered set:
+   - **FTS5/BM25** on name + tags + description (keywords, exact terms, named assets).
+   - **Vector KNN** (sqlite-vec) for semantic/paraphrase similarity.
+3. **Fuse with RRF**: `score(d) = Σ 1/(k + rank_i(d))`, `k≈60`. RRF combines on **ranks**, sidestepping
+   the BM25-vs-cosine score-incompatibility; reliably beats either retriever alone.
+4. **(Optional) cross-encoder rerank** of the top-N for the final 10–20 — opt-in (cost/latency).
+
+**Index sync:** because FTS5 and sqlite-vec are in the same file, every asset/tag mutation runs in one
+transaction updating base table + FTS (via triggers) together. Embeddings are produced async: mark
+`embedding_dirty=1` on content change; the embed worker computes + upserts the vector and clears the
+flag in its own transaction. There is a reference SQLite BM25+vector+RRF implementation to mirror.
+
+---
+
+## 4. The "mapping library"
+
+**Interpretation:** a user-defined **controlled vocabulary + rules** that map messy raw/AI tags onto a
+clean canonical project taxonomy (e.g. Environment / Props / Characters / SFX / Music, with
+sub-categories). This is the classic DAM problem; the model borrows from **SKOS** (preferred labels,
+alt labels, broader/narrower, match relations), simplified.
+
+Separates **raw tags** (observations) from **canonical categories** (interpretation) — so you can
+re-map non-destructively without touching the underlying tags, and swap whole mapping libraries
+(e.g. a generic map vs. a per-project UE5 vocab).
+
+```sql
+-- A named, swappable mapping library (= SKOS concept scheme)
+CREATE TABLE taxonomy (
+  id INTEGER PRIMARY KEY, uuid TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1, is_active INTEGER NOT NULL DEFAULT 0
+);
+
+-- Canonical categories (hierarchical)
+CREATE TABLE category (
+  id          INTEGER PRIMARY KEY,
+  taxonomy_id INTEGER NOT NULL REFERENCES taxonomy(id) ON DELETE CASCADE,
+  parent_id   INTEGER REFERENCES category(id),
+  pref_label  TEXT NOT NULL,             -- "Environment", "Props", "SFX/Footsteps"
+  path        TEXT NOT NULL,             -- materialized: "Environment/Foliage/Trees"
+  UNIQUE(taxonomy_id, path)
+);
+
+-- Aliases / synonyms that mean a category
+CREATE TABLE category_alias (
+  id INTEGER PRIMARY KEY,
+  category_id INTEGER NOT NULL REFERENCES category(id) ON DELETE CASCADE,
+  alias TEXT NOT NULL, norm_alias TEXT NOT NULL,
+  UNIQUE(category_id, norm_alias)
+);
+
+-- Rules mapping raw tags/metadata → a category
+CREATE TABLE mapping_rule (
+  id          INTEGER PRIMARY KEY,
+  taxonomy_id INTEGER NOT NULL REFERENCES taxonomy(id) ON DELETE CASCADE,
+  category_id INTEGER NOT NULL REFERENCES category(id) ON DELETE CASCADE,
+  match_type  TEXT NOT NULL,             -- 'exact_tag'|'alias'|'regex'|'glob_path'|'media_type'|'embedding_knn'
+  pattern     TEXT NOT NULL,
+  priority    INTEGER NOT NULL DEFAULT 100,   -- lower wins on conflict
+  min_confidence REAL DEFAULT 0,
+  enabled     INTEGER NOT NULL DEFAULT 1
+);
+
+-- Materialized assignments (the output)
+CREATE TABLE asset_category (
+  asset_id    INTEGER NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+  category_id INTEGER NOT NULL REFERENCES category(id) ON DELETE CASCADE,
+  taxonomy_id INTEGER NOT NULL REFERENCES taxonomy(id),
+  assigned_by TEXT NOT NULL,             -- 'rule' | 'manual' | 'override'
+  rule_id     INTEGER REFERENCES mapping_rule(id),
+  confidence  REAL,
+  is_pinned   INTEGER NOT NULL DEFAULT 0, -- manual overrides survive re-runs
+  PRIMARY KEY (asset_id, category_id, taxonomy_id)
+);
+```
+
+**Workflow:**
+1. **Author** the library (categories, aliases, rules) or import a starter pack; multiple taxonomies
+   coexist, one active.
+2. **Apply** (batch/incremental): evaluate rules in `priority` order against each asset's
+   tags/aliases/path/media_type (and optional `embedding_knn` = "near these seed examples"); write
+   `asset_category` with `assigned_by='rule'`.
+3. **Override**: manual assignments set `is_pinned=1`; re-runs never clobber pinned rows. Conflicts
+   resolve by `priority` then confidence.
+4. **Re-map**: bump `taxonomy.version` and re-apply; non-pinned rows regenerate. Raw `asset_tag`s are
+   untouched — fully non-destructive.
+5. **Search**: `asset_category` is just another structural pre-filter ("Props" AND semantically
+   "rusty medieval barrel"); hierarchy via `path` prefix or a recursive CTE on `parent_id`.
+
+---
+
+## 5. Dedup
+
+- **Exact**: BLAKE3 over file bytes → `content_hash`. Duplicates across libraries =
+  `GROUP BY content_hash HAVING COUNT(*)>1`. Also powers **move/rename detection** (§6).
+- **Near-dup**: pHash/blockhash (images) and Chromaprint (audio) → `perceptual_hash`; match by Hamming
+  distance (threshold ~≤6 bits). For fuzzy "similar asset," use embeddings instead.
+- **Surface, never auto-delete.** Present duplicate groups in a review queue (non-destructive).
+
+---
+
+## 6. Scale, watch & move detection
+
+- **Non-destructive catalog**: store `root_path` + `rel_path` + hashes + derived artifacts (thumbnails,
+  embeddings in a sidecar cache). Originals are never written.
+- **Incremental scan**: diff crawl results against DB by `(size, mtime)`; only re-hash on change.
+- **Watch**: `notify` crate for live updates, **always paired with a periodic full reconcile** (watchers
+  drop events under bursts).
+- **Move/rename**: a path that vanished + a new path with the **same `content_hash`** ⇒ same file
+  moved — update `rel_path` in place, preserving `asset_id`, tags, embeddings, and mappings. Missing
+  with no hash match ⇒ `missing=1` (grace period, no hard delete — resilient to unplugged drives).
+- **Perf at 100k**: FTS5 BM25 sub-10 ms; sqlite-vec KNN tens-of-ms (less with partition keys +
+  pre-filter). Past ~500k–1M vectors, flip the `VectorIndex` seam to LanceDB (HNSW).
+
+---
+
+## 7. Asset Store packages (Unity download library)
+
+Downloaded Asset Store `.unitypackage`s are modeled as **packages** so assets stay grouped by their
+origin pack — enabling "show/search everything from pack X" and update detection. The Asset Store
+library root is an `import_source` of kind `asset_store_library`; each ingested `.unitypackage` becomes
+a `package` row under it. See [`INGESTION.md`](INGESTION.md) §2.
+
+```sql
+CREATE TABLE package (
+  id            INTEGER PRIMARY KEY,
+  uuid          TEXT NOT NULL UNIQUE,
+  source_id     INTEGER NOT NULL REFERENCES import_source(id),
+  publisher     TEXT,                   -- from cache tree: <Publisher>/
+  category      TEXT,                   -- from cache tree: <Category>/
+  name          TEXT NOT NULL,          -- package display name
+  version       TEXT,                   -- detected pack version
+  package_path  TEXT NOT NULL,          -- absolute path to the .unitypackage in the cache
+  content_hash  TEXT,                   -- BLAKE3 of the .unitypackage (update detection)
+  asset_count   INTEGER,                -- filled after unpack (0/NULL = browsed but not yet ingested)
+  unpacked_at   INTEGER,
+  UNIQUE(source_id, package_path)
+);
+ALTER TABLE asset ADD COLUMN package_id INTEGER REFERENCES package(id);
+CREATE INDEX idx_asset_package ON asset(package_id);
+CREATE INDEX idx_package_source ON package(source_id);
+```
+
+- **Browse-only** populates `package` rows (publisher/category/name/version/path) **without** unpacking;
+  `asset_count`/`unpacked_at` stay null until the user ingests that pack.
+- **`package` is another search facet** (and a grid hierarchy: Publisher → Category → Package).
+- **Update detection**: re-compare the `.unitypackage` `content_hash`; on change, re-ingest and
+  reconcile that package's `asset` rows (non-destructive — preserves manual tags/mappings on unchanged
+  assets via per-file `content_hash`).
+
+---
+
+## 8. Asset lifecycle & "Identify" mode
+
+Every asset carries a **`status`** tracking how far it's been processed, so the app can separate the
+clean, searchable library from the raw backlog — and offer a focused workflow to work through that
+backlog. **Recommended user-facing terms: Identified vs Unidentified** (alternatives if you prefer:
+*Catalogued/Backlog* or *Indexed/Pending* — "stashed/unstashed" reads ambiguously, so avoid it).
+
+| `status` | Meaning | Searchable by |
+|---|---|---|
+| `discovered` | Seen on disk / listed from the Asset Store cache, **not yet unpacked/ingested** | browse only |
+| `indexed` | Ingested: file catalogued, thumbnail made, in FTS — **no AI yet** | name, folder, Unity labels |
+| `identified` | AI tagging **+** embeddings done → fully semantic-searchable | tags **and** AI |
+| `confirmed` | A human reviewed/curated the tags (accept/reject) → trusted | tags and AI |
+
+- **Library mode** shows the **Identified/Confirmed** set — your clean, fully searchable collection.
+- **Identify mode** (the triage workspace) shows the **Unidentified** backlog (`discovered`/`indexed`)
+  and lets you batch-run AI identification, hand-tag, and mark items `confirmed`. This is how you
+  whittle a freshly-imported 10k-asset pile down into a searchable library.
+- `status` is just another filter ("everything still **Unidentified** in **Sounds**" is one click).
+  Re-running AI (e.g. after a model upgrade) cycles an asset back through `identified`.
