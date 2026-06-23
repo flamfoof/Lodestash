@@ -65,6 +65,10 @@ Selecting one or multiple packages enqueues a **batch unpack+ingest** job (via t
 - Route raw FBX/PNG/WAV to direct loaders; Unity-native blobs to the UnityPy sidecar.
 - Ingest assets into the catalog **linked back to their origin `package`** (publisher/category/version)
   so you can filter/search "everything from pack X." See [`DATA-MODEL.md`](DATA-MODEL.md) §7.
+- **Harvest license/attribution** while ingesting a pack: the publisher comes free from the cache tree
+  (`<Publisher>/`), and any `LICENSE`/`README`/`Third-Party Notices` text or embedded pack metadata is
+  captured into `package.license`/`attribution`/`license_url`. This is surfaced on every export/import
+  so credits for bought assets travel with them (an individual asset can override its pack's license).
 
 ### Non-destructive & live
 - **Never modify the cache.** Lodestash extracts into its own managed workspace (or reads in place) and

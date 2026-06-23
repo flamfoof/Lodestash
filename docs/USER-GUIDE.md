@@ -84,16 +84,30 @@ Click any result to **view the 3D model** (orbit around it), **play the audio** 
 
 ## Step 6 — Bring it into Unity (the bridge)
 
-With your Unity project open and the Lodestash plugin panel active:
+With your Unity project open and the Lodestash plugin panel active (opening the panel **registers**
+your project with Lodestash, so it knows where "into Unity" means):
 
 1. Search/preview inside the panel (same catalog).
-2. **Select one or more assets** — even from different packs at once.
+2. **Select one or more assets** — even from different packs at once. *(Tip: collect candidates onto
+   the **staging tray** as you browse, then import the whole shortlist at once — Step "Stage" below.)*
 3. Click **Import**.
 
 Lodestash pulls in **only those assets plus their dependencies** (e.g. the beaver mesh + its materials
-and textures) into your project — **never the whole pack**. That keeps your project lean and clean.
+and textures) into your project — **never the whole pack**. That keeps your project lean and clean. If
+you've imported an asset here before, Lodestash flags it **"already imported"** rather than duplicating
+it, and shows its **license/attribution** so credits travel with the asset.
 
-You can also do this from **Claude** (or another AI client) via the built-in MCP connection.
+### …or ask Claude to do it (the MCP path)
+
+With the same panel open, you can tell **Claude** (or Claude Code, Cursor, any MCP client): *"find a
+low-poly beaver and import it into my project under `Wildlife/`."* Claude searches the catalog, shows
+you previews, and calls `import_to_project` — the asset lands in your **open** editor through the same
+import path the panel uses (Lodestash hands the request to the running plugin, which imports it on
+Unity's main thread). If no editor panel is open, Claude instead **exports** the asset to a folder you
+name. Either way you never import a whole pack.
+
+> **Stage, then import.** The staging tray is shared — assets you (or Claude) stage show up in the GUI,
+> the Unity panel, and over MCP alike. Build a shortlist, review it, then import the keepers together.
 
 ---
 
@@ -101,6 +115,8 @@ You can also do this from **Claude** (or another AI client) via the built-in MCP
 
 - **Re-run identification** whenever you download new packs (or set it to auto-run on new assets).
 - **Non-content assets** (tools/scripts) are hidden by default; toggle them on if you ever need them.
+- **Provenance & licenses:** each asset's detail panel shows which packs it came from, where you've
+  imported it, and its **license/attribution** — handy when crediting bought assets in a shipped game.
 - **Owned but not downloaded?** Optional Unity *account sync* can show packs you own but haven't
   downloaded as greyed-out entries — download them in Unity's My Assets to make them usable.
 - **Privacy:** everything runs locally. Cloud AI is opt-in only and never required.

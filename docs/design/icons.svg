@@ -120,5 +120,15 @@
     <symbol id="ls-non-content" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
       <path d="M9 8 L5 12 L9 16 M15 8 L19 12 L15 16 M13 5 L11 19"/>
     </symbol>
+    <!-- Staging tray / shortlist: an inbox tray with a gem dropping in -->
+    <symbol id="ls-stage" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 14 L6.5 8 H17.5 L20 14 M4 14 V18 a1 1 0 0 0 1 1 H19 a1 1 0 0 0 1-1 V14 H15.5 a3.5 3.5 0 0 1-7 0 Z"/>
+      <path d="M12 3 V8 M9.7 6 L12 8.3 L14.3 6"/>
+    </symbol>
+    <!-- Registered Unity project: a box/cube with a connection dot -->
+    <symbol id="ls-project" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 3 L20 7 V15 L12 19 L4 15 V7 Z M4 7 L12 11 L20 7 M12 11 V19"/>
+      <circle cx="18.5" cy="5.5" r="1.6" fill="currentColor" stroke="none"/>
+    </symbol>
   </defs>
 </svg>

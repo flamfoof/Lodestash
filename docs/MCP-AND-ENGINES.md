@@ -25,8 +25,13 @@ against the `claude-api` skill before implementing.
 
 - **MCP** is the **AI control plane** — for LLM clients that reason and decide which assets to pull.
 - **Local HTTP/JSON API** is the **deterministic integration plane** — for the Unity plugin and any
-  scripting. Plugins do **not** speak MCP. (Unreal plugin will use the same API when added.)
-- Both are thin frontends over the same `lodestash-core` operations — implemented once.
+  scripting. Plugins do **not** speak MCP; they speak REST. (Unreal plugin will use the same API when
+  added.) Its full contract — endpoints, the token handshake, entity shapes, project registration and
+  the import queue — lives in [`ENGINE-API.md`](ENGINE-API.md).
+- Both are thin frontends over the same `lodestash-core` operations — implemented once. **Every MCP
+  tool maps 1:1 onto a REST endpoint** ([`ENGINE-API.md`](ENGINE-API.md) §2), so the two planes can't
+  drift. The canonical request/response **entity shapes** (asset summary/detail, package, job) are
+  defined once in [`ENGINE-API.md`](ENGINE-API.md) §3 and referenced from here.
 
 ---
 
@@ -58,9 +63,14 @@ against the `claude-api` skill before implementing.
 | `apply_mapping` | `id`/`scope`, `taxonomy_id` | resulting category assignments |
 | `list_packages` | filters (`publisher`, `category`), `cursor` | downloaded Asset Store packages (publisher, category, name, version, asset count) |
 | `unpack_package` | `package_id`(s) | job id — unpacks + ingests one or many Asset Store packages *(long-running)* |
-| `export_asset` | `id`(s), `dest_path`, `format?`, `with_dependencies?` | writes the selected asset(s) **+ their dependency closure** (a mesh plus its materials/textures), never the whole pack *(side-effecting — confirm + sandbox path)* |
+| `export_asset` | `id`(s), `dest_path`, `format?`, `with_dependencies?` | writes the selected asset(s) **+ their dependency closure** (a mesh plus its materials/textures) to an arbitrary **sandboxed** path, never the whole pack — **no editor required** *(side-effecting — confirm + sandbox path)* |
+| `import_to_project` | `id`(s), `dest_subfolder?`, `with_dependencies?`, `project_id?` | imports the asset(s) + dependency closure **into the open Unity project** (vs. `export_asset`'s arbitrary path). Enqueues onto the shared import queue the running plugin drains on Unity's main thread (§3). Returns a `job_id`; `409 project_not_registered` if no editor is listening *(side-effecting — confirm)* |
+| `register_project` | `project_path`, `unity_version`, `can_execute_main_thread` | registers the open editor so the model knows where "into Unity" means *(usually called by the plugin, exposed for completeness)* |
+| `list_projects` / `get_active_project` | — | registered editors + which is active |
+| `stage_asset` / `list_staged` | `id`(s) / — | add to / read the **shared shortlist** (the staging tray; one `is_staging` collection — §2 agent loop) |
+| `import_staged` | `dest_subfolder?`, `project_id?`, `clear?` | import the whole staged shortlist into the open project via the import queue |
 | `get_job_status` | `job_id` | progress/result for long ops |
-| `get_server_info` | — | app + schema version |
+| `get_server_info` | — | app + schema + API version |
 
 **Resources (application-controlled), via URI templates:**
 - `asset://{id}` → metadata (JSON).
@@ -81,9 +91,11 @@ embedded `resource`.
 - **Always pair a viewable preview with a `resource_link`** — the agent reasons over the preview; the
   consumer (engine plugin/export) fetches bytes by path/URI.
 
-Realistic agent loop: *"find low-poly stylized rocks under 5k tris, show the top 6, tag the 3 I pick
-`level-3`, export them to `./Assets/Rocks/`"* → `semantic_search` → `get_asset_preview×N` → `add_tag` →
-`export_asset`.
+Realistic agent loop (into the open editor): *"find low-poly stylized rocks under 5k tris, show the
+top 6, stage the 3 I pick and tag them `level-3`, then import them into my project under `Rocks/`"* →
+`semantic_search` → `get_asset_preview×N` → `stage_asset` → `add_tag` → `import_to_project` →
+`get_job_status`. The same loop ending in `export_asset` writes to an arbitrary path instead (no
+editor needed). The whole entity/endpoint contract for these is in [`ENGINE-API.md`](ENGINE-API.md).
 
 ---
 
@@ -96,18 +108,76 @@ Realistic agent loop: *"find low-poly stylized rocks under 5k tris, show the top
 
 - **Plugin**: UPM C# package (`Editor/` assembly), `EditorWindow` UI, installed via Package Manager git
   URL.
-- **How it talks**: a **thin client over the loopback HTTP API** — query search (by tag or AI), fetch
-  thumbnails from the preview endpoint, and on "Import" pull **only the selected asset(s) plus their
-  dependency closure** (Lodestash resolves `.meta`/prefab GUID references → the mesh + its materials +
-  textures) into `Assets/<subfolder>/`, then `AssetDatabase.ImportAsset(...)` / `Refresh()` — **never
-  the entire package**. Select one or many across different libraries in a single import. Drag-and-drop
-  into Project/Hierarchy via the `DragAndDrop` API is a nice-to-have.
+- **How it talks**: a **thin client over the loopback HTTP API** ([`ENGINE-API.md`](ENGINE-API.md)) —
+  it reads the handshake file for port+token, queries search (by tag or AI), fetches thumbnails from
+  the preview endpoint, **registers the open project**, and imports **only the selected asset(s) plus
+  their dependency closure** (Lodestash resolves `.meta`/prefab GUID references → the mesh + its
+  materials + textures) into `Assets/<subfolder>/` — **never the entire package**. Select one or many
+  across different libraries in a single import. Drag-and-drop into Project/Hierarchy via the
+  `DragAndDrop` API is a nice-to-have.
+
+### The closed round-trip — GUI **and** Claude land assets in the *open* editor
+
+The plugin still does **not** speak MCP. Instead, **MCP and the plugin meet at one shared place: the
+import queue** in [`ENGINE-API.md`](ENGINE-API.md) §5. That single rendezvous is what lets an AI agent
+(MCP) and the desktop GUI both drop an asset into the same open project:
+
+```
+  Claude (MCP import_to_project)  ─┐
+  Desktop GUI "Import"            ─┼──▶  lodestash-core  ──▶  per-project import queue
+  Unity panel "Import"           ─┘        (resolves dep closure, stages bytes,
+                                            checks dup-guard, returns job_id)
+                                                          │
+                          long-poll GET /v1/import-queue  ▼
+                                   Unity plugin  ──▶  main-thread import
+                                   (AssetDatabase.ImportAsset / Refresh)
+                                                          │  POST …/ack {dest_path, guid}
+                                                          ▼
+                                   core writes import_record  ──▶  job = done
+                                   (MCP get_job_status / GUI both observe it)
+```
+
+Step by step:
+1. On panel open, the plugin **`register_project`** (project path, Unity version) → core marks it
+   active.
+2. A request from **any** caller (`import_to_project` over MCP, or `POST /v1/import` from the GUI/panel)
+   resolves the **dependency closure**, stages the bytes, runs the **dup-guard** check
+   (`import_record` on `(asset, project)`), and appends an import request to that project's queue —
+   returning a `job_id` immediately.
+3. The plugin's **long-poll loop** drains the queue on Unity's **main thread**, writes files under
+   `Assets/<subfolder>/`, calls `AssetDatabase.ImportAsset` / `Refresh`, and **acks** the real
+   in-project path + GUID.
+4. The core persists an **`import_record`** (provenance) and flips the job to `done`; MCP
+   `get_job_status` and the GUI both see completion identically.
+
+**If no editor is registered**, `import_to_project` returns `409 project_not_registered` with a clear
+"open the Lodestash panel in Unity" message — and the agent **falls back to `export_asset`** to a path.
+This is exactly how "do it from Claude" in [`USER-GUIDE.md`](USER-GUIDE.md) Step 6 works.
+
 - **Reference patterns** (community, unofficial): CoplayDev/unity-mcp (C# UPM package + bridge over a
   local socket), IvanMurzak/unity-mcp, CoderGamester/mcp-unity. They confirm the "C# editor agent
-  executes operations on external commands" pattern.
+  executes operations on external commands" pattern — the import-queue here is the same idea with
+  Lodestash core as the broker.
 - **Constraints**: editor must be open/listening; asset import must run on Unity's main thread; large
   binaries travel by path/URL, not inline; **dependency resolution is within a package** (cross-package
   references are flagged for the user, since GUIDs are reassigned per import).
+
+### 3b. Two MCP topologies (both supported)
+
+`import_to_project` works the same regardless of **where the MCP client runs**:
+
+1. **Claude Desktop / a remote IDE drives a separate editor.** The user has the Unity panel open
+   (registered); Claude reasons over previews and calls `import_to_project`; the asset lands in that
+   editor via the queue above. The MCP server is the local Lodestash app (stdio).
+2. **Claude Code / Cursor running *in the Unity project folder* (Unity-side MCP client).** A developer
+   working alongside the editor registers the Lodestash MCP server in their project
+   (`claude mcp add --transport stdio lodestash -- <lodestash --mcp>`) and asks it to find + import
+   assets into the very project they're in. **No new surface** — it's the same `import_to_project`
+   flow against the already-open editor; only the client's *placement* differs. Use **stdio** for this
+   single-developer case; reserve **Streamable HTTP** for when multiple/remote clients must reach one
+   running instance (same loopback + token + origin rules — §5).
+
+In both, the plugin remains a pure REST client; MCP only ever enters through the shared import queue.
 
 ---
 
@@ -152,9 +222,14 @@ version; plugins check on connect and degrade gracefully.
 
 - **MCP server**: `rmcp`, in-process, stdio default — the surface in §2, previews as `image` blocks +
   `resource_link`s, never inline large binaries.
-- **Engine plugins**: **Unity** is primary — a thin client over the loopback HTTP API, importing into
-  `Assets/`; Unreal plugin is planned for a later phase. Both reuse the same core operations as MCP.
-- **One backend, two planes**: MCP for the AI, REST for deterministic tooling.
+- **Engine plugins**: **Unity** is primary — a thin client over the loopback HTTP API
+  ([`ENGINE-API.md`](ENGINE-API.md)), importing into `Assets/`; Unreal plugin is planned for a later
+  phase. Both reuse the same core operations as MCP.
+- **One backend, two planes**: MCP for the AI, REST for deterministic tooling — **1:1 operations**, so
+  they never drift.
+- **The Unity round-trip closes at the import queue** (§3): GUI and Claude (`import_to_project`) both
+  land assets in the *open* editor; the plugin executes on the main thread and acks back an
+  `import_record` (provenance + dup-guard). Falls back to `export_asset` when no editor is registered.
 
 **Top risks**: editors must be open/listening; main-thread import constraints; community Unity
 servers are unofficial; Epic's Unreal MCP is experimental and shifting (and Unreal support is a

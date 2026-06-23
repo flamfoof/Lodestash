@@ -125,6 +125,10 @@ Sub-services:
 - **Job engine** — background queue (tokio + rayon) for scan/hash/thumbnail/embed/tag/map work with
   progress reporting and backpressure; everything long-running returns a job id.
 - **Asset operations** — get/search/tag/collection/export/import primitives shared by all frontends.
+- **Project & import registry** — tracks registered Unity editors (`project`) and the durable
+  provenance of every import (`import_record`: asset → project path + GUID), powering "into Unity"
+  targeting, dup-guard ("already imported?"), and the staging shortlist. See
+  [`DATA-MODEL.md`](DATA-MODEL.md) §9 and [`ENGINE-API.md`](ENGINE-API.md) §5.
 
 ### 3.2 Ingestion subsystem (`lodestash-ingest`)
 File crawling, format detection (magic bytes), `.unitypackage` untar, `.meta` YAML parsing (harvests
@@ -148,8 +152,13 @@ preview, tag, collection, and export tools so AI clients can find and retrieve a
 [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md).
 
 ### 3.6 Local HTTP API (`lodestash-api`)
-Loopback-only (`127.0.0.1`) JSON API with a per-session bearer token. The deterministic integration
-surface for the Unity plugin (and the Unreal plugin when added) and any scripting. Versioned (`/v1/`).
+Loopback-only (`127.0.0.1`) JSON API with a per-session bearer token (handed to the plugin via a
+handshake file). The deterministic integration surface for the Unity plugin (and the Unreal plugin
+when added) and any scripting. Versioned (`/v1/`), with endpoints **1:1 to the MCP surface**. It owns
+**project registration** and the **import queue** that closes the Unity round-trip: any caller (GUI,
+MCP `import_to_project`, the panel) enqueues an import; the running plugin drains it on Unity's main
+thread and acks the in-project path+GUID, which the core records as provenance. Full contract in
+[`ENGINE-API.md`](ENGINE-API.md).
 
 ### 3.7 Engine plugins
 - **Unity** (primary): UPM C# package with an `EditorWindow` that browses the catalog over the HTTP API
@@ -185,9 +194,15 @@ Query (text, optional semantic toggle, filters)
   → structural pre-filter (media_type, tags, mapped category, source)
   → BM25 (FTS5) ⊕ vector KNN (sqlite-vec)  → RRF fuse  → (optional rerank)
   → results grid with thumbnails
-  → preview (3D / audio / image)
-  → "Import to engine":  GUI/plugin → HTTP API export → write into Assets/ (Unity; /Content for Unreal later)
-                          or:  AI client → MCP export_asset → resource_link → plugin fetch
+  → preview (3D / audio / image)   → (optional) stage candidates onto the shared shortlist
+  → "Import into the open project":
+        GUI / Unity panel / AI client(MCP import_to_project)
+          → core resolves dependency closure + dup-guard check (import_record)
+          → enqueue on the project's import queue → job_id
+          → plugin long-polls the queue → imports on Unity's MAIN THREAD (AssetDatabase) → ack path+GUID
+          → core writes import_record (provenance) → job done (MCP get_job_status / GUI observe it)
+     or "Export to a path":  any caller → HTTP/MCP export_asset → dependency closure to a sandboxed dir
+                              (no open editor required; /Content for Unreal later)
 ```
 
 ### 4.3 Tag / identify
