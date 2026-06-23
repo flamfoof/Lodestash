@@ -115,9 +115,15 @@ alternatives (Tauri+three.js, pure-Python/PySide6).
 | [`docs/AI-MODELS-BY-GPU.md`](docs/AI-MODELS-BY-GPU.md) | **User guide:** which local AI models to run per GPU VRAM tier (CPU / 4 / 6 / 8 / 12 / 16 / 24 GB / cloud) |
 | [`docs/DESIGN-GUIDELINES.md`](docs/DESIGN-GUIDELINES.md) | **Design system** for devs & designers — dark-mode JRPG theme, tokens, components, icons (+ live [`design/style-guide.html`](docs/design/style-guide.html), [`design/icons.svg`](docs/design/icons.svg)) |
 | [`docs/DATA-MODEL.md`](docs/DATA-MODEL.md) | SQLite schema, hybrid search, the mapping library, dedup |
+| [`docs/IDENTIFICATION-AND-SEARCH.md`](docs/IDENTIFICATION-AND-SEARCH.md) | The identification engine + the **three ways to search** (tags / plain language / AI-MCP), faceted schema, query understanding |
 | [`docs/MCP-AND-ENGINES.md`](docs/MCP-AND-ENGINES.md) | MCP surface, the closed Unity import round-trip, Unity-side MCP-client topology, Unreal (planned) |
 | [`docs/ENGINE-API.md`](docs/ENGINE-API.md) | **The interface layer:** loopback HTTP/JSON contract — endpoints (1:1 with MCP), token handshake, project registration & import queue, staging |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Phased build plan, milestones, risks |
+| [`docs/TECH-STACK.md`](docs/TECH-STACK.md) | Implementation-ready stack — crates/libraries per module, AI runtime, sidecar, build/test/CI/packaging |
+| [`docs/KANBAN.md`](docs/KANBAN.md) | Kanban board (Backlog → Ready → In Progress → Review → Done) tracking the build |
+
+> Working in this repo? Read [`CLAUDE.md`](CLAUDE.md) — the docs are the source of truth, and code must
+> conform to them (update the doc in the same change if it diverges).
 
 ---
 

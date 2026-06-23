@@ -104,7 +104,7 @@ than redefining, so summaries/details never diverge.
 // AssetSummary — search results, staging, queue payloads
 {
   "id": 4821, "uuid": "…", "name": "Beaver_LowPoly",
-  "media_type": "model_3d",            // model_3d | texture | audio | image
+  "media_type": "model_3d",            // model_3d | texture | audio | image | sprite | material | font
   "format": "fbx", "status": "identified",
   "package": { "id": 12, "name": "Forest Pack", "publisher": "AcmeArt" },
   "tags": ["animal", "lowpoly"],

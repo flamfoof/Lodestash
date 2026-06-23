@@ -103,7 +103,7 @@ CREATE TABLE tag (
   id        INTEGER PRIMARY KEY,
   name      TEXT NOT NULL,
   norm_name TEXT NOT NULL UNIQUE,         -- lowercased/trimmed for matching
-  namespace TEXT,                         -- optional: 'color','style','genre'
+  namespace TEXT,                         -- facet: subject|style|material|color|mood|usage|audio|technical|free (IDENTIFICATION-AND-SEARCH.md §2)
   color     TEXT,                         -- optional hex for color-coded tag chips (UI)
   parent_id INTEGER REFERENCES tag(id)    -- optional nesting (tag groups)
 );

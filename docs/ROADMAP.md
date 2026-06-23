@@ -67,6 +67,9 @@ viewable + deduped, with imported Unity labels already searchable.
 - Hybrid search: pre-filter → BM25 ⊕ vector KNN → **RRF**; semantic toggle in the search bar.
 - **Variants** (collapse near-duplicate assets into one tile) and **color search** (`dominant_color`)
   as additional facets.
+- **Two search surfaces + query understanding**: Search by Tags (structural) and Search with AI
+  (NL → `{semantic_text, filters}` parser → hybrid). See
+  [`IDENTIFICATION-AND-SEARCH.md`](IDENTIFICATION-AND-SEARCH.md).
 - Background embed jobs keyed by `content_hash + model + version`; `embedding_dirty` flow.
 
 **Exit criteria:** keyword + tag-filter + natural-language semantic search all return good results on
@@ -82,6 +85,8 @@ a 10k+ library.
 - Per-modality `local | api` config; embeddings stay local.
 - Tag normalization + confidence thresholds; editable confidence chips with accept/reject logging;
   **color-coded / nested tags** (`tag.color` / `tag.parent_id`).
+- **Faceted identification schema** (subject/style/material/mood/usage/…) filled by a local VLM or
+  Claude vision via structured outputs — see [`IDENTIFICATION-AND-SEARCH.md`](IDENTIFICATION-AND-SEARCH.md) §2, §4.
 - **Mapping library**: taxonomy/category/alias/rule schema + apply engine + pinned overrides + re-map;
   category as a search facet. Ship a starter taxonomy (Environment/Props/Characters/SFX/Music/…).
 
