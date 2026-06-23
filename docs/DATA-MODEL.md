@@ -47,7 +47,7 @@ CREATE TABLE import_source (
 -- ---------- Media-type taxonomy ----------
 CREATE TABLE media_type (
   id    INTEGER PRIMARY KEY,
-  code  TEXT NOT NULL UNIQUE,             -- 'model_3d' | 'texture' | 'audio' | 'image'
+  code  TEXT NOT NULL UNIQUE,             -- 'model_3d' | 'texture' | 'audio' | 'image' | 'sprite' (animated 2D) | 'material' | 'font'
   label TEXT NOT NULL
 );
 
@@ -65,6 +65,8 @@ CREATE TABLE asset (
   is_content      INTEGER NOT NULL DEFAULT 1,  -- 0 = tool/script/editor-only (hidden from default search)
   content_kind    TEXT,                   -- 'model_3d'|'audio'|'image'|'material'|'prefab'|'script'|'dll'|'shader'|'editor_tool'|'data'|'other'
   status          TEXT NOT NULL DEFAULT 'discovered', -- lifecycle: discovered→indexed→identified→confirmed
+  dominant_color  TEXT,                   -- hex of the asset's dominant color (color search/sort; §10)
+  variant_group_id INTEGER,               -- groups near-identical variants under one grid tile (§10)
   embedding_dirty INTEGER NOT NULL DEFAULT 1,
   created_at      INTEGER NOT NULL,
   updated_at      INTEGER NOT NULL,
@@ -76,6 +78,7 @@ CREATE INDEX idx_asset_hash   ON asset(content_hash);
 CREATE INDEX idx_asset_dirty  ON asset(embedding_dirty) WHERE embedding_dirty=1;
 CREATE INDEX idx_asset_content ON asset(is_content) WHERE is_content=1;
 CREATE INDEX idx_asset_status  ON asset(status);
+CREATE INDEX idx_asset_variant ON asset(variant_group_id) WHERE variant_group_id IS NOT NULL;
 
 -- ---------- Physical files (LODs, variants, PBR maps) ----------
 CREATE TABLE asset_file (
@@ -100,7 +103,9 @@ CREATE TABLE tag (
   id        INTEGER PRIMARY KEY,
   name      TEXT NOT NULL,
   norm_name TEXT NOT NULL UNIQUE,         -- lowercased/trimmed for matching
-  namespace TEXT                          -- optional: 'color','style','genre'
+  namespace TEXT,                         -- optional: 'color','style','genre'
+  color     TEXT,                         -- optional hex for color-coded tag chips (UI)
+  parent_id INTEGER REFERENCES tag(id)    -- optional nesting (tag groups)
 );
 CREATE TABLE asset_tag (
   asset_id   INTEGER NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
@@ -425,3 +430,22 @@ ALTER TABLE asset ADD COLUMN license_url TEXT;
 - **License** resolves **asset → package**: an asset's effective license is `asset.license` when set,
   else `package.license`. Surfaced on the detail stat block and on every export/import so credits
   travel with the asset.
+
+---
+
+## 10. Variants, colors & 2D / material / font assets
+
+Backing the AssetHoard-inspired additions, kept cohesive with the existing model:
+
+- **Variants** — near-identical assets (same model at different scales, recolors, re-exports) are
+  clustered by perceptual / `content_hash` similarity (reusing dedup, §5) into a `variant_group_id`.
+  The grid **collapses a group into one tile** with a count badge; expanding shows members.
+  Non-destructive — variants stay separate rows, just visually grouped.
+- **Color search** — at ingest, image/texture/sprite assets get a `dominant_color`; it becomes another
+  structural facet in hybrid search (§3), enabling "filter / sort by color".
+- **Tag colors & nesting** — `tag.color` drives color-coded chips; `tag.parent_id` allows nested tag
+  groups. Distinct from the controlled-vocabulary **mapping library** (§4) — tags stay free-form.
+- **New media types** — `sprite` (animated 2D: frame/spritesheet metadata via `asset_file` roles +
+  stats), `material` (a map set grouped via `asset_file` roles, previewed on a sphere), and `font`
+  (glyph metrics; glyph-sheet preview). They reuse `asset`/`asset_file` as-is; only `media_type` and
+  preview/normalization differ (see [`INGESTION.md`](INGESTION.md)).

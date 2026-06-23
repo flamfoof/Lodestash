@@ -42,6 +42,10 @@ design decision in this spec.
 - **Sorted vs unsorted at a glance** — every asset has a status (**Unidentified → Identified →
   Confirmed**); an **Identify mode** lets you work through the freshly-imported backlog (batch AI
   tagging + hand-tagging) while the **Library** stays clean and searchable.
+- **2D & more**: animated sprites (pixel-perfect), **material previews on a 3D sphere**, and **fonts** —
+  plus Aseprite/Krita/PSD/Paint.NET, `.blend`, and MaterialX formats.
+- **Find more like it**: one-click similar-asset search (or drag in a reference to find owned matches);
+  collapse near-duplicate **variants** into one tile; **color** search and color-coded/nested tags.
 - **Apply a "mapping library"**: a user-defined taxonomy that maps messy raw/AI tags onto a clean
   canonical project vocabulary (Environment / Props / Characters / SFX / Music / …).
 - **MCP server** so Claude, Claude Code, Cursor, and other AI clients can search the catalog and
@@ -96,7 +100,7 @@ alternatives (Tauri+three.js, pure-Python/PySide6).
 | MCP server | **rmcp** (Rust), in-process, stdio default |
 | Engine API | loopback **HTTP/JSON** (127.0.0.1 + token); 1:1 with the MCP surface — see [`docs/ENGINE-API.md`](docs/ENGINE-API.md) |
 | Unity round-trip | shared **import queue**: GUI/Claude enqueue → plugin imports on Unity's main thread → acks provenance |
-| Engine plugins | **Unity** (UPM C# `EditorWindow`) — primary; Unreal (C++/Python Slate) — planned |
+| Engine plugins | **Unity** (UPM C# `EditorWindow`) — primary; Godot + Unreal — planned (co-equal) |
 
 ---
 

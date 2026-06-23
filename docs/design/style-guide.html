@@ -194,6 +194,11 @@ footer{margin-top:var(--sp-6);padding-top:var(--sp-4);border-top:1px solid var(-
 <symbol id="ls-non-content" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M9 8 L5 12 L9 16 M15 8 L19 12 L15 16 M13 5 L11 19"/></symbol>
 <symbol id="ls-stage" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14 L6.5 8 H17.5 L20 14 M4 14 V18 a1 1 0 0 0 1 1 H19 a1 1 0 0 0 1-1 V14 H15.5 a3.5 3.5 0 0 1-7 0 Z"/><path d="M12 3 V8 M9.7 6 L12 8.3 L14.3 6"/></symbol>
 <symbol id="ls-project" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 L20 7 V15 L12 19 L4 15 V7 Z M4 7 L12 11 L20 7 M12 11 V19"/><circle cx="18.5" cy="5.5" r="1.6" fill="currentColor" stroke="none"/></symbol>
+<symbol id="ls-type-font" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 19 L11 5 H13 L19 19 M8.2 14 H15.8"/></symbol>
+<symbol id="ls-type-material" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M6.4 8.4 a4.2 4.2 0 0 0 5.2 5.2"/><circle cx="9.2" cy="9.2" r="1.1" fill="currentColor" stroke="none"/></symbol>
+<symbol id="ls-variants" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="3.5" width="13.5" height="13.5" rx="2"/><path d="M16.5 20.5 H5.5 a2 2 0 0 1-2-2 V7.5"/></symbol>
+<symbol id="ls-color" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 C12 3.5 18 10 18 14 a6 6 0 0 1-12 0 C6 10 12 3.5 12 3.5 Z"/></symbol>
+<symbol id="ls-similar" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="12" r="5.5"/><circle cx="15" cy="12" r="5.5"/></symbol>
 </defs></svg>
 
 <header class="top">
@@ -371,7 +376,7 @@ seg.addEventListener('click',e=>{const b=e.target.closest('button'); if(!b)retur
 document.querySelectorAll('.cat').forEach(c=>c.addEventListener('click',()=>{
   document.querySelectorAll('.cat').forEach(x=>x.classList.remove('active')); c.classList.add('active');}));
 // icon grid
-const ids=["ls-logo","ls-nav-library","ls-nav-identify","ls-nav-collections","ls-nav-mapping","ls-nav-packages","ls-nav-settings","ls-search","ls-search-ai","ls-search-tags","ls-filter","ls-type-model","ls-type-sound","ls-type-image","ls-status-unidentified","ls-status-identified","ls-status-confirmed","ls-import","ls-download","ls-play","ls-pause","ls-tag-add","ls-dependency","ls-non-content","ls-stage","ls-project"];
+const ids=["ls-logo","ls-nav-library","ls-nav-identify","ls-nav-collections","ls-nav-mapping","ls-nav-packages","ls-nav-settings","ls-search","ls-search-ai","ls-search-tags","ls-filter","ls-type-model","ls-type-sound","ls-type-image","ls-status-unidentified","ls-status-identified","ls-status-confirmed","ls-import","ls-download","ls-play","ls-pause","ls-tag-add","ls-dependency","ls-non-content","ls-stage","ls-project","ls-type-font","ls-type-material","ls-variants","ls-color","ls-similar"];
 document.getElementById('iconGrid').innerHTML=ids.map(id=>`<div class="ic"><svg class="icon"><use href="#${id}"/></svg><small>${id}</small></div>`).join('');
 </script>
 </body>

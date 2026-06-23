@@ -130,5 +130,24 @@
       <path d="M12 3 L20 7 V15 L12 19 L4 15 V7 Z M4 7 L12 11 L20 7 M12 11 V19"/>
       <circle cx="18.5" cy="5.5" r="1.6" fill="currentColor" stroke="none"/>
     </symbol>
+    <!-- 2D / material / font media types + variants, color, similarity -->
+    <symbol id="ls-type-font" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M5 19 L11 5 H13 L19 19 M8.2 14 H15.8"/>
+    </symbol>
+    <symbol id="ls-type-material" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="8.5"/>
+      <path d="M6.4 8.4 a4.2 4.2 0 0 0 5.2 5.2"/>
+      <circle cx="9.2" cy="9.2" r="1.1" fill="currentColor" stroke="none"/>
+    </symbol>
+    <symbol id="ls-variants" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="7" y="3.5" width="13.5" height="13.5" rx="2"/>
+      <path d="M16.5 20.5 H5.5 a2 2 0 0 1-2-2 V7.5"/>
+    </symbol>
+    <symbol id="ls-color" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 3.5 C12 3.5 18 10 18 14 a6 6 0 0 1-12 0 C6 10 12 3.5 12 3.5 Z"/>
+    </symbol>
+    <symbol id="ls-similar" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="9" cy="12" r="5.5"/><circle cx="15" cy="12" r="5.5"/>
+    </symbol>
   </defs>
 </svg>

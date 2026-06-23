@@ -178,6 +178,10 @@ non-content so it stays out of content searches**:
 | Texture2D / DDS / KTX / TGA / PSD | **PNG** (display) | `image` + `image_dds` (BCn) + `psd`; `texture2ddecoder`/`decrunch` for Unity-compressed |
 | EXR / HDR | float → tone-mapped PNG for thumbs; float kept for viewer | `image` (EXR/HDR) |
 | AudioClip / FSB5 | **WAV/OGG** | UnityPy + `python-fsb5` (sidecar); `symphonia` for re-decode |
+| Aseprite / Krita / Paint.NET (`.aseprite`/`.kra`/`.pdn`) | PNG composite + **frame data** | zip-based parse → embedded composite; frames → spritesheet/animation |
+| `.blend` (Blender) | glTF/GLB + embedded thumbnail | read the embedded preview; Blender headless export when full geometry is needed |
+| Fonts (`.ttf`/`.otf`/`.woff`) | **glyph-sheet PNG** | rasterize a specimen (`ab_glyph`/`fontdue`) |
+| MaterialX (`.mtlx`) / `.mat` / PBR map set | **material** (sphere preview) | parse the map set; render on a lit sphere |
 
 **Normalize-to-glTF on import** is the load-bearing decision for 3D: it decouples the renderer and
 thumbnailer from format hell (FBX is proprietary) and is identical across all viewers.
@@ -205,8 +209,26 @@ All three previews share the single **wgpu** device used by the egui UI.
 - **Decode**: `image` (PNG/JPG/TGA/BMP/GIF/WebP/TIFF/DDS/HDR/EXR) + `image_dds` (BCn) + `psd`.
 - **Display**: upload to a GPU texture; let the GPU handle large images, mip selection, min/mag
   filtering. Tone-mapping/exposure control for float EXR/HDR. Channel toggles for normal/roughness/alpha.
+- **Pixel-art aware**: auto-detect pixel art (small dimensions + low unique-color count) and render
+  **nearest-neighbor** (no blur), with a manual NN/linear toggle.
 - **Material grouping**: detect PBR map sets by filename (`_n`/`_normal`, `_rough`, `_orm`, …) and
   hue heuristics; present albedo + maps as one "material" asset.
+
+---
+
+### 2D sprites & animation
+- **Spritesheets / Aseprite**: detect frames (grid slicing, or `.aseprite`/`.kra` frame data) and
+  **play the animation inline** (play/pause, FPS, frame scrubber) — the audio transport, for frames.
+- **Pixel-perfect**: nearest-neighbor rendering (see Images) keeps pixel art crisp at any zoom.
+
+### Materials
+- Group a PBR map set (albedo/normal/roughness/metallic/AO/ORM, MaterialX `.mtlx`) and **render it on a
+  lit 3D sphere** in the shared wgpu viewport (reuses the `three-d` renderer) — far more useful than
+  flat map thumbnails. The sphere render doubles as the material's thumbnail.
+
+### Fonts
+- Render a **glyph specimen sheet** (alphabet + a sample string at a few sizes) as preview and
+  thumbnail; capture basic metrics (style, weight) as stats/tags.
 
 ---
 

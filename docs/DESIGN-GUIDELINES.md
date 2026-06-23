@@ -154,7 +154,9 @@ Line-height: 1.45 body, 1.2 headings. Weight: 400 body, 500 labels, 600 headings
 | `ls-search-tags` | Search by Tags | | `ls-tag-add` | Add/edit tag |
 | `ls-filter` | Filters/facets | | `ls-dependency` | Dependency link |
 | `ls-stage` | Staging tray / shortlist | | `ls-non-content` | Non-content (tool/script) |
-| `ls-project` | Registered Unity project | | | |
+| `ls-project` | Registered Unity project | | `ls-type-font` | Fonts |
+| `ls-type-material` | Material (sphere) | | `ls-variants` | Variant group (collapsed) |
+| `ls-color` | Color search / swatch | | `ls-similar` | Find similar (more like this) |
 
 ---
 
@@ -256,6 +258,18 @@ silent duplicate. Pair the color with the icon (never color-only, per §9).
 The active registered Unity project shows as a small **`ls-project` chip** in the top bar (next to the
 AI-profile chip) — name + a connected/stale dot. Stale (editor closed) dims it and disables "into
 project" actions, which then fall back to **Export to folder**.
+
+### Variants, color & 2D previews
+- **Variant tile** — a collapsed group renders as a *stacked* tile (`ls-variants`) with a count badge;
+  click to fan out members. Reuses the card; the stack edge uses `--ls-border-strong`.
+- **Color-coded tags** — chips may carry a `tag.color`; nested groups indent under a parent. Keep AA
+  contrast on the label regardless of chip color.
+- **Color search** — a row of dominant-color swatches in the filter sidebar; selecting one filters by
+  `dominant_color` proximity. Pair each swatch with a hex label (never color-only).
+- **Animated sprite preview** — play/pause + FPS + frame scrubber (mirrors the audio transport);
+  **pixel-perfect** (nearest-neighbor) by default for pixel art.
+- **Material sphere** — preview PBR/MaterialX map sets on a lit sphere in the shared viewport.
+- **Font specimen** — alphabet + a sample string at a few sizes as preview/thumbnail.
 
 ### Jobs / progress
 Identification, ingestion, exports, **and imports** show as a **job tray** (bottom) with per-job

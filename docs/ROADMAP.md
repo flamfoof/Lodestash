@@ -28,6 +28,8 @@ Principle: **the search/retrieve loop must work end-to-end before polishing any 
 - Image/texture viewer: `image` + `image_dds` (BCn) + `psd`; HDR/EXR tone-map; channel toggles.
 - Offscreen 3D thumbnail render-to-texture; audio waveform thumbnails.
 - Metadata extraction (tris/verts/materials/bones; dims/colorspace; duration/rate).
+- **2D / material / font previews**: animated sprite + spritesheet playback; **pixel-perfect**
+  (nearest-neighbor) rendering; **material sphere** preview; **font** glyph-sheet.
 
 **Exit criteria:** view models, play audio, view images/textures — all from the grid.
 
@@ -47,6 +49,8 @@ Principle: **the search/retrieve loop must work end-to-end before polishing any 
   `Texture2D`/`Mesh`/`AudioClip` blobs; `texture2ddecoder`/`decrunch` decode; `fsb5` audio.
 - Routing: raw source → direct loader; Unity-native/bundle → sidecar.
 - Dedup (BLAKE3 exact groups; pHash/Chromaprint near-dup review queue); move/rename detection.
+- **Broader source formats**: Aseprite/Krita/PSD/Paint.NET (2D), `.blend`, fonts, MaterialX — see
+  [`INGESTION.md`](INGESTION.md) §4.
 
 **Exit criteria:** auto-discover the Asset Store download cache, browse the owned library, and
 **selectively unpack one or many packages**; import a standalone `.unitypackage` / folder too; assets
@@ -61,6 +65,8 @@ viewable + deduped, with imported Unity labels already searchable.
 - Local embeddings via **`ort`** (SigLIP 2 image; multiview→SigLIP 3D; CLAP audio); `vec_asset`
   (sqlite-vec) with the `VectorIndex` seam.
 - Hybrid search: pre-filter → BM25 ⊕ vector KNN → **RRF**; semantic toggle in the search bar.
+- **Variants** (collapse near-duplicate assets into one tile) and **color search** (`dominant_color`)
+  as additional facets.
 - Background embed jobs keyed by `content_hash + model + version`; `embedding_dirty` flow.
 
 **Exit criteria:** keyword + tag-filter + natural-language semantic search all return good results on
@@ -74,7 +80,8 @@ a 10k+ library.
 - `Tagger`/`Embedder` traits; **local** taggers (WD v3 image; YAMNet/PANNs + CLAP audio; Whisper
   speech; Ollama VLM captions) and the **API** tagger (Claude vision, JSON-schema, Batches + caching).
 - Per-modality `local | api` config; embeddings stay local.
-- Tag normalization + confidence thresholds; editable confidence chips with accept/reject logging.
+- Tag normalization + confidence thresholds; editable confidence chips with accept/reject logging;
+  **color-coded / nested tags** (`tag.color` / `tag.parent_id`).
 - **Mapping library**: taxonomy/category/alias/rule schema + apply engine + pinned overrides + re-map;
   category as a search facet. Ship a starter taxonomy (Environment/Props/Characters/SFX/Music/…).
 
@@ -108,7 +115,15 @@ dup-guarded.
 
 ---
 
-## Phase 6 — Unreal & polish (Unreal is best-effort + refinement)
+## Phase 6 — More engines & polish (Godot + Unreal — both best-effort, priority TBD)
+
+> Godot and Unreal are **co-equal later-phase** targets; final ordering decided then (Godot suits the
+> indie/2D audience, Unreal the AAA one). Both are thin REST clients over the same engine API
+> ([`ENGINE-API.md`](ENGINE-API.md)).
+
+- **Godot ingestion + plugin**: parse `.tres`/`.tscn`/`.res`, walk the resource graph for the
+  dependency closure, and import via an EditorPlugin dock (drag-drop into the FileSystem with folder
+  reconstruction).
 - **Unreal ingestion**: CUE4Parse sidecar for `.pak`/IoStore extraction (best-effort; AES/`.usmap` are
   the user's responsibility).
 - **Unreal editor plugin**: Slate tab (browse+import into `/Content`).
@@ -117,6 +132,33 @@ dup-guarded.
 - Optional **OpenShape** native-3D similarity (Python sidecar) for shape search.
 - Cross-encoder rerank toggle; LanceDB swap if a library exceeds ~500k–1M vectors.
 - Packaging/installer; auto-update; first-run model download/management.
+
+---
+
+## Phase 7 — Power features & insights (backlog)
+
+Higher-leverage features that build directly on the architecture already in place:
+
+- **"More like this" / example search** — one-click similar assets via cosine over `vec_asset`; **drag
+  an external image/audio/model in** → embed → find owned assets like it. (Reuses the `VectorIndex`.)
+- **Auto-collections & tag propagation** — cluster embeddings to *propose* collections; propagate a
+  Confirmed exemplar's tags to nearby Unidentified assets. (embeddings + collections + `asset_tag`.)
+- **Credits / attribution export** — generate a `CREDITS.md` for a project from `import_record` +
+  `license`/`attribution`, so shipping with bought assets stays compliant. (Builds on the engine
+  round-trip + license model.)
+- **Project asset audit (reverse sync)** — scan an open Unity project, match assets back to the catalog
+  by GUID/hash, and report **used / unused / source pack / license / in-project duplicates**. (Unity
+  plugin + `import_record` + hashes; a new REST/MCP op.)
+- **Batch operations** — multi-select batch tag / map / identify / export / import / stage, through the
+  job engine.
+- **Command palette (Ctrl-K) + keyboard-first** — fast search/nav/actions for a dense power tool.
+- **Library insights dashboard** — a home view: % Identified, untagged, duplicates, **unlicensed**,
+  by-type, largest packs, "where used" — extends the design's library-health meter.
+- **In-app model manager** — download/manage local AI models by GPU tier from within the app (see
+  [`AI-MODELS-BY-GPU.md`](AI-MODELS-BY-GPU.md)).
+- **Pack update diff** — when a pack's `content_hash` changes, show added/removed/modified assets.
+- **Catalog snapshot** — export/import the SQLite catalog (not the assets) for backup or to share a
+  taxonomy / mapping library.
 
 ---
 
@@ -137,7 +179,7 @@ dup-guarded.
 | Image tags | **WD v3** (ONNX) | Ollama VLM captions; Claude vision (API) |
 | MCP | **rmcp** (stdio) | optional Streamable HTTP |
 | Engine API | loopback **HTTP/JSON** (token) | — |
-| Plugins | **Unity UPM C#** (primary); Unreal C++/Python (planned) | thin REST clients |
+| Plugins | **Unity UPM C#** (primary); Godot + Unreal (planned, co-equal) | thin REST clients |
 
 ---
 
