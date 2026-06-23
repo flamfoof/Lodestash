@@ -87,6 +87,12 @@ editor needed); **`/v1/import`** routes into the **currently open** Unity projec
 in-editor import (§5). Both reuse the **same dependency-closure resolution** described in
 [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md) §3.
 
+> **Parity scope.** "1:1" covers the **agent-facing** surface. A few routes are **REST-only by
+> design** — `GET /v1/assets/{id}/file` (the MCP `resource_link` target) and the plugin-transport
+> endpoints `GET /v1/import-queue` + `POST /v1/import-queue/{req}/ack` (§5.3) — because they are
+> plugin↔core plumbing, not operations an LLM should call. No *agent* operation is missing from
+> either plane.
+
 ---
 
 ## 3. Canonical entity shapes (defined here, referenced by MCP)
@@ -143,7 +149,8 @@ than redefining, so summaries/details never diverge.
 
   Common codes: `unauthorized` (401), `forbidden_origin` (403), `not_found` (404),
   `path_traversal` (400), `project_not_registered` (409), `editor_unavailable` (409),
-  `already_imported` (409, advisory — see §5), `job_failed` (500).
+  `job_failed` (500). **`already_imported` is advisory, not an error** — it is a field in the `200`
+  body of `/v1/import` (§5.4), letting callers warn before duplicating rather than fail.
 - **Server-side guards (never trust the client):** validate and **sandbox** every write path
   (`/v1/export`, `/v1/import`, `apply_mapping`) against traversal; **confirm mutating ops
   server-side**; rate-limit. Mirrors [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md) §5.

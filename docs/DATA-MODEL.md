@@ -39,7 +39,7 @@ CREATE TABLE import_source (
   uuid            TEXT NOT NULL UNIQUE,
   name            TEXT NOT NULL,
   root_path       TEXT NOT NULL,
-  kind            TEXT NOT NULL,          -- 'folder' | 'unitypackage' | 'bundle' | 'unreal_pak' (planned) | ...
+  kind            TEXT NOT NULL,          -- 'folder' | 'asset_store_library' | 'unitypackage' | 'bundle' | 'unreal_pak' (planned) | ...
   last_scanned_at INTEGER,
   watch_enabled   INTEGER NOT NULL DEFAULT 1
 );
