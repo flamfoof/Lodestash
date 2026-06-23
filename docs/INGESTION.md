@@ -81,6 +81,25 @@ Selecting one or multiple packages enqueues a **batch unpack+ingest** job (via t
   captured into `package.license`/`attribution`/`license_url`. This is surfaced on every export/import
   so credits for bought assets travel with them (an individual asset can override its pack's license).
 
+### Archive handling & memory model
+A `.unitypackage` is **gzip+tar** — a *sequential* stream with **no central index**, so you can't seek
+to a single entry; reaching any entry means decompressing from the start. Lodestash therefore
+**streams, never loads the whole archive into memory**:
+- **Browse** = one light streaming pass reading only the small entries (`pathname`, `asset.meta`,
+  `preview.png`), skipping the big `asset` payloads, to build a **manifest** cached in the catalog — so
+  listing a pack's contents is instant thereafter, at O(1) memory.
+- **Open/ingest** = a single streaming pass (gzip-decode → tar-walk) that extracts the package **once**
+  into a content-addressed, LRU/size-capped **workspace** on disk (evict + re-extract on demand,
+  idempotent by hash). One full pass beats N partial re-opens, since late entries require streaming the
+  whole gzip anyway.
+- **After ingest the `.unitypackage` is never reopened**: previews come from the normalized/derived
+  caches (thumbnails, mesh→`.glb`, texture→PNG, audio→WAV), and viewing **lazy-loads just the one
+  file** (mmap/stream) then releases it — so even multi-GB packs stay light, and *every sibling asset
+  in the same pack is random-access on disk* (no re-streaming, no whole-pack-in-RAM).
+- **Container nuance:** this sequential constraint is specific to tar.gz (`.unitypackage`). **Zip**
+  sources (e.g. some Humble bundles) carry a central directory → true per-file random access, so those
+  lazy-extract individual files without a full scan. The pipeline picks the strategy per container.
+
 ### Non-destructive & live
 - **Never modify the cache.** Lodestash extracts into its own managed workspace (or reads in place) and
   references originals; the Asset Store cache is read-only to us.
