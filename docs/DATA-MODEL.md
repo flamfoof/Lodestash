@@ -39,7 +39,7 @@ CREATE TABLE import_source (
   uuid            TEXT NOT NULL UNIQUE,
   name            TEXT NOT NULL,
   root_path       TEXT NOT NULL,
-  kind            TEXT NOT NULL,          -- 'folder' | 'unitypackage' | 'bundle' | 'unreal_pak' (planned) | ...
+  kind            TEXT NOT NULL,          -- 'folder' | 'asset_store_library' | 'unitypackage' | 'bundle' | 'unreal_pak' (planned) | ...
   last_scanned_at INTEGER,
   watch_enabled   INTEGER NOT NULL DEFAULT 1
 );
@@ -120,8 +120,11 @@ CREATE TABLE collection (
   name       TEXT NOT NULL,
   parent_id  INTEGER REFERENCES collection(id),
   is_smart   INTEGER NOT NULL DEFAULT 0,  -- saved-search collection
+  is_staging INTEGER NOT NULL DEFAULT 0,  -- the shared shortlist / staging tray (§9); exactly one row
   query_json TEXT
 );
+-- Enforce a single staging collection (the shared shortlist across GUI / MCP / Unity panel).
+CREATE UNIQUE INDEX idx_collection_staging ON collection(is_staging) WHERE is_staging=1;
 CREATE TABLE collection_asset (
   collection_id INTEGER NOT NULL REFERENCES collection(id) ON DELETE CASCADE,
   asset_id      INTEGER NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
@@ -322,6 +325,9 @@ CREATE TABLE package (
   content_hash  TEXT,                   -- BLAKE3 of the .unitypackage (update detection)
   asset_count   INTEGER,                -- filled after unpack (0/NULL = browsed but not yet ingested)
   unpacked_at   INTEGER,
+  license       TEXT,                   -- e.g. 'Unity Asset Store EULA', 'CC-BY-4.0' (harvested at ingest)
+  attribution   TEXT,                   -- required credit string, when applicable
+  license_url   TEXT,                   -- link to the license/EULA
   UNIQUE(source_id, package_path)
 );
 ALTER TABLE asset ADD COLUMN package_id INTEGER REFERENCES package(id);
@@ -331,6 +337,10 @@ CREATE INDEX idx_package_source ON package(source_id);
 
 - **Browse-only** populates `package` rows (publisher/category/name/version/path) **without** unpacking;
   `asset_count`/`unpacked_at` stay null until the user ingests that pack.
+- **License/attribution** is harvested at ingest (cache tree + any embedded pack metadata; see
+  [`INGESTION.md`](INGESTION.md) §2) into `license`/`attribution`/`license_url`, then **surfaced on
+  export/import** so shipping with bought assets stays traceable. An individual asset may override the
+  pack's license (see `asset.license_*` below).
 - **`package` is another search facet** (and a grid hierarchy: Publisher → Category → Package).
 - **Update detection**: re-compare the `.unitypackage` `content_hash`; on change, re-ingest and
   reconcile that package's `asset` rows (non-destructive — preserves manual tags/mappings on unchanged
@@ -358,3 +368,60 @@ backlog. **Recommended user-facing terms: Identified vs Unidentified** (alternat
   whittle a freshly-imported 10k-asset pile down into a searchable library.
 - `status` is just another filter ("everything still **Unidentified** in **Sounds**" is one click).
   Re-running AI (e.g. after a model upgrade) cycles an asset back through `identified`.
+
+---
+
+## 9. Projects, imports & staging
+
+The state behind the engine round-trip ([`ENGINE-API.md`](ENGINE-API.md) §5,
+[`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md) §3): *which* editors are open, *what* has been imported
+where (provenance + dup-guard), and the shared shortlist.
+
+```sql
+-- ---------- Registered Unity projects (open editors) ----------
+CREATE TABLE project (
+  id            INTEGER PRIMARY KEY,
+  uuid          TEXT NOT NULL UNIQUE,
+  name          TEXT NOT NULL,            -- last path segment, or user label
+  project_path  TEXT NOT NULL UNIQUE,     -- absolute path to the Unity project root
+  unity_version TEXT,
+  last_seen_at  INTEGER,                  -- heartbeat; stale ⇒ editor considered closed
+  is_active     INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX idx_project_active ON project(is_active) WHERE is_active=1;
+
+-- ---------- Import provenance (durable result of an import) ----------
+CREATE TABLE import_record (
+  id                INTEGER PRIMARY KEY,
+  asset_id          INTEGER NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+  project_id        INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+  source_package_id INTEGER REFERENCES package(id),  -- where it came from
+  dest_path         TEXT NOT NULL,        -- in-project path, e.g. 'Assets/Wildlife/Beaver.fbx'
+  unity_guid        TEXT,                 -- GUID Unity assigned on import
+  with_deps         INTEGER NOT NULL DEFAULT 1,
+  imported_at       INTEGER NOT NULL,
+  UNIQUE(asset_id, project_id)            -- dup-guard key ("already imported?")
+);
+CREATE INDEX idx_import_project ON import_record(project_id);
+CREATE INDEX idx_import_asset   ON import_record(asset_id);
+
+-- ---------- Per-asset license override (optional; falls back to package) ----------
+ALTER TABLE asset ADD COLUMN license     TEXT;   -- overrides package.license when set
+ALTER TABLE asset ADD COLUMN attribution TEXT;
+ALTER TABLE asset ADD COLUMN license_url TEXT;
+```
+
+- **`project`** powers "import **into Unity**" targeting and the active-project facet. The Unity plugin
+  upserts its row on panel open (`register_project`) and heartbeats `last_seen_at`; the import flow
+  targets `is_active=1` when no `project_id` is given.
+- **`import_record`** is the **durable** outcome of an import (the import *queue* itself is transient,
+  job-engine backed — only this result persists). The `UNIQUE(asset_id, project_id)` key is the
+  **dup-guard**: before enqueuing, the core checks it and, if the `dest_path` still resolves, surfaces
+  "already imported — re-import?" instead of silently duplicating. It also answers "where did this
+  asset come from / where is it used," shown as `imported_in` in `AssetDetail`.
+- **Staging** reuses the existing `collection` machinery: the single `is_staging=1` row (§collections)
+  *is* the shared shortlist; `collection_asset` holds its members. No new table — so an item Claude
+  stages over MCP appears in the GUI tray and Unity panel at once.
+- **License** resolves **asset → package**: an asset's effective license is `asset.license` when set,
+  else `package.license`. Surfaced on the detail stat block and on every export/import so credits
+  travel with the asset.

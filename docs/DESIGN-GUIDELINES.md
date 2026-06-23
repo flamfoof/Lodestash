@@ -153,7 +153,8 @@ Line-height: 1.45 body, 1.2 headings. Weight: 400 body, 500 labels, 600 headings
 | `ls-search-ai` | Search with AI | | `ls-play` / `ls-pause` | Audio transport |
 | `ls-search-tags` | Search by Tags | | `ls-tag-add` | Add/edit tag |
 | `ls-filter` | Filters/facets | | `ls-dependency` | Dependency link |
-| | | | `ls-non-content` | Non-content (tool/script) |
+| `ls-stage` | Staging tray / shortlist | | `ls-non-content` | Non-content (tool/script) |
+| `ls-project` | Registered Unity project | | | |
 
 ---
 
@@ -220,7 +221,11 @@ Split: preview (3D viewport / audio player+waveform / image viewer) over a **sta
 - **Stats grid** (2-col, tabular): format, dimensions/tris/verts/materials/bones (3D); resolution/
   channels/color space (image); duration/sample-rate/channels (audio); file size; source package.
 - **Traits:** tag chips with confidence; AI vs manual vs imported distinguished (see chips).
-- **Actions:** Import (with dependency count), Add to collection, Re-identify, Edit tags.
+- **Provenance & license:** a quiet footer line — **source pack(s)**, a **license/attribution** value
+  (`ls-non-content`-muted style, never shouty), and any **"imported in <project> → <path>"** records.
+- **Actions:** **Stage** (`ls-stage`), Import (`ls-import`, with dependency count), Add to collection,
+  Re-identify, Edit tags. If the asset is already imported into the active project, the Import button
+  shows an **"already imported"** state (see badge below) and asks before duplicating.
 
 ### Tag / trait chips
 Pill, `--r-pill`, 11–12px. Provenance + confidence encoded:
@@ -233,9 +238,29 @@ Pill, `--r-pill`, 11–12px. Provenance + confidence encoded:
 Two-pane: raw tags (left) → canonical categories tree (right), with rules between. Drag to alias;
 rules list with priority. Pinned (manual) assignments get a small lock.
 
+### Staging tray (the shortlist)
+A **collect-then-import** dock (`ls-stage`), pinned to the right edge or above the job tray. Holds the
+shared shortlist — items you (or Claude over MCP) stage while browsing; the **same tray appears in the
+GUI and the Unity panel**. Compact thumbnail strip with a count badge, a **target project** selector
+(`ls-project`, defaults to the active editor), a **dest subfolder** field, and a primary **Import all**
+(`ls-import`) action. Empty state: "Stage candidates as you browse, then import the keepers together."
+Use `--ls-gold` for its accent (it's an action surface, not an AI one).
+
+### "Already imported" badge
+When an asset already has an `import_record` for the active project, mark it with a small **`ls-import`
+check badge** in `--ls-success` on the card/row and an inline "in <project>" note in the stat block.
+On Import, this turns the action into a confirm ("Re-import? It's already in Assets/…") — never a
+silent duplicate. Pair the color with the icon (never color-only, per §9).
+
+### Project chip
+The active registered Unity project shows as a small **`ls-project` chip** in the top bar (next to the
+AI-profile chip) — name + a connected/stale dot. Stale (editor closed) dims it and disables "into
+project" actions, which then fall back to **Export to folder**.
+
 ### Jobs / progress
-Identification, ingestion, exports show as a **job tray** (bottom) with per-job progress + an aggregate
-header meter. Use `--ls-arcane` for AI jobs, `--ls-gold` for ingest/IO.
+Identification, ingestion, exports, **and imports** show as a **job tray** (bottom) with per-job
+progress + an aggregate header meter. Use `--ls-arcane` for AI jobs, `--ls-gold` for ingest/IO and
+import.
 
 ### Feedback
 - **Toasts** bottom-right, `--ls-overlay`, 1px accent left-border by type (success/warn/danger/info).

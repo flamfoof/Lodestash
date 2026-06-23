@@ -45,11 +45,22 @@ publisher/category/package tree:
 | **macOS** | `~/Library/Unity/Asset Store-5.x` |
 | **Linux** | `~/.local/share/unity3d/Asset Store-5.x` |
 
-The location is **user-relocatable**, so discovery checks, in order:
-1. The **`ASSETSTORE_CACHE_PATH`** environment variable (Unity's override).
+The location is **user-relocatable**, so on first run Lodestash **auto-detects** candidate roots in
+this order, then lets you confirm / add / remove them:
+1. The **`ASSETSTORE_CACHE_PATH`** environment variable (Unity's override), if set.
 2. The default per-OS path above.
-3. A path the user points at manually (Package Manager → Preferences → My Assets → Cache Location can
-   move it — honor a custom root).
+3. Any roots you **add manually** — e.g. the cache was moved to another drive (Package Manager →
+   Preferences → My Assets → Cache Location), or you keep per-Unity-version / legacy caches.
+
+**Multiple roots are supported.** Each confirmed root is its own `import_source` of kind
+`asset_store_library` (see [`DATA-MODEL.md`](DATA-MODEL.md) §2), so several caches (current +
+relocated + leftover) all feed one searchable library.
+
+**First-run flow & validation.** On launch Lodestash probes the candidates and **validates** each
+looks like a real cache — an `Asset Store-5.x/<Publisher>/<Category>/…` tree — before offering it, so a
+wrong pick is caught early. If none are found (or you decline), an empty state prompts **"Add Asset
+Store cache folder…"** with a browse dialog that runs the same validation and warns if the chosen
+folder doesn't match the expected layout.
 
 ### Browse without unpacking (cheap)
 The folder tree already encodes **Publisher / Category / Package name** for free. Enumerate it to
@@ -65,6 +76,10 @@ Selecting one or multiple packages enqueues a **batch unpack+ingest** job (via t
 - Route raw FBX/PNG/WAV to direct loaders; Unity-native blobs to the UnityPy sidecar.
 - Ingest assets into the catalog **linked back to their origin `package`** (publisher/category/version)
   so you can filter/search "everything from pack X." See [`DATA-MODEL.md`](DATA-MODEL.md) §7.
+- **Harvest license/attribution** while ingesting a pack: the publisher comes free from the cache tree
+  (`<Publisher>/`), and any `LICENSE`/`README`/`Third-Party Notices` text or embedded pack metadata is
+  captured into `package.license`/`attribution`/`license_url`. This is surfaced on every export/import
+  so credits for bought assets travel with them (an individual asset can override its pack's license).
 
 ### Non-destructive & live
 - **Never modify the cache.** Lodestash extracts into its own managed workspace (or reads in place) and

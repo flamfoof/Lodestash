@@ -42,6 +42,7 @@ Principle: **the search/retrieve loop must work end-to-end before polishing any 
   (`ASSETSTORE_CACHE_PATH` → per-OS default → custom root), browse the full owned library by
   publisher/category **without unpacking**, and **unpack + ingest one or many packages on demand**
   (batch job); model each as a `package`, link assets to it, watch the cache for new downloads.
+  **Harvest license/attribution** (cache tree + embedded pack metadata) into the `package` row.
 - **Python sidecar (UnityPy)**: bundle + spawn-on-demand for compiled bundles / native
   `Texture2D`/`Mesh`/`AudioClip` blobs; `texture2ddecoder`/`decrunch` decode; `fsb5` audio.
 - Routing: raw source → direct loader; Unity-native/bundle → sidecar.
@@ -83,18 +84,27 @@ filter/search by category.
 ---
 
 ## Phase 5 — MCP & Unity retrieval (use it in the engine)
-**Goal:** pull assets into Unity and via AI.
+**Goal:** pull assets into Unity and via AI — the closed round-trip.
 
-- Loopback **HTTP/JSON API** (`/v1/`, 127.0.0.1 + per-session token) over `lodestash-core`.
+- Loopback **HTTP/JSON API** (`/v1/`, 127.0.0.1 + token via handshake file) over `lodestash-core` — the
+  full contract in [`ENGINE-API.md`](ENGINE-API.md); endpoints **1:1 with the MCP surface**.
 - **MCP server** (`rmcp`, stdio): the §2 surface in [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md);
   previews as `image` blocks + `resource_link`s; `export_asset` with sandboxed paths; `get_job_status`.
-- **Unity plugin** (UPM C# `EditorWindow`): browse over REST, import into `Assets/` via
-  `AssetDatabase`.
+- **Project registration + import queue**: `register_project`, `import_to_project`, and the long-poll
+  `import-queue` the plugin drains on Unity's **main thread**, acking the in-project path+GUID →
+  **`import_record`** provenance + **dup-guard** ("already imported?").
+- **Staging shortlist** shared across GUI / MCP / panel (`stage_asset` / `import_staged`; the
+  `is_staging` collection).
+- **Unity plugin** (UPM C# `EditorWindow`): read the handshake file, register the project, browse over
+  REST, import into `Assets/` via `AssetDatabase`; surface license/attribution and "already imported".
+- **Unity-side MCP-client** path documented (Claude Code in the project folder drives `import_to_project`).
 - Job system for long ops; surface versioning + `get_server_info`.
 - *(Unreal plugin is deferred to Phase 6.)*
 
-**Exit criteria:** from Claude/Claude Code, search the catalog and export an asset; from the Unity
-editor window, browse and import an asset into the open Unity project.
+**Exit criteria:** from Claude/Claude Code, search the catalog and **import an asset into the open
+Unity project** via `import_to_project` (with `export_asset` fallback when no editor is registered);
+from the Unity editor window, browse, stage, and import — with provenance recorded and re-imports
+dup-guarded.
 
 ---
 
@@ -152,6 +162,8 @@ editor window, browse and import an asset into the open Unity project.
 
 A user can: add their folders and `.unitypackage`/Asset-Store packs → view models, play audio, view
 textures → search by keyword, tag-filter, and natural language → auto-tag locally (or via Claude) and
-map onto a clean taxonomy → and **pull a chosen asset into an open Unity project**, both from the
-desktop UI and from Claude via MCP — entirely on their own PC. (Unreal support is a later-phase
-addition; v1 is Unity-focused.)
+map onto a clean taxonomy → **stage candidates** → and **pull a chosen asset into an open Unity
+project** — both from the desktop UI and from Claude via MCP (`import_to_project`, landing in the open
+editor via the import queue), with **provenance recorded, re-imports dup-guarded, and
+license/attribution surfaced** — entirely on their own PC. (Unreal support is a later-phase addition;
+v1 is Unity-focused.)

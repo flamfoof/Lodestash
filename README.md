@@ -45,10 +45,17 @@ design decision in this spec.
 - **Apply a "mapping library"**: a user-defined taxonomy that maps messy raw/AI tags onto a clean
   canonical project vocabulary (Environment / Props / Characters / SFX / Music / …).
 - **MCP server** so Claude, Claude Code, Cursor, and other AI clients can search the catalog and
-  retrieve assets directly.
+  retrieve assets directly — **including importing into your open Unity project** (`import_to_project`),
+  not just exporting to a path.
 - **Selective engine import**: a **Unity editor plugin** that browses the catalog and imports
   **only the asset(s) you pick — plus their dependencies — never the whole package**, pulling from
   many libraries at once. (An Unreal plugin is planned for a later phase.)
+- **Stage, then import**: a shared **shortlist/staging tray** to collect candidates across the GUI,
+  MCP, and the Unity panel and import the picks together.
+- **Import provenance & dup-guard**: Lodestash remembers which asset went into which project (path +
+  GUID), so it warns "already imported" instead of duplicating, and shows where an asset is used.
+- **License & attribution** captured per pack/asset and surfaced on every import/export, so shipping
+  with bought assets stays traceable.
 
 ---
 
@@ -87,7 +94,8 @@ alternatives (Tauri+three.js, pure-Python/PySide6).
 | Image tags | **WD v3** taggers (ONNX) |
 | Dedup | **BLAKE3** (exact) + pHash/blockhash + Chromaprint (near-dup) |
 | MCP server | **rmcp** (Rust), in-process, stdio default |
-| Engine API | loopback **HTTP/JSON** (127.0.0.1 + token) |
+| Engine API | loopback **HTTP/JSON** (127.0.0.1 + token); 1:1 with the MCP surface — see [`docs/ENGINE-API.md`](docs/ENGINE-API.md) |
+| Unity round-trip | shared **import queue**: GUI/Claude enqueue → plugin imports on Unity's main thread → acks provenance |
 | Engine plugins | **Unity** (UPM C# `EditorWindow`) — primary; Unreal (C++/Python Slate) — planned |
 
 ---
@@ -103,7 +111,8 @@ alternatives (Tauri+three.js, pure-Python/PySide6).
 | [`docs/AI-MODELS-BY-GPU.md`](docs/AI-MODELS-BY-GPU.md) | **User guide:** which local AI models to run per GPU VRAM tier (CPU / 4 / 6 / 8 / 12 / 16 / 24 GB / cloud) |
 | [`docs/DESIGN-GUIDELINES.md`](docs/DESIGN-GUIDELINES.md) | **Design system** for devs & designers — dark-mode JRPG theme, tokens, components, icons (+ live [`design/style-guide.html`](docs/design/style-guide.html), [`design/icons.svg`](docs/design/icons.svg)) |
 | [`docs/DATA-MODEL.md`](docs/DATA-MODEL.md) | SQLite schema, hybrid search, the mapping library, dedup |
-| [`docs/MCP-AND-ENGINES.md`](docs/MCP-AND-ENGINES.md) | MCP surface + Unity (primary) / Unreal (planned) / Claude integration |
+| [`docs/MCP-AND-ENGINES.md`](docs/MCP-AND-ENGINES.md) | MCP surface, the closed Unity import round-trip, Unity-side MCP-client topology, Unreal (planned) |
+| [`docs/ENGINE-API.md`](docs/ENGINE-API.md) | **The interface layer:** loopback HTTP/JSON contract — endpoints (1:1 with MCP), token handshake, project registration & import queue, staging |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Phased build plan, milestones, risks |
 
 ---
@@ -114,5 +123,5 @@ alternatives (Tauri+three.js, pure-Python/PySide6).
 2. **Local-first & private.** Fully functional offline; cloud AI is strictly opt-in.
 3. **Non-destructive.** Original asset files are never modified or moved; the catalog only references them.
 4. **Prefer source files.** Use the raw FBX/PNG/WAV inside packages directly; deep-parse only when there is no source.
-5. **One core, many frontends.** GUI, MCP server, and engine REST API are thin presentations over one shared service layer.
+5. **One core, many frontends.** GUI, MCP server, and engine REST API are thin presentations over one shared service layer — the MCP tools and REST endpoints are **1:1** ([`docs/ENGINE-API.md`](docs/ENGINE-API.md)), so the AI and the Unity plugin reach the *same* operations and meet at one shared import queue.
 6. **Swappable intelligence.** Local model ↔ cloud API is a config switch behind a stable interface.
