@@ -282,6 +282,68 @@ import.
   run Identify").
 - **Destructive confirms** are modals with a danger accent; never a bare toast.
 
+### Selection & context menu
+- **Multi-select:** click selects; Ctrl/Cmd-click toggles; Shift-click range; marquee drag selects;
+  Ctrl/Cmd-A selects all within the current filter. Selected cards get a 2px `--ls-gold` border + a
+  check overlay (top-left); a selection count shows in the top bar. Bulk actions operate on the set.
+- **Right-click context menu** (`--ls-overlay`, §4 elevation 2): Open, **Quick Look** (Space),
+  **Reveal in Explorer/Finder**, **Open with default app**, **Copy path**, Stage, Import…, Add to
+  collection, Edit tags, Re-identify, Find similar, **Move to Trash**. Engine actions gray out (with a
+  tooltip) when no project is active. The same menu serves single and multi selection.
+
+### View / sort toolbar
+A strip above the grid: a **view toggle** (grid / list / detail) · a **sort** dropdown (Name · Date
+added · Date modified · Size · Type · Status) with an asc/desc caret · a **thumbnail-size** zoom slider
+(grid only). View, sort, and zoom **persist** (app config) so a library reopens the way you left it.
+
+### Drag & drop
+- **Drag out:** drag selected asset(s) to the OS — Explorer/Finder, a DCC, or the **Unity Editor** — as
+  a native file drag of the underlying path(s). Complements `import_to_project` (drag = a manual drop;
+  the panel = a *tracked* import with provenance).
+- **Drag in:** drop files/folders onto the window to add a source and ingest (the "Open folder" path).
+  Show a full-window drop overlay with a gold dashed border.
+
+### Quick Look (preview peek)
+**Space** on the focused/selected asset opens a centered, dismissible large-preview overlay (the
+preview-pane content above, read-only) without leaving the grid; Space/Esc closes; arrow keys step to
+the next asset. Mirrors OS "quick look" muscle memory.
+
+### Trash & restore
+Soft delete (`asset.deleted_at`, [`DATA-MODEL.md`](DATA-MODEL.md) §8) surfaces as a **Trash** view in
+the sidebar. **Move to Trash** removes an asset from the catalog views (recoverable); **Restore**
+returns it. A separate, explicit **Delete file from disk** is a danger-accent modal — rare, and it
+breaks the non-destructive default, so warn clearly. Emptying Trash purges catalog rows only, never
+originals unless the on-disk delete was explicitly chosen.
+
+### Settings / Preferences
+A screen behind `ls-nav-settings`, grouped with the facet styling: **Library** (the Sources manager
+below), **Appearance** (density compact/comfortable §4, follow-OS reduced-motion), **AI** (per-modality
+local/API provider + active GPU profile, links [`AI-MODELS-BY-GPU.md`](AI-MODELS-BY-GPU.md)),
+**Storage** (thumbnail/embedding cache location + size + **Clear cache**), **Engine** (default export
+folder, loopback port/token).
+
+### Sources manager
+Manage the catalog's `import_source` roots ([`DATA-MODEL.md`](DATA-MODEL.md) §1): **Add folder / Asset
+Store cache**, **Rescan**, **toggle Watch**, **Remove from library** (keeps files), with per-source
+counts and last-scanned time, plus a recent-libraries list for quick reopen. This is the multi-library
+home that the M0 startup-restore builds toward.
+
+### Tag manager
+Curate the raw tag vocabulary ([`DATA-MODEL.md`](DATA-MODEL.md) §2): **rename**, **merge** (two tags →
+one, re-points `asset_tag`), **delete**, set `tag.color` / nesting (`parent_id`), with usage counts.
+Tag-entry fields get **autocomplete** over existing `norm_name`. Distinct from the controlled-vocabulary
+**mapping library editor** above — tags stay free-form.
+
+### Duplicate review
+Surface dedup groups (BLAKE3 exact + perceptual near-dup, [`DATA-MODEL.md`](DATA-MODEL.md) §5) as a
+**review queue**: grouped cards with the keeper highlighted and per-group **keep / merge tags / move to
+trash** — **never auto-delete**. Reachable from the sidebar with a count.
+
+### Undo / redo
+Catalog mutations — tag add/remove/confirm, collection membership, mapping apply, move-to-trash — are
+**undoable** (Ctrl/Cmd-Z / Ctrl/Cmd-Shift-Z) with a brief toast ("Removed 3 tags · Undo"). Ingest/scan
+and engine imports are **not** undoable (jobs / external side effects) — confirm those up front instead.
+
 ---
 
 ## 8. Motion
@@ -300,7 +362,8 @@ Subtle, fast, purposeful. Durations: micro 120ms, standard 200ms, reveal 360–4
   above on `--ls-surface`/`--ls-surface-raised`.
 - **Never color-only:** status, type, provenance always also carry an icon/label/shape.
 - **Focus:** visible 2px `--ls-focus` glow on every interactive element; full keyboard nav (grid is
-  arrow-navigable; `/` focuses search; mode toggle is a real segmented control).
+  arrow-navigable; **Space** = Quick Look, **Enter** = open, **Del** = move to Trash; `/` focuses
+  search; Ctrl/Cmd-click + Shift-click + Ctrl/Cmd-A select; mode toggle is a real segmented control).
 - **Hit targets:** ≥ 28px in compact, ≥ 32px comfortable.
 - **Motion/again:** reduced-motion respected; no essential info conveyed by animation alone.
 

@@ -6,7 +6,7 @@ design doc that governs it — read that doc before implementing, and update it 
 diverges.
 
 Card tags: **[P0]**–**[P7]** = roadmap phase ([`ROADMAP.md`](ROADMAP.md)) · **[spike]** = decision to
-resolve first.
+resolve first · **[QoL]** = cross-cutting browser-UX lane (M1.5), layered on Phase 1.
 
 ---
 
@@ -24,18 +24,21 @@ resolve first.
 - [x] AI-models-by-GPU guide ([`AI-MODELS-BY-GPU.md`](AI-MODELS-BY-GPU.md)) + user guide ([`USER-GUIDE.md`](USER-GUIDE.md))
 - [x] Tech stack parts list ([`TECH-STACK.md`](TECH-STACK.md))
 - [x] Private repo + design-conformance rule (`CLAUDE.md`)
+- [x] **[P0][spike]** Stack choices resolved: `ort`, `axum`, `russimp`, `fpcalc` subprocess → [`TECH-STACK.md`](TECH-STACK.md) §7
+- [x] **[P0]** Cargo workspace + crate skeletons (`lodestash-core/ingest/ai/mcp/api/ui/cli`) + `rust-toolchain.toml`, `rustfmt.toml`, `.clippy.toml`, CI workflow
+- [x] **[P0]** SQLite (WAL) catalog: base schema + packages + projects/imports + mapping library tables + FTS5 (`asset_fts`) + migrations (M1–M3 via `user_version`) ([`DATA-MODEL.md`](DATA-MODEL.md))
+- [x] **[P0]** Folder crawler + magic-byte detection + BLAKE3 hashing + `(size,mtime)` incremental diff ([`INGESTION.md`](INGESTION.md))
+- [x] **[P0]** Image thumbnailing → on-disk cache (keyed `content_hash`+params, Lanczos3)
 
 ---
 
 ## ▶ Ready — Phase 0: Foundations (walking skeleton)
 
-- [ ] **[P0][spike]** Resolve open stack choices: `ort` vs `candle`, `axum` vs `hyper`, Assimp vs FBX2glTF, Chromaprint binding vs `fpcalc` → update [`TECH-STACK.md`](TECH-STACK.md)
-- [ ] **[P0]** Cargo workspace + crate skeletons (`lodestash-core/ingest/ai/mcp/api/ui/cli`) + `rust-toolchain.toml`, clippy/rustfmt, CI
-- [ ] **[P0]** SQLite (WAL) catalog: base schema (`import_source`, `media_type`, `asset`, `asset_file`) + migrations ([`DATA-MODEL.md`](DATA-MODEL.md))
-- [ ] **[P0]** Folder crawler + magic-byte detection + BLAKE3 hashing + `(size,mtime)` incremental diff ([`INGESTION.md`](INGESTION.md))
-- [ ] **[P0]** egui/eframe shell on wgpu; virtualized thumbnail grid with placeholders ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md))
-- [ ] **[P0]** Image thumbnailing → on-disk cache (keyed `content_hash`+params)
-- [ ] **[P0]** Exit: point at a folder of images → searchable-by-name grid
+- [x] **[P0]** egui/eframe shell on wgpu (dark JRPG theme); responsive thumbnail grid with image textures + typed placeholders; name search ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md))
+- [x] **[P0]** Exit: point at a folder of images → searchable-by-name grid ✅ **M0 Walking Skeleton complete**
+- [x] **[P0]** Media-type category tab bar (All / 3D Models / Audio / Images / Textures / Materials / Fonts / Sprites) — in-memory filter, precursor to P3 faceted sidebar
+- [x] **[P0]** Async thumbnail loading — rayon + `std::sync::mpsc` channel; UI shows placeholders and fills in textures as they arrive; `ctx.request_repaint()` wakes frame
+- [x] **[P0]** Library persistence — `AppConfig` JSON at OS config dir; remembers last opened root and reopens it on startup; precursor to P2 full `import_source` catalog
 
 ---
 
@@ -47,6 +50,26 @@ resolve first.
 - [ ] **[P1]** Image/texture viewer: `image`+`image_dds`+`psd`; HDR/EXR tone-map; channel toggles; **pixel-perfect NN**
 - [ ] **[P1]** Animated sprite/spritesheet playback; **material sphere** preview; **font** glyph-sheet
 - [ ] **[P1]** Offscreen 3D thumbnails; audio waveform thumbnails; metadata extraction (technical facets)
+
+### Phase 1.5 — Browser QoL (M1.5)
+> Cross-cutting asset-browser UX layered on M1 — the plumbing that makes the viewer feel like a real
+> tool. Cards marked *(design exists)* are already specced in
+> [`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7/§9 (build to spec); the rest were added to §7 in the
+> same change as this lane.
+
+- [x] **[QoL]** Grid virtualization — `ScrollArea::show_rows`, build only visible rows (fixes the non-virtualized M0 grid; required at 10k–100k) ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7) *(design exists)*
+- [ ] **[QoL]** Asset detail / inspector pane — preview + stat block + traits + provenance/license + actions ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7, [`DATA-MODEL.md`](DATA-MODEL.md) §9) *(design exists)*
+- [ ] **[QoL]** Multi-select (click/Ctrl/Shift/marquee/Ctrl-A) + right-click context menu (Reveal, Open with, Copy path, Stage, Import, Tag, Trash) — the selection primitive P7 batch-ops needs ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7)
+- [x] **[QoL]** View/sort toolbar — sort (name/date/size/type ±) · thumbnail-size zoom slider; persist in config ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7)
+- [ ] **[QoL]** OS drag-out (asset → Unity/Explorer/DCC) + drag-in to ingest (drop overlay) ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7, [`INGESTION.md`](INGESTION.md) §1)
+- [ ] **[QoL]** Keyboard nav + **Quick Look** (arrows · Space=peek · Enter=open · Del=trash) ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §9)
+- [ ] **[QoL]** Activity / jobs panel — running scans/tagging/imports with progress + cancel + completion toasts (surfaces the core job engine) ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7, [`ARCHITECTURE.md`](ARCHITECTURE.md)) *(design exists)*
+- [ ] **[QoL]** Undo/redo for catalog mutations (tag/collection/mapping/trash); ingest + imports excluded ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7)
+- [ ] **[QoL]** Trash & restore — surface `asset.deleted_at`; "remove from library" vs explicit "delete from disk" ([`DATA-MODEL.md`](DATA-MODEL.md) §8, [`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7)
+- [ ] **[QoL]** Sources manager — add/remove/rescan/toggle-watch multiple `import_source` roots + recent libraries (extends M0 persistence) ([`DATA-MODEL.md`](DATA-MODEL.md) §1, [`INGESTION.md`](INGESTION.md) §2) *(`LibraryProject` + named-save persistence done; full manager UI remains)*
+- [ ] **[QoL]** Settings / Preferences — Library, Appearance (density §4), AI provider, Storage (cache location/size/clear), Engine (export path/port) ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7)
+- [ ] **[QoL]** Tag manager — rename/merge/delete library-wide + color/nesting + autocomplete ([`DATA-MODEL.md`](DATA-MODEL.md) §2)
+- [ ] **[QoL]** Duplicate-review queue — grouped keep/merge/trash, never auto-delete ([`DATA-MODEL.md`](DATA-MODEL.md) §5, [`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7)
 
 ### Phase 2 — Unity ingestion (primary input)
 - [ ] **[P2]** `.unitypackage` untar (pure Rust) + `.meta` parse (GUID/type/**labels**); archive memory model (stream-once → manifest → LRU workspace)

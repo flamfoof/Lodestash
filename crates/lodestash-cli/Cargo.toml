@@ -1,0 +1,26 @@
+[package]
+name = "lodestash-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Headless CLI (scan, index, tag) for scripting and CI"
+
+[[bin]]
+name = "lodestash-cli"
+path = "src/main.rs"
+
+[dependencies]
+lodestash-core   = { workspace = true }
+lodestash-ingest = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+thiserror        = { workspace = true }
+tracing          = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio            = { workspace = true }
+
+# Added when implementing CLI commands:
+# clap = { version = "4", features = ["derive"] }

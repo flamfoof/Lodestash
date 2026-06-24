@@ -1,0 +1,22 @@
+[package]
+name = "lodestash-api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Loopback HTTP/JSON API (/v1/) over axum — 1:1 with the MCP surface"
+
+[dependencies]
+lodestash-core = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+thiserror      = { workspace = true }
+tracing        = { workspace = true }
+tokio          = { workspace = true }
+
+# Added in Phase 5:
+# axum         = "0.8"
+# tower        = "0.5"
+# tower-http   = { version = "0.6", features = ["limit", "trace"] }

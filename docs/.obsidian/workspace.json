@@ -1,0 +1,203 @@
+{
+  "main": {
+    "id": "f24c04f5ce57deed",
+    "type": "split",
+    "children": [
+      {
+        "id": "9d21d9507f59668c",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "5a88124372de15a2",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "KANBAN.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "KANBAN"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "7841eb4a55177b53",
+    "type": "split",
+    "children": [
+      {
+        "id": "c8cf85e9068047d8",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "0ec0deaaad89c3b2",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "b2e48923cf3d90c8",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "5a0a8870c0e8a690",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "a14cd1e4a8775884",
+    "type": "split",
+    "children": [
+      {
+        "id": "7907459a15ed04c5",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "e1bbef8feaf9a223",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "KANBAN.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks for KANBAN"
+            }
+          },
+          {
+            "id": "1d4ec34e21ca194e",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "KANBAN.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links from KANBAN"
+            }
+          },
+          {
+            "id": "a56b98afb5b023d4",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "56c18a3828e8e198",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "All properties"
+            }
+          },
+          {
+            "id": "ae7c46c21f92af51",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "KANBAN.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Outline of KANBAN"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "bases:Create new base": false,
+      "obsidian-kanban:Create new board": false
+    }
+  },
+  "active": "0ec0deaaad89c3b2",
+  "lastOpenFiles": [
+    "KANBAN.md.tmp.20540.740f2d8ab80f",
+    "KANBAN.md.tmp.20540.d3690481e366",
+    "KANBAN.md.tmp.20540.c66250059ef3",
+    "ROADMAP.md.tmp.20540.006d0adf5aac",
+    "MILESTONES.md.tmp.20540.ac13201e2c38",
+    "MILESTONES.md.tmp.20540.7c35da54a615",
+    "KANBAN.md.tmp.20540.d5a93ac7c12f",
+    "KANBAN.md.tmp.20540.cc61ecfe5773",
+    "DESIGN-GUIDELINES.md.tmp.20540.332612ac5f23",
+    "DESIGN-GUIDELINES.md.tmp.20540.cce0d590819c",
+    "KANBAN.md.tmp.20540.22c915ee9701",
+    "INGESTION.md",
+    "KANBAN.md"
+  ]
+}

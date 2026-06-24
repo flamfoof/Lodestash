@@ -30,6 +30,11 @@ Principle: **the search/retrieve loop must work end-to-end before polishing any 
 - Metadata extraction (tris/verts/materials/bones; dims/colorspace; duration/rate).
 - **2D / material / font previews**: animated sprite + spritesheet playback; **pixel-perfect**
   (nearest-neighbor) rendering; **material sphere** preview; **font** glyph-sheet.
+- **Browser QoL (M1.5)** — cross-cutting asset-browser UX layered on this phase: virtualized grid,
+  detail/inspector pane, multi-select + context menu, view/sort + thumbnail-zoom, drag in/out, Quick
+  Look, jobs/activity panel, undo/redo, trash, sources manager, settings, tag manager, dup-review.
+  Tracked as the **[QoL]** lane in [`KANBAN.md`](KANBAN.md) / **M1.5** in
+  [`MILESTONES.md`](MILESTONES.md); UI specced in [`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7/§9.
 
 **Exit criteria:** view models, play audio, view images/textures — all from the grid.
 

@@ -88,11 +88,11 @@ flagged.
 
 ---
 
-## 7. Open choices to confirm during Phase 0
+## 7. Phase-0 spike decisions (resolved)
 
-- `ort` vs `candle` for the embedding/tagger runtime (ONNX breadth vs pure-Rust single binary).
-- `axum` vs raw `hyper` for the loopback API (axum's ergonomics vs minimal deps).
-- Assimp (`russimp`, C++ build dep) vs an `FBX2glTF` subprocess for FBX→glTF.
-- Chromaprint binding vs shelling to `fpcalc` for audio near-dup.
-
-These are flagged in [`KANBAN.md`](KANBAN.md) Phase 0 as spikes; resolving them updates this doc.
+| Spike | Decision | Rationale |
+|---|---|---|
+| `ort` vs `candle` | **`ort`** (ONNX Runtime) | Broadest model coverage (SigLIP 2, WD v3, CLAP, YAMNet); pre-built DirectML/CUDA/CPU EPs on Windows; no need to retrain or convert to candle format. |
+| `axum` vs `hyper` | **`axum`** | Tower middleware ecosystem (rate-limit, tracing, auth); ergonomic routing; axum is the standard for production Rust HTTP servers. |
+| Assimp vs FBX2glTF | **`russimp`** (Assimp, P1) | Handles FBX + OBJ + Collada + glTF in one C++ dep; FBX2glTF kept as optional external subprocess for edge cases where the proprietary Autodesk SDK is needed. |
+| Chromaprint vs `fpcalc` | **`fpcalc` subprocess** (P2) | Avoids C++ build complexity at P0/P1; shell to system `fpcalc` binary; binding optional later if cross-platform `fpcalc` bundling proves easier. |

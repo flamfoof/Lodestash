@@ -1,0 +1,20 @@
+[package]
+name = "lodestash-mcp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "MCP server (rmcp, stdio) — 1:1 with the loopback REST surface"
+
+[dependencies]
+lodestash-core = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+thiserror      = { workspace = true }
+tracing        = { workspace = true }
+tokio          = { workspace = true }
+
+# Added in Phase 5:
+# rmcp = "0.2"   # official Rust MCP SDK (stdio transport)

@@ -10,6 +10,7 @@ M0–M6 are the path to v1; **Extra Wins** are opt-in bonuses scheduled *after* 
 |---|---|---|---|---|
 | **M0** | **Walking Skeleton** | P0 | Cargo workspace + SQLite catalog + folder scan → searchable-by-name thumbnail grid. *Exit:* point at a folder of images, see them in the grid. | ARCHITECTURE, DATA-MODEL, TECH-STACK |
 | **M1** | **View Everything** | P1 | Interactive 3D viewport, audio playback + waveform, image/texture viewer (+ pixel-perfect, material sphere, font specimen, animated sprites). *Exit:* preview all media types from the grid. | INGESTION |
+| **M1.5** | **Browser QoL** | P1+ | Asset-browser plumbing layered on M1: virtualized grid, detail/inspector pane, multi-select + context menu, view/sort + thumbnail-zoom, drag in/out, Quick Look, jobs/activity panel, undo/redo, trash, sources manager, settings, tag manager, dup-review. *Exit:* the grid feels like a real asset browser at 50k+ assets. | DESIGN-GUIDELINES, DATA-MODEL |
 | **M2** | **Unity Ingestion** | P2 | Import real libraries: `.unitypackage`, **Asset Store download cache** (multi-root, browse, batch unpack), broader formats, dedup, non-content filtering. *Exit:* browse + selectively unpack the owned downloaded library. | INGESTION, DATA-MODEL |
 | **M3** | **Search & Identification** | P3 | Local embeddings + hybrid search; **Search by Tags** and **Search with AI** (NL→filters). *Exit:* keyword + tag + natural-language search on a 10k+ library. | IDENTIFICATION-AND-SEARCH, DATA-MODEL |
 | **M4** | **Auto-Tagging & Mapping** | P4 | Local/API faceted identification; mapping library; confidence + accept/reject. *Exit:* auto-tag a library and map onto a clean taxonomy. | AI-PIPELINE, IDENTIFICATION-AND-SEARCH |
@@ -17,6 +18,10 @@ M0–M6 are the path to v1; **Extra Wins** are opt-in bonuses scheduled *after* 
 | **M6** | **More Engines & Polish** | P6 | Godot + Unreal (best-effort), packaging/installer, auto-update, first-run setup. | INGESTION, MCP-AND-ENGINES, TECH-STACK |
 
 > **v1 ships at M5** (Unity end-to-end, local-first). M6 broadens engines and hardens distribution.
+>
+> **M1.5 (Browser QoL)** is a cross-cutting UX lane, not a gate — pull its cards (the `[QoL]` tag in
+> [`KANBAN.md`](KANBAN.md)) alongside M1–M3 as the library grows; the genuinely-new interactions are
+> specced in [`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7/§9.
 
 ## Extra Wins (post-scaffolding, opt-in)
 
