@@ -164,6 +164,9 @@ Higher-leverage features that build directly on the architecture already in plac
 - **Pack update diff** — when a pack's `content_hash` changes, show added/removed/modified assets.
 - **Catalog snapshot** — export/import the SQLite catalog (not the assets) for backup or to share a
   taxonomy / mapping library.
+- **★ Unity Account Sync (extra win)** — use the Unity login to list owned (incl. not-downloaded) packs,
+  **bulk-download** them (rate-limited queue) into the cache, and detect updates; opt-in, unofficial,
+  keychain-stored creds. Post-scaffolding bonus — full scope in [`MILESTONES.md`](MILESTONES.md) ★ MX.
 
 ---
 

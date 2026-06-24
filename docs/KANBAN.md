@@ -87,7 +87,7 @@ resolve first.
 - [ ] **[P7]** Credits/attribution export (`CREDITS.md` from `import_record` + license)
 - [ ] **[P7]** Project asset audit (reverse sync: used/unused/source/license/in-project dups)
 - [ ] **[P7]** Batch ops; command palette (Ctrl-K); library insights dashboard; pack update diff; catalog snapshot
-- [ ] **[P7]** Optional Unity *account sync* (owned-but-not-downloaded ghosts; best-effort)
+- [ ] **[P7] ★ Unity Account Sync (extra win)** — list owned (incl. not-downloaded) + **bulk download queue** (rate-limited) + update detection, via Unity login; opt-in, unofficial, keychain creds. Post-scaffolding bonus — see [`MILESTONES.md`](MILESTONES.md) ★ MX
 
 ---
 
