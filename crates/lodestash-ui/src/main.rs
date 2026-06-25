@@ -21,7 +21,11 @@ fn main() -> eframe::Result {
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([640.0, 480.0])
             .with_icon(load_icon()),
-        renderer: eframe::Renderer::Wgpu,
+        // Glow (OpenGL/WGL) has synchronous buffer swaps on Windows, so there is no
+        // swap-chain reconfiguration gap for DWM to fill with a scaled old frame.
+        // wgpu causes a visible "revert" jitter on resize because surface.configure()
+        // briefly invalidates the current texture before the new frame is ready.
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
 

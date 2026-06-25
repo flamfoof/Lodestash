@@ -58,11 +58,11 @@ resolve first · **[QoL]** = cross-cutting browser-UX lane (M1.5), layered on Ph
 > same change as this lane.
 
 - [x] **[QoL]** Grid virtualization — `ScrollArea::show_rows`, build only visible rows (fixes the non-virtualized M0 grid; required at 10k–100k) ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7) *(design exists)*
-- [ ] **[QoL]** Asset detail / inspector pane — preview + stat block + traits + provenance/license + actions ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7, [`DATA-MODEL.md`](DATA-MODEL.md) §9) *(design exists)*
+- [x] **[QoL]** Asset detail / inspector pane — preview + stat block + traits + provenance/license + actions ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7, [`DATA-MODEL.md`](DATA-MODEL.md) §9) *(design exists)* — scaffold: click-to-select, right-side panel (name/type/size/path/mtime), keyboard nav (arrows), Space=Quick Look overlay, Esc=dismiss; traits/provenance/actions wired in when catalog is connected
 - [ ] **[QoL]** Multi-select (click/Ctrl/Shift/marquee/Ctrl-A) + right-click context menu (Reveal, Open with, Copy path, Stage, Import, Tag, Trash) — the selection primitive P7 batch-ops needs ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7)
 - [x] **[QoL]** View/sort toolbar — sort (name/date/size/type ±) · thumbnail-size zoom slider; persist in config ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7)
 - [ ] **[QoL]** OS drag-out (asset → Unity/Explorer/DCC) + drag-in to ingest (drop overlay) ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7, [`INGESTION.md`](INGESTION.md) §1)
-- [ ] **[QoL]** Keyboard nav + **Quick Look** (arrows · Space=peek · Enter=open · Del=trash) ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §9)
+- [x] **[QoL]** Keyboard nav + **Quick Look** (arrows · Space=peek · Enter=open · Del=trash) ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §9) — scaffolded with inspector pane above; Enter/Del deferred to P3 (needs catalog)
 - [ ] **[QoL]** Activity / jobs panel — running scans/tagging/imports with progress + cancel + completion toasts (surfaces the core job engine) ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7, [`ARCHITECTURE.md`](ARCHITECTURE.md)) *(design exists)*
 - [ ] **[QoL]** Undo/redo for catalog mutations (tag/collection/mapping/trash); ingest + imports excluded ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7)
 - [ ] **[QoL]** Trash & restore — surface `asset.deleted_at`; "remove from library" vs explicit "delete from disk" ([`DATA-MODEL.md`](DATA-MODEL.md) §8, [`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7)

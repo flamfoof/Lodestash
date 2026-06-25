@@ -20,7 +20,7 @@ flagged.
 | `lodestash-core` | catalog, search, mapping, jobs, asset ops | `rusqlite` (bundled SQLite + FTS5 + loadable-ext), `sqlite-vec`, `blake3`, `serde`/`serde_json`, `tokio`, `rayon`, `notify`, `uuid`, `thiserror`/`anyhow`, `tracing` |
 | `lodestash-ingest` | crawl, detect, untar, normalize, thumbnail | `flate2`+`tar` (.unitypackage), `zip` (zip packs/.kra/.aseprite), `serde_yaml` (.meta), `image`, `image_dds`, `psd`, `texture2ddecoder`, `gltf`/`easy-gltf`, `russimp` (Assimp; C++ dep) **or** `FBX2glTF` (subprocess), `symphonia`, `ab_glyph`/`fontdue` (font specimens), `blake3`, `img_hash` (pHash) |
 | `lodestash-ai` | Tagger/Embedder traits + impls | `ort` (ONNX Runtime; CUDA/DirectML/CPU EPs) — alt `candle`/`fastembed`, `tokenizers`, `ndarray`, `reqwest` (Ollama + cloud HTTP), `whisper-rs` (speech), `image` (preprocess) |
-| `lodestash-ui` | egui app + 3D/audio/image preview | `eframe`/`egui` + `egui-wgpu` + `wgpu`, `three-d` (3D viewport), `rodio` (+ `symphonia`) audio, `egui_extras`/`egui_plot` (waveform), `rfd` (file dialogs), `poll-promise` (async UI) |
+| `lodestash-ui` | egui app + 3D/audio/image preview | `eframe`/`egui` + **`egui_glow`** (OpenGL renderer — see §7), `three-d` (3D viewport), `rodio` (+ `symphonia`) audio, `egui_extras`/`egui_plot` (waveform), `rfd` (file dialogs), `poll-promise` (async UI) |
 | `lodestash-mcp` | MCP server | `rmcp` (official Rust MCP SDK), `tokio`, `serde_json` |
 | `lodestash-api` | loopback HTTP/JSON | `axum` + `tower`/`tower-http` (limits, CORS-off), `tokio`, `serde_json` |
 | `lodestash-cli` | headless ops (scan/index/tag) | `clap`, `lodestash-core` |
@@ -96,3 +96,4 @@ flagged.
 | `axum` vs `hyper` | **`axum`** | Tower middleware ecosystem (rate-limit, tracing, auth); ergonomic routing; axum is the standard for production Rust HTTP servers. |
 | Assimp vs FBX2glTF | **`russimp`** (Assimp, P1) | Handles FBX + OBJ + Collada + glTF in one C++ dep; FBX2glTF kept as optional external subprocess for edge cases where the proprietary Autodesk SDK is needed. |
 | Chromaprint vs `fpcalc` | **`fpcalc` subprocess** (P2) | Avoids C++ build complexity at P0/P1; shell to system `fpcalc` binary; binding optional later if cross-platform `fpcalc` bundling proves easier. |
+| wgpu vs Glow (egui renderer) | **`egui_glow`** (OpenGL/WGL) | wgpu requires explicit `surface.configure()` on every resize; the brief gap between reconfiguration and the first presented frame lets the Windows DWM compositor fill with a scaled old frame, producing visible "revert" jitter. OpenGL/WGL buffer swaps are synchronous with the window system and don't have this gap. **Do not switch to wgpu without re-validating resize smoothness on Windows.** |
