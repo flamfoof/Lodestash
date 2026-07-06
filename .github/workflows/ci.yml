@@ -41,3 +41,25 @@ jobs:
 
       - name: Tests
         run: cargo test --all
+
+  # Early warning on upcoming-Rust breakage; never blocks a PR.
+  # Nightly rustfmt also honors the two nightly-only rustfmt.toml options
+  # (imports_granularity / group_imports) that stable silently ignores.
+  nightly:
+    name: nightly toolchain (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Cargo registry + build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (debug)
+        run: cargo build --all-targets
+
+      - name: Tests
+        run: cargo test --all

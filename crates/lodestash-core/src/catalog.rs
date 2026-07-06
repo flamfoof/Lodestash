@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use tracing::info;
 
 use crate::error::{CoreError, Result};
@@ -19,8 +19,8 @@ pub struct Catalog {
 impl Catalog {
     /// Open (or create) the catalog at `path`. Runs all pending migrations.
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)
-            .map_err(|e| CoreError::Catalog(format!("open failed: {e}")))?;
+        let conn =
+            Connection::open(path).map_err(|e| CoreError::Catalog(format!("open failed: {e}")))?;
 
         configure_connection(&conn)?;
         let mut catalog = Self { conn };
@@ -380,7 +380,9 @@ mod tests {
     fn seed_media_types_idempotent() {
         let catalog = Catalog::open_in_memory().expect("catalog open");
         catalog.seed_media_types().expect("first seed");
-        catalog.seed_media_types().expect("second seed (idempotent)");
+        catalog
+            .seed_media_types()
+            .expect("second seed (idempotent)");
 
         let count: i64 = catalog
             .conn

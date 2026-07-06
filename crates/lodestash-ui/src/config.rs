@@ -19,9 +19,9 @@ pub enum SortBy {
 
 impl SortBy {
     pub const OPTIONS: &'static [(SortBy, &'static str)] = &[
-        (SortBy::Name,     "Name"),
-        (SortBy::Type,     "Type"),
-        (SortBy::Size,     "Size"),
+        (SortBy::Name, "Name"),
+        (SortBy::Type, "Type"),
+        (SortBy::Size, "Size"),
         (SortBy::Modified, "Date"),
     ];
 
@@ -39,14 +39,18 @@ impl SortBy {
 /// A named, saved library that aggregates one or more source folders.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LibraryProject {
-    pub name:  String,
+    pub name: String,
     /// All source directories — may be on different drives or locations.
     pub paths: Vec<PathBuf>,
 }
 
 impl LibraryProject {
     pub fn live_paths(&self) -> Vec<&Path> {
-        self.paths.iter().filter(|p| p.is_dir()).map(|p| p.as_path()).collect()
+        self.paths
+            .iter()
+            .filter(|p| p.is_dir())
+            .map(|p| p.as_path())
+            .collect()
     }
 
     /// Add a source path if not already present. Returns true if it was added.
@@ -73,15 +77,20 @@ pub enum ViewMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ViewPrefs {
     pub thumb_size: f32,
-    pub sort_by:    SortBy,
-    pub sort_asc:   bool,
+    pub sort_by: SortBy,
+    pub sort_asc: bool,
     #[serde(default)]
-    pub mode:       ViewMode,
+    pub mode: ViewMode,
 }
 
 impl Default for ViewPrefs {
     fn default() -> Self {
-        Self { thumb_size: 128.0, sort_by: SortBy::Name, sort_asc: true, mode: ViewMode::Flat }
+        Self {
+            thumb_size: 128.0,
+            sort_by: SortBy::Name,
+            sort_asc: true,
+            mode: ViewMode::Flat,
+        }
     }
 }
 
@@ -93,14 +102,14 @@ pub struct AppConfig {
     pub last_project_name: Option<String>,
     /// Legacy single-root — kept for migration from older configs.
     #[serde(default)]
-    pub last_root:    Option<PathBuf>,
+    pub last_root: Option<PathBuf>,
     /// Recently opened folders, newest first (capped at 10).
     #[serde(default)]
     pub recent_roots: Vec<PathBuf>,
     /// Named saved libraries the user can reopen from the empty state.
-    pub projects:     Vec<LibraryProject>,
+    pub projects: Vec<LibraryProject>,
     /// Persisted view preferences (zoom, sort).
-    pub view:         ViewPrefs,
+    pub view: ViewPrefs,
 }
 
 impl AppConfig {
@@ -183,7 +192,10 @@ impl AppConfig {
         } else {
             name
         };
-        self.projects.push(LibraryProject { name: unique_name.clone(), paths: vec![path] });
+        self.projects.push(LibraryProject {
+            name: unique_name.clone(),
+            paths: vec![path],
+        });
         unique_name
     }
 
@@ -235,7 +247,11 @@ mod tests {
         let a = cfg.upsert_single_path_project(p("/assets/Synty"));
         let b = cfg.upsert_single_path_project(p("/assets/Synty"));
         assert_eq!(a, b);
-        assert_eq!(cfg.projects.len(), 1, "same path must not create a second project");
+        assert_eq!(
+            cfg.projects.len(),
+            1,
+            "same path must not create a second project"
+        );
     }
 
     #[test]
@@ -244,13 +260,19 @@ mod tests {
         let a = cfg.upsert_single_path_project(p("/a/Synty"));
         let b = cfg.upsert_single_path_project(p("/b/Synty"));
         assert_eq!(a, "Synty");
-        assert_ne!(a, b, "same folder name from a different path gets a unique label");
+        assert_ne!(
+            a, b,
+            "same folder name from a different path gets a unique label"
+        );
         assert_eq!(cfg.projects.len(), 2);
     }
 
     #[test]
     fn add_path_dedups() {
-        let mut proj = LibraryProject { name: "Synty".into(), paths: vec![p("/a")] };
+        let mut proj = LibraryProject {
+            name: "Synty".into(),
+            paths: vec![p("/a")],
+        };
         assert!(proj.add_path(p("/b")), "new path is added");
         assert!(!proj.add_path(p("/a")), "existing path is not re-added");
         assert_eq!(proj.paths, vec![p("/a"), p("/b")]);

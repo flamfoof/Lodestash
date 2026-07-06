@@ -68,7 +68,9 @@ pub fn by_magic(header: &[u8]) -> Option<MediaType> {
         return Some(MediaType::Audio);
     }
     // MP3 (ID3 tag or sync word)
-    if header.starts_with(b"ID3") || (header.len() >= 2 && header[0] == 0xff && header[1] & 0xe0 == 0xe0) {
+    if header.starts_with(b"ID3")
+        || (header.len() >= 2 && header[0] == 0xff && header[1] & 0xe0 == 0xe0)
+    {
         return Some(MediaType::Audio);
     }
     // FLAC
@@ -77,7 +79,10 @@ pub fn by_magic(header: &[u8]) -> Option<MediaType> {
     }
     // TTF / OTF (various magic patterns). Mac 'true' fonts: require the following
     // numTables high byte to be 0x00 so text files starting with "true…" don't match.
-    if header.starts_with(&[0x00, 0x01, 0x00, 0x00]) || header.starts_with(b"OTTO") || header.starts_with(b"true\0") {
+    if header.starts_with(&[0x00, 0x01, 0x00, 0x00])
+        || header.starts_with(b"OTTO")
+        || header.starts_with(b"true\0")
+    {
         return Some(MediaType::Font);
     }
     None
