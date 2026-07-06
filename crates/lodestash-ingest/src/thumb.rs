@@ -25,6 +25,17 @@ pub fn cache_path(cache_dir: &Path, content_hash: &str, params: ThumbParams) -> 
     cache_dir.join(format!("{}_{}x{}.png", content_hash, params.width, params.height))
 }
 
+/// Cache key for a file identified only by path metadata — same shape as a content hash.
+/// ponytail: (path,size,mtime) key until the catalog wires content_hash into the UI;
+/// an edited-in-place file with identical size+mtime serves a stale thumb, same as the crawler diff.
+pub fn meta_key(path: &Path, size_bytes: u64, mtime: i64) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(path.to_string_lossy().as_bytes());
+    hasher.update(&size_bytes.to_le_bytes());
+    hasher.update(&mtime.to_le_bytes());
+    hasher.finalize().to_hex()[..32].to_string()
+}
+
 /// Generate a thumbnail from an image file and write it to the cache.
 /// Returns the path of the written thumbnail.
 /// Skips writing if the cache file already exists (content_hash guarantees freshness).
@@ -48,7 +59,7 @@ pub fn generate(
 
     thumb
         .save_with_format(&dest, ImageFormat::Png)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     Ok(dest)
 }

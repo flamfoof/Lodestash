@@ -220,6 +220,11 @@ User edits tags (accept/reject chips) → recorded as training signal + immediat
 
 - **Single core process**, async runtime (**tokio**) for IO/orchestration + **rayon** for CPU-bound
   batch work (hashing, image decode/resize, offscreen 3D thumbnail renders).
+- **SQLite access**: `rusqlite::Connection` is `!Sync`, so the catalog is **not** shared by handle.
+  When multiple frontends go live (GUI + REST + MCP + ingest workers, P5), all writes funnel through
+  **one dedicated writer** (a thread/actor owning the connection, fed by a channel); reads use
+  short-lived per-task connections (WAL makes concurrent readers cheap). Do not reach for a pool of
+  writers — SQLite serializes writes anyway.
 - **Job engine** with bounded queues and progress events; the UI shows placeholders and swaps in
   results as jobs finish (what makes a 10k-grid feel instant).
 - **GPU work** (live viewport + offscreen thumbnail render-to-texture + image texture upload) shares

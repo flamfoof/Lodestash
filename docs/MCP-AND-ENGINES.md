@@ -55,12 +55,15 @@ against the `claude-api` skill before implementing.
 |---|---|---|
 | `search_assets` | `query`, filters (`type`, `tags[]`, `category`, `format`, `min/max` size…), `limit`, `cursor` | paginated asset summaries (id, name, type, format, tags, thumbnail URI) |
 | `semantic_search` | `query` (natural language), `type?`, `limit` | ranked summaries (embedding index) |
+| `find_similar` | `id`, `limit?` | ranked summaries most similar to the given asset (cosine over `vec_asset`) — "more like this" for agents |
 | `get_asset` | `id` | full metadata (paths, dims/poly-count/duration, formats, tags, collections, category, license) |
 | `get_asset_preview` | `id`, `kind?` (thumbnail/turntable-frame/waveform) | **image content block** (base64+mimeType); audio → waveform image or `resource_link` |
 | `list_tags` | `prefix?` | tags with counts |
 | `add_tag` / `retag` | `id`, `tags[]` | updated asset *(mutating — confirm)* |
 | `list_collections` | — | collections (id, name, count) |
 | `apply_mapping` | `id`/`scope`, `taxonomy_id` | resulting category assignments |
+| `identify_asset` | `id`(s), `tiers?` | runs/refreshes identification (tiers 0–4, [`IDENTIFICATION-AND-SEARCH.md`](IDENTIFICATION-AND-SEARCH.md) §3) for the asset(s) → `job_id` *(long-running)* |
+| `suggest_tags` | `id` | proposed facet tags + confidences for review — read-only; nothing is written until accepted via `add_tag` |
 | `list_packages` | filters (`publisher`, `category`), `cursor` | downloaded Asset Store packages (publisher, category, name, version, asset count) |
 | `unpack_package` | `package_id`(s) | job id — unpacks + ingests one or many Asset Store packages *(long-running)* |
 | `export_asset` | `id`(s), `dest_path`, `format?`, `with_dependencies?` | writes the selected asset(s) **+ their dependency closure** (a mesh plus its materials/textures) to an arbitrary **sandboxed** path, never the whole pack — **no editor required** *(side-effecting — confirm + sandbox path)* |
@@ -70,6 +73,7 @@ against the `claude-api` skill before implementing.
 | `stage_asset` / `list_staged` | `id`(s) / — | add to / read the **shared shortlist** (the staging tray; one `is_staging` collection — §2 agent loop) |
 | `import_staged` | `dest_subfolder?`, `project_id?`, `clear?` | import the whole staged shortlist into the open project via the import queue |
 | `get_job_status` | `job_id` | progress/result for long ops |
+| `cancel_job` | `job_id` | requests cancellation of a running job (idempotent; job flips to `cancelled`) |
 | `get_server_info` | — | app + schema + API version |
 
 **Resources (application-controlled), via URI templates:**
@@ -160,7 +164,9 @@ This is exactly how "do it from Claude" in [`USER-GUIDE.md`](USER-GUIDE.md) Step
   Lodestash core as the broker.
 - **Constraints**: editor must be open/listening; asset import must run on Unity's main thread; large
   binaries travel by path/URL, not inline; **dependency resolution is within a package** (cross-package
-  references are flagged for the user, since GUIDs are reassigned per import).
+  references are flagged for the user, since GUIDs are reassigned per import). A **render-pipeline
+  mismatch** (pack targets Built-in, project runs URP/HDRP) is surfaced as an import advisory, not an
+  error — see [`ENGINE-API.md`](ENGINE-API.md) §5.4 and [`DATA-MODEL.md`](DATA-MODEL.md) §12.
 
 ### 3b. Two MCP topologies (both supported)
 

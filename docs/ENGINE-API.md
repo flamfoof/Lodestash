@@ -65,6 +65,7 @@ Each row is the **same core operation** as the matching MCP tool in
 |---|---|---|
 | `search_assets` | `GET /v1/search` | query/filter params; paginated (`cursor`, `limit`) |
 | `semantic_search` | `GET /v1/search?mode=ai` | natural-language `q`; requires embeddings |
+| `find_similar` | `GET /v1/assets/{id}/similar` | `limit`; cosine over `vec_asset` ("more like this") |
 | `get_asset` | `GET /v1/assets/{id}` | full **asset detail** (§3) |
 | `get_asset_preview` | `GET /v1/assets/{id}/preview?kind=` | streams PNG/JPEG (thumbnail/turntable/waveform) |
 | — | `GET /v1/assets/{id}/file` | streams the on-disk source bytes (the MCP `resource_link` target) |
@@ -72,6 +73,8 @@ Each row is the **same core operation** as the matching MCP tool in
 | `add_tag` / `retag` | `POST /v1/assets/{id}/tags` | *mutating* |
 | `list_collections` | `GET /v1/collections` | incl. the staging collection (§staging) |
 | `apply_mapping` | `POST /v1/mapping/apply` | *mutating*; `{scope, taxonomy_id}` |
+| `identify_asset` | `POST /v1/identify` | *long-running* → `job_id`; `{asset_ids, tiers?}` |
+| `suggest_tags` | `GET /v1/assets/{id}/suggest-tags` | read-only tag proposals + confidences |
 | `list_packages` | `GET /v1/packages` | filters: `publisher`, `category`; `cursor` |
 | `unpack_package` | `POST /v1/packages/unpack` | *long-running* → returns `job_id` |
 | `export_asset` | `POST /v1/export` | *side-effecting*; arbitrary **sandboxed** `dest_path` |
@@ -80,6 +83,7 @@ Each row is the **same core operation** as the matching MCP tool in
 | `list_projects` / `get_active_project` | `GET /v1/projects` | registered/active editors |
 | `stage_asset` / `list_staged` / `import_staged` | `GET/POST/DELETE /v1/stage`, `POST /v1/stage/import` | shared shortlist (§6) |
 | `get_job_status` | `GET /v1/jobs/{id}` | progress/result for long ops |
+| `cancel_job` | `POST /v1/jobs/{id}/cancel` | idempotent; job flips to `cancelled` |
 | `get_server_info` | `GET /v1/server-info` | app + schema + API version |
 
 `export` vs `import`: **`/v1/export`** writes a dependency closure to an arbitrary sandboxed path (no
@@ -129,7 +133,7 @@ than redefining, so summaries/details never diverge.
   "license": "Unity Asset Store EULA", "attribution": "AcmeArt" }
 
 // Job — get_job_status (job engine; see ARCHITECTURE.md §3.1)
-{ "job_id": "imp_9f…", "kind": "import", "state": "running",   // queued|running|done|error
+{ "job_id": "imp_9f…", "kind": "import", "state": "running",   // queued|running|done|error|cancelled
   "progress": 0.66, "result": null, "error": null }
 ```
 
@@ -174,7 +178,7 @@ On panel open, the plugin announces itself:
 ```http
 POST /v1/projects/register
 { "project_path": "C:/dev/MyGame", "unity_version": "6000.0.23f1",
-  "can_execute_main_thread": true }
+  "pipeline": "urp", "can_execute_main_thread": true }
 → 200 { "project_id": 2, "is_active": true }
 ```
 
@@ -225,12 +229,18 @@ On ack the core writes an **`import_record`** per asset (provenance + dup-guard,
 > **Transient vs durable.** The import **queue** is in-memory (job-engine backed); only the
 > **`import_record`** result is persisted. A crash mid-import loses the queue, not the catalog.
 
-### 5.4 Dup-guard ("already imported")
+### 5.4 Import advisories (dup-guard & pipeline mismatch)
 Before enqueuing, the core checks `import_record` for `(asset_id, project_id)`:
 - if present and the on-disk `dest_path` still resolves, it returns the asset in an
   **`already_imported`** advisory list in the `/v1/import` response (HTTP `200` with
   `{ "imported_existing": [...], "job_id": null }` when *all* assets are already present, or proceeds
   for the rest). Clients surface "already in project — re-import?" rather than silently duplicating.
+
+It also compares the asset's `package.pipeline` (Built-in/URP/HDRP, harvested at ingest — see
+[`DATA-MODEL.md`](DATA-MODEL.md) §12) against the target project's pipeline (reported by the plugin at
+registration). A mismatch adds a **`pipeline_mismatch`** advisory list to the same `200` response —
+"this pack targets Built-in; your project runs URP (materials may appear pink)" — and the import
+proceeds. Advisory, never an error: the user/agent decides.
 
 ### 5.5 Constraints
 - Editor must be **open and polling**; imports run on Unity's **main thread**; large binaries travel

@@ -46,11 +46,12 @@ pub fn crawl(root: &Path) -> Vec<CrawledFile> {
         .collect()
 }
 
-/// Content-hash a file with BLAKE3.
+/// Content-hash a file with BLAKE3, streaming (constant memory even for multi-GB packages).
 /// Returns the hex digest string.
 pub fn hash_file(path: &Path) -> std::io::Result<String> {
-    let data = std::fs::read(path)?;
-    Ok(blake3::hash(&data).to_hex().to_string())
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(std::fs::File::open(path)?)?;
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// Incremental diff: given a crawl result and the DB's last known (size, mtime) for a rel_path,

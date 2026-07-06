@@ -27,17 +27,19 @@ resolve first · **[QoL]** = cross-cutting browser-UX lane (M1.5), layered on Ph
 - [x] **[P0][spike]** Stack choices resolved: `ort`, `axum`, `russimp`, `fpcalc` subprocess → [`TECH-STACK.md`](TECH-STACK.md) §7
 - [x] **[P0]** Cargo workspace + crate skeletons (`lodestash-core/ingest/ai/mcp/api/ui/cli`) + `rust-toolchain.toml`, `rustfmt.toml`, `.clippy.toml`, CI workflow
 - [x] **[P0]** SQLite (WAL) catalog: base schema + packages + projects/imports + mapping library tables + FTS5 (`asset_fts`) + migrations (M1–M3 via `user_version`) ([`DATA-MODEL.md`](DATA-MODEL.md))
-- [x] **[P0]** Folder crawler + magic-byte detection + BLAKE3 hashing + `(size,mtime)` incremental diff ([`INGESTION.md`](INGESTION.md))
-- [x] **[P0]** Image thumbnailing → on-disk cache (keyed `content_hash`+params, Lanczos3)
+- [x] **[P0]** Folder crawler + magic-byte detection + BLAKE3 hashing + `(size,mtime)` incremental diff ([`INGESTION.md`](INGESTION.md)) — hashing is streaming (constant memory on multi-GB files); `.anim` correctly left unclassified (Unity animation clip, not a sprite)
+- [x] **[P0]** Image thumbnailing → on-disk cache (keyed `content_hash`+params, Lanczos3) — UI wired to it via an interim `(path,size,mtime)` key until the catalog provides `content_hash`
+- [x] **[P0]** Spec/code review fixes (2026-07-01): background-thread crawl (no UI freeze on large trees, generation-guarded), window-based thumbnail texture eviction (bounded VRAM at 50k+), selection preserved by entry across filter/sort changes, M4 migration (`asset.rating`, `package.pipeline`, `project.pipeline` — [`DATA-MODEL.md`](DATA-MODEL.md) §12)
+- [x] Spec review additions (2026-07-01): `find_similar`/`identify_asset`/`suggest_tags`/`cancel_job` on both planes ([`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md) §2, [`ENGINE-API.md`](ENGINE-API.md) §2), `pipeline_mismatch` import advisory ([`ENGINE-API.md`](ENGINE-API.md) §5.4), sprite/material/font embedding rows ([`AI-PIPELINE.md`](AI-PIPELINE.md) §3), ratings + pipeline in the query grammar ([`IDENTIFICATION-AND-SEARCH.md`](IDENTIFICATION-AND-SEARCH.md) §6), SQLite single-writer rule ([`ARCHITECTURE.md`](ARCHITECTURE.md) §5)
 
 ---
 
 ## ▶ Ready — Phase 0: Foundations (walking skeleton)
 
-- [x] **[P0]** egui/eframe shell on wgpu (dark JRPG theme); responsive thumbnail grid with image textures + typed placeholders; name search ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md))
+- [x] **[P0]** egui/eframe shell (dark JRPG theme); responsive thumbnail grid with image textures + typed placeholders; name search ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md)). **Renderer: Glow (OpenGL)** — wgpu caused resize jitter from swap-chain reconfiguration on Windows ([`TECH-STACK.md`](TECH-STACK.md) §7)
 - [x] **[P0]** Exit: point at a folder of images → searchable-by-name grid ✅ **M0 Walking Skeleton complete**
 - [x] **[P0]** Media-type category tab bar (All / 3D Models / Audio / Images / Textures / Materials / Fonts / Sprites) — in-memory filter, precursor to P3 faceted sidebar
-- [x] **[P0]** Async thumbnail loading — rayon + `std::sync::mpsc` channel; UI shows placeholders and fills in textures as they arrive; `ctx.request_repaint()` wakes frame
+- [x] **[P0]** Async thumbnail loading — rayon + `std::sync::mpsc` channel; **demand-based** (only visible rows ± lookahead spawn tasks); UI shows placeholders and fills textures as they arrive; main thread polls via `request_repaint_after` while pending (no repaint from worker threads — avoids resize double-frames)
 - [x] **[P0]** Library persistence — `AppConfig` JSON at OS config dir; remembers last opened root and reopens it on startup; precursor to P2 full `import_source` catalog
 
 ---
@@ -61,21 +63,28 @@ resolve first · **[QoL]** = cross-cutting browser-UX lane (M1.5), layered on Ph
 - [x] **[QoL]** Asset detail / inspector pane — preview + stat block + traits + provenance/license + actions ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7, [`DATA-MODEL.md`](DATA-MODEL.md) §9) *(design exists)* — scaffold: click-to-select, right-side panel (name/type/size/path/mtime), keyboard nav (arrows), Space=Quick Look overlay, Esc=dismiss; traits/provenance/actions wired in when catalog is connected
 - [ ] **[QoL]** Multi-select (click/Ctrl/Shift/marquee/Ctrl-A) + right-click context menu (Reveal, Open with, Copy path, Stage, Import, Tag, Trash) — the selection primitive P7 batch-ops needs ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7)
 - [x] **[QoL]** View/sort toolbar — sort (name/date/size/type ±) · thumbnail-size zoom slider; persist in config ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7)
+- [x] **[QoL]** Browse views — **Flat / Folders** toggle (persisted) · Folders = breadcrumb + folder tiles + direct-child assets, Backspace = up, subtree search · **Library filter** dropdown + inspector "Library" row when >1 source ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7 "Browse views") — pre-catalog scaffold over scan roots; re-points at `import_source` in P2
 - [ ] **[QoL]** OS drag-out (asset → Unity/Explorer/DCC) + drag-in to ingest (drop overlay) ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7, [`INGESTION.md`](INGESTION.md) §1)
 - [x] **[QoL]** Keyboard nav + **Quick Look** (arrows · Space=peek · Enter=open · Del=trash) ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §9) — scaffolded with inspector pane above; Enter/Del deferred to P3 (needs catalog)
 - [ ] **[QoL]** Activity / jobs panel — running scans/tagging/imports with progress + cancel + completion toasts (surfaces the core job engine) ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7, [`ARCHITECTURE.md`](ARCHITECTURE.md)) *(design exists)*
 - [ ] **[QoL]** Undo/redo for catalog mutations (tag/collection/mapping/trash); ingest + imports excluded ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7)
 - [ ] **[QoL]** Trash & restore — surface `asset.deleted_at`; "remove from library" vs explicit "delete from disk" ([`DATA-MODEL.md`](DATA-MODEL.md) §8, [`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7)
 - [ ] **[QoL]** Sources manager — add/remove/rescan/toggle-watch multiple `import_source` roots + recent libraries (extends M0 persistence) ([`DATA-MODEL.md`](DATA-MODEL.md) §1, [`INGESTION.md`](INGESTION.md) §2) *(`LibraryProject` + named-save persistence done; full manager UI remains)*
-- [ ] **[QoL]** Settings / Preferences — Library, Appearance (density §4), AI provider, Storage (cache location/size/clear), Engine (export path/port) ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7)
+- [ ] **[QoL]** Settings / Preferences — Library, Appearance (density §4), AI provider, Storage (caches + **archive-workspace size cap & retention days** + clear actions), Engine (export path/port) ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7)
 - [ ] **[QoL]** Tag manager — rename/merge/delete library-wide + color/nesting + autocomplete ([`DATA-MODEL.md`](DATA-MODEL.md) §2)
+- [ ] **[QoL]** Ratings — 1–5 stars on grid card + inspector (keys 1–5), rating filter chip + sort key ([`DATA-MODEL.md`](DATA-MODEL.md) §12); schema column shipped in M4
 - [ ] **[QoL]** Duplicate-review queue — grouped keep/merge/trash, never auto-delete ([`DATA-MODEL.md`](DATA-MODEL.md) §5, [`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7)
+- [ ] **[QoL]** Asset **list-row view** — the view toggle's table mode: 32px zebra rows, sortable columns, type icon + stats + status gem ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7 "Asset list row") *(design exists; grid/folders shipped, list missing)*
+- [ ] **[P3]** **Library health meter** — "8,420 / 10,000 Identified" thin gold bar in the top bar; the backlog-as-quest affordance ([`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §6) *(needs status flow, so P3)*
 
 ### Phase 2 — Unity ingestion (primary input)
-- [ ] **[P2]** `.unitypackage` untar (pure Rust) + `.meta` parse (GUID/type/**labels**); archive memory model (stream-once → manifest → LRU workspace)
+- [ ] **[P2]** `.unitypackage` untar (pure Rust) + `.meta` parse (GUID/type/**labels**); archive memory model (stream-once → manifest → LRU workspace **with retention**: size-cap-then-age eviction, keep-recent window default 7 days, persists across sessions — [`INGESTION.md`](INGESTION.md) §2)
 - [ ] **[P2]** **Asset Store Library** source: multi-root discovery (`ASSETSTORE_CACHE_PATH`→default→custom) + first-run validation; browse-without-unpack; batch unpack+ingest; watch
 - [ ] **[P2]** Python sidecar (UnityPy) spawn-on-demand: compiled bundles / native blobs; texture/audio decode
 - [ ] **[P2]** Packages model + license/attribution harvest; dedup (BLAKE3 + pHash/Chromaprint) + move/rename detection
+- [ ] **[P2]** **Render-pipeline harvest** — detect Built-in/URP/HDRP per pack (shader GUIDs in `.mat`, embedded manifests) → `package.pipeline`; feeds the import `pipeline_mismatch` advisory ([`DATA-MODEL.md`](DATA-MODEL.md) §12, [`INGESTION.md`](INGESTION.md) §2, [`ENGINE-API.md`](ENGINE-API.md) §5.4)
+- [ ] **[P2]** **Library Source label** — display `import_source.name` chip on asset cards and inspector whenever project has >1 source; "Library" filter facet in search; user-rename source in project settings *(interim shipped in M1.5 browse-views scaffold: inspector "Library" row + toolbar Library filter; card chip + rename remain)*
+- [ ] **[P2]** **Asset relationship graph** — GUID-ref pass after ingest (`.meta` → `asset_relationship` rows); heuristic name-prefix pass for raw exports; inspector "Related" tab (inbound/outbound edges with Library Source); grid link-chain badge; `has_dependents`/`has_dependencies` search filters ([`DATA-MODEL.md`](DATA-MODEL.md) §10)
 - [ ] **[P2]** Broader formats: Aseprite/Krita/PSD/Paint.NET, `.blend`, fonts, MaterialX
 - [ ] **[P2]** Non-content classification (scripts/DLLs/editor tools/shaders → `is_content=0`)
 
@@ -94,7 +103,7 @@ resolve first · **[QoL]** = cross-cutting browser-UX lane (M1.5), layered on Ph
 
 ### Phase 5 — MCP & Unity retrieval
 - [ ] **[P5]** Loopback HTTP/JSON API (`/v1/`, 127.0.0.1 + handshake token) over `lodestash-core` ([`ENGINE-API.md`](ENGINE-API.md))
-- [ ] **[P5]** MCP server (`rmcp`, stdio): search/preview/tag/collection/export/import tools; previews as image blocks + `resource_link`
+- [ ] **[P5]** MCP server (`rmcp`, stdio): search/preview/tag/collection/export/import tools + `find_similar`/`identify_asset`/`suggest_tags`/`cancel_job`; previews as image blocks + `resource_link`
 - [ ] **[P5]** Project registration + import queue + `import_record` provenance + dup-guard; staging shortlist
 - [ ] **[P5]** Unity UPM plugin: handshake, register, browse, **selective import (asset + deps)**, license/“already imported” surfacing
 - [ ] **[P5]** Exit: import into open Unity project from GUI **and** from Claude via MCP (export fallback when no editor)
@@ -111,6 +120,14 @@ resolve first · **[QoL]** = cross-cutting browser-UX lane (M1.5), layered on Ph
 - [ ] **[P7]** Project asset audit (reverse sync: used/unused/source/license/in-project dups)
 - [ ] **[P7]** Batch ops; command palette (Ctrl-K); library insights dashboard; pack update diff; catalog snapshot
 - [ ] **[P7] ★ Unity Account Sync (extra win)** — list owned (incl. not-downloaded) + **bulk download queue** (rate-limited) + update detection, via Unity login; opt-in, unofficial, keychain creds. Post-scaffolding bonus — see [`MILESTONES.md`](MILESTONES.md) ★ MX
+
+### Cross-cutting — QA & testing ([`TECH-STACK.md`](TECH-STACK.md) §5.1)
+- [ ] **[P0]** Test scaffolding — add `insta`/`proptest`/`criterion` dev-deps; `tests/corpus/` dir; unit-test the existing UI pure helpers *(partially landed: `grid_columns`/`lookahead_window`/`keep_range` eviction math + `folder_children` browse-view logic + config project/recents tests; `rebuild_cache` sort-order tests and the snapshot/property/bench deps remain)*
+- [ ] **[P2]** Regression corpus — commit small license-clean samples (`.unitypackage`, `.dds`, `.fbx`, `.wav`, `.psd`, material+textures) + `insta` parse snapshots; ingest detect/untar/`.meta` tests
+- [ ] **[P2]** Relationship-harvest tests — GUID-pair resolution → expected edges; **cross-source edge** resolution; inbound/outbound traversal; dup-guard `UNIQUE(asset_id, project_id)`
+- [ ] **[P3]** Search/mapping determinism — RRF fusion order (`proptest` invariant under rank perturbation); pre-filter hard-boolean; mapping rule priority + **pinned-override survives re-apply**
+- [ ] **[P5]** **MCP↔REST 1:1 invariant test** — assert tool set == endpoint set (CI fails if one plane gains an op the other lacks); request/response schema snapshots; handshake-token rejection
+- [ ] **[P6]** `criterion` perf gate (dev/nightly) — crawl throughput, `rebuild_cache` @100k rows, hybrid-search latency @100k vectors; tracks §3/§6 perf claims
 
 ---
 
