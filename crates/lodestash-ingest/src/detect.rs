@@ -18,10 +18,12 @@ pub fn by_extension(path: &Path) -> Option<MediaType> {
 
         // General images (also used as textures but stored as image)
         "png" | "jpg" | "jpeg" | "bmp" | "tga" | "tiff" | "tif" | "hdr" | "exr" | "webp"
-        | "ico" | "psd" | "kra" | "aseprite" | "ase" | "pdn" => Some(MediaType::Image),
+        | "ico" | "psd" | "kra" | "pdn" => Some(MediaType::Image),
 
-        // Animated sprites (explicit sprite formats)
-        "anim" => Some(MediaType::Sprite),
+        // Animated sprites — Aseprite authoring files are animated-2D sources (INGESTION.md §5).
+        // Unity `.anim` is an animation-clip YAML (not a sprite) and stays unclassified;
+        // spritesheet PNGs classify at ingest (frame data), not by extension.
+        "aseprite" | "ase" => Some(MediaType::Sprite),
 
         // Audio
         "wav" | "mp3" | "ogg" | "flac" | "aif" | "aiff" | "m4a" | "opus" | "wma" | "fsb" => {
@@ -66,15 +68,21 @@ pub fn by_magic(header: &[u8]) -> Option<MediaType> {
         return Some(MediaType::Audio);
     }
     // MP3 (ID3 tag or sync word)
-    if header.starts_with(b"ID3") || (header.len() >= 2 && header[0] == 0xff && header[1] & 0xe0 == 0xe0) {
+    if header.starts_with(b"ID3")
+        || (header.len() >= 2 && header[0] == 0xff && header[1] & 0xe0 == 0xe0)
+    {
         return Some(MediaType::Audio);
     }
     // FLAC
     if header.starts_with(b"fLaC") {
         return Some(MediaType::Audio);
     }
-    // TTF / OTF (various magic patterns)
-    if header.starts_with(&[0x00, 0x01, 0x00, 0x00]) || header.starts_with(b"OTTO") || header.starts_with(b"true") {
+    // TTF / OTF (various magic patterns). Mac 'true' fonts: require the following
+    // numTables high byte to be 0x00 so text files starting with "true…" don't match.
+    if header.starts_with(&[0x00, 0x01, 0x00, 0x00])
+        || header.starts_with(b"OTTO")
+        || header.starts_with(b"true\0")
+    {
         return Some(MediaType::Font);
     }
     None
@@ -101,6 +109,8 @@ mod tests {
             ("sfx.ogg", MediaType::Audio),
             ("ui.ttf", MediaType::Font),
             ("ground.mat", MediaType::Material),
+            ("walk.aseprite", MediaType::Sprite),
+            ("walk.ase", MediaType::Sprite),
         ];
         for (name, expected) in cases {
             let result = by_extension(&PathBuf::from(name));

@@ -60,6 +60,9 @@ trait Embedder {
 | **Image / texture** | **SigLIP 2 So400m** (768-d; ViT-B fallback on weak CPUs) | **WD-EVA02-Large-v3** (ONNX) / Claude vision JSON. Textures: embed the **albedo** channel; detect other maps by filename and merge as one material. |
 | **Audio** | **LAION-CLAP** (512-d) | **YAMNet/PANNs** event tags + CLAP zero-shot description; **Whisper** only when VAD detects speech / API enriches text tags |
 | **3D model** | **multiview render (4–8 views) → SigLIP 2**, mean-pooled & renormalized | **WD tagger** on the rendered views (vote/union) + **file-derived structured tags** (poly count, material slots, bone count) / Claude vision on the views |
+| **Sprite (animated 2D)** | SigLIP 2 on the composited hero frame (image path) | WD v3 on sampled frames (union) + file-derived technical tags (frame count, fps, dimensions) |
+| **Material** | SigLIP 2 on the **albedo** map (upgrade: the lit sphere render once available) | filename/hue map-role heuristics + WD/Claude vision on albedo — same PBR-map caveat as textures |
+| **Font** | SigLIP 2 on the rendered **glyph specimen sheet** ([`INGESTION.md`](INGESTION.md) §5) | file-derived metrics (style, weight, glyph coverage) + VLM/Claude on the specimen (e.g. "handwritten", "pixel", "serif") |
 
 ### Notes & known limits
 - **PBR map channels are invisible to vision models.** Normal/roughness/metallic/ORM maps look like

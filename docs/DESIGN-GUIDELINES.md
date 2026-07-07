@@ -296,6 +296,23 @@ A strip above the grid: a **view toggle** (grid / list / detail) · a **sort** d
 added · Date modified · Size · Type · Status) with an asc/desc caret · a **thumbnail-size** zoom slider
 (grid only). View, sort, and zoom **persist** (app config) so a library reopens the way you left it.
 
+### Browse views (Flat · Folders) & the Library filter
+Assets from many sources must never blur into one anonymous pile — "where is this from?" is answerable
+at every level. Two **browse views**, toggled in the view/sort toolbar and persisted:
+- **Flat** — every asset in the current filter as one virtualized grid (the default). With more than
+  one source in the project, a **Library filter** ("Library: All · Synty · Human3" — the
+  `import_source.name` facet, [`DATA-MODEL.md`](DATA-MODEL.md) §10) narrows the grid to one source,
+  and each asset's Library Source shows in the inspector stat block.
+- **Folders** — a directory browser over the sources: a **breadcrumb** (`All libraries / Synty /
+  PolygonCity / …`, clickable segments; **Backspace** = up one level), **folder tiles** (📁 name +
+  contained-asset count) for the subdirectories at the current level, then the assets that live
+  directly in that folder. The top level lists the project's sources as tiles (single-source projects
+  descend automatically). Typing in search while in Folders searches the **current subtree**; the
+  media-type tabs keep filtering both tiles' counts and assets. This is how a pack-structured library
+  (`Synty/PolygonCity/…`) is browsed pack-by-pack before P2 packages land; the sidebar
+  Libraries/Packages tree (publisher → category → pack, §above) complements it once package metadata
+  exists.
+
 ### Drag & drop
 - **Drag out:** drag selected asset(s) to the OS — Explorer/Finder, a DCC, or the **Unity Editor** — as
   a native file drag of the underlying path(s). Complements `import_to_project` (drag = a manual drop;
@@ -319,8 +336,9 @@ originals unless the on-disk delete was explicitly chosen.
 A screen behind `ls-nav-settings`, grouped with the facet styling: **Library** (the Sources manager
 below), **Appearance** (density compact/comfortable §4, follow-OS reduced-motion), **AI** (per-modality
 local/API provider + active GPU profile, links [`AI-MODELS-BY-GPU.md`](AI-MODELS-BY-GPU.md)),
-**Storage** (thumbnail/embedding cache location + size + **Clear cache**), **Engine** (default export
-folder, loopback port/token).
+**Storage** (thumbnail/embedding cache + the **extracted-archive workspace** — location, size caps,
+**retention days** (default 7, [`INGESTION.md`](INGESTION.md) §2), **Clear cache / Clear workspace**),
+**Engine** (default export folder, loopback port/token).
 
 ### Sources manager
 Manage the catalog's `import_source` roots ([`DATA-MODEL.md`](DATA-MODEL.md) §1): **Add folder / Asset

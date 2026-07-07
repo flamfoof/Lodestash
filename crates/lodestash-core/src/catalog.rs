@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use tracing::info;
 
 use crate::error::{CoreError, Result};
@@ -19,8 +19,8 @@ pub struct Catalog {
 impl Catalog {
     /// Open (or create) the catalog at `path`. Runs all pending migrations.
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)
-            .map_err(|e| CoreError::Catalog(format!("open failed: {e}")))?;
+        let conn =
+            Connection::open(path).map_err(|e| CoreError::Catalog(format!("open failed: {e}")))?;
 
         configure_connection(&conn)?;
         let mut catalog = Self { conn };
@@ -57,6 +57,7 @@ impl Catalog {
             (1, MIGRATION_01_BASE_SCHEMA),
             (2, MIGRATION_02_PACKAGES),
             (3, MIGRATION_03_PROJECTS_IMPORTS),
+            (4, MIGRATION_04_RATING_PIPELINE),
         ];
 
         for (version, sql) in migrations {
@@ -354,6 +355,13 @@ ALTER TABLE asset ADD COLUMN attribution TEXT;
 ALTER TABLE asset ADD COLUMN license_url TEXT;
 ";
 
+/// M4 — user ratings + render-pipeline compatibility. Spec: DATA-MODEL.md §12.
+const MIGRATION_04_RATING_PIPELINE: &str = "
+ALTER TABLE asset   ADD COLUMN rating   INTEGER;  -- 1..5 stars; NULL = unrated
+ALTER TABLE package ADD COLUMN pipeline TEXT;     -- 'built_in'|'urp'|'hdrp'|'mixed'; NULL = unknown
+ALTER TABLE project ADD COLUMN pipeline TEXT;     -- registered editor's pipeline (register_project)
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,14 +373,16 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 3, "all 3 migrations should have run");
+        assert_eq!(version, 4, "all 4 migrations should have run");
     }
 
     #[test]
     fn seed_media_types_idempotent() {
         let catalog = Catalog::open_in_memory().expect("catalog open");
         catalog.seed_media_types().expect("first seed");
-        catalog.seed_media_types().expect("second seed (idempotent)");
+        catalog
+            .seed_media_types()
+            .expect("second seed (idempotent)");
 
         let count: i64 = catalog
             .conn

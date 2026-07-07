@@ -80,6 +80,12 @@ Selecting one or multiple packages enqueues a **batch unpack+ingest** job (via t
   (`<Publisher>/`), and any `LICENSE`/`README`/`Third-Party Notices` text or embedded pack metadata is
   captured into `package.license`/`attribution`/`license_url`. This is surfaced on every export/import
   so credits for bought assets travel with them (an individual asset can override its pack's license).
+- **Harvest the render pipeline** while ingesting: shader GUID references in the pack's `.mat` files
+  (URP/HDRP shaders have well-known GUIDs; `Standard`/custom CG shaders ⇒ `built_in`) and any
+  `com.unity.render-pipelines.*` entries in embedded package manifests → `package.pipeline`
+  (`built_in`/`urp`/`hdrp`/`mixed`; see [`DATA-MODEL.md`](DATA-MODEL.md) §12). Compared against the
+  target project on import to raise the `pipeline_mismatch` advisory
+  ([`ENGINE-API.md`](ENGINE-API.md) §5.4) — warn-only, never converted.
 
 ### Archive handling & memory model
 A `.unitypackage` is **gzip+tar** — a *sequential* stream with **no central index**, so you can't seek
@@ -96,9 +102,19 @@ to a single entry; reaching any entry means decompressing from the start. Lodest
   caches (thumbnails, mesh→`.glb`, texture→PNG, audio→WAV), and viewing **lazy-loads just the one
   file** (mmap/stream) then releases it — so even multi-GB packs stay light, and *every sibling asset
   in the same pack is random-access on disk* (no re-streaming, no whole-pack-in-RAM).
+- **Workspace retention (warm reopens)** — extracted payloads **persist across sessions**, so a pack
+  opened today is still random-access on disk tomorrow with zero re-extraction. Eviction is
+  **size-cap first, then age**: within the cap nothing is evicted; under cap pressure, LRU order —
+  but anything touched within the **retention window (default 7 days, configurable)** is evicted
+  last. Settings → Storage exposes the cap, the retention days, and a "Clear workspace" action.
+  Eviction is always safe by construction (idempotent re-extract by hash), and the derived caches
+  (thumbnails, normalized glTF/PNG/WAV) are keyed by `content_hash` and **independent of the
+  workspace** — browsing stays fast even after a pack's raw payloads are evicted; only raw-file
+  access (view original, export/import) triggers a re-extract.
 - **Container nuance:** this sequential constraint is specific to tar.gz (`.unitypackage`). **Zip**
   sources (e.g. some Humble bundles) carry a central directory → true per-file random access, so those
-  lazy-extract individual files without a full scan. The pipeline picks the strategy per container.
+  lazy-extract individual files without a full scan (and need no workspace copy at all). The pipeline
+  picks the strategy per container.
 
 ### Non-destructive & live
 - **Never modify the cache.** Lodestash extracts into its own managed workspace (or reads in place) and
@@ -141,6 +157,28 @@ to a single entry; reaching any entry means decompressing from the start. Lodest
 
 Steps 5–9 run as background jobs with progress; the asset appears in the grid immediately with a
 placeholder thumbnail.
+
+**Step 10 — Relationship harvest** (runs after all assets in the source batch are persisted):
+
+```
+10. Relate     GUID-ref pass: resolve .meta fileID/GUID pairs → asset_relationship rows
+               Heuristic pass: path-proximity / name-prefix matching for raw exports without .meta
+```
+
+- **GUID-ref pass:** Unity `.meta` files and material YAML files contain `fileID`/`guid` references
+  to other assets. After step 8 has populated `asset.unity_guid` for every item in the batch, a
+  second pass reads each material/prefab's GUID references and inserts `asset_relationship` rows
+  (`source='unity_meta'`). Cross-source GUIDs (texture in a shared pack, material in a project
+  folder) are resolved across all sources in the active project — relationship rows may cross
+  `source_id` boundaries.
+- **Heuristic pass:** for raw exports without `.meta`, a lighter inference runs: textures sharing a
+  name prefix with a sibling mesh (e.g. `Human3_Albedo.png` + `Human3.fbx`) get an `inferred`
+  `uses_texture` edge at `confidence ≈ 0.7`. Only fires when no `unity_meta` edge already covers
+  the pair.
+- **Library Source label** is set at crawl time: each file's `source_id` maps to its
+  `import_source.name` (the named root in the active project, e.g. "Synty", "Human3"). The label
+  is stored on the asset row and shown in the inspector + grid badge whenever the project has more
+  than one source. See [`DATA-MODEL.md`](DATA-MODEL.md) §10.
 
 ### Key extraction facts
 - **`.unitypackage` needs no Unity library** — stdlib gzip+tar recovers the original files. Harvest

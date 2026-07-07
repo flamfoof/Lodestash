@@ -5,11 +5,12 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
-use egui::{Key, Modifiers, RichText, ScrollArea, TextureHandle, Ui, Vec2};
+use egui::{Key, RichText, ScrollArea, TextureHandle, Ui, Vec2};
 use lodestash_core::types::MediaType;
 use lodestash_ingest::crawler::{self, CrawledFile};
+use lodestash_ingest::thumb;
 
-use crate::config::{AppConfig, SortBy};
+use crate::config::{self, AppConfig, SortBy, ViewMode};
 use crate::theme;
 
 // ── Category tabs ─────────────────────────────────────────────────────────────
@@ -50,56 +51,87 @@ impl Category {
 // ── Asset entry ───────────────────────────────────────────────────────────────
 
 struct AssetEntry {
-    file:          CrawledFile,
-    texture:       Option<TextureHandle>,
+    file: CrawledFile,
+    /// Index into `scan_roots` — which source this asset came from (the Library Source).
+    source_idx: usize,
+    texture: Option<TextureHandle>,
     thumb_spawned: bool,
 }
 
 struct ThumbReady {
-    index:   usize,
-    texture: TextureHandle,
+    index: usize,
+    /// None when generate_texture fails; sent so pending_thumbs is always decremented.
+    texture: Option<TextureHandle>,
+}
+
+/// Result of a background crawl. `generation` guards against a stale scan landing
+/// after the user has already opened a different folder/project.
+struct ScanDone {
+    generation: u64,
+    /// (source index into scan_roots, crawled file)
+    entries: Vec<(usize, CrawledFile)>,
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const THUMB_GEN_SIZE: u32  = 256;
-const CARD_LABEL:     f32  = 36.0;
-const CARD_PAD:       f32  = 8.0;
-pub const THUMB_MIN:  f32  = 64.0;
-pub const THUMB_MAX:  f32  = 256.0;
+const THUMB_GEN_SIZE: u32 = 256;
+const CARD_LABEL: f32 = 36.0;
+const CARD_PAD: f32 = 8.0;
+pub const THUMB_MIN: f32 = 64.0;
+pub const THUMB_MAX: f32 = 256.0;
 /// Extra rows above/below the visible viewport to prefetch thumbnails for.
 const LOOKAHEAD_ROWS: usize = 4;
+/// Rows beyond the visible window whose textures are kept resident; anything further
+/// is evicted so VRAM stays bounded while scrolling a large library.
+/// ponytail: window-based eviction, not true LRU — swap for a budgeted LRU if thrashing shows.
+const KEEP_ROWS: usize = 32;
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
 pub struct LodestashApp {
-    config:         AppConfig,
+    config: AppConfig,
     /// The source directories currently loaded (may be multiple for a multi-source project).
-    scan_roots:     Vec<PathBuf>,
+    scan_roots: Vec<PathBuf>,
     /// Name of the open LibraryProject (if any).
-    project_name:   Option<String>,
-    search:         String,
-    search_focused: bool,
-    active_tab:     Category,
-    sort_by:        SortBy,
-    sort_asc:       bool,
-    thumb_size:     f32,
-    entries:        Vec<AssetEntry>,
+    project_name: Option<String>,
+    search: String,
+    active_tab: Category,
+    sort_by: SortBy,
+    sort_asc: bool,
+    thumb_size: f32,
+    view_mode: ViewMode,
+    /// Flat mode: restrict the grid to one source (None = all libraries).
+    source_filter: Option<usize>,
+    /// Folders mode location: None = top level (source tiles); Some = (source, dir rel to root).
+    current_dir: Option<(usize, PathBuf)>,
+    /// Child folders at `current_dir`: (name, contained-asset count). Rebuilt with the cache.
+    folder_tiles: Vec<(String, usize)>,
+    /// Bumped on every folder navigation so the grid ScrollArea gets fresh scroll state.
+    nav_generation: u64,
+    entries: Vec<AssetEntry>,
     /// Sorted+filtered indices into `entries`. Rebuilt only when `cache_dirty`.
-    sorted_cache:   Vec<usize>,
+    sorted_cache: Vec<usize>,
     /// Per-tab entry counts, parallel to Category::TABS. Rebuilt on folder load.
-    tab_counts:     Vec<usize>,
-    cache_dirty:    bool,
-    /// Last computed column count and visible row range; used to skip spawn work when unchanged.
-    last_cols:      usize,
+    tab_counts: Vec<usize>,
+    cache_dirty: bool,
+    /// Last computed column count and visible row window; used to skip spawn work when unchanged.
+    last_cols: usize,
     last_row_start: usize,
-    thumb_rx:       Receiver<ThumbReady>,
-    thumb_tx:       Sender<ThumbReady>,
+    last_row_end: usize,
+    thumb_rx: Receiver<ThumbReady>,
+    thumb_tx: Sender<ThumbReady>,
     pending_thumbs: usize,
+    scan_rx: Receiver<ScanDone>,
+    scan_tx: Sender<ScanDone>,
+    /// Bumped per load_paths; a ScanDone with an older generation is discarded.
+    scan_generation: u64,
+    scanning: bool,
+    /// On-disk thumbnail cache dir (None if the OS cache dir is unavailable).
+    thumb_cache_dir: Option<PathBuf>,
     /// Index into `sorted_cache` of the currently selected asset.
     selected_cache_idx: Option<usize>,
     /// When true, the Quick Look overlay is open.
-    quick_look:     bool,
+    quick_look: bool,
 }
 
 impl LodestashApp {
@@ -107,31 +139,43 @@ impl LodestashApp {
         theme::apply(&cc.egui_ctx);
 
         let (thumb_tx, thumb_rx) = mpsc::channel();
-        let config     = AppConfig::load();
-        let sort_by    = config.view.sort_by;
-        let sort_asc   = config.view.sort_asc;
+        let (scan_tx, scan_rx) = mpsc::channel();
+        let config = AppConfig::load();
+        let sort_by = config.view.sort_by;
+        let sort_asc = config.view.sort_asc;
         let thumb_size = config.view.thumb_size.clamp(THUMB_MIN, THUMB_MAX);
+        let view_mode = config.view.mode;
 
         let mut app = Self {
-            scan_roots:         Vec::new(),
-            project_name:       None,
-            search:             String::new(),
-            search_focused:     false,
-            active_tab:         Category::All,
+            scan_roots: Vec::new(),
+            project_name: None,
+            search: String::new(),
+            active_tab: Category::All,
             sort_by,
             sort_asc,
             thumb_size,
-            entries:            Vec::new(),
-            sorted_cache:       Vec::new(),
-            tab_counts:         vec![0; Category::TABS.len()],
-            cache_dirty:        false,
-            last_cols:          0,
-            last_row_start:     usize::MAX,
+            view_mode,
+            source_filter: None,
+            current_dir: None,
+            folder_tiles: Vec::new(),
+            nav_generation: 0,
+            entries: Vec::new(),
+            sorted_cache: Vec::new(),
+            tab_counts: vec![0; Category::TABS.len()],
+            cache_dirty: false,
+            last_cols: 0,
+            last_row_start: usize::MAX,
+            last_row_end: 0,
             thumb_rx,
             thumb_tx,
-            pending_thumbs:     0,
+            pending_thumbs: 0,
+            scan_rx,
+            scan_tx,
+            scan_generation: 0,
+            scanning: false,
+            thumb_cache_dir: dirs::cache_dir().map(|d| d.join("Lodestash").join("thumbs")),
             selected_cache_idx: None,
-            quick_look:         false,
+            quick_look: false,
             config,
         };
 
@@ -139,7 +183,7 @@ impl LodestashApp {
         if let Some(name) = app.config.last_project_name.clone() {
             if let Some(proj) = app.config.project_by_name(&name) {
                 let paths: Vec<PathBuf> = proj.paths.clone();
-                let live: Vec<PathBuf>  = paths.into_iter().filter(|p| p.is_dir()).collect();
+                let live: Vec<PathBuf> = paths.into_iter().filter(|p| p.is_dir()).collect();
                 if !live.is_empty() {
                     app.load_paths(&cc.egui_ctx, live, Some(name));
                     return app;
@@ -165,11 +209,14 @@ impl LodestashApp {
     }
 
     fn add_source(&mut self, ctx: &egui::Context) {
-        let Some(proj_name) = self.project_name.clone() else { return; };
+        let Some(proj_name) = self.project_name.clone() else {
+            return;
+        };
         if let Some(path) = rfd::FileDialog::new().pick_folder() {
             self.config.add_source_to_project(&proj_name, path);
             // Reload all paths for this project from config (now includes the new one).
-            let paths: Vec<PathBuf> = self.config
+            let paths: Vec<PathBuf> = self
+                .config
                 .project_by_name(&proj_name)
                 .map(|p| p.paths.clone())
                 .unwrap_or_default();
@@ -179,75 +226,197 @@ impl LodestashApp {
     }
 
     fn open_project(&mut self, ctx: &egui::Context, name: &str) {
-        let paths: Vec<PathBuf> = self.config
+        let paths: Vec<PathBuf> = self
+            .config
             .project_by_name(name)
             .map(|p| p.paths.clone())
             .unwrap_or_default();
         let live: Vec<PathBuf> = paths.into_iter().filter(|p| p.is_dir()).collect();
-        if live.is_empty() { return; }
+        if live.is_empty() {
+            return;
+        }
         self.config.record_project_open(name);
         self.load_paths(ctx, live, Some(name.to_owned()));
     }
 
-    /// Core loader — crawls all `roots` and populates `entries`.
+    /// Core loader — clears the grid and crawls all `roots` on a background thread.
+    /// Entries arrive via `scan_rx`; a 100k-file tree must not freeze the window.
     fn load_paths(&mut self, ctx: &egui::Context, roots: Vec<PathBuf>, name: Option<String>) {
         // Drop old channel to cancel in-flight thumbnail tasks.
         let (thumb_tx, thumb_rx) = mpsc::channel();
-        self.thumb_tx       = thumb_tx;
-        self.thumb_rx       = thumb_rx;
+        self.thumb_tx = thumb_tx;
+        self.thumb_rx = thumb_rx;
         self.pending_thumbs = 0;
         self.search.clear();
         self.active_tab = Category::All;
 
-        self.entries = roots.iter()
-            .flat_map(|root| crawler::crawl(root))
-            .map(|f| AssetEntry { file: f, texture: None, thumb_spawned: false })
-            .collect();
-
-        self.tab_counts = Category::TABS
-            .iter()
-            .map(|&(cat, _)| self.entries.iter().filter(|e| cat.matches(e.file.media_type)).count())
-            .collect();
-
-        self.cache_dirty        = true;
-        self.last_cols          = 0;
-        self.last_row_start     = usize::MAX;
-        self.scan_roots         = roots;
-        self.project_name       = name;
+        self.entries = Vec::new();
+        self.tab_counts = vec![0; Category::TABS.len()];
+        self.cache_dirty = true;
+        self.last_cols = 0;
+        self.last_row_start = usize::MAX;
+        self.last_row_end = 0;
+        self.scan_roots = roots.clone();
+        self.project_name = name;
         self.selected_cache_idx = None;
-        self.quick_look         = false;
+        self.quick_look = false;
+        self.source_filter = None;
+        self.current_dir = None;
+        self.folder_tiles = Vec::new();
+        self.nav_generation += 1;
+
+        self.scan_generation += 1;
+        self.scanning = true;
+        let generation = self.scan_generation;
+        let tx = self.scan_tx.clone();
+        std::thread::spawn(move || {
+            let entries: Vec<(usize, CrawledFile)> = roots
+                .iter()
+                .enumerate()
+                .flat_map(|(i, root)| crawler::crawl(root).into_iter().map(move |f| (i, f)))
+                .collect();
+            let _ = tx.send(ScanDone {
+                generation,
+                entries,
+            });
+        });
 
         ctx.request_repaint();
     }
 
     // ── Per-frame helpers ─────────────────────────────────────────────────────
 
+    fn receive_scan(&mut self) {
+        while let Ok(msg) = self.scan_rx.try_recv() {
+            if msg.generation != self.scan_generation {
+                continue; // stale scan from a superseded load
+            }
+            self.scanning = false;
+            self.entries = msg
+                .entries
+                .into_iter()
+                .map(|(source_idx, f)| AssetEntry {
+                    file: f,
+                    source_idx,
+                    texture: None,
+                    thumb_spawned: false,
+                })
+                .collect();
+            self.current_dir = self.default_dir();
+            self.tab_counts = Category::TABS
+                .iter()
+                .map(|&(cat, _)| {
+                    self.entries
+                        .iter()
+                        .filter(|e| cat.matches(e.file.media_type))
+                        .count()
+                })
+                .collect();
+            self.cache_dirty = true;
+            self.last_cols = 0;
+            self.last_row_start = usize::MAX;
+            self.last_row_end = 0;
+        }
+    }
+
     fn receive_thumbnails(&mut self) {
         while let Ok(msg) = self.thumb_rx.try_recv() {
-            if let Some(entry) = self.entries.get_mut(msg.index) {
-                entry.texture = Some(msg.texture);
-                self.pending_thumbs = self.pending_thumbs.saturating_sub(1);
+            self.pending_thumbs = self.pending_thumbs.saturating_sub(1);
+            if let (Some(tex), Some(entry)) = (msg.texture, self.entries.get_mut(msg.index)) {
+                entry.texture = Some(tex);
             }
         }
     }
 
     /// Rebuild the sorted+filtered index cache. Called only when `cache_dirty`.
+    /// Selection is preserved by entry, not by grid slot — a filter change must not
+    /// silently move the selection onto a different asset.
     fn rebuild_cache(&mut self) {
-        let q   = self.search.to_lowercase();
+        let selected_entry = self
+            .selected_cache_idx
+            .and_then(|ci| self.sorted_cache.get(ci).copied());
+        let q = self.search.to_lowercase();
         let tab = self.active_tab;
 
-        let mut idxs: Vec<usize> = self.entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| {
-                tab.matches(e.file.media_type)
-                    && (q.is_empty()
-                        || e.file.rel_path.to_string_lossy().to_lowercase().contains(&q))
-            })
-            .map(|(i, _)| i)
-            .collect();
+        let name_matches = |e: &AssetEntry| {
+            q.is_empty()
+                || e.file
+                    .rel_path
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains(&q)
+        };
 
-        let asc     = self.sort_asc;
+        let (mut idxs, tiles): (Vec<usize>, Vec<(String, usize)>) =
+            match (self.view_mode, self.current_dir.clone()) {
+                (ViewMode::Flat, _) => {
+                    let filter = self.source_filter;
+                    let idxs = self
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, e)| {
+                            filter.map_or(true, |s| e.source_idx == s)
+                                && tab.matches(e.file.media_type)
+                                && name_matches(e)
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    (idxs, Vec::new())
+                }
+                // Folders, top level: one tile per source; searching searches everything.
+                (ViewMode::Folders, None) => {
+                    if q.is_empty() {
+                        let tiles = self
+                            .scan_roots
+                            .iter()
+                            .enumerate()
+                            .map(|(i, root)| {
+                                let count = self
+                                    .entries
+                                    .iter()
+                                    .filter(|e| e.source_idx == i && tab.matches(e.file.media_type))
+                                    .count();
+                                (config::stem_name(root), count)
+                            })
+                            .collect();
+                        (Vec::new(), tiles)
+                    } else {
+                        let idxs = self
+                            .entries
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, e)| tab.matches(e.file.media_type) && name_matches(e))
+                            .map(|(i, _)| i)
+                            .collect();
+                        (idxs, Vec::new())
+                    }
+                }
+                // Folders, inside a source: direct children + subfolder tiles;
+                // searching searches the current subtree.
+                (ViewMode::Folders, Some((src, dir))) => {
+                    if q.is_empty() {
+                        folder_children(&self.entries, src, &dir, tab)
+                    } else {
+                        let idxs = self
+                            .entries
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, e)| {
+                                e.source_idx == src
+                                    && e.file.rel_path.starts_with(&dir)
+                                    && tab.matches(e.file.media_type)
+                                    && name_matches(e)
+                            })
+                            .map(|(i, _)| i)
+                            .collect();
+                        (idxs, Vec::new())
+                    }
+                }
+            };
+        self.folder_tiles = tiles;
+
+        let asc = self.sort_asc;
         let entries = &self.entries;
         match self.sort_by {
             SortBy::Name => {
@@ -255,33 +424,191 @@ impl LodestashApp {
                 let mut paired: Vec<(usize, usize)> = idxs.iter().copied().zip(0..).collect();
                 paired.sort_by(|&(_, ka), &(_, kb)| {
                     let o = keys[ka].cmp(&keys[kb]);
-                    if asc { o } else { o.reverse() }
+                    if asc {
+                        o
+                    } else {
+                        o.reverse()
+                    }
                 });
                 idxs = paired.into_iter().map(|(i, _)| i).collect();
             }
             SortBy::Type => idxs.sort_by(|&a, &b| {
                 let o = type_key(&entries[a]).cmp(&type_key(&entries[b]));
-                if asc { o } else { o.reverse() }
+                if asc {
+                    o
+                } else {
+                    o.reverse()
+                }
             }),
             SortBy::Size => idxs.sort_by(|&a, &b| {
                 let o = entries[a].file.size_bytes.cmp(&entries[b].file.size_bytes);
-                if asc { o } else { o.reverse() }
+                if asc {
+                    o
+                } else {
+                    o.reverse()
+                }
             }),
             SortBy::Modified => idxs.sort_by(|&a, &b| {
                 let o = entries[a].file.mtime.cmp(&entries[b].file.mtime);
-                if asc { o } else { o.reverse() }
+                if asc {
+                    o
+                } else {
+                    o.reverse()
+                }
             }),
         }
 
         self.sorted_cache = idxs;
-        self.cache_dirty  = false;
+        self.selected_cache_idx =
+            selected_entry.and_then(|e| self.sorted_cache.iter().position(|&i| i == e));
+        self.cache_dirty = false;
+    }
+
+    /// Drop thumbnail textures far outside the visible window so VRAM stays bounded.
+    /// In-flight loads (spawned, no texture yet) are left alone — their send must still
+    /// decrement `pending_thumbs`; the texture lands and is evicted on a later pass.
+    fn evict_far_thumbnails(&mut self, cols: usize, row_start: usize, row_end: usize) {
+        let (keep_start, keep_end) = keep_range(row_start, row_end, cols, self.sorted_cache.len());
+        let selected_entry = self
+            .selected_cache_idx
+            .and_then(|ci| self.sorted_cache.get(ci).copied());
+
+        let keep: std::collections::HashSet<usize> = self.sorted_cache[keep_start..keep_end]
+            .iter()
+            .copied()
+            .collect();
+        for (idx, entry) in self.entries.iter_mut().enumerate() {
+            if entry.texture.is_some() && !keep.contains(&idx) && Some(idx) != selected_entry {
+                entry.texture = None;
+                entry.thumb_spawned = false;
+            }
+        }
     }
 
     fn save_view_prefs(&mut self) {
-        self.config.view.sort_by    = self.sort_by;
-        self.config.view.sort_asc   = self.sort_asc;
+        self.config.view.sort_by = self.sort_by;
+        self.config.view.sort_asc = self.sort_asc;
         self.config.view.thumb_size = self.thumb_size;
+        self.config.view.mode = self.view_mode;
         self.config.save();
+    }
+
+    // ── Folder navigation (Folders view) ──────────────────────────────────────
+
+    /// Where Folders view starts: single-source projects descend into the root
+    /// directly; multi-source projects start at the source-tile top level.
+    fn default_dir(&self) -> Option<(usize, PathBuf)> {
+        (self.scan_roots.len() == 1).then(|| (0, PathBuf::new()))
+    }
+
+    fn nav_to(&mut self, dir: Option<(usize, PathBuf)>) {
+        self.current_dir = dir;
+        self.cache_dirty = true;
+        self.nav_generation += 1;
+        self.selected_cache_idx = None;
+        self.quick_look = false;
+    }
+
+    /// Up one folder level; from a source root to the top level (multi-source only).
+    fn nav_up(&mut self) {
+        let Some((src, dir)) = self.current_dir.clone() else {
+            return;
+        };
+        if dir.as_os_str().is_empty() {
+            if self.scan_roots.len() > 1 {
+                self.nav_to(None);
+            }
+        } else {
+            let parent = dir.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+            self.nav_to(Some((src, parent)));
+        }
+    }
+
+    /// Breadcrumb + folder tiles for Folders view; handles navigation clicks.
+    fn folders_nav_ui(&mut self, ui: &mut Ui) {
+        let multi = self.scan_roots.len() > 1;
+        let mut nav: Option<Option<(usize, PathBuf)>> = None;
+
+        let crumb = |ui: &mut Ui, text: &str, active: bool| -> bool {
+            let rt = RichText::new(text).size(12.0).color(if active {
+                theme::GOLD
+            } else {
+                theme::TEXT_MUTED
+            });
+            ui.add(egui::Label::new(rt).sense(egui::Sense::click()))
+                .clicked()
+        };
+        let sep = |ui: &mut Ui| {
+            ui.label(RichText::new("/").color(theme::TEXT_DIM).size(12.0));
+        };
+
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if multi && crumb(ui, "All libraries", self.current_dir.is_none()) {
+                nav = Some(None);
+            }
+            if let Some((src, dir)) = self.current_dir.clone() {
+                if multi {
+                    sep(ui);
+                }
+                let at_root = dir.as_os_str().is_empty();
+                if crumb(ui, &config::stem_name(&self.scan_roots[src]), at_root) && !at_root {
+                    nav = Some(Some((src, PathBuf::new())));
+                }
+                let comps: Vec<String> = dir
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                let mut acc = PathBuf::new();
+                for (ci, comp) in comps.iter().enumerate() {
+                    acc.push(comp);
+                    sep(ui);
+                    let last = ci + 1 == comps.len();
+                    if crumb(ui, comp, last) && !last {
+                        nav = Some(Some((src, acc.clone())));
+                    }
+                }
+            }
+        });
+        ui.add_space(6.0);
+
+        // Folder tiles (hidden while searching — search shows subtree results flat).
+        if !self.folder_tiles.is_empty() && self.search.is_empty() {
+            let tiles = self.folder_tiles.clone();
+            let mut clicked: Option<usize> = None;
+            ScrollArea::vertical()
+                .id_salt("folder_tiles")
+                .max_height(150.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                        for (i, (name, count)) in tiles.iter().enumerate() {
+                            let btn = egui::Button::new(
+                                RichText::new(format!("\u{1F4C1} {name}   {count}"))
+                                    .color(theme::TEXT)
+                                    .size(12.0),
+                            )
+                            .fill(theme::SURFACE)
+                            .stroke(egui::Stroke::new(1.0, theme::BORDER));
+                            if ui.add(btn).clicked() {
+                                clicked = Some(i);
+                            }
+                        }
+                    });
+                });
+            ui.add_space(8.0);
+            if let Some(i) = clicked {
+                // Top level: tile index == source index (built parallel to scan_roots).
+                match self.current_dir.clone() {
+                    None => self.nav_to(Some((i, PathBuf::new()))),
+                    Some((src, dir)) => self.nav_to(Some((src, dir.join(&tiles[i].0)))),
+                }
+            }
+        }
+        if let Some(n) = nav {
+            self.nav_to(n);
+        }
     }
 
     /// Spawn thumbnail tasks for entry indices that haven't been started yet.
@@ -295,25 +622,41 @@ impl LodestashApp {
             self.pending_thumbs += 1;
 
             let abs_path = self.entries[idx].file.abs_path.clone();
-            let rel_path = self.entries[idx].file.rel_path.to_string_lossy().into_owned();
-            let tx   = self.thumb_tx.clone();
+            let rel_path = self.entries[idx]
+                .file
+                .rel_path
+                .to_string_lossy()
+                .into_owned();
+            let size_bytes = self.entries[idx].file.size_bytes;
+            let mtime = self.entries[idx].file.mtime;
+            let cache_dir = self.thumb_cache_dir.clone();
+            let tx = self.thumb_tx.clone();
             let ctx2 = ctx.clone();
 
             rayon::spawn(move || {
-                if let Some(tex) = generate_texture(&ctx2, &abs_path, &rel_path) {
-                    let _ = tx.send(ThumbReady { index: idx, texture: tex });
-                    // Do NOT call request_repaint() here — injecting a repaint from a rayon
-                    // thread during a resize event causes eframe to fire two frames back-to-back,
-                    // which appears as "reverts back" jitter. The main thread polls the channel
-                    // via request_repaint_after() in update() instead.
-                }
+                // Always send (even on failure) so pending_thumbs is always decremented.
+                // Do NOT call request_repaint() here — stray repaints from rayon during resize
+                // cause DWM jitter. The main thread polls via request_repaint_after() instead.
+                let texture = generate_texture(
+                    &ctx2,
+                    &abs_path,
+                    &rel_path,
+                    size_bytes,
+                    mtime,
+                    cache_dir.as_deref(),
+                );
+                let _ = tx.send(ThumbReady {
+                    index: idx,
+                    texture,
+                });
             });
         }
     }
 }
 
 fn name_key(e: &AssetEntry) -> String {
-    e.file.rel_path
+    e.file
+        .rel_path
         .file_stem()
         .map(|s| s.to_string_lossy().to_lowercase())
         .unwrap_or_default()
@@ -323,16 +666,71 @@ fn type_key(e: &AssetEntry) -> u8 {
     e.file.media_type.map(|m| m as u8).unwrap_or(255)
 }
 
+/// Folders view, inside a source: the assets living directly in `dir` plus one tile
+/// per child directory with its contained-asset count (recursive), both `tab`-filtered.
+/// Tiles come back name-sorted (BTreeMap).
+fn folder_children(
+    entries: &[AssetEntry],
+    src: usize,
+    dir: &std::path::Path,
+    tab: Category,
+) -> (Vec<usize>, Vec<(String, usize)>) {
+    let mut tiles: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut idxs = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        if e.source_idx != src || !tab.matches(e.file.media_type) {
+            continue;
+        }
+        let Ok(rest) = e.file.rel_path.strip_prefix(dir) else {
+            continue;
+        };
+        let mut comps = rest.components();
+        let Some(first) = comps.next() else { continue };
+        if comps.next().is_some() {
+            // Deeper than one level: counts toward its top-level child folder.
+            *tiles
+                .entry(first.as_os_str().to_string_lossy().into_owned())
+                .or_insert(0) += 1;
+        } else {
+            idxs.push(i);
+        }
+    }
+    (idxs, tiles.into_iter().collect())
+}
+
+/// How many card columns fit in `available` width. Always ≥ 1 so the grid never divides by zero.
+/// `available` is the content width *after* subtracting the scrollbar (callers do that).
+fn grid_columns(available: f32, thumb_size: f32) -> usize {
+    ((available + CARD_PAD) / (thumb_size + CARD_PAD)).max(1.0) as usize
+}
+
+/// The row window to prefetch thumbnails for: the visible `[start, end)` widened by
+/// `LOOKAHEAD_ROWS` on each side and clamped to `[0, total_rows]`.
+fn lookahead_window(start: usize, end: usize, total_rows: usize) -> (usize, usize) {
+    let buf_start = start.saturating_sub(LOOKAHEAD_ROWS);
+    let buf_end = (end + LOOKAHEAD_ROWS).min(total_rows);
+    (buf_start, buf_end)
+}
+
+/// The `sorted_cache` index range `[start, end)` whose textures stay resident:
+/// the visible row window widened by `KEEP_ROWS` on each side, in entries, clamped to `len`.
+fn keep_range(row_start: usize, row_end: usize, cols: usize, len: usize) -> (usize, usize) {
+    let keep_start = (row_start.saturating_sub(KEEP_ROWS) * cols).min(len);
+    let keep_end = ((row_end + KEEP_ROWS) * cols).min(len);
+    (keep_start, keep_end)
+}
+
 // ── eframe::App ───────────────────────────────────────────────────────────────
 
 impl eframe::App for LodestashApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.receive_scan();
         self.receive_thumbnails();
 
-        // While thumbnails are in flight, wake up at ~30 fps to drain the channel.
-        // Keeping this in the main thread (not the rayon thread) prevents stray
-        // request_repaint() calls from injecting extra frames during resize events.
-        if self.pending_thumbs > 0 {
+        // While a scan or thumbnails are in flight, wake up at ~30 fps to drain the
+        // channels. Keeping this in the main thread (not the worker threads) prevents
+        // stray request_repaint() calls from injecting extra frames during resize events.
+        if self.pending_thumbs > 0 || self.scanning {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
 
@@ -341,15 +739,20 @@ impl eframe::App for LodestashApp {
         }
 
         // ── Keyboard handling (when no text widget has focus) ─────────────────
+        if !ctx.wants_keyboard_input()
+            && self.view_mode == ViewMode::Folders
+            && ctx.input(|i| i.key_pressed(Key::Backspace))
+        {
+            self.nav_up();
+        }
         let n = self.sorted_cache.len();
-        if !self.search_focused && n > 0 {
+        if !ctx.wants_keyboard_input() && n > 0 {
             let (left, right, up, down, space, esc, slash) = ctx.input(|i| {
-                let m = Modifiers::NONE;
                 (
-                    i.key_pressed(Key::ArrowLeft)  && i.modifiers == m,
-                    i.key_pressed(Key::ArrowRight) && i.modifiers == m,
-                    i.key_pressed(Key::ArrowUp)    && i.modifiers == m,
-                    i.key_pressed(Key::ArrowDown)  && i.modifiers == m,
+                    i.key_pressed(Key::ArrowLeft) && i.modifiers.is_none(),
+                    i.key_pressed(Key::ArrowRight) && i.modifiers.is_none(),
+                    i.key_pressed(Key::ArrowUp) && i.modifiers.is_none(),
+                    i.key_pressed(Key::ArrowDown) && i.modifiers.is_none(),
                     i.key_pressed(Key::Space),
                     i.key_pressed(Key::Escape),
                     i.key_pressed(Key::Slash),
@@ -357,11 +760,15 @@ impl eframe::App for LodestashApp {
             });
 
             if slash {
-                self.search_focused = true; // toolbar will request_focus next frame
+                // Request focus on the search field; egui picks it up via the id next frame.
+                ctx.memory_mut(|m| m.request_focus(egui::Id::new("search_field")));
             }
             if esc {
-                if self.quick_look { self.quick_look = false; }
-                else               { self.selected_cache_idx = None; }
+                if self.quick_look {
+                    self.quick_look = false;
+                } else {
+                    self.selected_cache_idx = None;
+                }
             }
             if space && self.selected_cache_idx.is_some() {
                 self.quick_look = !self.quick_look;
@@ -370,14 +777,20 @@ impl eframe::App for LodestashApp {
             // Arrow nav — we need the column count from the last frame.
             let cols = self.last_cols.max(1);
             if let Some(cur) = self.selected_cache_idx {
-                let next = if      right && cur + 1 < n        { Some(cur + 1) }
-                           else if left  && cur > 0             { Some(cur - 1) }
-                           else if down  && cur + cols < n     { Some(cur + cols) }
-                           else if up    && cur >= cols          { Some(cur - cols) }
-                           else                                  { None };
+                let next = if right && cur + 1 < n {
+                    Some(cur + 1)
+                } else if left && cur > 0 {
+                    Some(cur - 1)
+                } else if down && cur + cols < n {
+                    Some(cur + cols)
+                } else if up && cur >= cols {
+                    Some(cur - cols)
+                } else {
+                    None
+                };
                 if let Some(idx) = next {
                     self.selected_cache_idx = Some(idx);
-                    if self.quick_look { /* keep Quick Look open, just moves asset */ }
+                    // quick_look stays open; navigating moves the selected asset
                 }
             } else if right || left || down || up {
                 self.selected_cache_idx = Some(0);
@@ -390,7 +803,12 @@ impl eframe::App for LodestashApp {
             .frame(
                 egui::Frame::none()
                     .fill(theme::SURFACE_RAISED)
-                    .inner_margin(egui::Margin { left: 12.0, right: 12.0, top: 8.0, bottom: 8.0 }),
+                    .inner_margin(egui::Margin {
+                        left: 12.0,
+                        right: 12.0,
+                        top: 8.0,
+                        bottom: 8.0,
+                    }),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -401,14 +819,19 @@ impl eframe::App for LodestashApp {
                             .strong(),
                     );
                     ui.separator();
-                    if ui.button(RichText::new("Open folder\u{2026}").color(theme::TEXT)).clicked() {
+                    if ui
+                        .button(RichText::new("Open folder\u{2026}").color(theme::TEXT))
+                        .clicked()
+                    {
                         self.open_folder(ctx);
                     }
                     // "Add source" only makes sense when a project is already open.
-                    if self.project_name.is_some() {
-                        if ui.button(RichText::new("+ Add source").color(theme::ARCANE)).clicked() {
-                            add_source_clicked = true;
-                        }
+                    if self.project_name.is_some()
+                        && ui
+                            .button(RichText::new("+ Add source").color(theme::ARCANE))
+                            .clicked()
+                    {
+                        add_source_clicked = true;
                     }
 
                     // Project / source info.
@@ -451,7 +874,12 @@ impl eframe::App for LodestashApp {
                 .frame(
                     egui::Frame::none()
                         .fill(theme::SURFACE)
-                        .inner_margin(egui::Margin { left: 12.0, right: 12.0, top: 4.0, bottom: 0.0 })
+                        .inner_margin(egui::Margin {
+                            left: 12.0,
+                            right: 12.0,
+                            top: 4.0,
+                            bottom: 0.0,
+                        })
                         .stroke(egui::Stroke::new(1.0, theme::BORDER)),
                 )
                 .show(ctx, |ui| {
@@ -459,12 +887,18 @@ impl eframe::App for LodestashApp {
                         ui.spacing_mut().item_spacing.x = 2.0;
                         for (i, &(cat, label)) in Category::TABS.iter().enumerate() {
                             let n = self.tab_counts[i];
-                            if n == 0 && cat != Category::All { continue; }
+                            if n == 0 && cat != Category::All {
+                                continue;
+                            }
                             let is_active = self.active_tab == cat;
                             let tab_color = cat.color();
-                            let rich = RichText::new(format!("{label}  {n}"))
-                                .size(12.0)
-                                .color(if is_active { tab_color } else { theme::TEXT_DIM });
+                            let rich = RichText::new(format!("{label}  {n}")).size(12.0).color(
+                                if is_active {
+                                    tab_color
+                                } else {
+                                    theme::TEXT_DIM
+                                },
+                            );
                             let resp = ui.add(
                                 egui::Button::new(rich)
                                     .fill(egui::Color32::TRANSPARENT)
@@ -472,14 +906,16 @@ impl eframe::App for LodestashApp {
                                     .frame(false),
                             );
                             if resp.clicked() {
-                                self.active_tab  = cat;
+                                self.active_tab = cat;
                                 self.cache_dirty = true;
                             }
                             if is_active {
                                 let rect = resp.rect;
                                 ui.painter().line_segment(
-                                    [egui::pos2(rect.min.x, rect.max.y),
-                                     egui::pos2(rect.max.x, rect.max.y)],
+                                    [
+                                        egui::pos2(rect.min.x, rect.max.y),
+                                        egui::pos2(rect.max.x, rect.max.y),
+                                    ],
                                     egui::Stroke::new(2.0, tab_color),
                                 );
                             }
@@ -492,28 +928,70 @@ impl eframe::App for LodestashApp {
                 .frame(
                     egui::Frame::none()
                         .fill(theme::SURFACE)
-                        .inner_margin(egui::Margin { left: 12.0, right: 12.0, top: 5.0, bottom: 5.0 })
+                        .inner_margin(egui::Margin {
+                            left: 12.0,
+                            right: 12.0,
+                            top: 5.0,
+                            bottom: 5.0,
+                        })
                         .stroke(egui::Stroke::new(1.0, theme::BORDER)),
                 )
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        let search_id = egui::Id::new("search_field");
                         let search_resp = ui.add(
                             egui::TextEdit::singleline(&mut self.search)
-                                .id(search_id)
+                                .id(egui::Id::new("search_field"))
                                 .hint_text("Search\u{2026}  /")
                                 .desired_width(180.0),
                         );
-                        if self.search_focused {
-                            search_resp.request_focus();
-                            self.search_focused = false;
-                        }
                         if search_resp.changed() {
                             self.cache_dirty = true;
                         }
-                        // Track whether the search box has keyboard focus so arrow keys
-                        // aren't stolen from text entry.
-                        self.search_focused = search_resp.has_focus();
+
+                        // Browse view toggle (DESIGN-GUIDELINES.md §7 "Browse views").
+                        ui.separator();
+                        for (mode, label) in
+                            [(ViewMode::Flat, "Grid"), (ViewMode::Folders, "Folders")]
+                        {
+                            let active = self.view_mode == mode;
+                            if ui
+                                .selectable_label(active, RichText::new(label).size(11.0))
+                                .clicked()
+                                && !active
+                            {
+                                self.view_mode = mode;
+                                self.nav_to(self.default_dir());
+                                self.save_view_prefs();
+                            }
+                        }
+
+                        // Library filter — flat mode, multi-source projects only.
+                        if self.view_mode == ViewMode::Flat && self.scan_roots.len() > 1 {
+                            let selected = match self.source_filter {
+                                None => "All libraries".to_owned(),
+                                Some(i) => config::stem_name(&self.scan_roots[i]),
+                            };
+                            let before = self.source_filter;
+                            egui::ComboBox::from_id_salt("lib_filter")
+                                .width(110.0)
+                                .selected_text(
+                                    RichText::new(selected).color(theme::TEXT).size(11.0),
+                                )
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.source_filter,
+                                        None,
+                                        "All libraries",
+                                    );
+                                    for i in 0..self.scan_roots.len() {
+                                        let name = config::stem_name(&self.scan_roots[i]);
+                                        ui.selectable_value(&mut self.source_filter, Some(i), name);
+                                    }
+                                });
+                            if self.source_filter != before {
+                                self.cache_dirty = true;
+                            }
+                        }
 
                         ui.separator();
                         ui.label(RichText::new("Sort").color(theme::TEXT_DIM).size(11.0));
@@ -522,7 +1000,9 @@ impl eframe::App for LodestashApp {
                         egui::ComboBox::from_id_salt("sort_combo")
                             .width(72.0)
                             .selected_text(
-                                RichText::new(self.sort_by.label()).color(theme::TEXT).size(11.0),
+                                RichText::new(self.sort_by.label())
+                                    .color(theme::TEXT)
+                                    .size(11.0),
                             )
                             .show_ui(ui, |ui| {
                                 for &(s, label) in SortBy::OPTIONS {
@@ -531,7 +1011,11 @@ impl eframe::App for LodestashApp {
                             });
 
                         let asc_before = self.sort_asc;
-                        let dir_label  = if self.sort_asc { "\u{2191}" } else { "\u{2193}" };
+                        let dir_label = if self.sort_asc {
+                            "\u{2191}"
+                        } else {
+                            "\u{2193}"
+                        };
                         if ui.small_button(dir_label).clicked() {
                             self.sort_asc = !self.sort_asc;
                         }
@@ -568,6 +1052,9 @@ impl eframe::App for LodestashApp {
             if let Some(&entry_idx) = self.sorted_cache.get(cache_idx) {
                 if let Some(entry) = self.entries.get(entry_idx) {
                     let file = &entry.file;
+                    // Library Source label — only meaningful with >1 source (DATA-MODEL.md §10).
+                    let library = (self.scan_roots.len() > 1)
+                        .then(|| config::stem_name(&self.scan_roots[entry.source_idx]));
                     egui::SidePanel::right("inspector")
                         .resizable(true)
                         .min_width(200.0)
@@ -579,17 +1066,18 @@ impl eframe::App for LodestashApp {
                                 .inner_margin(egui::Margin::same(12.0)),
                         )
                         .show(ctx, |ui| {
-                            inspector_pane(ui, file, entry.texture.as_ref());
+                            inspector_pane(ui, file, entry.texture.as_ref(), library.as_deref());
                         });
                 }
             }
         }
 
         // ── Main content ─────────────────────────────────────────────────────
-        let mut open_project:   Option<String>  = None;
-        let mut open_single:    Option<PathBuf> = None;
-        let mut spawn_queue:    Vec<usize>       = Vec::new();
-        let mut clicked_cache:  Option<usize>   = None;
+        let mut open_project: Option<String> = None;
+        let mut open_single: Option<PathBuf> = None;
+        let mut spawn_queue: Vec<usize> = Vec::new();
+        let mut clicked_cache: Option<usize> = None;
+        let mut evict_window: Option<(usize, usize, usize)> = None;
 
         egui::CentralPanel::default()
             .frame(
@@ -599,20 +1087,52 @@ impl eframe::App for LodestashApp {
             )
             .show(ctx, |ui| {
                 if self.entries.is_empty() {
-                    empty_state(ui, &self.config, &mut open_project, &mut open_single);
-                } else if self.sorted_cache.is_empty() {
-                    no_results_state(ui, &self.search);
+                    if self.scanning {
+                        scanning_state(ui);
+                    } else {
+                        empty_state(ui, &self.config, &mut open_project, &mut open_single);
+                    }
+                    return;
+                }
+                if self.view_mode == ViewMode::Folders {
+                    self.folders_nav_ui(ui);
+                }
+                let tiles_shown = self.view_mode == ViewMode::Folders
+                    && !self.folder_tiles.is_empty()
+                    && self.search.is_empty();
+                if self.sorted_cache.is_empty() {
+                    if !tiles_shown {
+                        no_results_state(ui, &self.search);
+                    }
                 } else {
-                    let (sq, new_cols, new_row_start, clicked) = thumbnail_grid(
-                        ui, &self.entries, &self.sorted_cache, self.thumb_size,
-                        self.last_cols, self.last_row_start, self.selected_cache_idx,
+                    let (sq, new_cols, new_row_start, new_row_end, clicked) = thumbnail_grid(
+                        ui,
+                        &self.entries,
+                        &self.sorted_cache,
+                        self.thumb_size,
+                        self.last_cols,
+                        self.last_row_start,
+                        self.last_row_end,
+                        self.selected_cache_idx,
+                        self.nav_generation,
                     );
-                    self.last_cols      = new_cols;
+                    if new_cols != self.last_cols
+                        || new_row_start != self.last_row_start
+                        || new_row_end != self.last_row_end
+                    {
+                        evict_window = Some((new_cols, new_row_start, new_row_end));
+                    }
+                    self.last_cols = new_cols;
                     self.last_row_start = new_row_start;
-                    spawn_queue   = sq;
+                    self.last_row_end = new_row_end;
+                    spawn_queue = sq;
                     clicked_cache = clicked;
                 }
             });
+
+        if let Some((cols, row_start, row_end)) = evict_window {
+            self.evict_far_thumbnails(cols, row_start, row_end);
+        }
 
         if let Some(cache_idx) = clicked_cache {
             if self.selected_cache_idx == Some(cache_idx) {
@@ -666,15 +1186,19 @@ impl eframe::App for LodestashApp {
 // ── Empty / no-results states ─────────────────────────────────────────────────
 
 fn empty_state(
-    ui:           &mut Ui,
-    config:       &AppConfig,
+    ui: &mut Ui,
+    config: &AppConfig,
     open_project: &mut Option<String>,
-    open_single:  &mut Option<PathBuf>,
+    open_single: &mut Option<PathBuf>,
 ) {
     let avail = ui.available_size();
     ui.add_space(avail.y * 0.18);
     ui.vertical_centered(|ui| {
-        ui.label(RichText::new("\u{25C8}").size(48.0).color(theme::GOLD.linear_multiply(0.4)));
+        ui.label(
+            RichText::new("\u{25C8}")
+                .size(48.0)
+                .color(theme::GOLD.linear_multiply(0.4)),
+        );
         ui.add_space(8.0);
         ui.label(RichText::new("Open a folder to browse your assets").color(theme::TEXT_MUTED));
         ui.add_space(4.0);
@@ -686,11 +1210,17 @@ fn empty_state(
 
         if !config.projects.is_empty() {
             ui.add_space(28.0);
-            ui.label(RichText::new("Saved Libraries").color(theme::TEXT_DIM).size(11.0));
+            ui.label(
+                RichText::new("Saved Libraries")
+                    .color(theme::TEXT_DIM)
+                    .size(11.0),
+            );
             ui.add_space(8.0);
             for proj in &config.projects {
                 let live = proj.live_paths();
-                if live.is_empty() { continue; }
+                if live.is_empty() {
+                    continue;
+                }
                 let src_label = if proj.paths.len() == 1 {
                     proj.paths[0].to_string_lossy().into_owned()
                 } else {
@@ -709,9 +1239,7 @@ fn empty_state(
                 if btn.clicked() {
                     *open_project = Some(proj.name.clone());
                 }
-                ui.label(
-                    RichText::new(src_label).color(theme::TEXT_DIM).size(10.0),
-                );
+                ui.label(RichText::new(src_label).color(theme::TEXT_DIM).size(10.0));
                 ui.add_space(4.0);
             }
         } else if !config.recent_roots.is_empty() {
@@ -719,19 +1247,34 @@ fn empty_state(
             ui.label(RichText::new("Recent").color(theme::TEXT_DIM).size(11.0));
             ui.add_space(4.0);
             for path in config.recent_roots.iter().take(5) {
-                if !path.is_dir() { continue; }
-                let label = path.file_name()
+                if !path.is_dir() {
+                    continue;
+                }
+                let label = path
+                    .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.to_string_lossy().into_owned());
                 if ui
-                    .add(egui::Button::new(RichText::new(label).color(theme::TEXT).size(12.0))
-                        .fill(egui::Color32::TRANSPARENT))
+                    .add(
+                        egui::Button::new(RichText::new(label).color(theme::TEXT).size(12.0))
+                            .fill(egui::Color32::TRANSPARENT),
+                    )
                     .clicked()
                 {
                     *open_single = Some(path.clone());
                 }
             }
         }
+    });
+}
+
+fn scanning_state(ui: &mut Ui) {
+    let avail = ui.available_size();
+    ui.add_space(avail.y * 0.3);
+    ui.vertical_centered(|ui| {
+        ui.add(egui::Spinner::new().size(28.0));
+        ui.add_space(8.0);
+        ui.label(RichText::new("Scanning\u{2026}").color(theme::TEXT_MUTED));
     });
 }
 
@@ -742,7 +1285,9 @@ fn no_results_state(ui: &mut Ui, query: &str) {
         ui.label(RichText::new("No assets match").color(theme::TEXT_MUTED));
         if !query.is_empty() {
             ui.label(
-                RichText::new(format!("\"{query}\"")).color(theme::TEXT_DIM).size(11.0),
+                RichText::new(format!("\"{query}\""))
+                    .color(theme::TEXT_DIM)
+                    .size(11.0),
             );
         }
     });
@@ -754,39 +1299,52 @@ fn no_results_state(ui: &mut Ui, query: &str) {
 /// Returns `(to_spawn, cols, row_start, clicked_cache_idx)`.
 /// The spawn-check loop only runs when cols or the visible row start changes — pure resize
 /// events that don't move either value produce no per-frame allocation work.
+// ponytail: threads viewport + selection state for one caller; a params struct would churn
+// the render path without removing complexity. Allow until a second caller justifies it.
+#[allow(clippy::too_many_arguments)]
 fn thumbnail_grid(
-    ui:                &mut Ui,
-    entries:           &[AssetEntry],
-    indices:           &[usize],
-    thumb_size:        f32,
-    prev_cols:         usize,
-    prev_row_start:    usize,
+    ui: &mut Ui,
+    entries: &[AssetEntry],
+    indices: &[usize],
+    thumb_size: f32,
+    prev_cols: usize,
+    prev_row_start: usize,
+    prev_row_end: usize,
     selected_cache_idx: Option<usize>,
-) -> (Vec<usize>, usize, usize, Option<usize>) {
-    let card_h     = thumb_size + CARD_LABEL;
-    let available  = ui.available_width() - ui.spacing().scroll.bar_width - 2.0;
-    let cols       = ((available + CARD_PAD) / (thumb_size + CARD_PAD)).max(1.0) as usize;
+    nav_salt: u64,
+) -> (Vec<usize>, usize, usize, usize, Option<usize>) {
+    let card_h = thumb_size + CARD_LABEL;
+    let available = ui.available_width() - ui.spacing().scroll.bar_width - 2.0;
+    let cols = grid_columns(available, thumb_size);
     let total_rows = indices.len().div_ceil(cols);
 
-    let mut to_spawn:    Vec<usize>   = Vec::new();
-    let mut row_start_out: usize      = prev_row_start;
-    let mut clicked:     Option<usize> = None;
+    let mut to_spawn: Vec<usize> = Vec::new();
+    let mut row_start_out: usize = prev_row_start;
+    let mut row_end_out: usize = prev_row_end;
+    let mut clicked: Option<usize> = None;
 
     ScrollArea::vertical()
+        .id_salt(("asset_grid", nav_salt)) // fresh scroll state per folder navigation
         .auto_shrink([false; 2])
         .show_rows(ui, card_h, total_rows, |ui, row_range| {
             row_start_out = row_range.start;
+            row_end_out = row_range.end;
 
-            // Only re-check the spawn buffer when the viewport or column layout changes.
-            // Pure window-resize events that don't shift cols or scroll position are free.
-            if cols != prev_cols || row_range.start != prev_row_start {
-                let buf_start = row_range.start.saturating_sub(LOOKAHEAD_ROWS);
-                let buf_end   = (row_range.end + LOOKAHEAD_ROWS).min(total_rows);
+            // Re-check the spawn buffer whenever the viewport window or column layout changes.
+            // Includes height-only resize (row_range.end grows, revealing new bottom rows).
+            if cols != prev_cols
+                || row_range.start != prev_row_start
+                || row_range.end != prev_row_end
+            {
+                let (buf_start, buf_end) =
+                    lookahead_window(row_range.start, row_range.end, total_rows);
                 for row in buf_start..buf_end {
                     let start = row * cols;
-                    let end   = (start + cols).min(indices.len());
+                    let end = (start + cols).min(indices.len());
                     for &idx in &indices[start..end] {
-                        if !entries[idx].thumb_spawned && needs_thumbnail(entries[idx].file.media_type) {
+                        if !entries[idx].thumb_spawned
+                            && needs_thumbnail(entries[idx].file.media_type)
+                        {
                             to_spawn.push(idx);
                         }
                     }
@@ -797,10 +1355,10 @@ fn thumbnail_grid(
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = CARD_PAD;
                     let start = row_idx * cols;
-                    let end   = (start + cols).min(indices.len());
+                    let end = (start + cols).min(indices.len());
                     for (col, &idx) in indices[start..end].iter().enumerate() {
                         let cache_idx = start + col;
-                        let selected  = selected_cache_idx == Some(cache_idx);
+                        let selected = selected_cache_idx == Some(cache_idx);
                         if asset_card(ui, &entries[idx], thumb_size, selected) {
                             clicked = Some(cache_idx);
                         }
@@ -809,18 +1367,19 @@ fn thumbnail_grid(
             }
         });
 
-    (to_spawn, cols, row_start_out, clicked)
+    (to_spawn, cols, row_start_out, row_end_out, clicked)
 }
 
 /// Returns true if the card was clicked.
 fn asset_card(ui: &mut Ui, entry: &AssetEntry, thumb_size: f32, selected: bool) -> bool {
-    let type_color    = entry.file.media_type
+    let type_color = entry
+        .file
+        .media_type
         .map(theme::media_type_color)
         .unwrap_or(theme::TEXT_DIM);
-    let border_color  = if selected { theme::GOLD } else { theme::BORDER };
-    let border_width  = if selected { 2.0 } else { 1.0 };
+    let border_color = if selected { theme::GOLD } else { theme::BORDER };
+    let border_width = if selected { 2.0 } else { 1.0 };
 
-    let mut clicked = false;
     let resp = egui::Frame::none()
         .fill(theme::SURFACE)
         .rounding(6.0)
@@ -853,7 +1412,10 @@ fn asset_card(ui: &mut Ui, entry: &AssetEntry, thumb_size: f32, selected: bool) 
                         ui.allocate_painter(Vec2::splat(8.0), egui::Sense::hover());
                     painter.circle_filled(dot_resp.rect.center(), 4.0, type_color);
 
-                    let name = entry.file.rel_path.file_stem()
+                    let name = entry
+                        .file
+                        .rel_path
+                        .file_stem()
                         .map(|s| s.to_string_lossy())
                         .unwrap_or_default();
                     ui.add(
@@ -866,29 +1428,36 @@ fn asset_card(ui: &mut Ui, entry: &AssetEntry, thumb_size: f32, selected: bool) 
             });
         });
 
-    // Sense clicks on the entire card frame.
-    if ui.interact(resp.response.rect, resp.response.id.with("click"), egui::Sense::click()).clicked() {
-        clicked = true;
-    }
-    clicked
+    resp.response.interact(egui::Sense::click()).clicked()
 }
 
 // ── Inspector pane ────────────────────────────────────────────────────────────
 
-fn inspector_pane(ui: &mut Ui, file: &CrawledFile, texture: Option<&TextureHandle>) {
-    let type_color = file.media_type.map(theme::media_type_color).unwrap_or(theme::TEXT_DIM);
-    let type_name  = media_type_label(file.media_type);
+fn inspector_pane(
+    ui: &mut Ui,
+    file: &CrawledFile,
+    texture: Option<&TextureHandle>,
+    library: Option<&str>,
+) {
+    let type_color = file
+        .media_type
+        .map(theme::media_type_color)
+        .unwrap_or(theme::TEXT_DIM);
+    let type_name = media_type_label(file.media_type);
 
     // Header
     ui.horizontal(|ui| {
         let (dot, painter) = ui.allocate_painter(Vec2::splat(10.0), egui::Sense::hover());
         painter.circle_filled(dot.rect.center(), 5.0, type_color);
-        let name = file.rel_path.file_stem()
+        let name = file
+            .rel_path
+            .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        ui.add(egui::Label::new(
-            RichText::new(&name).color(theme::TEXT).size(14.0).strong(),
-        ).truncate());
+        ui.add(
+            egui::Label::new(RichText::new(&name).color(theme::TEXT).size(14.0).strong())
+                .truncate(),
+        );
     });
     ui.label(RichText::new(type_name).color(type_color).size(11.0));
     ui.add(egui::Separator::default().spacing(10.0));
@@ -896,7 +1465,7 @@ fn inspector_pane(ui: &mut Ui, file: &CrawledFile, texture: Option<&TextureHandl
     // Preview (image only for now; 3D/audio come in P1)
     if let Some(tex) = texture {
         let avail_w = ui.available_width();
-        let size    = Vec2::splat(avail_w.min(240.0));
+        let size = Vec2::splat(avail_w.min(240.0));
         ui.add(
             egui::Image::new((tex.id(), size))
                 .fit_to_exact_size(size)
@@ -910,19 +1479,30 @@ fn inspector_pane(ui: &mut Ui, file: &CrawledFile, texture: Option<&TextureHandl
         .num_columns(2)
         .spacing([8.0, 4.0])
         .show(ui, |ui| {
-            stat_row(ui, "File", &file.rel_path.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default());
+            stat_row(
+                ui,
+                "File",
+                &file
+                    .rel_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            );
             stat_row(ui, "Size", &format_bytes(file.size_bytes));
             stat_row(ui, "Modified", &format_mtime(file.mtime));
+            if let Some(lib) = library {
+                stat_row(ui, "Library", lib);
+            }
             stat_row(ui, "Path", &file.abs_path.to_string_lossy());
         });
 
     ui.add_space(8.0);
     ui.label(
-        RichText::new("Space \u{2192} Quick Look  \u{2022}  \u{2191}\u{2193}\u{2190}\u{2192} navigate")
-            .color(theme::TEXT_DIM)
-            .size(10.0),
+        RichText::new(
+            "Space \u{2192} Quick Look  \u{2022}  \u{2191}\u{2193}\u{2190}\u{2192} navigate",
+        )
+        .color(theme::TEXT_DIM)
+        .size(10.0),
     );
 }
 
@@ -937,7 +1517,7 @@ fn format_bytes(bytes: u64) -> String {
         b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1 << 30) as f64),
         b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1 << 20) as f64),
         b if b >= 1 << 10 => format!("{:.1} KB", b as f64 / (1 << 10) as f64),
-        b                  => format!("{b} B"),
+        b => format!("{b} B"),
     }
 }
 
@@ -949,17 +1529,40 @@ fn format_mtime(mtime_secs: i64) -> String {
     let mut y = 1970u64;
     let mut d = days;
     loop {
-        let dy = if y % 400 == 0 || (y % 4 == 0 && y % 100 != 0) { 366 } else { 365 };
-        if d < dy { break; }
+        let dy = if y % 400 == 0 || (y % 4 == 0 && y % 100 != 0) {
+            366
+        } else {
+            365
+        };
+        if d < dy {
+            break;
+        }
         d -= dy;
         y += 1;
     }
-    let months = [31u64,
-        if y % 400 == 0 || (y % 4 == 0 && y % 100 != 0) { 29 } else { 28 },
-        31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let months = [
+        31u64,
+        if y % 400 == 0 || (y % 4 == 0 && y % 100 != 0) {
+            29
+        } else {
+            28
+        },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut m = 1u64;
     for &ml in &months {
-        if d < ml { break; }
+        if d < ml {
+            break;
+        }
         d -= ml;
         m += 1;
     }
@@ -968,14 +1571,14 @@ fn format_mtime(mtime_secs: i64) -> String {
 
 fn media_type_label(mt: Option<MediaType>) -> &'static str {
     match mt {
-        Some(MediaType::Model3d)  => "3D Model",
-        Some(MediaType::Texture)  => "Texture",
-        Some(MediaType::Audio)    => "Audio",
-        Some(MediaType::Image)    => "Image",
-        Some(MediaType::Sprite)   => "Sprite",
+        Some(MediaType::Model3d) => "3D Model",
+        Some(MediaType::Texture) => "Texture",
+        Some(MediaType::Audio) => "Audio",
+        Some(MediaType::Image) => "Image",
+        Some(MediaType::Sprite) => "Sprite",
         Some(MediaType::Material) => "Material",
-        Some(MediaType::Font)     => "Font",
-        None                      => "Unknown",
+        Some(MediaType::Font) => "Font",
+        None => "Unknown",
     }
 }
 
@@ -993,10 +1596,13 @@ fn quick_look_content(ui: &mut Ui, entry: &AssetEntry) {
                     .rounding(4.0),
             );
         } else {
-            let type_color = entry.file.media_type
+            let type_color = entry
+                .file
+                .media_type
                 .map(theme::media_type_color)
                 .unwrap_or(theme::TEXT_DIM);
-            let (resp, painter) = ui.allocate_painter(Vec2::splat(preview_size), egui::Sense::hover());
+            let (resp, painter) =
+                ui.allocate_painter(Vec2::splat(preview_size), egui::Sense::hover());
             painter.rect_filled(resp.rect, 8.0, type_color.linear_multiply(0.12));
             painter.text(
                 resp.rect.center(),
@@ -1008,12 +1614,16 @@ fn quick_look_content(ui: &mut Ui, entry: &AssetEntry) {
         }
 
         ui.add_space(12.0);
-        let name = entry.file.rel_path.file_stem()
+        let name = entry
+            .file
+            .rel_path
+            .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         ui.label(RichText::new(&name).color(theme::TEXT).size(15.0).strong());
         ui.label(
-            RichText::new(format!("{} \u{2022} {}",
+            RichText::new(format!(
+                "{} \u{2022} {}",
                 media_type_label(entry.file.media_type),
                 format_bytes(entry.file.size_bytes),
             ))
@@ -1021,37 +1631,172 @@ fn quick_look_content(ui: &mut Ui, entry: &AssetEntry) {
             .size(11.0),
         );
         ui.add_space(8.0);
-        ui.label(RichText::new("Space / Esc \u{2192} close  \u{2022}  \u{2190}\u{2192} navigate").color(theme::TEXT_DIM).size(10.0));
+        ui.label(
+            RichText::new("Space / Esc \u{2192} close  \u{2022}  \u{2190}\u{2192} navigate")
+                .color(theme::TEXT_DIM)
+                .size(10.0),
+        );
     });
 }
 
 fn type_label_char(mt: Option<MediaType>) -> &'static str {
     match mt {
-        Some(MediaType::Model3d)  => "3D",
-        Some(MediaType::Texture)  => "TX",
-        Some(MediaType::Audio)    => "\u{266A}",
-        Some(MediaType::Image)    => "IMG",
-        Some(MediaType::Sprite)   => "SP",
+        Some(MediaType::Model3d) => "3D",
+        Some(MediaType::Texture) => "TX",
+        Some(MediaType::Audio) => "\u{266A}",
+        Some(MediaType::Image) => "IMG",
+        Some(MediaType::Sprite) => "SP",
         Some(MediaType::Material) => "MAT",
-        Some(MediaType::Font)     => "A",
-        None                      => "?",
+        Some(MediaType::Font) => "A",
+        None => "?",
     }
 }
 
 // ── Background thumbnail helpers ──────────────────────────────────────────────
 
 fn needs_thumbnail(mt: Option<MediaType>) -> bool {
-    matches!(mt, Some(MediaType::Image | MediaType::Texture | MediaType::Sprite))
+    matches!(
+        mt,
+        Some(MediaType::Image | MediaType::Texture | MediaType::Sprite)
+    )
 }
 
 fn generate_texture(
-    ctx:      &egui::Context,
+    ctx: &egui::Context,
     abs_path: &std::path::Path,
     tex_name: &str,
+    size_bytes: u64,
+    mtime: i64,
+    cache_dir: Option<&std::path::Path>,
 ) -> Option<TextureHandle> {
-    let img = image::open(abs_path).ok()?;
+    // Serve from / populate the on-disk thumbnail cache (INGESTION.md §6): restarts then
+    // decode 256px cached PNGs instead of full-size originals. Falls back to a direct
+    // decode when the cache dir is unavailable or generation fails (e.g. exotic format).
+    let img = cache_dir
+        .and_then(|dir| {
+            let key = thumb::meta_key(abs_path, size_bytes, mtime);
+            let params = thumb::ThumbParams {
+                width: THUMB_GEN_SIZE,
+                height: THUMB_GEN_SIZE,
+            };
+            thumb::generate(abs_path, dir, &key, params).ok()
+        })
+        .and_then(|cached| image::open(cached).ok())
+        .or_else(|| image::open(abs_path).ok())?;
     let img = img.thumbnail(THUMB_GEN_SIZE, THUMB_GEN_SIZE).to_rgba8();
     let (w, h) = img.dimensions();
     let color_img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &img);
     Some(ctx.load_texture(tex_name, color_img, egui::TextureOptions::LINEAR))
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+// Pure layout/index math only — the render loop and egui Ui are not unit-tested.
+// Spec: TECH-STACK.md §5.1 (lodestash-ui row: "rebuild_cache order, thumbnail_grid column math").
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid_columns_is_never_zero() {
+        // Even an absurdly narrow pane yields at least one column (no div-by-zero downstream).
+        assert_eq!(grid_columns(0.0, 128.0), 1);
+        assert_eq!(grid_columns(10.0, 128.0), 1);
+        assert_eq!(grid_columns(-50.0, 128.0), 1);
+    }
+
+    #[test]
+    fn grid_columns_scales_with_width() {
+        // CARD_PAD is added to both available and the divisor: n cards of `size` + (n-1) pads fit.
+        // width for exactly 4 columns at size 100, pad 8 = 4*100 + 3*8 = 424; formula uses +pad.
+        assert_eq!(grid_columns(100.0, 100.0), 1);
+        assert_eq!(grid_columns(208.0, 100.0), 2); // (208+8)/(108) = 2.0
+        assert!(grid_columns(1000.0, 100.0) >= 9);
+    }
+
+    fn entry(src: usize, rel: &str, mt: Option<MediaType>) -> AssetEntry {
+        AssetEntry {
+            file: CrawledFile {
+                abs_path: PathBuf::from(rel),
+                rel_path: PathBuf::from(rel),
+                size_bytes: 1,
+                mtime: 0,
+                media_type: mt,
+            },
+            source_idx: src,
+            texture: None,
+            thumb_spawned: false,
+        }
+    }
+
+    #[test]
+    fn folder_children_splits_dirs_and_files() {
+        let entries = vec![
+            entry(0, "a.png", Some(MediaType::Image)),
+            entry(0, "PolygonCity/tex.png", Some(MediaType::Image)),
+            entry(0, "PolygonCity/Models/m.fbx", Some(MediaType::Model3d)),
+            entry(1, "other.png", Some(MediaType::Image)), // different source — excluded
+        ];
+        let (idxs, tiles) = folder_children(&entries, 0, std::path::Path::new(""), Category::All);
+        assert_eq!(idxs, vec![0], "only the direct-child file at the root");
+        assert_eq!(
+            tiles,
+            vec![("PolygonCity".to_owned(), 2)],
+            "subtree count is recursive"
+        );
+
+        let (idxs, tiles) = folder_children(
+            &entries,
+            0,
+            std::path::Path::new("PolygonCity"),
+            Category::All,
+        );
+        assert_eq!(idxs, vec![1]);
+        assert_eq!(tiles, vec![("Models".to_owned(), 1)]);
+    }
+
+    #[test]
+    fn folder_children_respects_tab_filter() {
+        let entries = vec![
+            entry(0, "PolygonCity/tex.png", Some(MediaType::Image)),
+            entry(0, "PolygonCity/m.fbx", Some(MediaType::Model3d)),
+        ];
+        let (idxs, tiles) = folder_children(
+            &entries,
+            0,
+            std::path::Path::new(""),
+            Category::Type(MediaType::Model3d),
+        );
+        assert!(idxs.is_empty());
+        assert_eq!(
+            tiles,
+            vec![("PolygonCity".to_owned(), 1)],
+            "tile counts are tab-filtered"
+        );
+    }
+
+    #[test]
+    fn keep_range_widens_and_clamps() {
+        // Interior window: widened KEEP_ROWS each side, in entries.
+        let (s, e) = keep_range(100, 105, 10, 10_000);
+        assert_eq!(s, (100 - KEEP_ROWS) * 10);
+        assert_eq!(e, (105 + KEEP_ROWS) * 10);
+        // Top of a short list: clamps to [0, len].
+        assert_eq!(keep_range(0, 2, 10, 100), (0, 100));
+        // Empty list never panics.
+        assert_eq!(keep_range(0, 0, 1, 0), (0, 0));
+    }
+
+    #[test]
+    fn lookahead_window_clamps_to_bounds() {
+        // Top of list: cannot go below 0.
+        assert_eq!(lookahead_window(0, 5, 100), (0, 5 + LOOKAHEAD_ROWS));
+        // Middle: widened both sides.
+        assert_eq!(
+            lookahead_window(20, 30, 100),
+            (20 - LOOKAHEAD_ROWS, 30 + LOOKAHEAD_ROWS)
+        );
+        // Bottom: end cannot exceed total_rows.
+        assert_eq!(lookahead_window(95, 100, 100), (95 - LOOKAHEAD_ROWS, 100));
+    }
 }

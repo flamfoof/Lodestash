@@ -433,7 +433,90 @@ ALTER TABLE asset ADD COLUMN license_url TEXT;
 
 ---
 
-## 10. Variants, colors & 2D / material / font assets
+## 10. Library Source labeling & asset relationships
+
+### Library Source
+
+Every asset row carries `source_id → import_source.name`. In a multi-source project (e.g. "Synty"
+folder + "Human3" folder added via *+ Add source*), `import_source.name` is the **Library Source
+label** shown in the inspector, grid badge, and search filter chip. It answers "where did this
+asset come from?" at the collection level.
+
+- **Display rule:** show the Library Source label on every asset card (small chip) and in the
+  inspector detail block whenever the active project has more than one source. Single-source
+  projects suppress it (redundant noise).
+- **Search facet:** `source_id IN (…)` is already a pre-filter column in `vec_asset`; it becomes
+  a UI filter chip ("Library: Synty") in both Search-by-Tags and AI Search modes.
+- **`import_source.name`** defaults to the root folder's stem on first add; the user can rename it
+  in Project settings without touching the file system.
+
+### Asset relationships (dependency graph)
+
+Assets reference each other — a texture is consumed by a material which is consumed by a mesh
+which is assembled into a prefab. These relationships must be **explicit rows**, not inferred at
+query time, so they survive re-indexing and are queryable ("what materials use this texture?",
+"what is this texture's parent mesh?").
+
+```sql
+-- Directed relationship edge between two assets.
+-- kind values: 'uses_texture' | 'uses_material' | 'uses_mesh' | 'uses_audio'
+--              | 'uses_script' | 'variant_of' | 'derived_from'
+-- source:      'unity_meta' (harvested from .meta GUID refs)
+--              | 'inferred'  (path-proximity / naming heuristics)
+--              | 'manual'    (user-asserted)
+CREATE TABLE asset_relationship (
+  id            INTEGER PRIMARY KEY,
+  from_asset_id INTEGER NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+  to_asset_id   INTEGER NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+  kind          TEXT NOT NULL,
+  source        TEXT NOT NULL DEFAULT 'unity_meta',
+  confidence    REAL,                     -- 0..1; null for unity_meta (deterministic)
+  UNIQUE(from_asset_id, to_asset_id, kind)
+);
+CREATE INDEX idx_rel_from ON asset_relationship(from_asset_id);
+CREATE INDEX idx_rel_to   ON asset_relationship(to_asset_id);
+```
+
+**Relationship kinds:**
+
+| `kind` | Direction | Example |
+|---|---|---|
+| `uses_texture` | material → texture | `Sword_Mat` → `Sword_Albedo.png` |
+| `uses_material` | mesh/prefab → material | `Sword.fbx` → `Sword_Mat` |
+| `uses_mesh` | prefab → mesh | `SwordPickup.prefab` → `Sword.fbx` |
+| `uses_audio` | prefab/script → audio | `FootstepController` → `gravel_step.wav` |
+| `uses_script` | prefab → script | `Player.prefab` → `PlayerController.cs` |
+| `variant_of` | recolor/LOD → source | `Sword_Gold.fbx` → `Sword.fbx` |
+| `derived_from` | baked/exported → source | `Sword_Baked.fbx` → `Sword.blend` |
+
+**Harvesting order (ingest pipeline, see [`INGESTION.md`](INGESTION.md) §5):**
+
+1. **Unity `.meta` GUID refs** — highest confidence; deterministic. A material's `.meta` file (or
+   the material YAML itself) lists the GUIDs of all textures it references. After all assets in a
+   source are indexed and `unity_guid` is populated, a second pass resolves GUID pairs into
+   `asset_relationship` rows (`source = 'unity_meta'`).
+2. **Path/naming heuristics** — for assets without `.meta` (raw exports): a texture named
+   `Human3_Albedo.png` living beside `Human3.fbx` infers `uses_texture` with `source='inferred'`
+   and `confidence ≈ 0.7`. Applies only when no `unity_meta` relationship exists.
+3. **Cross-source resolution** — GUID refs that resolve to an asset in a *different* source root
+   (e.g. a shared texture pack) are still recorded; `from_asset_id` and `to_asset_id` may differ
+   in `source_id`. This means "find all assets that use textures from the Synty source" is a
+   simple join.
+
+**UI surfaces:**
+- **Inspector → Related** tab: lists all outbound and inbound relationships with their kind and
+  Library Source label. Clicking navigates to the related asset.
+- **Grid badge:** a texture that has at least one `uses_texture` inbound edge shows a small
+  link-chain icon; hovering previews the parent material(s).
+- **Search:** `has_dependents` / `has_dependencies` as boolean filter chips. `"textures used by
+  assets from source: Synty"` resolves via a two-hop join.
+- **Export/import with deps:** when importing an asset into Unity, the relationship graph is walked
+  to offer "import with dependencies" — selecting a material auto-selects its textures. Already
+  referenced in [`ENGINE-API.md`](ENGINE-API.md) §4; `asset_relationship` is the backing table.
+
+---
+
+## 11. Variants, colors & 2D / material / font assets
 
 Backing the AssetHoard-inspired additions, kept cohesive with the existing model:
 
@@ -449,3 +532,27 @@ Backing the AssetHoard-inspired additions, kept cohesive with the existing model
   stats), `material` (a map set grouped via `asset_file` roles, previewed on a sphere), and `font`
   (glyph metrics; glyph-sheet preview). They reuse `asset`/`asset_file` as-is; only `media_type` and
   preview/normalization differ (see [`INGESTION.md`](INGESTION.md)).
+
+---
+
+## 12. Ratings & render-pipeline compatibility
+
+Two curation/compatibility columns (migration M4):
+
+```sql
+ALTER TABLE asset   ADD COLUMN rating   INTEGER;  -- 1..5 stars; NULL = unrated
+ALTER TABLE package ADD COLUMN pipeline TEXT;     -- 'built_in'|'urp'|'hdrp'|'mixed'; NULL = unknown/not applicable
+ALTER TABLE project ADD COLUMN pipeline TEXT;     -- the registered editor's pipeline (from register_project)
+```
+
+- **Rating** — the classic DAM "my go-to assets" signal. Set manually (grid/inspector stars,
+  keyboard 1–5); a numeric range filter in the query grammar
+  ([`IDENTIFICATION-AND-SEARCH.md`](IDENTIFICATION-AND-SEARCH.md) §6) and a sort key. Never
+  AI-written — it is pure user curation.
+- **Pipeline** — which Unity render pipeline a pack targets, harvested at ingest
+  ([`INGESTION.md`](INGESTION.md) §2): shader GUID references in `.mat` files (URP/HDRP shaders have
+  well-known GUIDs; custom/`Standard` shaders ⇒ `built_in`) and `com.unity.render-pipelines.*`
+  entries in any embedded package manifest. Packs shipping multiple variants are `mixed`. Compared
+  against the registered project's pipeline on import → the **`pipeline_mismatch` advisory**
+  ([`ENGINE-API.md`](ENGINE-API.md) §5.4). Material *conversion* is explicitly out of scope — we
+  warn, we don't rewrite.

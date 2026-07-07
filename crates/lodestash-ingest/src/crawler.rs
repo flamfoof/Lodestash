@@ -12,9 +12,9 @@ use super::detect;
 #[derive(Debug, Clone)]
 pub struct CrawledFile {
     pub abs_path: PathBuf,
-    pub rel_path: PathBuf,   // relative to the root passed to `crawl`
+    pub rel_path: PathBuf, // relative to the root passed to `crawl`
     pub size_bytes: u64,
-    pub mtime: i64,          // seconds since UNIX epoch
+    pub mtime: i64, // seconds since UNIX epoch
     pub media_type: Option<lodestash_core::types::MediaType>,
 }
 
@@ -41,16 +41,23 @@ pub fn crawl(root: &Path) -> Vec<CrawledFile> {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
             let media_type = detect::by_extension(&abs_path);
-            Some(CrawledFile { abs_path, rel_path, size_bytes, mtime, media_type })
+            Some(CrawledFile {
+                abs_path,
+                rel_path,
+                size_bytes,
+                mtime,
+                media_type,
+            })
         })
         .collect()
 }
 
-/// Content-hash a file with BLAKE3.
+/// Content-hash a file with BLAKE3, streaming (constant memory even for multi-GB packages).
 /// Returns the hex digest string.
 pub fn hash_file(path: &Path) -> std::io::Result<String> {
-    let data = std::fs::read(path)?;
-    Ok(blake3::hash(&data).to_hex().to_string())
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(std::fs::File::open(path)?)?;
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// Incremental diff: given a crawl result and the DB's last known (size, mtime) for a rel_path,
@@ -96,7 +103,11 @@ mod tests {
         fs::write(root.join(".hidden").join("skip.png"), b"PNG_data").unwrap();
 
         let files = crawl(root);
-        assert_eq!(files.len(), 2, "hidden dir should be skipped; got: {files:?}");
+        assert_eq!(
+            files.len(),
+            2,
+            "hidden dir should be skipped; got: {files:?}"
+        );
     }
 
     #[test]
@@ -111,7 +122,10 @@ mod tests {
         assert_eq!(files.len(), 1);
         // rel_path must be relative, not absolute
         assert!(!files[0].rel_path.is_absolute());
-        assert_eq!(files[0].media_type, Some(lodestash_core::types::MediaType::Model3d));
+        assert_eq!(
+            files[0].media_type,
+            Some(lodestash_core::types::MediaType::Model3d)
+        );
     }
 
     #[test]

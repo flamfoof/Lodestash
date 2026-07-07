@@ -48,7 +48,7 @@ facets are what let "Search by Tags" be precise and "Search with AI" turn langua
 | `mood` | theme/feel | dark, cheerful, horror, medieval, cyberpunk, fantasy | AI |
 | `usage` | role in a game | character, prop, environment, UI, VFX, weapon, vehicle, terrain | AI + mapping |
 | `audio` | sound nature | sfx, music, voice, ambient, loopable; event (explosion, wind) | CLAP/PANNs/Whisper |
-| `technical` | measurable facts | tris bucket, has-rig, has-animation, 2K, 48kHz, tileable | **file-derived (no model)** |
+| `technical` | measurable facts | tris bucket, has-rig, has-animation, 2K, 48kHz, tileable, urp/hdrp/built-in | **file-derived (no model)** |
 | `free` | anything else | high-recall catch-all | AI |
 
 - Every **AI** facet value carries a **confidence** (`asset_tag.confidence`) and `model_id`; technical
@@ -58,6 +58,38 @@ facets are what let "Search by Tags" be precise and "Search with AI" turn langua
   canonical project categories.
 - The schema *is* the contract: the local VLM, the WD tagger (mapped into facets), and the Claude API
   all emit the same shape, so search behaves identically regardless of which backend identified an asset.
+
+### The canonical tagger output (the contract, concretely)
+
+Every tier-3 tagger — local VLM (Ollama), WD-mapped, or Claude — must emit exactly this JSON shape
+(via structured output where the backend supports it, §4):
+
+```jsonc
+{
+  "subject":  [ { "value": "beaver",   "confidence": 0.93 } ],
+  "style":    [ { "value": "low-poly", "confidence": 0.88 },
+                { "value": "stylized", "confidence": 0.72 } ],
+  "material": [ { "value": "wood",     "confidence": 0.41 } ],
+  "mood":     [ { "value": "cheerful", "confidence": 0.66 } ],
+  "usage":    [ { "value": "prop",     "confidence": 0.81 } ],
+  "free":     [ { "value": "cartoon animal", "confidence": 0.70 } ],
+  "caption":  "A low-poly cartoon beaver suitable for a stylized forest scene."
+}
+```
+
+Rules the pipeline enforces (never trust the model):
+- **`color`, `technical`, and `audio` facets are never requested from a vision model** — color and
+  technical facts are derived deterministically (tier 0) and audio facets come from the local
+  CLAP/PANNs/Whisper pre-step; asking a VLM for them only invites hallucination.
+- **Validate then write:** unknown facet keys are dropped, values are normalized
+  ([`AI-PIPELINE.md`](AI-PIPELINE.md) §6: lowercase, singularize, de-Booru, alias merge), confidence
+  clamped to `[0,1]`, and per-facet value counts capped (≤ ~8) before anything lands in the catalog.
+- **Storage mapping:** each value becomes one `tag` row (`namespace` = facet) + one `asset_tag` row
+  (`source='ai'`, `confidence`, `model_id`); `caption` fills `asset.description` (FTS-searchable).
+- **Confidence is the model's self-estimate**, calibrated over time by the accept/reject log; the UI
+  threshold (~0.35) *hides* low-confidence tags, it never deletes them.
+- Non-schema backends map in: WD's flat scored labels are routed into facets by a static
+  label→namespace table; anything unroutable goes to `free`.
 
 ---
 
@@ -156,9 +188,10 @@ The filterable surface the parser (and `search_assets`) target — keep it small
 
 - **Enums (facets):** `subject`, `style`, `material`, `mood`, `usage`, `audio.*` — matched against the
   known vocabulary; unrecognized terms fall back into `semantic_text`.
-- **Numeric ranges:** `tris`, `verts`, `materials`, `bones`, `size_bytes`, `duration_ms`, `resolution`.
+- **Numeric ranges:** `tris`, `verts`, `materials`, `bones`, `size_bytes`, `duration_ms`, `resolution`,
+  `rating` (1–5 stars; [`DATA-MODEL.md`](DATA-MODEL.md) §12).
 - **Categorical:** `media_type` (model_3d/texture/audio/image/sprite/material/font), mapped `category`,
-  `package`/`publisher`, `status`, `color` (≈ `dominant_color`).
+  `package`/`publisher`, `status`, `color` (≈ `dominant_color`), `pipeline` (built_in/urp/hdrp).
 - The parser emits this as JSON via the **same structured-output mechanism** (§4) — local model or
   Haiku — then Lodestash **validates and clamps** it against the live vocab before querying, so a
   hallucinated facet can never produce a wrong-but-confident filter.

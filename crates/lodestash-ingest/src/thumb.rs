@@ -15,14 +15,31 @@ pub struct ThumbParams {
 
 impl Default for ThumbParams {
     fn default() -> Self {
-        Self { width: 256, height: 256 }
+        Self {
+            width: 256,
+            height: 256,
+        }
     }
 }
 
 /// Derive the cache path for a thumbnail.
 /// `cache_dir` is the app's thumbnail cache directory (e.g. `~/.lodestash/thumbs/`).
 pub fn cache_path(cache_dir: &Path, content_hash: &str, params: ThumbParams) -> PathBuf {
-    cache_dir.join(format!("{}_{}x{}.png", content_hash, params.width, params.height))
+    cache_dir.join(format!(
+        "{}_{}x{}.png",
+        content_hash, params.width, params.height
+    ))
+}
+
+/// Cache key for a file identified only by path metadata — same shape as a content hash.
+/// ponytail: (path,size,mtime) key until the catalog wires content_hash into the UI;
+/// an edited-in-place file with identical size+mtime serves a stale thumb, same as the crawler diff.
+pub fn meta_key(path: &Path, size_bytes: u64, mtime: i64) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(path.to_string_lossy().as_bytes());
+    hasher.update(&size_bytes.to_le_bytes());
+    hasher.update(&mtime.to_le_bytes());
+    hasher.finalize().to_hex()[..32].to_string()
 }
 
 /// Generate a thumbnail from an image file and write it to the cache.
@@ -48,7 +65,7 @@ pub fn generate(
 
     thumb
         .save_with_format(&dest, ImageFormat::Png)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     Ok(dest)
 }
@@ -85,7 +102,10 @@ mod tests {
         make_test_png(&src);
 
         let cache_dir = dir.path().join("thumbs");
-        let params = ThumbParams { width: 32, height: 32 };
+        let params = ThumbParams {
+            width: 32,
+            height: 32,
+        };
         let hash = "deadbeef";
 
         let dest = generate(&src, &cache_dir, hash, params).unwrap();
@@ -113,13 +133,30 @@ mod tests {
         let dest2 = generate(&src, &cache_dir, hash, params).unwrap();
         let mtime2 = fs::metadata(&dest2).unwrap().modified().unwrap();
 
-        assert_eq!(mtime1, mtime2, "existing thumbnail should not be regenerated");
+        assert_eq!(
+            mtime1, mtime2,
+            "existing thumbnail should not be regenerated"
+        );
     }
 
     #[test]
     fn cache_path_deterministic() {
-        let p1 = cache_path(Path::new("/cache"), "abc", ThumbParams { width: 128, height: 128 });
-        let p2 = cache_path(Path::new("/cache"), "abc", ThumbParams { width: 128, height: 128 });
+        let p1 = cache_path(
+            Path::new("/cache"),
+            "abc",
+            ThumbParams {
+                width: 128,
+                height: 128,
+            },
+        );
+        let p2 = cache_path(
+            Path::new("/cache"),
+            "abc",
+            ThumbParams {
+                width: 128,
+                height: 128,
+            },
+        );
         assert_eq!(p1, p2);
         assert!(p1.to_str().unwrap().contains("128x128"));
     }

@@ -71,11 +71,45 @@ flagged.
 |---|---|
 | **Toolchain** | Rust stable, Cargo workspace; pin via `rust-toolchain.toml` |
 | **Lint/format** | `rustfmt` + `clippy` (CI: `-D warnings`) |
-| **Tests** | `cargo test` + `insta` (snapshots) + a **regression corpus** of small real `.unitypackage`/asset samples |
-| **CI** | GitHub Actions: build + clippy + test on Windows/macOS/Linux; sccache; artifact upload |
+| **Tests** | `cargo test` + `insta` (snapshots) + `proptest` (properties) + `criterion` (benches); a **regression corpus** of small real asset samples — full layer matrix in **§5.1** |
+| **CI** | GitHub Actions: `fmt` + `clippy` (`-D warnings`) + build + test on Windows/macOS/Linux; sccache; artifact upload |
 | **Packaging** | `cargo-dist` (installers) / `cargo-bundle` / WiX (Windows); single binary + bundled sidecar; first-run **model download** step |
 | **Versioning** | semver for the app; the engine **REST/MCP surface is `/v1/`** and independently versioned |
 | **Errors/logging** | `thiserror` (libs) + `anyhow` (boundaries) + `tracing` (structured logs) |
+
+**Test dev-dependencies** (workspace `[dev-dependencies]`, not shipped): `insta` (snapshot
+assertions), `proptest` (property-based), `criterion` (benchmarks), `tempfile` (fixture dirs,
+already used). Real-model AI inference is **not** run in CI (non-deterministic, weight-dependent,
+slow) — gate those behind `--features model-tests` for local/nightly runs; CI uses mock
+`Tagger`/`Embedder` impls.
+
+### 5.1 QA matrix — what each layer tests
+
+The rule: **logic lives in pure, testable functions; the render loop and I/O stay thin.** Anything
+non-trivial (a branch, a parser, a ranking, a money/security/provenance path) leaves a test behind.
+
+| Layer | What gets tested | Tooling |
+|---|---|---|
+| `lodestash-core` — catalog | schema migrations apply clean on an empty DB; asset/file CRUD round-trips; soft-delete + move/rename (vanished path + same `content_hash` ⇒ `rel_path` updated, `asset_id`/tags/embeddings preserved) | `cargo test` on in-memory SQLite |
+| `lodestash-core` — search | **RRF fusion is deterministic** given fixed BM25 + KNN rank lists; pre-filter is a hard boolean (tag/category/source never leak past it); `k≈60` weighting | unit + `proptest` (fused order invariant under rank perturbation) |
+| `lodestash-core` — mapping | rule priority resolution (lower wins); **pinned overrides survive re-apply**; re-map on `taxonomy.version` bump regenerates only non-pinned rows | unit |
+| `lodestash-core` — relationships | GUID-pair resolution → expected `asset_relationship` edges; **cross-source edges** resolve (texture in source A ← material in source B); inbound/outbound traversal; dup-guard `UNIQUE(asset_id, project_id)` | unit + corpus |
+| `lodestash-ingest` | format detect by magic bytes (table-driven); `.unitypackage` untar → GUID→pathname map; `.meta` `labels:` + GUID-ref parse; content/non-content classification; **existing**: crawl, BLAKE3, dedup | unit + `insta` (parse snapshots) + corpus |
+| `lodestash-ai` | tag normalization + confidence thresholding; per-modality `local\|api` routing; trait contracts via **mock** impls | unit (mocks) |
+| `lodestash-mcp` + `lodestash-api` | **the MCP↔REST 1:1 invariant is a test** — assert the tool set and the endpoint set are identical (fails CI if one plane gains an op the other lacks); request/response schema snapshots; handshake-token rejection | `insta` + a shared op-registry test |
+| `lodestash-ui` | pure helpers only: `rebuild_cache` sort/filter order, `thumbnail_grid` column math, lookahead-window index range; **not** rendering | unit |
+| `lodestash-cli` | scan a fixture dir → assert JSON output shape | unit (calls core lib directly) |
+
+**Regression corpus** (`tests/corpus/`, committed): tiny real samples — a few-KB `.unitypackage`
+(GUID folders + `.meta` with `labels:` and GUID refs), a BCn `.dds`, an `.fbx`, a `.wav`, a `.psd`,
+a material + its textures (to exercise the relationship harvest). Each pairs with an `insta`
+snapshot of its parsed output, so a parser regression shows as a reviewable diff. **Keep samples
+small and license-clean** (self-authored or CC0) — they ship in the repo.
+
+**Performance gate** (`criterion`, dev/nightly — not a hard CI fail; shared runners are noisy):
+crawl throughput, `rebuild_cache` on 100k synthetic rows, hybrid-search latency at 100k vectors.
+Tracks the §6/§3 perf claims (FTS5 sub-10 ms, KNN tens-of-ms) so a regression is visible before
+release.
 
 ---
 
