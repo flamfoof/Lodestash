@@ -5,5 +5,7 @@
 pub mod crawler;
 pub mod detect;
 pub mod thumb;
+pub mod unitypackage;
+pub mod workspace;
 
 pub use lodestash_core::types::MediaType;

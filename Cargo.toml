@@ -41,9 +41,12 @@ blake3 = "1"
 rusqlite = { version = "0.32", features = ["bundled", "blob", "load_extension"] }
 
 # Ingest
-walkdir = "2"
-notify  = { version = "7", features = ["serde"] }
-image   = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff", "webp", "gif"] }
+walkdir    = "2"
+notify     = { version = "7", features = ["serde"] }
+image      = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff", "webp", "gif"] }
+flate2     = "1"
+tar        = "0.4"
+serde_yaml = "0.9"
 
 # UI
 eframe = { version = "0.29", features = ["wgpu"] }

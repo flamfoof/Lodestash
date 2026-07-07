@@ -17,12 +17,13 @@ tracing        = { workspace = true }
 rayon          = { workspace = true }
 blake3         = { workspace = true }
 
-walkdir = { workspace = true }
-image   = { workspace = true }
+walkdir    = { workspace = true }
+image      = { workspace = true }
+flate2     = { workspace = true }
+tar        = { workspace = true }
+serde_yaml = { workspace = true }
 
-# Added in P2:
-# flate2    = "1"   # .unitypackage (gzip+tar)
-# tar       = "0.4"
+# Added later in P2:
 # notify    = { workspace = true }  # file watching
 # image_dds = "0.7" # DDS/BCn textures
 
