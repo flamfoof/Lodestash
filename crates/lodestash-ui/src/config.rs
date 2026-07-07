@@ -61,6 +61,13 @@ impl LibraryProject {
         self.paths.push(path);
         true
     }
+
+    /// Remove a source path. Returns true if it was present and removed.
+    pub fn remove_path(&mut self, path: &Path) -> bool {
+        let before = self.paths.len();
+        self.paths.retain(|p| p != path);
+        self.paths.len() != before
+    }
 }
 
 // ── View preferences ──────────────────────────────────────────────────────────
@@ -179,6 +186,21 @@ impl AppConfig {
         }
     }
 
+    /// Remove a source folder from an existing project by name. Never touches the files on
+    /// disk — only the catalog's reference to them (DATA-MODEL.md §6 non-destructive rule).
+    /// Returns false if the project or the path wasn't found.
+    pub fn remove_source_from_project(&mut self, project_name: &str, path: &Path) -> bool {
+        if let Some(proj) = self.projects.iter_mut().find(|p| p.name == project_name) {
+            let removed = proj.remove_path(path);
+            if removed {
+                self.save();
+            }
+            removed
+        } else {
+            false
+        }
+    }
+
     /// Add `path` to saved projects under its folder name if not already in any project.
     /// Returns the project name it was added to (or already existed under).
     fn upsert_single_path_project(&mut self, path: PathBuf) -> String {
@@ -215,6 +237,12 @@ pub(crate) fn stem_name(path: &Path) -> String {
 
 fn config_path() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("Lodestash").join("config.json"))
+}
+
+/// Where `config.json` lives on this OS — surfaced in the UI so the user can find/back up their
+/// project list without hunting through `dirs::config_dir()` conventions themselves.
+pub fn config_file_path() -> Option<PathBuf> {
+    config_path()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -276,6 +304,20 @@ mod tests {
         assert!(proj.add_path(p("/b")), "new path is added");
         assert!(!proj.add_path(p("/a")), "existing path is not re-added");
         assert_eq!(proj.paths, vec![p("/a"), p("/b")]);
+    }
+
+    #[test]
+    fn remove_path_removes_present_and_reports_absent() {
+        let mut proj = LibraryProject {
+            name: "Synty".into(),
+            paths: vec![p("/a"), p("/b")],
+        };
+        assert!(proj.remove_path(&p("/a")));
+        assert_eq!(proj.paths, vec![p("/b")]);
+        assert!(
+            !proj.remove_path(&p("/a")),
+            "already removed, nothing to do"
+        );
     }
 
     #[test]
