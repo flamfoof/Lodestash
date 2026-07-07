@@ -73,6 +73,25 @@ pub struct PackageEntry {
     pub has_preview: bool,
 }
 
+/// Extract the real path from a `pathname` entry's raw content. Spec is one line, but some
+/// third-party repackaging tools append trailing garbage after a newline (observed in the wild:
+/// a bundled-variant wrapper package appending a stray `00` line) — only the first line is ever
+/// the real path, so anything after a newline is discarded rather than passed through into a
+/// filesystem path (a raw newline is an invalid Windows filename character and would panic
+/// `File::create`).
+fn parse_pathname(raw: &str) -> String {
+    raw.lines().next().unwrap_or("").trim().to_string()
+}
+
+/// Strip characters that are invalid in a Windows filename (control chars and `<>:"/\|?*`) from
+/// a workspace-file basename. Belt-and-suspenders on top of [`parse_pathname`] — a well-formed
+/// `pathname` shouldn't hit this, but the workspace write must never panic on hostile input.
+fn sanitize_basename(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_control() && !r#"<>:"/\|?*"#.contains(*c))
+        .collect()
+}
+
 fn guid_and_member(entry_path: &Path) -> Option<(String, String)> {
     let mut components = entry_path.components();
     let guid = components.next()?.as_os_str().to_string_lossy().to_string();
@@ -104,7 +123,7 @@ pub fn read_manifest(path: &Path) -> io::Result<Vec<PackageEntry>> {
             "pathname" => {
                 let mut s = String::new();
                 entry.read_to_string(&mut s)?;
-                rec.pathname = Some(s.trim().to_string());
+                rec.pathname = Some(parse_pathname(&s));
             }
             "asset.meta" => {
                 let mut s = String::new();
@@ -155,7 +174,7 @@ pub fn extract_to_workspace(path: &Path, dest: &Path) -> io::Result<Vec<Extracte
             "pathname" => {
                 let mut s = String::new();
                 entry.read_to_string(&mut s)?;
-                pathnames.insert(guid, s.trim().to_string());
+                pathnames.insert(guid, parse_pathname(&s));
             }
             "asset" => {
                 let tmp_path = tmp_dir.join(&guid);
@@ -172,7 +191,8 @@ pub fn extract_to_workspace(path: &Path, dest: &Path) -> io::Result<Vec<Extracte
         let basename = pathname
             .as_deref()
             .and_then(|p| Path::new(p).file_name())
-            .map(|n| n.to_string_lossy().to_string())
+            .map(|n| sanitize_basename(&n.to_string_lossy()))
+            .filter(|n| !n.is_empty())
             .unwrap_or_else(|| guid.clone());
 
         let out_dir = dest.join(&hash);
@@ -314,5 +334,34 @@ mod tests {
         let extracted_again = extract_to_workspace(&pkg, &workspace).unwrap();
         assert_eq!(extracted_again[0].content_hash, asset.content_hash);
         assert_eq!(extracted_again[0].workspace_path, asset.workspace_path);
+    }
+
+    #[test]
+    fn pathname_trailing_garbage_line_is_discarded() {
+        // Observed in the wild: a third-party repackaging tool appends a stray "00" line after
+        // the real path. A raw embedded newline is an invalid Windows filename character, so
+        // this must not reach `extract_to_workspace`'s basename derivation.
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = build_test_package(
+            dir.path(),
+            "abc123",
+            "Assets/Toon Fantasy Nature/_ReadFirst.txt\n00",
+            "fileFormatVersion: 2\nguid: abc123\n",
+            b"README_PAYLOAD",
+        );
+
+        let manifest = read_manifest(&pkg).unwrap();
+        assert_eq!(
+            manifest[0].pathname.as_deref(),
+            Some("Assets/Toon Fantasy Nature/_ReadFirst.txt")
+        );
+
+        let workspace = dir.path().join("workspace");
+        let extracted = extract_to_workspace(&pkg, &workspace).unwrap();
+        assert_eq!(
+            extracted[0].workspace_path.file_name().unwrap(),
+            "_ReadFirst.txt"
+        );
+        assert!(extracted[0].workspace_path.exists());
     }
 }
