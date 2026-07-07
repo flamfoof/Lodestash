@@ -823,6 +823,8 @@ impl eframe::App for LodestashApp {
 
         // ── Top bar ──────────────────────────────────────────────────────────
         let mut add_source_clicked = false;
+        let mut open_folder_clicked = false;
+        let mut project_to_open: Option<String> = None;
         egui::TopBottomPanel::top("topbar")
             .frame(
                 egui::Frame::none()
@@ -843,12 +845,57 @@ impl eframe::App for LodestashApp {
                             .strong(),
                     );
                     ui.separator();
-                    if ui
-                        .button(RichText::new("Open folder\u{2026}").color(theme::TEXT))
-                        .clicked()
-                    {
-                        self.open_folder(ctx);
-                    }
+
+                    ui.menu_button(RichText::new("File").color(theme::TEXT), |ui| {
+                        if let Some(name) = &self.project_name {
+                            let location = if self.scan_roots.len() == 1 {
+                                self.scan_roots[0].to_string_lossy().into_owned()
+                            } else {
+                                self.scan_roots
+                                    .iter()
+                                    .map(|p| p.to_string_lossy().into_owned())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            };
+                            ui.label(
+                                RichText::new(format!("Current: {name}"))
+                                    .color(theme::TEXT_DIM)
+                                    .size(11.0),
+                            );
+                            ui.label(RichText::new(location).color(theme::TEXT_DIM).size(10.0));
+                            ui.separator();
+                        }
+
+                        if ui.button("Open folder\u{2026}").clicked() {
+                            open_folder_clicked = true;
+                            ui.close_menu();
+                        }
+
+                        let switchable: Vec<&config::LibraryProject> = self
+                            .config
+                            .projects
+                            .iter()
+                            .filter(|p| !p.live_paths().is_empty())
+                            .collect();
+                        if !switchable.is_empty() {
+                            ui.separator();
+                            ui.label(RichText::new("Projects").color(theme::TEXT_DIM).size(11.0));
+                            for proj in switchable {
+                                let is_current = self.project_name.as_deref() == Some(&proj.name);
+                                let prefix = if is_current { "\u{2713} " } else { "    " };
+                                let resp = ui.button(
+                                    RichText::new(format!("{prefix}{}", proj.name))
+                                        .color(if is_current { theme::GOLD } else { theme::TEXT }),
+                                );
+                                if resp.clicked() {
+                                    if !is_current {
+                                        project_to_open = Some(proj.name.clone());
+                                    }
+                                    ui.close_menu();
+                                }
+                            }
+                        }
+                    });
                     // "Add source" only makes sense when a project is already open.
                     if self.project_name.is_some()
                         && ui
@@ -898,6 +945,12 @@ impl eframe::App for LodestashApp {
                 });
             });
 
+        if open_folder_clicked {
+            self.open_folder(ctx);
+        }
+        if let Some(name) = project_to_open {
+            self.open_project(ctx, &name);
+        }
         if add_source_clicked {
             self.add_source(ctx);
         }
