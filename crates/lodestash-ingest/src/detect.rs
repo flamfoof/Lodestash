@@ -40,6 +40,65 @@ pub fn by_extension(path: &Path) -> Option<MediaType> {
     }
 }
 
+/// Extensions that are pipeline plumbing, never browseable content (INGESTION.md §3).
+const NON_CONTENT_EXTENSIONS: &[&str] = &[
+    "cs", "js", "dll", "asmdef", "asmref", "shader", "cginc", "hlsl", "compute", "unity",
+];
+
+/// `.meta` importer types that are always non-content, regardless of extension.
+const NON_CONTENT_IMPORTERS: &[&str] = &[
+    "MonoImporter",
+    "PluginImporter",
+    "AssemblyDefinitionImporter",
+];
+
+/// `.meta` importer types that are non-content only when the file isn't already a recognized
+/// media type — a raw PNG imported via a custom `ScriptedImporter` is still an image.
+const NON_CONTENT_IMPORTERS_IF_UNCLASSIFIED: &[&str] = &["ScriptedImporter", "DefaultImporter"];
+
+/// Editor-only folder names — anything nested under one is tooling, not shippable content.
+const NON_CONTENT_FOLDERS: &[&str] = &["Editor", "Gizmos"];
+
+/// Classify a file as browseable content vs. non-content (scripts, DLLs, shaders, editor
+/// tooling — INGESTION.md §3). Non-content rows are kept, not deleted, but excluded from the
+/// default grid/search.
+///
+/// `ext` is the lowercase extension (no dot); `importer` is the Unity `.meta` importer type when
+/// known (from [`crate::unitypackage::UnityMeta::importer`]); `rel_path` is checked for
+/// editor-only folders; `has_media_type` is whether `by_extension`/`by_magic` already classified
+/// the file as a real media type.
+pub fn is_content(
+    ext: Option<&str>,
+    importer: Option<&str>,
+    rel_path: &Path,
+    has_media_type: bool,
+) -> bool {
+    if let Some(ext) = ext {
+        if NON_CONTENT_EXTENSIONS.contains(&ext) {
+            return false;
+        }
+    }
+
+    if rel_path.components().any(|c| {
+        NON_CONTENT_FOLDERS
+            .iter()
+            .any(|folder| c.as_os_str() == *folder)
+    }) {
+        return false;
+    }
+
+    if let Some(importer) = importer {
+        if NON_CONTENT_IMPORTERS.contains(&importer) {
+            return false;
+        }
+        if !has_media_type && NON_CONTENT_IMPORTERS_IF_UNCLASSIFIED.contains(&importer) {
+            return false;
+        }
+    }
+
+    true
+}
+
 /// Detect media type from magic bytes (first 16 bytes of the file).
 /// Called as fallback when extension detection fails or is ambiguous.
 pub fn by_magic(header: &[u8]) -> Option<MediaType> {
@@ -199,5 +258,83 @@ mod tests {
         assert_eq!(by_magic(b"DDS foo"), Some(MediaType::Texture));
         assert_eq!(by_magic(b"OggSxxxxxx"), Some(MediaType::Audio));
         assert_eq!(by_magic(b"fLaC"), Some(MediaType::Audio));
+    }
+
+    #[test]
+    fn is_content_excludes_by_extension() {
+        assert!(!is_content(
+            Some("cs"),
+            None,
+            &PathBuf::from("Scripts/Player.cs"),
+            false
+        ));
+        assert!(!is_content(
+            Some("dll"),
+            None,
+            &PathBuf::from("Plugins/Native.dll"),
+            false
+        ));
+        assert!(is_content(
+            Some("png"),
+            None,
+            &PathBuf::from("Textures/albedo.png"),
+            true
+        ));
+    }
+
+    #[test]
+    fn is_content_excludes_editor_only_folders() {
+        assert!(!is_content(
+            Some("png"),
+            None,
+            &PathBuf::from("Assets/Editor/icon.png"),
+            true
+        ));
+        assert!(!is_content(
+            Some("fbx"),
+            None,
+            &PathBuf::from("Assets/Gizmos/marker.fbx"),
+            true
+        ));
+        assert!(is_content(
+            Some("png"),
+            None,
+            &PathBuf::from("Assets/Textures/icon.png"),
+            true
+        ));
+    }
+
+    #[test]
+    fn is_content_excludes_by_importer() {
+        // MonoImporter/PluginImporter/AssemblyDefinitionImporter are always non-content
+        assert!(!is_content(
+            None,
+            Some("MonoImporter"),
+            &PathBuf::from("Scripts/Player"),
+            false
+        ));
+        assert!(!is_content(
+            None,
+            Some("AssemblyDefinitionImporter"),
+            &PathBuf::from("Foo.asmdef"),
+            false
+        ));
+
+        // DefaultImporter/ScriptedImporter are non-content only for unclassified files
+        assert!(!is_content(
+            None,
+            Some("DefaultImporter"),
+            &PathBuf::from("Data/config"),
+            false
+        ));
+        assert!(
+            is_content(
+                Some("png"),
+                Some("DefaultImporter"),
+                &PathBuf::from("Textures/albedo.png"),
+                true
+            ),
+            "a media file imported via DefaultImporter is still content"
+        );
     }
 }
