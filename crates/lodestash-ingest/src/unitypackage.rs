@@ -1,0 +1,318 @@
+//! `.unitypackage` parsing: gzip+tar of GUID folders, each holding `asset` (raw bytes),
+//! `asset.meta` (YAML: GUID/importer/labels), and `pathname` (the real Assets/ path).
+//! Spec: INGESTION.md §2 (archive memory model), §3 step 3.
+//!
+//! Two passes, matching the spec's memory model:
+//! - [`read_manifest`] — browse pass. Reads only the small entries (`pathname`, `asset.meta`);
+//!   the `asset` payload's size comes from the tar header, never its body. O(1) memory regardless
+//!   of package size.
+//! - [`extract_to_workspace`] — ingest pass. One streaming extract of every `asset` payload into a
+//!   content-addressed (BLAKE3) workspace directory, idempotent by hash.
+
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+
+use flate2::read::GzDecoder;
+
+/// Parsed `.meta` sidecar: GUID, Unity importer type, and author-assigned labels (seed tags).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UnityMeta {
+    pub guid: Option<String>,
+    /// The importer type key (e.g. `TextureImporter`, `ModelImporter`) — the first top-level YAML
+    /// key that isn't one of the known administrative fields. Feeds non-content classification
+    /// (INGESTION.md §3).
+    pub importer: Option<String>,
+    pub labels: Vec<String>,
+}
+
+/// Top-level `.meta` keys that are never an importer type.
+const META_ADMIN_KEYS: &[&str] = &[
+    "fileFormatVersion",
+    "guid",
+    "labels",
+    "assetBundleName",
+    "assetBundleVariant",
+];
+
+/// Parse a Unity `.meta` YAML document. Malformed YAML yields an empty `UnityMeta` rather than
+/// failing the whole package — one bad sidecar shouldn't abort ingest of everything else.
+pub fn parse_meta(yaml: &str) -> UnityMeta {
+    let mut meta = UnityMeta::default();
+    let Ok(serde_yaml::Value::Mapping(map)) = serde_yaml::from_str(yaml) else {
+        return meta;
+    };
+    for (k, v) in &map {
+        let Some(key) = k.as_str() else { continue };
+        if key == "guid" {
+            meta.guid = v.as_str().map(str::to_string);
+        } else if key == "labels" {
+            if let Some(seq) = v.as_sequence() {
+                meta.labels = seq
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect();
+            }
+        } else if meta.importer.is_none() && !META_ADMIN_KEYS.contains(&key) {
+            meta.importer = Some(key.to_string());
+        }
+    }
+    meta
+}
+
+/// One GUID folder's worth of manifest data — a browse-pass row.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PackageEntry {
+    pub guid: String,
+    /// Real Assets/-relative path, from the `pathname` entry.
+    pub pathname: Option<String>,
+    pub meta: UnityMeta,
+    /// Byte size of the `asset` payload, read from the tar header only (body never buffered).
+    pub asset_size: Option<u64>,
+    pub has_preview: bool,
+}
+
+fn guid_and_member(entry_path: &Path) -> Option<(String, String)> {
+    let mut components = entry_path.components();
+    let guid = components.next()?.as_os_str().to_string_lossy().to_string();
+    let member = components.next()?.as_os_str().to_string_lossy().to_string();
+    Some((guid, member))
+}
+
+/// Browse pass: enumerate every GUID folder's `pathname`/`asset.meta`/`asset` size/`preview.png`
+/// presence without ever buffering an `asset` payload's bytes. Returned in GUID order.
+pub fn read_manifest(path: &Path) -> io::Result<Vec<PackageEntry>> {
+    let file = File::open(path)?;
+    let gz = GzDecoder::new(file);
+    let mut archive = tar::Archive::new(gz);
+
+    let mut by_guid: BTreeMap<String, PackageEntry> = BTreeMap::new();
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let entry_path = entry.path()?.to_path_buf();
+        let Some((guid, member)) = guid_and_member(&entry_path) else {
+            continue;
+        };
+        let rec = by_guid.entry(guid.clone()).or_insert_with(|| PackageEntry {
+            guid: guid.clone(),
+            ..Default::default()
+        });
+
+        match member.as_str() {
+            "pathname" => {
+                let mut s = String::new();
+                entry.read_to_string(&mut s)?;
+                rec.pathname = Some(s.trim().to_string());
+            }
+            "asset.meta" => {
+                let mut s = String::new();
+                entry.read_to_string(&mut s)?;
+                rec.meta = parse_meta(&s);
+            }
+            "asset" => rec.asset_size = Some(entry.header().size()?),
+            "preview.png" => rec.has_preview = true,
+            _ => {}
+        }
+    }
+
+    Ok(by_guid.into_values().collect())
+}
+
+/// One `asset` payload extracted into the workspace.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtractedAsset {
+    pub guid: String,
+    pub pathname: Option<String>,
+    pub content_hash: String,
+    pub workspace_path: PathBuf,
+    pub size_bytes: u64,
+}
+
+/// Ingest pass: one streaming extract of every `asset` payload into `dest/<blake3-hex>/<basename>`.
+/// Content-addressed and idempotent — if the destination already exists (same bytes, same hash),
+/// the freshly-extracted temp copy is discarded rather than rewritten.
+pub fn extract_to_workspace(path: &Path, dest: &Path) -> io::Result<Vec<ExtractedAsset>> {
+    let tmp_dir = dest.join(".tmp");
+    std::fs::create_dir_all(&tmp_dir)?;
+
+    let file = File::open(path)?;
+    let gz = GzDecoder::new(file);
+    let mut archive = tar::Archive::new(gz);
+
+    let mut pathnames: BTreeMap<String, String> = BTreeMap::new();
+    let mut payloads: BTreeMap<String, (PathBuf, String, u64)> = BTreeMap::new();
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let entry_path = entry.path()?.to_path_buf();
+        let Some((guid, member)) = guid_and_member(&entry_path) else {
+            continue;
+        };
+
+        match member.as_str() {
+            "pathname" => {
+                let mut s = String::new();
+                entry.read_to_string(&mut s)?;
+                pathnames.insert(guid, s.trim().to_string());
+            }
+            "asset" => {
+                let tmp_path = tmp_dir.join(&guid);
+                let (hash, size) = stream_hash_to_file(&mut entry, &tmp_path)?;
+                payloads.insert(guid, (tmp_path, hash, size));
+            }
+            _ => {}
+        }
+    }
+
+    let mut extracted = Vec::with_capacity(payloads.len());
+    for (guid, (tmp_path, hash, size)) in payloads {
+        let pathname = pathnames.get(&guid).cloned();
+        let basename = pathname
+            .as_deref()
+            .and_then(|p| Path::new(p).file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| guid.clone());
+
+        let out_dir = dest.join(&hash);
+        std::fs::create_dir_all(&out_dir)?;
+        let out_path = out_dir.join(&basename);
+        if out_path.exists() {
+            std::fs::remove_file(&tmp_path)?;
+        } else {
+            std::fs::rename(&tmp_path, &out_path)?;
+        }
+        extracted.push(ExtractedAsset {
+            guid,
+            pathname,
+            content_hash: hash,
+            workspace_path: out_path,
+            size_bytes: size,
+        });
+    }
+    let _ = std::fs::remove_dir(&tmp_dir); // best-effort; empty once every payload is moved out
+    Ok(extracted)
+}
+
+/// Stream a tar entry to `dest` while hashing it, without holding the payload in memory.
+fn stream_hash_to_file(entry: &mut impl Read, dest: &Path) -> io::Result<(String, u64)> {
+    let mut out = File::create(dest)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut size: u64 = 0;
+    loop {
+        let n = entry.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        out.write_all(&buf[..n])?;
+        size += n as u64;
+    }
+    Ok((hasher.finalize().to_hex().to_string(), size))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal but real `.unitypackage`: one GUID folder with `asset`/`asset.meta`/`pathname`.
+    fn build_test_package(
+        dir: &Path,
+        guid: &str,
+        pathname: &str,
+        meta_yaml: &str,
+        asset_bytes: &[u8],
+    ) -> PathBuf {
+        let pkg_path = dir.join("test.unitypackage");
+        let file = File::create(&pkg_path).unwrap();
+        let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(gz);
+
+        let mut append = |member: &str, bytes: &[u8]| {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, format!("{guid}/{member}"), bytes)
+                .unwrap();
+        };
+        append("asset", asset_bytes);
+        append("asset.meta", meta_yaml.as_bytes());
+        append("pathname", pathname.as_bytes());
+
+        builder.into_inner().unwrap().finish().unwrap();
+        pkg_path
+    }
+
+    #[test]
+    fn parse_meta_extracts_guid_labels_and_importer() {
+        let yaml = "fileFormatVersion: 2\nguid: 8f338a7a1b2c3d4e5f6a7b8c9d0e1f2a\nlabels:\n- Prop\n- Medieval\nTextureImporter:\n  mipmaps: 1\n";
+        let meta = parse_meta(yaml);
+        assert_eq!(
+            meta.guid.as_deref(),
+            Some("8f338a7a1b2c3d4e5f6a7b8c9d0e1f2a")
+        );
+        assert_eq!(meta.labels, vec!["Prop", "Medieval"]);
+        assert_eq!(meta.importer.as_deref(), Some("TextureImporter"));
+    }
+
+    #[test]
+    fn parse_meta_malformed_yaml_yields_empty() {
+        let meta = parse_meta("not: valid: yaml: [");
+        assert_eq!(meta, UnityMeta::default());
+    }
+
+    #[test]
+    fn read_manifest_recovers_pathname_meta_and_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = build_test_package(
+            dir.path(),
+            "abc123",
+            "Assets/Props/Barrel.png",
+            "fileFormatVersion: 2\nguid: abc123\nlabels:\n- Prop\nTextureImporter:\n  mipmaps: 1\n",
+            b"PNGDATA_PAYLOAD",
+        );
+
+        let manifest = read_manifest(&pkg).unwrap();
+        assert_eq!(manifest.len(), 1);
+        let entry = &manifest[0];
+        assert_eq!(entry.guid, "abc123");
+        assert_eq!(entry.pathname.as_deref(), Some("Assets/Props/Barrel.png"));
+        assert_eq!(entry.meta.labels, vec!["Prop"]);
+        assert_eq!(entry.meta.importer.as_deref(), Some("TextureImporter"));
+        assert_eq!(entry.asset_size, Some(b"PNGDATA_PAYLOAD".len() as u64));
+        assert!(!entry.has_preview);
+    }
+
+    #[test]
+    fn extract_to_workspace_is_content_addressed_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = build_test_package(
+            dir.path(),
+            "abc123",
+            "Assets/Props/Barrel.png",
+            "fileFormatVersion: 2\nguid: abc123\n",
+            b"PNGDATA_PAYLOAD",
+        );
+        let workspace = dir.path().join("workspace");
+
+        let extracted = extract_to_workspace(&pkg, &workspace).unwrap();
+        assert_eq!(extracted.len(), 1);
+        let asset = &extracted[0];
+        assert_eq!(asset.pathname.as_deref(), Some("Assets/Props/Barrel.png"));
+        assert!(asset.workspace_path.exists());
+        assert_eq!(
+            std::fs::read(&asset.workspace_path).unwrap(),
+            b"PNGDATA_PAYLOAD"
+        );
+        assert_eq!(asset.workspace_path.file_name().unwrap(), "Barrel.png");
+
+        // idempotent re-extract: same hash, same on-disk path, no error on the second pass
+        let extracted_again = extract_to_workspace(&pkg, &workspace).unwrap();
+        assert_eq!(extracted_again[0].content_hash, asset.content_hash);
+        assert_eq!(extracted_again[0].workspace_path, asset.workspace_path);
+    }
+}
