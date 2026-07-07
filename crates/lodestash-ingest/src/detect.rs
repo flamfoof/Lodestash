@@ -118,6 +118,79 @@ mod tests {
         }
     }
 
+    /// Snapshot of every extension→MediaType mapping — a table regression (e.g. an accidental
+    /// reclassification) shows as a reviewable diff instead of a silent behavior change.
+    #[test]
+    fn extension_table_snapshot() {
+        let exts = [
+            "fbx",
+            "obj",
+            "gltf",
+            "glb",
+            "dae",
+            "3ds",
+            "blend",
+            "stl",
+            "ply",
+            "x3d",
+            "abc",
+            "usd",
+            "usda",
+            "usdc",
+            "usdz",
+            "dds",
+            "ktx",
+            "ktx2",
+            "astc",
+            "pvr",
+            "crn",
+            "png",
+            "jpg",
+            "jpeg",
+            "bmp",
+            "tga",
+            "tiff",
+            "tif",
+            "hdr",
+            "exr",
+            "webp",
+            "ico",
+            "psd",
+            "kra",
+            "pdn",
+            "aseprite",
+            "ase",
+            "wav",
+            "mp3",
+            "ogg",
+            "flac",
+            "aif",
+            "aiff",
+            "m4a",
+            "opus",
+            "wma",
+            "fsb",
+            "mat",
+            "mtl",
+            "materialx",
+            "mxm",
+            "sbsar",
+            "sbs",
+            "ttf",
+            "otf",
+            "woff",
+            "woff2",
+            "fnt",
+            "bdf",
+            "unknownext",
+        ];
+        let table: Vec<(&str, Option<MediaType>)> = exts
+            .iter()
+            .map(|&e| (e, by_extension(&PathBuf::from(format!("f.{e}")))))
+            .collect();
+        insta::assert_debug_snapshot!(table);
+    }
+
     #[test]
     fn magic_detection() {
         assert_eq!(by_magic(b"\x89PNG\r\n\x1a\n"), Some(MediaType::Image));

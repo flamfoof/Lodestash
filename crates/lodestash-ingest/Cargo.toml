@@ -27,4 +27,5 @@ image   = { workspace = true }
 # image_dds = "0.7" # DDS/BCn textures
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
+insta    = { workspace = true }

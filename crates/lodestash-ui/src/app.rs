@@ -416,47 +416,7 @@ impl LodestashApp {
             };
         self.folder_tiles = tiles;
 
-        let asc = self.sort_asc;
-        let entries = &self.entries;
-        match self.sort_by {
-            SortBy::Name => {
-                let keys: Vec<String> = idxs.iter().map(|&i| name_key(&entries[i])).collect();
-                let mut paired: Vec<(usize, usize)> = idxs.iter().copied().zip(0..).collect();
-                paired.sort_by(|&(_, ka), &(_, kb)| {
-                    let o = keys[ka].cmp(&keys[kb]);
-                    if asc {
-                        o
-                    } else {
-                        o.reverse()
-                    }
-                });
-                idxs = paired.into_iter().map(|(i, _)| i).collect();
-            }
-            SortBy::Type => idxs.sort_by(|&a, &b| {
-                let o = type_key(&entries[a]).cmp(&type_key(&entries[b]));
-                if asc {
-                    o
-                } else {
-                    o.reverse()
-                }
-            }),
-            SortBy::Size => idxs.sort_by(|&a, &b| {
-                let o = entries[a].file.size_bytes.cmp(&entries[b].file.size_bytes);
-                if asc {
-                    o
-                } else {
-                    o.reverse()
-                }
-            }),
-            SortBy::Modified => idxs.sort_by(|&a, &b| {
-                let o = entries[a].file.mtime.cmp(&entries[b].file.mtime);
-                if asc {
-                    o
-                } else {
-                    o.reverse()
-                }
-            }),
-        }
+        sort_indices(&mut idxs, &self.entries, self.sort_by, self.sort_asc);
 
         self.sorted_cache = idxs;
         self.selected_cache_idx =
@@ -664,6 +624,51 @@ fn name_key(e: &AssetEntry) -> String {
 
 fn type_key(e: &AssetEntry) -> u8 {
     e.file.media_type.map(|m| m as u8).unwrap_or(255)
+}
+
+/// Sort `idxs` (indices into `entries`) in place per the view/sort toolbar's `sort_by`/`asc`.
+/// Name pre-computes keys once (decorate-sort-undecorate) since `name_key` allocates —
+/// worth avoiding at O(n log n) comparisons on 10k+ entry libraries.
+fn sort_indices(idxs: &mut Vec<usize>, entries: &[AssetEntry], sort_by: SortBy, asc: bool) {
+    match sort_by {
+        SortBy::Name => {
+            let keys: Vec<String> = idxs.iter().map(|&i| name_key(&entries[i])).collect();
+            let mut paired: Vec<(usize, usize)> = idxs.iter().copied().zip(0..).collect();
+            paired.sort_by(|&(_, ka), &(_, kb)| {
+                let o = keys[ka].cmp(&keys[kb]);
+                if asc {
+                    o
+                } else {
+                    o.reverse()
+                }
+            });
+            *idxs = paired.into_iter().map(|(i, _)| i).collect();
+        }
+        SortBy::Type => idxs.sort_by(|&a, &b| {
+            let o = type_key(&entries[a]).cmp(&type_key(&entries[b]));
+            if asc {
+                o
+            } else {
+                o.reverse()
+            }
+        }),
+        SortBy::Size => idxs.sort_by(|&a, &b| {
+            let o = entries[a].file.size_bytes.cmp(&entries[b].file.size_bytes);
+            if asc {
+                o
+            } else {
+                o.reverse()
+            }
+        }),
+        SortBy::Modified => idxs.sort_by(|&a, &b| {
+            let o = entries[a].file.mtime.cmp(&entries[b].file.mtime);
+            if asc {
+                o
+            } else {
+                o.reverse()
+            }
+        }),
+    }
 }
 
 /// Folders view, inside a source: the assets living directly in `dir` plus one tile
@@ -1798,5 +1803,92 @@ mod tests {
         );
         // Bottom: end cannot exceed total_rows.
         assert_eq!(lookahead_window(95, 100, 100), (95 - LOOKAHEAD_ROWS, 100));
+    }
+
+    fn entry_full(rel: &str, size: u64, mtime: i64, mt: Option<MediaType>) -> AssetEntry {
+        AssetEntry {
+            file: CrawledFile {
+                abs_path: PathBuf::from(rel),
+                rel_path: PathBuf::from(rel),
+                size_bytes: size,
+                mtime,
+                media_type: mt,
+            },
+            source_idx: 0,
+            texture: None,
+            thumb_spawned: false,
+        }
+    }
+
+    #[test]
+    fn sort_indices_by_name_is_case_insensitive_and_reversible() {
+        let entries = vec![
+            entry_full("banana.png", 1, 1, Some(MediaType::Image)),
+            entry_full("Apple.png", 1, 1, Some(MediaType::Image)),
+            entry_full("cherry.png", 1, 1, Some(MediaType::Image)),
+        ];
+        let mut idxs = vec![0, 1, 2];
+        sort_indices(&mut idxs, &entries, SortBy::Name, true);
+        assert_eq!(
+            idxs,
+            vec![1, 0, 2],
+            "Apple < banana < cherry, ignoring case"
+        );
+
+        sort_indices(&mut idxs, &entries, SortBy::Name, false);
+        assert_eq!(idxs, vec![2, 0, 1], "descending reverses the same order");
+    }
+
+    #[test]
+    fn sort_indices_by_size_and_modified() {
+        let entries = vec![
+            entry_full("a", 300, 3, None),
+            entry_full("b", 100, 1, None),
+            entry_full("c", 200, 2, None),
+        ];
+        let mut idxs = vec![0, 1, 2];
+        sort_indices(&mut idxs, &entries, SortBy::Size, true);
+        assert_eq!(idxs, vec![1, 2, 0], "ascending by size_bytes");
+
+        let mut idxs = vec![0, 1, 2];
+        sort_indices(&mut idxs, &entries, SortBy::Modified, true);
+        assert_eq!(idxs, vec![1, 2, 0], "ascending by mtime");
+    }
+
+    #[test]
+    fn sort_indices_by_type_groups_none_last() {
+        // type_key maps None (unclassified) to 255 — sinks to the end ascending.
+        let entries = vec![
+            entry_full("a", 1, 1, None),
+            entry_full("b", 1, 1, Some(MediaType::Audio)),
+            entry_full("c", 1, 1, Some(MediaType::Model3d)),
+        ];
+        let mut idxs = vec![0, 1, 2];
+        sort_indices(&mut idxs, &entries, SortBy::Type, true);
+        assert_eq!(
+            idxs.last(),
+            Some(&0),
+            "unclassified entries sink to the end"
+        );
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// For arbitrary visible-row windows and library sizes, `keep_range` must always
+        /// return a valid, in-bounds slice range — the eviction code indexes `sorted_cache`
+        /// with it directly, so an out-of-bounds or inverted range would panic.
+        #[test]
+        fn keep_range_is_always_a_valid_slice_bound(
+            row_start in 0usize..2000,
+            extra in 0usize..50,
+            cols in 1usize..64,
+            len in 0usize..1_000_000,
+        ) {
+            let row_end = row_start + extra;
+            let (start, end) = keep_range(row_start, row_end, cols, len);
+            prop_assert!(start <= end);
+            prop_assert!(end <= len);
+        }
     }
 }
