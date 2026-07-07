@@ -86,7 +86,7 @@ resolve first · **[QoL]** = cross-cutting browser-UX lane (M1.5), layered on Ph
 - [ ] **[P2]** **Library Source label** — display `import_source.name` chip on asset cards and inspector whenever project has >1 source; "Library" filter facet in search; user-rename source in project settings *(interim shipped in M1.5 browse-views scaffold: inspector "Library" row + toolbar Library filter; card chip + rename remain)*
 - [ ] **[P2]** **Asset relationship graph** — GUID-ref pass after ingest (`.meta` → `asset_relationship` rows); heuristic name-prefix pass for raw exports; inspector "Related" tab (inbound/outbound edges with Library Source); grid link-chain badge; `has_dependents`/`has_dependencies` search filters ([`DATA-MODEL.md`](DATA-MODEL.md) §10)
 - [ ] **[P2]** Broader formats: Aseprite/Krita/PSD/Paint.NET, `.blend`, fonts, MaterialX
-- [ ] **[P2]** Non-content classification (scripts/DLLs/editor tools/shaders → `is_content=0`)
+- [x] **[P2]** Non-content classification (scripts/DLLs/editor tools/shaders → `is_content=0`) — `detect::is_content` (ext table + `Editor`/`Gizmos` folder check + `.meta` importer rules: Mono/Plugin/AssemblyDefinitionImporter always non-content, Default/ScriptedImporter only when unclassified). *Deferred*: wiring the result into `asset.is_content`/`content_kind` at ingest time (needs the ingest pipeline's persist step, not yet built) and the "tool-only package" whole-package flag.
 
 ### Phase 3 — Search & identification (core purpose)
 - [ ] **[P3]** FTS5 (BM25) + faceted filter sidebar; **Search by Tags**
