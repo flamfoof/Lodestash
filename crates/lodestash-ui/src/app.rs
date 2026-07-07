@@ -132,6 +132,8 @@ pub struct LodestashApp {
     selected_cache_idx: Option<usize>,
     /// When true, the Quick Look overlay is open.
     quick_look: bool,
+    /// When true, the Sources panel (view/add/remove project sources + app-data locations) is open.
+    sources_panel_open: bool,
 }
 
 impl LodestashApp {
@@ -176,6 +178,7 @@ impl LodestashApp {
             thumb_cache_dir: dirs::cache_dir().map(|d| d.join("Lodestash").join("thumbs")),
             selected_cache_idx: None,
             quick_look: false,
+            sources_panel_open: false,
             config,
         };
 
@@ -223,6 +226,22 @@ impl LodestashApp {
             let live: Vec<PathBuf> = paths.into_iter().filter(|p| p.is_dir()).collect();
             self.load_paths(ctx, live, Some(proj_name));
         }
+    }
+
+    /// Remove a source from the open project (config reference only — files are never touched)
+    /// and reload the remaining sources.
+    fn remove_source(&mut self, ctx: &egui::Context, path: &std::path::Path) {
+        let Some(proj_name) = self.project_name.clone() else {
+            return;
+        };
+        self.config.remove_source_from_project(&proj_name, path);
+        let paths: Vec<PathBuf> = self
+            .config
+            .project_by_name(&proj_name)
+            .map(|p| p.paths.clone())
+            .unwrap_or_default();
+        let live: Vec<PathBuf> = paths.into_iter().filter(|p| p.is_dir()).collect();
+        self.load_paths(ctx, live, Some(proj_name));
     }
 
     fn open_project(&mut self, ctx: &egui::Context, name: &str) {
@@ -839,7 +858,7 @@ impl eframe::App for LodestashApp {
                         add_source_clicked = true;
                     }
 
-                    // Project / source info.
+                    // Project / source info — click to open the Sources panel.
                     if let Some(name) = &self.project_name {
                         let src_count = self.scan_roots.len();
                         let detail = if src_count == 1 {
@@ -847,11 +866,21 @@ impl eframe::App for LodestashApp {
                         } else {
                             format!("{src_count} sources")
                         };
-                        ui.label(
-                            RichText::new(format!("{name}  \u{2014}  {detail}"))
-                                .color(theme::TEXT_DIM)
-                                .size(11.0),
-                        );
+                        let resp = ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(format!("{name}  \u{2014}  {detail}"))
+                                        .color(theme::TEXT_DIM)
+                                        .size(11.0),
+                                )
+                                .fill(egui::Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::NONE)
+                                .frame(false),
+                            )
+                            .on_hover_text("View / manage sources");
+                        if resp.clicked() {
+                            self.sources_panel_open = true;
+                        }
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1185,7 +1214,126 @@ impl eframe::App for LodestashApp {
                 }
             }
         }
+
+        // ── Sources panel ──────────────────────────────────────────────────────
+        if self.sources_panel_open {
+            let mut open = self.sources_panel_open;
+            let mut to_remove: Option<PathBuf> = None;
+            let mut add_clicked = false;
+            egui::Window::new("Sources")
+                .id(egui::Id::new("sources_panel"))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([480.0, 320.0])
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .frame(
+                    egui::Frame::window(&ctx.style())
+                        .fill(theme::SURFACE_RAISED)
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+                )
+                .show(ctx, |ui| {
+                    ui.label(
+                        RichText::new("Project sources")
+                            .color(theme::TEXT_MUTED)
+                            .size(12.0)
+                            .strong(),
+                    );
+                    ui.add_space(4.0);
+                    for root in &self.scan_roots {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(root.to_string_lossy())
+                                    .color(theme::TEXT)
+                                    .size(12.0),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("Remove").clicked() {
+                                        to_remove = Some(root.clone());
+                                    }
+                                    if ui.small_button("Reveal").clicked() {
+                                        reveal_in_file_manager(root);
+                                    }
+                                },
+                            );
+                        });
+                    }
+                    ui.add_space(8.0);
+                    if ui
+                        .button(RichText::new("+ Add source").color(theme::ARCANE))
+                        .clicked()
+                    {
+                        add_clicked = true;
+                    }
+
+                    ui.separator();
+                    ui.label(
+                        RichText::new("App data")
+                            .color(theme::TEXT_MUTED)
+                            .size(12.0)
+                            .strong(),
+                    );
+                    ui.add_space(4.0);
+                    if let Some(config_path) = config::config_file_path() {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("Config: {}", config_path.display()))
+                                    .color(theme::TEXT_DIM)
+                                    .size(11.0),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("Reveal").clicked() {
+                                        if let Some(parent) = config_path.parent() {
+                                            reveal_in_file_manager(parent);
+                                        }
+                                    }
+                                },
+                            );
+                        });
+                    }
+                    if let Some(thumb_dir) = &self.thumb_cache_dir {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("Thumbnail cache: {}", thumb_dir.display()))
+                                    .color(theme::TEXT_DIM)
+                                    .size(11.0),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("Reveal").clicked() {
+                                        reveal_in_file_manager(thumb_dir);
+                                    }
+                                },
+                            );
+                        });
+                    }
+                });
+            self.sources_panel_open = open;
+            if let Some(path) = to_remove {
+                self.remove_source(ctx, &path);
+            }
+            if add_clicked {
+                self.add_source(ctx);
+            }
+        }
     }
+}
+
+/// Open `path` in the OS file manager (Explorer/Finder/whatever `xdg-open` resolves to).
+/// Best-effort: a failure to launch is silently ignored, same as any other OS-integration action
+/// that has no in-app fallback to show.
+fn reveal_in_file_manager(path: &std::path::Path) {
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
 }
 
 // ── Empty / no-results states ─────────────────────────────────────────────────
