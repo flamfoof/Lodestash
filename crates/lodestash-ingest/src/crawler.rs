@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use lodestash_core::types::{is_excluded, Exclude};
 use walkdir::WalkDir;
 
 use super::detect;
@@ -19,13 +20,15 @@ pub struct CrawledFile {
 }
 
 /// Crawl `root` recursively and yield every content file.
-/// Skips hidden directories (`.` prefix) and noise directories (`target/`, `node_modules/`),
-/// but **never** the root directory itself (depth 0).
-pub fn crawl(root: &Path) -> Vec<CrawledFile> {
+/// Skips hidden directories (`.` prefix), noise directories (`target/`, `node_modules/`), and any
+/// path matching the per-source `excludes` blacklist (folders are pruned so their subtrees are
+/// never walked — INGESTION.md §1, DATA-MODEL.md §1). Never skips the root itself (depth 0).
+/// Excludes are non-destructive: they only affect cataloguing, never files on disk.
+pub fn crawl(root: &Path, excludes: &[Exclude]) -> Vec<CrawledFile> {
     WalkDir::new(root)
         .follow_links(false)
         .into_iter()
-        .filter_entry(|e| !is_skip_dir(e))
+        .filter_entry(|e| !is_skip_dir(e) && !is_excluded_entry(e, root, excludes))
         .filter_map(|entry| entry.ok())
         .filter(|e| e.file_type().is_file())
         .filter_map(|entry| {
@@ -79,6 +82,19 @@ fn is_skip_dir(entry: &walkdir::DirEntry) -> bool {
     name.starts_with('.') || name == "target" || name == "node_modules"
 }
 
+/// True if this entry (dir or file, but never the root) matches the blacklist. Applied in
+/// `filter_entry` so excluded **folders are pruned** (their subtrees aren't descended) and
+/// excluded files are dropped before yielding.
+fn is_excluded_entry(entry: &walkdir::DirEntry, root: &Path, excludes: &[Exclude]) -> bool {
+    if entry.depth() == 0 || excludes.is_empty() {
+        return false;
+    }
+    match entry.path().strip_prefix(root) {
+        Ok(rel) => is_excluded(rel, excludes),
+        Err(_) => false,
+    }
+}
+
 /// Current time as seconds since UNIX epoch.
 pub fn now_unix() -> i64 {
     SystemTime::now()
@@ -102,12 +118,43 @@ mod tests {
         fs::create_dir(root.join(".hidden")).unwrap();
         fs::write(root.join(".hidden").join("skip.png"), b"PNG_data").unwrap();
 
-        let files = crawl(root);
+        let files = crawl(root, &[]);
         assert_eq!(
             files.len(),
             2,
             "hidden dir should be skipped; got: {files:?}"
         );
+    }
+
+    #[test]
+    fn crawl_honors_folder_and_asset_excludes() {
+        use lodestash_core::types::{Exclude, ExcludeKind};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        fs::write(root.join("keep.png"), b"PNG").unwrap();
+        fs::write(root.join("skip.png"), b"PNG").unwrap();
+        fs::create_dir(root.join("Editor")).unwrap();
+        fs::write(root.join("Editor").join("tool.png"), b"PNG").unwrap();
+        fs::write(root.join("Editor").join("more.png"), b"PNG").unwrap();
+
+        let excludes = vec![
+            Exclude {
+                kind: ExcludeKind::Folder,
+                value: "Editor".into(),
+            },
+            Exclude {
+                kind: ExcludeKind::Asset,
+                value: "skip.png".into(),
+            },
+        ];
+        let files = crawl(root, &excludes);
+        let names: Vec<_> = files
+            .iter()
+            .map(|f| f.rel_path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files.len(), 1, "only keep.png survives; got: {names:?}");
+        assert_eq!(names[0], "keep.png");
     }
 
     #[test]
@@ -118,7 +165,7 @@ mod tests {
         fs::create_dir(root.join("sub")).unwrap();
         fs::write(root.join("sub").join("mesh.fbx"), b"FBX").unwrap();
 
-        let files = crawl(root);
+        let files = crawl(root, &[]);
         assert_eq!(files.len(), 1);
         // rel_path must be relative, not absolute
         assert!(!files[0].rel_path.is_absolute());

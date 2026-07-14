@@ -41,7 +41,8 @@ CREATE TABLE import_source (
   root_path       TEXT NOT NULL,
   kind            TEXT NOT NULL,          -- 'folder' | 'asset_store_library' | 'unitypackage' | 'bundle' | 'unreal_pak' (planned) | ...
   last_scanned_at INTEGER,
-  watch_enabled   INTEGER NOT NULL DEFAULT 1
+  watch_enabled   INTEGER NOT NULL DEFAULT 1,
+  blacklist       TEXT                    -- JSON: [{kind:'folder'|'asset', value:'<source-rel path or file name>'}] (§blacklist)
 );
 
 -- ---------- Media-type taxonomy ----------
@@ -449,6 +450,18 @@ asset come from?" at the collection level.
   a UI filter chip ("Library: Synty") in both Search-by-Tags and AI Search modes.
 - **`import_source.name`** defaults to the root folder's stem on first add; the user can rename it
   in Project settings without touching the file system.
+
+### Per-source blacklist
+
+Each `import_source` carries an independent **blacklist** — a list of `{kind, value}` exclusions
+(`folder` or `asset`) that the crawler **skips when indexing** ([`INGESTION.md`](INGESTION.md) §1),
+editable in Settings → Library (design §5.1). Semantics: a `folder` entry prunes that subtree
+(source-relative path); an `asset` entry drops a single file (exact source-relative path or bare
+file name). Matching is `/`↔`\` and case-insensitive. **Non-destructive** — a blacklist entry only
+affects cataloguing, never files on disk (§6). Removing a source drops its blacklist. Interim: while
+the SQLite catalog is pre-`import_source`, the pre-catalog UI persists this per source in the app
+config (`LibraryProject.blacklist`, keyed by source path); it maps 1:1 onto this column when the
+catalog lands.
 
 ### Asset relationships (dependency graph)
 

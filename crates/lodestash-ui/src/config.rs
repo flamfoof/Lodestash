@@ -1,9 +1,13 @@
 //! Persistent app configuration — survives restarts.
 //! Stored at: `{os_config_dir}/Lodestash/config.json`
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use lodestash_core::types::Exclude;
 use serde::{Deserialize, Serialize};
+
+pub use lodestash_core::types::ExcludeKind;
 
 // ── Sort preference ───────────────────────────────────────────────────────────
 
@@ -42,6 +46,10 @@ pub struct LibraryProject {
     pub name: String,
     /// All source directories — may be on different drives or locations.
     pub paths: Vec<PathBuf>,
+    /// Per-source indexing blacklist, keyed by source path (design §5.1, DATA-MODEL.md §1). A
+    /// source with no entry (or an empty vec) indexes everything under it.
+    #[serde(default)]
+    pub blacklist: BTreeMap<PathBuf, Vec<Exclude>>,
 }
 
 impl LibraryProject {
@@ -62,11 +70,41 @@ impl LibraryProject {
         true
     }
 
-    /// Remove a source path. Returns true if it was present and removed.
+    /// Remove a source path (and its blacklist). Returns true if it was present and removed.
     pub fn remove_path(&mut self, path: &Path) -> bool {
         let before = self.paths.len();
         self.paths.retain(|p| p != path);
+        self.blacklist.remove(path);
         self.paths.len() != before
+    }
+
+    /// The exclusion list for a source (empty slice when none).
+    pub fn excludes_for(&self, source: &Path) -> &[Exclude] {
+        self.blacklist.get(source).map_or(&[], |v| v.as_slice())
+    }
+
+    /// Add an exclusion to a source. Returns true if it was added (deduped).
+    pub fn add_exclude(&mut self, source: &Path, exclude: Exclude) -> bool {
+        let list = self.blacklist.entry(source.to_path_buf()).or_default();
+        if list.contains(&exclude) {
+            return false;
+        }
+        list.push(exclude);
+        true
+    }
+
+    /// Remove an exclusion from a source. Returns true if it was present.
+    pub fn remove_exclude(&mut self, source: &Path, exclude: &Exclude) -> bool {
+        let Some(list) = self.blacklist.get_mut(source) else {
+            return false;
+        };
+        let before = list.len();
+        list.retain(|e| e != exclude);
+        let removed = list.len() != before;
+        if list.is_empty() {
+            self.blacklist.remove(source);
+        }
+        removed
     }
 }
 
@@ -331,6 +369,46 @@ impl AppConfig {
         }
     }
 
+    /// The blacklist for a source in a project (cloned; empty when none). Design §5.1.
+    pub fn source_excludes(&self, project_name: &str, source: &Path) -> Vec<Exclude> {
+        self.project_by_name(project_name)
+            .map(|p| p.excludes_for(source).to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Add a per-source exclusion (deduped) and persist. Returns true if added. Non-destructive —
+    /// only affects cataloguing (DATA-MODEL.md §1, §6).
+    pub fn add_source_exclude(
+        &mut self,
+        project_name: &str,
+        source: &Path,
+        exclude: Exclude,
+    ) -> bool {
+        if let Some(proj) = self.projects.iter_mut().find(|p| p.name == project_name) {
+            if proj.add_exclude(source, exclude) {
+                self.save();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Remove a per-source exclusion and persist. Returns true if it was present.
+    pub fn remove_source_exclude(
+        &mut self,
+        project_name: &str,
+        source: &Path,
+        exclude: &Exclude,
+    ) -> bool {
+        if let Some(proj) = self.projects.iter_mut().find(|p| p.name == project_name) {
+            if proj.remove_exclude(source, exclude) {
+                self.save();
+                return true;
+            }
+        }
+        false
+    }
+
     /// Remove a source folder from an existing project by name. Never touches the files on
     /// disk — only the catalog's reference to them (DATA-MODEL.md §6 non-destructive rule).
     /// Returns false if the project or the path wasn't found.
@@ -362,6 +440,7 @@ impl AppConfig {
         self.projects.push(LibraryProject {
             name: unique_name.clone(),
             paths: vec![path],
+            blacklist: BTreeMap::new(),
         });
         unique_name
     }
@@ -445,6 +524,7 @@ mod tests {
         let mut proj = LibraryProject {
             name: "Synty".into(),
             paths: vec![p("/a")],
+            blacklist: BTreeMap::new(),
         };
         assert!(proj.add_path(p("/b")), "new path is added");
         assert!(!proj.add_path(p("/a")), "existing path is not re-added");
@@ -456,6 +536,7 @@ mod tests {
         let mut proj = LibraryProject {
             name: "Synty".into(),
             paths: vec![p("/a"), p("/b")],
+            blacklist: BTreeMap::new(),
         };
         assert!(proj.remove_path(&p("/a")));
         assert_eq!(proj.paths, vec![p("/b")]);
@@ -569,6 +650,38 @@ mod tests {
         .normalized();
         assert_eq!(t.range_kb(SizeTier::Xl), (t.xl_kb, t.cap_kb));
         assert_eq!(t.range_kb(SizeTier::S).0, 0);
+    }
+
+    #[test]
+    fn per_source_blacklist_add_dedup_remove_and_isolation() {
+        let mut proj = LibraryProject {
+            name: "Synty".into(),
+            paths: vec![p("/a"), p("/b")],
+            blacklist: BTreeMap::new(),
+        };
+        let ex = |v: &str| Exclude {
+            kind: ExcludeKind::Folder,
+            value: v.into(),
+        };
+        assert!(proj.add_exclude(&p("/a"), ex("Editor")));
+        assert!(!proj.add_exclude(&p("/a"), ex("Editor")), "deduped");
+        assert!(proj.add_exclude(&p("/a"), ex("Gizmos")));
+        assert_eq!(proj.excludes_for(&p("/a")).len(), 2);
+        assert!(
+            proj.excludes_for(&p("/b")).is_empty(),
+            "each source owns its own list"
+        );
+
+        assert!(proj.remove_exclude(&p("/a"), &ex("Editor")));
+        assert_eq!(proj.excludes_for(&p("/a")).len(), 1);
+        assert!(
+            !proj.remove_exclude(&p("/a"), &ex("Editor")),
+            "already gone"
+        );
+
+        // Removing the source drops its blacklist entry.
+        proj.remove_path(&p("/a"));
+        assert!(proj.excludes_for(&p("/a")).is_empty());
     }
 
     #[test]

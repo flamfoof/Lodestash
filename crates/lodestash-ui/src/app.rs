@@ -245,6 +245,10 @@ pub struct LodestashApp {
     content_filter: ContentFilter,
     /// Active top-level screen (Library grid vs Settings). Design §5.
     screen: Screen,
+    /// Index into `scan_roots` of the source whose blacklist panel is expanded in Settings. §5.1.
+    expanded_source: Option<usize>,
+    /// The in-progress blacklist exclusion text for the expanded source (transient). §5.1.
+    blacklist_input: String,
 }
 
 impl LodestashApp {
@@ -292,6 +296,8 @@ impl LodestashApp {
             sources_panel_open: false,
             content_filter: ContentFilter::default(),
             screen: Screen::Library,
+            expanded_source: None,
+            blacklist_input: String::new(),
             config,
         };
 
@@ -397,6 +403,17 @@ impl LodestashApp {
         self.folder_tiles = Vec::new();
         self.nav_generation += 1;
 
+        // Each source's blacklist (design §5.1) — resolved before the crawl thread so it honours
+        // per-source excludes (INGESTION.md §1).
+        let excludes: Vec<Vec<lodestash_core::types::Exclude>> = match self.project_name.as_deref()
+        {
+            Some(proj) => roots
+                .iter()
+                .map(|r| self.config.source_excludes(proj, r))
+                .collect(),
+            None => roots.iter().map(|_| Vec::new()).collect(),
+        };
+
         self.scan_generation += 1;
         self.scanning = true;
         let generation = self.scan_generation;
@@ -405,7 +422,11 @@ impl LodestashApp {
             let entries: Vec<(usize, CrawledFile)> = roots
                 .iter()
                 .enumerate()
-                .flat_map(|(i, root)| crawler::crawl(root).into_iter().map(move |f| (i, f)))
+                .flat_map(|(i, root)| {
+                    crawler::crawl(root, &excludes[i])
+                        .into_iter()
+                        .map(move |f| (i, f))
+                })
                 .collect();
             let _ = tx.send(ScanDone {
                 generation,
@@ -687,9 +708,14 @@ impl LodestashApp {
 
     // ── Settings screen (design §5) ────────────────────────────────────────────
 
-    fn settings_screen(&mut self, ui: &mut Ui) {
+    fn settings_screen(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let mut save = false;
         let mut quality_changed = false;
+        // Blacklist actions collected during render, applied after (avoids borrowing self while
+        // iterating scan_roots). Each is (source_idx, exclude).
+        let mut toggle_expand: Option<usize> = None;
+        let mut add_exclude: Option<(usize, lodestash_core::types::Exclude)> = None;
+        let mut remove_exclude: Option<(usize, lodestash_core::types::Exclude)> = None;
 
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
@@ -708,7 +734,7 @@ impl LodestashApp {
                         );
                         ui.add_space(14.0);
 
-                        // 5.1 Sources (Library).
+                        // 5.1 Sources (Library) + per-source blacklist (§5.1).
                         settings_card(ui, "LIBRARY \u{00B7} SOURCES", |ui| {
                             if self.scan_roots.is_empty() {
                                 ui.label(
@@ -717,7 +743,13 @@ impl LodestashApp {
                                         .color(theme::TEXT_DIM),
                                 );
                             }
-                            for root in &self.scan_roots {
+                            for (i, root) in self.scan_roots.iter().enumerate() {
+                                let expanded = self.expanded_source == Some(i);
+                                let excludes = self
+                                    .project_name
+                                    .as_deref()
+                                    .map(|p| self.config.source_excludes(p, root))
+                                    .unwrap_or_default();
                                 ui.horizontal(|ui| {
                                     let (dot, p) = ui
                                         .allocate_painter(Vec2::splat(10.0), egui::Sense::hover());
@@ -735,14 +767,118 @@ impl LodestashApp {
                                                 .monospace(),
                                         );
                                     });
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            // Expander glyph (⌄ closed / ⌃ open) + count.
+                                            let glyph = if expanded { "\u{2303}" } else { "\u{2304}" };
+                                            let n = excludes.len();
+                                            let btn = ui.add(
+                                                egui::Button::new(
+                                                    RichText::new(if n > 0 {
+                                                        format!("{glyph}  {n} excluded")
+                                                    } else {
+                                                        format!("{glyph}  Exclusions")
+                                                    })
+                                                    .size(11.0)
+                                                    .color(theme::TEXT_MUTED),
+                                                )
+                                                .frame(false),
+                                            );
+                                            if btn.clicked() {
+                                                toggle_expand = Some(i);
+                                            }
+                                        },
+                                    );
                                 });
-                                ui.add_space(2.0);
+
+                                if expanded {
+                                    // Blacklist panel — inset well.
+                                    egui::Frame::none()
+                                        .fill(theme::BG)
+                                        .rounding(6.0)
+                                        .inner_margin(egui::Margin::same(10.0))
+                                        .show(ui, |ui| {
+                                            if excludes.is_empty() {
+                                                ui.label(
+                                                    RichText::new(
+                                                        "Nothing excluded \u{2014} everything \
+                                                         under this source is indexed.",
+                                                    )
+                                                    .size(11.0)
+                                                    .color(theme::TEXT_DIM),
+                                                );
+                                            }
+                                            ui.horizontal_wrapped(|ui| {
+                                                for ex in &excludes {
+                                                    let color = match ex.kind {
+                                                        config::ExcludeKind::Folder => theme::WARNING,
+                                                        config::ExcludeKind::Asset => theme::DANGER,
+                                                    };
+                                                    if exclusion_chip(ui, &ex.value, color) {
+                                                        remove_exclude = Some((i, ex.clone()));
+                                                    }
+                                                }
+                                            });
+                                            ui.add_space(6.0);
+                                            ui.horizontal(|ui| {
+                                                ui.add(
+                                                    egui::TextEdit::singleline(
+                                                        &mut self.blacklist_input,
+                                                    )
+                                                    .hint_text("folder or asset\u{2026}")
+                                                    .desired_width(180.0),
+                                                );
+                                                let val = self.blacklist_input.trim().to_string();
+                                                let enabled = !val.is_empty();
+                                                if ui
+                                                    .add_enabled(
+                                                        enabled,
+                                                        egui::Button::new(
+                                                            RichText::new("\u{2298} folder")
+                                                                .color(theme::WARNING)
+                                                                .size(11.0),
+                                                        ),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    add_exclude = Some((
+                                                        i,
+                                                        lodestash_core::types::Exclude {
+                                                            kind: config::ExcludeKind::Folder,
+                                                            value: val.clone(),
+                                                        },
+                                                    ));
+                                                }
+                                                if ui
+                                                    .add_enabled(
+                                                        enabled,
+                                                        egui::Button::new(
+                                                            RichText::new("\u{2298} asset")
+                                                                .color(theme::DANGER)
+                                                                .size(11.0),
+                                                        ),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    add_exclude = Some((
+                                                        i,
+                                                        lodestash_core::types::Exclude {
+                                                            kind: config::ExcludeKind::Asset,
+                                                            value: val,
+                                                        },
+                                                    ));
+                                                }
+                                            });
+                                        });
+                                }
+                                ui.add_space(4.0);
                             }
-                            ui.add_space(6.0);
+                            ui.add_space(2.0);
                             ui.label(
                                 RichText::new(
-                                    "Per-source exclusions (blacklist) \u{2014} planned; needs the \
-                                     import_source catalog (DATA-MODEL.md \u{00A7}1).",
+                                    "Excluding only skips cataloguing \u{2014} files on disk are \
+                                     never touched.",
                                 )
                                 .size(10.0)
                                 .color(theme::TEXT_DIM),
@@ -853,6 +989,37 @@ impl LodestashApp {
         }
         if quality_changed {
             self.invalidate_thumbnails();
+        }
+
+        // Apply blacklist actions (collected during render to avoid borrowing self mid-iteration).
+        if let Some(i) = toggle_expand {
+            self.expanded_source = if self.expanded_source == Some(i) {
+                None
+            } else {
+                self.blacklist_input.clear();
+                Some(i)
+            };
+        }
+        let proj = self.project_name.clone();
+        let mut blacklist_changed = false;
+        if let (Some(proj), Some((i, ex))) = (proj.as_deref(), add_exclude) {
+            if let Some(root) = self.scan_roots.get(i).cloned() {
+                if self.config.add_source_exclude(proj, &root, ex) {
+                    self.blacklist_input.clear();
+                    blacklist_changed = true;
+                }
+            }
+        }
+        if let (Some(proj), Some((i, ex))) = (proj.as_deref(), remove_exclude) {
+            if let Some(root) = self.scan_roots.get(i).cloned() {
+                if self.config.remove_source_exclude(proj, &root, &ex) {
+                    blacklist_changed = true;
+                }
+            }
+        }
+        // A changed blacklist re-indexes the current library so the exclusion takes effect.
+        if blacklist_changed {
+            self.load_paths(ctx, self.scan_roots.clone(), self.project_name.clone());
         }
     }
 
@@ -1622,7 +1789,7 @@ impl eframe::App for LodestashApp {
             )
             .show(ctx, |ui| {
                 if self.screen == Screen::Settings {
-                    self.settings_screen(ui);
+                    self.settings_screen(ui, ctx);
                     return;
                 }
                 if self.entries.is_empty() {
@@ -2260,6 +2427,30 @@ fn nav_button(
         gc,
     );
     resp
+}
+
+/// A blacklist exclusion chip: tinted value + a ✕. Returns true if the ✕ was clicked (remove).
+fn exclusion_chip(ui: &mut Ui, value: &str, color: egui::Color32) -> bool {
+    let mut remove = false;
+    egui::Frame::none()
+        .fill(color.linear_multiply(0.18))
+        .rounding(999.0)
+        .stroke(egui::Stroke::new(1.0, color))
+        .inner_margin(egui::Margin::symmetric(9.0, 3.0))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            ui.label(RichText::new(value).color(color).size(11.0));
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("\u{2715}").color(color).size(10.0))
+                        .frame(false),
+                )
+                .clicked()
+            {
+                remove = true;
+            }
+        });
+    remove
 }
 
 /// Small letter-spaced section label used inside the filter popover and settings cards.

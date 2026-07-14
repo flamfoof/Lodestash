@@ -142,7 +142,8 @@ to a single entry; reaching any entry means decompressing from the start. Lodest
 ## 3. Ingestion pipeline (staged)
 
 ```
-1. Crawl        enumerate files (path, size, mtime) under each source root
+1. Crawl        enumerate files (path, size, mtime) under each source root, honouring the source's
+                blacklist (folder subtrees pruned, excluded assets dropped — DATA-MODEL.md §blacklist)
 2. Detect       classify by magic bytes (+ extension): unitypackage / bundle / source / archive
 3. Unpack       .unitypackage → gzip+tar extract; map GUID→pathname; read .meta (GUID, importer type, labels)
 4. Route        recognized source format → direct loader
