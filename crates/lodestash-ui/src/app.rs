@@ -8,7 +8,7 @@ use std::time::Duration;
 use egui::{Key, RichText, ScrollArea, TextureHandle, Ui, Vec2};
 use lodestash_core::types::MediaType;
 use lodestash_ingest::crawler::{self, CrawledFile};
-use lodestash_ingest::thumb;
+use lodestash_ingest::{detect, thumb, unitypackage};
 
 use crate::config::{self, AppConfig, SortBy, ViewMode};
 use crate::theme;
@@ -70,6 +70,32 @@ struct ScanDone {
     generation: u64,
     /// (source index into scan_roots, crawled file)
     entries: Vec<(usize, CrawledFile)>,
+    pending_packages: Vec<PendingPackage>,
+}
+
+/// A `.unitypackage` found while crawling, not yet extracted into the grid. Its manifest is
+/// already resolved (read on the same background crawl thread) so the UI can offer an "Extract"
+/// action immediately, with no separate loading step.
+struct PendingPackage {
+    source_idx: usize,
+    abs_path: PathBuf,
+    display_name: String,
+    /// (display label, real `pathname`) for each nested sub-package — e.g. a URP/Built-in
+    /// render-pipeline-variant wrapper (INGESTION.md §2 "Container nuance"). Empty when this
+    /// package directly contains real assets (no wrapper).
+    nested_candidates: Vec<(String, String)>,
+    /// Index into `nested_candidates`, defaulted to the URP variant when one exists.
+    chosen_variant: usize,
+    extracting: bool,
+}
+
+/// Result of a background package extraction.
+struct ExtractDone {
+    /// Identifies which `PendingPackage` this came from — matched by path rather than index
+    /// since `pending_packages` may have been mutated while the extraction ran.
+    abs_path: PathBuf,
+    source_idx: usize,
+    files: Vec<CrawledFile>,
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -134,6 +160,13 @@ pub struct LodestashApp {
     quick_look: bool,
     /// When true, the Sources panel (view/add/remove project sources + app-data locations) is open.
     sources_panel_open: bool,
+    /// `.unitypackage` files found while crawling, awaiting an explicit Extract action.
+    pending_packages: Vec<PendingPackage>,
+    extract_rx: Receiver<ExtractDone>,
+    extract_tx: Sender<ExtractDone>,
+    /// Where extracted package payloads are stored, content-addressed (None if the OS cache dir
+    /// is unavailable).
+    workspace_dir: Option<PathBuf>,
 }
 
 impl LodestashApp {
@@ -142,6 +175,7 @@ impl LodestashApp {
 
         let (thumb_tx, thumb_rx) = mpsc::channel();
         let (scan_tx, scan_rx) = mpsc::channel();
+        let (extract_tx, extract_rx) = mpsc::channel();
         let config = AppConfig::load();
         let sort_by = config.view.sort_by;
         let sort_asc = config.view.sort_asc;
@@ -179,6 +213,10 @@ impl LodestashApp {
             selected_cache_idx: None,
             quick_look: false,
             sources_panel_open: false,
+            pending_packages: Vec::new(),
+            extract_rx,
+            extract_tx,
+            workspace_dir: dirs::cache_dir().map(|d| d.join("Lodestash").join("workspace")),
             config,
         };
 
@@ -283,20 +321,30 @@ impl LodestashApp {
         self.current_dir = None;
         self.folder_tiles = Vec::new();
         self.nav_generation += 1;
+        self.pending_packages = Vec::new();
 
         self.scan_generation += 1;
         self.scanning = true;
         let generation = self.scan_generation;
         let tx = self.scan_tx.clone();
         std::thread::spawn(move || {
-            let entries: Vec<(usize, CrawledFile)> = roots
-                .iter()
-                .enumerate()
-                .flat_map(|(i, root)| crawler::crawl(root).into_iter().map(move |f| (i, f)))
-                .collect();
+            let mut entries: Vec<(usize, CrawledFile)> = Vec::new();
+            let mut pending_packages = Vec::new();
+            for (source_idx, root) in roots.iter().enumerate() {
+                for file in crawler::crawl(root) {
+                    if is_unitypackage(&file.abs_path) {
+                        if let Some(pkg) = resolve_pending_package(source_idx, &file) {
+                            pending_packages.push(pkg);
+                        }
+                        continue; // don't surface the raw archive as a browsable entry
+                    }
+                    entries.push((source_idx, file));
+                }
+            }
             let _ = tx.send(ScanDone {
                 generation,
                 entries,
+                pending_packages,
             });
         });
 
@@ -321,6 +369,7 @@ impl LodestashApp {
                     thumb_spawned: false,
                 })
                 .collect();
+            self.pending_packages = msg.pending_packages;
             self.current_dir = self.default_dir();
             self.tab_counts = Category::TABS
                 .iter()
@@ -335,6 +384,68 @@ impl LodestashApp {
             self.last_cols = 0;
             self.last_row_start = usize::MAX;
             self.last_row_end = 0;
+        }
+    }
+
+    /// Kick off a background extraction of `pending_packages[idx]` into the workspace dir.
+    fn extract_package(&mut self, ctx: &egui::Context, idx: usize) {
+        let Some(workspace_dir) = self.workspace_dir.clone() else {
+            return;
+        };
+        let Some(pkg) = self.pending_packages.get_mut(idx) else {
+            return;
+        };
+        if pkg.extracting {
+            return;
+        }
+        pkg.extracting = true;
+
+        let abs_path = pkg.abs_path.clone();
+        let source_idx = pkg.source_idx;
+        let display_name = pkg.display_name.clone();
+        let nested_pathname = pkg
+            .nested_candidates
+            .get(pkg.chosen_variant)
+            .map(|(_, pathname)| pathname.clone());
+        let tx = self.extract_tx.clone();
+
+        std::thread::spawn(move || {
+            let files = extract_package_contents(
+                &abs_path,
+                &workspace_dir,
+                nested_pathname.as_deref(),
+                &display_name,
+            );
+            let _ = tx.send(ExtractDone {
+                abs_path,
+                source_idx,
+                files,
+            });
+        });
+        ctx.request_repaint();
+    }
+
+    fn receive_extracts(&mut self) {
+        while let Ok(msg) = self.extract_rx.try_recv() {
+            self.pending_packages.retain(|p| p.abs_path != msg.abs_path);
+            for file in msg.files {
+                self.entries.push(AssetEntry {
+                    file,
+                    source_idx: msg.source_idx,
+                    texture: None,
+                    thumb_spawned: false,
+                });
+            }
+            self.tab_counts = Category::TABS
+                .iter()
+                .map(|&(cat, _)| {
+                    self.entries
+                        .iter()
+                        .filter(|e| cat.matches(e.file.media_type))
+                        .count()
+                })
+                .collect();
+            self.cache_dirty = true;
         }
     }
 
@@ -750,6 +861,7 @@ impl eframe::App for LodestashApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_scan();
         self.receive_thumbnails();
+        self.receive_extracts();
 
         // While a scan or thumbnails are in flight, wake up at ~30 fps to drain the
         // channels. Keeping this in the main thread (not the worker threads) prevents
@@ -970,6 +1082,76 @@ impl eframe::App for LodestashApp {
                         .stroke(egui::Stroke::new(1.0, theme::BORDER)),
                 )
                 .show(ctx, |ui| {
+                    // Library tabs — the primary grouping when a project has more than one
+                    // source, so browsing never mixes unrelated packs into one anonymous pile
+                    // (DESIGN-GUIDELINES.md §7 "Browse views"). Folders view already separates
+                    // sources structurally via folder tiles, so this only applies to Flat.
+                    if self.scan_roots.len() > 1 && self.view_mode == ViewMode::Flat {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            let is_all = self.source_filter.is_none();
+                            let all_resp =
+                                ui.add(
+                                    egui::Button::new(
+                                        RichText::new("All libraries").size(12.0).color(
+                                            if is_all { theme::GOLD } else { theme::TEXT_DIM },
+                                        ),
+                                    )
+                                    .fill(egui::Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::NONE)
+                                    .frame(false),
+                                );
+                            if all_resp.clicked() {
+                                self.source_filter = None;
+                                self.cache_dirty = true;
+                            }
+                            if is_all {
+                                let rect = all_resp.rect;
+                                ui.painter().line_segment(
+                                    [
+                                        egui::pos2(rect.min.x, rect.max.y),
+                                        egui::pos2(rect.max.x, rect.max.y),
+                                    ],
+                                    egui::Stroke::new(2.0, theme::GOLD),
+                                );
+                            }
+                            ui.add_space(8.0);
+
+                            for i in 0..self.scan_roots.len() {
+                                let is_active = self.source_filter == Some(i);
+                                let name = config::stem_name(&self.scan_roots[i]);
+                                let resp = ui.add(
+                                    egui::Button::new(RichText::new(name).size(12.0).color(
+                                        if is_active {
+                                            theme::GOLD
+                                        } else {
+                                            theme::TEXT_DIM
+                                        },
+                                    ))
+                                    .fill(egui::Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::NONE)
+                                    .frame(false),
+                                );
+                                if resp.clicked() {
+                                    self.source_filter = Some(i);
+                                    self.cache_dirty = true;
+                                }
+                                if is_active {
+                                    let rect = resp.rect;
+                                    ui.painter().line_segment(
+                                        [
+                                            egui::pos2(rect.min.x, rect.max.y),
+                                            egui::pos2(rect.max.x, rect.max.y),
+                                        ],
+                                        egui::Stroke::new(2.0, theme::GOLD),
+                                    );
+                                }
+                                ui.add_space(8.0);
+                            }
+                        });
+                        ui.add_space(2.0);
+                    }
+
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
                         for (i, &(cat, label)) in Category::TABS.iter().enumerate() {
@@ -1052,34 +1234,6 @@ impl eframe::App for LodestashApp {
                             }
                         }
 
-                        // Library filter — flat mode, multi-source projects only.
-                        if self.view_mode == ViewMode::Flat && self.scan_roots.len() > 1 {
-                            let selected = match self.source_filter {
-                                None => "All libraries".to_owned(),
-                                Some(i) => config::stem_name(&self.scan_roots[i]),
-                            };
-                            let before = self.source_filter;
-                            egui::ComboBox::from_id_salt("lib_filter")
-                                .width(110.0)
-                                .selected_text(
-                                    RichText::new(selected).color(theme::TEXT).size(11.0),
-                                )
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut self.source_filter,
-                                        None,
-                                        "All libraries",
-                                    );
-                                    for i in 0..self.scan_roots.len() {
-                                        let name = config::stem_name(&self.scan_roots[i]);
-                                        ui.selectable_value(&mut self.source_filter, Some(i), name);
-                                    }
-                                });
-                            if self.source_filter != before {
-                                self.cache_dirty = true;
-                            }
-                        }
-
                         ui.separator();
                         ui.label(RichText::new("Sort").color(theme::TEXT_DIM).size(11.0));
 
@@ -1132,6 +1286,67 @@ impl eframe::App for LodestashApp {
                         });
                     });
                 });
+        }
+
+        // ── Pending packages bar ────────────────────────────────────────────────
+        // .unitypackage files found while crawling — shown here rather than as opaque grid
+        // cards, since a raw archive isn't browseable until extracted (see the KANBAN Phase 2
+        // "wiring" note this closes: extraction is user-triggered, never automatic on scan).
+        if !self.pending_packages.is_empty() {
+            let mut extract_clicked: Option<usize> = None;
+            egui::TopBottomPanel::top("packages_bar")
+                .frame(
+                    egui::Frame::none()
+                        .fill(theme::SURFACE)
+                        .inner_margin(egui::Margin::symmetric(12.0, 6.0))
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+                )
+                .show(ctx, |ui| {
+                    for i in 0..self.pending_packages.len() {
+                        ui.horizontal(|ui| {
+                            let pkg = &mut self.pending_packages[i];
+                            ui.label(
+                                RichText::new(format!("\u{1F4E6} {}", pkg.display_name))
+                                    .color(theme::TEXT)
+                                    .size(12.0),
+                            );
+                            if !pkg.nested_candidates.is_empty() {
+                                let selected = pkg.nested_candidates[pkg.chosen_variant].0.clone();
+                                egui::ComboBox::from_id_salt(("pkg_variant", i))
+                                    .width(220.0)
+                                    .selected_text(
+                                        RichText::new(selected).color(theme::TEXT).size(11.0),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for (vi, (label, _)) in
+                                            pkg.nested_candidates.iter().enumerate()
+                                        {
+                                            ui.selectable_value(
+                                                &mut pkg.chosen_variant,
+                                                vi,
+                                                label.clone(),
+                                            );
+                                        }
+                                    });
+                            }
+                            let extracting = pkg.extracting;
+                            let label = if extracting {
+                                "Extracting\u{2026}"
+                            } else {
+                                "Extract"
+                            };
+                            if ui
+                                .add_enabled(!extracting, egui::Button::new(label))
+                                .clicked()
+                            {
+                                extract_clicked = Some(i);
+                            }
+                        });
+                    }
+                });
+            if let Some(idx) = extract_clicked {
+                self.extract_package(ctx, idx);
+            }
         }
 
         // ── Inspector pane (right side) ───────────────────────────────────────
@@ -1387,6 +1602,104 @@ fn reveal_in_file_manager(path: &std::path::Path) {
     let _ = std::process::Command::new("open").arg(path).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
     let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+}
+
+// ── .unitypackage discovery & extraction ──────────────────────────────────────
+
+fn is_unitypackage(path: &std::path::Path) -> bool {
+    path.extension()
+        .map(|e| e.eq_ignore_ascii_case("unitypackage"))
+        .unwrap_or(false)
+}
+
+/// Display name for a package: the file stem of its path (extension and directories stripped).
+fn package_display_name(path: &std::path::Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// Browse a freshly-crawled `.unitypackage` (cheap manifest read, no extraction) and turn it into
+/// a `PendingPackage` ready for the user to act on. Runs on the background crawl thread, so a
+/// large package's manifest read (still O(file size) to decompress, just O(1) memory) never
+/// blocks the UI. Returns `None` if the archive can't be read (corrupt/unsupported) — silently
+/// skipped rather than surfaced as an error card, matching INGESTION.md §8's "don't promise 100%."
+fn resolve_pending_package(source_idx: usize, file: &CrawledFile) -> Option<PendingPackage> {
+    let manifest = unitypackage::read_manifest(&file.abs_path).ok()?;
+    let nested = unitypackage::nested_package_candidates(&manifest);
+    let chosen_variant = unitypackage::preferred_variant_index(&nested);
+    let nested_candidates = nested
+        .iter()
+        .filter_map(|e| {
+            e.pathname
+                .clone()
+                .map(|p| (package_display_name(std::path::Path::new(&p)), p))
+        })
+        .collect();
+
+    Some(PendingPackage {
+        source_idx,
+        abs_path: file.abs_path.clone(),
+        display_name: package_display_name(&file.rel_path),
+        nested_candidates,
+        chosen_variant,
+        extracting: false,
+    })
+}
+
+/// Extract `path` into `workspace_dir` and convert the payloads into crawlable entries, virtually
+/// namespaced under `display_name` (`rel_path` becomes `{display_name}/{original pathname}`) so
+/// Folders view groups them under one tile showing where they came from.
+///
+/// When `nested_pathname` is set, the outer archive is a render-pipeline-variant wrapper
+/// (INGESTION.md §2 "Container nuance"): the first extraction pass only recovers the wrapper's
+/// direct payloads (including the nested `.unitypackage` file itself), so a second pass extracts
+/// *that* file to reach the real assets.
+fn extract_package_contents(
+    path: &std::path::Path,
+    workspace_dir: &std::path::Path,
+    nested_pathname: Option<&str>,
+    display_name: &str,
+) -> Vec<CrawledFile> {
+    let Ok(outer) = unitypackage::extract_to_workspace(path, workspace_dir) else {
+        return Vec::new();
+    };
+
+    let assets = match nested_pathname {
+        Some(nested_pathname) => {
+            let Some(nested) = outer
+                .iter()
+                .find(|a| a.pathname.as_deref() == Some(nested_pathname))
+            else {
+                return Vec::new();
+            };
+            unitypackage::extract_to_workspace(&nested.workspace_path, workspace_dir)
+                .unwrap_or_default()
+        }
+        None => outer,
+    };
+
+    assets
+        .into_iter()
+        .map(|a| {
+            let rel_suffix = a.pathname.clone().unwrap_or_else(|| a.guid.clone());
+            let rel_path = PathBuf::from(display_name).join(rel_suffix);
+            let media_type = detect::by_extension(&rel_path);
+            let mtime = std::fs::metadata(&a.workspace_path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            CrawledFile {
+                abs_path: a.workspace_path,
+                rel_path,
+                size_bytes: a.size_bytes,
+                mtime,
+                media_type,
+            }
+        })
+        .collect()
 }
 
 // ── Empty / no-results states ─────────────────────────────────────────────────
@@ -2091,5 +2404,85 @@ mod tests {
             prop_assert!(start <= end);
             prop_assert!(end <= len);
         }
+    }
+
+    /// Build a minimal real `.unitypackage`: one GUID folder with `asset`/`pathname` (no
+    /// `.meta`, not needed for this test).
+    fn build_test_package(
+        dir: &std::path::Path,
+        name: &str,
+        pathname: &str,
+        asset_bytes: &[u8],
+    ) -> PathBuf {
+        let pkg_path = dir.join(name);
+        let file = std::fs::File::create(&pkg_path).unwrap();
+        let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(gz);
+
+        let mut append = |member: &str, bytes: &[u8]| {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, format!("guid0/{member}"), bytes)
+                .unwrap();
+        };
+        append("asset", asset_bytes);
+        append("pathname", pathname.as_bytes());
+
+        builder.into_inner().unwrap().finish().unwrap();
+        pkg_path
+    }
+
+    #[test]
+    fn resolve_and_extract_nested_wrapper_package_end_to_end() {
+        // Two-level nesting, same shape as a real render-pipeline-variant wrapper: an outer
+        // package whose only payload is itself a `.unitypackage` (the URP variant), which in
+        // turn contains the real asset.
+        let dir = tempfile::tempdir().unwrap();
+        let inner_bytes = std::fs::read(build_test_package(
+            dir.path(),
+            "inner.unitypackage",
+            "Assets/Pack/model.fbx",
+            b"FBX_DATA",
+        ))
+        .unwrap();
+        let outer_path = build_test_package(
+            dir.path(),
+            "outer.unitypackage",
+            "Assets/Pack/URP_Pack_1.0.unitypackage",
+            &inner_bytes,
+        );
+
+        let file = CrawledFile {
+            abs_path: outer_path.clone(),
+            rel_path: PathBuf::from("Pack.unitypackage"),
+            size_bytes: std::fs::metadata(&outer_path).unwrap().len(),
+            mtime: 0,
+            media_type: None,
+        };
+        let pkg = resolve_pending_package(0, &file).expect("manifest should parse");
+        assert_eq!(pkg.display_name, "Pack");
+        assert_eq!(pkg.nested_candidates.len(), 1);
+        assert_eq!(pkg.chosen_variant, 0, "sole candidate is auto-chosen");
+
+        let workspace = dir.path().join("workspace");
+        let nested_pathname = pkg.nested_candidates[pkg.chosen_variant].1.clone();
+        let files = extract_package_contents(
+            &pkg.abs_path,
+            &workspace,
+            Some(&nested_pathname),
+            &pkg.display_name,
+        );
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].rel_path,
+            PathBuf::from("Pack").join("Assets/Pack/model.fbx")
+        );
+        assert_eq!(files[0].media_type, Some(MediaType::Model3d));
+        assert_eq!(files[0].size_bytes, b"FBX_DATA".len() as u64);
+        assert_eq!(std::fs::read(&files[0].abs_path).unwrap(), b"FBX_DATA");
     }
 }
