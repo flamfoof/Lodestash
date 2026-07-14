@@ -8,7 +8,7 @@ use std::time::Duration;
 use egui::{Key, RichText, ScrollArea, TextureHandle, Ui, Vec2};
 use lodestash_core::types::MediaType;
 use lodestash_ingest::crawler::{self, CrawledFile};
-use lodestash_ingest::thumb;
+use lodestash_ingest::{detect, thumb, unitypackage};
 
 use crate::config::{self, AppConfig, SizeTier, SizeTiers, SortBy, ViewMode};
 use crate::theme;
@@ -70,6 +70,32 @@ struct ScanDone {
     generation: u64,
     /// (source index into scan_roots, crawled file)
     entries: Vec<(usize, CrawledFile)>,
+    pending_packages: Vec<PendingPackage>,
+}
+
+/// A `.unitypackage` found while crawling, not yet extracted into the grid. Its manifest is
+/// already resolved (read on the same background crawl thread) so the UI can offer an "Extract"
+/// action immediately, with no separate loading step.
+struct PendingPackage {
+    source_idx: usize,
+    abs_path: PathBuf,
+    display_name: String,
+    /// (display label, real `pathname`) for each nested sub-package — e.g. a URP/Built-in
+    /// render-pipeline-variant wrapper (INGESTION.md §2 "Container nuance"). Empty when this
+    /// package directly contains real assets (no wrapper).
+    nested_candidates: Vec<(String, String)>,
+    /// Index into `nested_candidates`, defaulted to the URP variant when one exists.
+    chosen_variant: usize,
+    extracting: bool,
+}
+
+/// Result of a background package extraction.
+struct ExtractDone {
+    /// Identifies which `PendingPackage` this came from — matched by path rather than index
+    /// since `pending_packages` may have been mutated while the extraction ran.
+    abs_path: PathBuf,
+    source_idx: usize,
+    files: Vec<CrawledFile>,
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -257,6 +283,7 @@ impl LodestashApp {
 
         let (thumb_tx, thumb_rx) = mpsc::channel();
         let (scan_tx, scan_rx) = mpsc::channel();
+        let (extract_tx, extract_rx) = mpsc::channel();
         let config = AppConfig::load();
         let sort_by = config.view.sort_by;
         let sort_asc = config.view.sort_asc;
@@ -402,6 +429,7 @@ impl LodestashApp {
         self.current_dir = None;
         self.folder_tiles = Vec::new();
         self.nav_generation += 1;
+        self.pending_packages = Vec::new();
 
         // Each source's blacklist (design §5.1) — resolved before the crawl thread so it honours
         // per-source excludes (INGESTION.md §1).
@@ -431,6 +459,7 @@ impl LodestashApp {
             let _ = tx.send(ScanDone {
                 generation,
                 entries,
+                pending_packages,
             });
         });
 
@@ -455,6 +484,7 @@ impl LodestashApp {
                     thumb_spawned: false,
                 })
                 .collect();
+            self.pending_packages = msg.pending_packages;
             self.current_dir = self.default_dir();
             self.tab_counts = Category::TABS
                 .iter()
@@ -469,6 +499,68 @@ impl LodestashApp {
             self.last_cols = 0;
             self.last_row_start = usize::MAX;
             self.last_row_end = 0;
+        }
+    }
+
+    /// Kick off a background extraction of `pending_packages[idx]` into the workspace dir.
+    fn extract_package(&mut self, ctx: &egui::Context, idx: usize) {
+        let Some(workspace_dir) = self.workspace_dir.clone() else {
+            return;
+        };
+        let Some(pkg) = self.pending_packages.get_mut(idx) else {
+            return;
+        };
+        if pkg.extracting {
+            return;
+        }
+        pkg.extracting = true;
+
+        let abs_path = pkg.abs_path.clone();
+        let source_idx = pkg.source_idx;
+        let display_name = pkg.display_name.clone();
+        let nested_pathname = pkg
+            .nested_candidates
+            .get(pkg.chosen_variant)
+            .map(|(_, pathname)| pathname.clone());
+        let tx = self.extract_tx.clone();
+
+        std::thread::spawn(move || {
+            let files = extract_package_contents(
+                &abs_path,
+                &workspace_dir,
+                nested_pathname.as_deref(),
+                &display_name,
+            );
+            let _ = tx.send(ExtractDone {
+                abs_path,
+                source_idx,
+                files,
+            });
+        });
+        ctx.request_repaint();
+    }
+
+    fn receive_extracts(&mut self) {
+        while let Ok(msg) = self.extract_rx.try_recv() {
+            self.pending_packages.retain(|p| p.abs_path != msg.abs_path);
+            for file in msg.files {
+                self.entries.push(AssetEntry {
+                    file,
+                    source_idx: msg.source_idx,
+                    texture: None,
+                    thumb_spawned: false,
+                });
+            }
+            self.tab_counts = Category::TABS
+                .iter()
+                .map(|&(cat, _)| {
+                    self.entries
+                        .iter()
+                        .filter(|e| cat.matches(e.file.media_type))
+                        .count()
+                })
+                .collect();
+            self.cache_dirty = true;
         }
     }
 
@@ -1305,6 +1397,7 @@ impl eframe::App for LodestashApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_scan();
         self.receive_thumbnails();
+        self.receive_extracts();
 
         // While a scan or thumbnails are in flight, wake up at ~30 fps to drain the
         // channels. Keeping this in the main thread (not the worker threads) prevents
@@ -1528,6 +1621,76 @@ impl eframe::App for LodestashApp {
                         .stroke(egui::Stroke::new(1.0, theme::BORDER)),
                 )
                 .show(ctx, |ui| {
+                    // Library tabs — the primary grouping when a project has more than one
+                    // source, so browsing never mixes unrelated packs into one anonymous pile
+                    // (DESIGN-GUIDELINES.md §7 "Browse views"). Folders view already separates
+                    // sources structurally via folder tiles, so this only applies to Flat.
+                    if self.scan_roots.len() > 1 && self.view_mode == ViewMode::Flat {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            let is_all = self.source_filter.is_none();
+                            let all_resp =
+                                ui.add(
+                                    egui::Button::new(
+                                        RichText::new("All libraries").size(12.0).color(
+                                            if is_all { theme::GOLD } else { theme::TEXT_DIM },
+                                        ),
+                                    )
+                                    .fill(egui::Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::NONE)
+                                    .frame(false),
+                                );
+                            if all_resp.clicked() {
+                                self.source_filter = None;
+                                self.cache_dirty = true;
+                            }
+                            if is_all {
+                                let rect = all_resp.rect;
+                                ui.painter().line_segment(
+                                    [
+                                        egui::pos2(rect.min.x, rect.max.y),
+                                        egui::pos2(rect.max.x, rect.max.y),
+                                    ],
+                                    egui::Stroke::new(2.0, theme::GOLD),
+                                );
+                            }
+                            ui.add_space(8.0);
+
+                            for i in 0..self.scan_roots.len() {
+                                let is_active = self.source_filter == Some(i);
+                                let name = config::stem_name(&self.scan_roots[i]);
+                                let resp = ui.add(
+                                    egui::Button::new(RichText::new(name).size(12.0).color(
+                                        if is_active {
+                                            theme::GOLD
+                                        } else {
+                                            theme::TEXT_DIM
+                                        },
+                                    ))
+                                    .fill(egui::Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::NONE)
+                                    .frame(false),
+                                );
+                                if resp.clicked() {
+                                    self.source_filter = Some(i);
+                                    self.cache_dirty = true;
+                                }
+                                if is_active {
+                                    let rect = resp.rect;
+                                    ui.painter().line_segment(
+                                        [
+                                            egui::pos2(rect.min.x, rect.max.y),
+                                            egui::pos2(rect.max.x, rect.max.y),
+                                        ],
+                                        egui::Stroke::new(2.0, theme::GOLD),
+                                    );
+                                }
+                                ui.add_space(8.0);
+                            }
+                        });
+                        ui.add_space(2.0);
+                    }
+
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
                         for (i, &(cat, label)) in Category::TABS.iter().enumerate() {
@@ -1652,34 +1815,6 @@ impl eframe::App for LodestashApp {
                             }
                         }
 
-                        // Library filter — flat mode, multi-source projects only.
-                        if self.view_mode == ViewMode::Flat && self.scan_roots.len() > 1 {
-                            let selected = match self.source_filter {
-                                None => "All libraries".to_owned(),
-                                Some(i) => config::stem_name(&self.scan_roots[i]),
-                            };
-                            let before = self.source_filter;
-                            egui::ComboBox::from_id_salt("lib_filter")
-                                .width(110.0)
-                                .selected_text(
-                                    RichText::new(selected).color(theme::TEXT).size(11.0),
-                                )
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut self.source_filter,
-                                        None,
-                                        "All libraries",
-                                    );
-                                    for i in 0..self.scan_roots.len() {
-                                        let name = config::stem_name(&self.scan_roots[i]);
-                                        ui.selectable_value(&mut self.source_filter, Some(i), name);
-                                    }
-                                });
-                            if self.source_filter != before {
-                                self.cache_dirty = true;
-                            }
-                        }
-
                         ui.separator();
                         ui.label(RichText::new("Sort").color(theme::TEXT_DIM).size(11.0));
 
@@ -1740,6 +1875,67 @@ impl eframe::App for LodestashApp {
                         });
                     });
                 });
+        }
+
+        // ── Pending packages bar ────────────────────────────────────────────────
+        // .unitypackage files found while crawling — shown here rather than as opaque grid
+        // cards, since a raw archive isn't browseable until extracted (see the KANBAN Phase 2
+        // "wiring" note this closes: extraction is user-triggered, never automatic on scan).
+        if !self.pending_packages.is_empty() {
+            let mut extract_clicked: Option<usize> = None;
+            egui::TopBottomPanel::top("packages_bar")
+                .frame(
+                    egui::Frame::none()
+                        .fill(theme::SURFACE)
+                        .inner_margin(egui::Margin::symmetric(12.0, 6.0))
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+                )
+                .show(ctx, |ui| {
+                    for i in 0..self.pending_packages.len() {
+                        ui.horizontal(|ui| {
+                            let pkg = &mut self.pending_packages[i];
+                            ui.label(
+                                RichText::new(format!("\u{1F4E6} {}", pkg.display_name))
+                                    .color(theme::TEXT)
+                                    .size(12.0),
+                            );
+                            if !pkg.nested_candidates.is_empty() {
+                                let selected = pkg.nested_candidates[pkg.chosen_variant].0.clone();
+                                egui::ComboBox::from_id_salt(("pkg_variant", i))
+                                    .width(220.0)
+                                    .selected_text(
+                                        RichText::new(selected).color(theme::TEXT).size(11.0),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for (vi, (label, _)) in
+                                            pkg.nested_candidates.iter().enumerate()
+                                        {
+                                            ui.selectable_value(
+                                                &mut pkg.chosen_variant,
+                                                vi,
+                                                label.clone(),
+                                            );
+                                        }
+                                    });
+                            }
+                            let extracting = pkg.extracting;
+                            let label = if extracting {
+                                "Extracting\u{2026}"
+                            } else {
+                                "Extract"
+                            };
+                            if ui
+                                .add_enabled(!extracting, egui::Button::new(label))
+                                .clicked()
+                            {
+                                extract_clicked = Some(i);
+                            }
+                        });
+                    }
+                });
+            if let Some(idx) = extract_clicked {
+                self.extract_package(ctx, idx);
+            }
         }
 
         // ── Inspector pane (right side) ───────────────────────────────────────
@@ -3179,5 +3375,85 @@ mod tests {
             prop_assert!(start <= end);
             prop_assert!(end <= len);
         }
+    }
+
+    /// Build a minimal real `.unitypackage`: one GUID folder with `asset`/`pathname` (no
+    /// `.meta`, not needed for this test).
+    fn build_test_package(
+        dir: &std::path::Path,
+        name: &str,
+        pathname: &str,
+        asset_bytes: &[u8],
+    ) -> PathBuf {
+        let pkg_path = dir.join(name);
+        let file = std::fs::File::create(&pkg_path).unwrap();
+        let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(gz);
+
+        let mut append = |member: &str, bytes: &[u8]| {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, format!("guid0/{member}"), bytes)
+                .unwrap();
+        };
+        append("asset", asset_bytes);
+        append("pathname", pathname.as_bytes());
+
+        builder.into_inner().unwrap().finish().unwrap();
+        pkg_path
+    }
+
+    #[test]
+    fn resolve_and_extract_nested_wrapper_package_end_to_end() {
+        // Two-level nesting, same shape as a real render-pipeline-variant wrapper: an outer
+        // package whose only payload is itself a `.unitypackage` (the URP variant), which in
+        // turn contains the real asset.
+        let dir = tempfile::tempdir().unwrap();
+        let inner_bytes = std::fs::read(build_test_package(
+            dir.path(),
+            "inner.unitypackage",
+            "Assets/Pack/model.fbx",
+            b"FBX_DATA",
+        ))
+        .unwrap();
+        let outer_path = build_test_package(
+            dir.path(),
+            "outer.unitypackage",
+            "Assets/Pack/URP_Pack_1.0.unitypackage",
+            &inner_bytes,
+        );
+
+        let file = CrawledFile {
+            abs_path: outer_path.clone(),
+            rel_path: PathBuf::from("Pack.unitypackage"),
+            size_bytes: std::fs::metadata(&outer_path).unwrap().len(),
+            mtime: 0,
+            media_type: None,
+        };
+        let pkg = resolve_pending_package(0, &file).expect("manifest should parse");
+        assert_eq!(pkg.display_name, "Pack");
+        assert_eq!(pkg.nested_candidates.len(), 1);
+        assert_eq!(pkg.chosen_variant, 0, "sole candidate is auto-chosen");
+
+        let workspace = dir.path().join("workspace");
+        let nested_pathname = pkg.nested_candidates[pkg.chosen_variant].1.clone();
+        let files = extract_package_contents(
+            &pkg.abs_path,
+            &workspace,
+            Some(&nested_pathname),
+            &pkg.display_name,
+        );
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].rel_path,
+            PathBuf::from("Pack").join("Assets/Pack/model.fbx")
+        );
+        assert_eq!(files[0].media_type, Some(MediaType::Model3d));
+        assert_eq!(files[0].size_bytes, b"FBX_DATA".len() as u64);
+        assert_eq!(std::fs::read(&files[0].abs_path).unwrap(), b"FBX_DATA");
     }
 }

@@ -139,6 +139,35 @@ pub fn read_manifest(path: &Path) -> io::Result<Vec<PackageEntry>> {
     Ok(by_guid.into_values().collect())
 }
 
+/// Entries in a manifest whose `pathname` is itself a `.unitypackage` — a render-pipeline-variant
+/// wrapper bundling multiple sub-packages (INGESTION.md §2 "Container nuance"; observed in the
+/// wild as a publisher shipping separate URP/Built-in variants inside one outer package).
+pub fn nested_package_candidates(manifest: &[PackageEntry]) -> Vec<&PackageEntry> {
+    manifest
+        .iter()
+        .filter(|e| {
+            e.pathname
+                .as_deref()
+                .map(|p| p.to_lowercase().ends_with(".unitypackage"))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// Index into `candidates` of the preferred render-pipeline variant: the first whose pathname
+/// mentions URP (case-insensitive), else the first candidate. `candidates` must be non-empty.
+pub fn preferred_variant_index(candidates: &[&PackageEntry]) -> usize {
+    candidates
+        .iter()
+        .position(|e| {
+            e.pathname
+                .as_deref()
+                .map(|p| p.to_lowercase().contains("urp"))
+                .unwrap_or(false)
+        })
+        .unwrap_or(0)
+}
+
 /// One `asset` payload extracted into the workspace.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExtractedAsset {
@@ -283,6 +312,51 @@ mod tests {
     fn parse_meta_malformed_yaml_yields_empty() {
         let meta = parse_meta("not: valid: yaml: [");
         assert_eq!(meta, UnityMeta::default());
+    }
+
+    fn entry_with_pathname(pathname: &str) -> PackageEntry {
+        PackageEntry {
+            guid: "g".into(),
+            pathname: Some(pathname.into()),
+            meta: UnityMeta::default(),
+            asset_size: None,
+            has_preview: false,
+        }
+    }
+
+    #[test]
+    fn nested_package_candidates_finds_only_unitypackage_pathnames() {
+        let manifest = vec![
+            entry_with_pathname("Assets/Toon Fantasy Nature"),
+            entry_with_pathname("Assets/Toon Fantasy Nature/_ReadFirst.txt"),
+            entry_with_pathname(
+                "Assets/Toon Fantasy Nature/URP_Toon Fantasy Nature_6000.1.0.unitypackage",
+            ),
+            entry_with_pathname(
+                "Assets/Toon Fantasy Nature/BuiltIn_Toon Fantasy Nature_6000.1.0.unitypackage",
+            ),
+        ];
+        let nested = nested_package_candidates(&manifest);
+        assert_eq!(nested.len(), 2);
+        assert!(nested
+            .iter()
+            .all(|e| e.pathname.as_deref().unwrap().ends_with(".unitypackage")));
+    }
+
+    #[test]
+    fn preferred_variant_index_picks_urp_when_present() {
+        let a = entry_with_pathname("Assets/BuiltIn_Pack_1.0.unitypackage");
+        let b = entry_with_pathname("Assets/URP_Pack_1.0.unitypackage");
+        let candidates = vec![&a, &b];
+        assert_eq!(preferred_variant_index(&candidates), 1);
+    }
+
+    #[test]
+    fn preferred_variant_index_falls_back_to_first_when_no_urp() {
+        let a = entry_with_pathname("Assets/BuiltIn_Pack_1.0.unitypackage");
+        let b = entry_with_pathname("Assets/HDRP_Pack_1.0.unitypackage");
+        let candidates = vec![&a, &b];
+        assert_eq!(preferred_variant_index(&candidates), 0);
     }
 
     #[test]
