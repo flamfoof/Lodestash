@@ -267,6 +267,13 @@ pub struct LodestashApp {
     quick_look: bool,
     /// When true, the Sources panel (view/add/remove project sources + app-data locations) is open.
     sources_panel_open: bool,
+    /// `.unitypackage` files found while crawling, awaiting an explicit Extract action (PR #8).
+    pending_packages: Vec<PendingPackage>,
+    extract_rx: Receiver<ExtractDone>,
+    extract_tx: Sender<ExtractDone>,
+    /// Where extracted package payloads are stored, content-addressed (None if the OS cache dir
+    /// is unavailable).
+    workspace_dir: Option<PathBuf>,
     /// The ⚑ Filters content filter (trait / triangles / file-size). Transient. Design §3.
     content_filter: ContentFilter,
     /// Active top-level screen (Library grid vs Settings). Design §5.
@@ -275,6 +282,9 @@ pub struct LodestashApp {
     expanded_source: Option<usize>,
     /// The in-progress blacklist exclusion text for the expanded source (transient). §5.1.
     blacklist_input: String,
+    /// Show the first-run onboarding modal over the (dimmed) library. Design §1; suppressed by
+    /// `config.skip_onboarding`.
+    onboarding_open: bool,
 }
 
 impl LodestashApp {
@@ -289,6 +299,9 @@ impl LodestashApp {
         let sort_asc = config.view.sort_asc;
         let thumb_size = config.view.thumb_size.clamp(THUMB_MIN, THUMB_MAX);
         let view_mode = config.view.mode;
+        // First-run onboarding shows unless the user opted out (design §1, §5.7). It only actually
+        // renders when no library is open, so a restored library naturally suppresses it.
+        let show_onboarding = !config.skip_onboarding;
 
         let mut app = Self {
             scan_roots: Vec::new(),
@@ -321,10 +334,15 @@ impl LodestashApp {
             selected_cache_idx: None,
             quick_look: false,
             sources_panel_open: false,
+            pending_packages: Vec::new(),
+            extract_rx,
+            extract_tx,
+            workspace_dir: dirs::cache_dir().map(|d| d.join("Lodestash").join("workspace")),
             content_filter: ContentFilter::default(),
             screen: Screen::Library,
             expanded_source: None,
             blacklist_input: String::new(),
+            onboarding_open: show_onboarding,
             config,
         };
 
@@ -447,15 +465,20 @@ impl LodestashApp {
         let generation = self.scan_generation;
         let tx = self.scan_tx.clone();
         std::thread::spawn(move || {
-            let entries: Vec<(usize, CrawledFile)> = roots
-                .iter()
-                .enumerate()
-                .flat_map(|(i, root)| {
-                    crawler::crawl(root, &excludes[i])
-                        .into_iter()
-                        .map(move |f| (i, f))
-                })
-                .collect();
+            let mut entries: Vec<(usize, CrawledFile)> = Vec::new();
+            let mut pending_packages = Vec::new();
+            for (source_idx, root) in roots.iter().enumerate() {
+                for file in crawler::crawl(root, &excludes[source_idx]) {
+                    if is_unitypackage(&file.abs_path) {
+                        // Don't surface the raw archive; offer an Extract action instead (PR #8).
+                        if let Some(pkg) = resolve_pending_package(source_idx, &file) {
+                            pending_packages.push(pkg);
+                        }
+                        continue;
+                    }
+                    entries.push((source_idx, file));
+                }
+            }
             let _ = tx.send(ScanDone {
                 generation,
                 entries,
@@ -2084,6 +2107,75 @@ impl eframe::App for LodestashApp {
             }
         }
 
+        // ── First-run onboarding overlay (design §1) ──────────────────────────
+        if self.screen == Screen::Library
+            && self.onboarding_open
+            && self.scan_roots.is_empty()
+            && !self.scanning
+        {
+            let mut open_folder = false;
+            let mut onb_project: Option<String> = None;
+            let mut onb_single: Option<PathBuf> = None;
+            let mut dismiss = false;
+            let mut skip = self.config.skip_onboarding;
+
+            // Dimming scrim over the whole window; catches clicks so the library behind stays inert.
+            egui::Area::new(egui::Id::new("onboarding_scrim"))
+                .order(egui::Order::Middle)
+                .fixed_pos(egui::Pos2::ZERO)
+                .interactable(true)
+                .show(ctx, |ui| {
+                    let screen = ctx.screen_rect();
+                    ui.allocate_rect(screen, egui::Sense::click());
+                    ui.painter()
+                        .rect_filled(screen, 0.0, theme::BG.linear_multiply(0.6));
+                });
+
+            egui::Window::new("onboarding")
+                .title_bar(false)
+                .resizable(false)
+                .collapsible(false)
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .default_width(440.0)
+                .frame(
+                    egui::Frame::window(&ctx.style())
+                        .fill(theme::SURFACE_RAISED)
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                        .inner_margin(egui::Margin::same(22.0)),
+                )
+                .show(ctx, |ui| {
+                    onboarding_content(
+                        ui,
+                        &self.config,
+                        &mut open_folder,
+                        &mut onb_project,
+                        &mut onb_single,
+                        &mut dismiss,
+                        &mut skip,
+                    );
+                });
+
+            if skip != self.config.skip_onboarding {
+                self.config.skip_onboarding = skip;
+                self.config.save();
+            }
+            if dismiss {
+                self.onboarding_open = false;
+            }
+            if open_folder {
+                self.onboarding_open = false;
+                self.open_folder(ctx);
+            } else if let Some(name) = onb_project {
+                self.onboarding_open = false;
+                self.open_project(ctx, &name);
+            } else if let Some(path) = onb_single {
+                self.onboarding_open = false;
+                let proj_name = self.config.record_open(path.clone());
+                self.load_paths(ctx, vec![path], Some(proj_name));
+            }
+        }
+
         // ── Sources panel ──────────────────────────────────────────────────────
         if self.sources_panel_open {
             let mut open = self.sources_panel_open;
@@ -2346,6 +2438,104 @@ fn size_tiers_editor(ui: &mut Ui, tiers: &mut SizeTiers) -> bool {
     }
 }
 
+// ── .unitypackage discovery & extraction ──────────────────────────────────────
+
+fn is_unitypackage(path: &std::path::Path) -> bool {
+    path.extension()
+        .map(|e| e.eq_ignore_ascii_case("unitypackage"))
+        .unwrap_or(false)
+}
+
+/// Display name for a package: the file stem of its path (extension and directories stripped).
+fn package_display_name(path: &std::path::Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// Browse a freshly-crawled `.unitypackage` (cheap manifest read, no extraction) and turn it into
+/// a `PendingPackage` ready for the user to act on. Runs on the background crawl thread, so a
+/// large package's manifest read (still O(file size) to decompress, just O(1) memory) never
+/// blocks the UI. Returns `None` if the archive can't be read (corrupt/unsupported) — silently
+/// skipped rather than surfaced as an error card, matching INGESTION.md §8's "don't promise 100%."
+fn resolve_pending_package(source_idx: usize, file: &CrawledFile) -> Option<PendingPackage> {
+    let manifest = unitypackage::read_manifest(&file.abs_path).ok()?;
+    let nested = unitypackage::nested_package_candidates(&manifest);
+    let chosen_variant = unitypackage::preferred_variant_index(&nested);
+    let nested_candidates = nested
+        .iter()
+        .filter_map(|e| {
+            e.pathname
+                .clone()
+                .map(|p| (package_display_name(std::path::Path::new(&p)), p))
+        })
+        .collect();
+
+    Some(PendingPackage {
+        source_idx,
+        abs_path: file.abs_path.clone(),
+        display_name: package_display_name(&file.rel_path),
+        nested_candidates,
+        chosen_variant,
+        extracting: false,
+    })
+}
+
+/// Extract `path` into `workspace_dir` and convert the payloads into crawlable entries, virtually
+/// namespaced under `display_name` (`rel_path` becomes `{display_name}/{original pathname}`) so
+/// Folders view groups them under one tile showing where they came from.
+///
+/// When `nested_pathname` is set, the outer archive is a render-pipeline-variant wrapper
+/// (INGESTION.md §2 "Container nuance"): the first extraction pass only recovers the wrapper's
+/// direct payloads (including the nested `.unitypackage` file itself), so a second pass extracts
+/// *that* file to reach the real assets.
+fn extract_package_contents(
+    path: &std::path::Path,
+    workspace_dir: &std::path::Path,
+    nested_pathname: Option<&str>,
+    display_name: &str,
+) -> Vec<CrawledFile> {
+    let Ok(outer) = unitypackage::extract_to_workspace(path, workspace_dir) else {
+        return Vec::new();
+    };
+
+    let assets = match nested_pathname {
+        Some(nested_pathname) => {
+            let Some(nested) = outer
+                .iter()
+                .find(|a| a.pathname.as_deref() == Some(nested_pathname))
+            else {
+                return Vec::new();
+            };
+            unitypackage::extract_to_workspace(&nested.workspace_path, workspace_dir)
+                .unwrap_or_default()
+        }
+        None => outer,
+    };
+
+    assets
+        .into_iter()
+        .map(|a| {
+            let rel_suffix = a.pathname.clone().unwrap_or_else(|| a.guid.clone());
+            let rel_path = PathBuf::from(display_name).join(rel_suffix);
+            let media_type = detect::by_extension(&rel_path);
+            let mtime = std::fs::metadata(&a.workspace_path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            CrawledFile {
+                abs_path: a.workspace_path,
+                rel_path,
+                size_bytes: a.size_bytes,
+                mtime,
+                media_type,
+            }
+        })
+        .collect()
+}
+
 // ── Empty / no-results states ─────────────────────────────────────────────────
 
 fn empty_state(
@@ -2438,6 +2628,178 @@ fn scanning_state(ui: &mut Ui) {
         ui.add(egui::Spinner::new().size(28.0));
         ui.add_space(8.0);
         ui.label(RichText::new("Scanning\u{2026}").color(theme::TEXT_MUTED));
+    });
+}
+
+/// Paint a dashed rounded-rectangle border (the gold drop affordance — design §1).
+fn paint_dashed_rect(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.5, color);
+    let corners = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+    ];
+    for i in 0..4 {
+        let seg = [corners[i], corners[(i + 1) % 4]];
+        for shape in egui::Shape::dashed_line(&seg, stroke, 6.0, 4.0) {
+            painter.add(shape);
+        }
+    }
+}
+
+/// First-run onboarding modal content (design §1): the "Point it at your hoard" picker with a
+/// gold dashed drop affordance, quick-open of saved libraries/recents, and the
+/// "Don't show this next time" checkbox bound to `skip_onboarding` (§5.7).
+#[allow(clippy::too_many_arguments)]
+fn onboarding_content(
+    ui: &mut Ui,
+    config: &AppConfig,
+    open_folder: &mut bool,
+    open_project: &mut Option<String>,
+    open_single: &mut Option<PathBuf>,
+    dismiss: &mut bool,
+    skip: &mut bool,
+) {
+    ui.vertical_centered(|ui| {
+        ui.label(RichText::new("\u{25C8}").size(40.0).color(theme::GOLD));
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("Point it at your hoard")
+                .size(18.0)
+                .color(theme::TEXT)
+                .strong(),
+        );
+        ui.add_space(3.0);
+        ui.label(
+            RichText::new(
+                "Choose a folder of assets \u{2014} models, textures, audio, packs \u{2014} and \
+                 Lodestash will catalogue it.",
+            )
+            .size(11.0)
+            .color(theme::TEXT_MUTED),
+        );
+    });
+    ui.add_space(14.0);
+
+    // Gold dashed drop well (drag-in ingest is a later QoL card; the button is the live action).
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 64.0), egui::Sense::hover());
+    paint_dashed_rect(ui.painter(), rect, theme::GOLD);
+    ui.painter().text(
+        egui::pos2(rect.center().x, rect.top() + 20.0),
+        egui::Align2::CENTER_CENTER,
+        "Drop a folder here",
+        egui::FontId::proportional(12.0),
+        theme::GOLD,
+    );
+    ui.painter().text(
+        egui::pos2(rect.center().x, rect.top() + 40.0),
+        egui::Align2::CENTER_CENTER,
+        "\u{2014} or \u{2014}",
+        egui::FontId::proportional(10.0),
+        theme::TEXT_DIM,
+    );
+    ui.add_space(10.0);
+    ui.vertical_centered(|ui| {
+        if ui
+            .add(
+                egui::Button::new(
+                    RichText::new("Open folder\u{2026}")
+                        .color(theme::BG)
+                        .size(13.0)
+                        .strong(),
+                )
+                .min_size(Vec2::new(160.0, 30.0))
+                .fill(theme::GOLD),
+            )
+            .clicked()
+        {
+            *open_folder = true;
+        }
+    });
+
+    // Quick-open saved libraries or recents.
+    let has_saved = config.projects.iter().any(|p| !p.live_paths().is_empty());
+    if has_saved {
+        ui.add_space(14.0);
+        section_label(ui, "SAVED LIBRARIES");
+        ui.add_space(4.0);
+        for proj in &config.projects {
+            if proj.live_paths().is_empty() {
+                continue;
+            }
+            let detail = if proj.paths.len() == 1 {
+                proj.paths[0].to_string_lossy().into_owned()
+            } else {
+                format!("{} sources", proj.paths.len())
+            };
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new(format!("\u{1F4C1}  {}", proj.name))
+                            .color(theme::TEXT)
+                            .size(12.0),
+                    )
+                    .min_size(Vec2::new(ui.available_width(), 26.0))
+                    .fill(theme::SURFACE)
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+                )
+                .on_hover_text(detail)
+                .clicked()
+            {
+                *open_project = Some(proj.name.clone());
+            }
+            ui.add_space(2.0);
+        }
+    } else {
+        for path in config.recent_roots.iter().filter(|p| p.is_dir()).take(3) {
+            let label = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+            if ui
+                .add(
+                    egui::Button::new(RichText::new(label).color(theme::TEXT).size(12.0))
+                        .fill(egui::Color32::TRANSPARENT),
+                )
+                .clicked()
+            {
+                *open_single = Some(path.clone());
+            }
+        }
+    }
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.horizontal(|ui| {
+        let mut dont = *skip;
+        if ui
+            .checkbox(
+                &mut dont,
+                RichText::new("Don't show this next time")
+                    .size(11.0)
+                    .color(theme::TEXT_MUTED),
+            )
+            .changed()
+        {
+            *skip = dont;
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("Skip for now")
+                            .size(11.0)
+                            .color(theme::TEXT_DIM),
+                    )
+                    .frame(false),
+                )
+                .clicked()
+            {
+                *dismiss = true;
+            }
+        });
     });
 }
 
