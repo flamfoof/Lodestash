@@ -267,6 +267,13 @@ pub struct LodestashApp {
     quick_look: bool,
     /// When true, the Sources panel (view/add/remove project sources + app-data locations) is open.
     sources_panel_open: bool,
+    /// `.unitypackage` files found while crawling, awaiting an explicit Extract action (PR #8).
+    pending_packages: Vec<PendingPackage>,
+    extract_rx: Receiver<ExtractDone>,
+    extract_tx: Sender<ExtractDone>,
+    /// Where extracted package payloads are stored, content-addressed (None if the OS cache dir
+    /// is unavailable).
+    workspace_dir: Option<PathBuf>,
     /// The ⚑ Filters content filter (trait / triangles / file-size). Transient. Design §3.
     content_filter: ContentFilter,
     /// Active top-level screen (Library grid vs Settings). Design §5.
@@ -327,6 +334,10 @@ impl LodestashApp {
             selected_cache_idx: None,
             quick_look: false,
             sources_panel_open: false,
+            pending_packages: Vec::new(),
+            extract_rx,
+            extract_tx,
+            workspace_dir: dirs::cache_dir().map(|d| d.join("Lodestash").join("workspace")),
             content_filter: ContentFilter::default(),
             screen: Screen::Library,
             expanded_source: None,
@@ -454,15 +465,20 @@ impl LodestashApp {
         let generation = self.scan_generation;
         let tx = self.scan_tx.clone();
         std::thread::spawn(move || {
-            let entries: Vec<(usize, CrawledFile)> = roots
-                .iter()
-                .enumerate()
-                .flat_map(|(i, root)| {
-                    crawler::crawl(root, &excludes[i])
-                        .into_iter()
-                        .map(move |f| (i, f))
-                })
-                .collect();
+            let mut entries: Vec<(usize, CrawledFile)> = Vec::new();
+            let mut pending_packages = Vec::new();
+            for (source_idx, root) in roots.iter().enumerate() {
+                for file in crawler::crawl(root, &excludes[source_idx]) {
+                    if is_unitypackage(&file.abs_path) {
+                        // Don't surface the raw archive; offer an Extract action instead (PR #8).
+                        if let Some(pkg) = resolve_pending_package(source_idx, &file) {
+                            pending_packages.push(pkg);
+                        }
+                        continue;
+                    }
+                    entries.push((source_idx, file));
+                }
+            }
             let _ = tx.send(ScanDone {
                 generation,
                 entries,
@@ -2420,6 +2436,104 @@ fn size_tiers_editor(ui: &mut Ui, tiers: &mut SizeTiers) -> bool {
     } else {
         false
     }
+}
+
+// ── .unitypackage discovery & extraction ──────────────────────────────────────
+
+fn is_unitypackage(path: &std::path::Path) -> bool {
+    path.extension()
+        .map(|e| e.eq_ignore_ascii_case("unitypackage"))
+        .unwrap_or(false)
+}
+
+/// Display name for a package: the file stem of its path (extension and directories stripped).
+fn package_display_name(path: &std::path::Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// Browse a freshly-crawled `.unitypackage` (cheap manifest read, no extraction) and turn it into
+/// a `PendingPackage` ready for the user to act on. Runs on the background crawl thread, so a
+/// large package's manifest read (still O(file size) to decompress, just O(1) memory) never
+/// blocks the UI. Returns `None` if the archive can't be read (corrupt/unsupported) — silently
+/// skipped rather than surfaced as an error card, matching INGESTION.md §8's "don't promise 100%."
+fn resolve_pending_package(source_idx: usize, file: &CrawledFile) -> Option<PendingPackage> {
+    let manifest = unitypackage::read_manifest(&file.abs_path).ok()?;
+    let nested = unitypackage::nested_package_candidates(&manifest);
+    let chosen_variant = unitypackage::preferred_variant_index(&nested);
+    let nested_candidates = nested
+        .iter()
+        .filter_map(|e| {
+            e.pathname
+                .clone()
+                .map(|p| (package_display_name(std::path::Path::new(&p)), p))
+        })
+        .collect();
+
+    Some(PendingPackage {
+        source_idx,
+        abs_path: file.abs_path.clone(),
+        display_name: package_display_name(&file.rel_path),
+        nested_candidates,
+        chosen_variant,
+        extracting: false,
+    })
+}
+
+/// Extract `path` into `workspace_dir` and convert the payloads into crawlable entries, virtually
+/// namespaced under `display_name` (`rel_path` becomes `{display_name}/{original pathname}`) so
+/// Folders view groups them under one tile showing where they came from.
+///
+/// When `nested_pathname` is set, the outer archive is a render-pipeline-variant wrapper
+/// (INGESTION.md §2 "Container nuance"): the first extraction pass only recovers the wrapper's
+/// direct payloads (including the nested `.unitypackage` file itself), so a second pass extracts
+/// *that* file to reach the real assets.
+fn extract_package_contents(
+    path: &std::path::Path,
+    workspace_dir: &std::path::Path,
+    nested_pathname: Option<&str>,
+    display_name: &str,
+) -> Vec<CrawledFile> {
+    let Ok(outer) = unitypackage::extract_to_workspace(path, workspace_dir) else {
+        return Vec::new();
+    };
+
+    let assets = match nested_pathname {
+        Some(nested_pathname) => {
+            let Some(nested) = outer
+                .iter()
+                .find(|a| a.pathname.as_deref() == Some(nested_pathname))
+            else {
+                return Vec::new();
+            };
+            unitypackage::extract_to_workspace(&nested.workspace_path, workspace_dir)
+                .unwrap_or_default()
+        }
+        None => outer,
+    };
+
+    assets
+        .into_iter()
+        .map(|a| {
+            let rel_suffix = a.pathname.clone().unwrap_or_else(|| a.guid.clone());
+            let rel_path = PathBuf::from(display_name).join(rel_suffix);
+            let media_type = detect::by_extension(&rel_path);
+            let mtime = std::fs::metadata(&a.workspace_path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            CrawledFile {
+                abs_path: a.workspace_path,
+                rel_path,
+                size_bytes: a.size_bytes,
+                mtime,
+                media_type,
+            }
+        })
+        .collect()
 }
 
 // ── Empty / no-results states ─────────────────────────────────────────────────
