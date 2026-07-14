@@ -292,9 +292,26 @@ import.
   tooltip) when no project is active. The same menu serves single and multi selection.
 
 ### View / sort toolbar
-A strip above the grid: a **view toggle** (grid / list / detail) · a **sort** dropdown (Name · Date
-added · Date modified · Size · Type · Status) with an asc/desc caret · a **thumbnail-size** zoom slider
-(grid only). View, sort, and zoom **persist** (app config) so a library reopens the way you left it.
+A strip above the grid: a **⚑ Filters** button (opens the content-filter popover below; gold fill +
+count badge when any filter is active) · a **view toggle** (grid / list / detail) · a **grid-size
+selector** (Compact / Cozy / Large segmented control, grid only — the discrete-stop equivalent of a
+zoom slider, driving the single persisted `thumb_size`) · a **sort** dropdown (Name · Date added ·
+Date modified · Size · Type · Status) with an asc/desc caret. View, sort, and grid size **persist**
+(app config) so a library reopens the way you left it.
+
+### Content filter popover (⚑ Filters)
+A dedicated multi-select **content filter**, distinct from the sidebar facet nav — opened from the ⚑
+Filters button, anchored below it (never clipping the viewport edge). Three chip sections that **AND**
+together (empty section = no constraint), over the current asset list, composing on top of the facet
+selection and search:
+- **TRAIT** — the library's tags/traits (most-frequent first) with a search field; selected chips
+  arcane-teal. *(Backed by AI tags — P4; shown disabled until then.)*
+- **TRIANGLES** (models only) — buckets `≤1k · 1k–3k · 3k–6k · 6k+`; selected violet. Assets without
+  a tri count are excluded when the facet is active. *(Backed by 3D metadata — P1; disabled until then.)*
+- **FILE SIZE** — the **S / M / L / XL** tiers with their resolved ranges; selected chip tinted by
+  tier colour (S success · M sound-aqua · L warning · XL danger). Fully backed by `size_bytes`.
+Header "FILTER LIBRARY" + **Clear all**. Every thumbnail carries its size-tier badge (top-right,
+tier-coloured). The filter predicate is a **pure, unit-tested** function ([`TECH-STACK.md`](TECH-STACK.md) §5.1).
 
 ### Browse views (Flat · Folders) & the Library filter
 Assets from many sources must never blur into one anonymous pile — "where is this from?" is answerable
@@ -333,12 +350,31 @@ breaks the non-destructive default, so warn clearly. Emptying Trash purges catal
 originals unless the on-disk delete was explicitly chosen.
 
 ### Settings / Preferences
-A screen behind `ls-nav-settings`, grouped with the facet styling: **Library** (the Sources manager
-below), **Appearance** (density compact/comfortable §4, follow-OS reduced-motion), **AI** (per-modality
-local/API provider + active GPU profile, links [`AI-MODELS-BY-GPU.md`](AI-MODELS-BY-GPU.md)),
-**Storage** (thumbnail/embedding cache + the **extracted-archive workspace** — location, size caps,
-**retention days** (default 7, [`INGESTION.md`](INGESTION.md) §2), **Clear cache / Clear workspace**),
-**Engine** (default export folder, loopback port/token).
+A scrollable screen (max content width ≈ 760px, section cards on `--ls-surface`, `--r-lg` radius,
+letter-spaced 10px section labels) behind `ls-nav-settings`, reached from the left **navigation rail**
+(Library ⊞ at top, Settings ⚙ at the bottom; the Library glyph is the reset-to-everything affordance,
+§Browse views). Groups:
+- **Library** (the Sources manager below), incl. a **per-source blacklist** — folder/asset exclusions
+  that skip cataloguing (never touch disk); a new field on `import_source`
+  ([`DATA-MODEL.md`](DATA-MODEL.md) §1) honoured by the crawler ([`INGESTION.md`](INGESTION.md)).
+- **Appearance** — density (§4), follow-OS reduced-motion, and **on-screen (grid) quality**
+  (Low/Medium/High): the grid-thumbnail render size, a GPU/perf tradeoff. **Grid-only** — full-detail
+  previews are reserved for full-size **Quick Look** (§below), which always renders at full detail.
+- **File-size labels** — the byte thresholds behind the **S / M / L / XL** badge and the File-size
+  filter: three editable boundaries + an editable cap (0 KB → 10 MB), a live preview track, and a
+  reset. Boundaries keep a ≥128 KB gap and the cap stays ≥ XL + 128 KB. A pure `size_tier_of`
+  ([`TECH-STACK.md`](TECH-STACK.md) §5.1) feeds the badge, the filter, and the legend. Persisted.
+- **AI** — per-modality local/API provider + active GPU profile / identify tier
+  ([`AI-MODELS-BY-GPU.md`](AI-MODELS-BY-GPU.md)).
+- **MCP** — enable/configure the **existing** MCP server ([`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md) §2;
+  stdio default, optional loopback HTTP) with a per-tool allow-list (identify / tag / search); never a
+  second protocol surface, and the MCP↔REST 1:1 invariant holds.
+- **Storage** — thumbnail/embedding cache + the **extracted-archive workspace** (location, size caps,
+  **retention days** default 7, [`INGESTION.md`](INGESTION.md) §2, **Clear cache / Clear workspace**).
+- **Engine** — default export folder, loopback port/token, live-sync, confirm-before-Trash.
+- **First-run** — a **Show the first-run setup screen** toggle bound to the same persisted
+  `skip_onboarding` flag as the onboarding panel's "Don't show this next time"; off = open straight
+  into the library on launch.
 
 ### Sources manager
 Manage the catalog's `import_source` roots ([`DATA-MODEL.md`](DATA-MODEL.md) §1): **Add folder / Asset
