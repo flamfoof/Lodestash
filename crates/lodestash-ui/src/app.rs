@@ -275,6 +275,9 @@ pub struct LodestashApp {
     expanded_source: Option<usize>,
     /// The in-progress blacklist exclusion text for the expanded source (transient). §5.1.
     blacklist_input: String,
+    /// Show the first-run onboarding modal over the (dimmed) library. Design §1; suppressed by
+    /// `config.skip_onboarding`.
+    onboarding_open: bool,
 }
 
 impl LodestashApp {
@@ -289,6 +292,9 @@ impl LodestashApp {
         let sort_asc = config.view.sort_asc;
         let thumb_size = config.view.thumb_size.clamp(THUMB_MIN, THUMB_MAX);
         let view_mode = config.view.mode;
+        // First-run onboarding shows unless the user opted out (design §1, §5.7). It only actually
+        // renders when no library is open, so a restored library naturally suppresses it.
+        let show_onboarding = !config.skip_onboarding;
 
         let mut app = Self {
             scan_roots: Vec::new(),
@@ -325,6 +331,7 @@ impl LodestashApp {
             screen: Screen::Library,
             expanded_source: None,
             blacklist_input: String::new(),
+            onboarding_open: show_onboarding,
             config,
         };
 
@@ -2084,6 +2091,75 @@ impl eframe::App for LodestashApp {
             }
         }
 
+        // ── First-run onboarding overlay (design §1) ──────────────────────────
+        if self.screen == Screen::Library
+            && self.onboarding_open
+            && self.scan_roots.is_empty()
+            && !self.scanning
+        {
+            let mut open_folder = false;
+            let mut onb_project: Option<String> = None;
+            let mut onb_single: Option<PathBuf> = None;
+            let mut dismiss = false;
+            let mut skip = self.config.skip_onboarding;
+
+            // Dimming scrim over the whole window; catches clicks so the library behind stays inert.
+            egui::Area::new(egui::Id::new("onboarding_scrim"))
+                .order(egui::Order::Middle)
+                .fixed_pos(egui::Pos2::ZERO)
+                .interactable(true)
+                .show(ctx, |ui| {
+                    let screen = ctx.screen_rect();
+                    ui.allocate_rect(screen, egui::Sense::click());
+                    ui.painter()
+                        .rect_filled(screen, 0.0, theme::BG.linear_multiply(0.6));
+                });
+
+            egui::Window::new("onboarding")
+                .title_bar(false)
+                .resizable(false)
+                .collapsible(false)
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .default_width(440.0)
+                .frame(
+                    egui::Frame::window(&ctx.style())
+                        .fill(theme::SURFACE_RAISED)
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                        .inner_margin(egui::Margin::same(22.0)),
+                )
+                .show(ctx, |ui| {
+                    onboarding_content(
+                        ui,
+                        &self.config,
+                        &mut open_folder,
+                        &mut onb_project,
+                        &mut onb_single,
+                        &mut dismiss,
+                        &mut skip,
+                    );
+                });
+
+            if skip != self.config.skip_onboarding {
+                self.config.skip_onboarding = skip;
+                self.config.save();
+            }
+            if dismiss {
+                self.onboarding_open = false;
+            }
+            if open_folder {
+                self.onboarding_open = false;
+                self.open_folder(ctx);
+            } else if let Some(name) = onb_project {
+                self.onboarding_open = false;
+                self.open_project(ctx, &name);
+            } else if let Some(path) = onb_single {
+                self.onboarding_open = false;
+                let proj_name = self.config.record_open(path.clone());
+                self.load_paths(ctx, vec![path], Some(proj_name));
+            }
+        }
+
         // ── Sources panel ──────────────────────────────────────────────────────
         if self.sources_panel_open {
             let mut open = self.sources_panel_open;
@@ -2438,6 +2514,178 @@ fn scanning_state(ui: &mut Ui) {
         ui.add(egui::Spinner::new().size(28.0));
         ui.add_space(8.0);
         ui.label(RichText::new("Scanning\u{2026}").color(theme::TEXT_MUTED));
+    });
+}
+
+/// Paint a dashed rounded-rectangle border (the gold drop affordance — design §1).
+fn paint_dashed_rect(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.5, color);
+    let corners = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+    ];
+    for i in 0..4 {
+        let seg = [corners[i], corners[(i + 1) % 4]];
+        for shape in egui::Shape::dashed_line(&seg, stroke, 6.0, 4.0) {
+            painter.add(shape);
+        }
+    }
+}
+
+/// First-run onboarding modal content (design §1): the "Point it at your hoard" picker with a
+/// gold dashed drop affordance, quick-open of saved libraries/recents, and the
+/// "Don't show this next time" checkbox bound to `skip_onboarding` (§5.7).
+#[allow(clippy::too_many_arguments)]
+fn onboarding_content(
+    ui: &mut Ui,
+    config: &AppConfig,
+    open_folder: &mut bool,
+    open_project: &mut Option<String>,
+    open_single: &mut Option<PathBuf>,
+    dismiss: &mut bool,
+    skip: &mut bool,
+) {
+    ui.vertical_centered(|ui| {
+        ui.label(RichText::new("\u{25C8}").size(40.0).color(theme::GOLD));
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("Point it at your hoard")
+                .size(18.0)
+                .color(theme::TEXT)
+                .strong(),
+        );
+        ui.add_space(3.0);
+        ui.label(
+            RichText::new(
+                "Choose a folder of assets \u{2014} models, textures, audio, packs \u{2014} and \
+                 Lodestash will catalogue it.",
+            )
+            .size(11.0)
+            .color(theme::TEXT_MUTED),
+        );
+    });
+    ui.add_space(14.0);
+
+    // Gold dashed drop well (drag-in ingest is a later QoL card; the button is the live action).
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 64.0), egui::Sense::hover());
+    paint_dashed_rect(ui.painter(), rect, theme::GOLD);
+    ui.painter().text(
+        egui::pos2(rect.center().x, rect.top() + 20.0),
+        egui::Align2::CENTER_CENTER,
+        "Drop a folder here",
+        egui::FontId::proportional(12.0),
+        theme::GOLD,
+    );
+    ui.painter().text(
+        egui::pos2(rect.center().x, rect.top() + 40.0),
+        egui::Align2::CENTER_CENTER,
+        "\u{2014} or \u{2014}",
+        egui::FontId::proportional(10.0),
+        theme::TEXT_DIM,
+    );
+    ui.add_space(10.0);
+    ui.vertical_centered(|ui| {
+        if ui
+            .add(
+                egui::Button::new(
+                    RichText::new("Open folder\u{2026}")
+                        .color(theme::BG)
+                        .size(13.0)
+                        .strong(),
+                )
+                .min_size(Vec2::new(160.0, 30.0))
+                .fill(theme::GOLD),
+            )
+            .clicked()
+        {
+            *open_folder = true;
+        }
+    });
+
+    // Quick-open saved libraries or recents.
+    let has_saved = config.projects.iter().any(|p| !p.live_paths().is_empty());
+    if has_saved {
+        ui.add_space(14.0);
+        section_label(ui, "SAVED LIBRARIES");
+        ui.add_space(4.0);
+        for proj in &config.projects {
+            if proj.live_paths().is_empty() {
+                continue;
+            }
+            let detail = if proj.paths.len() == 1 {
+                proj.paths[0].to_string_lossy().into_owned()
+            } else {
+                format!("{} sources", proj.paths.len())
+            };
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new(format!("\u{1F4C1}  {}", proj.name))
+                            .color(theme::TEXT)
+                            .size(12.0),
+                    )
+                    .min_size(Vec2::new(ui.available_width(), 26.0))
+                    .fill(theme::SURFACE)
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+                )
+                .on_hover_text(detail)
+                .clicked()
+            {
+                *open_project = Some(proj.name.clone());
+            }
+            ui.add_space(2.0);
+        }
+    } else {
+        for path in config.recent_roots.iter().filter(|p| p.is_dir()).take(3) {
+            let label = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+            if ui
+                .add(
+                    egui::Button::new(RichText::new(label).color(theme::TEXT).size(12.0))
+                        .fill(egui::Color32::TRANSPARENT),
+                )
+                .clicked()
+            {
+                *open_single = Some(path.clone());
+            }
+        }
+    }
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.horizontal(|ui| {
+        let mut dont = *skip;
+        if ui
+            .checkbox(
+                &mut dont,
+                RichText::new("Don't show this next time")
+                    .size(11.0)
+                    .color(theme::TEXT_MUTED),
+            )
+            .changed()
+        {
+            *skip = dont;
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("Skip for now")
+                            .size(11.0)
+                            .color(theme::TEXT_DIM),
+                    )
+                    .frame(false),
+                )
+                .clicked()
+            {
+                *dismiss = true;
+            }
+        });
     });
 }
 
