@@ -10,7 +10,7 @@ use lodestash_core::types::MediaType;
 use lodestash_ingest::crawler::{self, CrawledFile};
 use lodestash_ingest::{detect, thumb, unitypackage};
 
-use crate::config::{self, AppConfig, SortBy, ViewMode};
+use crate::config::{self, AppConfig, SizeTier, SizeTiers, SortBy, ViewMode};
 use crate::theme;
 
 // ── Category tabs ─────────────────────────────────────────────────────────────
@@ -100,7 +100,6 @@ struct ExtractDone {
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const THUMB_GEN_SIZE: u32 = 256;
 const CARD_LABEL: f32 = 36.0;
 const CARD_PAD: f32 = 8.0;
 pub const THUMB_MIN: f32 = 64.0;
@@ -111,6 +110,114 @@ const LOOKAHEAD_ROWS: usize = 4;
 /// is evicted so VRAM stays bounded while scrolling a large library.
 /// ponytail: window-based eviction, not true LRU — swap for a budgeted LRU if thrashing shows.
 const KEEP_ROWS: usize = 32;
+
+/// Discrete grid-size stops for the segmented selector, all driving `thumb_size` (design §2).
+const GRID_STOPS: [(f32, &str); 3] = [(96.0, "Compact"), (128.0, "Cozy"), (176.0, "Large")];
+
+// ── Content filter (⚑ Filters popover) ─────────────────────────────────────────
+
+/// Triangle-count bucket for the Triangles facet (models only). Design §3 "TRIANGLES".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TriBucket {
+    Le1k,
+    K1to3,
+    K3to6,
+    Ge6k,
+}
+
+impl TriBucket {
+    const ALL: [TriBucket; 4] = [
+        TriBucket::Le1k,
+        TriBucket::K1to3,
+        TriBucket::K3to6,
+        TriBucket::Ge6k,
+    ];
+
+    fn of(tris: u32) -> TriBucket {
+        match tris {
+            0..=1000 => TriBucket::Le1k,
+            1001..=3000 => TriBucket::K1to3,
+            3001..=6000 => TriBucket::K3to6,
+            _ => TriBucket::Ge6k,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            TriBucket::Le1k => "\u{2264} 1k",
+            TriBucket::K1to3 => "1k\u{2013}3k",
+            TriBucket::K3to6 => "3k\u{2013}6k",
+            TriBucket::Ge6k => "6k +",
+        }
+    }
+}
+
+/// The dedicated content filter (distinct from the sidebar facet nav): multi-select Trait,
+/// Triangles, and File-size sets that AND together. Transient (not persisted). Design §3.
+///
+/// Trait and Triangle data don't exist in the pre-catalog build yet (traits arrive with P4 AI
+/// tagging, tri counts with P1 3D metadata), so those sets are currently always empty and the
+/// predicate below degenerates to the File-size filter — which is fully backed by `size_bytes`.
+#[derive(Default)]
+struct ContentFilter {
+    traits: std::collections::BTreeSet<String>,
+    tri_buckets: std::collections::BTreeSet<TriBucket>,
+    sizes: std::collections::BTreeSet<SizeTier>,
+    trait_search: String,
+}
+
+impl ContentFilter {
+    fn active_count(&self) -> usize {
+        self.traits.len() + self.tri_buckets.len() + self.sizes.len()
+    }
+
+    fn any_active(&self) -> bool {
+        self.active_count() > 0
+    }
+
+    /// Empty every filter set (the popover's "Clear all", and part of the Library nav reset).
+    fn clear(&mut self) {
+        self.traits.clear();
+        self.tri_buckets.clear();
+        self.sizes.clear();
+        self.trait_search.clear();
+    }
+
+    /// Pure predicate: does an asset pass the filter? An asset passes if it matches the selected
+    /// traits (any) AND selected tri-buckets (any) AND selected size tiers (any); an empty section
+    /// imposes no constraint. Assets lacking a tri count are excluded when any tri-bucket is
+    /// selected (design §3). Kept pure over primitives so it's unit-testable without an
+    /// `AssetEntry` (TECH-STACK.md §5.1).
+    fn passes(&self, size: u64, tri: Option<u32>, traits: &[String], tiers: &SizeTiers) -> bool {
+        if !self.traits.is_empty() && !traits.iter().any(|t| self.traits.contains(t)) {
+            return false;
+        }
+        if !self.tri_buckets.is_empty() {
+            match tri {
+                Some(n) => {
+                    if !self.tri_buckets.contains(&TriBucket::of(n)) {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+        if !self.sizes.is_empty() && !self.sizes.contains(&tiers.tier_of(size)) {
+            return false;
+        }
+        true
+    }
+}
+
+// ── Top-level screen ────────────────────────────────────────────────────────────
+
+/// Which screen the nav rail has selected. Design §5 adds Settings alongside the Library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Screen {
+    #[default]
+    Library,
+    Settings,
+}
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
@@ -160,13 +267,14 @@ pub struct LodestashApp {
     quick_look: bool,
     /// When true, the Sources panel (view/add/remove project sources + app-data locations) is open.
     sources_panel_open: bool,
-    /// `.unitypackage` files found while crawling, awaiting an explicit Extract action.
-    pending_packages: Vec<PendingPackage>,
-    extract_rx: Receiver<ExtractDone>,
-    extract_tx: Sender<ExtractDone>,
-    /// Where extracted package payloads are stored, content-addressed (None if the OS cache dir
-    /// is unavailable).
-    workspace_dir: Option<PathBuf>,
+    /// The ⚑ Filters content filter (trait / triangles / file-size). Transient. Design §3.
+    content_filter: ContentFilter,
+    /// Active top-level screen (Library grid vs Settings). Design §5.
+    screen: Screen,
+    /// Index into `scan_roots` of the source whose blacklist panel is expanded in Settings. §5.1.
+    expanded_source: Option<usize>,
+    /// The in-progress blacklist exclusion text for the expanded source (transient). §5.1.
+    blacklist_input: String,
 }
 
 impl LodestashApp {
@@ -213,10 +321,10 @@ impl LodestashApp {
             selected_cache_idx: None,
             quick_look: false,
             sources_panel_open: false,
-            pending_packages: Vec::new(),
-            extract_rx,
-            extract_tx,
-            workspace_dir: dirs::cache_dir().map(|d| d.join("Lodestash").join("workspace")),
+            content_filter: ContentFilter::default(),
+            screen: Screen::Library,
+            expanded_source: None,
+            blacklist_input: String::new(),
             config,
         };
 
@@ -323,24 +431,31 @@ impl LodestashApp {
         self.nav_generation += 1;
         self.pending_packages = Vec::new();
 
+        // Each source's blacklist (design §5.1) — resolved before the crawl thread so it honours
+        // per-source excludes (INGESTION.md §1).
+        let excludes: Vec<Vec<lodestash_core::types::Exclude>> = match self.project_name.as_deref()
+        {
+            Some(proj) => roots
+                .iter()
+                .map(|r| self.config.source_excludes(proj, r))
+                .collect(),
+            None => roots.iter().map(|_| Vec::new()).collect(),
+        };
+
         self.scan_generation += 1;
         self.scanning = true;
         let generation = self.scan_generation;
         let tx = self.scan_tx.clone();
         std::thread::spawn(move || {
-            let mut entries: Vec<(usize, CrawledFile)> = Vec::new();
-            let mut pending_packages = Vec::new();
-            for (source_idx, root) in roots.iter().enumerate() {
-                for file in crawler::crawl(root) {
-                    if is_unitypackage(&file.abs_path) {
-                        if let Some(pkg) = resolve_pending_package(source_idx, &file) {
-                            pending_packages.push(pkg);
-                        }
-                        continue; // don't surface the raw archive as a browsable entry
-                    }
-                    entries.push((source_idx, file));
-                }
-            }
+            let entries: Vec<(usize, CrawledFile)> = roots
+                .iter()
+                .enumerate()
+                .flat_map(|(i, root)| {
+                    crawler::crawl(root, &excludes[i])
+                        .into_iter()
+                        .map(move |f| (i, f))
+                })
+                .collect();
             let _ = tx.send(ScanDone {
                 generation,
                 entries,
@@ -546,6 +661,16 @@ impl LodestashApp {
             };
         self.folder_tiles = tiles;
 
+        // Content filter (⚑ Filters) composes on top of facet + search (design §3). Applied once
+        // over the resolved asset indices; folder-tile counts are intentionally left unfiltered.
+        if self.content_filter.any_active() {
+            let cf = &self.content_filter;
+            let tiers = &self.config.size_tiers;
+            let entries = &self.entries;
+            // No trait/tri data pre-catalog → None/&[]; wire real values when P1/P4 land.
+            idxs.retain(|&i| cf.passes(entries[i].file.size_bytes, None, &[], tiers));
+        }
+
         sort_indices(&mut idxs, &self.entries, self.sort_by, self.sort_asc);
 
         self.sorted_cache = idxs;
@@ -581,6 +706,413 @@ impl LodestashApp {
         self.config.view.thumb_size = self.thumb_size;
         self.config.view.mode = self.view_mode;
         self.config.save();
+    }
+
+    // ── Navigation rail (design §5, glyph catalog §01) ─────────────────────────
+
+    /// The Library nav glyph: return to the Library screen and **reset to All libraries, clearing
+    /// every active filter** — source filter, category tab, search, and the content-filter sets
+    /// (design §4). Distinct from picking a specific source in the Library facet, which preserves
+    /// the current filter.
+    fn go_to_library(&mut self) {
+        self.screen = Screen::Library;
+        self.source_filter = None;
+        self.active_tab = Category::All;
+        self.search.clear();
+        self.content_filter.clear();
+        self.current_dir = self.default_dir();
+        self.selected_cache_idx = None;
+        self.nav_generation += 1;
+        self.cache_dirty = true;
+    }
+
+    fn nav_rail(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("nav_rail")
+            .exact_width(52.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::SURFACE)
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                    .inner_margin(egui::Margin::symmetric(7.0, 10.0)),
+            )
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    // Library — the reset-to-everything affordance (design §4).
+                    if nav_button(
+                        ui,
+                        "\u{229E}",
+                        theme::GOLD,
+                        self.screen == Screen::Library,
+                        true,
+                    )
+                    .on_hover_text("Library")
+                    .clicked()
+                    {
+                        self.go_to_library();
+                    }
+                    ui.add_space(8.0);
+                    // Forward-declared destinations (glyph catalog §01) — disabled until their
+                    // screens exist. Shown so the rail reads as the designed structure.
+                    for (glyph, color, name) in [
+                        ("\u{2726}", theme::ARCANE_BRIGHT, "Identify"),
+                        ("\u{27E1}", theme::GOLD, "Collections"),
+                        ("\u{25A4}", theme::TEXT_MUTED, "Packages"),
+                        ("\u{2756}", theme::ARCANE_BRIGHT, "Traits"),
+                        ("\u{25C9}", theme::TEXT_MUTED, "Stats"),
+                        ("\u{29C9}", theme::WARNING, "Duplicates"),
+                        ("\u{2298}", theme::DANGER, "Trash"),
+                    ] {
+                        nav_button(ui, glyph, color, false, false).on_hover_text(name);
+                        ui.add_space(5.0);
+                    }
+                });
+                // Settings pinned to the bottom of the rail.
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                    if nav_button(
+                        ui,
+                        "\u{2699}",
+                        theme::TEXT_MUTED,
+                        self.screen == Screen::Settings,
+                        true,
+                    )
+                    .on_hover_text("Settings")
+                    .clicked()
+                    {
+                        self.screen = Screen::Settings;
+                        self.selected_cache_idx = None;
+                    }
+                });
+            });
+    }
+
+    /// Drop every resident thumbnail texture so the grid re-generates them (e.g. after the
+    /// on-screen quality changed). In-flight loads finish and are replaced next pass.
+    fn invalidate_thumbnails(&mut self) {
+        for e in &mut self.entries {
+            e.texture = None;
+            e.thumb_spawned = false;
+        }
+        self.last_cols = 0;
+        self.last_row_start = usize::MAX;
+        self.last_row_end = 0;
+    }
+
+    // ── Settings screen (design §5) ────────────────────────────────────────────
+
+    fn settings_screen(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        let mut save = false;
+        let mut quality_changed = false;
+        // Blacklist actions collected during render, applied after (avoids borrowing self while
+        // iterating scan_roots). Each is (source_idx, exclude).
+        let mut toggle_expand: Option<usize> = None;
+        let mut add_exclude: Option<(usize, lodestash_core::types::Exclude)> = None;
+        let mut remove_exclude: Option<(usize, lodestash_core::types::Exclude)> = None;
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                let side = ((ui.available_width() - 760.0) / 2.0).max(0.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(side);
+                    ui.vertical(|ui| {
+                        ui.set_max_width(760.0);
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new("Settings")
+                                .size(20.0)
+                                .color(theme::TEXT)
+                                .strong(),
+                        );
+                        ui.add_space(14.0);
+
+                        // 5.1 Sources (Library) + per-source blacklist (§5.1).
+                        settings_card(ui, "LIBRARY \u{00B7} SOURCES", |ui| {
+                            if self.scan_roots.is_empty() {
+                                ui.label(
+                                    RichText::new("No sources yet \u{2014} open a folder to start.")
+                                        .size(12.0)
+                                        .color(theme::TEXT_DIM),
+                                );
+                            }
+                            for (i, root) in self.scan_roots.iter().enumerate() {
+                                let expanded = self.expanded_source == Some(i);
+                                let excludes = self
+                                    .project_name
+                                    .as_deref()
+                                    .map(|p| self.config.source_excludes(p, root))
+                                    .unwrap_or_default();
+                                ui.horizontal(|ui| {
+                                    let (dot, p) = ui
+                                        .allocate_painter(Vec2::splat(10.0), egui::Sense::hover());
+                                    p.circle_filled(dot.rect.center(), 4.0, theme::GOLD);
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            RichText::new(config::stem_name(root))
+                                                .size(13.0)
+                                                .color(theme::TEXT),
+                                        );
+                                        ui.label(
+                                            RichText::new(root.to_string_lossy())
+                                                .size(10.0)
+                                                .color(theme::TEXT_DIM)
+                                                .monospace(),
+                                        );
+                                    });
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            // Expander glyph (⌄ closed / ⌃ open) + count.
+                                            let glyph = if expanded { "\u{2303}" } else { "\u{2304}" };
+                                            let n = excludes.len();
+                                            let btn = ui.add(
+                                                egui::Button::new(
+                                                    RichText::new(if n > 0 {
+                                                        format!("{glyph}  {n} excluded")
+                                                    } else {
+                                                        format!("{glyph}  Exclusions")
+                                                    })
+                                                    .size(11.0)
+                                                    .color(theme::TEXT_MUTED),
+                                                )
+                                                .frame(false),
+                                            );
+                                            if btn.clicked() {
+                                                toggle_expand = Some(i);
+                                            }
+                                        },
+                                    );
+                                });
+
+                                if expanded {
+                                    // Blacklist panel — inset well.
+                                    egui::Frame::none()
+                                        .fill(theme::BG)
+                                        .rounding(6.0)
+                                        .inner_margin(egui::Margin::same(10.0))
+                                        .show(ui, |ui| {
+                                            if excludes.is_empty() {
+                                                ui.label(
+                                                    RichText::new(
+                                                        "Nothing excluded \u{2014} everything \
+                                                         under this source is indexed.",
+                                                    )
+                                                    .size(11.0)
+                                                    .color(theme::TEXT_DIM),
+                                                );
+                                            }
+                                            ui.horizontal_wrapped(|ui| {
+                                                for ex in &excludes {
+                                                    let color = match ex.kind {
+                                                        config::ExcludeKind::Folder => theme::WARNING,
+                                                        config::ExcludeKind::Asset => theme::DANGER,
+                                                    };
+                                                    if exclusion_chip(ui, &ex.value, color) {
+                                                        remove_exclude = Some((i, ex.clone()));
+                                                    }
+                                                }
+                                            });
+                                            ui.add_space(6.0);
+                                            ui.horizontal(|ui| {
+                                                ui.add(
+                                                    egui::TextEdit::singleline(
+                                                        &mut self.blacklist_input,
+                                                    )
+                                                    .hint_text("folder or asset\u{2026}")
+                                                    .desired_width(180.0),
+                                                );
+                                                let val = self.blacklist_input.trim().to_string();
+                                                let enabled = !val.is_empty();
+                                                if ui
+                                                    .add_enabled(
+                                                        enabled,
+                                                        egui::Button::new(
+                                                            RichText::new("\u{2298} folder")
+                                                                .color(theme::WARNING)
+                                                                .size(11.0),
+                                                        ),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    add_exclude = Some((
+                                                        i,
+                                                        lodestash_core::types::Exclude {
+                                                            kind: config::ExcludeKind::Folder,
+                                                            value: val.clone(),
+                                                        },
+                                                    ));
+                                                }
+                                                if ui
+                                                    .add_enabled(
+                                                        enabled,
+                                                        egui::Button::new(
+                                                            RichText::new("\u{2298} asset")
+                                                                .color(theme::DANGER)
+                                                                .size(11.0),
+                                                        ),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    add_exclude = Some((
+                                                        i,
+                                                        lodestash_core::types::Exclude {
+                                                            kind: config::ExcludeKind::Asset,
+                                                            value: val,
+                                                        },
+                                                    ));
+                                                }
+                                            });
+                                        });
+                                }
+                                ui.add_space(4.0);
+                            }
+                            ui.add_space(2.0);
+                            ui.label(
+                                RichText::new(
+                                    "Excluding only skips cataloguing \u{2014} files on disk are \
+                                     never touched.",
+                                )
+                                .size(10.0)
+                                .color(theme::TEXT_DIM),
+                            );
+                        });
+
+                        // 5.2 Appearance — on-screen (grid) quality.
+                        settings_card(ui, "APPEARANCE \u{00B7} ON-SCREEN QUALITY", |ui| {
+                            ui.label(
+                                RichText::new(
+                                    "Grid thumbnail sharpness (a GPU/perf tradeoff). Quick Look \
+                                     always renders full detail.",
+                                )
+                                .size(11.0)
+                                .color(theme::TEXT_MUTED),
+                            );
+                            ui.add_space(6.0);
+                            if segmented(
+                                ui,
+                                &mut self.config.preview_quality,
+                                config::PreviewQuality::OPTIONS,
+                            ) {
+                                save = true;
+                                quality_changed = true;
+                            }
+                        });
+
+                        // 5.3 File-size labels.
+                        settings_card(ui, "FILE-SIZE LABELS", |ui| {
+                            ui.label(
+                                RichText::new(
+                                    "Thresholds behind the S / M / L / XL badge and the File-size \
+                                     filter.",
+                                )
+                                .size(11.0)
+                                .color(theme::TEXT_MUTED),
+                            );
+                            ui.add_space(8.0);
+                            if size_tiers_editor(ui, &mut self.config.size_tiers) {
+                                save = true;
+                            }
+                        });
+
+                        // 5.7 First-run onboarding (Engine group in the design).
+                        settings_card(ui, "FIRST-RUN", |ui| {
+                            let mut show = !self.config.skip_onboarding;
+                            if setting_toggle(
+                                ui,
+                                "Show the first-run setup screen",
+                                "Off = open straight into the library on launch.",
+                                &mut show,
+                            ) {
+                                self.config.skip_onboarding = !show;
+                                save = true;
+                            }
+                        });
+
+                        // Scaffold cards — controls shown; backends not built yet.
+                        settings_card(ui, "AI \u{00B7} IDENTIFY PROFILE", |ui| {
+                            ui.label(
+                                RichText::new(
+                                    "Integrated / Balanced / Dedicated GPU \u{2014} model set + \
+                                     preview quality. Planned (AI-MODELS-BY-GPU.md); no local AI \
+                                     engine yet.",
+                                )
+                                .size(11.0)
+                                .color(theme::TEXT_DIM),
+                            );
+                        });
+                        settings_card(ui, "MCP", |ui| {
+                            ui.label(
+                                RichText::new(
+                                    "Enable the Lodestash MCP server (identify / tag / search) for \
+                                     your agents. Planned; wires to the existing MCP plane \
+                                     (MCP-AND-ENGINES.md \u{00A7}2), not a new one.",
+                                )
+                                .size(11.0)
+                                .color(theme::TEXT_DIM),
+                            );
+                        });
+                        settings_card(ui, "STORAGE CAPS", |ui| {
+                            ui.label(
+                                RichText::new(
+                                    "Preview-cache limit + auto-purge. Planned (DESIGN-GUIDELINES.md \
+                                     \u{00A7}7 Storage).",
+                                )
+                                .size(11.0)
+                                .color(theme::TEXT_DIM),
+                            );
+                        });
+                        settings_card(ui, "ENGINE BRIDGE", |ui| {
+                            ui.label(
+                                RichText::new(
+                                    "Live-sync to the active Unity project + confirm-before-Trash. \
+                                     Planned (ENGINE-API.md).",
+                                )
+                                .size(11.0)
+                                .color(theme::TEXT_DIM),
+                            );
+                        });
+                    });
+                });
+            });
+
+        if save {
+            self.config.save();
+            self.cache_dirty = true;
+        }
+        if quality_changed {
+            self.invalidate_thumbnails();
+        }
+
+        // Apply blacklist actions (collected during render to avoid borrowing self mid-iteration).
+        if let Some(i) = toggle_expand {
+            self.expanded_source = if self.expanded_source == Some(i) {
+                None
+            } else {
+                self.blacklist_input.clear();
+                Some(i)
+            };
+        }
+        let proj = self.project_name.clone();
+        let mut blacklist_changed = false;
+        if let (Some(proj), Some((i, ex))) = (proj.as_deref(), add_exclude) {
+            if let Some(root) = self.scan_roots.get(i).cloned() {
+                if self.config.add_source_exclude(proj, &root, ex) {
+                    self.blacklist_input.clear();
+                    blacklist_changed = true;
+                }
+            }
+        }
+        if let (Some(proj), Some((i, ex))) = (proj.as_deref(), remove_exclude) {
+            if let Some(root) = self.scan_roots.get(i).cloned() {
+                if self.config.remove_source_exclude(proj, &root, &ex) {
+                    blacklist_changed = true;
+                }
+            }
+        }
+        // A changed blacklist re-indexes the current library so the exclusion takes effect.
+        if blacklist_changed {
+            self.load_paths(ctx, self.scan_roots.clone(), self.project_name.clone());
+        }
     }
 
     // ── Folder navigation (Folders view) ──────────────────────────────────────
@@ -720,6 +1252,9 @@ impl LodestashApp {
             let size_bytes = self.entries[idx].file.size_bytes;
             let mtime = self.entries[idx].file.mtime;
             let cache_dir = self.thumb_cache_dir.clone();
+            // On-screen quality drives the grid thumbnail render size (design §5.2). Quick Look is
+            // unaffected — it decodes the original at full detail.
+            let gen_px = self.config.preview_quality.thumb_px();
             let tx = self.thumb_tx.clone();
             let ctx2 = ctx.clone();
 
@@ -734,6 +1269,7 @@ impl LodestashApp {
                     size_bytes,
                     mtime,
                     cache_dir.as_deref(),
+                    gen_px,
                 );
                 let _ = tx.send(ThumbReady {
                     index: idx,
@@ -1067,8 +1603,11 @@ impl eframe::App for LodestashApp {
             self.add_source(ctx);
         }
 
+        // ── Navigation rail (left) ────────────────────────────────────────────
+        self.nav_rail(ctx);
+
         // ── Category tab bar + view toolbar ──────────────────────────────────
-        if !self.entries.is_empty() {
+        if self.screen == Screen::Library && !self.entries.is_empty() {
             egui::TopBottomPanel::top("tabbar")
                 .frame(
                     egui::Frame::none()
@@ -1217,6 +1756,48 @@ impl eframe::App for LodestashApp {
                             self.cache_dirty = true;
                         }
 
+                        // ⚑ Filters button + content-filter popover (design §2, §3).
+                        ui.separator();
+                        let active = self.content_filter.any_active();
+                        let ftext = if active {
+                            RichText::new(format!(
+                                "\u{2691} Filters  {}",
+                                self.content_filter.active_count()
+                            ))
+                            .color(theme::BG)
+                            .size(11.0)
+                        } else {
+                            RichText::new("\u{2691} Filters")
+                                .color(theme::TEXT)
+                                .size(11.0)
+                        };
+                        let mut fbtn = egui::Button::new(ftext);
+                        if active {
+                            fbtn = fbtn
+                                .fill(theme::GOLD)
+                                .stroke(egui::Stroke::new(1.0, theme::GOLD));
+                        }
+                        let fresp = ui.add(fbtn);
+                        let popup_id = ui.make_persistent_id("filters_popup");
+                        if fresp.clicked() {
+                            ui.memory_mut(|m| m.toggle_popup(popup_id));
+                        }
+                        let cf = &mut self.content_filter;
+                        let tiers = &self.config.size_tiers;
+                        let mut filter_changed = false;
+                        egui::popup::popup_below_widget(
+                            ui,
+                            popup_id,
+                            &fresp,
+                            egui::PopupCloseBehavior::CloseOnClickOutside,
+                            |ui| {
+                                filter_changed = filter_popover(ui, cf, tiers);
+                            },
+                        );
+                        if filter_changed {
+                            self.cache_dirty = true;
+                        }
+
                         // Browse view toggle (DESIGN-GUIDELINES.md §7 "Browse views").
                         ui.separator();
                         for (mode, label) in
@@ -1266,15 +1847,23 @@ impl eframe::App for LodestashApp {
                             self.save_view_prefs();
                         }
 
-                        ui.separator();
-                        ui.label(RichText::new("Size").color(theme::TEXT_DIM).size(11.0));
-                        let size_resp = ui.add(
-                            egui::Slider::new(&mut self.thumb_size, THUMB_MIN..=THUMB_MAX)
-                                .show_value(false)
-                                .step_by(8.0),
-                        );
-                        if size_resp.drag_stopped() {
-                            self.save_view_prefs();
+                        // Grid-size segmented selector (design §2) — grid view only; drives the
+                        // persisted `thumb_size`, the single source of truth.
+                        if self.view_mode == ViewMode::Flat {
+                            ui.separator();
+                            ui.label(RichText::new("Grid").color(theme::TEXT_DIM).size(11.0));
+                            for (px, label) in GRID_STOPS {
+                                let active = (self.thumb_size - px).abs() < 8.0;
+                                if ui
+                                    .selectable_label(active, RichText::new(label).size(11.0))
+                                    .clicked()
+                                    && !active
+                                {
+                                    self.thumb_size = px;
+                                    self.save_view_prefs();
+                                    self.cache_dirty = true;
+                                }
+                            }
                         }
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1350,26 +1939,33 @@ impl eframe::App for LodestashApp {
         }
 
         // ── Inspector pane (right side) ───────────────────────────────────────
-        if let Some(cache_idx) = self.selected_cache_idx {
-            if let Some(&entry_idx) = self.sorted_cache.get(cache_idx) {
-                if let Some(entry) = self.entries.get(entry_idx) {
-                    let file = &entry.file;
-                    // Library Source label — only meaningful with >1 source (DATA-MODEL.md §10).
-                    let library = (self.scan_roots.len() > 1)
-                        .then(|| config::stem_name(&self.scan_roots[entry.source_idx]));
-                    egui::SidePanel::right("inspector")
-                        .resizable(true)
-                        .min_width(200.0)
-                        .default_width(260.0)
-                        .frame(
-                            egui::Frame::none()
-                                .fill(theme::SURFACE)
-                                .stroke(egui::Stroke::new(1.0, theme::BORDER))
-                                .inner_margin(egui::Margin::same(12.0)),
-                        )
-                        .show(ctx, |ui| {
-                            inspector_pane(ui, file, entry.texture.as_ref(), library.as_deref());
-                        });
+        if self.screen == Screen::Library {
+            if let Some(cache_idx) = self.selected_cache_idx {
+                if let Some(&entry_idx) = self.sorted_cache.get(cache_idx) {
+                    if let Some(entry) = self.entries.get(entry_idx) {
+                        let file = &entry.file;
+                        // Library Source label — only meaningful with >1 source (DATA-MODEL.md §10).
+                        let library = (self.scan_roots.len() > 1)
+                            .then(|| config::stem_name(&self.scan_roots[entry.source_idx]));
+                        egui::SidePanel::right("inspector")
+                            .resizable(true)
+                            .min_width(200.0)
+                            .default_width(260.0)
+                            .frame(
+                                egui::Frame::none()
+                                    .fill(theme::SURFACE)
+                                    .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                                    .inner_margin(egui::Margin::same(12.0)),
+                            )
+                            .show(ctx, |ui| {
+                                inspector_pane(
+                                    ui,
+                                    file,
+                                    entry.texture.as_ref(),
+                                    library.as_deref(),
+                                );
+                            });
+                    }
                 }
             }
         }
@@ -1388,6 +1984,10 @@ impl eframe::App for LodestashApp {
                     .inner_margin(egui::Margin::same(12.0)),
             )
             .show(ctx, |ui| {
+                if self.screen == Screen::Settings {
+                    self.settings_screen(ui, ctx);
+                    return;
+                }
                 if self.entries.is_empty() {
                     if self.scanning {
                         scanning_state(ui);
@@ -1417,6 +2017,7 @@ impl eframe::App for LodestashApp {
                         self.last_row_end,
                         self.selected_cache_idx,
                         self.nav_generation,
+                        &self.config.size_tiers,
                     );
                     if new_cols != self.last_cols
                         || new_row_start != self.last_row_start
@@ -1604,102 +2205,145 @@ fn reveal_in_file_manager(path: &std::path::Path) {
     let _ = std::process::Command::new("xdg-open").arg(path).spawn();
 }
 
-// ── .unitypackage discovery & extraction ──────────────────────────────────────
+// ── Settings screen widgets (design §5) ────────────────────────────────────────
 
-fn is_unitypackage(path: &std::path::Path) -> bool {
-    path.extension()
-        .map(|e| e.eq_ignore_ascii_case("unitypackage"))
-        .unwrap_or(false)
+/// A settings section card: `SURFACE` fill, `BORDER`, 10px radius, letter-spaced title.
+fn settings_card(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
+    egui::Frame::none()
+        .fill(theme::SURFACE)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+        .rounding(10.0)
+        .inner_margin(egui::Margin::same(14.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            section_label(ui, title);
+            ui.add_space(10.0);
+            add(ui);
+        });
+    ui.add_space(12.0);
 }
 
-/// Display name for a package: the file stem of its path (extension and directories stripped).
-fn package_display_name(path: &std::path::Path) -> String {
-    path.file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string_lossy().into_owned())
-}
-
-/// Browse a freshly-crawled `.unitypackage` (cheap manifest read, no extraction) and turn it into
-/// a `PendingPackage` ready for the user to act on. Runs on the background crawl thread, so a
-/// large package's manifest read (still O(file size) to decompress, just O(1) memory) never
-/// blocks the UI. Returns `None` if the archive can't be read (corrupt/unsupported) — silently
-/// skipped rather than surfaced as an error card, matching INGESTION.md §8's "don't promise 100%."
-fn resolve_pending_package(source_idx: usize, file: &CrawledFile) -> Option<PendingPackage> {
-    let manifest = unitypackage::read_manifest(&file.abs_path).ok()?;
-    let nested = unitypackage::nested_package_candidates(&manifest);
-    let chosen_variant = unitypackage::preferred_variant_index(&nested);
-    let nested_candidates = nested
-        .iter()
-        .filter_map(|e| {
-            e.pathname
-                .clone()
-                .map(|p| (package_display_name(std::path::Path::new(&p)), p))
-        })
-        .collect();
-
-    Some(PendingPackage {
-        source_idx,
-        abs_path: file.abs_path.clone(),
-        display_name: package_display_name(&file.rel_path),
-        nested_candidates,
-        chosen_variant,
-        extracting: false,
-    })
-}
-
-/// Extract `path` into `workspace_dir` and convert the payloads into crawlable entries, virtually
-/// namespaced under `display_name` (`rel_path` becomes `{display_name}/{original pathname}`) so
-/// Folders view groups them under one tile showing where they came from.
-///
-/// When `nested_pathname` is set, the outer archive is a render-pipeline-variant wrapper
-/// (INGESTION.md §2 "Container nuance"): the first extraction pass only recovers the wrapper's
-/// direct payloads (including the nested `.unitypackage` file itself), so a second pass extracts
-/// *that* file to reach the real assets.
-fn extract_package_contents(
-    path: &std::path::Path,
-    workspace_dir: &std::path::Path,
-    nested_pathname: Option<&str>,
-    display_name: &str,
-) -> Vec<CrawledFile> {
-    let Ok(outer) = unitypackage::extract_to_workspace(path, workspace_dir) else {
-        return Vec::new();
-    };
-
-    let assets = match nested_pathname {
-        Some(nested_pathname) => {
-            let Some(nested) = outer
-                .iter()
-                .find(|a| a.pathname.as_deref() == Some(nested_pathname))
-            else {
-                return Vec::new();
-            };
-            unitypackage::extract_to_workspace(&nested.workspace_path, workspace_dir)
-                .unwrap_or_default()
-        }
-        None => outer,
-    };
-
-    assets
-        .into_iter()
-        .map(|a| {
-            let rel_suffix = a.pathname.clone().unwrap_or_else(|| a.guid.clone());
-            let rel_path = PathBuf::from(display_name).join(rel_suffix);
-            let media_type = detect::by_extension(&rel_path);
-            let mtime = std::fs::metadata(&a.workspace_path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            CrawledFile {
-                abs_path: a.workspace_path,
-                rel_path,
-                size_bytes: a.size_bytes,
-                mtime,
-                media_type,
+/// A label + description on the left, a checkbox toggle on the right. Returns true if toggled.
+fn setting_toggle(ui: &mut Ui, label: &str, desc: &str, value: &mut bool) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(RichText::new(label).size(13.0).color(theme::TEXT));
+            if !desc.is_empty() {
+                ui.label(RichText::new(desc).size(10.0).color(theme::TEXT_DIM));
             }
-        })
-        .collect()
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.checkbox(value, "").changed() {
+                changed = true;
+            }
+        });
+    });
+    changed
+}
+
+/// A 3-way (or N-way) segmented selector. Returns true if the selection changed.
+fn segmented<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, options: &[(T, &str)]) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        for &(val, label) in options {
+            let active = *current == val;
+            if ui
+                .selectable_label(active, RichText::new(label).size(12.0))
+                .clicked()
+                && !active
+            {
+                *current = val;
+                changed = true;
+            }
+        }
+    });
+    changed
+}
+
+/// The File-size labels editor (design §5.3): a painted preview track, editable MB boundaries +
+/// cap, a reset, and a resolved-range legend. Enforces the ascending / 128 KB-gap / 10 MB-cap
+/// invariant via [`SizeTiers::normalized`]. Returns true if the thresholds changed.
+fn size_tiers_editor(ui: &mut Ui, tiers: &mut SizeTiers) -> bool {
+    let mut t = *tiers;
+
+    // Preview track: cap-relative segment fills, tinted per tier.
+    let track_w = ui.available_width().min(700.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(track_w, 18.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 4.0, theme::BG);
+    let cap = t.cap_kb.max(1) as f32;
+    for tier in SizeTier::ALL {
+        let (lo, hi) = t.range_kb(tier);
+        let x0 = rect.left() + rect.width() * (lo as f32 / cap).clamp(0.0, 1.0);
+        let x1 = rect.left() + rect.width() * (hi as f32 / cap).clamp(0.0, 1.0);
+        painter.rect_filled(
+            egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1, rect.bottom())),
+            0.0,
+            size_tier_color(tier).linear_multiply(0.55),
+        );
+    }
+    ui.add_space(10.0);
+
+    // Editable numeric boundaries (MB) — disjoint mutable field borrows.
+    ui.horizontal(|ui| {
+        for (label, kb) in [
+            ("S|M", &mut t.m_kb),
+            ("M|L", &mut t.l_kb),
+            ("L|XL", &mut t.xl_kb),
+            ("Cap", &mut t.cap_kb),
+        ] {
+            ui.label(RichText::new(label).size(11.0).color(theme::TEXT_MUTED));
+            let mut mb = *kb as f32 / 1024.0;
+            let max_mb = SizeTiers::MAX_CAP_KB as f32 / 1024.0;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut mb)
+                        .speed(0.05)
+                        .range(0.125..=max_mb)
+                        .suffix(" MB")
+                        .fixed_decimals(2),
+                )
+                .changed()
+            {
+                *kb = (mb * 1024.0).round() as u32;
+            }
+            ui.add_space(12.0);
+        }
+    });
+
+    ui.add_space(8.0);
+    if ui.button("Reset defaults").clicked() {
+        t = SizeTiers::default();
+    }
+
+    // Normalize, then draw the resolved-range legend from the normalized values.
+    let t = t.normalized();
+    ui.add_space(8.0);
+    for tier in SizeTier::ALL {
+        let (lo, hi) = t.range_kb(tier);
+        ui.horizontal(|ui| {
+            let (dot, p) = ui.allocate_painter(Vec2::splat(10.0), egui::Sense::hover());
+            p.circle_filled(dot.rect.center(), 4.0, size_tier_color(tier));
+            ui.label(
+                RichText::new(format!(
+                    "{}   {} \u{2013} {}",
+                    tier.letter(),
+                    fmt_kb(lo),
+                    fmt_kb(hi)
+                ))
+                .size(11.0)
+                .color(theme::TEXT_MUTED),
+            );
+        });
+    }
+
+    if t != *tiers {
+        *tiers = t;
+        true
+    } else {
+        false
+    }
 }
 
 // ── Empty / no-results states ─────────────────────────────────────────────────
@@ -1831,6 +2475,7 @@ fn thumbnail_grid(
     prev_row_end: usize,
     selected_cache_idx: Option<usize>,
     nav_salt: u64,
+    tiers: &SizeTiers,
 ) -> (Vec<usize>, usize, usize, usize, Option<usize>) {
     let card_h = thumb_size + CARD_LABEL;
     let available = ui.available_width() - ui.spacing().scroll.bar_width - 2.0;
@@ -1878,7 +2523,7 @@ fn thumbnail_grid(
                     for (col, &idx) in indices[start..end].iter().enumerate() {
                         let cache_idx = start + col;
                         let selected = selected_cache_idx == Some(cache_idx);
-                        if asset_card(ui, &entries[idx], thumb_size, selected) {
+                        if asset_card(ui, &entries[idx], thumb_size, selected, tiers) {
                             clicked = Some(cache_idx);
                         }
                     }
@@ -1889,8 +2534,226 @@ fn thumbnail_grid(
     (to_spawn, cols, row_start_out, row_end_out, clicked)
 }
 
+/// Colour for a file-size tier badge (design §3 "FILE SIZE" token mapping).
+fn size_tier_color(tier: SizeTier) -> egui::Color32 {
+    match tier {
+        SizeTier::S => theme::SUCCESS,
+        SizeTier::M => theme::TYPE_SOUND,
+        SizeTier::L => theme::WARNING,
+        SizeTier::Xl => theme::DANGER,
+    }
+}
+
+/// Human-readable KB → "N KB" / "N MB".
+fn fmt_kb(kb: u32) -> String {
+    if kb >= 1024 {
+        let mb = kb as f32 / 1024.0;
+        if (mb.fract()).abs() < 0.05 {
+            format!("{mb:.0} MB")
+        } else {
+            format!("{mb:.1} MB")
+        }
+    } else {
+        format!("{kb} KB")
+    }
+}
+
+/// A pill filter chip. Returns true if clicked.
+fn filter_chip(ui: &mut Ui, label: &str, selected: bool, color: egui::Color32) -> bool {
+    let (bg, fg, stroke) = if selected {
+        (color.linear_multiply(0.25), color, color)
+    } else {
+        (theme::OVERLAY, theme::TEXT_MUTED, theme::BORDER_STRONG)
+    };
+    let resp = egui::Frame::none()
+        .fill(bg)
+        .rounding(999.0)
+        .stroke(egui::Stroke::new(1.0, stroke))
+        .inner_margin(egui::Margin::symmetric(9.0, 3.0))
+        .show(ui, |ui| {
+            ui.label(RichText::new(label).color(fg).size(11.0));
+        })
+        .response;
+    resp.interact(egui::Sense::click()).clicked()
+}
+
+/// A navigation-rail glyph button. Active shows a gold left-accent; disabled dims the glyph.
+fn nav_button(
+    ui: &mut Ui,
+    glyph: &str,
+    color: egui::Color32,
+    active: bool,
+    enabled: bool,
+) -> egui::Response {
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(38.0), sense);
+    let painter = ui.painter();
+    let bg = if active {
+        theme::OVERLAY
+    } else if enabled && resp.hovered() {
+        theme::OVERLAY.linear_multiply(0.5)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    painter.rect_filled(rect, 7.0, bg);
+    if active {
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                rect.left_top() + egui::vec2(-5.0, 7.0),
+                egui::vec2(3.0, rect.height() - 14.0),
+            ),
+            2.0,
+            theme::GOLD,
+        );
+    }
+    let gc = if enabled {
+        color
+    } else {
+        color.linear_multiply(0.32)
+    };
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        egui::FontId::proportional(19.0),
+        gc,
+    );
+    resp
+}
+
+/// A blacklist exclusion chip: tinted value + a ✕. Returns true if the ✕ was clicked (remove).
+fn exclusion_chip(ui: &mut Ui, value: &str, color: egui::Color32) -> bool {
+    let mut remove = false;
+    egui::Frame::none()
+        .fill(color.linear_multiply(0.18))
+        .rounding(999.0)
+        .stroke(egui::Stroke::new(1.0, color))
+        .inner_margin(egui::Margin::symmetric(9.0, 3.0))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            ui.label(RichText::new(value).color(color).size(11.0));
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("\u{2715}").color(color).size(10.0))
+                        .frame(false),
+                )
+                .clicked()
+            {
+                remove = true;
+            }
+        });
+    remove
+}
+
+/// Small letter-spaced section label used inside the filter popover and settings cards.
+fn section_label(ui: &mut Ui, text: &str) {
+    ui.label(
+        RichText::new(text)
+            .size(10.0)
+            .color(theme::TEXT_DIM)
+            .strong(),
+    );
+}
+
+/// The ⚑ Filters content-filter popover (design §3). Returns true if a filter set changed.
+/// Only the FILE SIZE section is interactive today; TRAIT and TRIANGLES are shown but disabled
+/// until their backing data exists (traits → P4 AI tagging, tri counts → P1 3D metadata), so a
+/// user can never select a facet that would filter the grid to empty.
+fn filter_popover(ui: &mut Ui, cf: &mut ContentFilter, tiers: &SizeTiers) -> bool {
+    ui.set_min_width(320.0);
+    let mut changed = false;
+
+    ui.horizontal(|ui| {
+        section_label(ui, "FILTER LIBRARY");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let clear = ui.add(
+                egui::Button::new(
+                    RichText::new("Clear all")
+                        .size(10.0)
+                        .color(theme::TEXT_MUTED),
+                )
+                .frame(false),
+            );
+            if clear.hovered() {
+                ui.painter().rect_stroke(
+                    clear.rect.expand(2.0),
+                    3.0,
+                    egui::Stroke::new(1.0, theme::DANGER),
+                );
+            }
+            if clear.clicked() && cf.any_active() {
+                cf.clear();
+                changed = true;
+            }
+        });
+    });
+    ui.separator();
+
+    // TRAIT — no tag data pre-catalog (P4).
+    section_label(ui, "TRAIT");
+    ui.add_enabled(
+        false,
+        egui::TextEdit::singleline(&mut cf.trait_search)
+            .hint_text("search traits\u{2026}")
+            .desired_width(140.0),
+    );
+    ui.label(
+        RichText::new("No traits yet \u{2014} assets gain traits after AI identification.")
+            .size(10.0)
+            .color(theme::TEXT_DIM),
+    );
+    ui.add_space(6.0);
+
+    // TRIANGLES — no tri-count data pre-catalog (P1); shown disabled.
+    section_label(ui, "TRIANGLES");
+    ui.add_enabled_ui(false, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            for b in TriBucket::ALL {
+                let sel = cf.tri_buckets.contains(&b);
+                let _ = filter_chip(ui, b.label(), sel, theme::TYPE_MODEL);
+            }
+        });
+    });
+    ui.label(
+        RichText::new("Available once 3D metadata is extracted.")
+            .size(10.0)
+            .color(theme::TEXT_DIM),
+    );
+    ui.add_space(6.0);
+
+    // FILE SIZE — fully functional (every asset has a byte size).
+    section_label(ui, "FILE SIZE");
+    ui.horizontal_wrapped(|ui| {
+        for tier in SizeTier::ALL {
+            let (lo, hi) = tiers.range_kb(tier);
+            let label = format!("{}  {}\u{2013}{}", tier.letter(), fmt_kb(lo), fmt_kb(hi));
+            let sel = cf.sizes.contains(&tier);
+            if filter_chip(ui, &label, sel, size_tier_color(tier)) {
+                if sel {
+                    cf.sizes.remove(&tier);
+                } else {
+                    cf.sizes.insert(tier);
+                }
+                changed = true;
+            }
+        }
+    });
+
+    changed
+}
+
 /// Returns true if the card was clicked.
-fn asset_card(ui: &mut Ui, entry: &AssetEntry, thumb_size: f32, selected: bool) -> bool {
+fn asset_card(
+    ui: &mut Ui,
+    entry: &AssetEntry,
+    thumb_size: f32,
+    selected: bool,
+    tiers: &SizeTiers,
+) -> bool {
     let type_color = entry
         .file
         .media_type
@@ -1907,11 +2770,12 @@ fn asset_card(ui: &mut Ui, entry: &AssetEntry, thumb_size: f32, selected: bool) 
             ui.vertical(|ui| {
                 ui.set_max_size(Vec2::new(thumb_size, thumb_size + CARD_LABEL));
 
-                if let Some(tex) = &entry.texture {
+                let thumb_rect = if let Some(tex) = &entry.texture {
                     ui.add(
                         egui::Image::new((tex.id(), Vec2::splat(thumb_size)))
                             .fit_to_exact_size(Vec2::splat(thumb_size)),
-                    );
+                    )
+                    .rect
                 } else {
                     let (resp, painter) =
                         ui.allocate_painter(Vec2::splat(thumb_size), egui::Sense::hover());
@@ -1923,7 +2787,28 @@ fn asset_card(ui: &mut Ui, entry: &AssetEntry, thumb_size: f32, selected: bool) 
                         egui::FontId::proportional((thumb_size * 0.22).max(12.0)),
                         type_color.linear_multiply(0.6),
                     );
-                }
+                    resp.rect
+                };
+
+                // S/M/L/XL size-tier badge, top-right of the thumbnail (design §3).
+                let tier = tiers.tier_of(entry.file.size_bytes);
+                let font = egui::FontId::proportional(9.0);
+                let painter = ui.painter();
+                let galley = painter.layout_no_wrap(tier.letter().into(), font.clone(), theme::BG);
+                let bw = galley.size().x + 8.0;
+                let top_right = thumb_rect.right_top() + egui::vec2(-3.0, 3.0);
+                let badge = egui::Rect::from_min_max(
+                    egui::pos2(top_right.x - bw, top_right.y),
+                    egui::pos2(top_right.x, top_right.y + 14.0),
+                );
+                painter.rect_filled(badge, 3.0, size_tier_color(tier));
+                painter.text(
+                    badge.center(),
+                    egui::Align2::CENTER_CENTER,
+                    tier.letter(),
+                    font,
+                    theme::BG,
+                );
 
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -2187,22 +3072,24 @@ fn generate_texture(
     size_bytes: u64,
     mtime: i64,
     cache_dir: Option<&std::path::Path>,
+    gen_px: u32,
 ) -> Option<TextureHandle> {
     // Serve from / populate the on-disk thumbnail cache (INGESTION.md §6): restarts then
-    // decode 256px cached PNGs instead of full-size originals. Falls back to a direct
-    // decode when the cache dir is unavailable or generation fails (e.g. exotic format).
+    // decode cached PNGs instead of full-size originals. The cache filename embeds WxH
+    // (`thumb::cache_path`), so each on-screen-quality size gets its own cache entry. Falls back
+    // to a direct decode when the cache dir is unavailable or generation fails (exotic format).
     let img = cache_dir
         .and_then(|dir| {
             let key = thumb::meta_key(abs_path, size_bytes, mtime);
             let params = thumb::ThumbParams {
-                width: THUMB_GEN_SIZE,
-                height: THUMB_GEN_SIZE,
+                width: gen_px,
+                height: gen_px,
             };
             thumb::generate(abs_path, dir, &key, params).ok()
         })
         .and_then(|cached| image::open(cached).ok())
         .or_else(|| image::open(abs_path).ok())?;
-    let img = img.thumbnail(THUMB_GEN_SIZE, THUMB_GEN_SIZE).to_rgba8();
+    let img = img.thumbnail(gen_px, gen_px).to_rgba8();
     let (w, h) = img.dimensions();
     let color_img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &img);
     Some(ctx.load_texture(tex_name, color_img, egui::TextureOptions::LINEAR))
@@ -2215,6 +3102,90 @@ fn generate_texture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Content filter predicate (design §3) ──────────────────────────────────
+
+    #[test]
+    fn content_filter_empty_passes_everything() {
+        let cf = ContentFilter::default();
+        let tiers = SizeTiers::default();
+        assert!(
+            cf.passes(10, None, &[], &tiers),
+            "no active facet = no constraint"
+        );
+        assert!(cf.passes(9_000_000, Some(5000), &["a".into()], &tiers));
+    }
+
+    #[test]
+    fn content_filter_size_tier_is_and_over_the_selected_set() {
+        let tiers = SizeTiers::default(); // S<1MB, M<4MB, L<8MB, XL≥8MB
+        let mut cf = ContentFilter::default();
+        cf.sizes.insert(SizeTier::S);
+        cf.sizes.insert(SizeTier::L);
+        let mb = |n: u64| n * 1024 * 1024;
+        assert!(cf.passes(mb(0), None, &[], &tiers), "500 KB → S, selected");
+        assert!(
+            !cf.passes(mb(2), None, &[], &tiers),
+            "2 MB → M, not selected"
+        );
+        assert!(cf.passes(mb(5), None, &[], &tiers), "5 MB → L, selected");
+        assert!(
+            !cf.passes(mb(9), None, &[], &tiers),
+            "9 MB → XL, not selected"
+        );
+    }
+
+    #[test]
+    fn content_filter_tri_bucket_excludes_assets_without_a_count() {
+        let tiers = SizeTiers::default();
+        let mut cf = ContentFilter::default();
+        cf.tri_buckets.insert(TriBucket::K1to3);
+        assert!(
+            cf.passes(10, Some(2000), &[], &tiers),
+            "2000 tris → 1k–3k, selected"
+        );
+        assert!(
+            !cf.passes(10, Some(500), &[], &tiers),
+            "500 tris → ≤1k, not selected"
+        );
+        assert!(
+            !cf.passes(10, None, &[], &tiers),
+            "no tri count is excluded when a tri facet is active"
+        );
+    }
+
+    #[test]
+    fn content_filter_trait_matches_any_selected() {
+        let tiers = SizeTiers::default();
+        let mut cf = ContentFilter::default();
+        cf.traits.insert("rusty".into());
+        assert!(cf.passes(10, None, &["rusty".into(), "barrel".into()], &tiers));
+        assert!(!cf.passes(10, None, &["barrel".into()], &tiers));
+        assert!(
+            !cf.passes(10, None, &[], &tiers),
+            "an asset with no traits fails a trait filter"
+        );
+    }
+
+    #[test]
+    fn tri_bucket_boundaries() {
+        assert_eq!(TriBucket::of(0), TriBucket::Le1k);
+        assert_eq!(TriBucket::of(1000), TriBucket::Le1k);
+        assert_eq!(TriBucket::of(1001), TriBucket::K1to3);
+        assert_eq!(TriBucket::of(3000), TriBucket::K1to3);
+        assert_eq!(TriBucket::of(6001), TriBucket::Ge6k);
+    }
+
+    #[test]
+    fn content_filter_active_count_and_clear() {
+        let mut cf = ContentFilter::default();
+        cf.sizes.insert(SizeTier::S);
+        cf.tri_buckets.insert(TriBucket::Le1k);
+        assert_eq!(cf.active_count(), 2);
+        assert!(cf.any_active());
+        cf.clear();
+        assert!(!cf.any_active());
+    }
 
     #[test]
     fn grid_columns_is_never_zero() {
