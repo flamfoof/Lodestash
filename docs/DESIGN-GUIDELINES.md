@@ -137,8 +137,10 @@ Line-height: 1.45 body, 1.2 headings. Weight: 400 body, 500 labels, 600 headings
   A faint **gem/diamond motif** ties the set to the theme (status gems, logo star).
 - **Sizes:** 16 (inline/rows), 20 (toolbar), 24 (nav), 32 (empty states).
 - **Color:** inherit text color by default; type/status icons take their token color.
-- **Delivery:** single sprite [`design/icons.svg`](design/icons.svg) — `<svg class="icon"><use
-  href="icons.svg#ls-search"/></svg>`.
+- **Delivery (current):** the app renders each icon as a **Unicode glyph** (no bitmap/SVG assets) —
+  see the design bundle's **Glyph Catalog** for the codepoint + `theme.rs` token per glyph. An SVG
+  sprite matching the 24×24 stroke spec above is the eventual source of truth; until it exists, the
+  glyph mapping stands in and the table below names the intended symbol ids.
 
 | id | Meaning | | id | Meaning |
 |---|---|---|---|---|
