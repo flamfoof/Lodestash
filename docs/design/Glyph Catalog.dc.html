@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700&family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  doc-page:not(:defined){visibility:hidden}
+  body{margin:0}
+  a{color:#B98A2E}
+  a:hover{color:#8a6720}
+</style>
+</helmet>
+<x-import component-from-global-scope="doc-page" from="./doc-page.js" size="letter" margin="0.6in" hint-size="100%,100%">
+  <div style="font-family:Inter,sans-serif;color:#1A1D24;line-height:1.5">
+
+    <div style="border-bottom:2px solid #1A1D24;padding-bottom:14px;margin-bottom:20px">
+      <div style="font-family:'Cinzel',serif;font-size:26px;font-weight:700;letter-spacing:.5px">Lodestash — Glyph &amp; Asset Catalog</div>
+      <div style="font-size:12.5px;color:#565C68;margin-top:6px;max-width:64ch">Every icon in the prototype is a <b>Unicode glyph</b>, not a bitmap or bundled image — there are no <code>.png</code>/<code>.svg</code> asset files to extract. This sheet is the reference for mapping each glyph to a real symbol id in <code>docs/design/icons.svg</code> during implementation. Codepoints let you find an equivalent path icon; the color column is the <code>theme.rs</code> token each glyph renders in.</div>
+    </div>
+
+    <!-- SECTION: nav -->
+    <div style="font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:1.5px;color:#8A6720;font-weight:600;margin:6px 0 10px">01 · NAVIGATION RAIL</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:22px">
+      <sc-for list="{{ nav }}" as="g" hint-placeholder-count="9">
+        <div style="display:flex;align-items:center;gap:13px;border:1px solid #DADDE3;border-radius:8px;padding:9px 12px;break-inside:avoid">
+          <div style="width:38px;height:38px;flex-shrink:0;border-radius:7px;background:#12151C;display:flex;align-items:center;justify-content:center;font-size:19px;color:{{ g.color }}">{{ g.glyph }}</div>
+          <div style="min-width:0">
+            <div style="font-size:13px;font-weight:600">{{ g.name }}</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#8A909C">{{ g.code }} · {{ g.usage }}</div>
+          </div>
+        </div>
+      </sc-for>
+    </div>
+
+    <!-- SECTION: type + category -->
+    <div style="font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:1.5px;color:#8A6720;font-weight:600;margin:6px 0 10px">02 · ASSET TYPE &amp; CATEGORY MARKERS</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:22px">
+      <sc-for list="{{ types }}" as="g" hint-placeholder-count="6">
+        <div style="display:flex;align-items:center;gap:13px;border:1px solid #DADDE3;border-radius:8px;padding:9px 12px;break-inside:avoid">
+          <div style="width:38px;height:38px;flex-shrink:0;border-radius:7px;background:#12151C;display:flex;align-items:center;justify-content:center;font-size:19px;color:{{ g.color }}">{{ g.glyph }}</div>
+          <div style="min-width:0">
+            <div style="font-size:13px;font-weight:600">{{ g.name }}</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#8A909C">{{ g.code }} · {{ g.usage }}</div>
+          </div>
+        </div>
+      </sc-for>
+    </div>
+
+    <!-- SECTION: status gems -->
+    <div style="font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:1.5px;color:#8A6720;font-weight:600;margin:6px 0 10px">03 · STATUS GEMS</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:22px">
+      <sc-for list="{{ gems }}" as="g" hint-placeholder-count="3">
+        <div style="border:1px solid #DADDE3;border-radius:8px;padding:12px;text-align:center;break-inside:avoid">
+          <div style="width:44px;height:44px;margin:0 auto 8px;border-radius:99px;background:#12151C;display:flex;align-items:center;justify-content:center;font-size:20px;color:{{ g.color }}">{{ g.glyph }}</div>
+          <div style="font-size:12.5px;font-weight:600">{{ g.name }}</div>
+          <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#8A909C">{{ g.code }}</div>
+        </div>
+      </sc-for>
+    </div>
+
+    <!-- SECTION: view + grid -->
+    <div style="font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:1.5px;color:#8A6720;font-weight:600;margin:6px 0 10px">04 · VIEW &amp; GRID-SIZE CONTROLS</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:22px">
+      <sc-for list="{{ views }}" as="g" hint-placeholder-count="5">
+        <div style="display:flex;align-items:center;gap:13px;border:1px solid #DADDE3;border-radius:8px;padding:9px 12px;break-inside:avoid">
+          <div style="width:38px;height:38px;flex-shrink:0;border-radius:7px;background:#12151C;display:flex;align-items:center;justify-content:center;font-size:18px;color:{{ g.color }}">{{ g.glyph }}</div>
+          <div style="min-width:0">
+            <div style="font-size:13px;font-weight:600">{{ g.name }}</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#8A909C">{{ g.code }} · {{ g.usage }}</div>
+          </div>
+        </div>
+      </sc-for>
+    </div>
+
+    <!-- SECTION: actions -->
+    <div style="font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:1.5px;color:#8A6720;font-weight:600;margin:6px 0 10px">05 · ACTION &amp; AFFORDANCE GLYPHS</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:22px">
+      <sc-for list="{{ actions }}" as="g" hint-placeholder-count="10">
+        <div style="display:flex;align-items:center;gap:13px;border:1px solid #DADDE3;border-radius:8px;padding:9px 12px;break-inside:avoid">
+          <div style="width:38px;height:38px;flex-shrink:0;border-radius:7px;background:#12151C;display:flex;align-items:center;justify-content:center;font-size:18px;color:{{ g.color }}">{{ g.glyph }}</div>
+          <div style="min-width:0">
+            <div style="font-size:13px;font-weight:600">{{ g.name }}</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#8A909C">{{ g.code }} · {{ g.usage }}</div>
+          </div>
+        </div>
+      </sc-for>
+    </div>
+
+    <!-- SECTION: generated graphics -->
+    <div style="font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:1.5px;color:#8A6720;font-weight:600;margin:6px 0 10px">06 · PROCEDURAL GRAPHICS (no asset files)</div>
+    <div style="border:1px solid #DADDE3;border-radius:8px;padding:13px 15px;font-size:12.5px;color:#3A3F4A;break-inside:avoid">
+      <div style="margin-bottom:8px">The remaining "graphics" in the prototype are <b>drawn at runtime</b>, not stored images. Recreate them the same way in egui rather than shipping bitmaps:</div>
+      <ul style="margin:0;padding-left:18px">
+        <li><b>Thumbnail placeholders</b> — per-asset HSL swatches (each asset carries <code>hue</code>/<code>sat</code>); models/images render a tinted gradient tile, sounds a waveform of bars. In the app these are the real decoded previews at the chosen on-screen quality.</li>
+        <li><b>Size-tier &amp; type diamonds</b> — small rotated CSS squares colored by tier/type token.</li>
+        <li><b>Toggles, chips, progress &amp; usage bars, the file-size threshold track</b> — pure layout + fills from <code>theme.rs</code> tokens.</li>
+        <li><b>Wordmark</b> — set in <b>Cinzel</b>; no logo image is used.</li>
+      </ul>
+    </div>
+
+    <div style="margin-top:20px;padding-top:12px;border-top:1px solid #DADDE3;font-size:11px;color:#8A909C">Real icon source of truth: <code>docs/design/icons.svg</code> (see <code>DESIGN-GUIDELINES.md</code> §5). Colors: map each swatch to the <code>theme.rs</code> token named in the main handoff README's token table.</div>
+
+  </div>
+</x-import>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  renderVals() {
+    const V = '#A98BFF', C = '#49C9E0', B = '#6FB1FF', G = '#5BD897', GOLD = '#E7B765', GOLDB = '#FFD98A', A = '#7BF0E5', MUT = '#A7B0C0', GRY = '#8A93A6', W = '#F2B84B', D = '#F2666E';
+    return {
+      nav: [
+        { glyph: '\u229E', name: 'Library', code: 'U+229E', usage: 'browse all assets', color: GOLD },
+        { glyph: '\u2726', name: 'Identify', code: 'U+2726', usage: 'appraisal queue', color: A },
+        { glyph: '\u27E1', name: 'Collections', code: 'U+27E1', usage: 'saved sets', color: GOLD },
+        { glyph: '\u25A4', name: 'Packages', code: 'U+25A4', usage: 'source packs', color: MUT },
+        { glyph: '\u2756', name: 'Traits', code: 'U+2756', usage: 'tag browser', color: A },
+        { glyph: '\u25C9', name: 'Stats', code: 'U+25C9', usage: 'overview / graph', color: MUT },
+        { glyph: '\u29C9', name: 'Duplicates', code: 'U+29C9', usage: 'dup review', color: W },
+        { glyph: '\u2298', name: 'Trash', code: 'U+2298', usage: 'soft-deleted', color: D },
+        { glyph: '\u2699', name: 'Settings', code: 'U+2699', usage: 'preferences', color: MUT }
+      ],
+      types: [
+        { glyph: '\u25C6', name: 'All types', code: 'U+25C6', usage: 'category filter', color: GOLD },
+        { glyph: '\u2B21', name: 'Model', code: 'U+2B21', usage: '3D asset type', color: V },
+        { glyph: '\u266A', name: 'Sound', code: 'U+266A', usage: 'audio asset type', color: C },
+        { glyph: '\u25A6', name: 'Image', code: 'U+25A6', usage: 'image asset type', color: B },
+        { glyph: '\u25C7', name: 'Material', code: 'U+25C7', usage: 'pack tree node', color: V },
+        { glyph: '\u25A6', name: 'Texture', code: 'U+25A6', usage: 'pack tree node', color: B }
+      ],
+      gems: [
+        { glyph: '?', name: 'Unidentified', code: 'literal ?', color: GRY },
+        { glyph: '\u2713', name: 'Identified', code: 'U+2713', color: G },
+        { glyph: '\u2605', name: 'Confirmed', code: 'U+2605', color: GOLD }
+      ],
+      views: [
+        { glyph: '\u229E', name: 'Grid view', code: 'U+229E', usage: 'view toggle', color: GOLD },
+        { glyph: '\u2630', name: 'List view', code: 'U+2630', usage: 'view toggle', color: MUT },
+        { glyph: '\u25AA', name: 'Compact grid', code: 'U+25AA', usage: 'grid-size S', color: GOLD },
+        { glyph: '\u25A6', name: 'Cozy grid', code: 'U+25A6', usage: 'grid-size M (default)', color: GOLD },
+        { glyph: '\u25A3', name: 'Large grid', code: 'U+25A3', usage: 'grid-size L', color: GOLD }
+      ],
+      actions: [
+        { glyph: '\u2922', name: 'Full-size preview', code: 'U+2922', usage: 'Quick Look (full detail)', color: MUT },
+        { glyph: '\u27E1', name: 'Stage', code: 'U+27E1', usage: 'stage to project', color: GOLD },
+        { glyph: '\u2715', name: 'Clear / remove', code: 'U+2715', usage: 'dismiss chip / selection', color: MUT },
+        { glyph: '\u21BB', name: 'Regenerate', code: 'U+21BB', usage: 'new MCP token', color: GOLD },
+        { glyph: '\u29C9', name: 'Copy', code: 'U+29C9', usage: 'copy endpoint', color: MUT },
+        { glyph: '\u2298', name: 'Exclude', code: 'U+2298', usage: 'blacklist folder / asset', color: W },
+        { glyph: '\u2303', name: 'Expander open', code: 'U+2303', usage: 'source row expanded', color: MUT },
+        { glyph: '\u2304', name: 'Expander closed', code: 'U+2304', usage: 'source row collapsed', color: MUT },
+        { glyph: '\u2726', name: 'AI sieve', code: 'U+2726', usage: 'semantic search / thinking', color: C },
+        { glyph: '\u2691', name: 'Filters', code: 'U+2691', usage: 'open filter popover', color: GOLD }
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>
