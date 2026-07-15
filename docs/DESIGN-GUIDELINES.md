@@ -144,7 +144,7 @@ Line-height: 1.45 body, 1.2 headings. Weight: 400 body, 500 labels, 600 headings
   still renders **Unicode glyph** stand-ins (see the design bundle's **Glyph Catalog** for the
   codepoint + `theme.rs` token per glyph) until SVG rendering lands in the UI.
 
-**Shipped** (in `docs/design/icons/icons.svg`):
+**In the sprite** (`docs/design/icons/icons.svg` — reference by `<use href="icons.svg#ls-…">`):
 
 | id | Meaning | | id | Meaning |
 |---|---|---|---|---|
@@ -165,10 +165,10 @@ Line-height: 1.45 body, 1.2 headings. Weight: 400 body, 500 labels, 600 headings
 | `ls-action-exclude` | Exclude / blacklist (⊘) | | `ls-action-expand-open/closed` | Expander chevrons |
 | `ls-action-ai-sieve` | AI sieve | | | |
 
-**Planned** (named here so future icons keep the vocabulary; not yet drawn):
-`ls-logo`, `ls-nav-mapping`, `ls-search`, `ls-search-ai`, `ls-search-tags`, `ls-project`,
-`ls-import`, `ls-download`, `ls-play`/`ls-pause`, `ls-tag-add`, `ls-dependency`, `ls-non-content`,
-`ls-color`, `ls-variants`, `ls-similar`.
+**Individual files only** (drawn in `docs/design/icons/` as standalone SVGs, not yet folded into
+the sprite): `logo`, `nav-mapping`, `search`, `search-ai`, `search-tags`, `project`, `import`,
+`download`, `play`/`pause`, `tag-add`, `dependency`, `non-content`, `color`, `variants`, `similar`.
+When any of these is first referenced in code, promote it into `icons.svg` under its `ls-*` id.
 
 ---
 
