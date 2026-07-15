@@ -4,9 +4,9 @@ A design system for **developers and designers** building Lodestash. **Dark-mode
 restrained **JRPG inventory/appraisal** flavor, and tuned to present **a lot of information that stays
 easy to digest**.
 
-> 🎨 **See it live:** open [`design/style-guide.html`](design/style-guide.html) in a browser for the
-> rendered palette, type, components, and icons. Icons ship as a sprite in
-> [`design/icons.svg`](design/icons.svg).
+> 🎨 **See it live:** open [`design/Lodestash Prototype.dc.html`](design/Lodestash%20Prototype.dc.html)
+> in a browser for the rendered prototype, and [`design/icons/index.html`](design/icons/index.html)
+> for the icon set. Icons ship as a sprite in [`design/icons/icons.svg`](design/icons/icons.svg).
 
 ---
 
@@ -133,32 +133,42 @@ Line-height: 1.45 body, 1.2 headings. Weight: 400 body, 500 labels, 600 headings
 
 ## 5. Iconography
 
-- **Style:** 24×24 grid, `stroke=currentColor`, **stroke-width 1.75**, round caps/joins, minimal fill.
+- **Style:** 24×24 grid, **stroke-width 1.8**, round caps/joins, minimal fill.
   A faint **gem/diamond motif** ties the set to the theme (status gems, logo star).
 - **Sizes:** 16 (inline/rows), 20 (toolbar), 24 (nav), 32 (empty states).
-- **Color:** inherit text color by default; type/status icons take their token color.
-- **Delivery (current):** the app renders each icon as a **Unicode glyph** (no bitmap/SVG assets) —
-  see the design bundle's **Glyph Catalog** for the codepoint + `theme.rs` token per glyph. An SVG
-  sprite matching the 24×24 stroke spec above is the eventual source of truth; until it exists, the
-  glyph mapping stands in and the table below names the intended symbol ids.
+- **Color:** each icon's stroke is **baked as its theme-token hex** in the SVG source (the sprite has
+  no viewer context to inherit from); an icon that must follow the surrounding text color swaps the
+  baked hex for `currentColor` at the point of use.
+- **Delivery (current):** the SVG set is the source of truth — `docs/design/icons/` holds one file
+  per icon plus the **`icons.svg` sprite** (symbol ids below) and an `index.html` preview. The app
+  still renders **Unicode glyph** stand-ins (see the design bundle's **Glyph Catalog** for the
+  codepoint + `theme.rs` token per glyph) until SVG rendering lands in the UI.
+
+**Shipped** (in `docs/design/icons/icons.svg`):
 
 | id | Meaning | | id | Meaning |
 |---|---|---|---|---|
-| `ls-logo` | Brand mark (lodestone star) | | `ls-type-model` | Models (3D) |
-| `ls-nav-library` | Library | | `ls-type-sound` | Sounds |
-| `ls-nav-identify` | Identify mode (appraise) | | `ls-type-image` | Images |
-| `ls-nav-collections` | Collections | | `ls-status-unidentified` | Unidentified `?` gem |
-| `ls-nav-mapping` | Mapping library | | `ls-status-identified` | Identified ✓ gem |
-| `ls-nav-packages` | Packages | | `ls-status-confirmed` | Confirmed ★ gem |
-| `ls-nav-settings` | Settings | | `ls-import` | Import to engine |
-| `ls-search` | Search | | `ls-download` | Download (cache) |
-| `ls-search-ai` | Search with AI | | `ls-play` / `ls-pause` | Audio transport |
-| `ls-search-tags` | Search by Tags | | `ls-tag-add` | Add/edit tag |
-| `ls-filter` | Filters/facets | | `ls-dependency` | Dependency link |
-| `ls-stage` | Staging tray / shortlist | | `ls-non-content` | Non-content (tool/script) |
-| `ls-project` | Registered Unity project | | `ls-type-font` | Fonts |
-| `ls-type-material` | Material (sphere) | | `ls-variants` | Variant group (collapsed) |
-| `ls-color` | Color search / swatch | | `ls-similar` | Find similar (more like this) |
+| `ls-nav-library` | Library | | `ls-type-all` | All types |
+| `ls-nav-identify` | Identify mode (appraise) | | `ls-type-model` | Models (3D) |
+| `ls-nav-collections` | Collections | | `ls-type-sound` | Sounds |
+| `ls-nav-packages` | Packages | | `ls-type-image` | Images |
+| `ls-nav-traits` | Traits | | `ls-type-texture` | Textures |
+| `ls-nav-stats` | Stats | | `ls-type-material` | Material (sphere) |
+| `ls-nav-duplicates` | Duplicates | | `ls-type-sprite` | Sprites (frame strip) |
+| `ls-nav-trash` | Trash | | `ls-type-font` | Fonts |
+| `ls-nav-settings` | Settings | | `ls-status-unidentified` | Unidentified `?` gem |
+| `ls-view-grid` / `ls-view-list` | View toggle | | `ls-status-identified` | Identified ✓ gem |
+| `ls-grid-compact/cozy/large` | Grid density | | `ls-status-confirmed` | Confirmed ★ gem |
+| `ls-action-filters` | Filters/facets popover | | `ls-action-fullsize` | Quick Look / full size |
+| `ls-action-stage` | Staging tray / shortlist | | `ls-action-clear` | Clear (✕) |
+| `ls-action-copy` | Copy | | `ls-action-regenerate` | Regenerate thumbnail |
+| `ls-action-exclude` | Exclude / blacklist (⊘) | | `ls-action-expand-open/closed` | Expander chevrons |
+| `ls-action-ai-sieve` | AI sieve | | | |
+
+**Planned** (named here so future icons keep the vocabulary; not yet drawn):
+`ls-logo`, `ls-nav-mapping`, `ls-search`, `ls-search-ai`, `ls-search-tags`, `ls-project`,
+`ls-import`, `ls-download`, `ls-play`/`ls-pause`, `ls-tag-add`, `ls-dependency`, `ls-non-content`,
+`ls-color`, `ls-variants`, `ls-similar`.
 
 ---
 
@@ -227,7 +237,7 @@ Split: preview (3D viewport / audio player+waveform / image viewer) over a **sta
 - **Traits:** tag chips with confidence; AI vs manual vs imported distinguished (see chips).
 - **Provenance & license:** a quiet footer line — **source pack(s)**, a **license/attribution** value
   (`ls-non-content`-muted style, never shouty), and any **"imported in <project> → <path>"** records.
-- **Actions:** **Stage** (`ls-stage`), Import (`ls-import`, with dependency count), Add to collection,
+- **Actions:** **Stage** (`ls-action-stage`), Import (`ls-import`, with dependency count), Add to collection,
   Re-identify, Edit tags. If the asset is already imported into the active project, the Import button
   shows an **"already imported"** state (see badge below) and asks before duplicating.
 
@@ -243,7 +253,7 @@ Two-pane: raw tags (left) → canonical categories tree (right), with rules betw
 rules list with priority. Pinned (manual) assignments get a small lock.
 
 ### Staging tray (the shortlist)
-A **collect-then-import** dock (`ls-stage`), pinned to the right edge or above the job tray. Holds the
+A **collect-then-import** dock (`ls-action-stage`), pinned to the right edge or above the job tray. Holds the
 shared shortlist — items you (or Claude over MCP) stage while browsing; the **same tray appears in the
 GUI and the Unity panel**. Compact thumbnail strip with a count badge, a **target project** selector
 (`ls-project`, defaults to the active editor), a **dest subfolder** field, and a primary **Import all**

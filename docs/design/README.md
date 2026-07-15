@@ -290,9 +290,10 @@ Spacing / radius / type: use the existing egui `Style` set in `theme::apply` and
 
 ## Assets / Icons
 
-Icons come from `docs/design/icons.svg` by symbol id (`DESIGN-GUIDELINES.md` §5). Relevant ids:
-`ls-nav-settings`, `ls-nav-library`, `ls-filter` (Filters button), `ls-search`/`ls-search-tags`,
-`ls-project`, `ls-import`, `ls-stage`, the status gems, and the type icons. No new bitmap assets are
+Icons come from `docs/design/icons/icons.svg` by symbol id (`DESIGN-GUIDELINES.md` §5; preview at
+`docs/design/icons/index.html`). Relevant ids: `ls-nav-settings`, `ls-nav-library`,
+`ls-action-filters` (Filters button), `ls-action-stage`, the status gems, and the type icons.
+Search/project/import ids are named in §5's planned list but not yet drawn. No bitmap assets are
 introduced by this work.
 
 ## Files
