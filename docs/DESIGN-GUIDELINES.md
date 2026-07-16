@@ -217,7 +217,7 @@ The active mode colors the input's focus ring so you always know which engine yo
 ### Sidebar (navigation + facets)
 A single **210px labeled sidebar** (`--ls-surface`), three stacked groups
 ([`UI-SPEC.md`](UI-SPEC.md) §0.2): **navigation** (Library / Identify / Collections / Packages /
-Traits / Stats / Duplicates / Trash / Settings — glyph + label + amber warn-badges for Identify/
+Vocabulary / Stats / Duplicates / Trash / Settings — glyph + label + amber warn-badges for Identify/
 Duplicates/Trash counts; Library doubles as the reset-to-everything affordance), then a **STATUS**
 facet group (All / Unid / Identified / Confirmed with diamond dots), then a **LIBRARIES** facet
 group (one row per Library Source) with a dashed **+ Add source…**. Each facet row shows a

@@ -30,7 +30,7 @@ resolve first · **[QoL]** = cross-cutting browser-UX lane (M1.5), layered on Ph
 - [x] **[P0]** Folder crawler + magic-byte detection + BLAKE3 hashing + `(size,mtime)` incremental diff ([`INGESTION.md`](INGESTION.md)) — hashing is streaming (constant memory on multi-GB files); `.anim` correctly left unclassified (Unity animation clip, not a sprite)
 - [x] **[P0]** Image thumbnailing → on-disk cache (keyed `content_hash`+params, Lanczos3) — UI wired to it via an interim `(path,size,mtime)` key until the catalog provides `content_hash`
 - [x] **[P0]** Spec/code review fixes (2026-07-01): background-thread crawl (no UI freeze on large trees, generation-guarded), window-based thumbnail texture eviction (bounded VRAM at 50k+), selection preserved by entry across filter/sort changes, M4 migration (`asset.rating`, `package.pipeline`, `project.pipeline` — [`DATA-MODEL.md`](DATA-MODEL.md) §12)
-- [x] UI functional spec (2026-07-15): [`UI-SPEC.md`](UI-SPEC.md) — all screens/overlays specced from the design prototype and normalized against the owning docs; 11 prototype↔spec conflicts resolved (sidebar replaces nav rail, per-project staging, MCP permission groups, 7-type taxonomy, unresolved-dependency rows, trait columns on `tag`, import batches + undo) with deltas applied to DESIGN-GUIDELINES / DATA-MODEL / ENGINE-API / MCP-AND-ENGINES / AI-PIPELINE / README
+- [x] UI functional spec (2026-07-15): [`UI-SPEC.md`](UI-SPEC.md) — all screens/overlays specced from the design prototype and normalized against the owning docs; 11 prototype↔spec conflicts resolved (sidebar replaces nav rail, per-project staging, MCP permission groups, 7-type taxonomy, unresolved-dependency rows, trait columns on `tag`, import batches + undo) with deltas applied to DESIGN-GUIDELINES / DATA-MODEL / ENGINE-API / MCP-AND-ENGINES / AI-PIPELINE / README; plus the **Vocabulary screen** (Traits + Mapping tabs, UI-SPEC §9) and the **M5 migration ledger** ([`DATA-MODEL.md`](DATA-MODEL.md) §13 — exact DDL + data steps vs the shipped M1–M4 schema)
 - [x] Design icon set imported + reconciled (2026-07-15): 35 SVGs + `icons.svg` sprite + Glyph Catalog in `docs/design/`; added missing `ls-type-sprite`/`ls-type-font`; [`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §5 synced to reality (stroke 1.8, baked token hex, shipped/planned id split)
 - [x] Spec review additions (2026-07-01): `find_similar`/`identify_asset`/`suggest_tags`/`cancel_job` on both planes ([`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md) §2, [`ENGINE-API.md`](ENGINE-API.md) §2), `pipeline_mismatch` import advisory ([`ENGINE-API.md`](ENGINE-API.md) §5.4), sprite/material/font embedding rows ([`AI-PIPELINE.md`](AI-PIPELINE.md) §3), ratings + pipeline in the query grammar ([`IDENTIFICATION-AND-SEARCH.md`](IDENTIFICATION-AND-SEARCH.md) §6), SQLite single-writer rule ([`ARCHITECTURE.md`](ARCHITECTURE.md) §5)
 
@@ -43,6 +43,19 @@ resolve first · **[QoL]** = cross-cutting browser-UX lane (M1.5), layered on Ph
 - [x] **[P0]** Media-type category tab bar (All / 3D Models / Audio / Images / Textures / Materials / Fonts / Sprites) — in-memory filter, precursor to P3 faceted sidebar
 - [x] **[P0]** Async thumbnail loading — rayon + `std::sync::mpsc` channel; **demand-based** (only visible rows ± lookahead spawn tasks); UI shows placeholders and fills textures as they arrive; main thread polls via `request_repaint_after` while pending (no repaint from worker threads — avoids resize double-frames)
 - [x] **[P0]** Library persistence — `AppConfig` JSON at OS config dir; remembers last opened root and reopens it on startup; precursor to P2 full `import_source` catalog
+
+---
+
+## ▶ Ready — UI-SPEC shell alignment
+
+> Bring the running app in line with [`UI-SPEC.md`](UI-SPEC.md) (the prototype-faithfulness gaps,
+> highest impact first). Build to spec; divergences go back into the doc.
+
+- [ ] **[QoL]** Bundle Cinzel / Inter / JetBrains Mono into egui `FontDefinitions` (display / body / mono roles per [`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §3; offline invariant — no runtime fetch). Biggest single fidelity win ([`UI-SPEC.md`](UI-SPEC.md) §0)
+- [ ] **[QoL]** Sidebar per [`UI-SPEC.md`](UI-SPEC.md) §0.2 — replaces the icon nav rail: 9 labeled destinations + warn badges, STATUS facet group, LIBRARIES facet group (absorbs the library pill tabs), dashed + Add source; Library row = reset-to-everything
+- [ ] **[QoL]** Top bar per [`UI-SPEC.md`](UI-SPEC.md) §0.1 — logo diamond + Cinzel wordmark, Tags/AI segmented search (Tags live, AI stub until P4), health meter, project chip (stub popover), AI-profile pill; background radial gradients (§0)
+- [ ] **[P2]** M5 migration ([`DATA-MODEL.md`](DATA-MODEL.md) §13) — per-project staging trays + legacy-tray data step, `import_record.batch_id` + backfill, `tag` trait columns, `asset_relationship` (final form), `import_source.blacklist` + one-time config import
+- [ ] **[QoL]** Library result-header row per [`UI-SPEC.md`](UI-SPEC.md) §2 — result label, pack/collection filter chips, sort select, hint text; Unidentified nudge banner
 
 ---
 

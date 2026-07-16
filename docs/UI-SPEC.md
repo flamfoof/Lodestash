@@ -77,7 +77,7 @@ One vertical panel, three stacked groups:
    | Identify | `nav-identify` | Unidentified count |
    | Collections | `nav-collections` | — |
    | Packages | `nav-packages` | — |
-   | Traits | `nav-traits` | — |
+   | Vocabulary | `nav-traits` | — |
    | Stats | `nav-stats` | — |
    | Duplicates | `nav-duplicates` | open dup-group count |
    | Trash | `nav-trash` | trashed count |
@@ -275,7 +275,7 @@ Two tabs (segmented in the header): **▦ Overview** and **◉ Tag Graph**.
 - **INSIGHTS**: generated advisory rows (accent glyph + message + action link), including at least:
   Unidentified backlog (→ Identify), open dup groups (→ Duplicates), heaviest model's share of
   total tris (→ View), heaviest pack's share of disk (→ Browse), traits teaching the identifier
-  (→ Trait library).
+  (→ Vocabulary, Traits tab).
 
 ### 8.2 Tag Graph
 Full-bleed force-directed canvas of the identified library: **gold tag nodes** (radius ∝ usage,
@@ -288,14 +288,22 @@ exist: *"? N Unidentified assets have no tags yet — they're not in the graph."
 
 ---
 
-## 9. Trait Library
+## 9. Vocabulary (Traits & Mapping)
+
+**One screen, two tabs** (header segmented control, same pattern as Stats §8): **❖ Traits** — the
+vocabulary you tag with — and **⇢ Mapping** — the rules that interpret tags into canonical
+categories. Both sides of "what do my words mean here" live together; raw tags are never modified
+by either. Sidebar destination **Vocabulary** (`ls-nav-traits`; `ls-nav-mapping` becomes the
+Mapping **tab** glyph). Deep links land on a tab (e.g. Stats' "Trait library →" insight → Traits).
+
+### 9.1 Traits tab
 
 The user's tagging vocabulary, and the human side of AI-PIPELINE §6.
 **⚖ Resolution:** "Traits" is the user-facing evolution of the Tag manager (DESIGN-GUIDELINES §7):
 a **trait** is a `tag` row promoted to first-class with `scope`, `usage_note`, `teach`, `color`,
 `icon` (DATA-MODEL delta, §20). Free-form tags keep working underneath.
 
-- Header subtitle: *"Your own tagging vocabulary. Traits marked ✦ teaching are fed to the
+- Tab subtitle: *"Your own tagging vocabulary. Traits marked ✦ teaching are fed to the
   identifier — future scans tag with your words, not just its own."*
 - **NEW TRAIT** card: name input (normalized: lowercase, spaces→dashes; dup-guarded) · **applies
   to** scope pills (`any / model / sound / image` — extend with the remaining media types as their
@@ -313,10 +321,46 @@ a **trait** is a `tag` row promoted to first-class with `scope`, `usage_note`, `
 
 ---
 
-## 10. (reserved)
+### 9.2 Mapping tab
 
-`Mapping library` editor (DESIGN-GUIDELINES §7, DATA-MODEL §4) — unchanged by the prototype; reached
-from Settings/Traits later. Reserved so section numbers stay stable.
+The controlled-vocabulary editor over DATA-MODEL §4 (taxonomy / category / alias / rule /
+`asset_category`). Not in the prototype — specced from DESIGN-GUIDELINES §7 ("two-pane: raw
+tags → categories tree, rules between") and the §4 workflow (tab stubbed until built).
+
+- **Tab header row**: subtitle *"Rules that sort messy tags into your clean categories — swap
+  whole vocabularies without touching a single tag."* Right: **taxonomy switcher** (select +
+  `● active` marker — multiple taxonomies coexist, one active), `v<version>` (mono),
+  **+ New taxonomy** / **Import starter pack**.
+- **Left pane — RAW TAGS**: the live tag vocabulary with usage counts and a search box (same data
+  as the Traits tab, read-only here; traits show their chip styling). Rows show which category the
+  active taxonomy currently maps
+  them to (dim `→ Environment/Foliage`) or an amber `unmapped` pill. **Drag a tag onto a category**
+  (right pane) to create an `exact_tag` rule; drop with `Alt` to create an **alias** instead.
+- **Right pane — CATEGORY TREE**: the hierarchy (`path`-materialized), expandable rows with
+  per-category mapped-asset counts. Row actions: rename, add child, delete (assignments cascade;
+  confirm). Selecting a category opens its **detail card**:
+  - **ALIASES**: chips (✕ to remove) + add field.
+  - **RULES**: one row per `mapping_rule` — match-type badge (`exact_tag · alias · regex ·
+    glob_path · media_type · embedding_knn`) + mono pattern + priority (editable number, lower
+    wins) + min-confidence + enable toggle + ✕. **+ Add rule** opens an inline form; `embedding_knn`
+    rules pick seed assets via a mini asset-picker ("near these examples").
+- **Footer bar — apply pipeline**: **Preview** runs a dry-run (*"would assign 1,204 assets · 37
+  conflicts · 12 pinned overrides untouched"*) with a diff list (asset, old → new category, winning
+  rule); **Apply** materializes `asset_category` rows (`assigned_by='rule'`), bumps
+  `taxonomy.version`, toasts. Conflicts resolve by priority then confidence; **pinned (manual)
+  assignments always survive re-runs** and show a small lock glyph wherever they render.
+- **Manual assignment** happens in the asset **inspector** (§13): a CATEGORY row under TRAITS —
+  current category chip(s) + a picker; manual picks write `assigned_by='manual', is_pinned=1`.
+- **Search integration**: categories appear as a facet group in the sidebar once a taxonomy is
+  active (`asset_category` pre-filter, IDENTIFICATION-AND-SEARCH §5A); `apply_mapping` is the
+  agent-plane equivalent (MCP surface).
+
+---
+
+## 10. (merged into §9)
+
+Traits and the Mapping editor share the single **Vocabulary** screen (§9). Number reserved so
+later sections keep their references.
 
 ---
 
