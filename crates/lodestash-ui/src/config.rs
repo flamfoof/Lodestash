@@ -300,6 +300,10 @@ pub struct AppConfig {
     /// Skip the first-run onboarding panel and open straight into the library (§1, §5.7).
     #[serde(default)]
     pub skip_onboarding: bool,
+    /// User-added Asset Store cache roots, checked after `ASSETSTORE_CACHE_PATH` and the
+    /// per-OS default (INGESTION.md §2 discovery order; UI-SPEC §4).
+    #[serde(default)]
+    pub asset_store_roots: Vec<PathBuf>,
 }
 
 impl AppConfig {
