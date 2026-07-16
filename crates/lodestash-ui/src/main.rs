@@ -3,6 +3,7 @@
 
 mod app;
 mod config;
+mod fonts;
 mod theme;
 
 fn main() -> eframe::Result {

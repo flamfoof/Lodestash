@@ -51,7 +51,7 @@ resolve first · **[QoL]** = cross-cutting browser-UX lane (M1.5), layered on Ph
 > Bring the running app in line with [`UI-SPEC.md`](UI-SPEC.md) (the prototype-faithfulness gaps,
 > highest impact first). Build to spec; divergences go back into the doc.
 
-- [ ] **[QoL]** Bundle Cinzel / Inter / JetBrains Mono into egui `FontDefinitions` (display / body / mono roles per [`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §3; offline invariant — no runtime fetch). Biggest single fidelity win ([`UI-SPEC.md`](UI-SPEC.md) §0)
+- [x] **[QoL]** Bundle Cinzel / Inter / JetBrains Mono into egui `FontDefinitions` (display / body / mono roles per [`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §3; offline invariant — no runtime fetch). Biggest single fidelity win ([`UI-SPEC.md`](UI-SPEC.md) §0) — `fonts.rs`: Inter → Proportional, JetBrains Mono → Monospace, Cinzel → named `display` family (`fonts::display(size)` helper; wordmark uses it); OFL licenses bundled beside the TTFs
 - [ ] **[QoL]** Sidebar per [`UI-SPEC.md`](UI-SPEC.md) §0.2 — replaces the icon nav rail: 9 labeled destinations + warn badges, STATUS facet group, LIBRARIES facet group (absorbs the library pill tabs), dashed + Add source; Library row = reset-to-everything
 - [ ] **[QoL]** Top bar per [`UI-SPEC.md`](UI-SPEC.md) §0.1 — logo diamond + Cinzel wordmark, Tags/AI segmented search (Tags live, AI stub until P4), health meter, project chip (stub popover), AI-profile pill; background radial gradients (§0)
 - [ ] **[P2]** M5 migration ([`DATA-MODEL.md`](DATA-MODEL.md) §13) — per-project staging trays + legacy-tray data step, `import_record.batch_id` + backfill, `tag` trait columns, `asset_relationship` (final form), `import_source.blacklist` + one-time config import
