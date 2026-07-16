@@ -8,6 +8,7 @@ use std::time::Duration;
 use egui::{Key, RichText, ScrollArea, TextureHandle, Ui, Vec2};
 use lodestash_core::catalog::{Catalog, CrawlRecord, StatusCounts};
 use lodestash_core::types::MediaType;
+use lodestash_ingest::asset_store::{self, AssetStorePackage};
 use lodestash_ingest::crawler::{self, CrawledFile};
 use lodestash_ingest::{detect, thumb, unitypackage};
 
@@ -393,6 +394,13 @@ pub struct LodestashApp {
     search_mode: SearchMode,
     /// Session dismissal for the Unidentified nudge banner (UI-SPEC §2.1).
     nudge_dismissed: bool,
+    /// Asset Store cache browse state (UI-SPEC §4): validated cache roots and the
+    /// packages under them, listed without unpacking. Scanned on first Packages open.
+    store_roots: Vec<PathBuf>,
+    store_packages: Vec<AssetStorePackage>,
+    store_scanned: bool,
+    /// Feedback when a user-picked cache folder fails validation.
+    store_add_error: Option<String>,
     /// Latest per-status counts read back from the catalog for the open project's
     /// sources (None until the first persist lands). Feeds the health meter + sidebar.
     catalog_counts: Option<StatusCounts>,
@@ -473,6 +481,10 @@ impl LodestashApp {
             content_filter: ContentFilter::default(),
             search_mode: SearchMode::Tags,
             nudge_dismissed: false,
+            store_roots: Vec::new(),
+            store_packages: Vec::new(),
+            store_scanned: false,
+            store_add_error: None,
             catalog_counts: None,
             catalog_persisting: false,
             catalog_rx,
@@ -525,19 +537,33 @@ impl LodestashApp {
     }
 
     fn add_source(&mut self, ctx: &egui::Context) {
-        let Some(proj_name) = self.project_name.clone() else {
+        if self.project_name.is_none() {
             return;
-        };
+        }
         if let Some(path) = rfd::FileDialog::new().pick_folder() {
-            self.config.add_source_to_project(&proj_name, path);
-            // Reload all paths for this project from config (now includes the new one).
-            let paths: Vec<PathBuf> = self
-                .config
-                .project_by_name(&proj_name)
-                .map(|p| p.paths.clone())
-                .unwrap_or_default();
-            let live: Vec<PathBuf> = paths.into_iter().filter(|p| p.is_dir()).collect();
-            self.load_paths(ctx, live, Some(proj_name));
+            self.add_source_path(ctx, path);
+        }
+    }
+
+    /// Add a known folder as a source: joins the open project when one exists, else
+    /// opens it as a fresh library (same as "Open folder…" with this path).
+    fn add_source_path(&mut self, ctx: &egui::Context, path: PathBuf) {
+        match self.project_name.clone() {
+            Some(proj_name) => {
+                self.config.add_source_to_project(&proj_name, path);
+                // Reload all paths for this project from config (now includes the new one).
+                let paths: Vec<PathBuf> = self
+                    .config
+                    .project_by_name(&proj_name)
+                    .map(|p| p.paths.clone())
+                    .unwrap_or_default();
+                let live: Vec<PathBuf> = paths.into_iter().filter(|p| p.is_dir()).collect();
+                self.load_paths(ctx, live, Some(proj_name));
+            }
+            None => {
+                let name = self.config.record_open(path.clone());
+                self.load_paths(ctx, vec![path], Some(name));
+            }
         }
     }
 
@@ -1155,6 +1181,262 @@ impl LodestashApp {
         self.last_cols = 0;
         self.last_row_start = usize::MAX;
         self.last_row_end = 0;
+    }
+
+    // ── Packages screen (UI-SPEC §4) ────────────────────────────────────────────
+
+    /// Discover + validate Asset Store cache roots (`ASSETSTORE_CACHE_PATH` → per-OS
+    /// default → user-added, INGESTION.md §2) and list their packages without unpacking.
+    fn refresh_store_cache(&mut self) {
+        let mut roots = asset_store::candidate_roots();
+        for custom in &self.config.asset_store_roots {
+            if !roots.contains(custom) {
+                roots.push(custom.clone());
+            }
+        }
+        self.store_roots = roots
+            .into_iter()
+            .filter(|r| asset_store::is_asset_store_cache(r))
+            .collect();
+        // ponytail: synchronous walk — the cache tree is metadata-only and modest;
+        // move to a worker thread if a huge cache ever makes this stall.
+        self.store_packages = self
+            .store_roots
+            .iter()
+            .flat_map(|r| asset_store::browse(r))
+            .collect();
+        self.store_scanned = true;
+    }
+
+    /// Which validated cache root a package lives under.
+    fn store_root_of(&self, path: &std::path::Path) -> Option<&PathBuf> {
+        self.store_roots.iter().find(|r| path.starts_with(r))
+    }
+
+    /// UI-SPEC §4: everything you own, publisher → pack, browsed straight from the
+    /// download cache. Extraction goes through the existing pending-package flow, so a
+    /// cache must be a library source (crawled) before its packs can be pulled in.
+    fn packages_screen(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        if !self.store_scanned {
+            self.refresh_store_cache();
+        }
+
+        ui.label(
+            RichText::new("Packages")
+                .color(theme::TEXT)
+                .font(crate::fonts::display(24.0)),
+        );
+        ui.label(
+            RichText::new(
+                "Everything you own, by publisher \u{2192} pack \u{2014} browsed straight \
+                 from the Asset Store download cache. Nothing unpacks until you say so.",
+            )
+            .color(theme::TEXT_MUTED)
+            .size(12.0),
+        );
+        ui.add_space(8.0);
+
+        let mut add_clicked = false;
+        let mut refresh_clicked = false;
+        let mut source_to_add: Option<PathBuf> = None;
+        let mut extract_idx: Option<usize> = None;
+
+        ui.horizontal(|ui| {
+            if ui
+                .button(RichText::new("+ Add cache folder\u{2026}").size(11.0))
+                .clicked()
+            {
+                add_clicked = true;
+            }
+            if ui.button(RichText::new("\u{27F3} Refresh").size(11.0)).clicked() {
+                refresh_clicked = true;
+            }
+            if let Some(err) = &self.store_add_error {
+                ui.label(RichText::new(err).color(theme::DANGER).size(11.0));
+            }
+        });
+        for root in self.store_roots.clone() {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(root.to_string_lossy())
+                        .color(theme::TEXT_DIM)
+                        .size(10.0)
+                        .monospace(),
+                );
+                if self.scan_roots.contains(&root) {
+                    ui.label(
+                        RichText::new("\u{2713} library source")
+                            .color(theme::SUCCESS)
+                            .size(10.0),
+                    );
+                } else if ui
+                    .button(
+                        RichText::new("Use as library source")
+                            .color(theme::GOLD)
+                            .size(10.0),
+                    )
+                    .on_hover_text(
+                        "Crawl this cache so its packages can be extracted into the library",
+                    )
+                    .clicked()
+                {
+                    source_to_add = Some(root.clone());
+                }
+            });
+        }
+
+        if self.store_roots.is_empty() {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("\u{25A4}").size(48.0).color(theme::TEXT_DIM));
+                ui.label(
+                    RichText::new("No Asset Store cache found")
+                        .color(theme::TEXT)
+                        .size(14.0),
+                );
+                let hint = asset_store::default_root()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "<no default on this platform>".into());
+                ui.label(
+                    RichText::new(format!(
+                        "Looked at ASSETSTORE_CACHE_PATH and {hint} \u{2014} \
+                         use \u{201C}+ Add cache folder\u{201D} if yours lives elsewhere."
+                    ))
+                    .color(theme::TEXT_DIM)
+                    .size(11.0),
+                );
+            });
+        } else {
+            ui.add_space(4.0);
+            ui.separator();
+            ScrollArea::vertical().show(ui, |ui| {
+                for run in publisher_runs(&self.store_packages) {
+                    let pkgs = &self.store_packages[run];
+                    let total: u64 = pkgs.iter().map(|p| p.size_bytes).sum();
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("\u{25A4}").color(theme::GOLD).size(13.0));
+                        ui.label(
+                            RichText::new(&pkgs[0].publisher)
+                                .color(theme::TEXT)
+                                .size(13.0)
+                                .strong(),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "{} packs \u{B7} {}",
+                                pkgs.len(),
+                                format_bytes(total)
+                            ))
+                            .color(theme::TEXT_DIM)
+                            .size(11.0)
+                            .monospace(),
+                        );
+                    });
+                    for pkg in pkgs {
+                        ui.horizontal(|ui| {
+                            ui.add_space(22.0);
+                            ui.label(RichText::new(&pkg.name).color(theme::TEXT_MUTED).size(12.0));
+                            if !pkg.category.is_empty() {
+                                ui.label(
+                                    RichText::new(&pkg.category)
+                                        .color(theme::TEXT_DIM)
+                                        .size(10.0),
+                                );
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(format_bytes(pkg.size_bytes))
+                                            .color(theme::TEXT_DIM)
+                                            .size(10.0)
+                                            .monospace(),
+                                    );
+                                    let pending = self
+                                        .pending_packages
+                                        .iter()
+                                        .position(|p| p.abs_path == pkg.path);
+                                    let root_is_source = self
+                                        .store_root_of(&pkg.path)
+                                        .is_some_and(|r| self.scan_roots.contains(r));
+                                    match pending {
+                                        Some(idx) if self.pending_packages[idx].extracting => {
+                                            ui.label(
+                                                RichText::new("extracting\u{2026}")
+                                                    .color(theme::ARCANE)
+                                                    .size(11.0),
+                                            );
+                                        }
+                                        Some(idx) => {
+                                            if ui
+                                                .button(
+                                                    RichText::new("Extract")
+                                                        .color(theme::GOLD)
+                                                        .size(11.0),
+                                                )
+                                                .clicked()
+                                            {
+                                                extract_idx = Some(idx);
+                                            }
+                                        }
+                                        None if root_is_source => {
+                                            ui.label(
+                                                RichText::new(if self.scanning {
+                                                    "scanning\u{2026}"
+                                                } else {
+                                                    "\u{2713} extracted"
+                                                })
+                                                .color(theme::TEXT_DIM)
+                                                .size(10.0),
+                                            );
+                                        }
+                                        None => {
+                                            ui.label(
+                                                RichText::new("needs the cache as a source")
+                                                    .color(theme::TEXT_DIM)
+                                                    .size(10.0),
+                                            )
+                                            .on_hover_text(
+                                                "Click \u{201C}Use as library source\u{201D} \
+                                                 above, then Extract",
+                                            );
+                                        }
+                                    }
+                                },
+                            );
+                        });
+                    }
+                }
+            });
+        }
+
+        if add_clicked {
+            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                if asset_store::is_asset_store_cache(&path) {
+                    self.store_add_error = None;
+                    if !self.config.asset_store_roots.contains(&path) {
+                        self.config.asset_store_roots.push(path);
+                        self.config.save();
+                    }
+                    self.refresh_store_cache();
+                } else {
+                    self.store_add_error = Some(format!(
+                        "\u{2298} {} has no .unitypackage files \u{2014} not an Asset Store cache",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        if refresh_clicked {
+            self.refresh_store_cache();
+        }
+        if let Some(root) = source_to_add {
+            self.add_source_path(ctx, root);
+        }
+        if let Some(idx) = extract_idx {
+            self.extract_package(ctx, idx);
+        }
     }
 
     // ── Settings screen (design §5) ────────────────────────────────────────────
@@ -2471,6 +2753,10 @@ impl eframe::App for LodestashApp {
                         self.settings_screen(ui, ctx);
                         return;
                     }
+                    Screen::Packages => {
+                        self.packages_screen(ui, ctx);
+                        return;
+                    }
                     Screen::Library => {}
                     // Unbuilt destinations render the §12 stub — never a dead click.
                     other => {
@@ -3457,6 +3743,20 @@ fn filter_chip(ui: &mut Ui, label: &str, selected: bool, color: egui::Color32) -
     resp.interact(egui::Sense::click()).clicked()
 }
 
+/// Contiguous publisher runs over a `browse()` result (already publisher-sorted),
+/// as index ranges into the slice. Pure for testability (TECH-STACK §5.1).
+fn publisher_runs(pkgs: &[AssetStorePackage]) -> Vec<std::ops::Range<usize>> {
+    let mut runs = Vec::new();
+    let mut start = 0;
+    for i in 1..=pkgs.len() {
+        if i == pkgs.len() || pkgs[i].publisher != pkgs[start].publisher {
+            runs.push(start..i);
+            start = i;
+        }
+    }
+    runs
+}
+
 /// The top-bar logo: an 18px rotated gold diamond with an inner bright dot and a
 /// faint glow (UI-SPEC §0.1).
 fn logo_diamond(ui: &mut Ui) {
@@ -4179,6 +4479,27 @@ fn generate_texture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Packages screen grouping (UI-SPEC §4) ─────────────────────────────────
+
+    #[test]
+    fn publisher_runs_groups_contiguous_publishers() {
+        let pkg = |publisher: &str, name: &str| AssetStorePackage {
+            publisher: publisher.into(),
+            category: String::new(),
+            name: name.into(),
+            path: PathBuf::from(name),
+            size_bytes: 1,
+        };
+        assert!(publisher_runs(&[]).is_empty());
+        let pkgs = [
+            pkg("SICS", "a"),
+            pkg("SICS", "b"),
+            pkg("Synty", "c"),
+            pkg("Zerin", "d"),
+        ];
+        assert_eq!(publisher_runs(&pkgs), vec![0..2, 2..3, 3..4]);
+    }
 
     // ── Content filter predicate (design §3) ──────────────────────────────────
 

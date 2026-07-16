@@ -228,6 +228,11 @@ name · amber `N unid` outline pill (when > 0) · asset count · **◉ Stats** (
 `.unitypackage`s (status `discovered`) also offer **Extract** per INGESTION §2 — browse-without-
 unpack stays cheap, extraction is on demand.
 
+*(Shipped slice: cache discovery/validation with persisted custom roots, publisher→pack browse
+straight off the download cache with pack counts + sizes, per-root "Use as library source", and
+per-pack Extract through the pending-package flow. The `N unid` pill, ◉ Stats, and Browse→ need
+catalog `package` rows — they land with the P2 Packages model.)*
+
 ---
 
 ## 5. Duplicates
