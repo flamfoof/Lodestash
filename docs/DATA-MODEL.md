@@ -599,10 +599,12 @@ transaction, in order, on open. Shipped so far:
 | **M2** | Mapping library: `taxonomy`, `category`, `category_alias`, `mapping_rule`, `asset_category` (§4) |
 | **M3** | Engine round-trip: `package` + `asset.package_id`, `project`, `import_record`, `asset.license/attribution/license_url` (§7, §9) |
 | **M4** | `asset.rating`, `package.pipeline`, `project.pipeline` (§12) |
+| **M5** | UI-SPEC alignment: per-project staging trays, `import_record.batch_id` + backfill, `tag` trait columns, `asset_relationship` (final form), `import_source.blacklist` — DDL + data steps below |
 
-### M5 — UI-SPEC alignment (next)
+### M5 — UI-SPEC alignment (shipped 2026-07-16)
 
-Everything [`UI-SPEC.md`](UI-SPEC.md) needs that the shipped schema lacks. Exact DDL:
+Everything [`UI-SPEC.md`](UI-SPEC.md) needed that the M1–M4 schema lacked. Exact DDL
+(as shipped in `catalog.rs`):
 
 ```sql
 -- 1. Per-project staging trays (§9; UI-SPEC §16)
@@ -652,7 +654,9 @@ ALTER TABLE import_source ADD COLUMN blacklist TEXT;               -- JSON [{ "k
   reconstructable from `dest_path`, so batch undo works on them too).
 - **Blacklist**: one-time import of the interim config blacklist (`LibraryProject.blacklist`) into
   `import_source.blacklist` by matching `root_path`; the config copy is then treated as dead and the
-  crawler reads the catalog column.
+  crawler reads the catalog column. *(Shipped as `Catalog::adopt_config_blacklists` — the app calls
+  it after open, since the catalog can't read the config file; it only fills sources whose catalog
+  blacklist is still NULL.)*
 
 Not in M5: MCP port/token, size tiers, quality, and cap settings stay in the app config file — they
 are per-machine preferences, not catalog data.
