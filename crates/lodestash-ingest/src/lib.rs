@@ -2,6 +2,7 @@
 //!
 //! Spec: docs/INGESTION.md
 
+pub mod asset_store;
 pub mod crawler;
 pub mod detect;
 pub mod thumb;
