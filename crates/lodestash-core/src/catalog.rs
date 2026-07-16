@@ -44,29 +44,37 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("user_version query: {e}")))
     }
 
-    fn set_schema_version(&self, v: u32) -> Result<()> {
-        // PRAGMA user_version cannot be parameterised — format is safe (u32 literal).
-        self.conn
-            .execute_batch(&format!("PRAGMA user_version = {v};"))
-            .map_err(|e| CoreError::Catalog(format!("set user_version: {e}")))
+    fn apply_migrations(&mut self) -> Result<()> {
+        self.apply_migrations_up_to(u32::MAX)
     }
 
-    fn apply_migrations(&mut self) -> Result<()> {
+    /// Run pending migrations up to and including `max_version` (tests use this to
+    /// build a fixture at an older schema, then re-run to exercise one migration's
+    /// data steps). Each migration runs inside its own transaction (DATA-MODEL §13).
+    fn apply_migrations_up_to(&mut self, max_version: u32) -> Result<()> {
         let current = self.schema_version()?;
         let migrations: &[(u32, &str)] = &[
             (1, MIGRATION_01_BASE_SCHEMA),
             (2, MIGRATION_02_PACKAGES),
             (3, MIGRATION_03_PROJECTS_IMPORTS),
             (4, MIGRATION_04_RATING_PIPELINE),
+            (5, MIGRATION_05_UI_SPEC_ALIGNMENT),
         ];
 
         for (version, sql) in migrations {
-            if current < *version {
+            if current < *version && *version <= max_version {
                 info!(version, "applying schema migration");
-                self.conn
-                    .execute_batch(sql)
+                let tx = self
+                    .conn
+                    .transaction()
+                    .map_err(|e| CoreError::Catalog(format!("migration {version} begin: {e}")))?;
+                tx.execute_batch(sql)
                     .map_err(|e| CoreError::Catalog(format!("migration {version} failed: {e}")))?;
-                self.set_schema_version(*version)?;
+                // PRAGMA user_version cannot be parameterised — format is safe (u32 literal).
+                tx.execute_batch(&format!("PRAGMA user_version = {version};"))
+                    .map_err(|e| CoreError::Catalog(format!("set user_version: {e}")))?;
+                tx.commit()
+                    .map_err(|e| CoreError::Catalog(format!("migration {version} commit: {e}")))?;
             }
         }
         Ok(())
@@ -92,6 +100,26 @@ impl Catalog {
                 .map_err(|e| CoreError::Catalog(format!("seed media_type: {e}")))?;
         }
         Ok(())
+    }
+
+    /// One-time M5 data step driven by the app after open: copy the interim config
+    /// blacklists (`LibraryProject.blacklist`) into `import_source.blacklist`, matched
+    /// by `root_path`. Only fills sources that have no catalog blacklist yet — the
+    /// catalog column is authoritative afterwards (DATA-MODEL §13). Returns how many
+    /// sources were updated.
+    pub fn adopt_config_blacklists(&self, entries: &[(String, String)]) -> Result<usize> {
+        let mut updated = 0;
+        for (root_path, blacklist_json) in entries {
+            updated += self
+                .conn
+                .execute(
+                    "UPDATE import_source SET blacklist = ?2
+                     WHERE root_path = ?1 AND blacklist IS NULL",
+                    params![root_path, blacklist_json],
+                )
+                .map_err(|e| CoreError::Catalog(format!("adopt blacklist: {e}")))?;
+        }
+        Ok(updated)
     }
 }
 
@@ -362,6 +390,58 @@ ALTER TABLE package ADD COLUMN pipeline TEXT;     -- 'built_in'|'urp'|'hdrp'|'mi
 ALTER TABLE project ADD COLUMN pipeline TEXT;     -- registered editor's pipeline (register_project)
 ";
 
+/// M5 — UI-SPEC alignment: per-project staging trays, import batches, trait columns
+/// on `tag`, the `asset_relationship` graph (final form), and the per-source
+/// blacklist. DDL + data steps verbatim from DATA-MODEL.md §13.
+const MIGRATION_05_UI_SPEC_ALIGNMENT: &str = "
+-- 1. Per-project staging trays (§9; UI-SPEC §16)
+ALTER TABLE collection ADD COLUMN project_id INTEGER REFERENCES project(id) ON DELETE CASCADE;
+DROP INDEX IF EXISTS idx_collection_staging;                       -- was: single shared tray
+CREATE UNIQUE INDEX idx_collection_staging
+  ON collection(project_id) WHERE is_staging=1;                    -- one tray per project
+
+-- 2. Import batches (§9; UI-SPEC §16.1 'Recent exports' + batch undo)
+ALTER TABLE import_record ADD COLUMN batch_id TEXT;
+CREATE INDEX idx_import_batch ON import_record(batch_id);
+
+-- 3. Trait Library (UI-SPEC §9)
+ALTER TABLE tag ADD COLUMN is_trait   INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tag ADD COLUMN scope      TEXT;                        -- media_type; NULL = any
+ALTER TABLE tag ADD COLUMN usage_note TEXT;                        -- fed to the identifier (AI-PIPELINE §6)
+ALTER TABLE tag ADD COLUMN teach      INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tag ADD COLUMN icon       TEXT;
+
+-- 4. Dependency graph (§10; UI-SPEC §13.6) — created directly in its final form
+CREATE TABLE asset_relationship (
+  id            INTEGER PRIMARY KEY,
+  from_asset_id INTEGER NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+  to_asset_id   INTEGER REFERENCES asset(id) ON DELETE CASCADE,    -- NULL = unresolved reference
+  kind          TEXT NOT NULL,
+  source        TEXT NOT NULL DEFAULT 'unity_meta',
+  confidence    REAL,
+  declared_path TEXT,
+  state         TEXT NOT NULL DEFAULT 'resolved',                  -- 'resolved'|'library'|'missing'
+  UNIQUE(from_asset_id, to_asset_id, kind)
+);
+CREATE INDEX idx_rel_from ON asset_relationship(from_asset_id);
+CREATE INDEX idx_rel_to   ON asset_relationship(to_asset_id);
+
+-- 5. Per-source blacklist moves into the catalog (until M5 it lives in app config)
+ALTER TABLE import_source ADD COLUMN blacklist TEXT;               -- JSON [{kind:'folder'|'asset', value}]
+
+-- Data: the legacy shared tray is reassigned to the active project when one
+-- exists, else deleted (collection_asset rows cascade).
+UPDATE collection SET project_id = (SELECT id FROM project WHERE is_active=1)
+ WHERE is_staging=1 AND project_id IS NULL
+   AND EXISTS (SELECT 1 FROM project WHERE is_active=1);
+DELETE FROM collection WHERE is_staging=1 AND project_id IS NULL;
+
+-- Data: synthetic batch id per (project_id, imported_at) group so pre-M5 imports
+-- appear as history rows and batch undo works on them.
+UPDATE import_record SET batch_id = 'legacy-' || project_id || '-' || imported_at
+ WHERE batch_id IS NULL;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,7 +453,133 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 4, "all 4 migrations should have run");
+        assert_eq!(version, 5, "all 5 migrations should have run");
+    }
+
+    /// A catalog stopped at schema v4, for exercising M5's data steps.
+    fn catalog_at_v4() -> Catalog {
+        let conn = Connection::open_in_memory().expect("open");
+        configure_connection(&conn).expect("pragmas");
+        let mut c = Catalog { conn };
+        c.apply_migrations_up_to(4).expect("migrations to v4");
+        c
+    }
+
+    #[test]
+    fn m5_reassigns_legacy_tray_to_active_project() {
+        let mut c = catalog_at_v4();
+        c.conn
+            .execute_batch(
+                "INSERT INTO project (id, uuid, name, project_path, is_active)
+                 VALUES (1, 'p1', 'Game', 'C:/game', 1);
+                 INSERT INTO collection (id, uuid, name, is_staging)
+                 VALUES (10, 'c1', 'Staging', 1);",
+            )
+            .expect("fixture");
+        c.apply_migrations().expect("M5");
+
+        let project_id: Option<i64> = c
+            .conn
+            .query_row("SELECT project_id FROM collection WHERE id=10", [], |r| {
+                r.get(0)
+            })
+            .expect("tray survives");
+        assert_eq!(project_id, Some(1), "legacy tray reassigned to active project");
+    }
+
+    #[test]
+    fn m5_deletes_orphan_legacy_tray_when_no_active_project() {
+        let mut c = catalog_at_v4();
+        c.conn
+            .execute_batch(
+                "INSERT INTO collection (id, uuid, name, is_staging)
+                 VALUES (10, 'c1', 'Staging', 1);",
+            )
+            .expect("fixture");
+        c.apply_migrations().expect("M5");
+
+        let n: i64 = c
+            .conn
+            .query_row("SELECT COUNT(*) FROM collection WHERE is_staging=1", [], |r| {
+                r.get(0)
+            })
+            .expect("count");
+        assert_eq!(n, 0, "orphan legacy tray deleted");
+    }
+
+    #[test]
+    fn m5_enforces_one_tray_per_project() {
+        let c = Catalog::open_in_memory().expect("open");
+        c.conn
+            .execute_batch(
+                "INSERT INTO project (id, uuid, name, project_path) VALUES (1, 'p1', 'A', '/a');
+                 INSERT INTO collection (uuid, name, is_staging, project_id) VALUES ('c1', 'S', 1, 1);",
+            )
+            .expect("first tray");
+        let dup = c.conn.execute(
+            "INSERT INTO collection (uuid, name, is_staging, project_id) VALUES ('c2', 'S2', 1, 1)",
+            [],
+        );
+        assert!(dup.is_err(), "second staging tray for the same project rejected");
+    }
+
+    #[test]
+    fn m5_backfills_batch_ids_per_project_and_time() {
+        let mut c = catalog_at_v4();
+        c.conn
+            .execute_batch(
+                "INSERT INTO import_source (id, uuid, name, root_path, kind)
+                 VALUES (1, 's1', 'Src', 'C:/lib', 'folder');
+                 INSERT INTO media_type (id, code, label) VALUES (1, 'image', 'Image');
+                 INSERT INTO asset (id, uuid, source_id, media_type_id, name, created_at, updated_at)
+                 VALUES (1, 'a1', 1, 1, 'rock', 0, 0), (2, 'a2', 1, 1, 'tree', 0, 0);
+                 INSERT INTO project (id, uuid, name, project_path) VALUES (1, 'p1', 'Game', '/g');
+                 INSERT INTO import_record (asset_id, project_id, dest_path, imported_at)
+                 VALUES (1, 1, 'Assets/rock.png', 1000), (2, 1, 'Assets/tree.png', 1000);",
+            )
+            .expect("fixture");
+        c.apply_migrations().expect("M5");
+
+        let ids: Vec<String> = c
+            .conn
+            .prepare("SELECT batch_id FROM import_record ORDER BY asset_id")
+            .expect("prep")
+            .query_map([], |r| r.get(0))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("rows");
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], ids[1], "same (project, imported_at) group → same batch id");
+        assert_eq!(ids[0], "legacy-1-1000");
+    }
+
+    #[test]
+    fn adopt_config_blacklists_fills_only_empty_matching_sources() {
+        let c = Catalog::open_in_memory().expect("open");
+        c.conn
+            .execute_batch(
+                "INSERT INTO import_source (uuid, name, root_path, kind, blacklist) VALUES
+                 ('s1', 'A', 'C:/a', 'folder', NULL),
+                 ('s2', 'B', 'C:/b', 'folder', '[{\"kind\":\"folder\",\"value\":\"Editor\"}]');",
+            )
+            .expect("fixture");
+
+        let updated = c
+            .adopt_config_blacklists(&[
+                ("C:/a".into(), "[{\"kind\":\"asset\",\"value\":\"x.dll\"}]".into()),
+                ("C:/b".into(), "[{\"kind\":\"folder\",\"value\":\"Gizmos\"}]".into()),
+                ("C:/missing".into(), "[]".into()),
+            ])
+            .expect("adopt");
+        assert_eq!(updated, 1, "only the empty, matching source is filled");
+
+        let b: String = c
+            .conn
+            .query_row("SELECT blacklist FROM import_source WHERE root_path='C:/b'", [], |r| {
+                r.get(0)
+            })
+            .expect("b");
+        assert!(b.contains("Editor"), "existing catalog blacklist untouched");
     }
 
     #[test]
