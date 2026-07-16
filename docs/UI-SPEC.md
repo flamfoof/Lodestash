@@ -68,7 +68,7 @@ One window, three fixed regions plus overlays:
 **⚖ Resolution:** the prototype's single labeled sidebar **replaces** the earlier icon-only nav rail.
 One vertical panel, three stacked groups:
 
-1. **Navigation** — 9 destinations, each a 32px row: 16px glyph + label + optional warn-badge
+1. **Navigation** — 10 destinations, each a 32px row: 16px glyph + label + optional warn-badge
    (amber pill, mono count). Active row: `--ls-overlay` fill + 2px gold left-border.
 
    | Destination | Icon (`ls-*`) | Badge |
@@ -78,6 +78,7 @@ One vertical panel, three stacked groups:
    | Collections | `nav-collections` | — |
    | Packages | `nav-packages` | — |
    | Traits | `nav-traits` | — |
+   | Mapping | `nav-mapping` | — |
    | Stats | `nav-stats` | — |
    | Duplicates | `nav-duplicates` | open dup-group count |
    | Trash | `nav-trash` | trashed count |
@@ -313,10 +314,40 @@ a **trait** is a `tag` row promoted to first-class with `scope`, `usage_note`, `
 
 ---
 
-## 10. (reserved)
+## 10. Mapping Library (editor)
 
-`Mapping library` editor (DESIGN-GUIDELINES §7, DATA-MODEL §4) — unchanged by the prototype; reached
-from Settings/Traits later. Reserved so section numbers stay stable.
+The controlled-vocabulary editor over DATA-MODEL §4 (taxonomy / category / alias / rule /
+`asset_category`). Not in the prototype — specced here from DESIGN-GUIDELINES §7 ("two-pane: raw
+tags → categories tree, rules between") and the §4 workflow. Sidebar destination `ls-nav-mapping`
+(stub until built). Distinct from the Trait Library (§9): **traits are vocabulary you tag with;
+the mapping library interprets tags into canonical categories** — raw tags are never modified.
+
+- **Header**: Cinzel "Mapping Library"; subtitle *"Rules that sort messy tags into your clean
+  categories — swap whole vocabularies without touching a single tag."* Right: **taxonomy
+  switcher** (select + `● active` marker — multiple taxonomies coexist, one active), `v<version>`
+  (mono), **+ New taxonomy** / **Import starter pack**.
+- **Left pane — RAW TAGS**: the live tag vocabulary with usage counts and a search box (same data
+  as Trait Library, read-only here). Rows show which category the active taxonomy currently maps
+  them to (dim `→ Environment/Foliage`) or an amber `unmapped` pill. **Drag a tag onto a category**
+  (right pane) to create an `exact_tag` rule; drop with `Alt` to create an **alias** instead.
+- **Right pane — CATEGORY TREE**: the hierarchy (`path`-materialized), expandable rows with
+  per-category mapped-asset counts. Row actions: rename, add child, delete (assignments cascade;
+  confirm). Selecting a category opens its **detail card**:
+  - **ALIASES**: chips (✕ to remove) + add field.
+  - **RULES**: one row per `mapping_rule` — match-type badge (`exact_tag · alias · regex ·
+    glob_path · media_type · embedding_knn`) + mono pattern + priority (editable number, lower
+    wins) + min-confidence + enable toggle + ✕. **+ Add rule** opens an inline form; `embedding_knn`
+    rules pick seed assets via a mini asset-picker ("near these examples").
+- **Footer bar — apply pipeline**: **Preview** runs a dry-run (*"would assign 1,204 assets · 37
+  conflicts · 12 pinned overrides untouched"*) with a diff list (asset, old → new category, winning
+  rule); **Apply** materializes `asset_category` rows (`assigned_by='rule'`), bumps
+  `taxonomy.version`, toasts. Conflicts resolve by priority then confidence; **pinned (manual)
+  assignments always survive re-runs** and show a small lock glyph wherever they render.
+- **Manual assignment** happens in the asset **inspector** (§13): a CATEGORY row under TRAITS —
+  current category chip(s) + a picker; manual picks write `assigned_by='manual', is_pinned=1`.
+- **Search integration**: categories appear as a facet group in the sidebar once a taxonomy is
+  active (`asset_category` pre-filter, IDENTIFICATION-AND-SEARCH §5A); `apply_mapping` is the
+  agent-plane equivalent (MCP surface).
 
 ---
 

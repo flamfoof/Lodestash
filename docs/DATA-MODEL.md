@@ -585,3 +585,74 @@ ALTER TABLE project ADD COLUMN pipeline TEXT;     -- the registered editor's pip
   against the registered project's pipeline on import → the **`pipeline_mismatch` advisory**
   ([`ENGINE-API.md`](ENGINE-API.md) §5.4). Material *conversion* is explicitly out of scope — we
   warn, we don't rewrite.
+
+---
+
+## 13. Migration ledger
+
+`PRAGMA user_version` tracks the schema version; each migration runs exactly once inside a
+transaction, in order, on open. Shipped so far:
+
+| ver | Contents |
+|---|---|
+| **M1** | Base catalog: `import_source`, `media_type`, `asset`, `asset_file`, `tag`, `asset_tag`, `collection`(+staging index), `collection_asset`, `embedding_meta`, FTS5 `asset_fts` + triggers |
+| **M2** | Mapping library: `taxonomy`, `category`, `category_alias`, `mapping_rule`, `asset_category` (§4) |
+| **M3** | Engine round-trip: `package` + `asset.package_id`, `project`, `import_record`, `asset.license/attribution/license_url` (§7, §9) |
+| **M4** | `asset.rating`, `package.pipeline`, `project.pipeline` (§12) |
+
+### M5 — UI-SPEC alignment (next)
+
+Everything [`UI-SPEC.md`](UI-SPEC.md) needs that the shipped schema lacks. Exact DDL:
+
+```sql
+-- 1. Per-project staging trays (§9; UI-SPEC §16)
+ALTER TABLE collection ADD COLUMN project_id INTEGER REFERENCES project(id) ON DELETE CASCADE;
+DROP INDEX IF EXISTS idx_collection_staging;                       -- was: single shared tray
+CREATE UNIQUE INDEX idx_collection_staging
+  ON collection(project_id) WHERE is_staging=1;                    -- one tray per project
+
+-- 2. Import batches (§9; UI-SPEC §16.1 "Recent exports" + batch undo)
+ALTER TABLE import_record ADD COLUMN batch_id TEXT;
+CREATE INDEX idx_import_batch ON import_record(batch_id);
+
+-- 3. Trait Library (UI-SPEC §9)
+ALTER TABLE tag ADD COLUMN is_trait   INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tag ADD COLUMN scope      TEXT;                        -- media_type; NULL = any
+ALTER TABLE tag ADD COLUMN usage_note TEXT;                        -- fed to the identifier (AI-PIPELINE §6)
+ALTER TABLE tag ADD COLUMN teach      INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tag ADD COLUMN icon       TEXT;
+
+-- 4. Dependency graph (§10; UI-SPEC §13.6) — new table, created directly in its final form
+CREATE TABLE asset_relationship (
+  id            INTEGER PRIMARY KEY,
+  from_asset_id INTEGER NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+  to_asset_id   INTEGER REFERENCES asset(id) ON DELETE CASCADE,    -- NULL ⇒ unresolved reference
+  kind          TEXT NOT NULL,
+  source        TEXT NOT NULL DEFAULT 'unity_meta',
+  confidence    REAL,
+  declared_path TEXT,
+  state         TEXT NOT NULL DEFAULT 'resolved',                  -- 'resolved'|'library'|'missing'
+  UNIQUE(from_asset_id, to_asset_id, kind)
+);
+CREATE INDEX idx_rel_from ON asset_relationship(from_asset_id);
+CREATE INDEX idx_rel_to   ON asset_relationship(to_asset_id);
+
+-- 5. Per-source blacklist moves into the catalog (§10; until M5 it lives in app config)
+ALTER TABLE import_source ADD COLUMN blacklist TEXT;               -- JSON [{ "kind": "folder"|"asset", "value": "…" }]
+```
+
+**Data steps (same transaction, after the DDL):**
+
+- **Staging**: the legacy shared tray (`is_staging=1`, now `project_id IS NULL`) is reassigned to
+  the active project when one exists, else deleted with its `collection_asset` rows. After M5 a
+  staging row with `project_id IS NULL` is invalid (the partial unique index does not police NULLs —
+  the app enforces it, and each `register_project` creates that project's empty tray).
+- **Batches**: backfill `batch_id` on existing `import_record` rows with one synthetic id per
+  `(project_id, imported_at)` group, so pre-M5 imports appear as history rows (their file lists are
+  reconstructable from `dest_path`, so batch undo works on them too).
+- **Blacklist**: one-time import of the interim config blacklist (`LibraryProject.blacklist`) into
+  `import_source.blacklist` by matching `root_path`; the config copy is then treated as dead and the
+  crawler reads the catalog column.
+
+Not in M5: MCP port/token, size tiers, quality, and cap settings stay in the app config file — they
+are per-machine preferences, not catalog data.
