@@ -295,6 +295,15 @@ impl Screen {
     }
 }
 
+/// Top-bar search mode (UI-SPEC §0.1): Tags = live substring filter (live today),
+/// AI = semantic search (stub until the P3/P4 embedding pipeline lands).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SearchMode {
+    #[default]
+    Tags,
+    Ai,
+}
+
 /// STATUS facet single-select (UI-SPEC §0.2). Maps to `status` (DATA-MODEL §8);
 /// `discovered|indexed` fold into Unidentified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -363,6 +372,11 @@ pub struct LodestashApp {
     workspace_dir: Option<PathBuf>,
     /// The ⚑ Filters content filter (trait / triangles / file-size). Transient. Design §3.
     content_filter: ContentFilter,
+    /// Top-bar search mode (UI-SPEC §0.1). AI is a stub until P3/P4.
+    search_mode: SearchMode,
+    /// Faint background radial gradients (UI-SPEC §0): gold top-right, arcane bottom-left.
+    bg_gold: Option<TextureHandle>,
+    bg_arcane: Option<TextureHandle>,
     /// Active top-level screen (UI-SPEC §0.2 sidebar).
     screen: Screen,
     /// STATUS facet selection (UI-SPEC §0.2). Pre-catalog every entry is `discovered`,
@@ -430,6 +444,17 @@ impl LodestashApp {
             extract_tx,
             workspace_dir: dirs::cache_dir().map(|d| d.join("Lodestash").join("workspace")),
             content_filter: ContentFilter::default(),
+            search_mode: SearchMode::Tags,
+            bg_gold: Some(cc.egui_ctx.load_texture(
+                "bg_radial_gold",
+                radial_image(theme::GOLD, 15), // rgba(231,183,101,.06)
+                egui::TextureOptions::LINEAR,
+            )),
+            bg_arcane: Some(cc.egui_ctx.load_texture(
+                "bg_radial_arcane",
+                radial_image(theme::ARCANE, 13), // rgba(73,214,201,.05)
+                egui::TextureOptions::LINEAR,
+            )),
             screen: Screen::Library,
             status_filter: StatusFilter::All,
             expanded_source: None,
@@ -695,7 +720,12 @@ impl LodestashApp {
         let selected_entry = self
             .selected_cache_idx
             .and_then(|ci| self.sorted_cache.get(ci).copied());
-        let q = self.search.to_lowercase();
+        // AI-mode queries never live-filter — results only replace the grid on Enter,
+        // which is stubbed until the P3/P4 semantic pipeline (UI-SPEC §0.1).
+        let q = match self.search_mode {
+            SearchMode::Tags => self.search.to_lowercase(),
+            SearchMode::Ai => String::new(),
+        };
         let tab = self.active_tab;
 
         let name_matches = |e: &AssetEntry| {
@@ -1700,8 +1730,10 @@ impl eframe::App for LodestashApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    // Logo: rotated gold diamond + Cinzel wordmark (UI-SPEC §0.1).
+                    logo_diamond(ui);
                     ui.label(
-                        RichText::new("\u{25C8} LODESTASH")
+                        RichText::new("LODESTASH")
                             .color(theme::GOLD)
                             .font(crate::fonts::display(16.0)),
                     );
@@ -1791,7 +1823,161 @@ impl eframe::App for LodestashApp {
                         }
                     }
 
+                    // Search mode toggle + search box (UI-SPEC §0.1). Tags is the live
+                    // substring filter; AI is a stub until the P3/P4 semantic pipeline.
+                    ui.separator();
+                    let mode_color = match self.search_mode {
+                        SearchMode::Tags => theme::GOLD,
+                        SearchMode::Ai => theme::ARCANE,
+                    };
+                    for (mode, label) in [
+                        (SearchMode::Tags, "\u{27E1} Tags"),
+                        (SearchMode::Ai, "\u{2726} AI"),
+                    ] {
+                        let active = self.search_mode == mode;
+                        let color = match mode {
+                            SearchMode::Tags => theme::GOLD,
+                            SearchMode::Ai => theme::ARCANE,
+                        };
+                        if ui
+                            .selectable_label(
+                                active,
+                                RichText::new(label).size(11.0).color(if active {
+                                    color
+                                } else {
+                                    theme::TEXT_DIM
+                                }),
+                            )
+                            .clicked()
+                            && !active
+                        {
+                            self.search_mode = mode;
+                            // Switching to Tags clears AI results (§0.1); the query
+                            // re-applies (or stops applying) as a live filter.
+                            self.cache_dirty = true;
+                        }
+                    }
+                    let hint = match self.search_mode {
+                        SearchMode::Tags => "Search\u{2026}  /",
+                        SearchMode::Ai => {
+                            "describe what you need \u{2014} e.g. \u{BB}pickup sound for rocks\u{AB} \u{2014} then Enter"
+                        }
+                    };
+                    let search_resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.search)
+                            .id(egui::Id::new("search_field"))
+                            .hint_text(hint)
+                            .desired_width(
+                                (ui.available_width() - 420.0).clamp(140.0, 400.0),
+                            ),
+                    );
+                    // Border follows the active mode; brighter while focused (§0.1).
+                    let border = if search_resp.has_focus() {
+                        egui::Stroke::new(1.5, mode_color)
+                    } else {
+                        egui::Stroke::new(1.0, mode_color.linear_multiply(0.4))
+                    };
+                    ui.painter()
+                        .rect_stroke(search_resp.rect.expand(1.0), 4.0, border);
+                    if search_resp.changed() && self.search_mode == SearchMode::Tags {
+                        self.cache_dirty = true;
+                    }
+                    if self.search_mode == SearchMode::Ai {
+                        // ponytail: stub — Enter will run §5B semantic search when P3/P4 land.
+                        ui.label(
+                            RichText::new("\u{2726} arrives with the AI pipeline (P4)")
+                                .color(theme::TEXT_DIM)
+                                .size(10.0),
+                        );
+                    }
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // AI-profile pill (§0.1 #7) — arcane outline; links to Settings → AI.
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("\u{2726} local")
+                                        .color(theme::ARCANE)
+                                        .size(11.0),
+                                )
+                                .fill(egui::Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::new(1.0, theme::ARCANE))
+                                .rounding(999.0),
+                            )
+                            .on_hover_text("Active identify profile \u{2014} configure in Settings")
+                            .clicked()
+                        {
+                            self.screen = Screen::Settings;
+                        }
+
+                        // Project chip (§0.1 #6) — engine projects arrive with the P5 bridge.
+                        let chip = ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("\u{25CF} No project \u{B7} \u{2014}  \u{25BE}")
+                                        .color(theme::TEXT_DIM)
+                                        .size(11.0),
+                                )
+                                .fill(theme::SURFACE)
+                                .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                                .rounding(999.0),
+                            );
+                        let chip_popup = ui.make_persistent_id("project_chip_popup");
+                        if chip.clicked() {
+                            ui.memory_mut(|m| m.toggle_popup(chip_popup));
+                        }
+                        egui::popup::popup_below_widget(
+                            ui,
+                            chip_popup,
+                            &chip,
+                            egui::PopupCloseBehavior::CloseOnClickOutside,
+                            |ui| {
+                                ui.set_min_width(220.0);
+                                // ponytail: §16 switcher stub — real engine projects register
+                                // through the P5 Unity bridge.
+                                ui.label(
+                                    RichText::new("No engine projects yet")
+                                        .color(theme::TEXT)
+                                        .size(12.0),
+                                );
+                                ui.label(
+                                    RichText::new(
+                                        "Unity projects appear here once the editor \
+                                         bridge (P5) registers them.",
+                                    )
+                                    .color(theme::TEXT_DIM)
+                                    .size(11.0),
+                                );
+                            },
+                        );
+
+                        // Health meter (§0.1 #5): mono label over a 6px gold bar.
+                        // ponytail: identified is 0 pre-catalog — the status flow lands in P3.
+                        let total = self.entries.len();
+                        let identified = 0_usize;
+                        ui.vertical(|ui| {
+                            ui.set_width(180.0);
+                            ui.spacing_mut().item_spacing.y = 3.0;
+                            ui.label(
+                                RichText::new(format!("Identified {identified} / {total}"))
+                                    .color(theme::TEXT_MUTED)
+                                    .monospace()
+                                    .size(10.0),
+                            );
+                            let (bar, _) = ui
+                                .allocate_exact_size(egui::vec2(180.0, 6.0), egui::Sense::hover());
+                            let painter = ui.painter();
+                            painter.rect_filled(bar, 3.0, theme::BORDER);
+                            if total > 0 && identified > 0 {
+                                let frac = identified as f32 / total as f32;
+                                let fill = egui::Rect::from_min_size(
+                                    bar.min,
+                                    egui::vec2(bar.width() * frac, bar.height()),
+                                );
+                                painter.rect_filled(fill, 3.0, theme::GOLD);
+                            }
+                        });
+
                         if self.pending_thumbs > 0 {
                             ui.label(
                                 RichText::new(format!(
@@ -1891,18 +2077,8 @@ impl eframe::App for LodestashApp {
                 )
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        let search_resp = ui.add(
-                            egui::TextEdit::singleline(&mut self.search)
-                                .id(egui::Id::new("search_field"))
-                                .hint_text("Search\u{2026}  /")
-                                .desired_width(180.0),
-                        );
-                        if search_resp.changed() {
-                            self.cache_dirty = true;
-                        }
-
+                        // (Search moved to the top bar — UI-SPEC §0.1.)
                         // ⚑ Filters button + content-filter popover (design §2, §3).
-                        ui.separator();
                         let active = self.content_filter.any_active();
                         let ftext = if active {
                             RichText::new(format!(
@@ -2130,6 +2306,26 @@ impl eframe::App for LodestashApp {
                     .inner_margin(egui::Margin::same(12.0)),
             )
             .show(ctx, |ui| {
+                // §0 ambience: faint radial gradients — gold top-right, arcane bottom-left.
+                let panel = ui.max_rect();
+                let d = panel.width() * 0.55;
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                if let Some(tex) = &self.bg_gold {
+                    ui.painter().image(
+                        tex.id(),
+                        egui::Rect::from_center_size(panel.right_top(), Vec2::splat(d)),
+                        uv,
+                        egui::Color32::WHITE,
+                    );
+                }
+                if let Some(tex) = &self.bg_arcane {
+                    ui.painter().image(
+                        tex.id(),
+                        egui::Rect::from_center_size(panel.left_bottom(), Vec2::splat(d)),
+                        uv,
+                        egui::Color32::WHITE,
+                    );
+                }
                 match self.screen {
                     Screen::Settings => {
                         self.settings_screen(ui, ctx);
@@ -3073,6 +3269,53 @@ fn filter_chip(ui: &mut Ui, label: &str, selected: bool, color: egui::Color32) -
         })
         .response;
     resp.interact(egui::Sense::click()).clicked()
+}
+
+/// The top-bar logo: an 18px rotated gold diamond with an inner bright dot and a
+/// faint glow (UI-SPEC §0.1).
+fn logo_diamond(ui: &mut Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(22.0), egui::Sense::hover());
+    let painter = ui.painter();
+    let c = rect.center();
+    let diamond = |r: f32| {
+        vec![
+            c + egui::vec2(0.0, -r),
+            c + egui::vec2(r, 0.0),
+            c + egui::vec2(0.0, r),
+            c + egui::vec2(-r, 0.0),
+        ]
+    };
+    // Faint glow: a slightly larger, mostly-transparent gold diamond behind.
+    painter.add(egui::Shape::convex_polygon(
+        diamond(11.0),
+        theme::GOLD.linear_multiply(0.10),
+        egui::Stroke::NONE,
+    ));
+    painter.add(egui::Shape::convex_polygon(
+        diamond(9.0),
+        egui::Color32::TRANSPARENT,
+        egui::Stroke::new(2.0, theme::GOLD),
+    ));
+    painter.circle_filled(c, 2.2, theme::GOLD_BRIGHT);
+}
+
+/// A 128×128 radial-falloff sprite in `color`, peaking at `max_alpha` in the centre.
+/// Stretched over the background for the §0 ambience gradients.
+fn radial_image(color: egui::Color32, max_alpha: u8) -> egui::ColorImage {
+    const N: usize = 128;
+    let mut img = egui::ColorImage::new([N, N], egui::Color32::TRANSPARENT);
+    let half = (N as f32 - 1.0) / 2.0;
+    for y in 0..N {
+        for x in 0..N {
+            let dx = (x as f32 - half) / half;
+            let dy = (y as f32 - half) / half;
+            let d = (dx * dx + dy * dy).sqrt().min(1.0);
+            let a = ((1.0 - d) * max_alpha as f32) as u8;
+            img.pixels[y * N + x] =
+                egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a);
+        }
+    }
+    img
 }
 
 /// One 32px sidebar navigation row: glyph + label + optional amber count badge.
