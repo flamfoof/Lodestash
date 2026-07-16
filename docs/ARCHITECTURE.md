@@ -194,7 +194,7 @@ Query (text, optional semantic toggle, filters)
   → structural pre-filter (media_type, tags, mapped category, source)
   → BM25 (FTS5) ⊕ vector KNN (sqlite-vec)  → RRF fuse  → (optional rerank)
   → results grid with thumbnails
-  → preview (3D / audio / image)   → (optional) stage candidates onto the shared shortlist
+  → preview (3D / audio / image)   → (optional) stage candidates onto the project's staging tray
   → "Import into the open project":
         GUI / Unity panel / AI client(MCP import_to_project)
           → core resolves dependency closure + dup-guard check (import_record)

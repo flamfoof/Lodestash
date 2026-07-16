@@ -121,6 +121,11 @@ goes through the local transcription/description pre-step regardless of provider
 - **Corrections**: tags shown as editable confidence chips with accept/reject. Two payoffs —
   corrected tags improve search immediately, and the accept/reject log becomes training data to tune
   thresholds or fine-tune a small local tagger over time.
+- **User traits teach the identifier**: traits from the Trait Library
+  ([`UI-SPEC.md`](UI-SPEC.md) §9; `tag.is_trait/scope/usage_note/teach`, [`DATA-MODEL.md`](DATA-MODEL.md))
+  with `teach=1` are injected into the tagger's candidate vocabulary (and, for VLM/Claude paths, the
+  prompt — the `usage_note` is the when-to-apply guidance), scoped per modality — so future scans tag
+  with the user's words, not just the model's. Paused traits are excluded but keep existing tags.
 
 ---
 
