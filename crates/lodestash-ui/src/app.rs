@@ -374,6 +374,8 @@ pub struct LodestashApp {
     content_filter: ContentFilter,
     /// Top-bar search mode (UI-SPEC §0.1). AI is a stub until P3/P4.
     search_mode: SearchMode,
+    /// Session dismissal for the Unidentified nudge banner (UI-SPEC §2.1).
+    nudge_dismissed: bool,
     /// Faint background radial gradients (UI-SPEC §0): gold top-right, arcane bottom-left.
     bg_gold: Option<TextureHandle>,
     bg_arcane: Option<TextureHandle>,
@@ -445,6 +447,7 @@ impl LodestashApp {
             workspace_dir: dirs::cache_dir().map(|d| d.join("Lodestash").join("workspace")),
             content_filter: ContentFilter::default(),
             search_mode: SearchMode::Tags,
+            nudge_dismissed: false,
             bg_gold: Some(cc.egui_ctx.load_texture(
                 "bg_radial_gold",
                 radial_image(theme::GOLD, 15), // rgba(231,183,101,.06)
@@ -2076,123 +2079,143 @@ impl eframe::App for LodestashApp {
                         .stroke(egui::Stroke::new(1.0, theme::BORDER)),
                 )
                 .show(ctx, |ui| {
+                    // Result header row (UI-SPEC §2.2): result label · hint text · sort ·
+                    // ⚑ Filters · grid density · view toggle. Pack/collection filter chips
+                    // join once the P2 packages model / P3 collections can activate them.
                     ui.horizontal(|ui| {
-                        // (Search moved to the top bar — UI-SPEC §0.1.)
-                        // ⚑ Filters button + content-filter popover (design §2, §3).
-                        let active = self.content_filter.any_active();
-                        let ftext = if active {
+                        let library_label = match self.source_filter {
+                            Some(i) => config::stem_name(&self.scan_roots[i]),
+                            None => self
+                                .project_name
+                                .clone()
+                                .unwrap_or_else(|| "All libraries".into()),
+                        };
+                        ui.label(
                             RichText::new(format!(
-                                "\u{2691} Filters  {}",
-                                self.content_filter.active_count()
+                                "{} assets \u{B7} {library_label}",
+                                self.sorted_cache.len()
                             ))
-                            .color(theme::BG)
-                            .size(11.0)
-                        } else {
-                            RichText::new("\u{2691} Filters")
-                                .color(theme::TEXT)
-                                .size(11.0)
-                        };
-                        let mut fbtn = egui::Button::new(ftext);
-                        if active {
-                            fbtn = fbtn
-                                .fill(theme::GOLD)
-                                .stroke(egui::Stroke::new(1.0, theme::GOLD));
-                        }
-                        let fresp = ui.add(fbtn);
-                        let popup_id = ui.make_persistent_id("filters_popup");
-                        if fresp.clicked() {
-                            ui.memory_mut(|m| m.toggle_popup(popup_id));
-                        }
-                        let cf = &mut self.content_filter;
-                        let tiers = &self.config.size_tiers;
-                        let mut filter_changed = false;
-                        egui::popup::popup_below_widget(
-                            ui,
-                            popup_id,
-                            &fresp,
-                            egui::PopupCloseBehavior::CloseOnClickOutside,
-                            |ui| {
-                                filter_changed = filter_popover(ui, cf, tiers);
-                            },
+                            .color(theme::TEXT_MUTED)
+                            .size(12.0),
                         );
-                        if filter_changed {
-                            self.cache_dirty = true;
+
+                        // Hint text — dim, hidden on narrow windows (§2.2).
+                        if ctx.screen_rect().width() >= 1200.0 {
+                            ui.label(
+                                RichText::new(
+                                    "Space quick-looks \u{B7} \u{2922} full size \u{B7} \u{27E1} stage",
+                                )
+                                .color(theme::TEXT_DIM)
+                                .size(11.0),
+                            );
                         }
 
-                        // Browse view toggle (DESIGN-GUIDELINES.md §7 "Browse views").
-                        ui.separator();
-                        for (mode, label) in
-                            [(ViewMode::Flat, "Grid"), (ViewMode::Folders, "Folders")]
-                        {
-                            let active = self.view_mode == mode;
-                            if ui
-                                .selectable_label(active, RichText::new(label).size(11.0))
-                                .clicked()
-                                && !active
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Browse view toggle (DESIGN-GUIDELINES.md §7 "Browse views").
+                            for (mode, label) in
+                                [(ViewMode::Folders, "Folders"), (ViewMode::Flat, "Grid")]
                             {
-                                self.view_mode = mode;
-                                self.nav_to(self.default_dir());
-                                self.save_view_prefs();
-                            }
-                        }
-
-                        ui.separator();
-                        ui.label(RichText::new("Sort").color(theme::TEXT_DIM).size(11.0));
-
-                        let sort_before = self.sort_by;
-                        egui::ComboBox::from_id_salt("sort_combo")
-                            .width(72.0)
-                            .selected_text(
-                                RichText::new(self.sort_by.label())
-                                    .color(theme::TEXT)
-                                    .size(11.0),
-                            )
-                            .show_ui(ui, |ui| {
-                                for &(s, label) in SortBy::OPTIONS {
-                                    ui.selectable_value(&mut self.sort_by, s, label);
-                                }
-                            });
-
-                        let asc_before = self.sort_asc;
-                        let dir_label = if self.sort_asc {
-                            "\u{2191}"
-                        } else {
-                            "\u{2193}"
-                        };
-                        if ui.small_button(dir_label).clicked() {
-                            self.sort_asc = !self.sort_asc;
-                        }
-
-                        if self.sort_by != sort_before || self.sort_asc != asc_before {
-                            self.cache_dirty = true;
-                            self.save_view_prefs();
-                        }
-
-                        // Grid-size segmented selector (design §2) — grid view only; drives the
-                        // persisted `thumb_size`, the single source of truth.
-                        if self.view_mode == ViewMode::Flat {
-                            ui.separator();
-                            ui.label(RichText::new("Grid").color(theme::TEXT_DIM).size(11.0));
-                            for (px, label) in GRID_STOPS {
-                                let active = (self.thumb_size - px).abs() < 8.0;
+                                let active = self.view_mode == mode;
                                 if ui
                                     .selectable_label(active, RichText::new(label).size(11.0))
                                     .clicked()
                                     && !active
                                 {
-                                    self.thumb_size = px;
+                                    self.view_mode = mode;
+                                    self.nav_to(self.default_dir());
                                     self.save_view_prefs();
-                                    self.cache_dirty = true;
                                 }
                             }
-                        }
 
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(format!("{} assets", self.sorted_cache.len()))
-                                    .color(theme::TEXT_MUTED)
-                                    .size(11.0),
+                            // Grid-size segmented selector (design §2) — grid view only;
+                            // drives the persisted `thumb_size`, the single source of truth.
+                            if self.view_mode == ViewMode::Flat {
+                                ui.separator();
+                                for (px, label) in GRID_STOPS.iter().rev() {
+                                    let active = (self.thumb_size - px).abs() < 8.0;
+                                    if ui
+                                        .selectable_label(active, RichText::new(*label).size(11.0))
+                                        .clicked()
+                                        && !active
+                                    {
+                                        self.thumb_size = *px;
+                                        self.save_view_prefs();
+                                        self.cache_dirty = true;
+                                    }
+                                }
+                            }
+
+                            // ⚑ Filters button + content-filter popover (design §2, §3).
+                            ui.separator();
+                            let active = self.content_filter.any_active();
+                            let ftext = if active {
+                                RichText::new(format!(
+                                    "\u{2691} Filters  {}",
+                                    self.content_filter.active_count()
+                                ))
+                                .color(theme::BG)
+                                .size(11.0)
+                            } else {
+                                RichText::new("\u{2691} Filters")
+                                    .color(theme::TEXT)
+                                    .size(11.0)
+                            };
+                            let mut fbtn = egui::Button::new(ftext);
+                            if active {
+                                fbtn = fbtn
+                                    .fill(theme::GOLD)
+                                    .stroke(egui::Stroke::new(1.0, theme::GOLD));
+                            }
+                            let fresp = ui.add(fbtn);
+                            let popup_id = ui.make_persistent_id("filters_popup");
+                            if fresp.clicked() {
+                                ui.memory_mut(|m| m.toggle_popup(popup_id));
+                            }
+                            let cf = &mut self.content_filter;
+                            let tiers = &self.config.size_tiers;
+                            let mut filter_changed = false;
+                            egui::popup::popup_below_widget(
+                                ui,
+                                popup_id,
+                                &fresp,
+                                egui::PopupCloseBehavior::CloseOnClickOutside,
+                                |ui| {
+                                    filter_changed = filter_popover(ui, cf, tiers);
+                                },
                             );
+                            if filter_changed {
+                                self.cache_dirty = true;
+                            }
+
+                            // Sort select + direction.
+                            ui.separator();
+                            let sort_before = self.sort_by;
+                            let asc_before = self.sort_asc;
+                            let dir_label = if self.sort_asc {
+                                "\u{2191}"
+                            } else {
+                                "\u{2193}"
+                            };
+                            if ui.small_button(dir_label).clicked() {
+                                self.sort_asc = !self.sort_asc;
+                            }
+                            egui::ComboBox::from_id_salt("sort_combo")
+                                .width(72.0)
+                                .selected_text(
+                                    RichText::new(self.sort_by.label())
+                                        .color(theme::TEXT)
+                                        .size(11.0),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for &(s, label) in SortBy::OPTIONS {
+                                        ui.selectable_value(&mut self.sort_by, s, label);
+                                    }
+                                });
+                            ui.label(RichText::new("Sort").color(theme::TEXT_DIM).size(11.0));
+                            if self.sort_by != sort_before || self.sort_asc != asc_before {
+                                self.cache_dirty = true;
+                                self.save_view_prefs();
+                            }
                         });
                     });
                 });
@@ -2348,6 +2371,52 @@ impl eframe::App for LodestashApp {
                     }
                     return;
                 }
+                // Unidentified nudge (UI-SPEC §2.1) — pre-catalog, every asset is
+                // Unidentified, so the count is the whole library until P3 status lands.
+                if !self.nudge_dismissed && !self.entries.is_empty() {
+                    let n = self.entries.len();
+                    egui::Frame::none()
+                        .fill(theme::WARNING.linear_multiply(0.10))
+                        .stroke(egui::Stroke::new(1.0, theme::WARNING.linear_multiply(0.45)))
+                        .rounding(4.0)
+                        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{n} assets are Unidentified \u{2014} invisible to AI \
+                                         search until appraised."
+                                    ))
+                                    .color(theme::WARNING)
+                                    .size(12.0),
+                                );
+                                if ui
+                                    .link(
+                                        RichText::new("Open Identify mode \u{2192}")
+                                            .color(theme::GOLD)
+                                            .size(12.0),
+                                    )
+                                    .clicked()
+                                {
+                                    self.screen = Screen::Identify;
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .small_button(RichText::new("\u{2715}").size(10.0))
+                                            .on_hover_text("Dismiss for this session")
+                                            .clicked()
+                                        {
+                                            self.nudge_dismissed = true;
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                    ui.add_space(6.0);
+                }
+
                 if self.view_mode == ViewMode::Folders {
                     self.folders_nav_ui(ui);
                 }
