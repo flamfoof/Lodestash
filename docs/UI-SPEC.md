@@ -102,8 +102,8 @@ are Library filters). Sidebar scrolls as one column.
 Under the top bar, on Library and Identify: `All` + one tab per `media_type` **with a non-zero
 count** (`All · 3D Models · Audio · Images · Textures · Materials · Fonts · Sprites`), each showing
 its count and colored by its type token when active (2px underline in the type color). Zero-count
-types hide; `All` never hides. Second row (Library only, >1 source, Flat view): the **Library tabs**
-(DESIGN-GUIDELINES §7 "Browse views").
+types hide; `All` never hides. *(The earlier second-row Library tabs are gone — the sidebar
+LIBRARIES facet group (§0.2) absorbed the per-source filter.)*
 
 ### 0.4 Keyboard map (global)
 
