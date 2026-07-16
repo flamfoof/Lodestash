@@ -17,6 +17,22 @@ pub enum MediaType {
     Font,
 }
 
+impl MediaType {
+    /// The catalog `media_type.code` string (DATA-MODEL §2). Must match the serde
+    /// snake_case names and the `seed_media_types` rows.
+    pub fn code(self) -> &'static str {
+        match self {
+            MediaType::Model3d => "model_3d",
+            MediaType::Texture => "texture",
+            MediaType::Audio => "audio",
+            MediaType::Image => "image",
+            MediaType::Sprite => "sprite",
+            MediaType::Material => "material",
+            MediaType::Font => "font",
+        }
+    }
+}
+
 /// Asset lifecycle status. Invariant: discovered → indexed → identified → confirmed.
 /// See DATA-MODEL.md §8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

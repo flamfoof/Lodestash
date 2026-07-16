@@ -6,6 +6,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use egui::{Key, RichText, ScrollArea, TextureHandle, Ui, Vec2};
+use lodestash_core::catalog::{Catalog, CrawlRecord, StatusCounts};
 use lodestash_core::types::MediaType;
 use lodestash_ingest::crawler::{self, CrawledFile};
 use lodestash_ingest::{detect, thumb, unitypackage};
@@ -87,6 +88,22 @@ struct PendingPackage {
     /// Index into `nested_candidates`, defaulted to the URP variant when one exists.
     chosen_variant: usize,
     extracting: bool,
+}
+
+/// Result of the write-behind catalog persist that follows every finished scan.
+/// `counts` is None when the persist failed (logged; the UI falls back to in-memory).
+struct CatalogSynced {
+    generation: u64,
+    counts: Option<StatusCounts>,
+}
+
+/// One source's worth of persist work handed to the catalog thread.
+struct PersistBatch {
+    root: String,
+    name: String,
+    /// `import_source.blacklist` JSON for the one-time config adoption (DATA-MODEL §13).
+    excludes_json: Option<String>,
+    records: Vec<CrawlRecord>,
 }
 
 /// Result of a background package extraction.
@@ -376,6 +393,13 @@ pub struct LodestashApp {
     search_mode: SearchMode,
     /// Session dismissal for the Unidentified nudge banner (UI-SPEC §2.1).
     nudge_dismissed: bool,
+    /// Latest per-status counts read back from the catalog for the open project's
+    /// sources (None until the first persist lands). Feeds the health meter + sidebar.
+    catalog_counts: Option<StatusCounts>,
+    /// A write-behind catalog persist is in flight.
+    catalog_persisting: bool,
+    catalog_rx: Receiver<CatalogSynced>,
+    catalog_tx: Sender<CatalogSynced>,
     /// Faint background radial gradients (UI-SPEC §0): gold top-right, arcane bottom-left.
     bg_gold: Option<TextureHandle>,
     bg_arcane: Option<TextureHandle>,
@@ -401,6 +425,7 @@ impl LodestashApp {
         let (thumb_tx, thumb_rx) = mpsc::channel();
         let (scan_tx, scan_rx) = mpsc::channel();
         let (extract_tx, extract_rx) = mpsc::channel();
+        let (catalog_tx, catalog_rx) = mpsc::channel();
         let config = AppConfig::load();
         let sort_by = config.view.sort_by;
         let sort_asc = config.view.sort_asc;
@@ -448,6 +473,10 @@ impl LodestashApp {
             content_filter: ContentFilter::default(),
             search_mode: SearchMode::Tags,
             nudge_dismissed: false,
+            catalog_counts: None,
+            catalog_persisting: false,
+            catalog_rx,
+            catalog_tx,
             bg_gold: Some(cc.egui_ctx.load_texture(
                 "bg_radial_gold",
                 radial_image(theme::GOLD, 15), // rgba(231,183,101,.06)
@@ -561,6 +590,7 @@ impl LodestashApp {
         self.last_row_end = 0;
         self.scan_roots = roots.clone();
         self.project_name = name;
+        self.catalog_counts = None; // stale counts belong to the previous project
         self.selected_cache_idx = None;
         self.quick_look = false;
         self.source_filter = None;
@@ -642,6 +672,85 @@ impl LodestashApp {
             self.last_cols = 0;
             self.last_row_start = usize::MAX;
             self.last_row_end = 0;
+            self.spawn_catalog_persist();
+        }
+    }
+
+    /// Write-behind persist of the freshly-scanned entries into the SQLite catalog on
+    /// a dedicated thread — the only catalog writer (single-writer rule, ARCHITECTURE
+    /// §5). The grid keeps rendering from memory; the thread reports per-status counts
+    /// back so the health meter and STATUS facet show catalog truth.
+    fn spawn_catalog_persist(&mut self) {
+        let Some(db_path) = catalog_db_path() else {
+            return;
+        };
+        let project = self
+            .project_name
+            .as_deref()
+            .and_then(|n| self.config.project_by_name(n));
+        let batches: Vec<PersistBatch> = self
+            .scan_roots
+            .iter()
+            .enumerate()
+            .map(|(i, root)| {
+                let records = self
+                    .entries
+                    .iter()
+                    .filter(|e| e.source_idx == i)
+                    // Classified, on-disk files only: extracted package payloads live in
+                    // the workspace, not under the source root — they get catalog rows
+                    // with the P2 packages model, not here.
+                    .filter(|e| e.file.media_type.is_some() && e.file.abs_path.starts_with(root))
+                    .map(|e| CrawlRecord {
+                        rel_path: e.file.rel_path.to_string_lossy().replace('\\', "/"),
+                        name: e
+                            .file
+                            .rel_path
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        media_type: e.file.media_type.expect("filtered Some").code().to_string(),
+                        size_bytes: e.file.size_bytes as i64,
+                        mtime: e.file.mtime,
+                    })
+                    .collect();
+                let excludes_json = project
+                    .map(|p| p.excludes_for(root))
+                    .filter(|ex| !ex.is_empty())
+                    .and_then(|ex| serde_json::to_string(ex).ok());
+                PersistBatch {
+                    root: root.to_string_lossy().into_owned(),
+                    name: config::stem_name(root),
+                    excludes_json,
+                    records,
+                }
+            })
+            .collect();
+
+        let generation = self.scan_generation;
+        let tx = self.catalog_tx.clone();
+        self.catalog_persisting = true;
+        std::thread::spawn(move || {
+            let counts = match persist_to_catalog(&db_path, &batches) {
+                Ok(counts) => Some(counts),
+                Err(err) => {
+                    tracing::warn!(%err, "catalog persist failed; UI stays on in-memory counts");
+                    None
+                }
+            };
+            // Send even on failure so the in-flight flag always clears.
+            let _ = tx.send(CatalogSynced { generation, counts });
+        });
+    }
+
+    fn receive_catalog(&mut self) {
+        while let Ok(msg) = self.catalog_rx.try_recv() {
+            self.catalog_persisting = false;
+            if msg.generation == self.scan_generation {
+                if let Some(counts) = msg.counts {
+                    self.catalog_counts = Some(counts);
+                }
+            }
         }
     }
 
@@ -894,9 +1003,12 @@ impl LodestashApp {
         let mut add_source_clicked = false;
 
         let total = self.entries.len();
-        // ponytail: pre-catalog every entry is `discovered` → Unidentified; real per-status
-        // counts arrive with the catalog wiring.
-        let unidentified = total;
+        // STATUS rows show catalog truth when the persist has landed ("All" stays the
+        // grid count — unclassified files render in the grid but aren't catalog rows).
+        let (unidentified, identified_n, confirmed_n) = match &self.catalog_counts {
+            Some(c) => (c.unidentified, c.identified, c.confirmed),
+            None => (total, 0, 0),
+        };
         let per_source: Vec<usize> = (0..self.scan_roots.len())
             .map(|i| self.entries.iter().filter(|e| e.source_idx == i).count())
             .collect();
@@ -954,13 +1066,13 @@ impl LodestashApp {
                                 StatusFilter::Identified,
                                 "Identified",
                                 theme::STATUS_IDENTIFIED,
-                                0,
+                                identified_n,
                             ),
                             (
                                 StatusFilter::Confirmed,
                                 "Confirmed",
                                 theme::STATUS_CONFIRMED,
-                                0,
+                                confirmed_n,
                             ),
                         ] {
                             if facet_row(ui, Some(color), label, count, self.status_filter == sf)
@@ -1645,11 +1757,13 @@ impl eframe::App for LodestashApp {
         self.receive_scan();
         self.receive_thumbnails();
         self.receive_extracts();
+        self.receive_catalog();
 
-        // While a scan or thumbnails are in flight, wake up at ~30 fps to drain the
-        // channels. Keeping this in the main thread (not the worker threads) prevents
-        // stray request_repaint() calls from injecting extra frames during resize events.
-        if self.pending_thumbs > 0 || self.scanning {
+        // While a scan, thumbnails, or a catalog persist are in flight, wake up at
+        // ~30 fps to drain the channels. Keeping this in the main thread (not the
+        // worker threads) prevents stray request_repaint() calls from injecting
+        // extra frames during resize events.
+        if self.pending_thumbs > 0 || self.scanning || self.catalog_persisting {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
 
@@ -1954,10 +2068,13 @@ impl eframe::App for LodestashApp {
                             },
                         );
 
-                        // Health meter (§0.1 #5): mono label over a 6px gold bar.
-                        // ponytail: identified is 0 pre-catalog — the status flow lands in P3.
-                        let total = self.entries.len();
-                        let identified = 0_usize;
+                        // Health meter (§0.1 #5): mono label over a 6px gold bar. Reads
+                        // catalog truth once the write-behind persist lands; "identified"
+                        // is the non-Unidentified share (identified + confirmed).
+                        let (identified, total) = match &self.catalog_counts {
+                            Some(c) => (c.identified + c.confirmed, c.total()),
+                            None => (0, self.entries.len()),
+                        };
                         ui.vertical(|ui| {
                             ui.set_width(180.0);
                             ui.spacing_mut().item_spacing.y = 3.0;
@@ -3366,6 +3483,55 @@ fn logo_diamond(ui: &mut Ui) {
         egui::Stroke::new(2.0, theme::GOLD),
     ));
     painter.circle_filled(c, 2.2, theme::GOLD_BRIGHT);
+}
+
+/// The single on-disk catalog location: `<OS data dir>/Lodestash/catalog.db`
+/// (DATA-MODEL §1 — one SQLite file). None if the platform has no data dir.
+fn catalog_db_path() -> Option<PathBuf> {
+    let dir = dirs::data_dir()?.join("Lodestash");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("catalog.db"))
+}
+
+/// Runs on the persist thread: open the catalog, upsert each source, record its crawl
+/// incrementally, adopt any config blacklists (one-time M5 data step), and read back the
+/// per-status counts for exactly these sources.
+fn persist_to_catalog(
+    db_path: &std::path::Path,
+    batches: &[PersistBatch],
+) -> Result<StatusCounts, String> {
+    let mut catalog = Catalog::open(db_path).map_err(|e| e.to_string())?;
+    catalog.seed_media_types().map_err(|e| e.to_string())?;
+
+    let mut source_ids = Vec::with_capacity(batches.len());
+    let mut blacklists = Vec::new();
+    for batch in batches {
+        let id = catalog
+            .upsert_import_source(&batch.name, &batch.root, "folder")
+            .map_err(|e| e.to_string())?;
+        source_ids.push(id);
+        if let Some(json) = &batch.excludes_json {
+            blacklists.push((batch.root.clone(), json.clone()));
+        }
+        let stats = catalog
+            .record_crawl(id, &batch.records)
+            .map_err(|e| e.to_string())?;
+        tracing::info!(
+            root = %batch.root,
+            inserted = stats.inserted,
+            updated = stats.updated,
+            unchanged = stats.unchanged,
+            "catalog sync"
+        );
+    }
+    if !blacklists.is_empty() {
+        catalog
+            .adopt_config_blacklists(&blacklists)
+            .map_err(|e| e.to_string())?;
+    }
+    catalog
+        .status_counts_for_sources(&source_ids)
+        .map_err(|e| e.to_string())
 }
 
 /// A 128×128 radial-falloff sprite in `color`, peaking at `max_alpha` in the centre.

@@ -4,12 +4,50 @@
 //! Migration strategy: `PRAGMA user_version` tracks the schema version;
 //! `apply_migrations` runs numbered SQL steps in order on first open.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use tracing::info;
 
 use crate::error::{CoreError, Result};
+
+/// One crawled file to persist — the crawl→catalog handoff (INGESTION.md §1).
+#[derive(Debug, Clone)]
+pub struct CrawlRecord {
+    /// Path relative to the source root, `/`-separated for portability.
+    pub rel_path: String,
+    /// Display name (file stem).
+    pub name: String,
+    /// `media_type.code` (DATA-MODEL §2) — unclassified files are not persisted.
+    pub media_type: String,
+    pub size_bytes: i64,
+    pub mtime: i64,
+}
+
+/// What `record_crawl` did with a batch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CrawlStats {
+    pub inserted: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+}
+
+/// Per-status asset counts (soft-deleted rows excluded). `unidentified` folds
+/// `discovered|indexed` per DATA-MODEL §8.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatusCounts {
+    pub unidentified: usize,
+    pub identified: usize,
+    pub confirmed: usize,
+}
+
+impl StatusCounts {
+    pub fn total(&self) -> usize {
+        self.unidentified + self.identified + self.confirmed
+    }
+}
 
 /// The fully-opened, migration-applied catalog database.
 pub struct Catalog {
@@ -121,6 +159,191 @@ impl Catalog {
         }
         Ok(updated)
     }
+
+    /// Find-or-create an `import_source` by `root_path`; returns its id. The name is
+    /// only set on insert (renames are a user action, not a scan side effect).
+    pub fn upsert_import_source(&self, name: &str, root_path: &str, kind: &str) -> Result<i64> {
+        let existing: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM import_source WHERE root_path = ?1",
+                params![root_path],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| CoreError::Catalog(format!("source lookup: {e}")))?;
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+        self.conn
+            .execute(
+                "INSERT INTO import_source (uuid, name, root_path, kind) VALUES (?1, ?2, ?3, ?4)",
+                params![uuid::Uuid::new_v4().to_string(), name, root_path, kind],
+            )
+            .map_err(|e| CoreError::Catalog(format!("source insert: {e}")))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Persist one source's crawl into `asset` + `asset_file`, incrementally:
+    /// new rel_path ⇒ insert (status `discovered`); same `(size, mtime)` ⇒ untouched;
+    /// changed ⇒ update the file row and mark the asset dirty (DATA-MODEL §6).
+    /// One transaction per call; also stamps `import_source.last_scanned_at`.
+    pub fn record_crawl(&mut self, source_id: i64, records: &[CrawlRecord]) -> Result<CrawlStats> {
+        let now = unix_now();
+        let mut stats = CrawlStats::default();
+
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| CoreError::Catalog(format!("record_crawl begin: {e}")))?;
+        {
+            // media_type code → id, resolved once per batch.
+            let mut type_ids: HashMap<String, i64> = HashMap::new();
+            {
+                let mut stmt = tx
+                    .prepare("SELECT code, id FROM media_type")
+                    .map_err(|e| CoreError::Catalog(format!("media_type prep: {e}")))?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                    .map_err(|e| CoreError::Catalog(format!("media_type query: {e}")))?;
+                for row in rows {
+                    let (code, id) =
+                        row.map_err(|e| CoreError::Catalog(format!("media_type row: {e}")))?;
+                    type_ids.insert(code, id);
+                }
+            }
+
+            let mut lookup = tx
+                .prepare(
+                    "SELECT af.id, af.size_bytes, af.mtime, af.asset_id
+                     FROM asset_file af JOIN asset a ON a.id = af.asset_id
+                     WHERE a.source_id = ?1 AND af.rel_path = ?2",
+                )
+                .map_err(|e| CoreError::Catalog(format!("lookup prep: {e}")))?;
+
+            for rec in records {
+                let Some(&media_type_id) = type_ids.get(&rec.media_type) else {
+                    return Err(CoreError::Catalog(format!(
+                        "unknown media_type code '{}' (seed_media_types not run?)",
+                        rec.media_type
+                    )));
+                };
+                let existing: Option<(i64, Option<i64>, Option<i64>, i64)> = lookup
+                    .query_row(params![source_id, rec.rel_path], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    })
+                    .optional()
+                    .map_err(|e| CoreError::Catalog(format!("lookup: {e}")))?;
+
+                match existing {
+                    None => {
+                        tx.execute(
+                            "INSERT INTO asset (uuid, source_id, media_type_id, name,
+                                                status, created_at, updated_at)
+                             VALUES (?1, ?2, ?3, ?4, 'discovered', ?5, ?5)",
+                            params![
+                                uuid::Uuid::new_v4().to_string(),
+                                source_id,
+                                media_type_id,
+                                rec.name,
+                                now
+                            ],
+                        )
+                        .map_err(|e| CoreError::Catalog(format!("asset insert: {e}")))?;
+                        let asset_id = tx.last_insert_rowid();
+                        let ext = rec.rel_path.rsplit('.').next().map(str::to_lowercase);
+                        tx.execute(
+                            "INSERT INTO asset_file (asset_id, rel_path, ext, size_bytes, mtime)
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            params![asset_id, rec.rel_path, ext, rec.size_bytes, rec.mtime],
+                        )
+                        .map_err(|e| CoreError::Catalog(format!("asset_file insert: {e}")))?;
+                        tx.execute(
+                            "UPDATE asset SET primary_file_id = ?2 WHERE id = ?1",
+                            params![asset_id, tx.last_insert_rowid()],
+                        )
+                        .map_err(|e| CoreError::Catalog(format!("primary_file: {e}")))?;
+                        stats.inserted += 1;
+                    }
+                    Some((_, Some(size), Some(mtime), _))
+                        if size == rec.size_bytes && mtime == rec.mtime =>
+                    {
+                        stats.unchanged += 1;
+                    }
+                    Some((file_id, _, _, asset_id)) => {
+                        tx.execute(
+                            "UPDATE asset_file SET size_bytes = ?2, mtime = ?3,
+                                                   content_hash = NULL
+                             WHERE id = ?1",
+                            params![file_id, rec.size_bytes, rec.mtime],
+                        )
+                        .map_err(|e| CoreError::Catalog(format!("asset_file update: {e}")))?;
+                        tx.execute(
+                            "UPDATE asset SET updated_at = ?2, embedding_dirty = 1 WHERE id = ?1",
+                            params![asset_id, now],
+                        )
+                        .map_err(|e| CoreError::Catalog(format!("asset touch: {e}")))?;
+                        stats.updated += 1;
+                    }
+                }
+            }
+        }
+        tx.execute(
+            "UPDATE import_source SET last_scanned_at = ?2 WHERE id = ?1",
+            params![source_id, now],
+        )
+        .map_err(|e| CoreError::Catalog(format!("last_scanned_at: {e}")))?;
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("record_crawl commit: {e}")))?;
+        Ok(stats)
+    }
+
+    /// Per-status counts across the given sources (live rows only). Feeds the health
+    /// meter and the sidebar STATUS facet (UI-SPEC §0.1/§0.2).
+    pub fn status_counts_for_sources(&self, source_ids: &[i64]) -> Result<StatusCounts> {
+        let mut counts = StatusCounts::default();
+        if source_ids.is_empty() {
+            return Ok(counts);
+        }
+        // source_ids are i64s we produced — safe to inline (rusqlite has no array binds).
+        let id_list = source_ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT status, COUNT(*) FROM asset
+             WHERE source_id IN ({id_list}) AND deleted_at IS NULL
+             GROUP BY status"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| CoreError::Catalog(format!("counts prep: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(|e| CoreError::Catalog(format!("counts query: {e}")))?;
+        for row in rows {
+            let (status, n) = row.map_err(|e| CoreError::Catalog(format!("counts row: {e}")))?;
+            let n = n as usize;
+            match status.as_str() {
+                "discovered" | "indexed" => counts.unidentified += n,
+                "identified" => counts.identified += n,
+                "confirmed" => counts.confirmed += n,
+                other => {
+                    return Err(CoreError::Catalog(format!("unknown asset status '{other}'")))
+                }
+            }
+        }
+        Ok(counts)
+    }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn configure_connection(conn: &Connection) -> Result<()> {
@@ -129,7 +352,8 @@ fn configure_connection(conn: &Connection) -> Result<()> {
          PRAGMA synchronous=NORMAL;
          PRAGMA foreign_keys=ON;
          PRAGMA cache_size=-32768;  -- 32 MiB page cache
-         PRAGMA temp_store=MEMORY;",
+         PRAGMA temp_store=MEMORY;
+         PRAGMA busy_timeout=5000;  -- writers queue briefly instead of erroring (single-writer rule)",
     )
     .map_err(|e| CoreError::Catalog(format!("configure pragmas: {e}")))?;
     Ok(())
@@ -580,6 +804,95 @@ mod tests {
             })
             .expect("b");
         assert!(b.contains("Editor"), "existing catalog blacklist untouched");
+    }
+
+    fn rec(rel: &str, size: i64, mtime: i64) -> CrawlRecord {
+        CrawlRecord {
+            rel_path: rel.to_string(),
+            name: rel.rsplit('/').next().unwrap_or(rel).to_string(),
+            media_type: "image".to_string(),
+            size_bytes: size,
+            mtime,
+        }
+    }
+
+    #[test]
+    fn upsert_import_source_is_idempotent_by_root_path() {
+        let c = Catalog::open_in_memory().expect("open");
+        let a = c.upsert_import_source("Synty", "C:/lib", "folder").expect("insert");
+        let b = c.upsert_import_source("Renamed", "C:/lib", "folder").expect("reuse");
+        assert_eq!(a, b, "same root_path resolves to the same source");
+        let name: String = c
+            .conn
+            .query_row("SELECT name FROM import_source WHERE id=?1", [a], |r| r.get(0))
+            .expect("name");
+        assert_eq!(name, "Synty", "name only set on insert");
+    }
+
+    #[test]
+    fn record_crawl_inserts_then_skips_then_updates() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let src = c.upsert_import_source("Lib", "C:/lib", "folder").expect("src");
+
+        // First crawl: everything new.
+        let stats = c
+            .record_crawl(src, &[rec("rocks/a.png", 10, 100), rec("rocks/b.png", 20, 100)])
+            .expect("crawl 1");
+        assert_eq!(stats, CrawlStats { inserted: 2, updated: 0, unchanged: 0 });
+
+        // Second crawl: one untouched, one changed (new mtime).
+        let stats = c
+            .record_crawl(src, &[rec("rocks/a.png", 10, 100), rec("rocks/b.png", 22, 200)])
+            .expect("crawl 2");
+        assert_eq!(stats, CrawlStats { inserted: 0, updated: 1, unchanged: 1 });
+
+        // The changed file's asset was marked dirty; sizes stored per file row.
+        let (size, dirty): (i64, i64) = c
+            .conn
+            .query_row(
+                "SELECT af.size_bytes, a.embedding_dirty
+                 FROM asset_file af JOIN asset a ON a.id = af.asset_id
+                 WHERE af.rel_path = 'rocks/b.png'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(size, 22);
+        assert_eq!(dirty, 1);
+
+        // Assets carry a primary file and 'discovered' status.
+        let n: i64 = c
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset
+                 WHERE status='discovered' AND primary_file_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn status_counts_scope_to_sources_and_fold_discovered() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let a = c.upsert_import_source("A", "C:/a", "folder").expect("a");
+        let b = c.upsert_import_source("B", "C:/b", "folder").expect("b");
+        c.record_crawl(a, &[rec("x.png", 1, 1), rec("y.png", 2, 2)]).expect("a crawl");
+        c.record_crawl(b, &[rec("z.png", 3, 3)]).expect("b crawl");
+        c.conn
+            .execute("UPDATE asset SET status='identified' WHERE name='y.png'", [])
+            .expect("promote");
+
+        let counts = c.status_counts_for_sources(&[a]).expect("counts a");
+        assert_eq!(counts, StatusCounts { unidentified: 1, identified: 1, confirmed: 0 });
+        assert_eq!(counts.total(), 2, "source B excluded");
+        assert_eq!(
+            c.status_counts_for_sources(&[]).expect("empty"),
+            StatusCounts::default()
+        );
     }
 
     #[test]
