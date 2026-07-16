@@ -184,11 +184,67 @@ impl Catalog {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Find-or-create a `package` row by `(source_id, package_path)` — the browse-only
+    /// population of DATA-MODEL §7 (`asset_count`/`unpacked_at` stay NULL until ingest).
+    pub fn upsert_package(
+        &self,
+        source_id: i64,
+        package_path: &str,
+        name: &str,
+        publisher: Option<&str>,
+        category: Option<&str>,
+    ) -> Result<i64> {
+        let existing: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM package WHERE source_id = ?1 AND package_path = ?2",
+                params![source_id, package_path],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| CoreError::Catalog(format!("package lookup: {e}")))?;
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+        self.conn
+            .execute(
+                "INSERT INTO package (uuid, source_id, package_path, name, publisher, category)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    source_id,
+                    package_path,
+                    name,
+                    publisher,
+                    category
+                ],
+            )
+            .map_err(|e| CoreError::Catalog(format!("package insert: {e}")))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Stamp a package as unpacked with its ingested asset count (DATA-MODEL §7).
+    pub fn mark_package_unpacked(&self, package_id: i64, asset_count: usize) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE package SET asset_count = ?2, unpacked_at = ?3 WHERE id = ?1",
+                params![package_id, asset_count as i64, unix_now()],
+            )
+            .map_err(|e| CoreError::Catalog(format!("package unpacked: {e}")))?;
+        Ok(())
+    }
+
     /// Persist one source's crawl into `asset` + `asset_file`, incrementally:
     /// new rel_path ⇒ insert (status `discovered`); same `(size, mtime)` ⇒ untouched;
     /// changed ⇒ update the file row and mark the asset dirty (DATA-MODEL §6).
+    /// New assets get `package_id` when the batch came out of a package (DATA-MODEL §7).
     /// One transaction per call; also stamps `import_source.last_scanned_at`.
-    pub fn record_crawl(&mut self, source_id: i64, records: &[CrawlRecord]) -> Result<CrawlStats> {
+    pub fn record_crawl(
+        &mut self,
+        source_id: i64,
+        package_id: Option<i64>,
+        records: &[CrawlRecord],
+    ) -> Result<CrawlStats> {
         let now = unix_now();
         let mut stats = CrawlStats::default();
 
@@ -239,13 +295,14 @@ impl Catalog {
                     None => {
                         tx.execute(
                             "INSERT INTO asset (uuid, source_id, media_type_id, name,
-                                                status, created_at, updated_at)
-                             VALUES (?1, ?2, ?3, ?4, 'discovered', ?5, ?5)",
+                                                package_id, status, created_at, updated_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, 'discovered', ?6, ?6)",
                             params![
                                 uuid::Uuid::new_v4().to_string(),
                                 source_id,
                                 media_type_id,
                                 rec.name,
+                                package_id,
                                 now
                             ],
                         )
@@ -837,13 +894,13 @@ mod tests {
 
         // First crawl: everything new.
         let stats = c
-            .record_crawl(src, &[rec("rocks/a.png", 10, 100), rec("rocks/b.png", 20, 100)])
+            .record_crawl(src, None, &[rec("rocks/a.png", 10, 100), rec("rocks/b.png", 20, 100)])
             .expect("crawl 1");
         assert_eq!(stats, CrawlStats { inserted: 2, updated: 0, unchanged: 0 });
 
         // Second crawl: one untouched, one changed (new mtime).
         let stats = c
-            .record_crawl(src, &[rec("rocks/a.png", 10, 100), rec("rocks/b.png", 22, 200)])
+            .record_crawl(src, None, &[rec("rocks/a.png", 10, 100), rec("rocks/b.png", 22, 200)])
             .expect("crawl 2");
         assert_eq!(stats, CrawlStats { inserted: 0, updated: 1, unchanged: 1 });
 
@@ -875,13 +932,56 @@ mod tests {
     }
 
     #[test]
+    fn upsert_package_and_unpack_stamp() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let src = c
+            .upsert_import_source("Store", "C:/cache", "asset_store_library")
+            .expect("src");
+
+        // Browse-only: row exists, unpack fields NULL, idempotent by (source, path).
+        let p1 = c
+            .upsert_package(src, "C:/cache/Synty/3D/POLYGON City.unitypackage",
+                "POLYGON City", Some("Synty"), Some("3D"))
+            .expect("insert");
+        let p2 = c
+            .upsert_package(src, "C:/cache/Synty/3D/POLYGON City.unitypackage",
+                "POLYGON City", Some("Synty"), Some("3D"))
+            .expect("reuse");
+        assert_eq!(p1, p2);
+        let unpacked: Option<i64> = c
+            .conn
+            .query_row("SELECT unpacked_at FROM package WHERE id=?1", [p1], |r| r.get(0))
+            .expect("row");
+        assert_eq!(unpacked, None, "browse-only leaves unpacked_at NULL");
+
+        // Ingest: extracted assets carry package_id; unpack stamp fills.
+        let stats = c
+            .record_crawl(src, Some(p1), &[rec("POLYGON City/rock.png", 5, 50)])
+            .expect("extract crawl");
+        assert_eq!(stats.inserted, 1);
+        c.mark_package_unpacked(p1, 1).expect("stamp");
+        let (pkg_of_asset, count): (i64, i64) = c
+            .conn
+            .query_row(
+                "SELECT a.package_id, p.asset_count FROM asset a
+                 JOIN package p ON p.id = a.package_id WHERE a.name='rock.png'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("joined");
+        assert_eq!(pkg_of_asset, p1);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn status_counts_scope_to_sources_and_fold_discovered() {
         let mut c = Catalog::open_in_memory().expect("open");
         c.seed_media_types().expect("seed");
         let a = c.upsert_import_source("A", "C:/a", "folder").expect("a");
         let b = c.upsert_import_source("B", "C:/b", "folder").expect("b");
-        c.record_crawl(a, &[rec("x.png", 1, 1), rec("y.png", 2, 2)]).expect("a crawl");
-        c.record_crawl(b, &[rec("z.png", 3, 3)]).expect("b crawl");
+        c.record_crawl(a, None, &[rec("x.png", 1, 1), rec("y.png", 2, 2)]).expect("a crawl");
+        c.record_crawl(b, None, &[rec("z.png", 3, 3)]).expect("b crawl");
         c.conn
             .execute("UPDATE asset SET status='identified' WHERE name='y.png'", [])
             .expect("promote");
