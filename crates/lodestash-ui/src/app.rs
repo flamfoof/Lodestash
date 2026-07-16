@@ -98,6 +98,21 @@ struct CatalogSynced {
     counts: Option<StatusCounts>,
 }
 
+/// An extracted package's worth of persist work: the `package` row plus its
+/// extracted assets (DATA-MODEL §7), handed to the catalog thread.
+struct PackagePersist {
+    /// Source root the package was found under (existing or to-be-created source row).
+    root: String,
+    root_name: String,
+    package_path: String,
+    name: String,
+    publisher: Option<String>,
+    category: Option<String>,
+    records: Vec<CrawlRecord>,
+    /// (name, root) of every project source, for the read-back status counts.
+    all_roots: Vec<(String, String)>,
+}
+
 /// One source's worth of persist work handed to the catalog thread.
 struct PersistBatch {
     root: String,
@@ -719,27 +734,14 @@ impl LodestashApp {
             .iter()
             .enumerate()
             .map(|(i, root)| {
-                let records = self
-                    .entries
-                    .iter()
-                    .filter(|e| e.source_idx == i)
-                    // Classified, on-disk files only: extracted package payloads live in
-                    // the workspace, not under the source root — they get catalog rows
-                    // with the P2 packages model, not here.
-                    .filter(|e| e.file.media_type.is_some() && e.file.abs_path.starts_with(root))
-                    .map(|e| CrawlRecord {
-                        rel_path: e.file.rel_path.to_string_lossy().replace('\\', "/"),
-                        name: e
-                            .file
-                            .rel_path
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
-                        media_type: e.file.media_type.expect("filtered Some").code().to_string(),
-                        size_bytes: e.file.size_bytes as i64,
-                        mtime: e.file.mtime,
-                    })
-                    .collect();
+                // On-disk files only: extracted package payloads live in the workspace,
+                // not under the source root — spawn_package_persist covers those.
+                let records = crawl_records(
+                    self.entries
+                        .iter()
+                        .filter(|e| e.source_idx == i && e.file.abs_path.starts_with(root))
+                        .map(|e| &e.file),
+                );
                 let excludes_json = project
                     .map(|p| p.excludes_for(root))
                     .filter(|ex| !ex.is_empty())
@@ -766,6 +768,130 @@ impl LodestashApp {
             };
             // Send even on failure so the in-flight flag always clears.
             let _ = tx.send(CatalogSynced { generation, counts });
+        });
+    }
+
+    /// Write-behind persist of an extracted package: its `package` row (publisher and
+    /// category taken from the Asset Store cache tree when it lives under one) plus
+    /// asset rows carrying `package_id`. Same single-writer + generation rules as
+    /// `spawn_catalog_persist`.
+    fn spawn_package_persist(
+        &mut self,
+        source_idx: usize,
+        package_path: &std::path::Path,
+        files: &[CrawledFile],
+    ) {
+        let Some(db_path) = catalog_db_path() else {
+            return;
+        };
+        let Some(root) = self.scan_roots.get(source_idx) else {
+            return;
+        };
+        let (publisher, category) = match self.store_root_of(package_path) {
+            Some(store_root) => {
+                let comps: Vec<String> = package_path
+                    .strip_prefix(store_root)
+                    .ok()
+                    .map(|rel| {
+                        rel.components()
+                            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // comps: [publisher, category, ..., "Pack.unitypackage"]
+                let publisher = (comps.len() >= 2).then(|| comps[0].clone());
+                let category = (comps.len() >= 3).then(|| comps[1].clone());
+                (publisher, category)
+            }
+            None => (None, None),
+        };
+        let job = PackagePersist {
+            root: root.to_string_lossy().into_owned(),
+            root_name: config::stem_name(root),
+            package_path: package_path.to_string_lossy().into_owned(),
+            name: package_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            publisher,
+            category,
+            records: crawl_records(files.iter()),
+            all_roots: self
+                .scan_roots
+                .iter()
+                .map(|r| (config::stem_name(r), r.to_string_lossy().into_owned()))
+                .collect(),
+        };
+
+        let generation = self.scan_generation;
+        let tx = self.catalog_tx.clone();
+        self.catalog_persisting = true;
+        std::thread::spawn(move || {
+            let counts = match persist_package_to_catalog(&db_path, &job) {
+                Ok(counts) => Some(counts),
+                Err(err) => {
+                    tracing::warn!(%err, "package persist failed; UI stays on in-memory counts");
+                    None
+                }
+            };
+            let _ = tx.send(CatalogSynced { generation, counts });
+        });
+    }
+
+    /// Fire-and-forget browse-only persist (DATA-MODEL §7): each validated cache root
+    /// becomes an `asset_store_library` source and every browsed pack a `package` row
+    /// with `asset_count`/`unpacked_at` left NULL.
+    fn spawn_store_browse_persist(&self) {
+        let Some(db_path) = catalog_db_path() else {
+            return;
+        };
+        if self.store_packages.is_empty() {
+            return;
+        }
+        let batches: Vec<(String, String, Vec<AssetStorePackage>)> = self
+            .store_roots
+            .iter()
+            .map(|root| {
+                let pkgs = self
+                    .store_packages
+                    .iter()
+                    .filter(|p| p.path.starts_with(root))
+                    .cloned()
+                    .collect();
+                (
+                    config::stem_name(root),
+                    root.to_string_lossy().into_owned(),
+                    pkgs,
+                )
+            })
+            .collect();
+        std::thread::spawn(move || {
+            let run = || -> Result<usize, String> {
+                let catalog = Catalog::open(&db_path).map_err(|e| e.to_string())?;
+                let mut n = 0;
+                for (name, root, pkgs) in &batches {
+                    let sid = catalog
+                        .upsert_import_source(name, root, "asset_store_library")
+                        .map_err(|e| e.to_string())?;
+                    for pkg in pkgs {
+                        catalog
+                            .upsert_package(
+                                sid,
+                                &pkg.path.to_string_lossy(),
+                                &pkg.name,
+                                (!pkg.publisher.is_empty()).then_some(pkg.publisher.as_str()),
+                                (!pkg.category.is_empty()).then_some(pkg.category.as_str()),
+                            )
+                            .map_err(|e| e.to_string())?;
+                        n += 1;
+                    }
+                }
+                Ok(n)
+            };
+            match run() {
+                Ok(n) => tracing::info!(packages = n, "asset-store browse persisted"),
+                Err(err) => tracing::warn!(%err, "asset-store browse persist failed"),
+            }
         });
     }
 
@@ -819,8 +945,14 @@ impl LodestashApp {
     }
 
     fn receive_extracts(&mut self) {
+        let mut done = Vec::new();
         while let Ok(msg) = self.extract_rx.try_recv() {
+            done.push(msg);
+        }
+        for msg in done {
             self.pending_packages.retain(|p| p.abs_path != msg.abs_path);
+            // Write-behind: package row + extracted asset rows (DATA-MODEL §7).
+            self.spawn_package_persist(msg.source_idx, &msg.abs_path, &msg.files);
             for file in msg.files {
                 self.entries.push(AssetEntry {
                     file,
@@ -1206,6 +1338,8 @@ impl LodestashApp {
             .flat_map(|r| asset_store::browse(r))
             .collect();
         self.store_scanned = true;
+        // Browse-only package rows (DATA-MODEL §7) — asset_count/unpacked_at stay NULL.
+        self.spawn_store_browse_persist();
     }
 
     /// Which validated cache root a package lives under.
@@ -3793,6 +3927,72 @@ fn catalog_db_path() -> Option<PathBuf> {
     Some(dir.join("catalog.db"))
 }
 
+/// Classified files → catalog crawl records; unclassified files stay grid-only
+/// (`asset.media_type_id` is NOT NULL). Paths are stored `/`-separated.
+fn crawl_records<'a>(files: impl Iterator<Item = &'a CrawledFile>) -> Vec<CrawlRecord> {
+    files
+        .filter(|f| f.media_type.is_some())
+        .map(|f| CrawlRecord {
+            rel_path: f.rel_path.to_string_lossy().replace('\\', "/"),
+            name: f
+                .rel_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            media_type: f.media_type.expect("filtered Some").code().to_string(),
+            size_bytes: f.size_bytes as i64,
+            mtime: f.mtime,
+        })
+        .collect()
+}
+
+/// Runs on the persist thread: the extracted package's `package` row, its asset rows
+/// (carrying `package_id`), the unpack stamp, then project-wide status counts.
+fn persist_package_to_catalog(
+    db_path: &std::path::Path,
+    job: &PackagePersist,
+) -> Result<StatusCounts, String> {
+    let mut catalog = Catalog::open(db_path).map_err(|e| e.to_string())?;
+    catalog.seed_media_types().map_err(|e| e.to_string())?;
+
+    let source_id = catalog
+        .upsert_import_source(&job.root_name, &job.root, "folder")
+        .map_err(|e| e.to_string())?;
+    let package_id = catalog
+        .upsert_package(
+            source_id,
+            &job.package_path,
+            &job.name,
+            job.publisher.as_deref(),
+            job.category.as_deref(),
+        )
+        .map_err(|e| e.to_string())?;
+    let stats = catalog
+        .record_crawl(source_id, Some(package_id), &job.records)
+        .map_err(|e| e.to_string())?;
+    catalog
+        .mark_package_unpacked(package_id, job.records.len())
+        .map_err(|e| e.to_string())?;
+    tracing::info!(
+        package = %job.name,
+        inserted = stats.inserted,
+        unchanged = stats.unchanged,
+        "package sync"
+    );
+
+    let mut source_ids = Vec::with_capacity(job.all_roots.len());
+    for (name, root) in &job.all_roots {
+        source_ids.push(
+            catalog
+                .upsert_import_source(name, root, "folder")
+                .map_err(|e| e.to_string())?,
+        );
+    }
+    catalog
+        .status_counts_for_sources(&source_ids)
+        .map_err(|e| e.to_string())
+}
+
 /// Runs on the persist thread: open the catalog, upsert each source, record its crawl
 /// incrementally, adopt any config blacklists (one-time M5 data step), and read back the
 /// per-status counts for exactly these sources.
@@ -3814,7 +4014,7 @@ fn persist_to_catalog(
             blacklists.push((batch.root.clone(), json.clone()));
         }
         let stats = catalog
-            .record_crawl(id, &batch.records)
+            .record_crawl(id, None, &batch.records)
             .map_err(|e| e.to_string())?;
         tracing::info!(
             root = %batch.root,
