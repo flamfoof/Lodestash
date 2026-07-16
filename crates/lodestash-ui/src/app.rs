@@ -289,6 +289,7 @@ pub struct LodestashApp {
 
 impl LodestashApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        crate::fonts::install(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx);
 
         let (thumb_tx, thumb_rx) = mpsc::channel();
@@ -1510,10 +1511,9 @@ impl eframe::App for LodestashApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("\u{25C8} Lodestash")
+                        RichText::new("\u{25C8} LODESTASH")
                             .color(theme::GOLD)
-                            .size(16.0)
-                            .strong(),
+                            .font(crate::fonts::display(16.0)),
                     );
                     ui.separator();
 
