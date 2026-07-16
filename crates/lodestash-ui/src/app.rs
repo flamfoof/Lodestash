@@ -211,12 +211,108 @@ impl ContentFilter {
 
 // ── Top-level screen ────────────────────────────────────────────────────────────
 
-/// Which screen the nav rail has selected. Design §5 adds Settings alongside the Library.
+/// Which screen the sidebar has selected (UI-SPEC §0.2). Screens without a build yet
+/// render the §12 stub — the nav row is never hidden.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Screen {
     #[default]
     Library,
+    Identify,
+    Collections,
+    Packages,
+    Vocabulary,
+    Stats,
+    Duplicates,
+    Trash,
     Settings,
+}
+
+impl Screen {
+    /// Sidebar navigation order (UI-SPEC §0.2).
+    const NAV: [Screen; 9] = [
+        Screen::Library,
+        Screen::Identify,
+        Screen::Collections,
+        Screen::Packages,
+        Screen::Vocabulary,
+        Screen::Stats,
+        Screen::Duplicates,
+        Screen::Trash,
+        Screen::Settings,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Screen::Library => "Library",
+            Screen::Identify => "Identify",
+            Screen::Collections => "Collections",
+            Screen::Packages => "Packages",
+            Screen::Vocabulary => "Vocabulary",
+            Screen::Stats => "Stats",
+            Screen::Duplicates => "Duplicates",
+            Screen::Trash => "Trash",
+            Screen::Settings => "Settings",
+        }
+    }
+
+    /// Unicode stand-ins for the `ls-nav-*` glyphs (glyph catalog §01) until SVG icons load.
+    fn glyph(self) -> &'static str {
+        match self {
+            Screen::Library => "\u{229E}",
+            Screen::Identify => "\u{2726}",
+            Screen::Collections => "\u{27E1}",
+            Screen::Packages => "\u{25A4}",
+            Screen::Vocabulary => "\u{2756}",
+            Screen::Stats => "\u{25C9}",
+            Screen::Duplicates => "\u{29C9}",
+            Screen::Trash => "\u{2298}",
+            Screen::Settings => "\u{2699}",
+        }
+    }
+
+    fn glyph_color(self) -> egui::Color32 {
+        match self {
+            Screen::Library | Screen::Collections => theme::GOLD,
+            Screen::Identify | Screen::Vocabulary => theme::ARCANE_BRIGHT,
+            Screen::Duplicates => theme::WARNING,
+            Screen::Trash => theme::DANGER,
+            Screen::Packages | Screen::Stats | Screen::Settings => theme::TEXT_MUTED,
+        }
+    }
+
+    /// One sentence of what the destination will be, for the §12 stub screen.
+    fn stub_line(self) -> &'static str {
+        match self {
+            Screen::Library | Screen::Settings => "", // built — never stubbed
+            Screen::Identify => "Work through the Unidentified backlog with batch AI + hand tagging.",
+            Screen::Collections => "Pinned loadouts \u{2014} stash tabs for your best assets.",
+            Screen::Packages => "Everything you own, by publisher and pack.",
+            Screen::Vocabulary => "Traits and the mapping library \u{2014} your canonical tag vocabulary.",
+            Screen::Stats => "Library insights \u{2014} counts, sizes, identification coverage.",
+            Screen::Duplicates => "Review near-duplicate groups \u{2014} keep, merge, or trash; never auto-delete.",
+            Screen::Trash => "Removed assets wait here for restore or explicit deletion.",
+        }
+    }
+}
+
+/// Top-bar search mode (UI-SPEC §0.1): Tags = live substring filter (live today),
+/// AI = semantic search (stub until the P3/P4 embedding pipeline lands).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SearchMode {
+    #[default]
+    Tags,
+    Ai,
+}
+
+/// STATUS facet single-select (UI-SPEC §0.2). Maps to `status` (DATA-MODEL §8);
+/// `discovered|indexed` fold into Unidentified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum StatusFilter {
+    #[default]
+    All,
+    Unidentified,
+    Identified,
+    Confirmed,
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -276,8 +372,18 @@ pub struct LodestashApp {
     workspace_dir: Option<PathBuf>,
     /// The ⚑ Filters content filter (trait / triangles / file-size). Transient. Design §3.
     content_filter: ContentFilter,
-    /// Active top-level screen (Library grid vs Settings). Design §5.
+    /// Top-bar search mode (UI-SPEC §0.1). AI is a stub until P3/P4.
+    search_mode: SearchMode,
+    /// Session dismissal for the Unidentified nudge banner (UI-SPEC §2.1).
+    nudge_dismissed: bool,
+    /// Faint background radial gradients (UI-SPEC §0): gold top-right, arcane bottom-left.
+    bg_gold: Option<TextureHandle>,
+    bg_arcane: Option<TextureHandle>,
+    /// Active top-level screen (UI-SPEC §0.2 sidebar).
     screen: Screen,
+    /// STATUS facet selection (UI-SPEC §0.2). Pre-catalog every entry is `discovered`,
+    /// which folds into Unidentified — so Identified/Confirmed currently match nothing.
+    status_filter: StatusFilter,
     /// Index into `scan_roots` of the source whose blacklist panel is expanded in Settings. §5.1.
     expanded_source: Option<usize>,
     /// The in-progress blacklist exclusion text for the expanded source (transient). §5.1.
@@ -340,7 +446,20 @@ impl LodestashApp {
             extract_tx,
             workspace_dir: dirs::cache_dir().map(|d| d.join("Lodestash").join("workspace")),
             content_filter: ContentFilter::default(),
+            search_mode: SearchMode::Tags,
+            nudge_dismissed: false,
+            bg_gold: Some(cc.egui_ctx.load_texture(
+                "bg_radial_gold",
+                radial_image(theme::GOLD, 15), // rgba(231,183,101,.06)
+                egui::TextureOptions::LINEAR,
+            )),
+            bg_arcane: Some(cc.egui_ctx.load_texture(
+                "bg_radial_arcane",
+                radial_image(theme::ARCANE, 13), // rgba(73,214,201,.05)
+                egui::TextureOptions::LINEAR,
+            )),
             screen: Screen::Library,
+            status_filter: StatusFilter::All,
             expanded_source: None,
             blacklist_input: String::new(),
             onboarding_open: show_onboarding,
@@ -604,7 +723,12 @@ impl LodestashApp {
         let selected_entry = self
             .selected_cache_idx
             .and_then(|ci| self.sorted_cache.get(ci).copied());
-        let q = self.search.to_lowercase();
+        // AI-mode queries never live-filter — results only replace the grid on Enter,
+        // which is stubbed until the P3/P4 semantic pipeline (UI-SPEC §0.1).
+        let q = match self.search_mode {
+            SearchMode::Tags => self.search.to_lowercase(),
+            SearchMode::Ai => String::new(),
+        };
         let tab = self.active_tab;
 
         let name_matches = |e: &AssetEntry| {
@@ -695,6 +819,15 @@ impl LodestashApp {
             idxs.retain(|&i| cf.passes(entries[i].file.size_bytes, None, &[], tiers));
         }
 
+        // STATUS facet (UI-SPEC §0.2). ponytail: pre-catalog every entry is Unidentified,
+        // so this is a keep-all/keep-none gate; becomes a per-asset match when status lands.
+        if matches!(
+            self.status_filter,
+            StatusFilter::Identified | StatusFilter::Confirmed
+        ) {
+            idxs.clear();
+        }
+
         sort_indices(&mut idxs, &self.entries, self.sort_by, self.sort_asc);
 
         self.sorted_cache = idxs;
@@ -740,6 +873,7 @@ impl LodestashApp {
     /// the current filter.
     fn go_to_library(&mut self) {
         self.screen = Screen::Library;
+        self.status_filter = StatusFilter::All;
         self.source_filter = None;
         self.active_tab = Category::All;
         self.search.clear();
@@ -750,64 +884,153 @@ impl LodestashApp {
         self.cache_dirty = true;
     }
 
-    fn nav_rail(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("nav_rail")
-            .exact_width(52.0)
+    /// The labeled sidebar (UI-SPEC §0.2): 9 nav destinations + STATUS and LIBRARIES
+    /// facet groups. Replaces the earlier icon-only nav rail.
+    fn sidebar(&mut self, ctx: &egui::Context) {
+        let mut go_library = false;
+        let mut new_screen: Option<Screen> = None;
+        let mut new_status: Option<StatusFilter> = None;
+        let mut new_source: Option<Option<usize>> = None;
+        let mut add_source_clicked = false;
+
+        let total = self.entries.len();
+        // ponytail: pre-catalog every entry is `discovered` → Unidentified; real per-status
+        // counts arrive with the catalog wiring.
+        let unidentified = total;
+        let per_source: Vec<usize> = (0..self.scan_roots.len())
+            .map(|i| self.entries.iter().filter(|e| e.source_idx == i).count())
+            .collect();
+        // Facet groups collapse to their labels on screens where they don't apply (§0.2).
+        let facets_open = matches!(self.screen, Screen::Library | Screen::Identify);
+
+        egui::SidePanel::left("sidebar")
+            .exact_width(210.0)
             .resizable(false)
             .frame(
                 egui::Frame::none()
                     .fill(theme::SURFACE)
                     .stroke(egui::Stroke::new(1.0, theme::BORDER))
-                    .inner_margin(egui::Margin::symmetric(7.0, 10.0)),
+                    .inner_margin(egui::Margin::symmetric(8.0, 10.0)),
             )
             .show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    // Library — the reset-to-everything affordance (design §4).
-                    if nav_button(
-                        ui,
-                        "\u{229E}",
-                        theme::GOLD,
-                        self.screen == Screen::Library,
-                        true,
-                    )
-                    .on_hover_text("Library")
-                    .clicked()
-                    {
-                        self.go_to_library();
+                ScrollArea::vertical().show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for screen in Screen::NAV {
+                        let badge = match screen {
+                            Screen::Identify => unidentified,
+                            // Dup groups / trashed counts need the catalog; 0 hides the pill.
+                            _ => 0,
+                        };
+                        if sidebar_nav_row(
+                            ui,
+                            screen.glyph(),
+                            screen.glyph_color(),
+                            screen.label(),
+                            (badge > 0).then_some(badge),
+                            self.screen == screen,
+                        )
+                        .clicked()
+                        {
+                            if screen == Screen::Library {
+                                go_library = true;
+                            } else {
+                                new_screen = Some(screen);
+                            }
+                        }
                     }
-                    ui.add_space(8.0);
-                    // Forward-declared destinations (glyph catalog §01) — disabled until their
-                    // screens exist. Shown so the rail reads as the designed structure.
-                    for (glyph, color, name) in [
-                        ("\u{2726}", theme::ARCANE_BRIGHT, "Identify"),
-                        ("\u{27E1}", theme::GOLD, "Collections"),
-                        ("\u{25A4}", theme::TEXT_MUTED, "Packages"),
-                        ("\u{2756}", theme::ARCANE_BRIGHT, "Traits"),
-                        ("\u{25C9}", theme::TEXT_MUTED, "Stats"),
-                        ("\u{29C9}", theme::WARNING, "Duplicates"),
-                        ("\u{2298}", theme::DANGER, "Trash"),
-                    ] {
-                        nav_button(ui, glyph, color, false, false).on_hover_text(name);
-                        ui.add_space(5.0);
+
+                    ui.add_space(14.0);
+                    facet_group_label(ui, "STATUS");
+                    if facets_open {
+                        for (sf, label, color, count) in [
+                            (StatusFilter::All, "All", theme::TEXT_MUTED, total),
+                            (
+                                StatusFilter::Unidentified,
+                                "Unidentified",
+                                theme::STATUS_UNIDENTIFIED,
+                                unidentified,
+                            ),
+                            (
+                                StatusFilter::Identified,
+                                "Identified",
+                                theme::STATUS_IDENTIFIED,
+                                0,
+                            ),
+                            (
+                                StatusFilter::Confirmed,
+                                "Confirmed",
+                                theme::STATUS_CONFIRMED,
+                                0,
+                            ),
+                        ] {
+                            if facet_row(ui, Some(color), label, count, self.status_filter == sf)
+                                .clicked()
+                            {
+                                new_status = Some(sf);
+                            }
+                        }
                     }
-                });
-                // Settings pinned to the bottom of the rail.
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-                    if nav_button(
-                        ui,
-                        "\u{2699}",
-                        theme::TEXT_MUTED,
-                        self.screen == Screen::Settings,
-                        true,
-                    )
-                    .on_hover_text("Settings")
-                    .clicked()
-                    {
-                        self.screen = Screen::Settings;
-                        self.selected_cache_idx = None;
+
+                    ui.add_space(14.0);
+                    facet_group_label(ui, "LIBRARIES");
+                    if facets_open {
+                        if facet_row(ui, None, "All libraries", total, self.source_filter.is_none())
+                            .clicked()
+                        {
+                            new_source = Some(None);
+                        }
+                        for (i, &count) in per_source.iter().enumerate() {
+                            let name = config::stem_name(&self.scan_roots[i]);
+                            if facet_row(ui, None, &name, count, self.source_filter == Some(i))
+                                .clicked()
+                            {
+                                new_source = Some(Some(i));
+                            }
+                        }
+                        ui.add_space(4.0);
+                        // ponytail: solid 1px border stands in for the spec's dashed one —
+                        // egui strokes can't dash.
+                        if self.project_name.is_some()
+                            && ui
+                                .add_sized(
+                                    [ui.available_width(), 28.0],
+                                    egui::Button::new(
+                                        RichText::new("+ Add source\u{2026}")
+                                            .color(theme::ARCANE)
+                                            .size(12.0),
+                                    )
+                                    .fill(egui::Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::new(1.0, theme::BORDER_STRONG)),
+                                )
+                                .clicked()
+                        {
+                            add_source_clicked = true;
+                        }
                     }
                 });
             });
+
+        if go_library {
+            self.go_to_library();
+        }
+        if let Some(s) = new_screen {
+            self.screen = s;
+            self.selected_cache_idx = None;
+            self.quick_look = false;
+        }
+        if let Some(sf) = new_status {
+            self.status_filter = sf;
+            self.screen = Screen::Library;
+            self.cache_dirty = true;
+        }
+        if let Some(src) = new_source {
+            self.source_filter = src;
+            self.screen = Screen::Library;
+            self.cache_dirty = true;
+        }
+        if add_source_clicked {
+            self.add_source(ctx);
+        }
     }
 
     /// Drop every resident thumbnail texture so the grid re-generates them (e.g. after the
@@ -1510,8 +1733,10 @@ impl eframe::App for LodestashApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    // Logo: rotated gold diamond + Cinzel wordmark (UI-SPEC §0.1).
+                    logo_diamond(ui);
                     ui.label(
-                        RichText::new("\u{25C8} LODESTASH")
+                        RichText::new("LODESTASH")
                             .color(theme::GOLD)
                             .font(crate::fonts::display(16.0)),
                     );
@@ -1601,7 +1826,161 @@ impl eframe::App for LodestashApp {
                         }
                     }
 
+                    // Search mode toggle + search box (UI-SPEC §0.1). Tags is the live
+                    // substring filter; AI is a stub until the P3/P4 semantic pipeline.
+                    ui.separator();
+                    let mode_color = match self.search_mode {
+                        SearchMode::Tags => theme::GOLD,
+                        SearchMode::Ai => theme::ARCANE,
+                    };
+                    for (mode, label) in [
+                        (SearchMode::Tags, "\u{27E1} Tags"),
+                        (SearchMode::Ai, "\u{2726} AI"),
+                    ] {
+                        let active = self.search_mode == mode;
+                        let color = match mode {
+                            SearchMode::Tags => theme::GOLD,
+                            SearchMode::Ai => theme::ARCANE,
+                        };
+                        if ui
+                            .selectable_label(
+                                active,
+                                RichText::new(label).size(11.0).color(if active {
+                                    color
+                                } else {
+                                    theme::TEXT_DIM
+                                }),
+                            )
+                            .clicked()
+                            && !active
+                        {
+                            self.search_mode = mode;
+                            // Switching to Tags clears AI results (§0.1); the query
+                            // re-applies (or stops applying) as a live filter.
+                            self.cache_dirty = true;
+                        }
+                    }
+                    let hint = match self.search_mode {
+                        SearchMode::Tags => "Search\u{2026}  /",
+                        SearchMode::Ai => {
+                            "describe what you need \u{2014} e.g. \u{BB}pickup sound for rocks\u{AB} \u{2014} then Enter"
+                        }
+                    };
+                    let search_resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.search)
+                            .id(egui::Id::new("search_field"))
+                            .hint_text(hint)
+                            .desired_width(
+                                (ui.available_width() - 420.0).clamp(140.0, 400.0),
+                            ),
+                    );
+                    // Border follows the active mode; brighter while focused (§0.1).
+                    let border = if search_resp.has_focus() {
+                        egui::Stroke::new(1.5, mode_color)
+                    } else {
+                        egui::Stroke::new(1.0, mode_color.linear_multiply(0.4))
+                    };
+                    ui.painter()
+                        .rect_stroke(search_resp.rect.expand(1.0), 4.0, border);
+                    if search_resp.changed() && self.search_mode == SearchMode::Tags {
+                        self.cache_dirty = true;
+                    }
+                    if self.search_mode == SearchMode::Ai {
+                        // ponytail: stub — Enter will run §5B semantic search when P3/P4 land.
+                        ui.label(
+                            RichText::new("\u{2726} arrives with the AI pipeline (P4)")
+                                .color(theme::TEXT_DIM)
+                                .size(10.0),
+                        );
+                    }
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // AI-profile pill (§0.1 #7) — arcane outline; links to Settings → AI.
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("\u{2726} local")
+                                        .color(theme::ARCANE)
+                                        .size(11.0),
+                                )
+                                .fill(egui::Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::new(1.0, theme::ARCANE))
+                                .rounding(999.0),
+                            )
+                            .on_hover_text("Active identify profile \u{2014} configure in Settings")
+                            .clicked()
+                        {
+                            self.screen = Screen::Settings;
+                        }
+
+                        // Project chip (§0.1 #6) — engine projects arrive with the P5 bridge.
+                        let chip = ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("\u{25CF} No project \u{B7} \u{2014}  \u{25BE}")
+                                        .color(theme::TEXT_DIM)
+                                        .size(11.0),
+                                )
+                                .fill(theme::SURFACE)
+                                .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                                .rounding(999.0),
+                            );
+                        let chip_popup = ui.make_persistent_id("project_chip_popup");
+                        if chip.clicked() {
+                            ui.memory_mut(|m| m.toggle_popup(chip_popup));
+                        }
+                        egui::popup::popup_below_widget(
+                            ui,
+                            chip_popup,
+                            &chip,
+                            egui::PopupCloseBehavior::CloseOnClickOutside,
+                            |ui| {
+                                ui.set_min_width(220.0);
+                                // ponytail: §16 switcher stub — real engine projects register
+                                // through the P5 Unity bridge.
+                                ui.label(
+                                    RichText::new("No engine projects yet")
+                                        .color(theme::TEXT)
+                                        .size(12.0),
+                                );
+                                ui.label(
+                                    RichText::new(
+                                        "Unity projects appear here once the editor \
+                                         bridge (P5) registers them.",
+                                    )
+                                    .color(theme::TEXT_DIM)
+                                    .size(11.0),
+                                );
+                            },
+                        );
+
+                        // Health meter (§0.1 #5): mono label over a 6px gold bar.
+                        // ponytail: identified is 0 pre-catalog — the status flow lands in P3.
+                        let total = self.entries.len();
+                        let identified = 0_usize;
+                        ui.vertical(|ui| {
+                            ui.set_width(180.0);
+                            ui.spacing_mut().item_spacing.y = 3.0;
+                            ui.label(
+                                RichText::new(format!("Identified {identified} / {total}"))
+                                    .color(theme::TEXT_MUTED)
+                                    .monospace()
+                                    .size(10.0),
+                            );
+                            let (bar, _) = ui
+                                .allocate_exact_size(egui::vec2(180.0, 6.0), egui::Sense::hover());
+                            let painter = ui.painter();
+                            painter.rect_filled(bar, 3.0, theme::BORDER);
+                            if total > 0 && identified > 0 {
+                                let frac = identified as f32 / total as f32;
+                                let fill = egui::Rect::from_min_size(
+                                    bar.min,
+                                    egui::vec2(bar.width() * frac, bar.height()),
+                                );
+                                painter.rect_filled(fill, 3.0, theme::GOLD);
+                            }
+                        });
+
                         if self.pending_thumbs > 0 {
                             ui.label(
                                 RichText::new(format!(
@@ -1626,8 +2005,8 @@ impl eframe::App for LodestashApp {
             self.add_source(ctx);
         }
 
-        // ── Navigation rail (left) ────────────────────────────────────────────
-        self.nav_rail(ctx);
+        // ── Sidebar (left, UI-SPEC §0.2) ──────────────────────────────────────
+        self.sidebar(ctx);
 
         // ── Category tab bar + view toolbar ──────────────────────────────────
         if self.screen == Screen::Library && !self.entries.is_empty() {
@@ -1644,76 +2023,8 @@ impl eframe::App for LodestashApp {
                         .stroke(egui::Stroke::new(1.0, theme::BORDER)),
                 )
                 .show(ctx, |ui| {
-                    // Library tabs — the primary grouping when a project has more than one
-                    // source, so browsing never mixes unrelated packs into one anonymous pile
-                    // (DESIGN-GUIDELINES.md §7 "Browse views"). Folders view already separates
-                    // sources structurally via folder tiles, so this only applies to Flat.
-                    if self.scan_roots.len() > 1 && self.view_mode == ViewMode::Flat {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 2.0;
-                            let is_all = self.source_filter.is_none();
-                            let all_resp =
-                                ui.add(
-                                    egui::Button::new(
-                                        RichText::new("All libraries").size(12.0).color(
-                                            if is_all { theme::GOLD } else { theme::TEXT_DIM },
-                                        ),
-                                    )
-                                    .fill(egui::Color32::TRANSPARENT)
-                                    .stroke(egui::Stroke::NONE)
-                                    .frame(false),
-                                );
-                            if all_resp.clicked() {
-                                self.source_filter = None;
-                                self.cache_dirty = true;
-                            }
-                            if is_all {
-                                let rect = all_resp.rect;
-                                ui.painter().line_segment(
-                                    [
-                                        egui::pos2(rect.min.x, rect.max.y),
-                                        egui::pos2(rect.max.x, rect.max.y),
-                                    ],
-                                    egui::Stroke::new(2.0, theme::GOLD),
-                                );
-                            }
-                            ui.add_space(8.0);
-
-                            for i in 0..self.scan_roots.len() {
-                                let is_active = self.source_filter == Some(i);
-                                let name = config::stem_name(&self.scan_roots[i]);
-                                let resp = ui.add(
-                                    egui::Button::new(RichText::new(name).size(12.0).color(
-                                        if is_active {
-                                            theme::GOLD
-                                        } else {
-                                            theme::TEXT_DIM
-                                        },
-                                    ))
-                                    .fill(egui::Color32::TRANSPARENT)
-                                    .stroke(egui::Stroke::NONE)
-                                    .frame(false),
-                                );
-                                if resp.clicked() {
-                                    self.source_filter = Some(i);
-                                    self.cache_dirty = true;
-                                }
-                                if is_active {
-                                    let rect = resp.rect;
-                                    ui.painter().line_segment(
-                                        [
-                                            egui::pos2(rect.min.x, rect.max.y),
-                                            egui::pos2(rect.max.x, rect.max.y),
-                                        ],
-                                        egui::Stroke::new(2.0, theme::GOLD),
-                                    );
-                                }
-                                ui.add_space(8.0);
-                            }
-                        });
-                        ui.add_space(2.0);
-                    }
-
+                    // (Library pill tabs lived here; the sidebar LIBRARIES facet group
+                    // absorbed them — UI-SPEC §0.2.)
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
                         for (i, &(cat, label)) in Category::TABS.iter().enumerate() {
@@ -1768,133 +2079,143 @@ impl eframe::App for LodestashApp {
                         .stroke(egui::Stroke::new(1.0, theme::BORDER)),
                 )
                 .show(ctx, |ui| {
+                    // Result header row (UI-SPEC §2.2): result label · hint text · sort ·
+                    // ⚑ Filters · grid density · view toggle. Pack/collection filter chips
+                    // join once the P2 packages model / P3 collections can activate them.
                     ui.horizontal(|ui| {
-                        let search_resp = ui.add(
-                            egui::TextEdit::singleline(&mut self.search)
-                                .id(egui::Id::new("search_field"))
-                                .hint_text("Search\u{2026}  /")
-                                .desired_width(180.0),
-                        );
-                        if search_resp.changed() {
-                            self.cache_dirty = true;
-                        }
-
-                        // ⚑ Filters button + content-filter popover (design §2, §3).
-                        ui.separator();
-                        let active = self.content_filter.any_active();
-                        let ftext = if active {
+                        let library_label = match self.source_filter {
+                            Some(i) => config::stem_name(&self.scan_roots[i]),
+                            None => self
+                                .project_name
+                                .clone()
+                                .unwrap_or_else(|| "All libraries".into()),
+                        };
+                        ui.label(
                             RichText::new(format!(
-                                "\u{2691} Filters  {}",
-                                self.content_filter.active_count()
+                                "{} assets \u{B7} {library_label}",
+                                self.sorted_cache.len()
                             ))
-                            .color(theme::BG)
-                            .size(11.0)
-                        } else {
-                            RichText::new("\u{2691} Filters")
-                                .color(theme::TEXT)
-                                .size(11.0)
-                        };
-                        let mut fbtn = egui::Button::new(ftext);
-                        if active {
-                            fbtn = fbtn
-                                .fill(theme::GOLD)
-                                .stroke(egui::Stroke::new(1.0, theme::GOLD));
-                        }
-                        let fresp = ui.add(fbtn);
-                        let popup_id = ui.make_persistent_id("filters_popup");
-                        if fresp.clicked() {
-                            ui.memory_mut(|m| m.toggle_popup(popup_id));
-                        }
-                        let cf = &mut self.content_filter;
-                        let tiers = &self.config.size_tiers;
-                        let mut filter_changed = false;
-                        egui::popup::popup_below_widget(
-                            ui,
-                            popup_id,
-                            &fresp,
-                            egui::PopupCloseBehavior::CloseOnClickOutside,
-                            |ui| {
-                                filter_changed = filter_popover(ui, cf, tiers);
-                            },
+                            .color(theme::TEXT_MUTED)
+                            .size(12.0),
                         );
-                        if filter_changed {
-                            self.cache_dirty = true;
+
+                        // Hint text — dim, hidden on narrow windows (§2.2).
+                        if ctx.screen_rect().width() >= 1200.0 {
+                            ui.label(
+                                RichText::new(
+                                    "Space quick-looks \u{B7} \u{2922} full size \u{B7} \u{27E1} stage",
+                                )
+                                .color(theme::TEXT_DIM)
+                                .size(11.0),
+                            );
                         }
 
-                        // Browse view toggle (DESIGN-GUIDELINES.md §7 "Browse views").
-                        ui.separator();
-                        for (mode, label) in
-                            [(ViewMode::Flat, "Grid"), (ViewMode::Folders, "Folders")]
-                        {
-                            let active = self.view_mode == mode;
-                            if ui
-                                .selectable_label(active, RichText::new(label).size(11.0))
-                                .clicked()
-                                && !active
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Browse view toggle (DESIGN-GUIDELINES.md §7 "Browse views").
+                            for (mode, label) in
+                                [(ViewMode::Folders, "Folders"), (ViewMode::Flat, "Grid")]
                             {
-                                self.view_mode = mode;
-                                self.nav_to(self.default_dir());
-                                self.save_view_prefs();
-                            }
-                        }
-
-                        ui.separator();
-                        ui.label(RichText::new("Sort").color(theme::TEXT_DIM).size(11.0));
-
-                        let sort_before = self.sort_by;
-                        egui::ComboBox::from_id_salt("sort_combo")
-                            .width(72.0)
-                            .selected_text(
-                                RichText::new(self.sort_by.label())
-                                    .color(theme::TEXT)
-                                    .size(11.0),
-                            )
-                            .show_ui(ui, |ui| {
-                                for &(s, label) in SortBy::OPTIONS {
-                                    ui.selectable_value(&mut self.sort_by, s, label);
-                                }
-                            });
-
-                        let asc_before = self.sort_asc;
-                        let dir_label = if self.sort_asc {
-                            "\u{2191}"
-                        } else {
-                            "\u{2193}"
-                        };
-                        if ui.small_button(dir_label).clicked() {
-                            self.sort_asc = !self.sort_asc;
-                        }
-
-                        if self.sort_by != sort_before || self.sort_asc != asc_before {
-                            self.cache_dirty = true;
-                            self.save_view_prefs();
-                        }
-
-                        // Grid-size segmented selector (design §2) — grid view only; drives the
-                        // persisted `thumb_size`, the single source of truth.
-                        if self.view_mode == ViewMode::Flat {
-                            ui.separator();
-                            ui.label(RichText::new("Grid").color(theme::TEXT_DIM).size(11.0));
-                            for (px, label) in GRID_STOPS {
-                                let active = (self.thumb_size - px).abs() < 8.0;
+                                let active = self.view_mode == mode;
                                 if ui
                                     .selectable_label(active, RichText::new(label).size(11.0))
                                     .clicked()
                                     && !active
                                 {
-                                    self.thumb_size = px;
+                                    self.view_mode = mode;
+                                    self.nav_to(self.default_dir());
                                     self.save_view_prefs();
-                                    self.cache_dirty = true;
                                 }
                             }
-                        }
 
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(format!("{} assets", self.sorted_cache.len()))
-                                    .color(theme::TEXT_MUTED)
-                                    .size(11.0),
+                            // Grid-size segmented selector (design §2) — grid view only;
+                            // drives the persisted `thumb_size`, the single source of truth.
+                            if self.view_mode == ViewMode::Flat {
+                                ui.separator();
+                                for (px, label) in GRID_STOPS.iter().rev() {
+                                    let active = (self.thumb_size - px).abs() < 8.0;
+                                    if ui
+                                        .selectable_label(active, RichText::new(*label).size(11.0))
+                                        .clicked()
+                                        && !active
+                                    {
+                                        self.thumb_size = *px;
+                                        self.save_view_prefs();
+                                        self.cache_dirty = true;
+                                    }
+                                }
+                            }
+
+                            // ⚑ Filters button + content-filter popover (design §2, §3).
+                            ui.separator();
+                            let active = self.content_filter.any_active();
+                            let ftext = if active {
+                                RichText::new(format!(
+                                    "\u{2691} Filters  {}",
+                                    self.content_filter.active_count()
+                                ))
+                                .color(theme::BG)
+                                .size(11.0)
+                            } else {
+                                RichText::new("\u{2691} Filters")
+                                    .color(theme::TEXT)
+                                    .size(11.0)
+                            };
+                            let mut fbtn = egui::Button::new(ftext);
+                            if active {
+                                fbtn = fbtn
+                                    .fill(theme::GOLD)
+                                    .stroke(egui::Stroke::new(1.0, theme::GOLD));
+                            }
+                            let fresp = ui.add(fbtn);
+                            let popup_id = ui.make_persistent_id("filters_popup");
+                            if fresp.clicked() {
+                                ui.memory_mut(|m| m.toggle_popup(popup_id));
+                            }
+                            let cf = &mut self.content_filter;
+                            let tiers = &self.config.size_tiers;
+                            let mut filter_changed = false;
+                            egui::popup::popup_below_widget(
+                                ui,
+                                popup_id,
+                                &fresp,
+                                egui::PopupCloseBehavior::CloseOnClickOutside,
+                                |ui| {
+                                    filter_changed = filter_popover(ui, cf, tiers);
+                                },
                             );
+                            if filter_changed {
+                                self.cache_dirty = true;
+                            }
+
+                            // Sort select + direction.
+                            ui.separator();
+                            let sort_before = self.sort_by;
+                            let asc_before = self.sort_asc;
+                            let dir_label = if self.sort_asc {
+                                "\u{2191}"
+                            } else {
+                                "\u{2193}"
+                            };
+                            if ui.small_button(dir_label).clicked() {
+                                self.sort_asc = !self.sort_asc;
+                            }
+                            egui::ComboBox::from_id_salt("sort_combo")
+                                .width(72.0)
+                                .selected_text(
+                                    RichText::new(self.sort_by.label())
+                                        .color(theme::TEXT)
+                                        .size(11.0),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for &(s, label) in SortBy::OPTIONS {
+                                        ui.selectable_value(&mut self.sort_by, s, label);
+                                    }
+                                });
+                            ui.label(RichText::new("Sort").color(theme::TEXT_DIM).size(11.0));
+                            if self.sort_by != sort_before || self.sort_asc != asc_before {
+                                self.cache_dirty = true;
+                                self.save_view_prefs();
+                            }
                         });
                     });
                 });
@@ -1999,6 +2320,7 @@ impl eframe::App for LodestashApp {
         let mut spawn_queue: Vec<usize> = Vec::new();
         let mut clicked_cache: Option<usize> = None;
         let mut evict_window: Option<(usize, usize, usize)> = None;
+        let mut back_to_library = false;
 
         egui::CentralPanel::default()
             .frame(
@@ -2007,9 +2329,39 @@ impl eframe::App for LodestashApp {
                     .inner_margin(egui::Margin::same(12.0)),
             )
             .show(ctx, |ui| {
-                if self.screen == Screen::Settings {
-                    self.settings_screen(ui, ctx);
-                    return;
+                // §0 ambience: faint radial gradients — gold top-right, arcane bottom-left.
+                let panel = ui.max_rect();
+                let d = panel.width() * 0.55;
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                if let Some(tex) = &self.bg_gold {
+                    ui.painter().image(
+                        tex.id(),
+                        egui::Rect::from_center_size(panel.right_top(), Vec2::splat(d)),
+                        uv,
+                        egui::Color32::WHITE,
+                    );
+                }
+                if let Some(tex) = &self.bg_arcane {
+                    ui.painter().image(
+                        tex.id(),
+                        egui::Rect::from_center_size(panel.left_bottom(), Vec2::splat(d)),
+                        uv,
+                        egui::Color32::WHITE,
+                    );
+                }
+                match self.screen {
+                    Screen::Settings => {
+                        self.settings_screen(ui, ctx);
+                        return;
+                    }
+                    Screen::Library => {}
+                    // Unbuilt destinations render the §12 stub — never a dead click.
+                    other => {
+                        if stub_screen(ui, other) {
+                            back_to_library = true;
+                        }
+                        return;
+                    }
                 }
                 if self.entries.is_empty() {
                     if self.scanning {
@@ -2019,6 +2371,52 @@ impl eframe::App for LodestashApp {
                     }
                     return;
                 }
+                // Unidentified nudge (UI-SPEC §2.1) — pre-catalog, every asset is
+                // Unidentified, so the count is the whole library until P3 status lands.
+                if !self.nudge_dismissed && !self.entries.is_empty() {
+                    let n = self.entries.len();
+                    egui::Frame::none()
+                        .fill(theme::WARNING.linear_multiply(0.10))
+                        .stroke(egui::Stroke::new(1.0, theme::WARNING.linear_multiply(0.45)))
+                        .rounding(4.0)
+                        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{n} assets are Unidentified \u{2014} invisible to AI \
+                                         search until appraised."
+                                    ))
+                                    .color(theme::WARNING)
+                                    .size(12.0),
+                                );
+                                if ui
+                                    .link(
+                                        RichText::new("Open Identify mode \u{2192}")
+                                            .color(theme::GOLD)
+                                            .size(12.0),
+                                    )
+                                    .clicked()
+                                {
+                                    self.screen = Screen::Identify;
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .small_button(RichText::new("\u{2715}").size(10.0))
+                                            .on_hover_text("Dismiss for this session")
+                                            .clicked()
+                                        {
+                                            self.nudge_dismissed = true;
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                    ui.add_space(6.0);
+                }
+
                 if self.view_mode == ViewMode::Folders {
                     self.folders_nav_ui(ui);
                 }
@@ -2056,6 +2454,9 @@ impl eframe::App for LodestashApp {
                 }
             });
 
+        if back_to_library {
+            self.go_to_library();
+        }
         if let Some((cols, row_start, row_end)) = evict_window {
             self.evict_far_thumbnails(cols, row_start, row_end);
         }
@@ -2939,52 +3340,200 @@ fn filter_chip(ui: &mut Ui, label: &str, selected: bool, color: egui::Color32) -
     resp.interact(egui::Sense::click()).clicked()
 }
 
-/// A navigation-rail glyph button. Active shows a gold left-accent; disabled dims the glyph.
-fn nav_button(
+/// The top-bar logo: an 18px rotated gold diamond with an inner bright dot and a
+/// faint glow (UI-SPEC §0.1).
+fn logo_diamond(ui: &mut Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(22.0), egui::Sense::hover());
+    let painter = ui.painter();
+    let c = rect.center();
+    let diamond = |r: f32| {
+        vec![
+            c + egui::vec2(0.0, -r),
+            c + egui::vec2(r, 0.0),
+            c + egui::vec2(0.0, r),
+            c + egui::vec2(-r, 0.0),
+        ]
+    };
+    // Faint glow: a slightly larger, mostly-transparent gold diamond behind.
+    painter.add(egui::Shape::convex_polygon(
+        diamond(11.0),
+        theme::GOLD.linear_multiply(0.10),
+        egui::Stroke::NONE,
+    ));
+    painter.add(egui::Shape::convex_polygon(
+        diamond(9.0),
+        egui::Color32::TRANSPARENT,
+        egui::Stroke::new(2.0, theme::GOLD),
+    ));
+    painter.circle_filled(c, 2.2, theme::GOLD_BRIGHT);
+}
+
+/// A 128×128 radial-falloff sprite in `color`, peaking at `max_alpha` in the centre.
+/// Stretched over the background for the §0 ambience gradients.
+fn radial_image(color: egui::Color32, max_alpha: u8) -> egui::ColorImage {
+    const N: usize = 128;
+    let mut img = egui::ColorImage::new([N, N], egui::Color32::TRANSPARENT);
+    let half = (N as f32 - 1.0) / 2.0;
+    for y in 0..N {
+        for x in 0..N {
+            let dx = (x as f32 - half) / half;
+            let dy = (y as f32 - half) / half;
+            let d = (dx * dx + dy * dy).sqrt().min(1.0);
+            let a = ((1.0 - d) * max_alpha as f32) as u8;
+            img.pixels[y * N + x] =
+                egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a);
+        }
+    }
+    img
+}
+
+/// One 32px sidebar navigation row: glyph + label + optional amber count badge.
+/// Active shows an `--ls-overlay` fill + 2px gold left border (UI-SPEC §0.2).
+fn sidebar_nav_row(
     ui: &mut Ui,
     glyph: &str,
-    color: egui::Color32,
+    glyph_color: egui::Color32,
+    label: &str,
+    badge: Option<usize>,
     active: bool,
-    enabled: bool,
 ) -> egui::Response {
-    let sense = if enabled {
-        egui::Sense::click()
-    } else {
-        egui::Sense::hover()
-    };
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(38.0), sense);
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::click());
     let painter = ui.painter();
-    let bg = if active {
-        theme::OVERLAY
-    } else if enabled && resp.hovered() {
-        theme::OVERLAY.linear_multiply(0.5)
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    painter.rect_filled(rect, 7.0, bg);
     if active {
+        painter.rect_filled(rect, 4.0, theme::OVERLAY);
         painter.rect_filled(
-            egui::Rect::from_min_size(
-                rect.left_top() + egui::vec2(-5.0, 7.0),
-                egui::vec2(3.0, rect.height() - 14.0),
-            ),
-            2.0,
+            egui::Rect::from_min_size(rect.left_top(), egui::vec2(2.0, rect.height())),
+            0.0,
             theme::GOLD,
         );
+    } else if resp.hovered() {
+        painter.rect_filled(rect, 4.0, theme::OVERLAY.linear_multiply(0.5));
     }
-    let gc = if enabled {
-        color
-    } else {
-        color.linear_multiply(0.32)
-    };
     painter.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
+        rect.left_center() + egui::vec2(12.0, 0.0),
+        egui::Align2::LEFT_CENTER,
         glyph,
-        egui::FontId::proportional(19.0),
-        gc,
+        egui::FontId::proportional(15.0),
+        glyph_color,
+    );
+    painter.text(
+        rect.left_center() + egui::vec2(36.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        if active { theme::TEXT } else { theme::TEXT_MUTED },
+    );
+    if let Some(n) = badge {
+        let galley = painter.layout_no_wrap(n.to_string(), egui::FontId::monospace(10.0), theme::BG);
+        let pad = egui::vec2(6.0, 2.0);
+        let size = galley.size() + pad * 2.0;
+        let pill = egui::Rect::from_min_size(
+            egui::pos2(rect.max.x - size.x - 8.0, rect.center().y - size.y / 2.0),
+            size,
+        );
+        painter.rect_filled(pill, size.y / 2.0, theme::WARNING);
+        painter.galley(pill.min + pad, galley, theme::BG);
+    }
+    resp
+}
+
+/// A letter-spaced dim facet-group label (STATUS / LIBRARIES).
+fn facet_group_label(ui: &mut Ui, text: &str) {
+    // ponytail: egui has no letter-spacing; spaced chars approximate the design token.
+    let spaced: String = text.chars().flat_map(|c| [c, ' ']).collect();
+    ui.label(
+        RichText::new(spaced.trim_end())
+            .color(theme::TEXT_DIM)
+            .size(10.0),
+    );
+    ui.add_space(2.0);
+}
+
+/// A 26px facet row: optional rotated status diamond + label + right-aligned mono count.
+fn facet_row(
+    ui: &mut Ui,
+    dot: Option<egui::Color32>,
+    label: &str,
+    count: usize,
+    active: bool,
+) -> egui::Response {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
+    let painter = ui.painter();
+    if active {
+        painter.rect_filled(rect, 4.0, theme::OVERLAY);
+        painter.rect_filled(
+            egui::Rect::from_min_size(rect.left_top(), egui::vec2(2.0, rect.height())),
+            0.0,
+            theme::GOLD,
+        );
+    } else if resp.hovered() {
+        painter.rect_filled(rect, 4.0, theme::OVERLAY.linear_multiply(0.5));
+    }
+    let mut x = rect.min.x + 12.0;
+    if let Some(color) = dot {
+        // "◆" is already the rotated status diamond (DESIGN-GUIDELINES §6).
+        painter.text(
+            egui::pos2(x, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            "\u{25C6}",
+            egui::FontId::proportional(9.0),
+            color,
+        );
+        x += 16.0;
+    }
+    painter.text(
+        egui::pos2(x, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(12.0),
+        if active { theme::TEXT } else { theme::TEXT_MUTED },
+    );
+    painter.text(
+        egui::pos2(rect.max.x - 8.0, rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        count.to_string(),
+        egui::FontId::monospace(11.0),
+        theme::TEXT_DIM,
     );
     resp
+}
+
+/// The §12 stub screen for navigable-but-unbuilt destinations. Returns true when
+/// "← Back to Library" was clicked.
+fn stub_screen(ui: &mut Ui, screen: Screen) -> bool {
+    let mut back = false;
+    ui.vertical_centered(|ui| {
+        ui.add_space(ui.available_height() * 0.25);
+        ui.label(
+            RichText::new(screen.glyph())
+                .size(52.0)
+                .color(theme::TEXT_DIM),
+        );
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(screen.label())
+                .color(theme::TEXT)
+                .font(crate::fonts::display(24.0)),
+        );
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(screen.stub_line())
+                .color(theme::TEXT_MUTED)
+                .size(13.0),
+        );
+        ui.add_space(2.0);
+        ui.label(RichText::new("Not wired yet.").color(theme::TEXT_DIM).size(11.0));
+        ui.add_space(12.0);
+        if ui
+            .button(RichText::new("\u{2190} Back to Library").color(theme::GOLD))
+            .clicked()
+        {
+            back = true;
+        }
+    });
+    back
 }
 
 /// A blacklist exclusion chip: tinted value + a ✕. Returns true if the ✕ was clicked (remove).

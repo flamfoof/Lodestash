@@ -102,8 +102,8 @@ are Library filters). Sidebar scrolls as one column.
 Under the top bar, on Library and Identify: `All` + one tab per `media_type` **with a non-zero
 count** (`All · 3D Models · Audio · Images · Textures · Materials · Fonts · Sprites`), each showing
 its count and colored by its type token when active (2px underline in the type color). Zero-count
-types hide; `All` never hides. Second row (Library only, >1 source, Flat view): the **Library tabs**
-(DESIGN-GUIDELINES §7 "Browse views").
+types hide; `All` never hides. *(The earlier second-row Library tabs are gone — the sidebar
+LIBRARIES facet group (§0.2) absorbed the per-source filter.)*
 
 ### 0.4 Keyboard map (global)
 
@@ -158,11 +158,15 @@ The browse-everything grid. Composition top→bottom:
 1. **Unidentified nudge** (when count > 0): slim amber banner — *"N assets are Unidentified —
    invisible to AI search until appraised."* + **Open Identify mode →**. Dismisses for the session.
 2. **Result header row**: result label (`N assets · <library>` or `✦ N ranked matches for "q"`);
-   active **pack** and **collection** filter chips (gold outline pill with ✕ to clear); hint text
+   active **pack** and **collection** filter chips (gold outline pill with ✕ to clear — activate
+   once the P2 packages model / P3 collections exist); hint text
    `Space quick-looks · ⤢ full size · ⟡ stage` (dim, hidden < 1200px); **sort select**
-   (default / name A–Z / largest / smallest / tri count — sort is disabled while AI-ranked results
-   are shown); **⚑ Filters** button; **grid-density segmented** (▪ Compact ▦ Cozy ▣ Large — card
-   min-widths **150 / 205 / 288px**); **view toggle** ⊞ grid / ☰ list.
+   (⚖ resolution: shipped sort keys are name / date / size / type ± direction per
+   DESIGN-GUIDELINES §7 — richer than the prototype's list; tri count joins with P1 metadata;
+   sort is disabled while AI-ranked results are shown); **⚑ Filters** button; **grid-density
+   segmented** (▪ Compact ▦ Cozy ▣ Large — card min-widths **150 / 205 / 288px**); **view
+   toggle** ⊞ grid / ☰ list (list view still pending — the shipped toggle is Grid / Folders,
+   DESIGN-GUIDELINES §7 "Browse views").
 3. **Content filter popover** (⚑, 328px, elevation 2) — DESIGN-GUIDELINES §7: TRAIT chip cloud with
    search (arcane select-state), TRIANGLES buckets `≤1k · 1k–3k · 3k–6k · 6k+` (violet, models
    only), FILE SIZE tiers S/M/L/XL with live ranges from §11.4 (tier-colored). Multi-select within
