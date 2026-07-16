@@ -77,7 +77,14 @@ intended text/background use.
 |---|---|---|
 | `--ls-type-model` | `#A98BFF` | **Models** (3D) — amethyst |
 | `--ls-type-sound` | `#49C9E0` | **Sounds** (audio) — aqua |
-| `--ls-type-image` | `#6FB1FF` | **Images** (textures) — sapphire |
+| `--ls-type-image` | `#6FB1FF` | **Images** — sapphire |
+| `--ls-type-texture` | `#6FB1FF` | **Textures** — shares sapphire with images |
+| `--ls-type-material` | `#A98BFF` | **Materials** — shares amethyst with models |
+| `--ls-type-sprite` | `#5BD897` | **Sprites** — verdant |
+| `--ls-type-font` | `#F2966E` | **Fonts** — coral |
+
+One row per `media_type` value (the 7-value enum, [`DATA-MODEL.md`](DATA-MODEL.md)); shared hues
+keep the palette calm — the type **icon** disambiguates within a hue family (§9: never color alone).
 
 ### Status / rarity colors
 | Token | Hex | Status |
@@ -193,22 +200,30 @@ The single most important visual language. Every asset shows status three ways (
 
 ## 7. Core components
 
+> **Screen-by-screen functional spec:** [`UI-SPEC.md`](UI-SPEC.md) owns what each screen shows and
+> does; this section owns the reusable components and their visual rules.
+
 ### Top bar
-Logo + global search (with mode toggle, §below) + library health meter + active AI-profile chip
-(shows GPU tier / model set, links to AI-MODELS-BY-GPU) + settings. Height 48px, `--ls-surface-raised`.
+Logo + global search (with mode toggle, §below) + library health meter (`Identified n/total` over a
+gold progress bar) + **project chip** (§below) + active AI-profile pill (shows GPU tier / model set,
+links to AI-MODELS-BY-GPU). Height 48px, `--ls-surface-raised`. The media-type filter is its own
+**tab row** beneath the bar ([`UI-SPEC.md`](UI-SPEC.md) §0.3), not inline chips.
 
 ### Search bar with **mode toggle**
 A segmented control: **⟨ Tags ⟩ ⟨ AI ⟩** (`ls-search-tags` / `ls-search-ai`).
 - **Tags** mode → gold accent, placeholder "filter by tag…".
 - **AI** mode → arcane-teal accent + subtle glow, placeholder "describe what you need…".
 The active mode colors the input's focus ring so you always know which engine you're querying.
-A **category segmented filter** (All · Models · Sounds · Images) sits beside it, each with its type
-color + icon.
-
-### Sidebar (facets)
-Collapsible groups: Libraries/Packages (tree, publisher → category → pack), Status (Unid/Id/Confirmed
-counts), Type, Tags (top + search), Mapping categories. Each facet row shows a **count** in dim
-tabular figures. Selected facet gets a gold left-border.
+### Sidebar (navigation + facets)
+A single **210px labeled sidebar** (`--ls-surface`), three stacked groups
+([`UI-SPEC.md`](UI-SPEC.md) §0.2): **navigation** (Library / Identify / Collections / Packages /
+Traits / Stats / Duplicates / Trash / Settings — glyph + label + amber warn-badges for Identify/
+Duplicates/Trash counts; Library doubles as the reset-to-everything affordance), then a **STATUS**
+facet group (All / Unid / Identified / Confirmed with diamond dots), then a **LIBRARIES** facet
+group (one row per Library Source) with a dashed **+ Add source…**. Each facet row shows a
+**count** in dim tabular figures; the active row gets a 2px gold left-border + `--ls-overlay` fill.
+Unbuilt destinations render a stub screen — never hide the row. *(Supersedes the earlier icon-only
+nav-rail treatment.)*
 
 ### Asset card (grid) — the "item card"
 The hero component. Compact, scannable:
@@ -253,12 +268,14 @@ Two-pane: raw tags (left) → canonical categories tree (right), with rules betw
 rules list with priority. Pinned (manual) assignments get a small lock.
 
 ### Staging tray (the shortlist)
-A **collect-then-import** dock (`ls-action-stage`), pinned to the right edge or above the job tray. Holds the
-shared shortlist — items you (or Claude over MCP) stage while browsing; the **same tray appears in the
-GUI and the Unity panel**. Compact thumbnail strip with a count badge, a **target project** selector
-(`ls-project`, defaults to the active editor), a **dest subfolder** field, and a primary **Import all**
-(`ls-import`) action. Empty state: "Stage candidates as you browse, then import the keepers together."
-Use `--ls-gold` for its accent (it's an action surface, not an AI one).
+A **collect-then-import** dock (`ls-action-stage`), pinned bottom-right. Holds the **active
+project's** shortlist — staging is **per-project** ([`DATA-MODEL.md`](DATA-MODEL.md) §9): switching
+projects swaps trays, never mixes picks. Items you (or Claude over MCP) stage while browsing appear
+in the GUI tray and the Unity panel alike. Compact thumbnail strip with a count badge, a dependency
+summary line (`N picks → M files incl. materials & textures`), a **dest subfolder** field, and a
+primary **Import all → <project>** (`ls-import`) action; dup-guard conflicts offer Overwrite / Skip
+existing ([`UI-SPEC.md`](UI-SPEC.md) §16.2). Empty state: "Stage candidates as you browse, then
+import the keepers together." Use `--ls-gold` for its accent (it's an action surface, not an AI one).
 
 ### "Already imported" badge
 When an asset already has an `import_record` for the active project, mark it with a small **`ls-import`
@@ -363,9 +380,9 @@ originals unless the on-disk delete was explicitly chosen.
 
 ### Settings / Preferences
 A scrollable screen (max content width ≈ 760px, section cards on `--ls-surface`, `--r-lg` radius,
-letter-spaced 10px section labels) behind `ls-nav-settings`, reached from the left **navigation rail**
-(Library ⊞ at top, Settings ⚙ at the bottom; the Library glyph is the reset-to-everything affordance,
-§Browse views). Groups:
+letter-spaced 10px section labels) behind `ls-nav-settings` in the **sidebar** (§Sidebar; the
+Library entry is the reset-to-everything affordance, §Browse views). The card-by-card expansion is
+[`UI-SPEC.md`](UI-SPEC.md) §11. Groups:
 - **Library** (the Sources manager below), incl. a **per-source blacklist** — folder/asset exclusions
   that skip cataloguing (never touch disk); a new field on `import_source`
   ([`DATA-MODEL.md`](DATA-MODEL.md) §1) honoured by the crawler ([`INGESTION.md`](INGESTION.md)).

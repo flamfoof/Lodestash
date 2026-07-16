@@ -42,8 +42,13 @@ against the `claude-api` skill before implementing.
 - **In-process**, sharing the catalog DB/index handle — a desktop tool is single-user and local; a
   separate microservice would add a hop and a second failure mode for no benefit.
 - **Transport**: **stdio by default** (zero network surface, lowest latency, exactly what Claude
-  Desktop/Code expect). Optional **Streamable HTTP** later for multiple/remote clients (apply the same
-  loopback + token + origin rules). The old HTTP+SSE transport is deprecated — do not build on it.
+  Desktop/Code expect). Optional **Streamable HTTP** for multiple/remote clients (same loopback +
+  token + origin rules): bound to a **stable configurable port (default 4319)** — unlike the engine
+  API's ephemeral port — since MCP clients configure a URL by hand. The Settings → MCP card
+  ([`UI-SPEC.md`](UI-SPEC.md) §11.5) toggles this transport, shows endpoint + rotating token, and
+  gates tools by **permission group** (search&read / tag&traits / identify); side-effecting
+  import/export tools stay confirm-gated per call regardless. The old HTTP+SSE transport is
+  deprecated — do not build on it.
 - **Registration**: `claude mcp add --transport stdio lodestash -- <lodestash --mcp>` for Claude Code;
   JSON config entry for Claude Desktop.
 
@@ -70,7 +75,7 @@ against the `claude-api` skill before implementing.
 | `import_to_project` | `id`(s), `dest_subfolder?`, `with_dependencies?`, `project_id?` | imports the asset(s) + dependency closure **into the open Unity project** (vs. `export_asset`'s arbitrary path). Enqueues onto the shared import queue the running plugin drains on Unity's main thread (§3). Returns a `job_id`; `409 project_not_registered` if no editor is listening *(side-effecting — confirm)* |
 | `register_project` | `project_path`, `unity_version`, `can_execute_main_thread` | registers the open editor so the model knows where "into Unity" means *(usually called by the plugin, exposed for completeness)* |
 | `list_projects` / `get_active_project` | — | registered editors + which is active |
-| `stage_asset` / `list_staged` | `id`(s) / — | add to / read the **shared shortlist** (the staging tray; one `is_staging` collection — §2 agent loop) |
+| `stage_asset` / `list_staged` | `id`(s), `project_id?` / `project_id?` | add to / read a **project's staging tray** (one `is_staging` collection per project, default: active — §2 agent loop) |
 | `import_staged` | `dest_subfolder?`, `project_id?`, `clear?` | import the whole staged shortlist into the open project via the import queue |
 | `get_job_status` | `job_id` | progress/result for long ops |
 | `cancel_job` | `job_id` | requests cancellation of a running job (idempotent; job flips to `cancelled`) |

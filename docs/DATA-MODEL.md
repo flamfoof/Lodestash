@@ -106,7 +106,13 @@ CREATE TABLE tag (
   norm_name TEXT NOT NULL UNIQUE,         -- lowercased/trimmed for matching
   namespace TEXT,                         -- facet: subject|style|material|color|mood|usage|audio|technical|free (IDENTIFICATION-AND-SEARCH.md §2)
   color     TEXT,                         -- optional hex for color-coded tag chips (UI)
-  parent_id INTEGER REFERENCES tag(id)    -- optional nesting (tag groups)
+  parent_id INTEGER REFERENCES tag(id),   -- optional nesting (tag groups)
+  -- Trait Library promotion (UI-SPEC.md §9): a tag with is_trait=1 is a first-class user trait
+  is_trait   INTEGER NOT NULL DEFAULT 0,
+  scope      TEXT,                        -- media_type it applies to; NULL = any
+  usage_note TEXT,                        -- when-to-apply guidance, fed to the identifier (AI-PIPELINE.md §6)
+  teach      INTEGER NOT NULL DEFAULT 0,  -- 1 ⇒ injected into the identifier vocabulary on future scans
+  icon       TEXT                         -- optional glyph for the trait chip
 );
 CREATE TABLE asset_tag (
   asset_id   INTEGER NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
@@ -126,11 +132,12 @@ CREATE TABLE collection (
   name       TEXT NOT NULL,
   parent_id  INTEGER REFERENCES collection(id),
   is_smart   INTEGER NOT NULL DEFAULT 0,  -- saved-search collection
-  is_staging INTEGER NOT NULL DEFAULT 0,  -- the shared shortlist / staging tray (§9); exactly one row
+  is_staging INTEGER NOT NULL DEFAULT 0,  -- a staging tray (§9); one per registered project
+  project_id INTEGER REFERENCES project(id) ON DELETE CASCADE,  -- staging trays only
   query_json TEXT
 );
--- Enforce a single staging collection (the shared shortlist across GUI / MCP / Unity panel).
-CREATE UNIQUE INDEX idx_collection_staging ON collection(is_staging) WHERE is_staging=1;
+-- Enforce one staging collection per project (trays shared across GUI / MCP / Unity panel, §9).
+CREATE UNIQUE INDEX idx_collection_staging ON collection(project_id) WHERE is_staging=1;
 CREATE TABLE collection_asset (
   collection_id INTEGER NOT NULL REFERENCES collection(id) ON DELETE CASCADE,
   asset_id      INTEGER NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
@@ -381,7 +388,7 @@ backlog. **Recommended user-facing terms: Identified vs Unidentified** (alternat
 
 The state behind the engine round-trip ([`ENGINE-API.md`](ENGINE-API.md) §5,
 [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md) §3): *which* editors are open, *what* has been imported
-where (provenance + dup-guard), and the shared shortlist.
+where (provenance + dup-guard), and the per-project staging shortlists.
 
 ```sql
 -- ---------- Registered Unity projects (open editors) ----------
@@ -406,6 +413,7 @@ CREATE TABLE import_record (
   unity_guid        TEXT,                 -- GUID Unity assigned on import
   with_deps         INTEGER NOT NULL DEFAULT 1,
   imported_at       INTEGER NOT NULL,
+  batch_id          TEXT,                 -- groups one tray/queue run; powers "Recent exports" + batch undo (UI-SPEC.md §16)
   UNIQUE(asset_id, project_id)            -- dup-guard key ("already imported?")
 );
 CREATE INDEX idx_import_project ON import_record(project_id);
@@ -425,9 +433,15 @@ ALTER TABLE asset ADD COLUMN license_url TEXT;
   **dup-guard**: before enqueuing, the core checks it and, if the `dest_path` still resolves, surfaces
   "already imported — re-import?" instead of silently duplicating. It also answers "where did this
   asset come from / where is it used," shown as `imported_in` in `AssetDetail`.
-- **Staging** reuses the existing `collection` machinery: the single `is_staging=1` row (§collections)
-  *is* the shared shortlist; `collection_asset` holds its members. No new table — so an item Claude
-  stages over MCP appears in the GUI tray and Unity panel at once.
+- **Staging** reuses the existing `collection` machinery, **one staging collection per project**:
+  `is_staging=1` rows carry a `project_id` (created empty when a project is registered), so each
+  import target owns its shortlist and switching projects never mixes picks
+  ([`UI-SPEC.md`](UI-SPEC.md) §16). Stage operations take an optional `project_id`, defaulting to
+  the active project — an item Claude stages over MCP still appears in the GUI tray and Unity panel
+  at once. *(Supersedes the earlier single shared shortlist.)*
+- **Import batches**: `import_record` rows from one tray/queue run share a `batch_id`, so the UI can
+  list "Recent exports" per project and **undo a batch** — delete the copied files it produced and
+  its records; catalog assets are untouched (confirm-gated, [`UI-SPEC.md`](UI-SPEC.md) §16.1).
 - **License** resolves **asset → package**: an asset's effective license is `asset.license` when set,
   else `package.license`. Surfaced on the detail stat block and on every export/import so credits
   travel with the asset.
@@ -480,10 +494,12 @@ query time, so they survive re-indexing and are queryable ("what materials use t
 CREATE TABLE asset_relationship (
   id            INTEGER PRIMARY KEY,
   from_asset_id INTEGER NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
-  to_asset_id   INTEGER NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+  to_asset_id   INTEGER REFERENCES asset(id) ON DELETE CASCADE,  -- NULL ⇒ unresolved reference
   kind          TEXT NOT NULL,
   source        TEXT NOT NULL DEFAULT 'unity_meta',
   confidence    REAL,                     -- 0..1; null for unity_meta (deterministic)
+  declared_path TEXT,                     -- the path/name the parent declared (FBX binding, .mtl, GUID)
+  state         TEXT NOT NULL DEFAULT 'resolved',  -- 'resolved' (in pack) | 'library' (cross-source) | 'missing'
   UNIQUE(from_asset_id, to_asset_id, kind)
 );
 CREATE INDEX idx_rel_from ON asset_relationship(from_asset_id);
