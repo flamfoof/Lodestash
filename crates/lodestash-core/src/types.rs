@@ -44,6 +44,34 @@ pub enum AssetStatus {
     Confirmed,
 }
 
+impl AssetStatus {
+    /// The catalog `asset.status` string (DATA-MODEL §8). Matches the serde names.
+    pub fn code(self) -> &'static str {
+        match self {
+            AssetStatus::Discovered => "discovered",
+            AssetStatus::Indexed => "indexed",
+            AssetStatus::Identified => "identified",
+            AssetStatus::Confirmed => "confirmed",
+        }
+    }
+
+    /// Parse a catalog status string; unknown values are None (schema drift, not a panic).
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "discovered" => Some(AssetStatus::Discovered),
+            "indexed" => Some(AssetStatus::Indexed),
+            "identified" => Some(AssetStatus::Identified),
+            "confirmed" => Some(AssetStatus::Confirmed),
+            _ => None,
+        }
+    }
+
+    /// The user-facing fold (DATA-MODEL §8): `discovered|indexed` are Unidentified.
+    pub fn is_unidentified(self) -> bool {
+        matches!(self, AssetStatus::Discovered | AssetStatus::Indexed)
+    }
+}
+
 /// Unique identifier for an asset in the catalog.
 pub type AssetId = uuid::Uuid;
 

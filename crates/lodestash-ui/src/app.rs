@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use egui::{Key, RichText, ScrollArea, TextureHandle, Ui, Vec2};
 use lodestash_core::catalog::{Catalog, CrawlRecord, StatusCounts};
-use lodestash_core::types::MediaType;
+use lodestash_core::types::{AssetStatus, MediaType};
 use lodestash_ingest::asset_store::{self, AssetStorePackage};
 use lodestash_ingest::crawler::{self, CrawledFile};
 use lodestash_ingest::{detect, thumb, unitypackage};
@@ -56,6 +56,12 @@ struct AssetEntry {
     file: CrawledFile,
     /// Index into `scan_roots` — which source this asset came from (the Library Source).
     source_idx: usize,
+    /// Catalog identity, attached when the write-behind persist reads back
+    /// (None until then, or for files the catalog doesn't hold — unclassified).
+    asset_id: Option<i64>,
+    /// Catalog lifecycle status (DATA-MODEL §8); entries default to Discovered
+    /// until the read-back lands.
+    status: AssetStatus,
     texture: Option<TextureHandle>,
     thumb_spawned: bool,
 }
@@ -91,11 +97,17 @@ struct PendingPackage {
     extracting: bool,
 }
 
+/// Per-root asset identity maps: root → (rel_path → (asset id, status)).
+type AssetIdentityMaps = Vec<(String, std::collections::HashMap<String, (i64, AssetStatus)>)>;
+
 /// Result of the write-behind catalog persist that follows every finished scan.
 /// `counts` is None when the persist failed (logged; the UI falls back to in-memory).
 struct CatalogSynced {
     generation: u64,
     counts: Option<StatusCounts>,
+    /// The read path: per source root, `rel_path → (asset id, status)` for every live
+    /// catalog row, joined onto the in-memory entries on receipt.
+    assets: AssetIdentityMaps,
 }
 
 /// An extracted package's worth of persist work: the `package` row plus its
@@ -346,6 +358,18 @@ enum StatusFilter {
     Unidentified,
     Identified,
     Confirmed,
+}
+
+impl StatusFilter {
+    /// Does an asset's catalog status pass this facet? Pure for testability.
+    fn matches(self, status: AssetStatus) -> bool {
+        match self {
+            StatusFilter::All => true,
+            StatusFilter::Unidentified => status.is_unidentified(),
+            StatusFilter::Identified => status == AssetStatus::Identified,
+            StatusFilter::Confirmed => status == AssetStatus::Confirmed,
+        }
+    }
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -704,6 +728,8 @@ impl LodestashApp {
                 .map(|(source_idx, f)| AssetEntry {
                     file: f,
                     source_idx,
+                    asset_id: None,
+                    status: AssetStatus::Discovered,
                     texture: None,
                     thumb_spawned: false,
                 })
@@ -772,15 +798,19 @@ impl LodestashApp {
         let tx = self.catalog_tx.clone();
         self.catalog_persisting = true;
         std::thread::spawn(move || {
-            let counts = match persist_to_catalog(&db_path, &batches) {
-                Ok(counts) => Some(counts),
+            let (counts, assets) = match persist_to_catalog(&db_path, &batches) {
+                Ok((counts, assets)) => (Some(counts), assets),
                 Err(err) => {
                     tracing::warn!(%err, "catalog persist failed; UI stays on in-memory counts");
-                    None
+                    (None, Vec::new())
                 }
             };
             // Send even on failure so the in-flight flag always clears.
-            let _ = tx.send(CatalogSynced { generation, counts });
+            let _ = tx.send(CatalogSynced {
+                generation,
+                counts,
+                assets,
+            });
         });
     }
 
@@ -840,14 +870,18 @@ impl LodestashApp {
         let tx = self.catalog_tx.clone();
         self.catalog_persisting = true;
         std::thread::spawn(move || {
-            let counts = match persist_package_to_catalog(&db_path, &job) {
-                Ok(counts) => Some(counts),
+            let (counts, assets) = match persist_package_to_catalog(&db_path, &job) {
+                Ok((counts, assets)) => (Some(counts), assets),
                 Err(err) => {
                     tracing::warn!(%err, "package persist failed; UI stays on in-memory counts");
-                    None
+                    (None, Vec::new())
                 }
             };
-            let _ = tx.send(CatalogSynced { generation, counts });
+            let _ = tx.send(CatalogSynced {
+                generation,
+                counts,
+                assets,
+            });
         });
     }
 
@@ -911,11 +945,42 @@ impl LodestashApp {
     fn receive_catalog(&mut self) {
         while let Ok(msg) = self.catalog_rx.try_recv() {
             self.catalog_persisting = false;
-            if msg.generation == self.scan_generation {
-                if let Some(counts) = msg.counts {
-                    self.catalog_counts = Some(counts);
+            if msg.generation != self.scan_generation {
+                continue;
+            }
+            if let Some(counts) = msg.counts {
+                self.catalog_counts = Some(counts);
+            }
+            if msg.assets.is_empty() {
+                continue;
+            }
+            // Attach catalog identity (asset id + status) to the in-memory entries,
+            // joined by source root + rel_path — the grid's read path.
+            let by_root: std::collections::HashMap<&str, _> = msg
+                .assets
+                .iter()
+                .map(|(root, map)| (root.as_str(), map))
+                .collect();
+            let roots: Vec<String> = self
+                .scan_roots
+                .iter()
+                .map(|r| r.to_string_lossy().into_owned())
+                .collect();
+            for entry in &mut self.entries {
+                let Some(map) = roots
+                    .get(entry.source_idx)
+                    .and_then(|r| by_root.get(r.as_str()))
+                else {
+                    continue;
+                };
+                let rel = entry.file.rel_path.to_string_lossy().replace('\\', "/");
+                if let Some(&(id, status)) = map.get(&rel) {
+                    entry.asset_id = Some(id);
+                    entry.status = status;
                 }
             }
+            // Statuses may have changed what the STATUS facet shows.
+            self.cache_dirty = true;
         }
     }
 
@@ -970,6 +1035,8 @@ impl LodestashApp {
                 self.entries.push(AssetEntry {
                     file,
                     source_idx: msg.source_idx,
+                    asset_id: None,
+                    status: AssetStatus::Discovered,
                     texture: None,
                     thumb_spawned: false,
                 });
@@ -1099,13 +1166,12 @@ impl LodestashApp {
             idxs.retain(|&i| cf.passes(entries[i].file.size_bytes, None, &[], tiers));
         }
 
-        // STATUS facet (UI-SPEC §0.2). ponytail: pre-catalog every entry is Unidentified,
-        // so this is a keep-all/keep-none gate; becomes a per-asset match when status lands.
-        if matches!(
-            self.status_filter,
-            StatusFilter::Identified | StatusFilter::Confirmed
-        ) {
-            idxs.clear();
+        // STATUS facet (UI-SPEC §0.2): a real per-asset match now that entries carry
+        // their catalog status (read back after each persist).
+        if self.status_filter != StatusFilter::All {
+            let sf = self.status_filter;
+            let entries = &self.entries;
+            idxs.retain(|&i| sf.matches(entries[i].status));
         }
 
         sort_indices(&mut idxs, &self.entries, self.sort_by, self.sort_asc);
@@ -2883,6 +2949,7 @@ impl eframe::App for LodestashApp {
                                 inspector_pane(
                                     ui,
                                     file,
+                                    entry.status,
                                     entry.texture.as_ref(),
                                     library.as_deref(),
                                 );
@@ -4159,7 +4226,7 @@ fn crawl_records<'a>(files: impl Iterator<Item = &'a CrawledFile>) -> Vec<CrawlR
 fn persist_package_to_catalog(
     db_path: &std::path::Path,
     job: &PackagePersist,
-) -> Result<StatusCounts, String> {
+) -> Result<CatalogReadBack, String> {
     let mut catalog = Catalog::open(db_path).map_err(|e| e.to_string())?;
     catalog.seed_media_types().map_err(|e| e.to_string())?;
 
@@ -4188,36 +4255,63 @@ fn persist_package_to_catalog(
         "package sync"
     );
 
-    let mut source_ids = Vec::with_capacity(job.all_roots.len());
+    let mut sources = Vec::with_capacity(job.all_roots.len());
     for (name, root) in &job.all_roots {
-        source_ids.push(
-            catalog
-                .upsert_import_source(name, root, "folder")
-                .map_err(|e| e.to_string())?,
-        );
+        let id = catalog
+            .upsert_import_source(name, root, "folder")
+            .map_err(|e| e.to_string())?;
+        sources.push((root.clone(), id));
     }
-    catalog
-        .status_counts_for_sources(&source_ids)
-        .map_err(|e| e.to_string())
+    let ids: Vec<i64> = sources.iter().map(|(_, id)| *id).collect();
+    let counts = catalog
+        .status_counts_for_sources(&ids)
+        .map_err(|e| e.to_string())?;
+    let assets = read_back_assets(&catalog, &sources)?;
+    Ok((counts, assets))
+}
+
+/// The persist threads' read-back payload: counts + per-root asset identity maps.
+type CatalogReadBack = (StatusCounts, AssetIdentityMaps);
+
+/// Read every live asset row back for the given `(root, source_id)` pairs, keyed for
+/// the UI-side join (unknown status strings are dropped, not fatal).
+fn read_back_assets(
+    catalog: &Catalog,
+    sources: &[(String, i64)],
+) -> Result<AssetIdentityMaps, String> {
+    sources
+        .iter()
+        .map(|(root, id)| {
+            let map = catalog
+                .assets_for_source(*id)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter_map(|(rel, id, code)| {
+                    AssetStatus::from_code(&code).map(|s| (rel, (id, s)))
+                })
+                .collect();
+            Ok((root.clone(), map))
+        })
+        .collect()
 }
 
 /// Runs on the persist thread: open the catalog, upsert each source, record its crawl
-/// incrementally, adopt any config blacklists (one-time M5 data step), and read back the
-/// per-status counts for exactly these sources.
+/// incrementally, adopt any config blacklists (one-time M5 data step), and read back
+/// the per-status counts + asset identities for exactly these sources.
 fn persist_to_catalog(
     db_path: &std::path::Path,
     batches: &[PersistBatch],
-) -> Result<StatusCounts, String> {
+) -> Result<CatalogReadBack, String> {
     let mut catalog = Catalog::open(db_path).map_err(|e| e.to_string())?;
     catalog.seed_media_types().map_err(|e| e.to_string())?;
 
-    let mut source_ids = Vec::with_capacity(batches.len());
+    let mut sources = Vec::with_capacity(batches.len());
     let mut blacklists = Vec::new();
     for batch in batches {
         let id = catalog
             .upsert_import_source(&batch.name, &batch.root, "folder")
             .map_err(|e| e.to_string())?;
-        source_ids.push(id);
+        sources.push((batch.root.clone(), id));
         if let Some(json) = &batch.excludes_json {
             blacklists.push((batch.root.clone(), json.clone()));
         }
@@ -4237,9 +4331,12 @@ fn persist_to_catalog(
             .adopt_config_blacklists(&blacklists)
             .map_err(|e| e.to_string())?;
     }
-    catalog
-        .status_counts_for_sources(&source_ids)
-        .map_err(|e| e.to_string())
+    let ids: Vec<i64> = sources.iter().map(|(_, id)| *id).collect();
+    let counts = catalog
+        .status_counts_for_sources(&ids)
+        .map_err(|e| e.to_string())?;
+    let assets = read_back_assets(&catalog, &sources)?;
+    Ok((counts, assets))
 }
 
 /// A 128×128 radial-falloff sprite in `color`, peaking at `max_alpha` in the centre.
@@ -4640,6 +4737,7 @@ fn asset_card(
 fn inspector_pane(
     ui: &mut Ui,
     file: &CrawledFile,
+    status: AssetStatus,
     texture: Option<&TextureHandle>,
     library: Option<&str>,
 ) {
@@ -4694,6 +4792,17 @@ fn inspector_pane(
             );
             stat_row(ui, "Size", &format_bytes(file.size_bytes));
             stat_row(ui, "Modified", &format_mtime(file.mtime));
+            // Status row — user-facing terms fold discovered|indexed (DATA-MODEL §8).
+            let (term, color) = if status.is_unidentified() {
+                ("Unidentified", theme::STATUS_UNIDENTIFIED)
+            } else if status == AssetStatus::Identified {
+                ("Identified", theme::STATUS_IDENTIFIED)
+            } else {
+                ("Confirmed", theme::STATUS_CONFIRMED)
+            };
+            ui.label(RichText::new("Status").color(theme::TEXT_DIM).size(11.0));
+            ui.label(RichText::new(format!("\u{25C6} {term}")).color(color).size(11.0));
+            ui.end_row();
             if let Some(lib) = library {
                 stat_row(ui, "Library", lib);
             }
@@ -4903,6 +5012,23 @@ fn generate_texture(
 mod tests {
     use super::*;
 
+    // ── STATUS facet predicate (UI-SPEC §0.2, DATA-MODEL §8) ──────────────────
+
+    #[test]
+    fn status_filter_folds_discovered_and_indexed_into_unidentified() {
+        use AssetStatus::*;
+        for s in [Discovered, Indexed, Identified, Confirmed] {
+            assert!(StatusFilter::All.matches(s));
+        }
+        assert!(StatusFilter::Unidentified.matches(Discovered));
+        assert!(StatusFilter::Unidentified.matches(Indexed));
+        assert!(!StatusFilter::Unidentified.matches(Identified));
+        assert!(StatusFilter::Identified.matches(Identified));
+        assert!(!StatusFilter::Identified.matches(Confirmed));
+        assert!(StatusFilter::Confirmed.matches(Confirmed));
+        assert!(!StatusFilter::Confirmed.matches(Discovered));
+    }
+
     // ── Packages screen grouping (UI-SPEC §4) ─────────────────────────────────
 
     #[test]
@@ -5035,6 +5161,8 @@ mod tests {
                 media_type: mt,
             },
             source_idx: src,
+            asset_id: None,
+            status: AssetStatus::Discovered,
             texture: None,
             thumb_spawned: false,
         }
@@ -5121,6 +5249,8 @@ mod tests {
                 media_type: mt,
             },
             source_idx: 0,
+            asset_id: None,
+            status: AssetStatus::Discovered,
             texture: None,
             thumb_spawned: false,
         }

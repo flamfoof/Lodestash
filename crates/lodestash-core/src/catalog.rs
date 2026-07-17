@@ -355,6 +355,27 @@ impl Catalog {
         Ok(stats)
     }
 
+    /// The read path for the grid: every live asset under a source as
+    /// `(rel_path of its primary file, asset id, status code)`. The UI joins these
+    /// onto its in-memory entries by rel_path so entries carry catalog identity.
+    pub fn assets_for_source(&self, source_id: i64) -> Result<Vec<(String, i64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT af.rel_path, a.id, a.status
+                 FROM asset a JOIN asset_file af ON af.id = a.primary_file_id
+                 WHERE a.source_id = ?1 AND a.deleted_at IS NULL",
+            )
+            .map_err(|e| CoreError::Catalog(format!("assets prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![source_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(|e| CoreError::Catalog(format!("assets query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("assets row: {e}")))
+    }
+
     /// Per-status counts across the given sources (live rows only). Feeds the health
     /// meter and the sidebar STATUS facet (UI-SPEC §0.1/§0.2).
     pub fn status_counts_for_sources(&self, source_ids: &[i64]) -> Result<StatusCounts> {
@@ -929,6 +950,29 @@ mod tests {
             )
             .expect("count");
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn assets_for_source_returns_live_rows_with_status() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let src = c.upsert_import_source("Lib", "C:/lib", "folder").expect("src");
+        c.record_crawl(src, None, &[rec("a.png", 1, 1), rec("b.png", 2, 2)])
+            .expect("crawl");
+        c.conn
+            .execute(
+                "UPDATE asset SET status='identified' WHERE name='a.png';",
+                [],
+            )
+            .expect("promote");
+        c.conn
+            .execute("UPDATE asset SET deleted_at=1 WHERE name='b.png';", [])
+            .expect("trash");
+
+        let rows = c.assets_for_source(src).expect("read");
+        assert_eq!(rows.len(), 1, "soft-deleted rows excluded");
+        assert_eq!(rows[0].0, "a.png");
+        assert_eq!(rows[0].2, "identified");
     }
 
     #[test]
