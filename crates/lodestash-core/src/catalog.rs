@@ -355,25 +355,48 @@ impl Catalog {
         Ok(stats)
     }
 
-    /// The read path for the grid: every live asset under a source as
-    /// `(rel_path of its primary file, asset id, status code)`. The UI joins these
-    /// onto its in-memory entries by rel_path so entries carry catalog identity.
-    pub fn assets_for_source(&self, source_id: i64) -> Result<Vec<(String, i64, String)>> {
+    /// The read path for the grid: every asset under a source as
+    /// `(rel_path of its primary file, asset id, status code, trashed)`. Trashed
+    /// (soft-deleted) rows are included with the flag set so the UI can both hide
+    /// them from the grid and list them on the Trash screen (DATA-MODEL §8).
+    pub fn assets_for_source(&self, source_id: i64) -> Result<Vec<(String, i64, String, bool)>> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT af.rel_path, a.id, a.status
+                "SELECT af.rel_path, a.id, a.status, a.deleted_at IS NOT NULL
                  FROM asset a JOIN asset_file af ON af.id = a.primary_file_id
-                 WHERE a.source_id = ?1 AND a.deleted_at IS NULL",
+                 WHERE a.source_id = ?1",
             )
             .map_err(|e| CoreError::Catalog(format!("assets prep: {e}")))?;
         let rows = stmt
             .query_map(params![source_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })
             .map_err(|e| CoreError::Catalog(format!("assets query: {e}")))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| CoreError::Catalog(format!("assets row: {e}")))
+    }
+
+    /// Move assets to / restore them from the Trash (catalog-only soft delete —
+    /// files on disk are never touched; DATA-MODEL §8). Returns rows changed.
+    pub fn set_trashed(&self, asset_ids: &[i64], trashed: bool) -> Result<usize> {
+        if asset_ids.is_empty() {
+            return Ok(0);
+        }
+        // Ids are i64s we produced — safe to inline (rusqlite has no array binds).
+        let id_list = asset_ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = if trashed {
+            format!("UPDATE asset SET deleted_at = {} WHERE id IN ({id_list}) AND deleted_at IS NULL", unix_now())
+        } else {
+            format!("UPDATE asset SET deleted_at = NULL WHERE id IN ({id_list})")
+        };
+        self.conn
+            .execute(&sql, [])
+            .map_err(|e| CoreError::Catalog(format!("set_trashed: {e}")))
     }
 
     /// Per-status counts across the given sources (live rows only). Feeds the health
@@ -953,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn assets_for_source_returns_live_rows_with_status() {
+    fn assets_for_source_flags_trashed_and_set_trashed_round_trips() {
         let mut c = Catalog::open_in_memory().expect("open");
         c.seed_media_types().expect("seed");
         let src = c.upsert_import_source("Lib", "C:/lib", "folder").expect("src");
@@ -965,14 +988,27 @@ mod tests {
                 [],
             )
             .expect("promote");
-        c.conn
-            .execute("UPDATE asset SET deleted_at=1 WHERE name='b.png';", [])
-            .expect("trash");
 
         let rows = c.assets_for_source(src).expect("read");
-        assert_eq!(rows.len(), 1, "soft-deleted rows excluded");
-        assert_eq!(rows[0].0, "a.png");
-        assert_eq!(rows[0].2, "identified");
+        assert_eq!(rows.len(), 2);
+        let a = rows.iter().find(|r| r.0 == "a.png").expect("a");
+        assert_eq!(a.2, "identified");
+        assert!(!a.3, "not trashed");
+
+        let b_id = rows.iter().find(|r| r.0 == "b.png").expect("b").1;
+        assert_eq!(c.set_trashed(&[b_id], true).expect("trash"), 1);
+        let rows = c.assets_for_source(src).expect("read 2");
+        assert!(rows.iter().find(|r| r.0 == "b.png").expect("b").3, "flagged");
+        // Trashed rows leave the status counts (search, dup groups, staging).
+        assert_eq!(
+            c.status_counts_for_sources(&[src]).expect("counts").total(),
+            1
+        );
+        // Restore round-trips.
+        assert_eq!(c.set_trashed(&[b_id], false).expect("restore"), 1);
+        let rows = c.assets_for_source(src).expect("read 3");
+        assert!(!rows.iter().find(|r| r.0 == "b.png").expect("b").3);
+        assert_eq!(c.set_trashed(&[], true).expect("noop"), 0);
     }
 
     #[test]
