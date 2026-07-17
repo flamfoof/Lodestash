@@ -390,8 +390,14 @@ pub struct LodestashApp {
     scanning: bool,
     /// On-disk thumbnail cache dir (None if the OS cache dir is unavailable).
     thumb_cache_dir: Option<PathBuf>,
-    /// Index into `sorted_cache` of the currently selected asset.
+    /// Index into `sorted_cache` of the lead selection (inspector / Quick Look / anchor
+    /// for keyboard nav).
     selected_cache_idx: Option<usize>,
+    /// Multi-selection as entry indices (stable across sort changes); pruned to the
+    /// visible filter on every cache rebuild (DESIGN-GUIDELINES §7 "Selection").
+    selected: std::collections::BTreeSet<usize>,
+    /// Shift-range anchor as a `sorted_cache` index.
+    select_anchor: Option<usize>,
     /// When true, the Quick Look overlay is open.
     quick_look: bool,
     /// When true, the Sources panel (view/add/remove project sources + app-data locations) is open.
@@ -487,6 +493,8 @@ impl LodestashApp {
             scanning: false,
             thumb_cache_dir: dirs::cache_dir().map(|d| d.join("Lodestash").join("thumbs")),
             selected_cache_idx: None,
+            selected: std::collections::BTreeSet::new(),
+            select_anchor: None,
             quick_look: false,
             sources_panel_open: false,
             pending_packages: Vec::new(),
@@ -633,6 +641,8 @@ impl LodestashApp {
         self.project_name = name;
         self.catalog_counts = None; // stale counts belong to the previous project
         self.selected_cache_idx = None;
+        self.selected.clear();
+        self.select_anchor = None;
         self.quick_look = false;
         self.source_filter = None;
         self.current_dir = None;
@@ -699,6 +709,9 @@ impl LodestashApp {
                 })
                 .collect();
             self.pending_packages = msg.pending_packages;
+            // Entries were rebuilt — old entry indices are meaningless.
+            self.selected.clear();
+            self.select_anchor = None;
             self.current_dir = self.default_dir();
             self.tab_counts = Category::TABS
                 .iter()
@@ -1100,6 +1113,14 @@ impl LodestashApp {
         self.sorted_cache = idxs;
         self.selected_cache_idx =
             selected_entry.and_then(|e| self.sorted_cache.iter().position(|&i| i == e));
+        // Multi-selection follows the filter: hidden entries drop out (Ctrl-A is
+        // "all within the current filter", design §7), and the range anchor resets.
+        if !self.selected.is_empty() {
+            let visible: std::collections::HashSet<usize> =
+                self.sorted_cache.iter().copied().collect();
+            self.selected.retain(|e| visible.contains(e));
+        }
+        self.select_anchor = self.selected_cache_idx;
         self.cache_dirty = false;
     }
 
@@ -2217,10 +2238,18 @@ impl eframe::App for LodestashApp {
                     self.quick_look = false;
                 } else {
                     self.selected_cache_idx = None;
+                    self.selected.clear();
+                    self.select_anchor = None;
                 }
             }
             if space && self.selected_cache_idx.is_some() {
                 self.quick_look = !self.quick_look;
+            }
+            // Ctrl/Cmd-A: select all within the current filter (§0.4, design §7).
+            if self.screen == Screen::Library
+                && ctx.input(|i| i.modifiers.command && i.key_pressed(Key::A))
+            {
+                self.selected = self.sorted_cache.iter().copied().collect();
             }
 
             // Arrow nav — we need the column count from the last frame.
@@ -2239,10 +2268,17 @@ impl eframe::App for LodestashApp {
                 };
                 if let Some(idx) = next {
                     self.selected_cache_idx = Some(idx);
+                    self.select_anchor = Some(idx);
+                    // Keyboard nav collapses a multi-selection to the lead card.
+                    self.selected.clear();
+                    if let Some(&e) = self.sorted_cache.get(idx) {
+                        self.selected.insert(e);
+                    }
                     // quick_look stays open; navigating moves the selected asset
                 }
             } else if right || left || down || up {
                 self.selected_cache_idx = Some(0);
+                self.select_anchor = Some(0);
             }
         }
 
@@ -2522,6 +2558,15 @@ impl eframe::App for LodestashApp {
                                 ))
                                 .color(theme::ARCANE)
                                 .size(11.0),
+                            );
+                        }
+                        // Multi-selection count (design §7 "a selection count shows
+                        // in the top bar").
+                        if self.selected.len() > 1 {
+                            ui.label(
+                                RichText::new(format!("{} selected", self.selected.len()))
+                                    .color(theme::GOLD)
+                                    .size(11.0),
                             );
                         }
                     });
@@ -2851,7 +2896,8 @@ impl eframe::App for LodestashApp {
         let mut open_project: Option<String> = None;
         let mut open_single: Option<PathBuf> = None;
         let mut spawn_queue: Vec<usize> = Vec::new();
-        let mut clicked_cache: Option<usize> = None;
+        let mut clicked_cache: Option<(usize, egui::Modifiers)> = None;
+        let mut context_action: Option<(usize, ContextAction)> = None;
         let mut evict_window: Option<(usize, usize, usize)> = None;
         let mut back_to_library = false;
 
@@ -2965,7 +3011,7 @@ impl eframe::App for LodestashApp {
                         no_results_state(ui, &self.search);
                     }
                 } else {
-                    let (sq, new_cols, new_row_start, new_row_end, clicked) = thumbnail_grid(
+                    let out = thumbnail_grid(
                         ui,
                         &self.entries,
                         &self.sorted_cache,
@@ -2974,20 +3020,22 @@ impl eframe::App for LodestashApp {
                         self.last_row_start,
                         self.last_row_end,
                         self.selected_cache_idx,
+                        &self.selected,
                         self.nav_generation,
                         &self.config.size_tiers,
                     );
-                    if new_cols != self.last_cols
-                        || new_row_start != self.last_row_start
-                        || new_row_end != self.last_row_end
+                    if out.cols != self.last_cols
+                        || out.row_start != self.last_row_start
+                        || out.row_end != self.last_row_end
                     {
-                        evict_window = Some((new_cols, new_row_start, new_row_end));
+                        evict_window = Some((out.cols, out.row_start, out.row_end));
                     }
-                    self.last_cols = new_cols;
-                    self.last_row_start = new_row_start;
-                    self.last_row_end = new_row_end;
-                    spawn_queue = sq;
-                    clicked_cache = clicked;
+                    self.last_cols = out.cols;
+                    self.last_row_start = out.row_start;
+                    self.last_row_end = out.row_end;
+                    spawn_queue = out.to_spawn;
+                    clicked_cache = out.clicked;
+                    context_action = out.context;
                 }
             });
 
@@ -2998,13 +3046,69 @@ impl eframe::App for LodestashApp {
             self.evict_far_thumbnails(cols, row_start, row_end);
         }
 
-        if let Some(cache_idx) = clicked_cache {
-            if self.selected_cache_idx == Some(cache_idx) {
-                // Second click on same card: open Quick Look.
-                self.quick_look = true;
-            } else {
-                self.selected_cache_idx = Some(cache_idx);
-                self.quick_look = false;
+        // Selection semantics (DESIGN-GUIDELINES §7): click selects; Ctrl toggles;
+        // Shift extends a range from the anchor. Second plain click = Quick Look.
+        if let Some((cache_idx, mods)) = clicked_cache {
+            if let Some(&entry_idx) = self.sorted_cache.get(cache_idx) {
+                if mods.command {
+                    if !self.selected.insert(entry_idx) {
+                        self.selected.remove(&entry_idx);
+                    }
+                    self.selected_cache_idx = Some(cache_idx);
+                    self.select_anchor = Some(cache_idx);
+                    self.quick_look = false;
+                } else if mods.shift {
+                    let anchor = self.select_anchor.unwrap_or(cache_idx);
+                    let (a, b) = (anchor.min(cache_idx), anchor.max(cache_idx));
+                    self.selected = self.sorted_cache[a..=b.min(self.sorted_cache.len() - 1)]
+                        .iter()
+                        .copied()
+                        .collect();
+                    self.selected_cache_idx = Some(cache_idx);
+                    self.quick_look = false;
+                } else if self.selected_cache_idx == Some(cache_idx) && self.selected.len() <= 1 {
+                    // Second click on same card: open Quick Look.
+                    self.quick_look = true;
+                } else {
+                    self.selected.clear();
+                    self.selected.insert(entry_idx);
+                    self.selected_cache_idx = Some(cache_idx);
+                    self.select_anchor = Some(cache_idx);
+                    self.quick_look = false;
+                }
+            }
+        }
+
+        // Context-menu actions operate on the whole selection where that makes sense
+        // (Copy path); Reveal / open act on the clicked card.
+        if let Some((cache_idx, action)) = context_action {
+            if let Some(&entry_idx) = self.sorted_cache.get(cache_idx) {
+                match action {
+                    ContextAction::QuickLook => {
+                        self.selected_cache_idx = Some(cache_idx);
+                        self.quick_look = true;
+                    }
+                    ContextAction::Reveal => {
+                        reveal_file(&self.entries[entry_idx].file.abs_path);
+                    }
+                    ContextAction::OpenWithDefault => {
+                        // Opens the file with its default handler on every platform.
+                        reveal_in_file_manager(&self.entries[entry_idx].file.abs_path);
+                    }
+                    ContextAction::CopyPath => {
+                        let set = if self.selected.contains(&entry_idx) {
+                            self.selected.iter().copied().collect::<Vec<_>>()
+                        } else {
+                            vec![entry_idx]
+                        };
+                        let text = set
+                            .iter()
+                            .map(|&i| self.entries[i].file.abs_path.to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        ctx.output_mut(|o| o.copied_text = text);
+                    }
+                }
             }
         }
 
@@ -3765,6 +3869,29 @@ fn no_results_state(ui: &mut Ui, query: &str) {
 // ponytail: threads viewport + selection state for one caller; a params struct would churn
 // the render path without removing complexity. Allow until a second caller justifies it.
 #[allow(clippy::too_many_arguments)]
+/// A context-menu action on a card (DESIGN-GUIDELINES §7 "Selection & context menu").
+/// The menu serves single and multi selection alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextAction {
+    QuickLook,
+    Reveal,
+    OpenWithDefault,
+    CopyPath,
+}
+
+/// What the grid reported back this frame.
+struct GridOutput {
+    to_spawn: Vec<usize>,
+    cols: usize,
+    row_start: usize,
+    row_end: usize,
+    /// (cache index, modifiers at click time)
+    clicked: Option<(usize, egui::Modifiers)>,
+    /// (cache index, chosen action)
+    context: Option<(usize, ContextAction)>,
+}
+
+#[allow(clippy::too_many_arguments)] // ponytail: internal fn mirroring grid state; a struct would just rename the args
 fn thumbnail_grid(
     ui: &mut Ui,
     entries: &[AssetEntry],
@@ -3774,9 +3901,10 @@ fn thumbnail_grid(
     prev_row_start: usize,
     prev_row_end: usize,
     selected_cache_idx: Option<usize>,
+    selected_entries: &std::collections::BTreeSet<usize>,
     nav_salt: u64,
     tiers: &SizeTiers,
-) -> (Vec<usize>, usize, usize, usize, Option<usize>) {
+) -> GridOutput {
     let card_h = thumb_size + CARD_LABEL;
     let available = ui.available_width() - ui.spacing().scroll.bar_width - 2.0;
     let cols = grid_columns(available, thumb_size);
@@ -3785,7 +3913,8 @@ fn thumbnail_grid(
     let mut to_spawn: Vec<usize> = Vec::new();
     let mut row_start_out: usize = prev_row_start;
     let mut row_end_out: usize = prev_row_end;
-    let mut clicked: Option<usize> = None;
+    let mut clicked: Option<(usize, egui::Modifiers)> = None;
+    let mut context: Option<(usize, ContextAction)> = None;
 
     ScrollArea::vertical()
         .id_salt(("asset_grid", nav_salt)) // fresh scroll state per folder navigation
@@ -3822,16 +3951,95 @@ fn thumbnail_grid(
                     let end = (start + cols).min(indices.len());
                     for (col, &idx) in indices[start..end].iter().enumerate() {
                         let cache_idx = start + col;
-                        let selected = selected_cache_idx == Some(cache_idx);
-                        if asset_card(ui, &entries[idx], thumb_size, selected, tiers) {
-                            clicked = Some(cache_idx);
+                        let is_lead = selected_cache_idx == Some(cache_idx);
+                        let in_selection = selected_entries.contains(&idx);
+                        let resp = asset_card(
+                            ui,
+                            &entries[idx],
+                            thumb_size,
+                            is_lead || in_selection,
+                            in_selection && selected_entries.len() > 1,
+                            tiers,
+                        );
+                        if resp.clicked() {
+                            clicked = Some((cache_idx, ui.input(|i| i.modifiers)));
                         }
+                        // Right-click on an unselected card selects it before the menu.
+                        if resp.secondary_clicked() && !in_selection {
+                            clicked = Some((cache_idx, egui::Modifiers::NONE));
+                        }
+                        resp.context_menu(|ui| {
+                            ui.set_min_width(190.0);
+                            if let Some(action) = card_context_menu(ui) {
+                                context = Some((cache_idx, action));
+                            }
+                        });
                     }
                 });
             }
         });
 
-    (to_spawn, cols, row_start_out, row_end_out, clicked)
+    GridOutput {
+        to_spawn,
+        cols,
+        row_start: row_start_out,
+        row_end: row_end_out,
+        clicked,
+        context,
+    }
+}
+
+/// The right-click card menu (DESIGN-GUIDELINES §7). Catalog/engine actions render
+/// disabled until their backends exist — grayed with a tooltip, never hidden.
+fn card_context_menu(ui: &mut Ui) -> Option<ContextAction> {
+    let mut action = None;
+    let mut act = |ui: &mut Ui, a: ContextAction, label: &str| {
+        if ui.button(label).clicked() {
+            action = Some(a);
+            ui.close_menu();
+        }
+    };
+    // "Open" (in-app viewer) arrives with the P1 viewers.
+    ui.add_enabled(false, egui::Button::new("Open"))
+        .on_disabled_hover_text("In-app viewers land in P1");
+    act(ui, ContextAction::QuickLook, "Quick Look        Space");
+    ui.separator();
+    act(ui, ContextAction::Reveal, "Reveal in Explorer");
+    act(ui, ContextAction::OpenWithDefault, "Open with default app");
+    act(ui, ContextAction::CopyPath, "Copy path");
+    ui.separator();
+    for label in [
+        "\u{27E1} Stage",
+        "Import\u{2026}",
+        "Add to collection",
+        "Edit tags",
+        "Re-identify",
+        "Find similar",
+    ] {
+        ui.add_enabled(false, egui::Button::new(label))
+            .on_disabled_hover_text("Arrives with the catalog / engine bridge (P3\u{2013}P5)");
+    }
+    ui.separator();
+    ui.add_enabled(
+        false,
+        egui::Button::new(RichText::new("Move to Trash").color(theme::DANGER)),
+    )
+    .on_disabled_hover_text("Trash lands with the catalog read path (P3)");
+    action
+}
+
+/// Reveal a file in the OS file manager, selecting it where the platform allows.
+fn reveal_file(path: &std::path::Path) {
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer")
+        .arg(format!("/select,{}", path.display()))
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open")
+        .arg(path.parent().unwrap_or(path))
+        .spawn();
 }
 
 /// Colour for a file-size tier badge (design §3 "FILE SIZE" token mapping).
@@ -4329,8 +4537,9 @@ fn asset_card(
     entry: &AssetEntry,
     thumb_size: f32,
     selected: bool,
+    check_overlay: bool,
     tiers: &SizeTiers,
-) -> bool {
+) -> egui::Response {
     let type_color = entry
         .file
         .media_type
@@ -4409,7 +4618,21 @@ fn asset_card(
             });
         });
 
-    resp.response.interact(egui::Sense::click()).clicked()
+    let resp = resp.response.interact(egui::Sense::click());
+    if check_overlay {
+        // Multi-select check badge, top-left (DESIGN-GUIDELINES §7 "Selection").
+        let c = resp.rect.left_top() + egui::vec2(11.0, 11.0);
+        let painter = ui.painter();
+        painter.circle_filled(c, 8.0, theme::GOLD);
+        painter.text(
+            c,
+            egui::Align2::CENTER_CENTER,
+            "\u{2713}",
+            egui::FontId::proportional(10.0),
+            theme::BG,
+        );
+    }
+    resp
 }
 
 // ── Inspector pane ────────────────────────────────────────────────────────────
