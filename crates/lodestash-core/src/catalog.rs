@@ -49,6 +49,21 @@ impl StatusCounts {
     }
 }
 
+/// One catalog row hydrated for the grid at startup (no disk access needed).
+#[derive(Debug, Clone)]
+pub struct HydratedAsset {
+    /// `/`-separated path relative to the source root.
+    pub rel_path: String,
+    pub asset_id: i64,
+    /// `media_type.code`.
+    pub media_type: String,
+    pub size_bytes: i64,
+    pub mtime: i64,
+    /// `asset.status` code.
+    pub status: String,
+    pub trashed: bool,
+}
+
 /// The fully-opened, migration-applied catalog database.
 pub struct Catalog {
     pub(crate) conn: Connection,
@@ -375,6 +390,95 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("assets query: {e}")))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| CoreError::Catalog(format!("assets row: {e}")))
+    }
+
+    /// Everything the UI needs to show a source's grid **without touching the disk**
+    /// (startup hydrate). Excludes files flagged missing (not on disk last reconcile)
+    /// and package-extracted assets (their payloads live in the workspace, not under
+    /// the source root — they re-enter via extraction until cross-session rehydration
+    /// stores the workspace path).
+    pub fn entries_for_source(&self, source_id: i64) -> Result<Vec<HydratedAsset>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT af.rel_path, a.id, mt.code, af.size_bytes, af.mtime,
+                        a.status, a.deleted_at IS NOT NULL
+                 FROM asset a
+                 JOIN asset_file af ON af.id = a.primary_file_id
+                 JOIN media_type mt ON mt.id = a.media_type_id
+                 WHERE a.source_id = ?1 AND af.missing = 0 AND a.package_id IS NULL",
+            )
+            .map_err(|e| CoreError::Catalog(format!("hydrate prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![source_id], |r| {
+                Ok(HydratedAsset {
+                    rel_path: r.get(0)?,
+                    asset_id: r.get(1)?,
+                    media_type: r.get(2)?,
+                    size_bytes: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    mtime: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    status: r.get(5)?,
+                    trashed: r.get(6)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("hydrate query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("hydrate row: {e}")))
+    }
+
+    /// Reconcile the `missing` flag for a source after a crawl: files in the catalog
+    /// but absent from `present` are flagged missing (metadata preserved — the file
+    /// may be on an unplugged drive); files that reappeared are unflagged. Package-
+    /// extracted assets are exempt (never present in a folder crawl). Returns
+    /// (newly missing, reappeared).
+    pub fn reconcile_missing(
+        &mut self,
+        source_id: i64,
+        present: &std::collections::HashSet<String>,
+    ) -> Result<(usize, usize)> {
+        let rows: Vec<(i64, String, bool)> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT af.id, af.rel_path, af.missing
+                     FROM asset_file af JOIN asset a ON a.id = af.asset_id
+                     WHERE a.source_id = ?1 AND a.package_id IS NULL",
+                )
+                .map_err(|e| CoreError::Catalog(format!("missing prep: {e}")))?;
+            let mapped = stmt
+                .query_map(params![source_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+                .map_err(|e| CoreError::Catalog(format!("missing query: {e}")))?;
+            mapped
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| CoreError::Catalog(format!("missing row: {e}")))?
+        };
+
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| CoreError::Catalog(format!("missing begin: {e}")))?;
+        let (mut gone, mut back) = (0, 0);
+        for (file_id, rel_path, missing) in rows {
+            let on_disk = present.contains(&rel_path);
+            if on_disk != missing {
+                continue; // flag already correct
+            }
+            tx.execute(
+                "UPDATE asset_file SET missing = ?2 WHERE id = ?1",
+                params![file_id, !on_disk],
+            )
+            .map_err(|e| CoreError::Catalog(format!("missing update: {e}")))?;
+            if on_disk {
+                back += 1;
+            } else {
+                gone += 1;
+            }
+        }
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("missing commit: {e}")))?;
+        Ok((gone, back))
     }
 
     /// Move assets to / restore them from the Trash (catalog-only soft delete —
@@ -1009,6 +1113,50 @@ mod tests {
         let rows = c.assets_for_source(src).expect("read 3");
         assert!(!rows.iter().find(|r| r.0 == "b.png").expect("b").3);
         assert_eq!(c.set_trashed(&[], true).expect("noop"), 0);
+    }
+
+    #[test]
+    fn hydrate_and_missing_reconcile_round_trip() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let src = c.upsert_import_source("Lib", "C:/lib", "folder").expect("src");
+        c.record_crawl(src, None, &[rec("a.png", 1, 10), rec("sub/b.png", 2, 20)])
+            .expect("crawl");
+
+        let rows = c.entries_for_source(src).expect("hydrate");
+        assert_eq!(rows.len(), 2);
+        let a = rows.iter().find(|r| r.rel_path == "a.png").expect("a");
+        assert_eq!((a.media_type.as_str(), a.size_bytes, a.mtime), ("image", 1, 10));
+        assert_eq!(a.status, "discovered");
+        assert!(!a.trashed);
+
+        // b vanishes from disk → flagged missing, hidden from hydrate, metadata kept.
+        let present: std::collections::HashSet<String> = ["a.png".to_string()].into();
+        assert_eq!(c.reconcile_missing(src, &present).expect("gone"), (1, 0));
+        assert_eq!(c.entries_for_source(src).expect("hydrate 2").len(), 1);
+
+        // b reappears → unflagged, hydrates again.
+        let present: std::collections::HashSet<String> =
+            ["a.png".to_string(), "sub/b.png".to_string()].into();
+        assert_eq!(c.reconcile_missing(src, &present).expect("back"), (0, 1));
+        assert_eq!(c.entries_for_source(src).expect("hydrate 3").len(), 2);
+
+        // Extracted package assets are exempt from missing-reconcile and hydrate.
+        let pkg = c
+            .upsert_package(src, "C:/lib/p.unitypackage", "p", None, None)
+            .expect("pkg");
+        c.record_crawl(src, Some(pkg), &[rec("p/x.png", 3, 30)])
+            .expect("pkg crawl");
+        assert_eq!(
+            c.reconcile_missing(src, &present).expect("exempt"),
+            (0, 0),
+            "package asset not flagged despite being absent from the crawl"
+        );
+        assert_eq!(
+            c.entries_for_source(src).expect("hydrate 4").len(),
+            2,
+            "package assets stay out of the folder hydrate"
+        );
     }
 
     #[test]
