@@ -62,6 +62,20 @@ pub struct HydratedAsset {
     /// `asset.status` code.
     pub status: String,
     pub trashed: bool,
+    /// 1..=5 stars; None = unrated (DATA-MODEL §12).
+    pub rating: Option<u8>,
+}
+
+/// One asset's catalog identity for the UI join (grid read path).
+#[derive(Debug, Clone)]
+pub struct AssetIdentity {
+    /// `/`-separated primary-file path relative to the source root.
+    pub rel_path: String,
+    pub asset_id: i64,
+    /// `asset.status` code.
+    pub status: String,
+    pub trashed: bool,
+    pub rating: Option<u8>,
 }
 
 /// The fully-opened, migration-applied catalog database.
@@ -374,18 +388,24 @@ impl Catalog {
     /// `(rel_path of its primary file, asset id, status code, trashed)`. Trashed
     /// (soft-deleted) rows are included with the flag set so the UI can both hide
     /// them from the grid and list them on the Trash screen (DATA-MODEL §8).
-    pub fn assets_for_source(&self, source_id: i64) -> Result<Vec<(String, i64, String, bool)>> {
+    pub fn assets_for_source(&self, source_id: i64) -> Result<Vec<AssetIdentity>> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT af.rel_path, a.id, a.status, a.deleted_at IS NOT NULL
+                "SELECT af.rel_path, a.id, a.status, a.deleted_at IS NOT NULL, a.rating
                  FROM asset a JOIN asset_file af ON af.id = a.primary_file_id
                  WHERE a.source_id = ?1",
             )
             .map_err(|e| CoreError::Catalog(format!("assets prep: {e}")))?;
         let rows = stmt
             .query_map(params![source_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                Ok(AssetIdentity {
+                    rel_path: r.get(0)?,
+                    asset_id: r.get(1)?,
+                    status: r.get(2)?,
+                    trashed: r.get(3)?,
+                    rating: r.get(4)?,
+                })
             })
             .map_err(|e| CoreError::Catalog(format!("assets query: {e}")))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -402,7 +422,7 @@ impl Catalog {
             .conn
             .prepare(
                 "SELECT af.rel_path, a.id, mt.code, af.size_bytes, af.mtime,
-                        a.status, a.deleted_at IS NOT NULL
+                        a.status, a.deleted_at IS NOT NULL, a.rating
                  FROM asset a
                  JOIN asset_file af ON af.id = a.primary_file_id
                  JOIN media_type mt ON mt.id = a.media_type_id
@@ -419,6 +439,7 @@ impl Catalog {
                     mtime: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
                     status: r.get(5)?,
                     trashed: r.get(6)?,
+                    rating: r.get(7)?,
                 })
             })
             .map_err(|e| CoreError::Catalog(format!("hydrate query: {e}")))?;
@@ -479,6 +500,24 @@ impl Catalog {
         tx.commit()
             .map_err(|e| CoreError::Catalog(format!("missing commit: {e}")))?;
         Ok((gone, back))
+    }
+
+    /// Set (or clear, with None) the 1–5 star rating on assets (DATA-MODEL §12).
+    pub fn set_rating(&self, asset_ids: &[i64], rating: Option<u8>) -> Result<usize> {
+        if asset_ids.is_empty() {
+            return Ok(0);
+        }
+        let id_list = asset_ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.conn
+            .execute(
+                &format!("UPDATE asset SET rating = ?1 WHERE id IN ({id_list})"),
+                params![rating],
+            )
+            .map_err(|e| CoreError::Catalog(format!("set_rating: {e}")))
     }
 
     /// Move assets to / restore them from the Trash (catalog-only soft delete —
@@ -1095,14 +1134,17 @@ mod tests {
 
         let rows = c.assets_for_source(src).expect("read");
         assert_eq!(rows.len(), 2);
-        let a = rows.iter().find(|r| r.0 == "a.png").expect("a");
-        assert_eq!(a.2, "identified");
-        assert!(!a.3, "not trashed");
+        let a = rows.iter().find(|r| r.rel_path == "a.png").expect("a");
+        assert_eq!(a.status, "identified");
+        assert!(!a.trashed, "not trashed");
 
-        let b_id = rows.iter().find(|r| r.0 == "b.png").expect("b").1;
+        let b_id = rows.iter().find(|r| r.rel_path == "b.png").expect("b").asset_id;
         assert_eq!(c.set_trashed(&[b_id], true).expect("trash"), 1);
         let rows = c.assets_for_source(src).expect("read 2");
-        assert!(rows.iter().find(|r| r.0 == "b.png").expect("b").3, "flagged");
+        assert!(
+            rows.iter().find(|r| r.rel_path == "b.png").expect("b").trashed,
+            "flagged"
+        );
         // Trashed rows leave the status counts (search, dup groups, staging).
         assert_eq!(
             c.status_counts_for_sources(&[src]).expect("counts").total(),
@@ -1111,7 +1153,7 @@ mod tests {
         // Restore round-trips.
         assert_eq!(c.set_trashed(&[b_id], false).expect("restore"), 1);
         let rows = c.assets_for_source(src).expect("read 3");
-        assert!(!rows.iter().find(|r| r.0 == "b.png").expect("b").3);
+        assert!(!rows.iter().find(|r| r.rel_path == "b.png").expect("b").trashed);
         assert_eq!(c.set_trashed(&[], true).expect("noop"), 0);
     }
 
@@ -1129,6 +1171,23 @@ mod tests {
         assert_eq!((a.media_type.as_str(), a.size_bytes, a.mtime), ("image", 1, 10));
         assert_eq!(a.status, "discovered");
         assert!(!a.trashed);
+        assert_eq!(a.rating, None);
+
+        // Rating round-trips through both read paths.
+        assert_eq!(c.set_rating(&[a.asset_id], Some(4)).expect("rate"), 1);
+        let a2 = c
+            .entries_for_source(src)
+            .expect("hydrate rated")
+            .into_iter()
+            .find(|r| r.rel_path == "a.png")
+            .expect("a");
+        assert_eq!(a2.rating, Some(4));
+        let read = c.assets_for_source(src).expect("read");
+        assert_eq!(
+            read.iter().find(|r| r.rel_path == "a.png").expect("a").rating,
+            Some(4)
+        );
+        assert_eq!(c.set_rating(&[a.asset_id], None).expect("clear"), 1);
 
         // b vanishes from disk → flagged missing, hidden from hydrate, metadata kept.
         let present: std::collections::HashSet<String> = ["a.png".to_string()].into();
