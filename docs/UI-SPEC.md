@@ -198,6 +198,12 @@ The browse-everything grid. Composition top→bottom:
 Card click = select (inspector opens); second click deselects. All filters compose:
 type ∧ library ∧ status ∧ pack ∧ collection ∧ ⚑ filters ∧ query/AI.
 
+**Pagination (thumbnail views):** the grid renders one page of the filtered result at a
+time — a bottom pager bar shows `‹ Prev · Page x / y · Next ›` plus an **assets-per-page**
+selector (50 default / 75 / 100 / Custom…, persisted in the view prefs). Only the current
+page decodes thumbnails; keyboard navigation follows the selection across page boundaries.
+The future list view is exempt (rows are cheap; it stays a single virtualized scroll).
+
 ---
 
 ## 3. Identify (the appraisal workspace)

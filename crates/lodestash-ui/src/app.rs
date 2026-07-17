@@ -224,6 +224,9 @@ const KEEP_ROWS_MIN: usize = 4;
 /// Discrete grid-size stops for the segmented selector, all driving `thumb_size` (design §2).
 const GRID_STOPS: [(f32, &str); 3] = [(96.0, "Compact"), (128.0, "Cozy"), (176.0, "Large")];
 
+/// Preset assets-per-page choices; anything else is "Custom" (persisted either way).
+const PAGE_SIZE_PRESETS: [usize; 3] = [50, 75, 100];
+
 // ── Content filter (⚑ Filters popover) ─────────────────────────────────────────
 
 /// Triangle-count bucket for the Triangles facet (models only). Design §3 "TRIANGLES".
@@ -477,6 +480,14 @@ pub struct LodestashApp {
     folder_tiles: Vec<(String, usize)>,
     /// Bumped on every folder navigation so the grid ScrollArea gets fresh scroll state.
     nav_generation: u64,
+    /// Current thumbnail-grid page (0-based; page size lives in `config.view.page_size`).
+    /// Clamped to the filtered result on every cache rebuild.
+    page: usize,
+    /// Last (page, page_size) the grid rendered — a change resets the spawn window
+    /// so the new page's thumbnails load.
+    last_page_key: (usize, usize),
+    /// The per-page selector is on "Custom…" (even while the value matches a preset).
+    page_size_custom: bool,
     entries: Vec<AssetEntry>,
     /// Sorted+filtered indices into `entries`. Rebuilt only when `cache_dirty`.
     sorted_cache: Vec<usize>,
@@ -592,6 +603,9 @@ impl LodestashApp {
             current_dir: None,
             folder_tiles: Vec::new(),
             nav_generation: 0,
+            page: 0,
+            last_page_key: (0, 0),
+            page_size_custom: !PAGE_SIZE_PRESETS.contains(&config.view.page_size),
             entries: Vec::new(),
             sorted_cache: Vec::new(),
             tab_counts: vec![0; Category::TABS.len()],
@@ -768,6 +782,7 @@ impl LodestashApp {
         self.current_dir = None;
         self.folder_tiles = Vec::new();
         self.nav_generation += 1;
+        self.page = 0;
         self.pending_packages = Vec::new();
 
         // Each source's blacklist (design §5.1) — resolved before the crawl thread so it honours
@@ -1579,19 +1594,41 @@ impl LodestashApp {
             self.selected.retain(|e| visible.contains(e));
         }
         self.select_anchor = self.selected_cache_idx;
+        // Keep the page inside the (possibly shrunken) filtered result.
+        self.page = self.page.min(self.page_count().saturating_sub(1));
         self.cache_dirty = false;
+    }
+
+    /// Number of grid pages for the current filtered result (always ≥ 1).
+    fn page_count(&self) -> usize {
+        self.sorted_cache
+            .len()
+            .div_ceil(self.config.view.page_size.max(1))
+            .max(1)
+    }
+
+    /// The `sorted_cache` index range shown on the current page.
+    fn page_range(&self) -> std::ops::Range<usize> {
+        let size = self.config.view.page_size.max(1);
+        let start = (self.page * size).min(self.sorted_cache.len());
+        let end = (start + size).min(self.sorted_cache.len());
+        start..end
     }
 
     /// Drop thumbnail textures far outside the visible window so VRAM stays bounded.
     /// In-flight loads (spawned, no texture yet) are left alone — their send must still
     /// decrement `pending_thumbs`; the texture lands and is evicted on a later pass.
     fn evict_far_thumbnails(&mut self, cols: usize, row_start: usize, row_end: usize) {
-        let (keep_start, keep_end) = keep_range(row_start, row_end, cols, self.sorted_cache.len());
+        // Rows are relative to the current page slice; entries on other pages fall
+        // outside the keep set and evict too (a page flip frees the old page).
+        let page = self.page_range();
+        let (keep_start, keep_end) = keep_range(row_start, row_end, cols, page.len());
         let selected_entry = self
             .selected_cache_idx
             .and_then(|ci| self.sorted_cache.get(ci).copied());
 
-        let keep: std::collections::HashSet<usize> = self.sorted_cache[keep_start..keep_end]
+        let keep: std::collections::HashSet<usize> = self.sorted_cache[page.clone()]
+            [keep_start..keep_end]
             .iter()
             .copied()
             .collect();
@@ -1619,6 +1656,7 @@ impl LodestashApp {
     /// the current filter.
     fn go_to_library(&mut self) {
         self.screen = Screen::Library;
+        self.page = 0;
         self.status_filter = StatusFilter::All;
         self.source_filter = None;
         self.active_tab = Category::All;
@@ -2894,6 +2932,8 @@ impl eframe::App for LodestashApp {
                 if let Some(idx) = next {
                     self.selected_cache_idx = Some(idx);
                     self.select_anchor = Some(idx);
+                    // Keyboard nav crosses page boundaries: follow the selection.
+                    self.page = idx / self.config.view.page_size.max(1);
                     // Keyboard nav collapses a multi-selection to the lead card.
                     self.selected.clear();
                     if let Some(&e) = self.sorted_cache.get(idx) {
@@ -3525,6 +3565,109 @@ impl eframe::App for LodestashApp {
             self.set_entries_rating(&[entry_idx], new_rating);
         }
 
+        // A page flip (or page-size change) must re-check the spawn window even when
+        // the visible row numbers happen to match the previous page's.
+        let page_key = (self.page, self.config.view.page_size);
+        if page_key != self.last_page_key {
+            self.last_page_key = page_key;
+            self.last_cols = 0;
+            self.last_row_start = usize::MAX;
+            self.last_row_end = 0;
+        }
+
+        // ── Pager bar (Library only): page controls + assets-per-page ─────────
+        if self.screen == Screen::Library && !self.sorted_cache.is_empty() {
+            egui::TopBottomPanel::bottom("pager")
+                .frame(
+                    egui::Frame::none()
+                        .fill(theme::SURFACE)
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                        .inner_margin(egui::Margin::symmetric(12.0, 4.0)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Per page").color(theme::TEXT_DIM).size(11.0));
+                        let current = self.config.view.page_size;
+                        let selected_label = if self.page_size_custom {
+                            "Custom\u{2026}".to_owned()
+                        } else {
+                            current.to_string()
+                        };
+                        let mut new_size: Option<usize> = None;
+                        egui::ComboBox::from_id_salt("page_size_combo")
+                            .width(76.0)
+                            .selected_text(RichText::new(selected_label).size(11.0))
+                            .show_ui(ui, |ui| {
+                                for preset in PAGE_SIZE_PRESETS {
+                                    if ui
+                                        .selectable_label(
+                                            !self.page_size_custom && current == preset,
+                                            preset.to_string(),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.page_size_custom = false;
+                                        new_size = Some(preset);
+                                    }
+                                }
+                                if ui
+                                    .selectable_label(self.page_size_custom, "Custom\u{2026}")
+                                    .clicked()
+                                {
+                                    self.page_size_custom = true;
+                                }
+                            });
+                        if self.page_size_custom {
+                            let mut value = current;
+                            let resp = ui.add(
+                                egui::DragValue::new(&mut value)
+                                    .range(config::PAGE_SIZE_RANGE)
+                                    .speed(1),
+                            );
+                            if resp.changed() {
+                                new_size = Some(value);
+                            }
+                        }
+                        if let Some(size) = new_size {
+                            let size = size.clamp(
+                                *config::PAGE_SIZE_RANGE.start(),
+                                *config::PAGE_SIZE_RANGE.end(),
+                            );
+                            if size != self.config.view.page_size {
+                                self.config.view.page_size = size;
+                                self.page = self.page.min(self.page_count().saturating_sub(1));
+                                self.config.save();
+                            }
+                        }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let pages = self.page_count();
+                            if ui
+                                .add_enabled(
+                                    self.page + 1 < pages,
+                                    egui::Button::new("Next \u{203A}"),
+                                )
+                                .clicked()
+                            {
+                                self.page += 1;
+                            }
+                            ui.label(
+                                RichText::new(format!("Page {} / {}", self.page + 1, pages))
+                                    .color(theme::TEXT_MUTED)
+                                    .size(11.0)
+                                    .monospace(),
+                            );
+                            if ui
+                                .add_enabled(self.page > 0, egui::Button::new("\u{2039} Prev"))
+                                .clicked()
+                            {
+                                self.page = self.page.saturating_sub(1);
+                            }
+                        });
+                    });
+                });
+        }
+
         // ── Main content ─────────────────────────────────────────────────────
         let mut open_project: Option<String> = None;
         let mut open_single: Option<PathBuf> = None;
@@ -3648,17 +3791,22 @@ impl eframe::App for LodestashApp {
                         no_results_state(ui, &self.search);
                     }
                 } else {
+                    // Thumbnail pages: only the current page's slice reaches the
+                    // grid, so decode work and textures stay bounded per page.
+                    let page_range = self.page_range();
+                    let page_start = page_range.start;
                     let out = thumbnail_grid(
                         ui,
                         &self.entries,
-                        &self.sorted_cache,
+                        &self.sorted_cache[page_range],
+                        page_start,
                         self.thumb_size,
                         self.last_cols,
                         self.last_row_start,
                         self.last_row_end,
                         self.selected_cache_idx,
                         &self.selected,
-                        self.nav_generation,
+                        self.nav_generation.wrapping_add(self.page as u64),
                         &self.config.size_tiers,
                     );
                     if out.cols != self.last_cols
@@ -4563,6 +4711,8 @@ fn thumbnail_grid(
     ui: &mut Ui,
     entries: &[AssetEntry],
     indices: &[usize],
+    /* `sorted_cache` offset of indices[0] — clicked/context report absolute cache idxs */
+    index_offset: usize,
     thumb_size: f32,
     prev_cols: usize,
     prev_row_start: usize,
@@ -4617,7 +4767,7 @@ fn thumbnail_grid(
                     let start = row_idx * cols;
                     let end = (start + cols).min(indices.len());
                     for (col, &idx) in indices[start..end].iter().enumerate() {
-                        let cache_idx = start + col;
+                        let cache_idx = index_offset + start + col;
                         let is_lead = selected_cache_idx == Some(cache_idx);
                         let in_selection = selected_entries.contains(&idx);
                         let resp = asset_card(
