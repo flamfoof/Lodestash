@@ -4808,8 +4808,8 @@ fn catalog_db_path() -> Option<PathBuf> {
     Some(dir.join("catalog.db"))
 }
 
-/// Raster types the Quick Look viewer can decode with the `image` crate today.
-/// DDS/PSD/HDR arrive with their dedicated decoders (issue #29 item 1 follow-ups).
+/// Raster types the Quick Look viewer can decode via the shared raster seam
+/// (`image` formats + DDS/PSD). HDR/EXR tone-map is the remaining #29 follow-up.
 fn is_viewer_image(mt: Option<MediaType>) -> bool {
     matches!(
         mt,
@@ -4819,8 +4819,9 @@ fn is_viewer_image(mt: Option<MediaType>) -> bool {
 
 /// Decode a full-detail image on the load thread, downscaling anything past
 /// `VIEWER_MAX_DIM` (GPU texture cap). Returns the pixels + original dimensions.
+/// Routes through the shared raster seam, so DDS/PSD work here and in thumbnails.
 fn load_viewer_image(path: &std::path::Path) -> Result<(egui::ColorImage, [u32; 2]), String> {
-    let img = image::open(path).map_err(|e| e.to_string())?;
+    let img = lodestash_ingest::raster::decode(path).map_err(|e| e.to_string())?;
     let dims = [img.width(), img.height()];
     let img = if img.width().max(img.height()) > VIEWER_MAX_DIM {
         // Triangle filter: fast and good enough for an already-oversized preview.

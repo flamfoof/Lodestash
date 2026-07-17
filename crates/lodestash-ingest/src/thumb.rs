@@ -58,8 +58,7 @@ pub fn generate(
 
     std::fs::create_dir_all(cache_dir)?;
 
-    let img = image::open(source)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let img = crate::raster::decode(source)?;
 
     let thumb = resize_fit(&img, params.width, params.height);
 

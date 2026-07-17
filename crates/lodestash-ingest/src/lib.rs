@@ -5,6 +5,7 @@
 pub mod asset_store;
 pub mod crawler;
 pub mod detect;
+pub mod raster;
 pub mod thumb;
 pub mod unitypackage;
 pub mod workspace;
