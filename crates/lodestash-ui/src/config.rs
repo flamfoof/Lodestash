@@ -19,6 +19,7 @@ pub enum SortBy {
     Type,
     Size,
     Modified,
+    Rating,
 }
 
 impl SortBy {
@@ -27,6 +28,7 @@ impl SortBy {
         (SortBy::Type, "Type"),
         (SortBy::Size, "Size"),
         (SortBy::Modified, "Date"),
+        (SortBy::Rating, "Rating"),
     ];
 
     pub fn label(self) -> &'static str {

@@ -65,6 +65,8 @@ struct AssetEntry {
     /// In the Trash (catalog-only soft delete; files on disk untouched). Hidden from
     /// the grid, listed on the Trash screen (DATA-MODEL §8).
     trashed: bool,
+    /// 1..=5 stars; None = unrated (DATA-MODEL §12).
+    rating: Option<u8>,
     texture: Option<TextureHandle>,
     thumb_spawned: bool,
 }
@@ -109,7 +111,8 @@ struct HydrateDone {
 }
 
 /// Per-root asset identity maps: root → (rel_path → (asset id, status)).
-type AssetIdentityMaps = Vec<(String, std::collections::HashMap<String, (i64, AssetStatus, bool)>)>;
+type AssetIdentityMaps =
+    Vec<(String, std::collections::HashMap<String, (i64, AssetStatus, bool, Option<u8>)>)>;
 
 /// Result of the write-behind catalog persist that follows every finished scan.
 /// `counts` is None when the persist failed (logged; the UI falls back to in-memory).
@@ -219,12 +222,17 @@ struct ContentFilter {
     traits: std::collections::BTreeSet<String>,
     tri_buckets: std::collections::BTreeSet<TriBucket>,
     sizes: std::collections::BTreeSet<SizeTier>,
+    /// Minimum star rating (None = no constraint). DATA-MODEL §12.
+    min_rating: Option<u8>,
     trait_search: String,
 }
 
 impl ContentFilter {
     fn active_count(&self) -> usize {
-        self.traits.len() + self.tri_buckets.len() + self.sizes.len()
+        self.traits.len()
+            + self.tri_buckets.len()
+            + self.sizes.len()
+            + usize::from(self.min_rating.is_some())
     }
 
     fn any_active(&self) -> bool {
@@ -236,6 +244,7 @@ impl ContentFilter {
         self.traits.clear();
         self.tri_buckets.clear();
         self.sizes.clear();
+        self.min_rating = None;
         self.trait_search.clear();
     }
 
@@ -244,7 +253,19 @@ impl ContentFilter {
     /// imposes no constraint. Assets lacking a tri count are excluded when any tri-bucket is
     /// selected (design §3). Kept pure over primitives so it's unit-testable without an
     /// `AssetEntry` (TECH-STACK.md §5.1).
-    fn passes(&self, size: u64, tri: Option<u32>, traits: &[String], tiers: &SizeTiers) -> bool {
+    fn passes(
+        &self,
+        size: u64,
+        tri: Option<u32>,
+        rating: Option<u8>,
+        traits: &[String],
+        tiers: &SizeTiers,
+    ) -> bool {
+        if let Some(min) = self.min_rating {
+            if rating.unwrap_or(0) < min {
+                return false;
+            }
+        }
         if !self.traits.is_empty() && !traits.iter().any(|t| self.traits.contains(t)) {
             return false;
         }
@@ -795,6 +816,7 @@ impl LodestashApp {
                             asset_id: Some(row.asset_id),
                             status: AssetStatus::from_code(&row.status)?,
                             trashed: row.trashed,
+                            rating: row.rating,
                             texture: None,
                             thumb_spawned: false,
                         })
@@ -822,30 +844,32 @@ impl LodestashApp {
             // Carry catalog identity over from the outgoing entries (a hydrate or an
             // earlier read-back) so trashed/identified state doesn't flash back to
             // defaults between the crawl landing and the next persist read-back.
-            let carry: std::collections::HashMap<(usize, PathBuf), (Option<i64>, AssetStatus, bool)> =
-                self.entries
-                    .drain(..)
-                    .map(|e| {
-                        (
-                            (e.source_idx, e.file.rel_path),
-                            (e.asset_id, e.status, e.trashed),
-                        )
-                    })
-                    .collect();
+            type Carried = (Option<i64>, AssetStatus, bool, Option<u8>);
+            let carry: std::collections::HashMap<(usize, PathBuf), Carried> = self
+                .entries
+                .drain(..)
+                .map(|e| {
+                    (
+                        (e.source_idx, e.file.rel_path),
+                        (e.asset_id, e.status, e.trashed, e.rating),
+                    )
+                })
+                .collect();
             self.entries = msg
                 .entries
                 .into_iter()
                 .map(|(source_idx, f)| {
-                    let (asset_id, status, trashed) = carry
+                    let (asset_id, status, trashed, rating) = carry
                         .get(&(source_idx, f.rel_path.clone()))
                         .copied()
-                        .unwrap_or((None, AssetStatus::Discovered, false));
+                        .unwrap_or((None, AssetStatus::Discovered, false, None));
                     AssetEntry {
                         file: f,
                         source_idx,
                         asset_id,
                         status,
                         trashed,
+                        rating,
                         texture: None,
                         thumb_spawned: false,
                     }
@@ -1136,6 +1160,51 @@ impl LodestashApp {
         });
     }
 
+    /// Set (or clear) the star rating on entries: optimistic local update, then the
+    /// write on the single-writer thread. Keys 1-5 toggle: rating an already-equal
+    /// selection clears it (design: ratings card, DATA-MODEL §12).
+    fn set_entries_rating(&mut self, entry_idxs: &[usize], rating: Option<u8>) {
+        let all_equal = !entry_idxs.is_empty()
+            && entry_idxs
+                .iter()
+                .all(|&i| self.entries.get(i).is_some_and(|e| e.rating == rating));
+        let rating = if all_equal { None } else { rating };
+
+        let mut ids = Vec::new();
+        for &i in entry_idxs {
+            if let Some(e) = self.entries.get_mut(i) {
+                if let Some(id) = e.asset_id {
+                    e.rating = rating;
+                    ids.push(id);
+                }
+            }
+        }
+        if ids.is_empty() {
+            return;
+        }
+        self.cache_dirty = true; // rating filter/sort may change the view
+
+        let Some(db_path) = catalog_db_path() else {
+            return;
+        };
+        let generation = self.scan_generation;
+        let tx = self.catalog_tx.clone();
+        self.catalog_persisting = true;
+        std::thread::spawn(move || {
+            let result = Catalog::open(&db_path)
+                .and_then(|c| c.set_rating(&ids, rating))
+                .map_err(|e| e.to_string());
+            if let Err(err) = result {
+                tracing::warn!(%err, "rating update failed; local value may diverge until next sync");
+            }
+            let _ = tx.send(CatalogSynced {
+                generation,
+                counts: None,
+                assets: Vec::new(),
+            });
+        });
+    }
+
     fn receive_catalog(&mut self) {
         while let Ok(msg) = self.catalog_rx.try_recv() {
             self.catalog_persisting = false;
@@ -1168,10 +1237,11 @@ impl LodestashApp {
                     continue;
                 };
                 let rel = entry.file.rel_path.to_string_lossy().replace('\\', "/");
-                if let Some(&(id, status, trashed)) = map.get(&rel) {
+                if let Some(&(id, status, trashed, rating)) = map.get(&rel) {
                     entry.asset_id = Some(id);
                     entry.status = status;
                     entry.trashed = trashed;
+                    entry.rating = rating;
                 }
             }
             // Statuses/trash flags may have changed what the grid and tabs show.
@@ -1234,6 +1304,7 @@ impl LodestashApp {
                     asset_id: None,
                     status: AssetStatus::Discovered,
                     trashed: false,
+                    rating: None,
                     texture: None,
                     thumb_spawned: false,
                 });
@@ -1356,7 +1427,9 @@ impl LodestashApp {
             let tiers = &self.config.size_tiers;
             let entries = &self.entries;
             // No trait/tri data pre-catalog → None/&[]; wire real values when P1/P4 land.
-            idxs.retain(|&i| cf.passes(entries[i].file.size_bytes, None, &[], tiers));
+            idxs.retain(|&i| {
+                cf.passes(entries[i].file.size_bytes, None, entries[i].rating, &[], tiers)
+            });
         }
 
         // Trashed assets leave the grid everywhere; they live on the Trash screen
@@ -2505,6 +2578,18 @@ fn sort_indices(idxs: &mut Vec<usize>, entries: &[AssetEntry], sort_by: SortBy, 
                 o.reverse()
             }
         }),
+        // Unrated sorts as 0 so rated assets lead when descending (the common use).
+        SortBy::Rating => idxs.sort_by(|&a, &b| {
+            let o = entries[a]
+                .rating
+                .unwrap_or(0)
+                .cmp(&entries[b].rating.unwrap_or(0));
+            if asc {
+                o
+            } else {
+                o.reverse()
+            }
+        }),
     }
 }
 
@@ -2645,6 +2730,25 @@ impl eframe::App for LodestashApp {
                     self.selected.iter().copied().collect()
                 };
                 self.set_entries_trashed(&targets, true);
+            }
+            // Keys 1-5: rate the selection (or the lead card); same value again clears.
+            if self.screen == Screen::Library {
+                let pressed = ctx.input(|i| {
+                    [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5]
+                        .iter()
+                        .position(|&k| i.key_pressed(k) && i.modifiers.is_none())
+                });
+                if let Some(n) = pressed {
+                    let targets: Vec<usize> = if self.selected.is_empty() {
+                        self.selected_cache_idx
+                            .and_then(|ci| self.sorted_cache.get(ci).copied())
+                            .into_iter()
+                            .collect()
+                    } else {
+                        self.selected.iter().copied().collect()
+                    };
+                    self.set_entries_rating(&targets, Some(n as u8 + 1));
+                }
             }
 
             // Arrow nav — we need the column count from the last frame.
@@ -3256,6 +3360,7 @@ impl eframe::App for LodestashApp {
         }
 
         // ── Inspector pane (right side) ───────────────────────────────────────
+        let mut inspector_rating: Option<(usize, Option<u8>)> = None;
         if self.screen == Screen::Library {
             if let Some(cache_idx) = self.selected_cache_idx {
                 if let Some(&entry_idx) = self.sorted_cache.get(cache_idx) {
@@ -3275,17 +3380,23 @@ impl eframe::App for LodestashApp {
                                     .inner_margin(egui::Margin::same(12.0)),
                             )
                             .show(ctx, |ui| {
-                                inspector_pane(
+                                if let Some(new_rating) = inspector_pane(
                                     ui,
                                     file,
                                     entry.status,
+                                    entry.rating,
                                     entry.texture.as_ref(),
                                     library.as_deref(),
-                                );
+                                ) {
+                                    inspector_rating = Some((entry_idx, new_rating));
+                                }
                             });
                     }
                 }
             }
+        }
+        if let Some((entry_idx, new_rating)) = inspector_rating {
+            self.set_entries_rating(&[entry_idx], new_rating);
         }
 
         // ── Main content ─────────────────────────────────────────────────────
@@ -4634,8 +4745,9 @@ fn read_back_assets(
                 .assets_for_source(*id)
                 .map_err(|e| e.to_string())?
                 .into_iter()
-                .filter_map(|(rel, id, code, trashed)| {
-                    AssetStatus::from_code(&code).map(|s| (rel, (id, s, trashed)))
+                .filter_map(|a| {
+                    AssetStatus::from_code(&a.status)
+                        .map(|s| (a.rel_path, (a.asset_id, s, a.trashed, a.rating)))
                 })
                 .collect();
             Ok((root.clone(), map))
@@ -4981,6 +5093,20 @@ fn filter_popover(ui: &mut Ui, cf: &mut ContentFilter, tiers: &SizeTiers) -> boo
             }
         }
     });
+    ui.add_space(6.0);
+
+    // RATING — minimum-stars single-select; same chip toggles off (DATA-MODEL §12).
+    section_label(ui, "RATING");
+    ui.horizontal_wrapped(|ui| {
+        for min in 1..=5u8 {
+            let label = format!("\u{2605}{min}+");
+            let sel = cf.min_rating == Some(min);
+            if filter_chip(ui, &label, sel, theme::GOLD) {
+                cf.min_rating = if sel { None } else { Some(min) };
+                changed = true;
+            }
+        }
+    });
 
     changed
 }
@@ -5050,6 +5176,17 @@ fn asset_card(
                     theme::BG,
                 );
 
+                // Star rating, bottom-left of the thumbnail (DATA-MODEL §12).
+                if let Some(r) = entry.rating {
+                    painter.text(
+                        thumb_rect.left_bottom() + egui::vec2(4.0, -3.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        format!("\u{2605} {r}"),
+                        egui::FontId::proportional(10.0),
+                        theme::GOLD,
+                    );
+                }
+
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     let (dot_resp, painter) =
@@ -5091,13 +5228,16 @@ fn asset_card(
 
 // ── Inspector pane ────────────────────────────────────────────────────────────
 
+/// Returns Some(new_rating) when the star row was clicked (Some(None) = cleared).
 fn inspector_pane(
     ui: &mut Ui,
     file: &CrawledFile,
     status: AssetStatus,
+    rating: Option<u8>,
     texture: Option<&TextureHandle>,
     library: Option<&str>,
-) {
+) -> Option<Option<u8>> {
+    let mut rating_clicked: Option<Option<u8>> = None;
     let type_color = file
         .media_type
         .map(theme::media_type_color)
@@ -5160,6 +5300,27 @@ fn inspector_pane(
             ui.label(RichText::new("Status").color(theme::TEXT_DIM).size(11.0));
             ui.label(RichText::new(format!("\u{25C6} {term}")).color(color).size(11.0));
             ui.end_row();
+            // Rating stars (keys 1-5 work too; clicking the current value clears).
+            ui.label(RichText::new("Rating").color(theme::TEXT_DIM).size(11.0));
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 1.0;
+                let current = rating.unwrap_or(0);
+                for n in 1..=5u8 {
+                    let (glyph, star_color) = if n <= current {
+                        ("\u{2605}", theme::GOLD)
+                    } else {
+                        ("\u{2606}", theme::TEXT_DIM)
+                    };
+                    let resp = ui.add(
+                        egui::Button::new(RichText::new(glyph).color(star_color).size(13.0))
+                            .frame(false),
+                    );
+                    if resp.clicked() {
+                        rating_clicked = Some(if current == n { None } else { Some(n) });
+                    }
+                }
+            });
+            ui.end_row();
             if let Some(lib) = library {
                 stat_row(ui, "Library", lib);
             }
@@ -5169,11 +5330,12 @@ fn inspector_pane(
     ui.add_space(8.0);
     ui.label(
         RichText::new(
-            "Space \u{2192} Quick Look  \u{2022}  \u{2191}\u{2193}\u{2190}\u{2192} navigate",
+            "Space \u{2192} Quick Look  \u{2022}  \u{2191}\u{2193}\u{2190}\u{2192} navigate  \u{2022}  1\u{2013}5 rate",
         )
         .color(theme::TEXT_DIM)
         .size(10.0),
     );
+    rating_clicked
 }
 
 fn stat_row(ui: &mut Ui, label: &str, value: &str) {
@@ -5414,10 +5576,10 @@ mod tests {
         let cf = ContentFilter::default();
         let tiers = SizeTiers::default();
         assert!(
-            cf.passes(10, None, &[], &tiers),
+            cf.passes(10, None, None, &[], &tiers),
             "no active facet = no constraint"
         );
-        assert!(cf.passes(9_000_000, Some(5000), &["a".into()], &tiers));
+        assert!(cf.passes(9_000_000, Some(5000), None, &["a".into()], &tiers));
     }
 
     #[test]
@@ -5427,14 +5589,14 @@ mod tests {
         cf.sizes.insert(SizeTier::S);
         cf.sizes.insert(SizeTier::L);
         let mb = |n: u64| n * 1024 * 1024;
-        assert!(cf.passes(mb(0), None, &[], &tiers), "500 KB → S, selected");
+        assert!(cf.passes(mb(0), None, None, &[], &tiers), "500 KB → S, selected");
         assert!(
-            !cf.passes(mb(2), None, &[], &tiers),
+            !cf.passes(mb(2), None, None, &[], &tiers),
             "2 MB → M, not selected"
         );
-        assert!(cf.passes(mb(5), None, &[], &tiers), "5 MB → L, selected");
+        assert!(cf.passes(mb(5), None, None, &[], &tiers), "5 MB → L, selected");
         assert!(
-            !cf.passes(mb(9), None, &[], &tiers),
+            !cf.passes(mb(9), None, None, &[], &tiers),
             "9 MB → XL, not selected"
         );
     }
@@ -5445,15 +5607,15 @@ mod tests {
         let mut cf = ContentFilter::default();
         cf.tri_buckets.insert(TriBucket::K1to3);
         assert!(
-            cf.passes(10, Some(2000), &[], &tiers),
+            cf.passes(10, Some(2000), None, &[], &tiers),
             "2000 tris → 1k–3k, selected"
         );
         assert!(
-            !cf.passes(10, Some(500), &[], &tiers),
+            !cf.passes(10, Some(500), None, &[], &tiers),
             "500 tris → ≤1k, not selected"
         );
         assert!(
-            !cf.passes(10, None, &[], &tiers),
+            !cf.passes(10, None, None, &[], &tiers),
             "no tri count is excluded when a tri facet is active"
         );
     }
@@ -5463,10 +5625,10 @@ mod tests {
         let tiers = SizeTiers::default();
         let mut cf = ContentFilter::default();
         cf.traits.insert("rusty".into());
-        assert!(cf.passes(10, None, &["rusty".into(), "barrel".into()], &tiers));
-        assert!(!cf.passes(10, None, &["barrel".into()], &tiers));
+        assert!(cf.passes(10, None, None, &["rusty".into(), "barrel".into()], &tiers));
+        assert!(!cf.passes(10, None, None, &["barrel".into()], &tiers));
         assert!(
-            !cf.passes(10, None, &[], &tiers),
+            !cf.passes(10, None, None, &[], &tiers),
             "an asset with no traits fails a trait filter"
         );
     }
@@ -5521,6 +5683,7 @@ mod tests {
             asset_id: None,
             status: AssetStatus::Discovered,
             trashed: false,
+            rating: None,
             texture: None,
             thumb_spawned: false,
         }
@@ -5611,6 +5774,7 @@ mod tests {
             asset_id: None,
             status: AssetStatus::Discovered,
             trashed: false,
+            rating: None,
             texture: None,
             thumb_spawned: false,
         }
