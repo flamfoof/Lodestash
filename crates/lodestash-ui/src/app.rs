@@ -102,6 +102,57 @@ struct PendingPackage {
     extracting: bool,
 }
 
+/// Longest side a full-detail viewer texture may have; larger sources are
+/// downscaled on the load thread (GPU texture limits, and 8k is beyond any zoom
+/// level the overlay can usefully show).
+const VIEWER_MAX_DIM: u32 = 8192;
+
+/// Full-detail image loaded for the Quick Look viewer (issue #29 item 1).
+struct ViewerLoaded {
+    entry_idx: usize,
+    /// (pixels, original dimensions before any downscale) or a decode error.
+    result: Result<(egui::ColorImage, [u32; 2]), String>,
+}
+
+/// Quick Look's full-detail image state: what's loaded, and the zoom/pan/filter view.
+#[derive(Default)]
+struct ImageViewer {
+    /// Entry the current texture (or in-flight load) belongs to.
+    entry_idx: Option<usize>,
+    texture: Option<TextureHandle>,
+    /// Kept for re-upload when the NN toggle changes the sampler.
+    image: Option<egui::ColorImage>,
+    /// Original source dimensions (pre-downscale).
+    source_dims: [u32; 2],
+    loading: bool,
+    error: Option<String>,
+    /// None = fit-to-window; Some(z) = texels-per-point.
+    zoom: Option<f32>,
+    /// Pan offset from center, in points.
+    offset: Vec2,
+    /// Pixel-perfect nearest-neighbour sampling (design: image viewer NN toggle).
+    nearest: bool,
+}
+
+impl ImageViewer {
+    fn reset_for(&mut self, entry_idx: usize) {
+        *self = ImageViewer {
+            entry_idx: Some(entry_idx),
+            nearest: self.nearest, // sampler preference survives navigation
+            loading: true,
+            ..Default::default()
+        };
+    }
+
+    fn texture_options(&self) -> egui::TextureOptions {
+        if self.nearest {
+            egui::TextureOptions::NEAREST
+        } else {
+            egui::TextureOptions::LINEAR
+        }
+    }
+}
+
 /// Startup hydrate: the catalog's view of the sources, shown instantly while the
 /// filesystem crawl reconciles in the background. Superseded by that crawl's ScanDone.
 struct HydrateDone {
@@ -487,6 +538,10 @@ pub struct LodestashApp {
     catalog_tx: Sender<CatalogSynced>,
     hydrate_rx: Receiver<HydrateDone>,
     hydrate_tx: Sender<HydrateDone>,
+    /// Quick Look full-detail image viewer (issue #29 item 1).
+    image_viewer: ImageViewer,
+    viewer_rx: Receiver<ViewerLoaded>,
+    viewer_tx: Sender<ViewerLoaded>,
     /// Faint background radial gradients (UI-SPEC §0): gold top-right, arcane bottom-left.
     bg_gold: Option<TextureHandle>,
     bg_arcane: Option<TextureHandle>,
@@ -514,6 +569,7 @@ impl LodestashApp {
         let (extract_tx, extract_rx) = mpsc::channel();
         let (catalog_tx, catalog_rx) = mpsc::channel();
         let (hydrate_tx, hydrate_rx) = mpsc::channel();
+        let (viewer_tx, viewer_rx) = mpsc::channel();
         let config = AppConfig::load();
         let sort_by = config.view.sort_by;
         let sort_asc = config.view.sort_asc;
@@ -573,6 +629,9 @@ impl LodestashApp {
             catalog_tx,
             hydrate_rx,
             hydrate_tx,
+            image_viewer: ImageViewer::default(),
+            viewer_rx,
+            viewer_tx,
             bg_gold: Some(cc.egui_ctx.load_texture(
                 "bg_radial_gold",
                 radial_image(theme::GOLD, 15), // rgba(231,183,101,.06)
@@ -1203,6 +1262,66 @@ impl LodestashApp {
                 assets: Vec::new(),
             });
         });
+    }
+
+    /// Keep the viewer in sync with the Quick Look target: (re)load when the overlay
+    /// is open on a raster asset it doesn't hold yet. Decode runs off-thread.
+    fn ensure_viewer_loaded(&mut self, ctx: &egui::Context) {
+        if !self.quick_look {
+            // Drop the full-detail pixels + texture as soon as the overlay closes —
+            // an 8k source holds ~128 MB across CPU+GPU copies.
+            if self.image_viewer.entry_idx.is_some() {
+                let nearest = self.image_viewer.nearest;
+                self.image_viewer = ImageViewer {
+                    nearest,
+                    ..Default::default()
+                };
+            }
+            return;
+        }
+        let Some(&entry_idx) = self
+            .selected_cache_idx
+            .and_then(|ci| self.sorted_cache.get(ci))
+        else {
+            return;
+        };
+        let Some(entry) = self.entries.get(entry_idx) else {
+            return;
+        };
+        if !is_viewer_image(entry.file.media_type) || self.image_viewer.entry_idx == Some(entry_idx)
+        {
+            return;
+        }
+        self.image_viewer.reset_for(entry_idx);
+        let path = entry.file.abs_path.clone();
+        let tx = self.viewer_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = load_viewer_image(&path);
+            let _ = tx.send(ViewerLoaded { entry_idx, result });
+            ctx.request_repaint();
+        });
+    }
+
+    fn receive_viewer(&mut self, ctx: &egui::Context) {
+        while let Ok(msg) = self.viewer_rx.try_recv() {
+            if self.image_viewer.entry_idx != Some(msg.entry_idx) {
+                continue; // stale load for a superseded target
+            }
+            self.image_viewer.loading = false;
+            match msg.result {
+                Ok((image, dims)) => {
+                    self.image_viewer.texture = Some(ctx.load_texture(
+                        "viewer_image",
+                        image.clone(),
+                        self.image_viewer.texture_options(),
+                    ));
+                    self.image_viewer.image = Some(image);
+                    self.image_viewer.source_dims = dims;
+                }
+                Err(err) => self.image_viewer.error = Some(err),
+            }
+        }
     }
 
     fn receive_catalog(&mut self) {
@@ -2661,6 +2780,8 @@ impl eframe::App for LodestashApp {
         self.receive_thumbnails();
         self.receive_extracts();
         self.receive_catalog();
+        self.receive_viewer(ctx);
+        self.ensure_viewer_loaded(ctx);
 
         // While a scan, thumbnails, or a catalog persist are in flight, wake up at
         // ~30 fps to drain the channels. Keeping this in the main thread (not the
@@ -2710,6 +2831,11 @@ impl eframe::App for LodestashApp {
             }
             if space && self.selected_cache_idx.is_some() {
                 self.quick_look = !self.quick_look;
+            }
+            // Enter = open (§0.4). The full viewer lives behind Quick Look; dedicated
+            // per-type viewers grow inside it (issue #29).
+            if ctx.input(|i| i.key_pressed(Key::Enter)) && self.selected_cache_idx.is_some() {
+                self.quick_look = true;
             }
             // Ctrl/Cmd-A: select all within the current filter (§0.4, design §7).
             if self.screen == Screen::Library
@@ -3645,14 +3771,28 @@ impl eframe::App for LodestashApp {
         if self.quick_look {
             if let Some(cache_idx) = self.selected_cache_idx {
                 if let Some(&entry_idx) = self.sorted_cache.get(cache_idx) {
-                    if let Some(entry) = self.entries.get(entry_idx) {
+                    // Cheap clones so the closure can borrow the viewer mutably.
+                    let peek = self.entries.get(entry_idx).map(|e| {
+                        (
+                            e.file
+                                .rel_path
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                            e.file.media_type,
+                            e.file.size_bytes,
+                            e.texture.clone(),
+                        )
+                    });
+                    if let Some((name, media_type, size_bytes, thumb)) = peek {
                         let mut open = self.quick_look;
+                        let viewer = &mut self.image_viewer;
                         egui::Window::new("Quick Look")
                             .id(egui::Id::new("quick_look"))
                             .open(&mut open)
                             .collapsible(false)
                             .resizable(true)
-                            .default_size([520.0, 560.0])
+                            .default_size([640.0, 620.0])
                             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                             .frame(
                                 egui::Frame::window(&ctx.style())
@@ -3660,7 +3800,14 @@ impl eframe::App for LodestashApp {
                                     .stroke(egui::Stroke::new(1.0, theme::BORDER)),
                             )
                             .show(ctx, |ui| {
-                                quick_look_content(ui, entry);
+                                quick_look_content(
+                                    ui,
+                                    &name,
+                                    media_type,
+                                    size_bytes,
+                                    thumb.as_ref(),
+                                    viewer,
+                                );
                             });
                         self.quick_look = open;
                     }
@@ -4661,6 +4808,38 @@ fn catalog_db_path() -> Option<PathBuf> {
     Some(dir.join("catalog.db"))
 }
 
+/// Raster types the Quick Look viewer can decode with the `image` crate today.
+/// DDS/PSD/HDR arrive with their dedicated decoders (issue #29 item 1 follow-ups).
+fn is_viewer_image(mt: Option<MediaType>) -> bool {
+    matches!(
+        mt,
+        Some(MediaType::Image) | Some(MediaType::Texture) | Some(MediaType::Sprite)
+    )
+}
+
+/// Decode a full-detail image on the load thread, downscaling anything past
+/// `VIEWER_MAX_DIM` (GPU texture cap). Returns the pixels + original dimensions.
+fn load_viewer_image(path: &std::path::Path) -> Result<(egui::ColorImage, [u32; 2]), String> {
+    let img = image::open(path).map_err(|e| e.to_string())?;
+    let dims = [img.width(), img.height()];
+    let img = if img.width().max(img.height()) > VIEWER_MAX_DIM {
+        // Triangle filter: fast and good enough for an already-oversized preview.
+        img.resize(
+            VIEWER_MAX_DIM,
+            VIEWER_MAX_DIM,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        img
+    };
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    Ok((
+        egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()),
+        dims,
+    ))
+}
+
 /// Classified files → catalog crawl records; unclassified files stay grid-only
 /// (`asset.media_type_id` is NOT NULL). Paths are stored `/`-separated.
 fn crawl_records<'a>(files: impl Iterator<Item = &'a CrawledFile>) -> Vec<CrawlRecord> {
@@ -5416,57 +5595,181 @@ fn media_type_label(mt: Option<MediaType>) -> &'static str {
 
 // ── Quick Look overlay ────────────────────────────────────────────────────────
 
-fn quick_look_content(ui: &mut Ui, entry: &AssetEntry) {
-    let avail = ui.available_size();
-    let preview_size = (avail.x.min(avail.y - 80.0)).max(64.0);
+fn quick_look_content(
+    ui: &mut Ui,
+    name: &str,
+    media_type: Option<MediaType>,
+    size_bytes: u64,
+    thumb: Option<&TextureHandle>,
+    viewer: &mut ImageViewer,
+) {
+    let is_image = is_viewer_image(media_type);
 
-    ui.vertical_centered(|ui| {
-        if let Some(tex) = &entry.texture {
-            ui.add(
-                egui::Image::new((tex.id(), Vec2::splat(preview_size)))
-                    .fit_to_exact_size(Vec2::splat(preview_size))
-                    .rounding(4.0),
+    // Toolbar (image assets only): Fit / 1:1 / pixel-perfect toggle / zoom readout.
+    if is_image {
+        ui.horizontal(|ui| {
+            if ui.selectable_label(viewer.zoom.is_none(), "Fit").clicked() {
+                viewer.zoom = None;
+                viewer.offset = Vec2::ZERO;
+            }
+            if ui
+                .selectable_label(viewer.zoom == Some(1.0), "1:1")
+                .clicked()
+            {
+                viewer.zoom = Some(1.0);
+                viewer.offset = Vec2::ZERO;
+            }
+            let nn = ui
+                .selectable_label(viewer.nearest, "\u{25A6} Pixel-perfect")
+                .on_hover_text("Nearest-neighbour sampling \u{2014} no smoothing");
+            if nn.clicked() {
+                viewer.nearest = !viewer.nearest;
+                // Re-upload with the new sampler; the pixels are retained for this.
+                let opts = viewer.texture_options();
+                if let Some(image) = viewer.image.clone() {
+                    if let Some(tex) = &mut viewer.texture {
+                        tex.set(image, opts);
+                    }
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let [w, h] = viewer.source_dims;
+                if w > 0 {
+                    let pct = viewer.zoom.map(|z| format!("{:.0}%", z * 100.0));
+                    ui.label(
+                        RichText::new(format!(
+                            "{w}\u{D7}{h}{}",
+                            pct.map(|p| format!("  \u{B7}  {p}")).unwrap_or_default()
+                        ))
+                        .color(theme::TEXT_DIM)
+                        .size(10.0)
+                        .monospace(),
+                    );
+                }
+            });
+        });
+        ui.add_space(4.0);
+    }
+
+    let avail = ui.available_size();
+    let canvas = Vec2::new(avail.x, (avail.y - 64.0).max(96.0));
+
+    if is_image && (viewer.texture.is_some() || viewer.loading || viewer.error.is_some()) {
+        let (resp, mut painter) = ui.allocate_painter(canvas, egui::Sense::click_and_drag());
+        painter.rect_filled(resp.rect, 4.0, theme::BG);
+
+        if let Some(tex) = &viewer.texture {
+            let tex_size = tex.size_vec2();
+            let fit_zoom = (canvas.x / tex_size.x).min(canvas.y / tex_size.y).min(1.0);
+            let zoom = viewer.zoom.unwrap_or(fit_zoom);
+
+            // Scroll zooms around the cursor; drag pans; double-click refits.
+            if resp.hovered() {
+                let scroll = ui.input(|i| i.raw_scroll_delta.y);
+                if scroll != 0.0 {
+                    let factor = (scroll * 0.003).exp();
+                    let new_zoom = (zoom * factor).clamp(0.02, 32.0);
+                    if let Some(pointer) = resp.hover_pos() {
+                        let rel = pointer - resp.rect.center() - viewer.offset;
+                        viewer.offset += rel - rel * (new_zoom / zoom);
+                    }
+                    viewer.zoom = Some(new_zoom);
+                }
+            }
+            if resp.dragged() {
+                viewer.offset += resp.drag_delta();
+            }
+            if resp.double_clicked() {
+                viewer.zoom = None;
+                viewer.offset = Vec2::ZERO;
+            }
+            let zoom = viewer.zoom.unwrap_or(fit_zoom);
+
+            let draw_size = tex_size * zoom;
+            let rect = egui::Rect::from_center_size(resp.rect.center() + viewer.offset, draw_size);
+            painter.set_clip_rect(resp.rect);
+            painter.image(
+                tex.id(),
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
             );
-        } else {
-            let type_color = entry
-                .file
-                .media_type
-                .map(theme::media_type_color)
-                .unwrap_or(theme::TEXT_DIM);
-            let (resp, painter) =
-                ui.allocate_painter(Vec2::splat(preview_size), egui::Sense::hover());
-            painter.rect_filled(resp.rect, 8.0, type_color.linear_multiply(0.12));
+        } else if viewer.loading {
+            // Blurry-but-instant: the grid thumbnail as a stand-in while decoding.
+            if let Some(tex) = thumb {
+                let side = canvas.min_elem() * 0.6;
+                painter.image(
+                    tex.id(),
+                    egui::Rect::from_center_size(resp.rect.center(), Vec2::splat(side)),
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+            painter.text(
+                resp.rect.center_bottom() + egui::vec2(0.0, -10.0),
+                egui::Align2::CENTER_BOTTOM,
+                "\u{25CC} loading full detail\u{2026}",
+                egui::FontId::proportional(11.0),
+                theme::ARCANE,
+            );
+        } else if let Some(err) = &viewer.error {
             painter.text(
                 resp.rect.center(),
                 egui::Align2::CENTER_CENTER,
-                type_label_char(entry.file.media_type),
-                egui::FontId::proportional(preview_size * 0.18),
-                type_color.linear_multiply(0.7),
+                format!("\u{2298} couldn't decode: {err}"),
+                egui::FontId::proportional(11.0),
+                theme::DANGER,
             );
         }
+    } else {
+        // Non-image assets keep the typed placeholder card (viewers arrive per
+        // issue #29: audio next, then 3D).
+        let preview_size = canvas.min_elem().max(64.0);
+        ui.vertical_centered(|ui| {
+            if let Some(tex) = thumb {
+                ui.add(
+                    egui::Image::new((tex.id(), Vec2::splat(preview_size)))
+                        .fit_to_exact_size(Vec2::splat(preview_size))
+                        .rounding(4.0),
+                );
+            } else {
+                let type_color = media_type
+                    .map(theme::media_type_color)
+                    .unwrap_or(theme::TEXT_DIM);
+                let (resp, painter) =
+                    ui.allocate_painter(Vec2::splat(preview_size), egui::Sense::hover());
+                painter.rect_filled(resp.rect, 8.0, type_color.linear_multiply(0.12));
+                painter.text(
+                    resp.rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    type_label_char(media_type),
+                    egui::FontId::proportional(preview_size * 0.18),
+                    type_color.linear_multiply(0.7),
+                );
+            }
+        });
+    }
 
-        ui.add_space(12.0);
-        let name = entry
-            .file
-            .rel_path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        ui.label(RichText::new(&name).color(theme::TEXT).size(15.0).strong());
+    ui.add_space(8.0);
+    ui.vertical_centered(|ui| {
+        ui.label(RichText::new(name).color(theme::TEXT).size(15.0).strong());
         ui.label(
             RichText::new(format!(
                 "{} \u{2022} {}",
-                media_type_label(entry.file.media_type),
-                format_bytes(entry.file.size_bytes),
+                media_type_label(media_type),
+                format_bytes(size_bytes),
             ))
             .color(theme::TEXT_DIM)
             .size(11.0),
         );
-        ui.add_space(8.0);
         ui.label(
-            RichText::new("Space / Esc \u{2192} close  \u{2022}  \u{2190}\u{2192} navigate")
-                .color(theme::TEXT_DIM)
-                .size(10.0),
+            RichText::new(if is_image {
+                "scroll zoom \u{2022} drag pan \u{2022} double-click fit \u{2022} \u{2190}\u{2192} navigate \u{2022} Esc close"
+            } else {
+                "Space / Esc \u{2192} close  \u{2022}  \u{2190}\u{2192} navigate"
+            })
+            .color(theme::TEXT_DIM)
+            .size(10.0),
         );
     });
 }
