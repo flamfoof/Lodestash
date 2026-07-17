@@ -19,6 +19,8 @@ blake3         = { workspace = true }
 
 walkdir    = { workspace = true }
 image      = { workspace = true }
+image_dds  = { workspace = true }
+psd        = { workspace = true }
 flate2     = { workspace = true }
 tar        = { workspace = true }
 serde_yaml = { workspace = true }
