@@ -62,9 +62,11 @@ resolve first · **[QoL]** = cross-cutting browser-UX lane (M1.5), layered on Ph
 ## 📋 Backlog
 
 ### Phase 1 — View everything
-- [ ] **[P1]** 3D viewport (`three-d` on shared wgpu) + normalize→glTF cache (Assimp/FBX2glTF)
+> Batched as tracking issue [#29](https://github.com/flamfoof/Lodestash/issues/29) (build order: image → audio → 3D → 2D-extras → metadata; one PR per checkbox).
+
+- [ ] **[P1]** 3D viewport (`three-d` on shared wgpu) + normalize→glTF cache (Assimp/FBX2glTF) — **spike first**: shell now runs Glow, so evaluate three-d's GL backend vs offscreen handoff (TECH-STACK §7)
 - [ ] **[P1]** Audio: `symphonia` decode + `rodio` playback + waveform
-- [ ] **[P1]** Image/texture viewer: `image`+`image_dds`+`psd`; HDR/EXR tone-map; channel toggles; **pixel-perfect NN**
+- [ ] **[P1]** Image/texture viewer: `image`+`image_dds`+`psd`; HDR/EXR tone-map; channel toggles; **pixel-perfect NN** — *first slice shipped*: Quick Look is a real viewer for image/texture/sprite (full-detail decode on a load thread with the grid thumb as stand-in, >8k sources downscaled to the GPU cap, pixels+texture freed on close); scroll-zoom around the cursor, drag-pan, double-click/Fit/1:1, **pixel-perfect NN toggle** (sampler re-upload), dimensions + zoom readout; Enter=open wired (§0.4). Remaining: DDS/PSD decoders, HDR/EXR tone-map, channel toggles
 - [ ] **[P1]** Animated sprite/spritesheet playback; **material sphere** preview; **font** glyph-sheet
 - [ ] **[P1]** Offscreen 3D thumbnails; audio waveform thumbnails; metadata extraction (technical facets)
 
