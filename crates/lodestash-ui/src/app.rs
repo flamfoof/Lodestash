@@ -62,6 +62,9 @@ struct AssetEntry {
     /// Catalog lifecycle status (DATA-MODEL §8); entries default to Discovered
     /// until the read-back lands.
     status: AssetStatus,
+    /// In the Trash (catalog-only soft delete; files on disk untouched). Hidden from
+    /// the grid, listed on the Trash screen (DATA-MODEL §8).
+    trashed: bool,
     texture: Option<TextureHandle>,
     thumb_spawned: bool,
 }
@@ -98,7 +101,7 @@ struct PendingPackage {
 }
 
 /// Per-root asset identity maps: root → (rel_path → (asset id, status)).
-type AssetIdentityMaps = Vec<(String, std::collections::HashMap<String, (i64, AssetStatus)>)>;
+type AssetIdentityMaps = Vec<(String, std::collections::HashMap<String, (i64, AssetStatus, bool)>)>;
 
 /// Result of the write-behind catalog persist that follows every finished scan.
 /// `counts` is None when the persist failed (logged; the UI falls back to in-memory).
@@ -730,6 +733,7 @@ impl LodestashApp {
                     source_idx,
                     asset_id: None,
                     status: AssetStatus::Discovered,
+                    trashed: false,
                     texture: None,
                     thumb_spawned: false,
                 })
@@ -739,15 +743,7 @@ impl LodestashApp {
             self.selected.clear();
             self.select_anchor = None;
             self.current_dir = self.default_dir();
-            self.tab_counts = Category::TABS
-                .iter()
-                .map(|&(cat, _)| {
-                    self.entries
-                        .iter()
-                        .filter(|e| cat.matches(e.file.media_type))
-                        .count()
-                })
-                .collect();
+            self.recompute_tab_counts();
             self.cache_dirty = true;
             self.last_cols = 0;
             self.last_row_start = usize::MAX;
@@ -942,6 +938,91 @@ impl LodestashApp {
         });
     }
 
+    /// Tab-bar counts over the live (non-trashed) entries.
+    fn recompute_tab_counts(&mut self) {
+        self.tab_counts = Category::TABS
+            .iter()
+            .map(|&(cat, _)| {
+                self.entries
+                    .iter()
+                    .filter(|e| !e.trashed && cat.matches(e.file.media_type))
+                    .count()
+            })
+            .collect();
+    }
+
+    /// Move entries to / restore them from the Trash: optimistic local flip, then the
+    /// soft delete on a writer thread (single-writer rule) with fresh project counts
+    /// read back. Catalog-only — files on disk are never touched (DATA-MODEL §8).
+    fn set_entries_trashed(&mut self, entry_idxs: &[usize], trashed: bool) {
+        let mut ids = Vec::new();
+        for &i in entry_idxs {
+            if let Some(e) = self.entries.get_mut(i) {
+                if let (Some(id), true) = (e.asset_id, e.trashed != trashed) {
+                    e.trashed = trashed;
+                    ids.push(id);
+                }
+            }
+        }
+        if ids.is_empty() {
+            return;
+        }
+        if trashed {
+            self.selected.retain(|i| !entry_idxs.contains(i));
+            if self
+                .selected_cache_idx
+                .and_then(|ci| self.sorted_cache.get(ci))
+                .is_some_and(|e| entry_idxs.contains(e))
+            {
+                self.selected_cache_idx = None;
+                self.quick_look = false;
+            }
+        }
+        self.recompute_tab_counts();
+        self.cache_dirty = true;
+
+        let Some(db_path) = catalog_db_path() else {
+            return;
+        };
+        let roots: Vec<(String, String)> = self
+            .scan_roots
+            .iter()
+            .map(|r| (config::stem_name(r), r.to_string_lossy().into_owned()))
+            .collect();
+        let generation = self.scan_generation;
+        let tx = self.catalog_tx.clone();
+        self.catalog_persisting = true;
+        std::thread::spawn(move || {
+            let run = || -> Result<StatusCounts, String> {
+                let catalog = Catalog::open(&db_path).map_err(|e| e.to_string())?;
+                catalog.set_trashed(&ids, trashed).map_err(|e| e.to_string())?;
+                let mut sids = Vec::with_capacity(roots.len());
+                for (name, root) in &roots {
+                    sids.push(
+                        catalog
+                            .upsert_import_source(name, root, "folder")
+                            .map_err(|e| e.to_string())?,
+                    );
+                }
+                catalog
+                    .status_counts_for_sources(&sids)
+                    .map_err(|e| e.to_string())
+            };
+            let counts = match run() {
+                Ok(c) => Some(c),
+                Err(err) => {
+                    tracing::warn!(%err, "trash update failed; local flag may diverge until next sync");
+                    None
+                }
+            };
+            let _ = tx.send(CatalogSynced {
+                generation,
+                counts,
+                assets: Vec::new(),
+            });
+        });
+    }
+
     fn receive_catalog(&mut self) {
         while let Ok(msg) = self.catalog_rx.try_recv() {
             self.catalog_persisting = false;
@@ -974,12 +1055,14 @@ impl LodestashApp {
                     continue;
                 };
                 let rel = entry.file.rel_path.to_string_lossy().replace('\\', "/");
-                if let Some(&(id, status)) = map.get(&rel) {
+                if let Some(&(id, status, trashed)) = map.get(&rel) {
                     entry.asset_id = Some(id);
                     entry.status = status;
+                    entry.trashed = trashed;
                 }
             }
-            // Statuses may have changed what the STATUS facet shows.
+            // Statuses/trash flags may have changed what the grid and tabs show.
+            self.recompute_tab_counts();
             self.cache_dirty = true;
         }
     }
@@ -1037,19 +1120,12 @@ impl LodestashApp {
                     source_idx: msg.source_idx,
                     asset_id: None,
                     status: AssetStatus::Discovered,
+                    trashed: false,
                     texture: None,
                     thumb_spawned: false,
                 });
             }
-            self.tab_counts = Category::TABS
-                .iter()
-                .map(|&(cat, _)| {
-                    self.entries
-                        .iter()
-                        .filter(|e| cat.matches(e.file.media_type))
-                        .count()
-                })
-                .collect();
+            self.recompute_tab_counts();
             self.cache_dirty = true;
         }
     }
@@ -1115,7 +1191,11 @@ impl LodestashApp {
                                 let count = self
                                     .entries
                                     .iter()
-                                    .filter(|e| e.source_idx == i && tab.matches(e.file.media_type))
+                                    .filter(|e| {
+                                        e.source_idx == i
+                                            && !e.trashed
+                                            && tab.matches(e.file.media_type)
+                                    })
                                     .count();
                                 (config::stem_name(root), count)
                             })
@@ -1164,6 +1244,13 @@ impl LodestashApp {
             let entries = &self.entries;
             // No trait/tri data pre-catalog → None/&[]; wire real values when P1/P4 land.
             idxs.retain(|&i| cf.passes(entries[i].file.size_bytes, None, &[], tiers));
+        }
+
+        // Trashed assets leave the grid everywhere; they live on the Trash screen
+        // (DATA-MODEL §8 — catalog-only, files untouched).
+        {
+            let entries = &self.entries;
+            idxs.retain(|&i| !entries[i].trashed);
         }
 
         // STATUS facet (UI-SPEC §0.2): a real per-asset match now that entries carry
@@ -1247,7 +1334,8 @@ impl LodestashApp {
         let mut new_source: Option<Option<usize>> = None;
         let mut add_source_clicked = false;
 
-        let total = self.entries.len();
+        let trashed_count = self.entries.iter().filter(|e| e.trashed).count();
+        let total = self.entries.len() - trashed_count;
         // STATUS rows show catalog truth when the persist has landed ("All" stays the
         // grid count — unclassified files render in the grid but aren't catalog rows).
         let (unidentified, identified_n, confirmed_n) = match &self.catalog_counts {
@@ -1275,7 +1363,8 @@ impl LodestashApp {
                     for screen in Screen::NAV {
                         let badge = match screen {
                             Screen::Identify => unidentified,
-                            // Dup groups / trashed counts need the catalog; 0 hides the pill.
+                            Screen::Trash => trashed_count,
+                            // Dup-group counts need P2 dedup; 0 hides the pill.
                             _ => 0,
                         };
                         if sidebar_nav_row(
@@ -1657,6 +1746,113 @@ impl LodestashApp {
         }
         if let Some(idx) = extract_idx {
             self.extract_package(ctx, idx);
+        }
+    }
+
+    // ── Trash screen (UI-SPEC §7) ───────────────────────────────────────────────
+
+    /// Catalog-only soft delete: zebra table rows with Restore. Files stay on disk;
+    /// explicit delete-from-disk is a separate danger flow (not on this screen).
+    fn trash_screen(&mut self, ui: &mut Ui) {
+        ui.label(
+            RichText::new("Trash")
+                .color(theme::TEXT)
+                .font(crate::fonts::display(24.0)),
+        );
+        ui.label(
+            RichText::new(
+                "Removed from the catalog only \u{2014} files stay on disk. Restore any time.",
+            )
+            .color(theme::TEXT_MUTED)
+            .size(12.0),
+        );
+        ui.add_space(10.0);
+
+        let trashed: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.trashed)
+            .map(|(i, _)| i)
+            .collect();
+        if trashed.is_empty() {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("\u{2298}").size(48.0).color(theme::TEXT_DIM));
+                ui.label(
+                    RichText::new("Trash is empty.")
+                        .color(theme::TEXT_MUTED)
+                        .size(13.0),
+                );
+            });
+            return;
+        }
+
+        let mut restore: Option<usize> = None;
+        let many_sources = self.scan_roots.len() > 1;
+        ScrollArea::vertical().show(ui, |ui| {
+            for (row, &i) in trashed.iter().enumerate() {
+                let entry = &self.entries[i];
+                let bg = if row % 2 == 0 {
+                    theme::SURFACE
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                egui::Frame::none()
+                    .fill(bg)
+                    .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let color = entry
+                                .file
+                                .media_type
+                                .map(theme::media_type_color)
+                                .unwrap_or(theme::TEXT_DIM);
+                            ui.label(RichText::new("\u{25C6}").color(color).size(9.0));
+                            let name = entry
+                                .file
+                                .rel_path
+                                .file_stem()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(name).color(theme::TEXT_MUTED).size(12.0),
+                                )
+                                .truncate(),
+                            );
+                            let mut meta = Vec::new();
+                            if many_sources {
+                                meta.push(config::stem_name(&self.scan_roots[entry.source_idx]));
+                            }
+                            meta.push(format_bytes(entry.file.size_bytes));
+                            ui.label(
+                                RichText::new(meta.join(" \u{B7} "))
+                                    .color(theme::TEXT_DIM)
+                                    .size(10.0)
+                                    .monospace(),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .button(
+                                            RichText::new("\u{21A9} Restore")
+                                                .color(theme::SUCCESS)
+                                                .size(11.0),
+                                        )
+                                        .clicked()
+                                    {
+                                        restore = Some(i);
+                                    }
+                                },
+                            );
+                        });
+                    });
+            }
+        });
+        if let Some(i) = restore {
+            self.set_entries_trashed(&[i], false);
         }
     }
 
@@ -2211,7 +2407,7 @@ fn folder_children(
     let mut tiles: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     let mut idxs = Vec::new();
     for (i, e) in entries.iter().enumerate() {
-        if e.source_idx != src || !tab.matches(e.file.media_type) {
+        if e.source_idx != src || e.trashed || !tab.matches(e.file.media_type) {
             continue;
         }
         let Ok(rest) = e.file.rel_path.strip_prefix(dir) else {
@@ -2316,6 +2512,20 @@ impl eframe::App for LodestashApp {
                 && ctx.input(|i| i.modifiers.command && i.key_pressed(Key::A))
             {
                 self.selected = self.sorted_cache.iter().copied().collect();
+            }
+            // Del: move the selection (or the lead card) to the Trash (design §9).
+            // ponytail: no confirm modal — Trash is catalog-only and restorable; the
+            // §11.6 confirm-before-Trash toggle arrives with the Settings backend.
+            if self.screen == Screen::Library && ctx.input(|i| i.key_pressed(Key::Delete)) {
+                let targets: Vec<usize> = if self.selected.is_empty() {
+                    self.selected_cache_idx
+                        .and_then(|ci| self.sorted_cache.get(ci).copied())
+                        .into_iter()
+                        .collect()
+                } else {
+                    self.selected.iter().copied().collect()
+                };
+                self.set_entries_trashed(&targets, true);
             }
 
             // Arrow nav — we need the column count from the last frame.
@@ -3004,6 +3214,10 @@ impl eframe::App for LodestashApp {
                         self.packages_screen(ui, ctx);
                         return;
                     }
+                    Screen::Trash => {
+                        self.trash_screen(ui);
+                        return;
+                    }
                     Screen::Library => {}
                     // Unbuilt destinations render the §12 stub — never a dead click.
                     other => {
@@ -3161,6 +3375,14 @@ impl eframe::App for LodestashApp {
                     ContextAction::OpenWithDefault => {
                         // Opens the file with its default handler on every platform.
                         reveal_in_file_manager(&self.entries[entry_idx].file.abs_path);
+                    }
+                    ContextAction::Trash => {
+                        let targets: Vec<usize> = if self.selected.contains(&entry_idx) {
+                            self.selected.iter().copied().collect()
+                        } else {
+                            vec![entry_idx]
+                        };
+                        self.set_entries_trashed(&targets, true);
                     }
                     ContextAction::CopyPath => {
                         let set = if self.selected.contains(&entry_idx) {
@@ -3944,6 +4166,7 @@ enum ContextAction {
     Reveal,
     OpenWithDefault,
     CopyPath,
+    Trash,
 }
 
 /// What the grid reported back this frame.
@@ -4035,9 +4258,10 @@ fn thumbnail_grid(
                         if resp.secondary_clicked() && !in_selection {
                             clicked = Some((cache_idx, egui::Modifiers::NONE));
                         }
+                        let can_trash = entries[idx].asset_id.is_some();
                         resp.context_menu(|ui| {
                             ui.set_min_width(190.0);
-                            if let Some(action) = card_context_menu(ui) {
+                            if let Some(action) = card_context_menu(ui, can_trash) {
                                 context = Some((cache_idx, action));
                             }
                         });
@@ -4058,7 +4282,7 @@ fn thumbnail_grid(
 
 /// The right-click card menu (DESIGN-GUIDELINES §7). Catalog/engine actions render
 /// disabled until their backends exist — grayed with a tooltip, never hidden.
-fn card_context_menu(ui: &mut Ui) -> Option<ContextAction> {
+fn card_context_menu(ui: &mut Ui, can_trash: bool) -> Option<ContextAction> {
     let mut action = None;
     let mut act = |ui: &mut Ui, a: ContextAction, label: &str| {
         if ui.button(label).clicked() {
@@ -4087,11 +4311,16 @@ fn card_context_menu(ui: &mut Ui) -> Option<ContextAction> {
             .on_disabled_hover_text("Arrives with the catalog / engine bridge (P3\u{2013}P5)");
     }
     ui.separator();
-    ui.add_enabled(
-        false,
-        egui::Button::new(RichText::new("Move to Trash").color(theme::DANGER)),
-    )
-    .on_disabled_hover_text("Trash lands with the catalog read path (P3)");
+    let trash = ui
+        .add_enabled(
+            can_trash,
+            egui::Button::new(RichText::new("Move to Trash").color(theme::DANGER)),
+        )
+        .on_disabled_hover_text("Waiting for this asset's catalog row (syncs after scan)");
+    if trash.clicked() {
+        action = Some(ContextAction::Trash);
+        ui.close_menu();
+    }
     action
 }
 
@@ -4286,8 +4515,8 @@ fn read_back_assets(
                 .assets_for_source(*id)
                 .map_err(|e| e.to_string())?
                 .into_iter()
-                .filter_map(|(rel, id, code)| {
-                    AssetStatus::from_code(&code).map(|s| (rel, (id, s)))
+                .filter_map(|(rel, id, code, trashed)| {
+                    AssetStatus::from_code(&code).map(|s| (rel, (id, s, trashed)))
                 })
                 .collect();
             Ok((root.clone(), map))
@@ -5163,6 +5392,7 @@ mod tests {
             source_idx: src,
             asset_id: None,
             status: AssetStatus::Discovered,
+            trashed: false,
             texture: None,
             thumb_spawned: false,
         }
@@ -5251,6 +5481,7 @@ mod tests {
             source_idx: 0,
             asset_id: None,
             status: AssetStatus::Discovered,
+            trashed: false,
             texture: None,
             thumb_spawned: false,
         }
