@@ -128,6 +128,20 @@ pub struct ViewPrefs {
     pub sort_asc: bool,
     #[serde(default)]
     pub mode: ViewMode,
+    /// Thumbnail-grid assets per page (50/75/100 presets or a custom value).
+    /// Persisted so a chosen page size survives restarts.
+    #[serde(default = "default_page_size")]
+    pub page_size: usize,
+}
+
+/// Default assets-per-page for the thumbnail grid.
+pub const DEFAULT_PAGE_SIZE: usize = 50;
+/// Custom page sizes are clamped to this range (0 would divide by zero; huge pages
+/// defeat the point of paging).
+pub const PAGE_SIZE_RANGE: std::ops::RangeInclusive<usize> = 10..=1000;
+
+fn default_page_size() -> usize {
+    DEFAULT_PAGE_SIZE
 }
 
 impl Default for ViewPrefs {
@@ -137,6 +151,7 @@ impl Default for ViewPrefs {
             sort_by: SortBy::Name,
             sort_asc: true,
             mode: ViewMode::Flat,
+            page_size: DEFAULT_PAGE_SIZE,
         }
     }
 }
