@@ -18,6 +18,20 @@ pub enum MediaType {
 }
 
 impl MediaType {
+    /// Parse a catalog `media_type.code`; unknown codes are None (schema drift, not a panic).
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "model_3d" => Some(MediaType::Model3d),
+            "texture" => Some(MediaType::Texture),
+            "audio" => Some(MediaType::Audio),
+            "image" => Some(MediaType::Image),
+            "sprite" => Some(MediaType::Sprite),
+            "material" => Some(MediaType::Material),
+            "font" => Some(MediaType::Font),
+            _ => None,
+        }
+    }
+
     /// The catalog `media_type.code` string (DATA-MODEL §2). Must match the serde
     /// snake_case names and the `seed_media_types` rows.
     pub fn code(self) -> &'static str {

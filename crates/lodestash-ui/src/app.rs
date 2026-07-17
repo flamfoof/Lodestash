@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use egui::{Key, RichText, ScrollArea, TextureHandle, Ui, Vec2};
-use lodestash_core::catalog::{Catalog, CrawlRecord, StatusCounts};
+use lodestash_core::catalog::{Catalog, CrawlRecord, HydratedAsset, StatusCounts};
 use lodestash_core::types::{AssetStatus, MediaType};
 use lodestash_ingest::asset_store::{self, AssetStorePackage};
 use lodestash_ingest::crawler::{self, CrawledFile};
@@ -100,6 +100,14 @@ struct PendingPackage {
     extracting: bool,
 }
 
+/// Startup hydrate: the catalog's view of the sources, shown instantly while the
+/// filesystem crawl reconciles in the background. Superseded by that crawl's ScanDone.
+struct HydrateDone {
+    generation: u64,
+    /// (source index, hydrated rows) per source.
+    sources: Vec<(usize, Vec<HydratedAsset>)>,
+}
+
 /// Per-root asset identity maps: root → (rel_path → (asset id, status)).
 type AssetIdentityMaps = Vec<(String, std::collections::HashMap<String, (i64, AssetStatus, bool)>)>;
 
@@ -152,12 +160,12 @@ const CARD_LABEL: f32 = 36.0;
 const CARD_PAD: f32 = 8.0;
 pub const THUMB_MIN: f32 = 64.0;
 pub const THUMB_MAX: f32 = 256.0;
-/// Extra rows above/below the visible viewport to prefetch thumbnails for.
-const LOOKAHEAD_ROWS: usize = 4;
-/// Rows beyond the visible window whose textures are kept resident; anything further
-/// is evicted so VRAM stays bounded while scrolling a large library.
+/// Floor for the proportional prefetch window (half the viewport each side),
+/// so tiny windows still get some lookahead.
+const LOOKAHEAD_ROWS_MIN: usize = 2;
+/// Floor for the proportional resident window (1.5x the viewport each side).
 /// ponytail: window-based eviction, not true LRU — swap for a budgeted LRU if thrashing shows.
-const KEEP_ROWS: usize = 32;
+const KEEP_ROWS_MIN: usize = 4;
 
 /// Discrete grid-size stops for the segmented selector, all driving `thumb_size` (design §2).
 const GRID_STOPS: [(f32, &str); 3] = [(96.0, "Compact"), (128.0, "Cozy"), (176.0, "Large")];
@@ -456,6 +464,8 @@ pub struct LodestashApp {
     catalog_persisting: bool,
     catalog_rx: Receiver<CatalogSynced>,
     catalog_tx: Sender<CatalogSynced>,
+    hydrate_rx: Receiver<HydrateDone>,
+    hydrate_tx: Sender<HydrateDone>,
     /// Faint background radial gradients (UI-SPEC §0): gold top-right, arcane bottom-left.
     bg_gold: Option<TextureHandle>,
     bg_arcane: Option<TextureHandle>,
@@ -482,6 +492,7 @@ impl LodestashApp {
         let (scan_tx, scan_rx) = mpsc::channel();
         let (extract_tx, extract_rx) = mpsc::channel();
         let (catalog_tx, catalog_rx) = mpsc::channel();
+        let (hydrate_tx, hydrate_rx) = mpsc::channel();
         let config = AppConfig::load();
         let sort_by = config.view.sort_by;
         let sort_asc = config.view.sort_asc;
@@ -539,6 +550,8 @@ impl LodestashApp {
             catalog_persisting: false,
             catalog_rx,
             catalog_tx,
+            hydrate_rx,
+            hydrate_tx,
             bg_gold: Some(cc.egui_ctx.load_texture(
                 "bg_radial_gold",
                 radial_image(theme::GOLD, 15), // rgba(231,183,101,.06)
@@ -714,7 +727,88 @@ impl LodestashApp {
             });
         });
 
+        // Startup hydrate: show the catalog's view of these sources instantly (no
+        // disk walk) while the crawl above reconciles in the background. Whichever
+        // lands first wins the frame; ScanDone always supersedes.
+        if let Some(db_path) = catalog_db_path() {
+            let roots: Vec<PathBuf> = self.scan_roots.clone();
+            let tx = self.hydrate_tx.clone();
+            let generation = self.scan_generation;
+            std::thread::spawn(move || {
+                let run = || -> Result<Vec<(usize, Vec<HydratedAsset>)>, String> {
+                    let catalog = Catalog::open(&db_path).map_err(|e| e.to_string())?;
+                    let mut sources = Vec::new();
+                    for (idx, root) in roots.iter().enumerate() {
+                        let sid = catalog
+                            .upsert_import_source(
+                                &config::stem_name(root),
+                                &root.to_string_lossy(),
+                                "folder",
+                            )
+                            .map_err(|e| e.to_string())?;
+                        let rows = catalog.entries_for_source(sid).map_err(|e| e.to_string())?;
+                        if !rows.is_empty() {
+                            sources.push((idx, rows));
+                        }
+                    }
+                    Ok(sources)
+                };
+                match run() {
+                    Ok(sources) if !sources.is_empty() => {
+                        let _ = tx.send(HydrateDone {
+                            generation,
+                            sources,
+                        });
+                    }
+                    Ok(_) => {} // nothing catalogued yet — first open of these sources
+                    Err(err) => tracing::warn!(%err, "startup hydrate failed; waiting for crawl"),
+                }
+            });
+        }
+
         ctx.request_repaint();
+    }
+
+    /// Apply a startup hydrate — only while the reconciling crawl is still running
+    /// (a landed ScanDone is always fresher) and only for the current generation.
+    fn receive_hydrate(&mut self) {
+        while let Ok(msg) = self.hydrate_rx.try_recv() {
+            if msg.generation != self.scan_generation || !self.scanning {
+                continue;
+            }
+            self.entries = msg
+                .sources
+                .into_iter()
+                .flat_map(|(source_idx, rows)| {
+                    let root = self.scan_roots.get(source_idx).cloned().unwrap_or_default();
+                    rows.into_iter().filter_map(move |row| {
+                        let rel_path = PathBuf::from(&row.rel_path);
+                        Some(AssetEntry {
+                            file: CrawledFile {
+                                abs_path: root.join(&rel_path),
+                                rel_path,
+                                size_bytes: row.size_bytes.max(0) as u64,
+                                mtime: row.mtime,
+                                media_type: MediaType::from_code(&row.media_type),
+                            },
+                            source_idx,
+                            asset_id: Some(row.asset_id),
+                            status: AssetStatus::from_code(&row.status)?,
+                            trashed: row.trashed,
+                            texture: None,
+                            thumb_spawned: false,
+                        })
+                    })
+                })
+                .collect();
+            self.current_dir = self.default_dir();
+            self.recompute_tab_counts();
+            self.cache_dirty = true;
+            self.last_cols = 0;
+            self.last_row_start = usize::MAX;
+            self.last_row_end = 0;
+            tracing::info!(entries = self.entries.len(), "hydrated grid from catalog");
+        }
     }
 
     // ── Per-frame helpers ─────────────────────────────────────────────────────
@@ -725,17 +819,36 @@ impl LodestashApp {
                 continue; // stale scan from a superseded load
             }
             self.scanning = false;
+            // Carry catalog identity over from the outgoing entries (a hydrate or an
+            // earlier read-back) so trashed/identified state doesn't flash back to
+            // defaults between the crawl landing and the next persist read-back.
+            let carry: std::collections::HashMap<(usize, PathBuf), (Option<i64>, AssetStatus, bool)> =
+                self.entries
+                    .drain(..)
+                    .map(|e| {
+                        (
+                            (e.source_idx, e.file.rel_path),
+                            (e.asset_id, e.status, e.trashed),
+                        )
+                    })
+                    .collect();
             self.entries = msg
                 .entries
                 .into_iter()
-                .map(|(source_idx, f)| AssetEntry {
-                    file: f,
-                    source_idx,
-                    asset_id: None,
-                    status: AssetStatus::Discovered,
-                    trashed: false,
-                    texture: None,
-                    thumb_spawned: false,
+                .map(|(source_idx, f)| {
+                    let (asset_id, status, trashed) = carry
+                        .get(&(source_idx, f.rel_path.clone()))
+                        .copied()
+                        .unwrap_or((None, AssetStatus::Discovered, false));
+                    AssetEntry {
+                        file: f,
+                        source_idx,
+                        asset_id,
+                        status,
+                        trashed,
+                        texture: None,
+                        thumb_spawned: false,
+                    }
                 })
                 .collect();
             self.pending_packages = msg.pending_packages;
@@ -2436,16 +2549,21 @@ fn grid_columns(available: f32, thumb_size: f32) -> usize {
 /// The row window to prefetch thumbnails for: the visible `[start, end)` widened by
 /// `LOOKAHEAD_ROWS` on each side and clamped to `[0, total_rows]`.
 fn lookahead_window(start: usize, end: usize, total_rows: usize) -> (usize, usize) {
-    let buf_start = start.saturating_sub(LOOKAHEAD_ROWS);
-    let buf_end = (end + LOOKAHEAD_ROWS).min(total_rows);
+    // Half the visible window each side → ~2x the visible grid is loading at once.
+    let buf = ((end - start) / 2).max(LOOKAHEAD_ROWS_MIN);
+    let buf_start = start.saturating_sub(buf);
+    let buf_end = (end + buf).min(total_rows);
     (buf_start, buf_end)
 }
 
 /// The `sorted_cache` index range `[start, end)` whose textures stay resident:
 /// the visible row window widened by `KEEP_ROWS` on each side, in entries, clamped to `len`.
 fn keep_range(row_start: usize, row_end: usize, cols: usize, len: usize) -> (usize, usize) {
-    let keep_start = (row_start.saturating_sub(KEEP_ROWS) * cols).min(len);
-    let keep_end = ((row_end + KEEP_ROWS) * cols).min(len);
+    // 1.5x the visible window above and below stays resident; further rows evict
+    // back to placeholders so VRAM stays bounded on large libraries.
+    let keep = ((row_end - row_start) * 3 / 2).max(KEEP_ROWS_MIN);
+    let keep_start = (row_start.saturating_sub(keep) * cols).min(len);
+    let keep_end = ((row_end + keep) * cols).min(len);
     (keep_start, keep_end)
 }
 
@@ -2453,6 +2571,7 @@ fn keep_range(row_start: usize, row_end: usize, cols: usize, len: usize) -> (usi
 
 impl eframe::App for LodestashApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.receive_hydrate();
         self.receive_scan();
         self.receive_thumbnails();
         self.receive_extracts();
@@ -4547,11 +4666,20 @@ fn persist_to_catalog(
         let stats = catalog
             .record_crawl(id, None, &batch.records)
             .map_err(|e| e.to_string())?;
+        // Files gone from disk are flagged missing (metadata preserved, hidden from
+        // hydrate + grid); files that came back are unflagged.
+        let present: std::collections::HashSet<String> =
+            batch.records.iter().map(|r| r.rel_path.clone()).collect();
+        let (gone, back) = catalog
+            .reconcile_missing(id, &present)
+            .map_err(|e| e.to_string())?;
         tracing::info!(
             root = %batch.root,
             inserted = stats.inserted,
             updated = stats.updated,
             unchanged = stats.unchanged,
+            gone,
+            back,
             "catalog sync"
         );
     }
@@ -5446,27 +5574,28 @@ mod tests {
 
     #[test]
     fn keep_range_widens_and_clamps() {
-        // Interior window: widened KEEP_ROWS each side, in entries.
-        let (s, e) = keep_range(100, 105, 10, 10_000);
-        assert_eq!(s, (100 - KEEP_ROWS) * 10);
-        assert_eq!(e, (105 + KEEP_ROWS) * 10);
+        // Interior window: 1.5x the 6 visible rows (=9) kept each side, in entries.
+        let (s, e) = keep_range(100, 106, 10, 10_000);
+        assert_eq!(s, (100 - 9) * 10);
+        assert_eq!(e, (106 + 9) * 10);
+        // Tiny viewport falls back to the floor.
+        let (s, e) = keep_range(100, 101, 10, 10_000);
+        assert_eq!(s, (100 - KEEP_ROWS_MIN) * 10);
+        assert_eq!(e, (101 + KEEP_ROWS_MIN) * 10);
         // Top of a short list: clamps to [0, len].
-        assert_eq!(keep_range(0, 2, 10, 100), (0, 100));
+        assert_eq!(keep_range(0, 2, 10, 30), (0, 30));
         // Empty list never panics.
         assert_eq!(keep_range(0, 0, 1, 0), (0, 0));
     }
 
     #[test]
     fn lookahead_window_clamps_to_bounds() {
-        // Top of list: cannot go below 0.
-        assert_eq!(lookahead_window(0, 5, 100), (0, 5 + LOOKAHEAD_ROWS));
-        // Middle: widened both sides.
-        assert_eq!(
-            lookahead_window(20, 30, 100),
-            (20 - LOOKAHEAD_ROWS, 30 + LOOKAHEAD_ROWS)
-        );
+        // Top of list: cannot go below 0. 5 visible → buf 2 (floor).
+        assert_eq!(lookahead_window(0, 5, 100), (0, 7));
+        // Middle: half the 10 visible rows (=5) each side → ~2x visible loading.
+        assert_eq!(lookahead_window(20, 30, 100), (15, 35));
         // Bottom: end cannot exceed total_rows.
-        assert_eq!(lookahead_window(95, 100, 100), (95 - LOOKAHEAD_ROWS, 100));
+        assert_eq!(lookahead_window(95, 100, 100), (93, 100));
     }
 
     fn entry_full(rel: &str, size: u64, mtime: i64, mt: Option<MediaType>) -> AssetEntry {
