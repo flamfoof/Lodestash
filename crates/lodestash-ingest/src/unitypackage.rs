@@ -178,14 +178,49 @@ pub struct ExtractedAsset {
     pub size_bytes: u64,
 }
 
+/// Wraps a reader and reports cumulative bytes read after every chunk.
+struct ProgressReader<'a, R> {
+    inner: R,
+    read: u64,
+    total: u64,
+    on_progress: &'a (dyn Fn(u64, u64) + Sync),
+}
+
+impl<R: Read> Read for ProgressReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read += n as u64;
+        (self.on_progress)(self.read, self.total);
+        Ok(n)
+    }
+}
+
 /// Ingest pass: one streaming extract of every `asset` payload into `dest/<blake3-hex>/<basename>`.
 /// Content-addressed and idempotent — if the destination already exists (same bytes, same hash),
 /// the freshly-extracted temp copy is discarded rather than rewritten.
 pub fn extract_to_workspace(path: &Path, dest: &Path) -> io::Result<Vec<ExtractedAsset>> {
+    extract_to_workspace_with_progress(path, dest, &|_, _| {})
+}
+
+/// [`extract_to_workspace`] with byte-level progress: `on_progress(read, total)` is called with
+/// **compressed** bytes consumed vs. the archive's file size — accurate activity even when the
+/// entry count isn't known upfront (streamed tar).
+pub fn extract_to_workspace_with_progress(
+    path: &Path,
+    dest: &Path,
+    on_progress: &(dyn Fn(u64, u64) + Sync),
+) -> io::Result<Vec<ExtractedAsset>> {
     let tmp_dir = dest.join(".tmp");
     std::fs::create_dir_all(&tmp_dir)?;
 
     let file = File::open(path)?;
+    let total = file.metadata()?.len();
+    let file = ProgressReader {
+        inner: file,
+        read: 0,
+        total,
+        on_progress,
+    };
     let gz = GzDecoder::new(file);
     let mut archive = tar::Archive::new(gz);
 

@@ -18,9 +18,9 @@ flagged.
 | Crate | Purpose | Key dependencies |
 |---|---|---|
 | `lodestash-core` | catalog, search, mapping, jobs, asset ops | `rusqlite` (bundled SQLite + FTS5 + loadable-ext), `sqlite-vec`, `blake3`, `serde`/`serde_json`, `tokio`, `rayon`, `notify`, `uuid`, `thiserror`/`anyhow`, `tracing` |
-| `lodestash-ingest` | crawl, detect, untar, normalize, thumbnail | `flate2`+`tar` (.unitypackage), `zip` (zip packs/.kra/.aseprite), `serde_yaml` (.meta), `image`, `image_dds`, `psd`, `texture2ddecoder`, `gltf`/`easy-gltf`, `russimp` (Assimp; C++ dep) **or** `FBX2glTF` (subprocess), `symphonia`, `ab_glyph`/`fontdue` (font specimens), `blake3`, `img_hash` (pHash) |
+| `lodestash-ingest` | crawl, detect, untar, normalize, thumbnail | `flate2`+`tar` (.unitypackage), `zip` (zip packs/.kra/.aseprite), `serde_yaml` (.meta), `image`, `image_dds`, `psd`, `texture2ddecoder`, `gltf`/`easy-gltf`, `ufbx` (FBX; single C file via `cc`), `symphonia`, `ab_glyph`/`fontdue` (font specimens), `blake3`, `img_hash` (pHash) |
 | `lodestash-ai` | Tagger/Embedder traits + impls | `ort` (ONNX Runtime; CUDA/DirectML/CPU EPs) — alt `candle`/`fastembed`, `tokenizers`, `ndarray`, `reqwest` (Ollama + cloud HTTP), `whisper-rs` (speech), `image` (preprocess) |
-| `lodestash-ui` | egui app + 3D/audio/image preview | `eframe`/`egui` + **`egui_glow`** (OpenGL renderer — see §7), `three-d` (3D viewport), `rodio` (+ `symphonia`) audio, `egui_extras`/`egui_plot` (waveform), `rfd` (file dialogs), `poll-promise` (async UI) |
+| `lodestash-ui` | egui app + 3D/audio/image preview | `eframe`/`egui` + **`egui_glow`** (OpenGL renderer — see §7), `three-d` + `three-d-asset` (3D viewport; glow-lockstep with eframe, §7), `rodio` (+ `symphonia`) audio, `egui_extras`/`egui_plot` (waveform), `rfd` (file dialogs), `poll-promise` (async UI) |
 | `lodestash-mcp` | MCP server | `rmcp` (official Rust MCP SDK), `tokio`, `serde_json` |
 | `lodestash-api` | loopback HTTP/JSON | `axum` + `tower`/`tower-http` (limits, CORS-off), `tokio`, `serde_json` |
 | `lodestash-cli` | headless ops (scan/index/tag) | `clap`, `lodestash-core` |
@@ -33,7 +33,7 @@ flagged.
 | Concern | Choice | Notes |
 |---|---|---|
 | **DB / search** | SQLite (WAL) via `rusqlite` (bundled) + **FTS5** + **sqlite-vec** (loadable ext) | one file; `VectorIndex` trait → **LanceDB** (`lancedb` crate) past ~500k–1M vectors |
-| **3D render** | `three-d` **0.18** on eframe's shared **Glow** GL context (§7 — glow-version lockstep) | normalize→glTF on import (Assimp via `russimp`, or `FBX2glTF` binary); glTF/GLB/OBJ load directly via `three-d-asset` |
+| **3D render** | `three-d` **0.18** on eframe's shared **Glow** GL context (§7 — glow-version lockstep) | FBX flattens in-process via `ufbx`; glTF/GLB/OBJ load directly via `three-d-asset` (Assimp/`FBX2glTF` deferred — §7) |
 | **Audio** | `symphonia` (decode) + `rodio` (playback) | waveform drawn with egui painter |
 | **Images** | `image` + `image_dds` (BCn/DDS) + `psd` + EXR/HDR via `image` | dominant color via `color-thief`/k-means → `dominant_color` |
 | **2D-authoring** | `.aseprite`/`.kra` = zip → embedded composite + frames; `.pdn` via parser; `.blend` embedded thumbnail / Blender headless | see [`INGESTION.md`](INGESTION.md) §4 |
@@ -128,7 +128,7 @@ release.
 |---|---|---|
 | `ort` vs `candle` | **`ort`** (ONNX Runtime) | Broadest model coverage (SigLIP 2, WD v3, CLAP, YAMNet); pre-built DirectML/CUDA/CPU EPs on Windows; no need to retrain or convert to candle format. |
 | `axum` vs `hyper` | **`axum`** | Tower middleware ecosystem (rate-limit, tracing, auth); ergonomic routing; axum is the standard for production Rust HTTP servers. |
-| Assimp vs FBX2glTF | **`russimp`** (Assimp, P1) | Handles FBX + OBJ + Collada + glTF in one C++ dep; FBX2glTF kept as optional external subprocess for edge cases where the proprietary Autodesk SDK is needed. |
+| Assimp vs FBX2glTF vs ufbx | **`ufbx`** (P1, shipped) | Single-file C FBX importer building with `cc` alone — russimp/Assimp needs cmake **and** libclang on the build machine for ~zero extra value (FBX is the dominant Unity mesh format; glTF/GLB/OBJ load via `three-d-asset`). Assimp stays the fallback if long-tail formats (DAE/3DS/LWO…) ever matter; FBX2glTF optional subprocess for Autodesk-SDK edge cases. |
 | Chromaprint vs `fpcalc` | **`fpcalc` subprocess** (P2) | Avoids C++ build complexity at P0/P1; shell to system `fpcalc` binary; binding optional later if cross-platform `fpcalc` bundling proves easier. |
 | wgpu vs Glow (egui renderer) | **`egui_glow`** (OpenGL/WGL) | wgpu requires explicit `surface.configure()` on every resize; the brief gap between reconfiguration and the first presented frame lets the Windows DWM compositor fill with a scaled old frame, producing visible "revert" jitter. OpenGL/WGL buffer swaps are synchronous with the window system and don't have this gap. **Do not switch to wgpu without re-validating resize smoothness on Windows.** |
 | three-d on Glow: shared context vs offscreen handoff | **shared context** — `three_d::Context::from_gl_context(frame gl)` + egui `PaintCallback` | three-d is glow-based, so it renders straight into egui's frame (`RenderTarget::screen` + scissor to the widget rect): no second context, no readback. Constraint: **eframe and three-d must agree on one `glow` version** (eframe 0.29 ↔ three-d 0.18 ↔ glow 0.14) — upgrade the pair together. egui_glow re-arms its own GL state after each callback, so three-d's state doesn't leak. |

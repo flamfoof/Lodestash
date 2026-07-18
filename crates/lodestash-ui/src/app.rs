@@ -2,7 +2,9 @@
 //! Spec: DESIGN-GUIDELINES.md §4, §7, §9; ARCHITECTURE.md §6.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::time::Duration;
 
 use egui::{Key, RichText, ScrollArea, TextureHandle, Ui, Vec2};
@@ -54,6 +56,10 @@ impl Category {
 // ── Asset entry ───────────────────────────────────────────────────────────────
 
 struct AssetEntry {
+    /// Extracted-package origin (the sidebar "package library" facet). None for plain
+    /// on-disk files. ponytail: session-only — rehydration re-derives it when the
+    /// catalog packages model lands (P2 card).
+    package: Option<String>,
     file: CrawledFile,
     /// Index into `scan_roots` — which source this asset came from (the Library Source).
     source_idx: usize,
@@ -90,6 +96,30 @@ struct ScanDone {
 /// A `.unitypackage` found while crawling, not yet extracted into the grid. Its manifest is
 /// already resolved (read on the same background crawl thread) so the UI can offer an "Extract"
 /// action immediately, with no separate loading step.
+/// Shared byte-progress of a running extraction (written by the worker, read by the UI).
+#[derive(Default)]
+struct ExtractProgress {
+    done: AtomicU64,
+    total: AtomicU64,
+}
+
+impl ExtractProgress {
+    fn fraction(&self) -> f32 {
+        let total = self.total.load(Ordering::Relaxed);
+        if total == 0 {
+            return 0.0;
+        }
+        (self.done.load(Ordering::Relaxed) as f32 / total as f32).clamp(0.0, 1.0)
+    }
+}
+
+/// Sidebar LIBRARIES facet selection: a source root, or one extracted package.
+#[derive(Clone, PartialEq)]
+enum LibraryFilter {
+    Source(usize),
+    Package(String),
+}
+
 struct PendingPackage {
     source_idx: usize,
     abs_path: PathBuf,
@@ -101,6 +131,7 @@ struct PendingPackage {
     /// Index into `nested_candidates`, defaulted to the URP variant when one exists.
     chosen_variant: usize,
     extracting: bool,
+    progress: Arc<ExtractProgress>,
 }
 
 /// Longest side a full-detail viewer texture may have; larger sources are
@@ -204,6 +235,7 @@ struct PersistBatch {
 
 /// Result of a background package extraction.
 struct ExtractDone {
+    display_name: String,
     /// Identifies which `PendingPackage` this came from — matched by path rather than index
     /// since `pending_packages` may have been mutated while the extraction ran.
     abs_path: PathBuf,
@@ -482,7 +514,7 @@ pub struct LodestashApp {
     thumb_size: f32,
     view_mode: ViewMode,
     /// Flat mode: restrict the grid to one source (None = all libraries).
-    source_filter: Option<usize>,
+    source_filter: Option<LibraryFilter>,
     /// Folders mode location: None = top level (source tiles); Some = (source, dir rel to root).
     current_dir: Option<(usize, PathBuf)>,
     /// Child folders at `current_dir`: (name, contained-asset count). Rebuilt with the cache.
@@ -891,6 +923,7 @@ impl LodestashApp {
                     rows.into_iter().filter_map(move |row| {
                         let rel_path = PathBuf::from(&row.rel_path);
                         Some(AssetEntry {
+                            package: None,
                             file: CrawledFile {
                                 abs_path: root.join(&rel_path),
                                 rel_path,
@@ -950,6 +983,7 @@ impl LodestashApp {
                         .copied()
                         .unwrap_or((None, AssetStatus::Discovered, false, None));
                     AssetEntry {
+                        package: None,
                         file: f,
                         source_idx,
                         asset_id,
@@ -1325,7 +1359,7 @@ impl LodestashApp {
         };
         // 3D branch mirrors the raster branch below.
         if entry.file.media_type == Some(MediaType::Model3d)
-            && viewport3d::is_direct_model(&entry.file.abs_path)
+            && viewport3d::is_viewable_model(&entry.file.abs_path)
         {
             let path = entry.file.abs_path.clone();
             if let Some(vp) = &mut self.viewport3d {
@@ -1428,6 +1462,8 @@ impl LodestashApp {
             return;
         }
         pkg.extracting = true;
+        pkg.progress = Arc::default();
+        let progress = pkg.progress.clone();
 
         let abs_path = pkg.abs_path.clone();
         let source_idx = pkg.source_idx;
@@ -1444,8 +1480,10 @@ impl LodestashApp {
                 &workspace_dir,
                 nested_pathname.as_deref(),
                 &display_name,
+                &progress,
             );
             let _ = tx.send(ExtractDone {
+                display_name,
                 abs_path,
                 source_idx,
                 files,
@@ -1465,6 +1503,7 @@ impl LodestashApp {
             self.spawn_package_persist(msg.source_idx, &msg.abs_path, &msg.files);
             for file in msg.files {
                 self.entries.push(AssetEntry {
+                    package: Some(msg.display_name.clone()),
                     file,
                     source_idx: msg.source_idx,
                     asset_id: None,
@@ -1516,14 +1555,16 @@ impl LodestashApp {
         let (mut idxs, tiles): (Vec<usize>, Vec<(String, usize)>) =
             match (self.view_mode, self.current_dir.clone()) {
                 (ViewMode::Flat, _) => {
-                    let filter = self.source_filter;
+                    let filter = self.source_filter.clone();
                     let idxs = self
                         .entries
                         .iter()
                         .enumerate()
                         .filter(|(_, e)| {
-                            filter.map_or(true, |s| e.source_idx == s)
-                                && tab.matches(e.file.media_type)
+                            filter.as_ref().map_or(true, |f| match f {
+                                LibraryFilter::Source(s) => e.source_idx == *s,
+                                LibraryFilter::Package(p) => e.package.as_deref() == Some(p),
+                            }) && tab.matches(e.file.media_type)
                                 && name_matches(e)
                         })
                         .map(|(i, _)| i)
@@ -1712,7 +1753,7 @@ impl LodestashApp {
         let mut go_library = false;
         let mut new_screen: Option<Screen> = None;
         let mut new_status: Option<StatusFilter> = None;
-        let mut new_source: Option<Option<usize>> = None;
+        let mut new_source: Option<Option<LibraryFilter>> = None;
         let mut add_source_clicked = false;
 
         let trashed_count = self.entries.iter().filter(|e| e.trashed).count();
@@ -1814,11 +1855,33 @@ impl LodestashApp {
                         }
                         for (i, &count) in per_source.iter().enumerate() {
                             let name = config::stem_name(&self.scan_roots[i]);
-                            if facet_row(ui, None, &name, count, self.source_filter == Some(i))
-                                .clicked()
-                            {
-                                new_source = Some(Some(i));
+                            let active = self.source_filter == Some(LibraryFilter::Source(i));
+                            if facet_row(ui, None, &name, count, active).clicked() {
+                                new_source = Some(Some(LibraryFilter::Source(i)));
                             }
+                        }
+                        // Extracted packages as their own library rows (session view of the
+                        // P2 packages model).
+                        let mut per_package: std::collections::BTreeMap<&str, usize> =
+                            std::collections::BTreeMap::new();
+                        for e in &self.entries {
+                            if let Some(pkg) = e.package.as_deref() {
+                                *per_package.entry(pkg).or_default() += 1;
+                            }
+                        }
+                        let mut pick_package: Option<String> = None;
+                        for (pkg, count) in per_package {
+                            let active = matches!(
+                                &self.source_filter,
+                                Some(LibraryFilter::Package(p)) if p == pkg
+                            );
+                            let label = format!("\u{25A4} {pkg}");
+                            if facet_row(ui, None, &label, count, active).clicked() {
+                                pick_package = Some(pkg.to_owned());
+                            }
+                        }
+                        if let Some(pkg) = pick_package {
+                            new_source = Some(Some(LibraryFilter::Package(pkg)));
                         }
                         ui.add_space(4.0);
                         // ponytail: solid 1px border stands in for the spec's dashed one —
@@ -2062,10 +2125,20 @@ impl LodestashApp {
                                         .is_some_and(|r| self.scan_roots.contains(r));
                                     match pending {
                                         Some(idx) if self.pending_packages[idx].extracting => {
-                                            ui.label(
-                                                RichText::new("extracting\u{2026}")
-                                                    .color(theme::ARCANE)
-                                                    .size(11.0),
+                                            let frac =
+                                                self.pending_packages[idx].progress.fraction();
+                                            ui.add(
+                                                egui::ProgressBar::new(frac)
+                                                    .desired_width(120.0)
+                                                    .desired_height(12.0)
+                                                    .fill(theme::ARCANE)
+                                                    .text(
+                                                        RichText::new(format!(
+                                                            "extracting {:.0}%",
+                                                            frac * 100.0
+                                                        ))
+                                                        .size(9.0),
+                                                    ),
                                             );
                                         }
                                         Some(idx) => {
@@ -2866,6 +2939,10 @@ impl eframe::App for LodestashApp {
         self.receive_extracts();
         self.receive_catalog();
         self.receive_viewer(ctx);
+        if self.pending_packages.iter().any(|p| p.extracting) {
+            // Keep the extraction progress bar moving without input events.
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
         if let Some(vp) = &mut self.viewport3d {
             vp.poll();
         }
@@ -3388,8 +3465,11 @@ impl eframe::App for LodestashApp {
                     // ⚑ Filters · grid density · view toggle. Pack/collection filter chips
                     // join once the P2 packages model / P3 collections can activate them.
                     ui.horizontal(|ui| {
-                        let library_label = match self.source_filter {
-                            Some(i) => config::stem_name(&self.scan_roots[i]),
+                        let library_label = match &self.source_filter {
+                            Some(LibraryFilter::Source(i)) => {
+                                config::stem_name(&self.scan_roots[*i])
+                            }
+                            Some(LibraryFilter::Package(p)) => p.clone(),
                             None => self
                                 .project_name
                                 .clone()
@@ -3567,16 +3647,22 @@ impl eframe::App for LodestashApp {
                                         }
                                     });
                             }
-                            let extracting = pkg.extracting;
-                            let label = if extracting {
-                                "Extracting\u{2026}"
-                            } else {
-                                "Extract"
-                            };
-                            if ui
-                                .add_enabled(!extracting, egui::Button::new(label))
-                                .clicked()
-                            {
+                            if pkg.extracting {
+                                let frac = pkg.progress.fraction();
+                                ui.add(
+                                    egui::ProgressBar::new(frac)
+                                        .desired_width(140.0)
+                                        .desired_height(14.0)
+                                        .fill(theme::ARCANE)
+                                        .text(
+                                            RichText::new(format!(
+                                                "extracting {:.0}%",
+                                                frac * 100.0
+                                            ))
+                                            .size(10.0),
+                                        ),
+                                );
+                            } else if ui.add(egui::Button::new("Extract")).clicked() {
                                 extract_clicked = Some(i);
                             }
                         });
@@ -3993,7 +4079,7 @@ impl eframe::App for LodestashApp {
                             e.file.size_bytes,
                             e.texture.clone(),
                             e.file.media_type == Some(MediaType::Model3d)
-                                && viewport3d::is_direct_model(&e.file.abs_path),
+                                && viewport3d::is_viewable_model(&e.file.abs_path),
                         )
                     });
                     if let Some((name, media_type, size_bytes, thumb, direct_model)) = peek {
@@ -4416,6 +4502,7 @@ fn resolve_pending_package(source_idx: usize, file: &CrawledFile) -> Option<Pend
         nested_candidates,
         chosen_variant,
         extracting: false,
+        progress: Arc::default(),
     })
 }
 
@@ -4432,8 +4519,14 @@ fn extract_package_contents(
     workspace_dir: &std::path::Path,
     nested_pathname: Option<&str>,
     display_name: &str,
+    progress: &ExtractProgress,
 ) -> Vec<CrawledFile> {
-    let Ok(outer) = unitypackage::extract_to_workspace(path, workspace_dir) else {
+    let report = |done: u64, total: u64| {
+        progress.done.store(done, Ordering::Relaxed);
+        progress.total.store(total, Ordering::Relaxed);
+    };
+    let Ok(outer) = unitypackage::extract_to_workspace_with_progress(path, workspace_dir, &report)
+    else {
         return Vec::new();
     };
 
@@ -4445,8 +4538,13 @@ fn extract_package_contents(
             else {
                 return Vec::new();
             };
-            unitypackage::extract_to_workspace(&nested.workspace_path, workspace_dir)
-                .unwrap_or_default()
+            // Phase 2 (the real inner package) restarts the bar; still honest activity.
+            unitypackage::extract_to_workspace_with_progress(
+                &nested.workspace_path,
+                workspace_dir,
+                &report,
+            )
+            .unwrap_or_default()
         }
         None => outer,
     };
@@ -6275,6 +6373,7 @@ mod tests {
 
     fn entry(src: usize, rel: &str, mt: Option<MediaType>) -> AssetEntry {
         AssetEntry {
+            package: None,
             file: CrawledFile {
                 abs_path: PathBuf::from(rel),
                 rel_path: PathBuf::from(rel),
@@ -6366,6 +6465,7 @@ mod tests {
 
     fn entry_full(rel: &str, size: u64, mtime: i64, mt: Option<MediaType>) -> AssetEntry {
         AssetEntry {
+            package: None,
             file: CrawledFile {
                 abs_path: PathBuf::from(rel),
                 rel_path: PathBuf::from(rel),
@@ -6523,6 +6623,7 @@ mod tests {
             &workspace,
             Some(&nested_pathname),
             &pkg.display_name,
+            &ExtractProgress::default(),
         );
 
         assert_eq!(files.len(), 1);

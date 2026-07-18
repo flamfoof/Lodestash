@@ -9,8 +9,8 @@
 //! (pure CPU, `Send`); the GPU upload and every render happen on the UI thread. The
 //! scene lives in an `Arc<Mutex<…>>` because egui paint callbacks must be `Send + Sync`.
 //!
-//! ponytail: direct-load formats only (glTF/GLB/OBJ) — FBX arrives with the
-//! normalize→glTF cache (KANBAN P1 card), which feeds this same viewport.
+//! Formats: glTF/GLB/OBJ load via three-d-asset; FBX flattens through ufbx
+//! (`lodestash_ingest::mesh`) into triangle soup + base-color materials.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
@@ -18,11 +18,25 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui_glow::CallbackFn;
 use egui::{PointerButton, Response, Sense, Ui, Vec2};
+use lodestash_ingest::mesh::{self, MeshData};
 use three_d::{
-    degrees, vec3, AmbientLight, AxisAlignedBoundingBox, Camera, ClearState, Context,
-    DirectionalLight, Geometry, InnerSpace, Model, ModelPart, PhysicalMaterial, RenderTarget,
-    ScissorBox, Srgba, Vec3, Viewport,
+    degrees, vec3, AmbientLight, AxisAlignedBoundingBox, Camera, ClearState, Context, CpuMaterial,
+    CpuMesh, DirectionalLight, Geometry, Gm, Indices, InnerSpace, Mesh, Model, ModelPart,
+    PhysicalMaterial, Positions, RenderTarget, ScissorBox, Srgba, Vec3, Viewport,
 };
+
+/// Anything the viewport can open (either loader).
+pub fn is_viewable_model(path: &Path) -> bool {
+    is_direct_model(path) || mesh::is_fbx_model(path)
+}
+
+/// What the worker thread hands back for GPU upload.
+enum LoadedModel {
+    /// three-d-asset parse (glTF/GLB/OBJ) — materials/textures included.
+    Direct(three_d_asset::Model),
+    /// ufbx flatten (FBX) — triangle soup + base colors.
+    Flattened(Vec<MeshData>),
+}
 
 /// File extensions the viewport can load directly (no normalization pass needed).
 pub fn is_direct_model(path: &Path) -> bool {
@@ -36,7 +50,7 @@ pub fn is_direct_model(path: &Path) -> bool {
 /// The Quick Look 3D viewer: async model loading + an orbit camera rendered in-frame.
 pub struct Viewport3d {
     scene: Arc<Mutex<Scene>>,
-    rx: Option<Receiver<Result<three_d_asset::Model, String>>>,
+    rx: Option<Receiver<Result<LoadedModel, String>>>,
     /// Grid entry currently loaded/loading — the staleness guard, like `ImageViewer`.
     pub entry_idx: Option<usize>,
     pub loading: bool,
@@ -56,6 +70,7 @@ impl Viewport3d {
             scene: Arc::new(Mutex::new(Scene {
                 ctx,
                 models: Vec::new(),
+                flat: Vec::new(),
                 ambient,
                 sun,
                 fill,
@@ -77,7 +92,11 @@ impl Viewport3d {
         self.entry_idx = Some(entry_idx);
         self.loading = true;
         self.error = None;
-        self.scene.lock().unwrap().models.clear();
+        {
+            let mut s = self.scene.lock().unwrap();
+            s.models.clear();
+            s.flat.clear();
+        }
 
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
@@ -96,15 +115,11 @@ impl Viewport3d {
         self.rx = None;
         self.loading = false;
         match result {
-            Ok(cpu) => {
+            Ok(loaded) => {
                 let mut scene = self.scene.lock().unwrap();
-                match Model::<PhysicalMaterial>::new(&scene.ctx, &cpu) {
-                    Ok(mut model) => {
-                        // Model derefs to Vec<Gm<..>>; take the parts out of the wrapper.
-                        scene.models = std::mem::take(&mut *model);
-                        scene.frame_content();
-                    }
-                    Err(e) => self.error = Some(e.to_string()),
+                match scene.upload(loaded) {
+                    Ok(()) => scene.frame_content(),
+                    Err(e) => self.error = Some(e),
                 }
             }
             Err(e) => self.error = Some(e),
@@ -117,11 +132,14 @@ impl Viewport3d {
         self.entry_idx = None;
         self.loading = false;
         self.error = None;
-        self.scene.lock().unwrap().models.clear();
+        let mut s = self.scene.lock().unwrap();
+        s.models.clear();
+        s.flat.clear();
     }
 
     pub fn has_content(&self) -> bool {
-        !self.scene.lock().unwrap().models.is_empty()
+        let s = self.scene.lock().unwrap();
+        !s.models.is_empty() || !s.flat.is_empty()
     }
 
     /// The interactive viewport: left-drag orbits, right/middle-drag pans, scroll
@@ -171,6 +189,8 @@ impl Viewport3d {
 struct Scene {
     ctx: Context,
     models: Vec<ModelPart<PhysicalMaterial>>,
+    /// Meshes built by hand from `MeshData` (the FBX path).
+    flat: Vec<Gm<Mesh, PhysicalMaterial>>,
     ambient: AmbientLight,
     sun: DirectionalLight,
     fill: DirectionalLight,
@@ -182,11 +202,59 @@ struct Scene {
 }
 
 impl Scene {
+    /// GPU-upload a finished background parse into the right bucket.
+    fn upload(&mut self, loaded: LoadedModel) -> Result<(), String> {
+        match loaded {
+            LoadedModel::Direct(cpu) => {
+                let mut model =
+                    Model::<PhysicalMaterial>::new(&self.ctx, &cpu).map_err(|e| e.to_string())?;
+                // Model derefs to Vec<ModelPart>; take the parts out of the wrapper.
+                self.models = std::mem::take(&mut *model);
+            }
+            LoadedModel::Flattened(meshes) => {
+                let mut flat = Vec::with_capacity(meshes.len());
+                for m in meshes {
+                    let cpu = CpuMesh {
+                        positions: Positions::F32(
+                            m.positions.iter().map(|p| vec3(p[0], p[1], p[2])).collect(),
+                        ),
+                        indices: Indices::U32(m.indices),
+                        normals: m
+                            .normals
+                            .map(|ns| ns.iter().map(|n| vec3(n[0], n[1], n[2])).collect()),
+                        uvs: m
+                            .uvs
+                            .map(|us| us.iter().map(|u| three_d::vec2(u[0], u[1])).collect()),
+                        ..Default::default()
+                    };
+                    let material = PhysicalMaterial::new_opaque(
+                        &self.ctx,
+                        &CpuMaterial {
+                            albedo: Srgba::new(
+                                m.base_color[0],
+                                m.base_color[1],
+                                m.base_color[2],
+                                m.base_color[3],
+                            ),
+                            ..Default::default()
+                        },
+                    );
+                    flat.push(Gm::new(Mesh::new(&self.ctx, &cpu), material));
+                }
+                self.flat = flat;
+            }
+        }
+        Ok(())
+    }
+
     /// Re-center and re-distance the orbit around the loaded meshes' bounds.
     fn frame_content(&mut self) {
         let mut aabb = AxisAlignedBoundingBox::EMPTY;
         for m in &self.models {
             aabb.expand_with_aabb(m.aabb());
+        }
+        for g in &self.flat {
+            aabb.expand_with_aabb(g.aabb());
         }
         if aabb.is_empty() {
             return;
@@ -217,7 +285,7 @@ impl Scene {
     }
 
     fn render(&mut self, info: &egui::PaintCallbackInfo) {
-        if self.models.is_empty() {
+        if self.models.is_empty() && self.flat.is_empty() {
             return;
         }
         let vp = info.viewport_in_pixels();
@@ -256,14 +324,24 @@ impl Scene {
                 &camera,
                 &self.models,
                 &[&self.ambient, &self.sun, &self.fill],
+            )
+            .render_partially(
+                scissor,
+                &camera,
+                &self.flat,
+                &[&self.ambient, &self.sun, &self.fill],
             );
     }
 }
 
 /// Parse a model file into CPU-side meshes + materials. Runs on a worker thread.
-fn load_cpu_model(path: &Path) -> Result<three_d_asset::Model, String> {
+fn load_cpu_model(path: &Path) -> Result<LoadedModel, String> {
+    if mesh::is_fbx_model(path) {
+        return mesh::load_meshes(path).map(LoadedModel::Flattened);
+    }
     let mut raw = three_d_asset::io::load(&[path]).map_err(|e| e.to_string())?;
     raw.deserialize::<three_d_asset::Model>(path)
+        .map(LoadedModel::Direct)
         .map_err(|e| e.to_string())
 }
 
@@ -285,13 +363,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tri.obj");
         std::fs::write(&path, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").unwrap();
-        let model = load_cpu_model(&path).expect("minimal OBJ parses");
-        assert_eq!(model.geometries.len(), 1, "one triangle geometry");
+        match load_cpu_model(&path).expect("minimal OBJ parses") {
+            LoadedModel::Direct(model) => {
+                assert_eq!(model.geometries.len(), 1, "one triangle geometry");
+            }
+            LoadedModel::Flattened(_) => panic!("OBJ must take the three-d-asset path"),
+        }
     }
 
     #[test]
     fn load_cpu_model_reports_missing_file_as_error() {
-        let err = load_cpu_model(Path::new("Z:/definitely/not/here.obj")).unwrap_err();
+        let Err(err) = load_cpu_model(Path::new("Z:/definitely/not/here.obj")) else {
+            panic!("missing obj must error");
+        };
         assert!(!err.is_empty());
+        let Err(err) = load_cpu_model(Path::new("Z:/definitely/not/here.fbx")) else {
+            panic!("missing fbx must error");
+        };
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn viewable_covers_both_loader_routes() {
+        assert!(is_viewable_model(Path::new("a.glb")));
+        assert!(is_viewable_model(Path::new("a.FBX")));
+        assert!(!is_viewable_model(Path::new("a.wav")));
     }
 }

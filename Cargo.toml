@@ -36,6 +36,8 @@ rayon = "1"
 # Utilities
 uuid  = { version = "1", features = ["v4", "serde"] }
 blake3 = "1"
+# FBX import for the 3D viewport (TECH-STACK §7): single-file C lib via cc — no cmake/libclang.
+ufbx = "0.11"
 
 # Catalog / storage
 rusqlite = { version = "0.32", features = ["bundled", "blob", "load_extension"] }
