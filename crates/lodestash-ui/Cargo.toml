@@ -24,6 +24,8 @@ tokio            = { workspace = true }
 
 eframe = { workspace = true }
 egui   = { workspace = true }
+three-d       = { workspace = true }
+three-d-asset = { workspace = true }
 rfd    = { workspace = true }
 image  = { workspace = true }
 dirs   = { workspace = true }

@@ -14,6 +14,7 @@ use lodestash_ingest::{detect, thumb, unitypackage};
 
 use crate::config::{self, AppConfig, SizeTier, SizeTiers, SortBy, ViewMode};
 use crate::theme;
+use crate::viewport3d::{self, Viewport3d};
 
 // ── Category tabs ─────────────────────────────────────────────────────────────
 
@@ -162,8 +163,10 @@ struct HydrateDone {
 }
 
 /// Per-root asset identity maps: root → (rel_path → (asset id, status)).
-type AssetIdentityMaps =
-    Vec<(String, std::collections::HashMap<String, (i64, AssetStatus, bool, Option<u8>)>)>;
+type AssetIdentityMaps = Vec<(
+    String,
+    std::collections::HashMap<String, (i64, AssetStatus, bool, Option<u8>)>,
+)>;
 
 /// Result of the write-behind catalog persist that follows every finished scan.
 /// `counts` is None when the persist failed (logged; the UI falls back to in-memory).
@@ -415,12 +418,18 @@ impl Screen {
     fn stub_line(self) -> &'static str {
         match self {
             Screen::Library | Screen::Settings => "", // built — never stubbed
-            Screen::Identify => "Work through the Unidentified backlog with batch AI + hand tagging.",
+            Screen::Identify => {
+                "Work through the Unidentified backlog with batch AI + hand tagging."
+            }
             Screen::Collections => "Pinned loadouts \u{2014} stash tabs for your best assets.",
             Screen::Packages => "Everything you own, by publisher and pack.",
-            Screen::Vocabulary => "Traits and the mapping library \u{2014} your canonical tag vocabulary.",
+            Screen::Vocabulary => {
+                "Traits and the mapping library \u{2014} your canonical tag vocabulary."
+            }
             Screen::Stats => "Library insights \u{2014} counts, sizes, identification coverage.",
-            Screen::Duplicates => "Review near-duplicate groups \u{2014} keep, merge, or trash; never auto-delete.",
+            Screen::Duplicates => {
+                "Review near-duplicate groups \u{2014} keep, merge, or trash; never auto-delete."
+            }
             Screen::Trash => "Removed assets wait here for restore or explicit deletion.",
         }
     }
@@ -553,6 +562,8 @@ pub struct LodestashApp {
     image_viewer: ImageViewer,
     viewer_rx: Receiver<ViewerLoaded>,
     viewer_tx: Sender<ViewerLoaded>,
+    /// Quick Look 3D orbit viewport (issue #29 item 3) — None if GL context handoff failed.
+    viewport3d: Option<Viewport3d>,
     /// Faint background radial gradients (UI-SPEC §0): gold top-right, arcane bottom-left.
     bg_gold: Option<TextureHandle>,
     bg_arcane: Option<TextureHandle>,
@@ -646,6 +657,7 @@ impl LodestashApp {
             image_viewer: ImageViewer::default(),
             viewer_rx,
             viewer_tx,
+            viewport3d: cc.gl.clone().and_then(Viewport3d::new),
             bg_gold: Some(cc.egui_ctx.load_texture(
                 "bg_radial_gold",
                 radial_image(theme::GOLD, 15), // rgba(231,183,101,.06)
@@ -1206,7 +1218,9 @@ impl LodestashApp {
         std::thread::spawn(move || {
             let run = || -> Result<StatusCounts, String> {
                 let catalog = Catalog::open(&db_path).map_err(|e| e.to_string())?;
-                catalog.set_trashed(&ids, trashed).map_err(|e| e.to_string())?;
+                catalog
+                    .set_trashed(&ids, trashed)
+                    .map_err(|e| e.to_string())?;
                 let mut sids = Vec::with_capacity(roots.len());
                 for (name, root) in &roots {
                     sids.push(
@@ -1292,6 +1306,12 @@ impl LodestashApp {
                     ..Default::default()
                 };
             }
+            // Same for the 3D viewport's mesh buffers.
+            if let Some(vp) = &mut self.viewport3d {
+                if vp.entry_idx.is_some() {
+                    vp.clear();
+                }
+            }
             return;
         }
         let Some(&entry_idx) = self
@@ -1303,6 +1323,18 @@ impl LodestashApp {
         let Some(entry) = self.entries.get(entry_idx) else {
             return;
         };
+        // 3D branch mirrors the raster branch below.
+        if entry.file.media_type == Some(MediaType::Model3d)
+            && viewport3d::is_direct_model(&entry.file.abs_path)
+        {
+            let path = entry.file.abs_path.clone();
+            if let Some(vp) = &mut self.viewport3d {
+                if vp.entry_idx != Some(entry_idx) {
+                    vp.load(entry_idx, path, ctx);
+                }
+            }
+            return;
+        }
         if !is_viewer_image(entry.file.media_type) || self.image_viewer.entry_idx == Some(entry_idx)
         {
             return;
@@ -1562,7 +1594,13 @@ impl LodestashApp {
             let entries = &self.entries;
             // No trait/tri data pre-catalog → None/&[]; wire real values when P1/P4 land.
             idxs.retain(|&i| {
-                cf.passes(entries[i].file.size_bytes, None, entries[i].rating, &[], tiers)
+                cf.passes(
+                    entries[i].file.size_bytes,
+                    None,
+                    entries[i].rating,
+                    &[],
+                    tiers,
+                )
             });
         }
 
@@ -1763,8 +1801,14 @@ impl LodestashApp {
                     ui.add_space(14.0);
                     facet_group_label(ui, "LIBRARIES");
                     if facets_open {
-                        if facet_row(ui, None, "All libraries", total, self.source_filter.is_none())
-                            .clicked()
+                        if facet_row(
+                            ui,
+                            None,
+                            "All libraries",
+                            total,
+                            self.source_filter.is_none(),
+                        )
+                        .clicked()
                         {
                             new_source = Some(None);
                         }
@@ -1901,7 +1945,10 @@ impl LodestashApp {
             {
                 add_clicked = true;
             }
-            if ui.button(RichText::new("\u{27F3} Refresh").size(11.0)).clicked() {
+            if ui
+                .button(RichText::new("\u{27F3} Refresh").size(11.0))
+                .clicked()
+            {
                 refresh_clicked = true;
             }
             if let Some(err) = &self.store_add_error {
@@ -2819,6 +2866,9 @@ impl eframe::App for LodestashApp {
         self.receive_extracts();
         self.receive_catalog();
         self.receive_viewer(ctx);
+        if let Some(vp) = &mut self.viewport3d {
+            vp.poll();
+        }
         self.ensure_viewer_loaded(ctx);
 
         // While a scan, thumbnails, or a catalog persist are in flight, wake up at
@@ -3032,7 +3082,8 @@ impl eframe::App for LodestashApp {
                         add_source_clicked = true;
                     }
 
-                    // Project / source info — click to open the Sources panel.
+                    // Project / source info — a visible bordered button opening the Sources
+                    // panel (frameless text read as a label, not an affordance).
                     if let Some(name) = &self.project_name {
                         let src_count = self.scan_roots.len();
                         let detail = if src_count == 1 {
@@ -3043,15 +3094,26 @@ impl eframe::App for LodestashApp {
                         let resp = ui
                             .add(
                                 egui::Button::new(
-                                    RichText::new(format!("{name}  \u{2014}  {detail}"))
-                                        .color(theme::TEXT_DIM)
-                                        .size(11.0),
+                                    RichText::new(format!(
+                                        "\u{25A4} {name}  \u{2014}  {detail}  \u{25BE}"
+                                    ))
+                                    .color(theme::TEXT_MUTED)
+                                    .size(11.0),
                                 )
-                                .fill(egui::Color32::TRANSPARENT)
-                                .stroke(egui::Stroke::NONE)
-                                .frame(false),
+                                .fill(theme::OVERLAY)
+                                .stroke(egui::Stroke::new(1.0, theme::BORDER_STRONG))
+                                .rounding(6.0),
                             )
-                            .on_hover_text("View / manage sources");
+                            .on_hover_text("View / manage sources")
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if resp.hovered() {
+                            // Brightened border on hover (prototype's border-color:#6E7689).
+                            ui.painter().rect_stroke(
+                                resp.rect,
+                                6.0,
+                                egui::Stroke::new(1.0, theme::TEXT_DIM),
+                            );
+                        }
                         if resp.clicked() {
                             self.sources_panel_open = true;
                         }
@@ -3930,11 +3992,14 @@ impl eframe::App for LodestashApp {
                             e.file.media_type,
                             e.file.size_bytes,
                             e.texture.clone(),
+                            e.file.media_type == Some(MediaType::Model3d)
+                                && viewport3d::is_direct_model(&e.file.abs_path),
                         )
                     });
-                    if let Some((name, media_type, size_bytes, thumb)) = peek {
+                    if let Some((name, media_type, size_bytes, thumb, direct_model)) = peek {
                         let mut open = self.quick_look;
                         let viewer = &mut self.image_viewer;
+                        let viewport = self.viewport3d.as_mut();
                         egui::Window::new("Quick Look")
                             .id(egui::Id::new("quick_look"))
                             .open(&mut open)
@@ -3955,6 +4020,8 @@ impl eframe::App for LodestashApp {
                                     size_bytes,
                                     thumb.as_ref(),
                                     viewer,
+                                    direct_model,
+                                    viewport,
                                 );
                             });
                         self.quick_look = open;
@@ -4037,6 +4104,7 @@ impl eframe::App for LodestashApp {
             let mut open = self.sources_panel_open;
             let mut to_remove: Option<PathBuf> = None;
             let mut add_clicked = false;
+            let mut rescan_clicked = false;
             egui::Window::new("Sources")
                 .id(egui::Id::new("sources_panel"))
                 .open(&mut open)
@@ -4072,6 +4140,15 @@ impl eframe::App for LodestashApp {
                                     }
                                     if ui.small_button("Reveal").clicked() {
                                         reveal_in_file_manager(root);
+                                    }
+                                    // ponytail: re-crawls the whole project — per-source
+                                    // incremental rescan arrives with the job engine (§11.1).
+                                    if ui
+                                        .small_button("\u{21BB} Rescan")
+                                        .on_hover_text("Re-crawl sources for new/changed files")
+                                        .clicked()
+                                    {
+                                        rescan_clicked = true;
                                     }
                                 },
                             );
@@ -4136,6 +4213,11 @@ impl eframe::App for LodestashApp {
             }
             if add_clicked {
                 self.add_source(ctx);
+            }
+            if rescan_clicked {
+                if let Some(name) = self.project_name.clone() {
+                    self.open_project(ctx, &name);
+                }
             }
         }
     }
@@ -4858,7 +4940,10 @@ fn reveal_file(path: &std::path::Path) {
         .arg(format!("/select,{}", path.display()))
         .spawn();
     #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+    let _ = std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
     let _ = std::process::Command::new("xdg-open")
         .arg(path.parent().unwrap_or(path))
@@ -5192,10 +5277,15 @@ fn sidebar_nav_row(
         egui::Align2::LEFT_CENTER,
         label,
         egui::FontId::proportional(13.0),
-        if active { theme::TEXT } else { theme::TEXT_MUTED },
+        if active {
+            theme::TEXT
+        } else {
+            theme::TEXT_MUTED
+        },
     );
     if let Some(n) = badge {
-        let galley = painter.layout_no_wrap(n.to_string(), egui::FontId::monospace(10.0), theme::BG);
+        let galley =
+            painter.layout_no_wrap(n.to_string(), egui::FontId::monospace(10.0), theme::BG);
         let pad = egui::vec2(6.0, 2.0);
         let size = galley.size() + pad * 2.0;
         let pill = egui::Rect::from_min_size(
@@ -5258,7 +5348,11 @@ fn facet_row(
         egui::Align2::LEFT_CENTER,
         label,
         egui::FontId::proportional(12.0),
-        if active { theme::TEXT } else { theme::TEXT_MUTED },
+        if active {
+            theme::TEXT
+        } else {
+            theme::TEXT_MUTED
+        },
     );
     painter.text(
         egui::pos2(rect.max.x - 8.0, rect.center().y),
@@ -5294,7 +5388,11 @@ fn stub_screen(ui: &mut Ui, screen: Screen) -> bool {
                 .size(13.0),
         );
         ui.add_space(2.0);
-        ui.label(RichText::new("Not wired yet.").color(theme::TEXT_DIM).size(11.0));
+        ui.label(
+            RichText::new("Not wired yet.")
+                .color(theme::TEXT_DIM)
+                .size(11.0),
+        );
         ui.add_space(12.0);
         if ui
             .button(RichText::new("\u{2190} Back to Library").color(theme::GOLD))
@@ -5628,7 +5726,11 @@ fn inspector_pane(
                 ("Confirmed", theme::STATUS_CONFIRMED)
             };
             ui.label(RichText::new("Status").color(theme::TEXT_DIM).size(11.0));
-            ui.label(RichText::new(format!("\u{25C6} {term}")).color(color).size(11.0));
+            ui.label(
+                RichText::new(format!("\u{25C6} {term}"))
+                    .color(color)
+                    .size(11.0),
+            );
             ui.end_row();
             // Rating stars (keys 1-5 work too; clicking the current value clears).
             ui.label(RichText::new("Rating").color(theme::TEXT_DIM).size(11.0));
@@ -5746,6 +5848,7 @@ fn media_type_label(mt: Option<MediaType>) -> &'static str {
 
 // ── Quick Look overlay ────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn quick_look_content(
     ui: &mut Ui,
     name: &str,
@@ -5753,8 +5856,11 @@ fn quick_look_content(
     size_bytes: u64,
     thumb: Option<&TextureHandle>,
     viewer: &mut ImageViewer,
+    direct_model: bool,
+    viewport: Option<&mut Viewport3d>,
 ) {
     let is_image = is_viewer_image(media_type);
+    let is_model = direct_model && viewport.is_some();
 
     // Toolbar (image assets only): Fit / 1:1 / pixel-perfect toggle / zoom readout.
     if is_image {
@@ -5872,9 +5978,44 @@ fn quick_look_content(
                 theme::DANGER,
             );
         }
+    } else if is_model {
+        // 3D orbit viewport (issue #29 item 3) — three-d on the shared GL context.
+        let vp = viewport.expect("is_model implies viewport");
+        if vp.has_content() {
+            vp.ui(ui, canvas);
+        } else {
+            let (resp, painter) = ui.allocate_painter(canvas, egui::Sense::hover());
+            painter.rect_filled(resp.rect, 4.0, theme::BG);
+            if vp.loading {
+                if let Some(tex) = thumb {
+                    let side = canvas.min_elem() * 0.6;
+                    painter.image(
+                        tex.id(),
+                        egui::Rect::from_center_size(resp.rect.center(), Vec2::splat(side)),
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                }
+                painter.text(
+                    resp.rect.center_bottom() + egui::vec2(0.0, -10.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    "\u{25CC} loading mesh\u{2026}",
+                    egui::FontId::proportional(11.0),
+                    theme::ARCANE,
+                );
+            } else if let Some(err) = &vp.error {
+                painter.text(
+                    resp.rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    format!("\u{2298} couldn't load model: {err}"),
+                    egui::FontId::proportional(11.0),
+                    theme::DANGER,
+                );
+            }
+        }
     } else {
-        // Non-image assets keep the typed placeholder card (viewers arrive per
-        // issue #29: audio next, then 3D).
+        // Non-image assets keep the typed placeholder card (audio arrives per
+        // issue #29; FBX models render once the normalize→glTF cache lands).
         let preview_size = canvas.min_elem().max(64.0);
         ui.vertical_centered(|ui| {
             if let Some(tex) = thumb {
@@ -5916,6 +6057,8 @@ fn quick_look_content(
         ui.label(
             RichText::new(if is_image {
                 "scroll zoom \u{2022} drag pan \u{2022} double-click fit \u{2022} \u{2190}\u{2192} navigate \u{2022} Esc close"
+            } else if is_model {
+                "drag orbit \u{2022} right-drag pan \u{2022} scroll zoom \u{2022} double-click reframe \u{2022} Esc close"
             } else {
                 "Space / Esc \u{2192} close  \u{2022}  \u{2190}\u{2192} navigate"
             })
@@ -6043,12 +6186,18 @@ mod tests {
         cf.sizes.insert(SizeTier::S);
         cf.sizes.insert(SizeTier::L);
         let mb = |n: u64| n * 1024 * 1024;
-        assert!(cf.passes(mb(0), None, None, &[], &tiers), "500 KB → S, selected");
+        assert!(
+            cf.passes(mb(0), None, None, &[], &tiers),
+            "500 KB → S, selected"
+        );
         assert!(
             !cf.passes(mb(2), None, None, &[], &tiers),
             "2 MB → M, not selected"
         );
-        assert!(cf.passes(mb(5), None, None, &[], &tiers), "5 MB → L, selected");
+        assert!(
+            cf.passes(mb(5), None, None, &[], &tiers),
+            "5 MB → L, selected"
+        );
         assert!(
             !cf.passes(mb(9), None, None, &[], &tiers),
             "9 MB → XL, not selected"

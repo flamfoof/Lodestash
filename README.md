@@ -85,8 +85,8 @@ alternatives (Tauri+three.js, pure-Python/PySide6).
 | Concern | Choice |
 |---|---|
 | Language (core) | **Rust** (+ optional bundled Python sidecar for UnityPy) |
-| GUI | **egui / eframe** on **wgpu** (Slint 1.12 as polish-focused alternative) |
-| 3D viewport | **three-d** on the shared wgpu device; normalize to glTF on import |
+| GUI | **egui / eframe** on **Glow** (OpenGL — see TECH-STACK §7) |
+| 3D viewport | **three-d** on eframe's shared GL context; glTF/GLB/OBJ direct, FBX via normalize-to-glTF on import |
 | Audio | **symphonia** (decode) + **rodio** (playback) + egui waveform |
 | Images | **image** + **image_dds** (BCn/DDS) + **psd** |
 | Catalog DB | **SQLite** (WAL) — single file |

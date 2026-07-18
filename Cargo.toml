@@ -51,10 +51,16 @@ tar        = "0.4"
 serde_yaml = "0.9"
 
 # UI
-eframe = { version = "0.29", features = ["wgpu"] }
+# eframe runs the Glow renderer (TECH-STACK §7) — the wgpu backend is not compiled.
+eframe = "0.29"
 egui   = "0.29"
 rfd    = "0.15"
 dirs   = "5"
+
+# 3D viewport — three-d 0.18 shares eframe 0.29's GL context (both pin glow 0.14;
+# upgrade the two together — TECH-STACK §7). default-features off: no window/glutin.
+three-d       = { version = "0.18.2", default-features = false }
+three-d-asset = { version = "0.9", features = ["gltf", "obj", "png", "jpeg", "tga"] }
 
 # Testing
 tempfile = "3"

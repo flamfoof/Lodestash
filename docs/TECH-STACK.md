@@ -33,7 +33,7 @@ flagged.
 | Concern | Choice | Notes |
 |---|---|---|
 | **DB / search** | SQLite (WAL) via `rusqlite` (bundled) + **FTS5** + **sqlite-vec** (loadable ext) | one file; `VectorIndex` trait → **LanceDB** (`lancedb` crate) past ~500k–1M vectors |
-| **3D render** | `wgpu` + `three-d`, shared device with egui | normalize→glTF on import (Assimp via `russimp`, or `FBX2glTF` binary) |
+| **3D render** | `three-d` **0.18** on eframe's shared **Glow** GL context (§7 — glow-version lockstep) | normalize→glTF on import (Assimp via `russimp`, or `FBX2glTF` binary); glTF/GLB/OBJ load directly via `three-d-asset` |
 | **Audio** | `symphonia` (decode) + `rodio` (playback) | waveform drawn with egui painter |
 | **Images** | `image` + `image_dds` (BCn/DDS) + `psd` + EXR/HDR via `image` | dominant color via `color-thief`/k-means → `dominant_color` |
 | **2D-authoring** | `.aseprite`/`.kra` = zip → embedded composite + frames; `.pdn` via parser; `.blend` embedded thumbnail / Blender headless | see [`INGESTION.md`](INGESTION.md) §4 |
@@ -131,3 +131,4 @@ release.
 | Assimp vs FBX2glTF | **`russimp`** (Assimp, P1) | Handles FBX + OBJ + Collada + glTF in one C++ dep; FBX2glTF kept as optional external subprocess for edge cases where the proprietary Autodesk SDK is needed. |
 | Chromaprint vs `fpcalc` | **`fpcalc` subprocess** (P2) | Avoids C++ build complexity at P0/P1; shell to system `fpcalc` binary; binding optional later if cross-platform `fpcalc` bundling proves easier. |
 | wgpu vs Glow (egui renderer) | **`egui_glow`** (OpenGL/WGL) | wgpu requires explicit `surface.configure()` on every resize; the brief gap between reconfiguration and the first presented frame lets the Windows DWM compositor fill with a scaled old frame, producing visible "revert" jitter. OpenGL/WGL buffer swaps are synchronous with the window system and don't have this gap. **Do not switch to wgpu without re-validating resize smoothness on Windows.** |
+| three-d on Glow: shared context vs offscreen handoff | **shared context** — `three_d::Context::from_gl_context(frame gl)` + egui `PaintCallback` | three-d is glow-based, so it renders straight into egui's frame (`RenderTarget::screen` + scissor to the widget rect): no second context, no readback. Constraint: **eframe and three-d must agree on one `glow` version** (eframe 0.29 ↔ three-d 0.18 ↔ glow 0.14) — upgrade the pair together. egui_glow re-arms its own GL state after each callback, so three-d's state doesn't leak. |

@@ -5,6 +5,7 @@ mod app;
 mod config;
 mod fonts;
 mod theme;
+mod viewport3d;
 
 fn main() -> eframe::Result {
     tracing_subscriber::fmt()
