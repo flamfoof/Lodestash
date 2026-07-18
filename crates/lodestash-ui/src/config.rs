@@ -317,6 +317,11 @@ pub struct AppConfig {
     /// Skip the first-run onboarding panel and open straight into the library (§1, §5.7).
     #[serde(default)]
     pub skip_onboarding: bool,
+    /// Rehydrate extracted packages from the workspace on startup (UI-SPEC §11.6 Storage).
+    /// Off (default): extractions are session-only; the workspace files still persist under
+    /// the retention policy, so re-enabling brings them back without re-extracting.
+    #[serde(default)]
+    pub cache_extracted: bool,
     /// User-added Asset Store cache roots, checked after `ASSETSTORE_CACHE_PATH` and the
     /// per-OS default (INGESTION.md §2 discovery order; UI-SPEC §4).
     #[serde(default)]

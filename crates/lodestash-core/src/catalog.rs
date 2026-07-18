@@ -24,6 +24,9 @@ pub struct CrawlRecord {
     pub media_type: String,
     pub size_bytes: i64,
     pub mtime: i64,
+    /// For package-extracted files: path inside the extraction workspace (workspace-relative,
+    /// `/`-separated). None for plain on-disk files.
+    pub workspace_rel: Option<String>,
 }
 
 /// What `record_crawl` did with a batch.
@@ -126,6 +129,7 @@ impl Catalog {
             (3, MIGRATION_03_PROJECTS_IMPORTS),
             (4, MIGRATION_04_RATING_PIPELINE),
             (5, MIGRATION_05_UI_SPEC_ALIGNMENT),
+            (6, MIGRATION_06_PACKAGE_ENTRIES),
         ];
 
         for (version, sql) in migrations {
@@ -339,9 +343,17 @@ impl Catalog {
                         let asset_id = tx.last_insert_rowid();
                         let ext = rec.rel_path.rsplit('.').next().map(str::to_lowercase);
                         tx.execute(
-                            "INSERT INTO asset_file (asset_id, rel_path, ext, size_bytes, mtime)
-                             VALUES (?1, ?2, ?3, ?4, ?5)",
-                            params![asset_id, rec.rel_path, ext, rec.size_bytes, rec.mtime],
+                            "INSERT INTO asset_file (asset_id, rel_path, ext, size_bytes, mtime,
+                                                     workspace_rel)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            params![
+                                asset_id,
+                                rec.rel_path,
+                                ext,
+                                rec.size_bytes,
+                                rec.mtime,
+                                rec.workspace_rel
+                            ],
                         )
                         .map_err(|e| CoreError::Catalog(format!("asset_file insert: {e}")))?;
                         tx.execute(
@@ -533,7 +545,10 @@ impl Catalog {
             .collect::<Vec<_>>()
             .join(",");
         let sql = if trashed {
-            format!("UPDATE asset SET deleted_at = {} WHERE id IN ({id_list}) AND deleted_at IS NULL", unix_now())
+            format!(
+                "UPDATE asset SET deleted_at = {} WHERE id IN ({id_list}) AND deleted_at IS NULL",
+                unix_now()
+            )
         } else {
             format!("UPDATE asset SET deleted_at = NULL WHERE id IN ({id_list})")
         };
@@ -575,7 +590,9 @@ impl Catalog {
                 "identified" => counts.identified += n,
                 "confirmed" => counts.confirmed += n,
                 other => {
-                    return Err(CoreError::Catalog(format!("unknown asset status '{other}'")))
+                    return Err(CoreError::Catalog(format!(
+                        "unknown asset status '{other}'"
+                    )))
                 }
             }
         }
@@ -910,6 +927,135 @@ UPDATE import_record SET batch_id = 'legacy-' || project_id || '-' || imported_a
  WHERE batch_id IS NULL;
 ";
 
+/// M6 — extracted-pack persistence + surgical extraction (DATA-MODEL §13).
+/// `asset_file.workspace_rel` locates a package-extracted file inside the content-addressed
+/// workspace (workspace-relative, so the workspace can move). `package_entry` records every
+/// payload's offset/size in the decompressed tar so selected assets can be re-extracted with
+/// one skip-scan instead of a full unpack (INGESTION.md §2).
+const MIGRATION_06_PACKAGE_ENTRIES: &str = "
+ALTER TABLE asset_file ADD COLUMN workspace_rel TEXT;
+CREATE TABLE IF NOT EXISTS package_entry (
+    id          INTEGER PRIMARY KEY,
+    package_id  INTEGER NOT NULL REFERENCES package(id) ON DELETE CASCADE,
+    guid        TEXT    NOT NULL,
+    pathname    TEXT,
+    tar_offset  INTEGER,               -- payload offset in the decompressed tar
+    size_bytes  INTEGER,
+    UNIQUE(package_id, guid)
+);
+CREATE INDEX IF NOT EXISTS idx_pkgentry_pkg ON package_entry(package_id);
+";
+
+/// A package-extracted asset rehydrated from the catalog (UI "cache extracted packs" toggle).
+#[derive(Debug, Clone)]
+pub struct HydratedExtracted {
+    pub package_name: String,
+    /// Path inside the extraction workspace (workspace-relative).
+    pub workspace_rel: String,
+    pub asset: HydratedAsset,
+}
+
+/// One payload's location inside a `.unitypackage` (DATA-MODEL §13 M6; INGESTION §2
+/// surgical extraction).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageEntryRecord {
+    pub guid: String,
+    pub pathname: Option<String>,
+    pub tar_offset: Option<i64>,
+    pub size_bytes: Option<i64>,
+}
+
+impl Catalog {
+    /// Package-extracted assets of a source (the rows `entries_for_source` skips), with
+    /// enough location info to rebuild grid entries from the workspace.
+    pub fn extracted_entries_for_source(&self, source_id: i64) -> Result<Vec<HydratedExtracted>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT af.rel_path, a.id, mt.code, af.size_bytes, af.mtime,
+                        a.status, a.deleted_at IS NOT NULL, a.rating,
+                        p.name, af.workspace_rel
+                 FROM asset a
+                 JOIN asset_file af ON af.id = a.primary_file_id
+                 JOIN media_type mt ON mt.id = a.media_type_id
+                 JOIN package p     ON p.id = a.package_id
+                 WHERE a.source_id = ?1 AND af.missing = 0
+                   AND a.package_id IS NOT NULL AND af.workspace_rel IS NOT NULL",
+            )
+            .map_err(|e| CoreError::Catalog(format!("extracted prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![source_id], |r| {
+                Ok(HydratedExtracted {
+                    package_name: r.get(8)?,
+                    workspace_rel: r.get(9)?,
+                    asset: HydratedAsset {
+                        rel_path: r.get(0)?,
+                        asset_id: r.get(1)?,
+                        media_type: r.get(2)?,
+                        size_bytes: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                        mtime: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                        status: r.get(5)?,
+                        trashed: r.get(6)?,
+                        rating: r.get(7)?,
+                    },
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("extracted query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("extracted row: {e}")))
+    }
+
+    /// Upsert the payload locations of a package's manifest (browse pass) so selected
+    /// assets can later be pulled with one skip-scan (surgical extraction).
+    pub fn record_package_entries(
+        &mut self,
+        package_id: i64,
+        entries: &[PackageEntryRecord],
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| CoreError::Catalog(format!("pkg entries begin: {e}")))?;
+        for e in entries {
+            tx.execute(
+                "INSERT INTO package_entry (package_id, guid, pathname, tar_offset, size_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(package_id, guid) DO UPDATE SET
+                    pathname = excluded.pathname,
+                    tar_offset = excluded.tar_offset,
+                    size_bytes = excluded.size_bytes",
+                params![package_id, e.guid, e.pathname, e.tar_offset, e.size_bytes],
+            )
+            .map_err(|e2| CoreError::Catalog(format!("pkg entry upsert: {e2}")))?;
+        }
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("pkg entries commit: {e}")))
+    }
+
+    /// All recorded payload locations of a package, GUID-ordered.
+    pub fn entries_for_package(&self, package_id: i64) -> Result<Vec<PackageEntryRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT guid, pathname, tar_offset, size_bytes
+                 FROM package_entry WHERE package_id = ?1 ORDER BY guid",
+            )
+            .map_err(|e| CoreError::Catalog(format!("pkg entries prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![package_id], |r| {
+                Ok(PackageEntryRecord {
+                    guid: r.get(0)?,
+                    pathname: r.get(1)?,
+                    tar_offset: r.get(2)?,
+                    size_bytes: r.get(3)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("pkg entries query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("pkg entries row: {e}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -921,7 +1067,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 5, "all 5 migrations should have run");
+        assert_eq!(version, 6, "all 6 migrations should have run");
     }
 
     /// A catalog stopped at schema v4, for exercising M5's data steps.
@@ -952,7 +1098,11 @@ mod tests {
                 r.get(0)
             })
             .expect("tray survives");
-        assert_eq!(project_id, Some(1), "legacy tray reassigned to active project");
+        assert_eq!(
+            project_id,
+            Some(1),
+            "legacy tray reassigned to active project"
+        );
     }
 
     #[test]
@@ -968,9 +1118,11 @@ mod tests {
 
         let n: i64 = c
             .conn
-            .query_row("SELECT COUNT(*) FROM collection WHERE is_staging=1", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM collection WHERE is_staging=1",
+                [],
+                |r| r.get(0),
+            )
             .expect("count");
         assert_eq!(n, 0, "orphan legacy tray deleted");
     }
@@ -988,7 +1140,10 @@ mod tests {
             "INSERT INTO collection (uuid, name, is_staging, project_id) VALUES ('c2', 'S2', 1, 1)",
             [],
         );
-        assert!(dup.is_err(), "second staging tray for the same project rejected");
+        assert!(
+            dup.is_err(),
+            "second staging tray for the same project rejected"
+        );
     }
 
     #[test]
@@ -1017,7 +1172,10 @@ mod tests {
             .collect::<std::result::Result<_, _>>()
             .expect("rows");
         assert_eq!(ids.len(), 2);
-        assert_eq!(ids[0], ids[1], "same (project, imported_at) group → same batch id");
+        assert_eq!(
+            ids[0], ids[1],
+            "same (project, imported_at) group → same batch id"
+        );
         assert_eq!(ids[0], "legacy-1-1000");
     }
 
@@ -1034,8 +1192,14 @@ mod tests {
 
         let updated = c
             .adopt_config_blacklists(&[
-                ("C:/a".into(), "[{\"kind\":\"asset\",\"value\":\"x.dll\"}]".into()),
-                ("C:/b".into(), "[{\"kind\":\"folder\",\"value\":\"Gizmos\"}]".into()),
+                (
+                    "C:/a".into(),
+                    "[{\"kind\":\"asset\",\"value\":\"x.dll\"}]".into(),
+                ),
+                (
+                    "C:/b".into(),
+                    "[{\"kind\":\"folder\",\"value\":\"Gizmos\"}]".into(),
+                ),
                 ("C:/missing".into(), "[]".into()),
             ])
             .expect("adopt");
@@ -1043,15 +1207,18 @@ mod tests {
 
         let b: String = c
             .conn
-            .query_row("SELECT blacklist FROM import_source WHERE root_path='C:/b'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT blacklist FROM import_source WHERE root_path='C:/b'",
+                [],
+                |r| r.get(0),
+            )
             .expect("b");
         assert!(b.contains("Editor"), "existing catalog blacklist untouched");
     }
 
     fn rec(rel: &str, size: i64, mtime: i64) -> CrawlRecord {
         CrawlRecord {
+            workspace_rel: None,
             rel_path: rel.to_string(),
             name: rel.rsplit('/').next().unwrap_or(rel).to_string(),
             media_type: "image".to_string(),
@@ -1061,14 +1228,76 @@ mod tests {
     }
 
     #[test]
+    fn m6_extracted_rehydration_and_package_entries_round_trip() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let sid = c
+            .upsert_import_source("src", "G:/src", "folder")
+            .expect("sid");
+        let pid = c
+            .upsert_package(sid, "G:/src/Pack.unitypackage", "Pack", None, None)
+            .expect("pid");
+
+        // Extracted asset: recorded with a workspace_rel, hidden from the normal
+        // hydrate, visible to the extracted hydrate with its package name.
+        let mut extracted = rec("Pack/Models/Rock.fbx", 10, 1);
+        extracted.media_type = "model_3d".into();
+        extracted.workspace_rel = Some("abc123/Rock.fbx".into());
+        c.record_crawl(sid, Some(pid), &[extracted])
+            .expect("record");
+        c.record_crawl(sid, None, &[rec("plain.png", 5, 1)])
+            .expect("record2");
+
+        let normal = c.entries_for_source(sid).expect("normal");
+        assert_eq!(
+            normal.len(),
+            1,
+            "extracted rows stay out of the folder hydrate"
+        );
+        let ex = c.extracted_entries_for_source(sid).expect("extracted");
+        assert_eq!(ex.len(), 1);
+        assert_eq!(ex[0].package_name, "Pack");
+        assert_eq!(ex[0].workspace_rel, "abc123/Rock.fbx");
+        assert_eq!(ex[0].asset.rel_path, "Pack/Models/Rock.fbx");
+
+        // package_entry offsets round-trip + upsert semantics.
+        let entries = vec![
+            PackageEntryRecord {
+                guid: "g1".into(),
+                pathname: Some("Assets/Rock.fbx".into()),
+                tar_offset: Some(1536),
+                size_bytes: Some(4096),
+            },
+            PackageEntryRecord {
+                guid: "g2".into(),
+                pathname: None,
+                tar_offset: Some(8192),
+                size_bytes: Some(100),
+            },
+        ];
+        c.record_package_entries(pid, &entries).expect("entries");
+        let mut updated = entries.clone();
+        updated[1].tar_offset = Some(9000);
+        c.record_package_entries(pid, &updated).expect("upsert");
+        let got = c.entries_for_package(pid).expect("read");
+        assert_eq!(got, updated, "guid-keyed upsert, guid-ordered read");
+    }
+
+    #[test]
     fn upsert_import_source_is_idempotent_by_root_path() {
         let c = Catalog::open_in_memory().expect("open");
-        let a = c.upsert_import_source("Synty", "C:/lib", "folder").expect("insert");
-        let b = c.upsert_import_source("Renamed", "C:/lib", "folder").expect("reuse");
+        let a = c
+            .upsert_import_source("Synty", "C:/lib", "folder")
+            .expect("insert");
+        let b = c
+            .upsert_import_source("Renamed", "C:/lib", "folder")
+            .expect("reuse");
         assert_eq!(a, b, "same root_path resolves to the same source");
         let name: String = c
             .conn
-            .query_row("SELECT name FROM import_source WHERE id=?1", [a], |r| r.get(0))
+            .query_row("SELECT name FROM import_source WHERE id=?1", [a], |r| {
+                r.get(0)
+            })
             .expect("name");
         assert_eq!(name, "Synty", "name only set on insert");
     }
@@ -1077,19 +1306,43 @@ mod tests {
     fn record_crawl_inserts_then_skips_then_updates() {
         let mut c = Catalog::open_in_memory().expect("open");
         c.seed_media_types().expect("seed");
-        let src = c.upsert_import_source("Lib", "C:/lib", "folder").expect("src");
+        let src = c
+            .upsert_import_source("Lib", "C:/lib", "folder")
+            .expect("src");
 
         // First crawl: everything new.
         let stats = c
-            .record_crawl(src, None, &[rec("rocks/a.png", 10, 100), rec("rocks/b.png", 20, 100)])
+            .record_crawl(
+                src,
+                None,
+                &[rec("rocks/a.png", 10, 100), rec("rocks/b.png", 20, 100)],
+            )
             .expect("crawl 1");
-        assert_eq!(stats, CrawlStats { inserted: 2, updated: 0, unchanged: 0 });
+        assert_eq!(
+            stats,
+            CrawlStats {
+                inserted: 2,
+                updated: 0,
+                unchanged: 0
+            }
+        );
 
         // Second crawl: one untouched, one changed (new mtime).
         let stats = c
-            .record_crawl(src, None, &[rec("rocks/a.png", 10, 100), rec("rocks/b.png", 22, 200)])
+            .record_crawl(
+                src,
+                None,
+                &[rec("rocks/a.png", 10, 100), rec("rocks/b.png", 22, 200)],
+            )
             .expect("crawl 2");
-        assert_eq!(stats, CrawlStats { inserted: 0, updated: 1, unchanged: 1 });
+        assert_eq!(
+            stats,
+            CrawlStats {
+                inserted: 0,
+                updated: 1,
+                unchanged: 1
+            }
+        );
 
         // The changed file's asset was marked dirty; sizes stored per file row.
         let (size, dirty): (i64, i64) = c
@@ -1122,7 +1375,9 @@ mod tests {
     fn assets_for_source_flags_trashed_and_set_trashed_round_trips() {
         let mut c = Catalog::open_in_memory().expect("open");
         c.seed_media_types().expect("seed");
-        let src = c.upsert_import_source("Lib", "C:/lib", "folder").expect("src");
+        let src = c
+            .upsert_import_source("Lib", "C:/lib", "folder")
+            .expect("src");
         c.record_crawl(src, None, &[rec("a.png", 1, 1), rec("b.png", 2, 2)])
             .expect("crawl");
         c.conn
@@ -1138,11 +1393,18 @@ mod tests {
         assert_eq!(a.status, "identified");
         assert!(!a.trashed, "not trashed");
 
-        let b_id = rows.iter().find(|r| r.rel_path == "b.png").expect("b").asset_id;
+        let b_id = rows
+            .iter()
+            .find(|r| r.rel_path == "b.png")
+            .expect("b")
+            .asset_id;
         assert_eq!(c.set_trashed(&[b_id], true).expect("trash"), 1);
         let rows = c.assets_for_source(src).expect("read 2");
         assert!(
-            rows.iter().find(|r| r.rel_path == "b.png").expect("b").trashed,
+            rows.iter()
+                .find(|r| r.rel_path == "b.png")
+                .expect("b")
+                .trashed,
             "flagged"
         );
         // Trashed rows leave the status counts (search, dup groups, staging).
@@ -1153,7 +1415,13 @@ mod tests {
         // Restore round-trips.
         assert_eq!(c.set_trashed(&[b_id], false).expect("restore"), 1);
         let rows = c.assets_for_source(src).expect("read 3");
-        assert!(!rows.iter().find(|r| r.rel_path == "b.png").expect("b").trashed);
+        assert!(
+            !rows
+                .iter()
+                .find(|r| r.rel_path == "b.png")
+                .expect("b")
+                .trashed
+        );
         assert_eq!(c.set_trashed(&[], true).expect("noop"), 0);
     }
 
@@ -1161,14 +1429,19 @@ mod tests {
     fn hydrate_and_missing_reconcile_round_trip() {
         let mut c = Catalog::open_in_memory().expect("open");
         c.seed_media_types().expect("seed");
-        let src = c.upsert_import_source("Lib", "C:/lib", "folder").expect("src");
+        let src = c
+            .upsert_import_source("Lib", "C:/lib", "folder")
+            .expect("src");
         c.record_crawl(src, None, &[rec("a.png", 1, 10), rec("sub/b.png", 2, 20)])
             .expect("crawl");
 
         let rows = c.entries_for_source(src).expect("hydrate");
         assert_eq!(rows.len(), 2);
         let a = rows.iter().find(|r| r.rel_path == "a.png").expect("a");
-        assert_eq!((a.media_type.as_str(), a.size_bytes, a.mtime), ("image", 1, 10));
+        assert_eq!(
+            (a.media_type.as_str(), a.size_bytes, a.mtime),
+            ("image", 1, 10)
+        );
         assert_eq!(a.status, "discovered");
         assert!(!a.trashed);
         assert_eq!(a.rating, None);
@@ -1184,7 +1457,10 @@ mod tests {
         assert_eq!(a2.rating, Some(4));
         let read = c.assets_for_source(src).expect("read");
         assert_eq!(
-            read.iter().find(|r| r.rel_path == "a.png").expect("a").rating,
+            read.iter()
+                .find(|r| r.rel_path == "a.png")
+                .expect("a")
+                .rating,
             Some(4)
         );
         assert_eq!(c.set_rating(&[a.asset_id], None).expect("clear"), 1);
@@ -1228,17 +1504,29 @@ mod tests {
 
         // Browse-only: row exists, unpack fields NULL, idempotent by (source, path).
         let p1 = c
-            .upsert_package(src, "C:/cache/Synty/3D/POLYGON City.unitypackage",
-                "POLYGON City", Some("Synty"), Some("3D"))
+            .upsert_package(
+                src,
+                "C:/cache/Synty/3D/POLYGON City.unitypackage",
+                "POLYGON City",
+                Some("Synty"),
+                Some("3D"),
+            )
             .expect("insert");
         let p2 = c
-            .upsert_package(src, "C:/cache/Synty/3D/POLYGON City.unitypackage",
-                "POLYGON City", Some("Synty"), Some("3D"))
+            .upsert_package(
+                src,
+                "C:/cache/Synty/3D/POLYGON City.unitypackage",
+                "POLYGON City",
+                Some("Synty"),
+                Some("3D"),
+            )
             .expect("reuse");
         assert_eq!(p1, p2);
         let unpacked: Option<i64> = c
             .conn
-            .query_row("SELECT unpacked_at FROM package WHERE id=?1", [p1], |r| r.get(0))
+            .query_row("SELECT unpacked_at FROM package WHERE id=?1", [p1], |r| {
+                r.get(0)
+            })
             .expect("row");
         assert_eq!(unpacked, None, "browse-only leaves unpacked_at NULL");
 
@@ -1267,14 +1555,26 @@ mod tests {
         c.seed_media_types().expect("seed");
         let a = c.upsert_import_source("A", "C:/a", "folder").expect("a");
         let b = c.upsert_import_source("B", "C:/b", "folder").expect("b");
-        c.record_crawl(a, None, &[rec("x.png", 1, 1), rec("y.png", 2, 2)]).expect("a crawl");
-        c.record_crawl(b, None, &[rec("z.png", 3, 3)]).expect("b crawl");
+        c.record_crawl(a, None, &[rec("x.png", 1, 1), rec("y.png", 2, 2)])
+            .expect("a crawl");
+        c.record_crawl(b, None, &[rec("z.png", 3, 3)])
+            .expect("b crawl");
         c.conn
-            .execute("UPDATE asset SET status='identified' WHERE name='y.png'", [])
+            .execute(
+                "UPDATE asset SET status='identified' WHERE name='y.png'",
+                [],
+            )
             .expect("promote");
 
         let counts = c.status_counts_for_sources(&[a]).expect("counts a");
-        assert_eq!(counts, StatusCounts { unidentified: 1, identified: 1, confirmed: 0 });
+        assert_eq!(
+            counts,
+            StatusCounts {
+                unidentified: 1,
+                identified: 1,
+                confirmed: 0
+            }
+        );
         assert_eq!(counts.total(), 2, "source B excluded");
         assert_eq!(
             c.status_counts_for_sources(&[]).expect("empty"),

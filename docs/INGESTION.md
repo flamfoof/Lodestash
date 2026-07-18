@@ -68,6 +68,13 @@ present the whole owned library — publisher, category, name, version, size, on
 extracting anything. The `.unitypackage` can be peeked for an embedded `preview.png` and counts for a
 richer listing.
 
+**Surgical re-extraction:** the browse pass records each `asset` payload's **byte offset in the
+decompressed tar** (`package_entry`, [`DATA-MODEL.md`](DATA-MODEL.md) §13 M6). gzip has no random
+access, so pulling selected assets is a single **skip-scan**: decompress-and-discard to each wanted
+offset, copy that payload out (same content-addressed placement), touch nothing else. Cost is
+O(bytes up to the last wanted offset) — no tar parsing, no writes for the unwanted rest. A stale
+locator (package changed on disk) fails loudly rather than truncating.
+
 ### Unpack & ingest one or many (on demand)
 Selecting one or multiple packages enqueues a **batch unpack+ingest** job (via the job engine):
 - `.unitypackage` → **gzip+tar** extract in pure Rust (no Editor, no Python sidecar for the common case).

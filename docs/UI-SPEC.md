@@ -431,6 +431,10 @@ Side-effecting import/export tools stay confirm-gated per call (MCP-AND-ENGINES 
 blanket toggle. MCP ↔ REST 1:1 invariant unaffected.
 
 ### 11.6 STORAGE CAPS
+
+**Keep extracted packs cached** toggle (default **off**): on, extracted packages rehydrate from
+the workspace + catalog at startup (`asset_file.workspace_rel`, DATA-MODEL §13 M6) — no
+re-extraction; retention-evicted files simply don't return. Off: extractions are session-only.
 **Preview cache limit** slider (1–16 GB) + usage bar (verdant → amber >80% → red over) with
 `used by N thumbnails` / headroom labels; **Auto-purge over cap** toggle (drop least-recently-viewed
 previews). The extracted-archive **workspace** cap + retention (INGESTION §2) and **Clear cache /

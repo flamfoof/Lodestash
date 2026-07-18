@@ -191,6 +191,9 @@ struct HydrateDone {
     generation: u64,
     /// (source index, hydrated rows) per source.
     sources: Vec<(usize, Vec<HydratedAsset>)>,
+    /// Package-extracted rows (only when "cache extracted packs" is on), with the
+    /// workspace-existence check already done on the hydrate thread.
+    extracted: Vec<(usize, Vec<lodestash_core::catalog::HydratedExtracted>)>,
 }
 
 /// Per-root asset identity maps: root → (rel_path → (asset id, status)).
@@ -873,10 +876,17 @@ impl LodestashApp {
             let roots: Vec<PathBuf> = self.scan_roots.clone();
             let tx = self.hydrate_tx.clone();
             let generation = self.scan_generation;
+            let cache_extracted = self.config.cache_extracted;
+            let workspace_dir = self.workspace_dir.clone();
             std::thread::spawn(move || {
-                let run = || -> Result<Vec<(usize, Vec<HydratedAsset>)>, String> {
+                type Hydrated = (
+                    Vec<(usize, Vec<HydratedAsset>)>,
+                    Vec<(usize, Vec<lodestash_core::catalog::HydratedExtracted>)>,
+                );
+                let run = || -> Result<Hydrated, String> {
                     let catalog = Catalog::open(&db_path).map_err(|e| e.to_string())?;
                     let mut sources = Vec::new();
+                    let mut extracted = Vec::new();
                     for (idx, root) in roots.iter().enumerate() {
                         let sid = catalog
                             .upsert_import_source(
@@ -889,14 +899,32 @@ impl LodestashApp {
                         if !rows.is_empty() {
                             sources.push((idx, rows));
                         }
+                        // "Cache extracted packs" (UI-SPEC §11.6): rehydrate extracted
+                        // entries whose workspace file still exists (retention may have
+                        // evicted some — those simply don't come back).
+                        if cache_extracted {
+                            if let Some(ws) = &workspace_dir {
+                                let rows = catalog
+                                    .extracted_entries_for_source(sid)
+                                    .map_err(|e| e.to_string())?;
+                                let live: Vec<_> = rows
+                                    .into_iter()
+                                    .filter(|r| ws.join(&r.workspace_rel).is_file())
+                                    .collect();
+                                if !live.is_empty() {
+                                    extracted.push((idx, live));
+                                }
+                            }
+                        }
                     }
-                    Ok(sources)
+                    Ok((sources, extracted))
                 };
                 match run() {
-                    Ok(sources) if !sources.is_empty() => {
+                    Ok((sources, extracted)) if !sources.is_empty() || !extracted.is_empty() => {
                         let _ = tx.send(HydrateDone {
                             generation,
                             sources,
+                            extracted,
                         });
                     }
                     Ok(_) => {} // nothing catalogued yet — first open of these sources
@@ -942,6 +970,33 @@ impl LodestashApp {
                     })
                 })
                 .collect();
+            if let Some(ws) = self.workspace_dir.clone() {
+                for (source_idx, rows) in msg.extracted {
+                    for row in rows {
+                        let Some(status) = AssetStatus::from_code(&row.asset.status) else {
+                            continue;
+                        };
+                        let rel_path = PathBuf::from(&row.asset.rel_path);
+                        self.entries.push(AssetEntry {
+                            package: Some(row.package_name),
+                            file: CrawledFile {
+                                abs_path: ws.join(&row.workspace_rel),
+                                rel_path,
+                                size_bytes: row.asset.size_bytes.max(0) as u64,
+                                mtime: row.asset.mtime,
+                                media_type: MediaType::from_code(&row.asset.media_type),
+                            },
+                            source_idx,
+                            asset_id: Some(row.asset.asset_id),
+                            status,
+                            trashed: row.asset.trashed,
+                            rating: row.asset.rating,
+                            texture: None,
+                            thumb_spawned: false,
+                        });
+                    }
+                }
+            }
             self.current_dir = self.default_dir();
             self.recompute_tab_counts();
             self.cache_dirty = true;
@@ -963,10 +1018,13 @@ impl LodestashApp {
             // Carry catalog identity over from the outgoing entries (a hydrate or an
             // earlier read-back) so trashed/identified state doesn't flash back to
             // defaults between the crawl landing and the next persist read-back.
+            // Extracted-package entries never appear in a folder crawl — they live in
+            // the workspace. Keep them across rescans instead of silently dropping them.
+            let (kept, rest): (Vec<AssetEntry>, Vec<AssetEntry>) =
+                self.entries.drain(..).partition(|e| e.package.is_some());
             type Carried = (Option<i64>, AssetStatus, bool, Option<u8>);
-            let carry: std::collections::HashMap<(usize, PathBuf), Carried> = self
-                .entries
-                .drain(..)
+            let carry: std::collections::HashMap<(usize, PathBuf), Carried> = rest
+                .into_iter()
                 .map(|e| {
                     (
                         (e.source_idx, e.file.rel_path),
@@ -995,6 +1053,7 @@ impl LodestashApp {
                     }
                 })
                 .collect();
+            self.entries.extend(kept);
             self.pending_packages = msg.pending_packages;
             // Entries were rebuilt — old entry indices are meaningless.
             self.selected.clear();
@@ -1111,7 +1170,21 @@ impl LodestashApp {
                 .unwrap_or_default(),
             publisher,
             category,
-            records: crawl_records(files.iter()),
+            records: {
+                let mut records = crawl_records(files.iter());
+                // Locate each extracted file inside the workspace so the catalog can
+                // rehydrate it next session (M6 `asset_file.workspace_rel`).
+                if let Some(ws) = &self.workspace_dir {
+                    for (rec, f) in records.iter_mut().zip(files) {
+                        rec.workspace_rel = f
+                            .abs_path
+                            .strip_prefix(ws)
+                            .ok()
+                            .map(|r| r.to_string_lossy().replace('\\', "/"));
+                    }
+                }
+                records
+            },
             all_roots: self
                 .scan_roots
                 .iter()
@@ -2573,6 +2646,23 @@ impl LodestashApp {
                             );
                         });
                         settings_card(ui, "STORAGE CAPS", |ui| {
+                            let mut cache = self.config.cache_extracted;
+                            if ui
+                                .checkbox(
+                                    &mut cache,
+                                    RichText::new("Keep extracted packs cached").size(12.0),
+                                )
+                                .on_hover_text(
+                                    "Extracted packages reload instantly next session from the \
+                                     workspace instead of re-extracting. Uses workspace disk \
+                                     (retention still applies). Off: extractions are session-only.",
+                                )
+                                .changed()
+                            {
+                                self.config.cache_extracted = cache;
+                                save = true;
+                            }
+                            ui.add_space(6.0);
                             ui.label(
                                 RichText::new(
                                     "Preview-cache limit + auto-purge. Planned (DESIGN-GUIDELINES.md \
@@ -5189,6 +5279,7 @@ fn crawl_records<'a>(files: impl Iterator<Item = &'a CrawledFile>) -> Vec<CrawlR
             media_type: f.media_type.expect("filtered Some").code().to_string(),
             size_bytes: f.size_bytes as i64,
             mtime: f.mtime,
+            workspace_rel: None,
         })
         .collect()
 }

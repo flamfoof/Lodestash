@@ -61,7 +61,8 @@ pub fn load_meshes(path: &Path) -> Result<Vec<MeshData>, String> {
                 let p = ufbx::transform_position(&to_world, mesh.vertex_position[ix as usize]);
                 positions.push([p.x as f32, p.y as f32, p.z as f32]);
                 if has_normals {
-                    let nv = ufbx::transform_direction(&normal_mat, mesh.vertex_normal[ix as usize]);
+                    let nv =
+                        ufbx::transform_direction(&normal_mat, mesh.vertex_normal[ix as usize]);
                     normals.push([nv.x as f32, nv.y as f32, nv.z as f32]);
                 }
                 if has_uvs {

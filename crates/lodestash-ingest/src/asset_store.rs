@@ -25,8 +25,7 @@ pub fn default_root() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         // %APPDATA% (…\AppData\Roaming) \ Unity \ Asset Store-5.x
-        std::env::var_os("APPDATA")
-            .map(|p| PathBuf::from(p).join("Unity").join("Asset Store-5.x"))
+        std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("Unity").join("Asset Store-5.x"))
     }
     #[cfg(target_os = "macos")]
     {
@@ -42,7 +41,9 @@ pub fn default_root() -> Option<PathBuf> {
         // $XDG_DATA_HOME or ~/.local/share, then unity3d/Asset Store-5.x
         std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
+            })
             .map(|d| d.join("unity3d").join("Asset Store-5.x"))
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
@@ -171,9 +172,15 @@ mod tests {
     #[test]
     fn is_asset_store_cache_true_for_a_real_tree_false_otherwise() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!is_asset_store_cache(dir.path()), "empty dir is not a cache");
+        assert!(
+            !is_asset_store_cache(dir.path()),
+            "empty dir is not a cache"
+        );
         build_cache(dir.path());
-        assert!(is_asset_store_cache(dir.path()), "populated tree is a cache");
+        assert!(
+            is_asset_store_cache(dir.path()),
+            "populated tree is a cache"
+        );
 
         let empty = tempfile::tempdir().unwrap();
         fs::create_dir_all(empty.path().join("Publisher").join("Category")).unwrap();

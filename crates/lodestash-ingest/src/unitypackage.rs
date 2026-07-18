@@ -70,6 +70,9 @@ pub struct PackageEntry {
     pub meta: UnityMeta,
     /// Byte size of the `asset` payload, read from the tar header only (body never buffered).
     pub asset_size: Option<u64>,
+    /// Byte offset of the payload's data in the **decompressed** tar stream — the key to
+    /// surgical re-extraction (gzip is sequential, so extraction skip-scans to this offset).
+    pub asset_offset: Option<u64>,
     pub has_preview: bool,
 }
 
@@ -130,7 +133,10 @@ pub fn read_manifest(path: &Path) -> io::Result<Vec<PackageEntry>> {
                 entry.read_to_string(&mut s)?;
                 rec.meta = parse_meta(&s);
             }
-            "asset" => rec.asset_size = Some(entry.header().size()?),
+            "asset" => {
+                rec.asset_size = Some(entry.header().size()?);
+                rec.asset_offset = Some(entry.raw_file_position());
+            }
             "preview.png" => rec.has_preview = true,
             _ => {}
         }
@@ -279,6 +285,98 @@ pub fn extract_to_workspace_with_progress(
     Ok(extracted)
 }
 
+/// Where one wanted payload lives inside the decompressed tar (from the catalog's
+/// `package_entry` rows or a fresh manifest).
+#[derive(Debug, Clone)]
+pub struct EntryLocator {
+    pub guid: String,
+    pub pathname: Option<String>,
+    pub offset: u64,
+    pub size: u64,
+}
+
+/// Surgical extraction (INGESTION.md §2): pull **only** `wanted` payloads with one
+/// skip-scan over the gzip stream — decompress-and-discard up to each offset, copy the
+/// payload out, never touch the rest. Same content-addressed, idempotent placement as
+/// [`extract_to_workspace`]. gzip has no random access, so cost is O(bytes up to the
+/// last wanted offset) — still no tar parsing, no writes for unwanted entries.
+pub fn extract_at_offsets(
+    path: &Path,
+    dest: &Path,
+    mut wanted: Vec<EntryLocator>,
+) -> io::Result<Vec<ExtractedAsset>> {
+    wanted.sort_by_key(|w| w.offset);
+    let tmp_dir = dest.join(".tmp");
+    std::fs::create_dir_all(&tmp_dir)?;
+
+    let mut gz = GzDecoder::new(File::open(path)?);
+    let mut pos: u64 = 0;
+    let mut extracted = Vec::with_capacity(wanted.len());
+    for w in wanted {
+        if w.offset < pos {
+            continue; // overlapping/duplicate locator — already consumed
+        }
+        io::copy(&mut (&mut gz).take(w.offset - pos), &mut io::sink())?;
+        pos = w.offset;
+        let tmp_path = tmp_dir.join(&w.guid);
+        let (hash, size) = {
+            let mut region = (&mut gz).take(w.size);
+            stream_hash_to_file(&mut region, &tmp_path)?
+        };
+        pos += size;
+        if size != w.size {
+            // Truncated read: stale locator (package changed on disk). Fail loudly —
+            // silently placing a short payload would poison the content-addressed store.
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "payload {} truncated: wanted {} got {size} bytes",
+                    w.guid, w.size
+                ),
+            ));
+        }
+        extracted.push(place_payload(
+            dest, w.guid, w.pathname, tmp_path, hash, size,
+        )?);
+    }
+    let _ = std::fs::remove_dir(&tmp_dir);
+    Ok(extracted)
+}
+
+/// Content-addressed placement shared by full and surgical extraction: move the hashed
+/// temp payload to `dest/<hash>/<basename>`, discarding it if already present.
+fn place_payload(
+    dest: &Path,
+    guid: String,
+    pathname: Option<String>,
+    tmp_path: PathBuf,
+    hash: String,
+    size: u64,
+) -> io::Result<ExtractedAsset> {
+    let basename = pathname
+        .as_deref()
+        .and_then(|p| Path::new(p).file_name())
+        .map(|n| sanitize_basename(&n.to_string_lossy()))
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| guid.clone());
+    let out_dir = dest.join(&hash);
+    std::fs::create_dir_all(&out_dir)?;
+    let out_path = out_dir.join(&basename);
+    if out_path.exists() {
+        std::fs::remove_file(&tmp_path)?;
+    } else {
+        std::fs::rename(&tmp_path, &out_path)?;
+    }
+    Ok(ExtractedAsset {
+        guid,
+        pathname,
+        content_hash: hash,
+        workspace_path: out_path,
+        size_bytes: size,
+    })
+}
+
 /// Stream a tar entry to `dest` while hashing it, without holding the payload in memory.
 fn stream_hash_to_file(entry: &mut impl Read, dest: &Path) -> io::Result<(String, u64)> {
     let mut out = File::create(dest)?;
@@ -332,6 +430,69 @@ mod tests {
     }
 
     #[test]
+    fn surgical_extraction_matches_full_extraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"surgical payload bytes".repeat(40); // >1 tar block
+        let pkg = build_test_package(
+            dir.path(),
+            "aaaa1111bbbb2222cccc3333dddd4444",
+            "Assets/Props/Barrel.fbx",
+            "guid: aaaa1111bbbb2222cccc3333dddd4444
+",
+            &payload,
+        );
+
+        // Manifest records the payload's offset in the decompressed tar.
+        let manifest = read_manifest(&pkg).unwrap();
+        let entry = &manifest[0];
+        let (offset, size) = (entry.asset_offset.unwrap(), entry.asset_size.unwrap());
+        assert_eq!(size, payload.len() as u64);
+        assert!(offset > 0, "payload sits after its tar header");
+
+        // Full extraction (ground truth) into workspace A.
+        let full_ws = dir.path().join("full");
+        let full = extract_to_workspace(&pkg, &full_ws).unwrap();
+
+        // Surgical extraction from the recorded offset into workspace B.
+        let surgical_ws = dir.path().join("surgical");
+        let got = extract_at_offsets(
+            &pkg,
+            &surgical_ws,
+            vec![EntryLocator {
+                guid: entry.guid.clone(),
+                pathname: entry.pathname.clone(),
+                offset,
+                size,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].content_hash, full[0].content_hash,
+            "same bytes, same address"
+        );
+        assert_eq!(
+            std::fs::read(&got[0].workspace_path).unwrap(),
+            payload,
+            "surgical payload is byte-identical"
+        );
+
+        // A stale locator (wrong size past EOF) must fail loudly, not truncate silently.
+        let bad = extract_at_offsets(
+            &pkg,
+            &surgical_ws,
+            vec![EntryLocator {
+                guid: "stale".into(),
+                pathname: None,
+                offset,
+                size: size + 4096,
+            }],
+        );
+        assert!(bad.is_err());
+    }
+
+    #[test]
     fn parse_meta_extracts_guid_labels_and_importer() {
         let yaml = "fileFormatVersion: 2\nguid: 8f338a7a1b2c3d4e5f6a7b8c9d0e1f2a\nlabels:\n- Prop\n- Medieval\nTextureImporter:\n  mipmaps: 1\n";
         let meta = parse_meta(yaml);
@@ -355,6 +516,7 @@ mod tests {
             pathname: Some(pathname.into()),
             meta: UnityMeta::default(),
             asset_size: None,
+            asset_offset: None,
             has_preview: false,
         }
     }
