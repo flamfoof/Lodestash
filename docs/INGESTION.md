@@ -75,6 +75,14 @@ offset, copy that payload out (same content-addressed placement), touch nothing 
 O(bytes up to the last wanted offset) — no tar parsing, no writes for the unwanted rest. A stale
 locator (package changed on disk) fails loudly rather than truncating.
 
+In the UI this surfaces on the pending-packages bar: **Browse** expands a pack's manifest
+(pathname + size per pickable entry; `.meta` sidecars and offset-less entries excluded) with
+checkboxes and an **Extract selected** action that runs the skip-scan — the pack card stays after a
+partial pull so more assets can be picked later. Locators are captured at browse time and persisted
+as `package_entry` rows whenever the package persists, so re-extraction never re-scans the archive.
+Wrapper packages (render-pipeline variants) get the variant picker instead — their outer manifest
+only contains sub-packages.
+
 ### Unpack & ingest one or many (on demand)
 Selecting one or multiple packages enqueues a **batch unpack+ingest** job (via the job engine):
 - `.unitypackage` → **gzip+tar** extract in pure Rust (no Editor, no Python sidecar for the common case).

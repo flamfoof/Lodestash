@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use egui::{Key, RichText, ScrollArea, TextureHandle, Ui, Vec2};
-use lodestash_core::catalog::{Catalog, CrawlRecord, HydratedAsset, StatusCounts};
+use lodestash_core::catalog::{
+    Catalog, CrawlRecord, HydratedAsset, PackageEntryRecord, StatusCounts,
+};
 use lodestash_core::types::{AssetStatus, MediaType};
 use lodestash_ingest::asset_store::{self, AssetStorePackage};
 use lodestash_ingest::crawler::{self, CrawledFile};
@@ -132,6 +134,28 @@ struct PendingPackage {
     chosen_variant: usize,
     extracting: bool,
     progress: Arc<ExtractProgress>,
+    /// Manifest locators (guid/pathname/tar-offset/size) captured at browse time —
+    /// persisted as `package_entry` rows on extraction so surgical re-extraction never
+    /// needs a second full scan (DATA-MODEL §7, INGESTION §2).
+    entries: Vec<PackageEntryRecord>,
+    /// Contents list expanded under the package row (pick-and-extract).
+    browsing: bool,
+    /// Indices into `entries` picked for surgical extraction.
+    picked: std::collections::BTreeSet<usize>,
+}
+
+impl PendingPackage {
+    /// Indices of entries a surgical extraction can pull: a real (non-.meta) pathname
+    /// plus the tar offset + size recorded at browse time.
+    fn extractable(&self) -> impl Iterator<Item = usize> + '_ {
+        self.entries.iter().enumerate().filter_map(|(i, e)| {
+            let p = e.pathname.as_deref()?;
+            (!p.to_ascii_lowercase().ends_with(".meta")
+                && e.tar_offset.is_some()
+                && e.size_bytes.is_some())
+            .then_some(i)
+        })
+    }
 }
 
 /// Longest side a full-detail viewer texture may have; larger sources are
@@ -223,6 +247,8 @@ struct PackagePersist {
     publisher: Option<String>,
     category: Option<String>,
     records: Vec<CrawlRecord>,
+    /// Manifest locators for `package_entry` (surgical re-extraction, DATA-MODEL §7).
+    entries: Vec<PackageEntryRecord>,
     /// (name, root) of every project source, for the read-back status counts.
     all_roots: Vec<(String, String)>,
 }
@@ -244,6 +270,11 @@ struct ExtractDone {
     abs_path: PathBuf,
     source_idx: usize,
     files: Vec<CrawledFile>,
+    /// The package's manifest locators, carried through for `package_entry` persist.
+    entries: Vec<PackageEntryRecord>,
+    /// True for a surgical (picked-assets) extraction: the pending card stays so more
+    /// can be pulled later; false for a full extraction, which retires it.
+    partial: bool,
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -1142,6 +1173,7 @@ impl LodestashApp {
         source_idx: usize,
         package_path: &std::path::Path,
         files: &[CrawledFile],
+        entries: Vec<PackageEntryRecord>,
     ) {
         let Some(db_path) = catalog_db_path() else {
             return;
@@ -1192,6 +1224,7 @@ impl LodestashApp {
                 }
                 records
             },
+            entries,
             all_roots: self
                 .scan_roots
                 .iter()
@@ -1442,9 +1475,37 @@ impl LodestashApp {
             && viewport3d::is_viewable_model(&entry.file.abs_path)
         {
             let path = entry.file.abs_path.clone();
+            // Extracted packages place payloads in content-addressed dirs, so an FBX's
+            // relative texture paths dangle — hand the loader a basename→file map built
+            // from the same package's image entries. Loose files resolve on disk.
+            let tex_files = match &entry.package {
+                Some(pkg) => {
+                    let pkg = pkg.clone();
+                    self.entries
+                        .iter()
+                        .filter(|e| {
+                            e.package.as_deref() == Some(pkg.as_str())
+                                && matches!(
+                                    e.file.media_type,
+                                    Some(MediaType::Texture | MediaType::Image | MediaType::Sprite)
+                                )
+                        })
+                        .filter_map(|e| {
+                            let base = e
+                                .file
+                                .rel_path
+                                .file_name()?
+                                .to_string_lossy()
+                                .to_lowercase();
+                            Some((base, e.file.abs_path.clone()))
+                        })
+                        .collect()
+                }
+                None => std::collections::BTreeMap::new(),
+            };
             if let Some(vp) = &mut self.viewport3d {
                 if vp.entry_idx != Some(entry_idx) {
-                    vp.load(entry_idx, path, ctx);
+                    vp.load(entry_idx, path, tex_files, ctx);
                 }
             }
             return;
@@ -1552,6 +1613,7 @@ impl LodestashApp {
             .nested_candidates
             .get(pkg.chosen_variant)
             .map(|(_, pathname)| pathname.clone());
+        let entries = pkg.entries.clone();
         let tx = self.extract_tx.clone();
 
         std::thread::spawn(move || {
@@ -1567,6 +1629,63 @@ impl LodestashApp {
                 abs_path,
                 source_idx,
                 files,
+                entries,
+                partial: false,
+            });
+        });
+        ctx.request_repaint();
+    }
+
+    /// Surgical extraction of the picked entries of `pending_packages[idx]` — one
+    /// skip-scan pulling only those payloads (INGESTION.md §2), never the whole pack.
+    fn extract_picked(&mut self, ctx: &egui::Context, idx: usize) {
+        let Some(workspace_dir) = self.workspace_dir.clone() else {
+            return;
+        };
+        let Some(pkg) = self.pending_packages.get_mut(idx) else {
+            return;
+        };
+        if pkg.extracting || pkg.picked.is_empty() {
+            return;
+        }
+        pkg.extracting = true;
+
+        let locators: Vec<unitypackage::EntryLocator> = pkg
+            .picked
+            .iter()
+            .filter_map(|&i| {
+                let e = pkg.entries.get(i)?;
+                Some(unitypackage::EntryLocator {
+                    guid: e.guid.clone(),
+                    pathname: e.pathname.clone(),
+                    // `extractable()` gates picking, so these are always Some.
+                    offset: e.tar_offset? as u64,
+                    size: e.size_bytes? as u64,
+                })
+            })
+            .collect();
+        let abs_path = pkg.abs_path.clone();
+        let source_idx = pkg.source_idx;
+        let display_name = pkg.display_name.clone();
+        let entries = pkg.entries.clone();
+        let tx = self.extract_tx.clone();
+
+        std::thread::spawn(move || {
+            let files = match unitypackage::extract_at_offsets(&abs_path, &workspace_dir, locators)
+            {
+                Ok(assets) => extracted_to_crawled(assets, &display_name),
+                Err(err) => {
+                    tracing::warn!(%err, package = %display_name, "surgical extraction failed");
+                    Vec::new()
+                }
+            };
+            let _ = tx.send(ExtractDone {
+                display_name,
+                abs_path,
+                source_idx,
+                files,
+                entries,
+                partial: true,
             });
         });
         ctx.request_repaint();
@@ -1578,9 +1697,21 @@ impl LodestashApp {
             done.push(msg);
         }
         for msg in done {
-            self.pending_packages.retain(|p| p.abs_path != msg.abs_path);
+            if msg.partial {
+                // Surgical pull: the card stays armed for further picks.
+                if let Some(pkg) = self
+                    .pending_packages
+                    .iter_mut()
+                    .find(|p| p.abs_path == msg.abs_path)
+                {
+                    pkg.extracting = false;
+                    pkg.picked.clear();
+                }
+            } else {
+                self.pending_packages.retain(|p| p.abs_path != msg.abs_path);
+            }
             // Write-behind: package row + extracted asset rows (DATA-MODEL §7).
-            self.spawn_package_persist(msg.source_idx, &msg.abs_path, &msg.files);
+            self.spawn_package_persist(msg.source_idx, &msg.abs_path, &msg.files, msg.entries);
             for file in msg.files {
                 self.entries.push(AssetEntry {
                     package: Some(msg.display_name.clone()),
@@ -3709,6 +3840,7 @@ impl eframe::App for LodestashApp {
         // "wiring" note this closes: extraction is user-triggered, never automatic on scan).
         if !self.pending_packages.is_empty() {
             let mut extract_clicked: Option<usize> = None;
+            let mut picked_clicked: Option<usize> = None;
             egui::TopBottomPanel::top("packages_bar")
                 .frame(
                     egui::Frame::none()
@@ -3745,28 +3877,123 @@ impl eframe::App for LodestashApp {
                                     });
                             }
                             if pkg.extracting {
-                                let frac = pkg.progress.fraction();
-                                ui.add(
-                                    egui::ProgressBar::new(frac)
-                                        .desired_width(140.0)
-                                        .desired_height(14.0)
-                                        .fill(theme::ARCANE)
-                                        .text(
-                                            RichText::new(format!(
-                                                "extracting {:.0}%",
-                                                frac * 100.0
-                                            ))
+                                // ponytail: surgical extracts have no progress callback —
+                                // a spinner is the honest indicator; full extracts keep
+                                // the byte-accurate bar.
+                                if pkg.browsing {
+                                    ui.add(egui::Spinner::new().size(14.0));
+                                    ui.label(
+                                        RichText::new("extracting selection…")
+                                            .color(theme::TEXT_DIM)
                                             .size(10.0),
-                                        ),
-                                );
-                            } else if ui.add(egui::Button::new("Extract")).clicked() {
-                                extract_clicked = Some(i);
+                                    );
+                                } else {
+                                    let frac = pkg.progress.fraction();
+                                    ui.add(
+                                        egui::ProgressBar::new(frac)
+                                            .desired_width(140.0)
+                                            .desired_height(14.0)
+                                            .fill(theme::ARCANE)
+                                            .text(
+                                                RichText::new(format!(
+                                                    "extracting {:.0}%",
+                                                    frac * 100.0
+                                                ))
+                                                .size(10.0),
+                                            ),
+                                    );
+                                }
+                            } else {
+                                if ui.add(egui::Button::new("Extract")).clicked() {
+                                    extract_clicked = Some(i);
+                                }
+                                // Pick-and-extract only makes sense where the manifest
+                                // lists real assets — wrappers only contain sub-packages.
+                                if pkg.nested_candidates.is_empty()
+                                    && ui
+                                        .add(egui::Button::new("Browse").selected(pkg.browsing))
+                                        .clicked()
+                                {
+                                    pkg.browsing = !pkg.browsing;
+                                }
                             }
                         });
+                        let pkg = &mut self.pending_packages[i];
+                        if pkg.browsing && !pkg.extracting {
+                            let all: Vec<usize> = pkg.extractable().collect();
+                            ui.horizontal(|ui| {
+                                if ui.small_button("All").clicked() {
+                                    pkg.picked = all.iter().copied().collect();
+                                }
+                                if ui.small_button("None").clicked() {
+                                    pkg.picked.clear();
+                                }
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} of {} picked",
+                                        pkg.picked.len(),
+                                        all.len()
+                                    ))
+                                    .color(theme::TEXT_DIM)
+                                    .size(10.0),
+                                );
+                                if !pkg.picked.is_empty()
+                                    && ui
+                                        .add(egui::Button::new(format!(
+                                            "Extract selected ({})",
+                                            pkg.picked.len()
+                                        )))
+                                        .clicked()
+                                {
+                                    picked_clicked = Some(i);
+                                }
+                            });
+                            egui::ScrollArea::vertical()
+                                .id_salt(("pkg_browse", i))
+                                .max_height(220.0)
+                                .show(ui, |ui| {
+                                    for ei in all {
+                                        let e = &pkg.entries[ei];
+                                        let (Some(pathname), Some(size)) =
+                                            (e.pathname.as_deref(), e.size_bytes)
+                                        else {
+                                            continue;
+                                        };
+                                        ui.horizontal(|ui| {
+                                            let mut on = pkg.picked.contains(&ei);
+                                            if ui.checkbox(&mut on, "").changed() {
+                                                if on {
+                                                    pkg.picked.insert(ei);
+                                                } else {
+                                                    pkg.picked.remove(&ei);
+                                                }
+                                            }
+                                            ui.label(
+                                                RichText::new(pathname)
+                                                    .color(theme::TEXT_DIM)
+                                                    .size(11.0),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        RichText::new(format_bytes(size as u64))
+                                                            .color(theme::TEXT_MUTED)
+                                                            .size(10.0),
+                                                    );
+                                                },
+                                            );
+                                        });
+                                    }
+                                });
+                        }
                     }
                 });
             if let Some(idx) = extract_clicked {
                 self.extract_package(ctx, idx);
+            }
+            if let Some(idx) = picked_clicked {
+                self.extract_picked(ctx, idx);
             }
         }
 
@@ -4592,6 +4819,16 @@ fn resolve_pending_package(source_idx: usize, file: &CrawledFile) -> Option<Pend
         })
         .collect();
 
+    let entries = manifest
+        .iter()
+        .map(|e| PackageEntryRecord {
+            guid: e.guid.clone(),
+            pathname: e.pathname.clone(),
+            tar_offset: e.asset_offset.map(|o| o as i64),
+            size_bytes: e.asset_size.map(|s| s as i64),
+        })
+        .collect();
+
     Some(PendingPackage {
         source_idx,
         abs_path: file.abs_path.clone(),
@@ -4600,6 +4837,9 @@ fn resolve_pending_package(source_idx: usize, file: &CrawledFile) -> Option<Pend
         chosen_variant,
         extracting: false,
         progress: Arc::default(),
+        entries,
+        browsing: false,
+        picked: std::collections::BTreeSet::new(),
     })
 }
 
@@ -4646,6 +4886,15 @@ fn extract_package_contents(
         None => outer,
     };
 
+    extracted_to_crawled(assets, display_name)
+}
+
+/// Convert extracted payloads into crawlable grid entries, virtually namespaced under
+/// `display_name`. Shared by the full and surgical extraction paths.
+fn extracted_to_crawled(
+    assets: Vec<unitypackage::ExtractedAsset>,
+    display_name: &str,
+) -> Vec<CrawledFile> {
     assets
         .into_iter()
         // Unity .meta sidecars are bookkeeping, never grid assets.
@@ -5320,6 +5569,9 @@ fn persist_package_to_catalog(
         .map_err(|e| e.to_string())?;
     let stats = catalog
         .record_crawl(source_id, Some(package_id), &job.records)
+        .map_err(|e| e.to_string())?;
+    catalog
+        .record_package_entries(package_id, &job.entries)
         .map_err(|e| e.to_string())?;
     catalog
         .mark_package_unpacked(package_id, job.records.len())
@@ -6686,6 +6938,50 @@ mod tests {
 
         builder.into_inner().unwrap().finish().unwrap();
         pkg_path
+    }
+
+    /// B1+B2 wiring: browse captures locators, `extractable` gates the pickable rows,
+    /// and a surgical extraction from those locators yields a namespaced grid entry.
+    #[test]
+    fn pending_package_locators_drive_surgical_extraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_path = build_test_package(
+            dir.path(),
+            "Props.unitypackage",
+            "Assets/Props/rock.fbx",
+            b"FBX_DATA",
+        );
+        let file = CrawledFile {
+            abs_path: pkg_path,
+            rel_path: PathBuf::from("Props.unitypackage"),
+            size_bytes: 0,
+            mtime: 0,
+            media_type: None,
+        };
+        let pkg = resolve_pending_package(0, &file).expect("manifest parses");
+        assert_eq!(pkg.entries.len(), 1, "one locator captured at browse");
+        let picks: Vec<usize> = pkg.extractable().collect();
+        assert_eq!(picks, vec![0], "the fbx is pickable");
+
+        let e = &pkg.entries[0];
+        let assets = unitypackage::extract_at_offsets(
+            &pkg.abs_path,
+            &dir.path().join("ws"),
+            vec![unitypackage::EntryLocator {
+                guid: e.guid.clone(),
+                pathname: e.pathname.clone(),
+                offset: e.tar_offset.unwrap() as u64,
+                size: e.size_bytes.unwrap() as u64,
+            }],
+        )
+        .expect("surgical extraction succeeds");
+        let files = extracted_to_crawled(assets, &pkg.display_name);
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].rel_path,
+            PathBuf::from("Props").join("Assets/Props/rock.fbx")
+        );
+        assert_eq!(std::fs::read(&files[0].abs_path).unwrap(), b"FBX_DATA");
     }
 
     #[test]

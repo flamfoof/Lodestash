@@ -12,6 +12,7 @@
 //! Formats: glTF/GLB/OBJ load via three-d-asset; FBX flattens through ufbx
 //! (`lodestash_ingest::mesh`) into triangle soup + base-color materials.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -87,8 +88,16 @@ impl Viewport3d {
         })
     }
 
-    /// Kick off an async load for `path`, replacing whatever is shown.
-    pub fn load(&mut self, entry_idx: usize, path: PathBuf, egui_ctx: &egui::Context) {
+    /// Kick off an async load for `path`, replacing whatever is shown. `tex_files` maps
+    /// lowercase texture basenames to on-disk files for the FBX loader's fallback
+    /// resolution (extracted packages; empty for loose files).
+    pub fn load(
+        &mut self,
+        entry_idx: usize,
+        path: PathBuf,
+        tex_files: BTreeMap<String, PathBuf>,
+        egui_ctx: &egui::Context,
+    ) {
         self.entry_idx = Some(entry_idx);
         self.loading = true;
         self.error = None;
@@ -102,7 +111,7 @@ impl Viewport3d {
         self.rx = Some(rx);
         let egui_ctx = egui_ctx.clone();
         std::thread::spawn(move || {
-            let result = load_cpu_model(&path);
+            let result = load_cpu_model(&path, &tex_files);
             let _ = tx.send(result);
             egui_ctx.request_repaint();
         });
@@ -227,15 +236,27 @@ impl Scene {
                             .map(|us| us.iter().map(|u| three_d::vec2(u[0], u[1])).collect()),
                         ..Default::default()
                     };
+                    // With a texture the base color must not tint it — white multiplies out.
+                    let albedo = match &m.albedo {
+                        Some(_) => Srgba::WHITE,
+                        None => Srgba::new(
+                            m.base_color[0],
+                            m.base_color[1],
+                            m.base_color[2],
+                            m.base_color[3],
+                        ),
+                    };
+                    let albedo_texture = m.albedo.as_ref().map(|t| three_d_asset::Texture2D {
+                        data: three_d_asset::TextureData::RgbaU8(t.rgba.clone()),
+                        width: t.width,
+                        height: t.height,
+                        ..Default::default()
+                    });
                     let material = PhysicalMaterial::new_opaque(
                         &self.ctx,
                         &CpuMaterial {
-                            albedo: Srgba::new(
-                                m.base_color[0],
-                                m.base_color[1],
-                                m.base_color[2],
-                                m.base_color[3],
-                            ),
+                            albedo,
+                            albedo_texture,
                             ..Default::default()
                         },
                     );
@@ -335,9 +356,12 @@ impl Scene {
 }
 
 /// Parse a model file into CPU-side meshes + materials. Runs on a worker thread.
-fn load_cpu_model(path: &Path) -> Result<LoadedModel, String> {
+fn load_cpu_model(
+    path: &Path,
+    tex_files: &BTreeMap<String, PathBuf>,
+) -> Result<LoadedModel, String> {
     if mesh::is_fbx_model(path) {
-        return mesh::load_meshes(path).map(LoadedModel::Flattened);
+        return mesh::load_meshes(path, tex_files).map(LoadedModel::Flattened);
     }
     let mut raw = three_d_asset::io::load(&[path]).map_err(|e| e.to_string())?;
     raw.deserialize::<three_d_asset::Model>(path)
@@ -363,7 +387,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tri.obj");
         std::fs::write(&path, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").unwrap();
-        match load_cpu_model(&path).expect("minimal OBJ parses") {
+        match load_cpu_model(&path, &BTreeMap::new()).expect("minimal OBJ parses") {
             LoadedModel::Direct(model) => {
                 assert_eq!(model.geometries.len(), 1, "one triangle geometry");
             }
@@ -373,11 +397,13 @@ mod tests {
 
     #[test]
     fn load_cpu_model_reports_missing_file_as_error() {
-        let Err(err) = load_cpu_model(Path::new("Z:/definitely/not/here.obj")) else {
+        let Err(err) = load_cpu_model(Path::new("Z:/definitely/not/here.obj"), &BTreeMap::new())
+        else {
             panic!("missing obj must error");
         };
         assert!(!err.is_empty());
-        let Err(err) = load_cpu_model(Path::new("Z:/definitely/not/here.fbx")) else {
+        let Err(err) = load_cpu_model(Path::new("Z:/definitely/not/here.fbx"), &BTreeMap::new())
+        else {
             panic!("missing fbx must error");
         };
         assert!(!err.is_empty());
