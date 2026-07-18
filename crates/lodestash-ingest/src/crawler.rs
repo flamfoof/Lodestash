@@ -30,7 +30,7 @@ pub fn crawl(root: &Path, excludes: &[Exclude]) -> Vec<CrawledFile> {
         .into_iter()
         .filter_entry(|e| !is_skip_dir(e) && !is_excluded_entry(e, root, excludes))
         .filter_map(|entry| entry.ok())
-        .filter(|e| e.file_type().is_file())
+        .filter(|e| e.file_type().is_file() && !is_meta_sidecar(e.path()))
         .filter_map(|entry| {
             let meta = entry.metadata().ok()?;
             let abs_path = entry.path().to_path_buf();
@@ -53,6 +53,14 @@ pub fn crawl(root: &Path, excludes: &[Exclude]) -> Vec<CrawledFile> {
             })
         })
         .collect()
+}
+
+/// Unity `.meta` sidecars are bookkeeping, never content — they are read for GUIDs/labels
+/// during package ingest (`unitypackage::parse_meta`) but must not appear as assets.
+fn is_meta_sidecar(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("meta"))
 }
 
 /// Content-hash a file with BLAKE3, streaming (constant memory even for multi-GB packages).
@@ -155,6 +163,17 @@ mod tests {
             .collect();
         assert_eq!(files.len(), 1, "only keep.png survives; got: {names:?}");
         assert_eq!(names[0], "keep.png");
+    }
+
+    #[test]
+    fn crawl_ignores_unity_meta_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rock.fbx"), b"mesh").unwrap();
+        std::fs::write(dir.path().join("rock.fbx.meta"), b"guid: abc").unwrap();
+        std::fs::write(dir.path().join("Rock2.FBX.META"), b"guid: def").unwrap();
+        let files = crawl(dir.path(), &[]);
+        assert_eq!(files.len(), 1, "sidecars skipped, case-insensitively");
+        assert!(files[0].rel_path.to_string_lossy().ends_with("rock.fbx"));
     }
 
     #[test]

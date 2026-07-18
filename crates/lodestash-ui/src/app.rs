@@ -949,6 +949,10 @@ impl LodestashApp {
                 .flat_map(|(source_idx, rows)| {
                     let root = self.scan_roots.get(source_idx).cloned().unwrap_or_default();
                     rows.into_iter().filter_map(move |row| {
+                        // Legacy rows from before the .meta-sidecar filter existed.
+                        if row.rel_path.to_ascii_lowercase().ends_with(".meta") {
+                            return None;
+                        }
                         let rel_path = PathBuf::from(&row.rel_path);
                         Some(AssetEntry {
                             package: None,
@@ -976,6 +980,9 @@ impl LodestashApp {
                         let Some(status) = AssetStatus::from_code(&row.asset.status) else {
                             continue;
                         };
+                        if row.asset.rel_path.to_ascii_lowercase().ends_with(".meta") {
+                            continue; // legacy pre-filter rows
+                        }
                         let rel_path = PathBuf::from(&row.asset.rel_path);
                         self.entries.push(AssetEntry {
                             package: Some(row.package_name),
@@ -4641,6 +4648,12 @@ fn extract_package_contents(
 
     assets
         .into_iter()
+        // Unity .meta sidecars are bookkeeping, never grid assets.
+        .filter(|a| {
+            !a.pathname
+                .as_deref()
+                .is_some_and(|p| p.to_ascii_lowercase().ends_with(".meta"))
+        })
         .map(|a| {
             let rel_suffix = a.pathname.clone().unwrap_or_else(|| a.guid.clone());
             let rel_path = PathBuf::from(display_name).join(rel_suffix);
