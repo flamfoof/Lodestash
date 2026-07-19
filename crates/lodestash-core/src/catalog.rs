@@ -1118,6 +1118,50 @@ impl Catalog {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| CoreError::Catalog(format!("pkg list row: {e}")))
     }
+
+    /// Search by Tags (IDENTIFICATION-AND-SEARCH §5.A): FTS5/BM25 over asset name +
+    /// description + denormalised tags. Returns matching asset ids **most-relevant
+    /// first**, capped at `limit`, soft-deleted rows excluded. An empty or
+    /// punctuation-only query yields `None` (the caller shows the unfiltered set).
+    ///
+    /// The raw user text never reaches FTS5's MATCH grammar directly — [`fts_match_query`]
+    /// tokenises it and prefix-quotes each term, so a stray `"`/`*`/`AND` can't error the
+    /// query or change its meaning (typeahead-friendly: every term matches as a prefix).
+    pub fn search_assets(&self, query: &str, limit: usize) -> Result<Option<Vec<i64>>> {
+        let Some(match_expr) = fts_match_query(query) else {
+            return Ok(None);
+        };
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT f.rowid
+                 FROM asset_fts f
+                 JOIN asset a ON a.id = f.rowid
+                 WHERE asset_fts MATCH ?1 AND a.deleted_at IS NULL
+                 ORDER BY bm25(asset_fts) LIMIT ?2",
+            )
+            .map_err(|e| CoreError::Catalog(format!("search prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![match_expr, limit as i64], |r| r.get::<_, i64>(0))
+            .map_err(|e| CoreError::Catalog(format!("search query: {e}")))?;
+        let ids = rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("search row: {e}")))?;
+        Ok(Some(ids))
+    }
+}
+
+/// Turn free user text into a safe FTS5 MATCH expression: split on non-alphanumerics,
+/// prefix-quote each term (`"term"*`), AND them together. Quoting neutralises FTS5
+/// operators/syntax in the term body; the trailing `*` makes each a prefix match so
+/// typing "roc" already finds "rock". Returns `None` when nothing tokenisable remains.
+fn fts_match_query(query: &str) -> Option<String> {
+    let terms: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("\"{}\"*", t.to_lowercase()))
+        .collect();
+    (!terms.is_empty()).then(|| terms.join(" "))
 }
 
 #[cfg(test)]
@@ -1289,6 +1333,62 @@ mod tests {
             size_bytes: size,
             mtime,
         }
+    }
+
+    #[test]
+    fn fts_match_query_is_injection_safe() {
+        // Every term is prefix-quoted; FTS5 operators in the body are neutralised.
+        assert_eq!(fts_match_query("rock"), Some("\"rock\"*".into()));
+        assert_eq!(
+            fts_match_query("low poly"),
+            Some("\"low\"* \"poly\"*".into())
+        );
+        // Quotes / operators / stars never reach MATCH as syntax.
+        assert_eq!(
+            fts_match_query("a\" OR b*"),
+            Some("\"a\"* \"or\"* \"b\"*".into())
+        );
+        assert_eq!(fts_match_query(""), None);
+        assert_eq!(fts_match_query("  -–—  "), None, "punctuation only → None");
+    }
+
+    #[test]
+    fn search_assets_ranks_and_prefix_matches() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let src = c
+            .upsert_import_source("Lib", "C:/lib", "folder")
+            .expect("src");
+        c.record_crawl(
+            src,
+            None,
+            &[
+                rec("rock_wall.png", 1, 1),
+                rec("rocky_path.png", 2, 1),
+                rec("tree_oak.png", 3, 1),
+            ],
+        )
+        .expect("crawl");
+
+        // Prefix match: "rock" finds rock_wall AND rocky_path, not the tree.
+        let hits = c.search_assets("rock", 50).expect("search").expect("some");
+        assert_eq!(hits.len(), 2, "rock* matches both rock names");
+        let tree = c.search_assets("tree", 50).expect("s").expect("some");
+        assert_eq!(tree.len(), 1);
+
+        // Empty / punctuation-only → None (caller shows everything).
+        assert!(c.search_assets("", 50).expect("s").is_none());
+        assert!(c.search_assets("***", 50).expect("s").is_none());
+
+        // Soft-deleted rows drop out of results.
+        c.conn
+            .execute(
+                "UPDATE asset SET deleted_at = 1 WHERE name = 'rock_wall.png'",
+                [],
+            )
+            .expect("trash");
+        let hits = c.search_assets("rock", 50).expect("s").expect("some");
+        assert_eq!(hits.len(), 1, "trashed asset excluded");
     }
 
     #[test]
