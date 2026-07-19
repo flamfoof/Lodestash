@@ -338,6 +338,7 @@ CREATE TABLE package (
   content_hash  TEXT,                   -- BLAKE3 of the .unitypackage (update detection)
   asset_count   INTEGER,                -- filled after unpack (0/NULL = browsed but not yet ingested)
   unpacked_at   INTEGER,
+  pinned        INTEGER NOT NULL DEFAULT 0, -- 1 = promoted to a sidebar LIBRARIES row (M7, §UI)
   license       TEXT,                   -- e.g. 'Unity Asset Store EULA', 'CC-BY-4.0' (harvested at ingest)
   attribution   TEXT,                   -- required credit string, when applicable
   license_url   TEXT,                   -- link to the license/EULA
@@ -355,6 +356,10 @@ CREATE INDEX idx_package_source ON package(source_id);
   export/import** so shipping with bought assets stays traceable. An individual asset may override the
   pack's license (see `asset.license_*` below).
 - **`package` is another search facet** (and a grid hierarchy: Publisher → Category → Package).
+- **Pinned as a library**: the Unity Assets screen's **Add to Library** sets `package.pinned=1`
+  (FEATURES.md §5.5); a pinned pack shows as a sidebar **LIBRARIES** row and surfaces its assets in the
+  normal grid via the `asset.package_id` join — no separate config list. Removing it clears the flag.
+  This is the durable backing for the in-memory `LibraryFilter::Package` the UI already uses.
 - **Update detection**: re-compare the `.unitypackage` `content_hash`; on change, re-ingest and
   reconcile that package's `asset` rows (non-destructive — preserves manual tags/mappings on unchanged
   assets via per-file `content_hash`).
@@ -601,6 +606,7 @@ transaction, in order, on open. Shipped so far:
 | **M4** | `asset.rating`, `package.pipeline`, `project.pipeline` (§12) |
 | **M5** | UI-SPEC alignment (below) |
 | **M6** | Extracted-pack persistence + surgical extraction: `asset_file.workspace_rel` (locates a package-extracted file in the content-addressed workspace, so extracted packs rehydrate across sessions behind the **Keep extracted packs cached** toggle, default off) + `package_entry` (per-payload guid/pathname/**tar offset**/size from the browse pass — selected assets re-extract with one gzip skip-scan instead of a full unpack, [`INGESTION.md`](INGESTION.md) §2) |
+| **M7** | *(planned)* Unity Assets library pinning: `package.pinned` (`ALTER TABLE package ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`) — backs the Add-to-Library pin (FEATURES.md §5.5, §7 above) so a promoted pack is a durable sidebar LIBRARIES row |
 | **M5** | UI-SPEC alignment: per-project staging trays, `import_record.batch_id` + backfill, `tag` trait columns, `asset_relationship` (final form), `import_source.blacklist` — DDL + data steps below |
 
 ### M5 — UI-SPEC alignment (shipped 2026-07-16)

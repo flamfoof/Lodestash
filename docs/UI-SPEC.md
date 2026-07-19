@@ -68,7 +68,7 @@ One window, three fixed regions plus overlays:
 **⚖ Resolution:** the prototype's single labeled sidebar **replaces** the earlier icon-only nav rail.
 One vertical panel, three stacked groups:
 
-1. **Navigation** — 9 destinations, each a 32px row: 16px glyph + label + optional warn-badge
+1. **Navigation** — 10 destinations, each a 32px row: 16px glyph + label + optional warn-badge
    (amber pill, mono count). Active row: `--ls-overlay` fill + 2px gold left-border.
 
    | Destination | Icon (`ls-*`) | Badge |
@@ -77,11 +77,17 @@ One vertical panel, three stacked groups:
    | Identify | `nav-identify` | Unidentified count |
    | Collections | `nav-collections` | — |
    | Packages | `nav-packages` | — |
+   | Unity Assets | `unitypackage` | — |
    | Vocabulary | `nav-traits` | — |
    | Stats | `nav-stats` | — |
    | Duplicates | `nav-duplicates` | open dup-group count |
    | Trash | `nav-trash` | trashed count |
    | Settings | `nav-settings` | — |
+
+   **Unity Assets** is a distinct destination from **Packages** (FEATURES.md §5 vs §4.1): Packages is
+   the aggregate view of *already-indexed* assets; Unity Assets manages `.unitypackage` archive
+   sources — browse/preview one package, surgical per-asset extraction, and **Add to Library** pinning
+   (`package.pinned`, DATA-MODEL §7). Code adds a `Screen::Unity` variant to the existing nine.
 
    Clicking **Library is the reset-to-everything affordance**: it clears library/type/status/pack/
    collection filters, the query, AI results, and the ⚑ content filters.
@@ -99,11 +105,21 @@ are Library filters). Sidebar scrolls as one column.
 
 ### 0.3 Type tab row
 
-Under the top bar, on Library and Identify: `All` + one tab per `media_type` **with a non-zero
-count** (`All · 3D Models · Audio · Images · Textures · Materials · Fonts · Sprites`), each showing
-its count and colored by its type token when active (2px underline in the type color). Zero-count
-types hide; `All` never hides. *(The earlier second-row Library tabs are gone — the sidebar
-LIBRARIES facet group (§0.2) absorbed the per-source filter.)*
+Under the top bar, on Library and Identify: **four coarse category tabs** — `All · Models · Sounds ·
+Images` (FEATURES.md §0.2) — each showing its count and colored by its bucket token when active (2px
+underline). `All` never hides; a bucket with a zero count hides. The tabs are a **presentation
+grouping over the unchanged 7-value `media_type` enum** (the enum stays
+`model_3d | texture | audio | image | sprite | material | font` — a data-model invariant); finer
+type distinctions live in the ⚑ Filters popover, not the top bar. Bucket → `media_type`:
+
+| Tab | `media_type`(s) |
+|---|---|
+| Models | `model_3d`, `material` |
+| Sounds | `audio` |
+| Images | `image`, `texture`, `sprite`, `font` |
+
+*(The earlier second-row Library tabs are gone — the sidebar LIBRARIES facet group (§0.2) absorbed
+the per-source filter.)*
 
 ### 0.4 Keyboard map (global)
 
@@ -226,6 +242,10 @@ Backlog triage per DATA-MODEL §8. Arcane-tinted header:
 ---
 
 ## 4. Packages
+
+> **Packages vs Unity Assets** (§0.2): Packages is the aggregate view of *already-indexed* assets
+> grouped by publisher → pack; **Unity Assets** manages `.unitypackage` archive *sources* (browse,
+> surgical extraction, Add-to-Library pinning). FEATURES.md §4.1 / §5.
 
 Everything you own, by **publisher → pack** (DATA-MODEL §7). Header: Cinzel "Packages" + subtitle.
 One card per publisher: header row (▤ gold + name + total asset count) then a row per pack:
@@ -615,13 +635,15 @@ in the owning doc** (same-change rule):
    folder" = arbitrary path (`export_asset`). The prototype tray's "Export to <project>" label is
    superseded.
 4. **MCP settings card** = the optional Streamable-HTTP transport of the one MCP server: stable
-   configurable port (default **4319**), rotating token, three **permission groups** (search&read /
-   tag&traits / identify) instead of the prototype's literal tool names; import/export stays
-   per-call confirm. *(MCP-AND-ENGINES §2 updated.)*
-5. **Type taxonomy** — the 7-value `media_type` enum stands; the prototype's 3-category chips are
-   superseded by the type tab row (§0.3). Element-color tokens extended: texture `#6FB1FF` (shares
-   sapphire with image), material `#A98BFF` (shares amethyst with model), sprite `#5BD897`
-   (verdant), font `#F2966E` (coral). *(DESIGN-GUIDELINES §2 updated.)*
+   configurable port (default **4319**), rotating token, and a **literal per-tool allow-list**
+   (FEATURES.md §6.5) toggling the real MCP tools (`search_assets`, `find_similar`, `identify_asset`,
+   `suggest_tags`, `add_tag`/`retag`, …) — names must match the canonical inventory, and toggles keep
+   MCP↔REST 1:1; import/export stays per-call confirm. *(MCP-AND-ENGINES §2 updated.)*
+5. **Type taxonomy** — the 7-value `media_type` enum stands (data-model invariant). The **top-bar
+   category tabs are four coarse buckets** (`All · Models · Sounds · Images`, §0.3) grouping the
+   enum — a presentation choice, not an enum reduction (FEATURES.md §0.2). Element-color tokens
+   extended: texture `#6FB1FF` (shares sapphire with image), material `#A98BFF` (shares amethyst
+   with model), sprite `#5BD897` (verdant), font `#F2966E` (coral). *(DESIGN-GUIDELINES §2 updated.)*
 6. **Identify profiles** — presentation tiers bind to AI-MODELS-BY-GPU model sets; cloud steps only
    under per-modality cloud opt-in. Prototype model names are placeholders.
 7. **Unresolved dependencies** — `asset_relationship` gains an unresolved form: `to_asset_id`

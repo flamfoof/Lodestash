@@ -190,13 +190,14 @@ below and maps onto those.
 - **IMPORTANT — do not invent a new protocol surface.** Lodestash **already** has an MCP plane
   (`rmcp`, stdio by default + optional Streamable HTTP) specified in `MCP-AND-ENGINES.md` §2, and the
   **MCP ↔ REST 1:1 invariant** in `CLAUDE.md` must hold. This Settings section is the **UI to
-  enable/configure that existing server**, not a second one. Map controls to the real tools:
-  - "identify_asset" → the existing identify tool/endpoint.
-  - "tag_trait" → the existing tag mutation tool/endpoint.
+  enable/configure that existing server**, not a second one. The shipping UI is a **literal per-tool
+  allow-list of the canonical tools** (FEATURES.md §6.5, MCP-AND-ENGINES.md §2); the prototype's
+  placeholder labels map to them:
+  - "identify_asset" → `identify_asset`.
+  - "tag_trait" → `add_tag` / `retag` (the tag-mutation tools).
   - "search_library" (read-only) → `search_assets` / `get_asset`.
-  Any capability toggle here must correspond to a real MCP tool; if a per-tool allow-list doesn't exist
-  in the spec yet, add it to `MCP-AND-ENGINES.md` **and** the REST side (1:1) before shipping the
-  toggles.
+  Every toggle must correspond to a real MCP tool that exists on both planes; a disabled tool is gated
+  on MCP **and** REST (1:1).
 - **Controls (prototype):** Enable MCP server toggle; when on → **Endpoint** (copyable), **Access
   token** (regenerate), and **Allowed actions** toggles for the three tools above. Note the prototype
   shows an HTTP endpoint on a loopback port; the spec's **default transport is stdio** — present stdio
@@ -229,6 +230,70 @@ below and maps onto those.
 
 ---
 
+## Unity asset-package libraries (`ls-nav-unity` / `ls-unitypackage`)
+
+A dedicated flow for `.unitypackage` archives (e.g. `%AppData%/Roaming/Unity/Asset Store-5.x`). The
+*Unity Assets* screen previews packages; **Add to Library** promotes a package into the normal
+Libraries list. Two
+entry points, one import path, one browse view. **Nothing is copied on import — packages are indexed
+in place and files are surgically extracted on demand** (the archive is never fully unpacked). This
+maps onto the existing ingest/extract path in `lodestash-ingest`; treat `.unitypackage` as a
+sealed container source, not a folder to expand to disk.
+
+### Entry points (both required)
+
+1. **Dedicated sidebar nav item** — *Unity Assets*, glyph `ls-unitypackage` (the restyled Unity
+   cube, `SUCCESS` green stroke), sitting under *Packages* in the rail.
+2. **"Add a source" chooser** — the sidebar *Add source…* and Settings → *+ Add source* now open a
+   small chooser modal with two options: **Watch a folder** (the existing watched-source path) and
+   **Unity Asset Store packages** (opens the import dialog below).
+
+### Import dialog (folder picker → package list)
+
+- **Folder row:** the chosen asset-package folder path + a **Choose folder…** action. On pick, scan
+  the folder tree for `.unitypackage` files.
+- **Grouped by publisher / containing folder** (the Asset Store-5.x layout: `<Publisher>/…/*.unitypackage`).
+  Each group is collapsible and has a **select all / clear** affordance.
+- **Per package:** checkbox, name, `vX · size · N assets`, and an **auto-detected content-category**
+  badge that is also a **dropdown override** (3D Models / Audio / Code / UI / Materials). Category is
+  auto-detected from archive contents; the dropdown lets the user correct it before import.
+- **Category filter tabs** (All / 3D / Audio / Code / UI / Materials) filter the visible packages.
+- **Multiple versions:** the **newest version is shown**; older versions collapse under an
+  "N older versions · newest shown" disclosure and are not imported.
+- **Footer:** "indexed in place — no files are copied", a running **N selected** count, and
+  **Import as libraries**. Each selected `.unitypackage` becomes **one Library** named by the package
+  (publisher shown as subtitle).
+- **Duplicate check:** during import (and on *Add to Library*), packages whose contents likely overlap
+  an already-indexed pack are flagged — a `⧉ possibly already indexed as “…”` note in the list and a
+  warning toast. Non-blocking; the user decides. Back this with the existing near-duplicate detector
+  (`IDENTIFICATION-AND-SEARCH.md`), matching on normalized package/pack name + content hashes.
+
+### Browse view (one package library)
+
+- **Header:** back-to-libraries, `ls-unitypackage` mark, library name + category badge, mono path,
+  `N assets · size · indexed in place`, and a **Sync** action (re-scan the archive index).
+- **Left rail:** the **surgically-extracted** file tree, grouped by in-archive folder
+  (Prefabs / Models / Textures / Materials / Audio / Scripts), each entry typed with a glyph+colour.
+- **Right pane — per-asset preview** (extracted without unpacking the whole archive):
+  - **3D model** → viewport with tri/vert/material readout (orbit/zoom affordance).
+  - **Texture / material** → checker-backed swatch + dimensions/format.
+  - **Audio** → waveform + play/pause transport + duration.
+  - **Prefab** → resolved object hierarchy tree.
+  - **Script** → line-numbered code peek.
+- **Add to project:** copies **that file plus its resolved dependencies** (materials, textures,
+  referenced meshes) into the open Unity project — resolved from the package's own dependency graph,
+  not the whole archive. Uses the same export/stage path as other libraries (`ENGINE-API.md`).
+- **Add to Library (grid promotion):** *Add to Library* in the preview header pins the package into the
+  sidebar **LIBRARIES** facet list, and its assets are surfaced in the **normal library grid** — same
+  cards, sort, filters, Quick Look, and staging as every other library (no separate viewer once pinned).
+  The *Unity Assets* screen keeps the package **preview/browse** view; *Add to Library* is what makes it
+  a first-class library.
+- **Add all to project (bulk):** when a pinned Unity library is the active grid filter, the toolbar shows
+  a **⇢ Add all N to project** action — copies every asset in the library plus resolved dependencies into
+  the open Unity project in one step.
+
+---
+
 ## Interactions & Behaviour
 
 - **Toggles / segmented controls:** instant state change; honour `prefers-reduced-motion`
@@ -250,6 +315,9 @@ New/changed persisted state (via `config.rs` `AppConfig`, mirroring `ViewPrefs`)
 - `SizeTiers { m_kb, l_kb, xl_kb }` + `cap_kb` — file-size label thresholds and the editable upper
   cap; `cap_kb ≥ xl_kb + 128` (new).
 - `skip_onboarding: bool` — suppress the first-run setup panel on launch (new).
+- Unity package libraries: `Vec<UnityLib { id, name, publisher, category, version, path, asset_count, size }>`
+  — imported `.unitypackage` sources, **indexed in place (no copy)**. Category is auto-detected with a
+  user override; only the newest version of a package is tracked (new — see `DATA-MODEL.md`).
 - On-screen preview quality (`Low|Medium|High`) (new).
 - Per-source `blacklist: Vec<Exclude { kind: Folder|Asset, value: String }>` on the source/import_source
   model (new — see `DATA-MODEL.md` §1).
@@ -290,10 +358,13 @@ Spacing / radius / type: use the existing egui `Style` set in `theme::apply` and
 
 ## Assets / Icons
 
-Icons come from `docs/design/icons/icons.svg` by symbol id (`DESIGN-GUIDELINES.md` §5; preview at
-`docs/design/icons/index.html`). Relevant ids: `ls-nav-settings`, `ls-nav-library`,
-`ls-action-filters` (Filters button), `ls-action-stage`, the status gems, and the type icons.
-Search/project/import ids are named in §5's planned list but not yet drawn. No bitmap assets are
+Icons come from `docs/design/icons.svg` by symbol id (`DESIGN-GUIDELINES.md` §5). Relevant ids:
+`ls-nav-settings`, `ls-nav-library`, `ls-filter` (Filters button), `ls-search`/`ls-search-tags`,
+`ls-project`, `ls-import`, `ls-stage`, the status gems, and the type icons.
+
+**New symbol:** `ls-unitypackage` (added to `icons.svg` + `icons/unitypackage.svg`) — the Unity
+asset-package mark (isometric cube in the standard 24×24 stroke style, `SUCCESS` green). Used for the
+*Unity Libraries* nav item, library cards, and the Add-a-source chooser. No bitmap assets are
 introduced by this work.
 
 ## Files

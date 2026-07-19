@@ -100,6 +100,12 @@ embedded `resource`.
 - **Always pair a viewable preview with a `resource_link`** — the agent reasons over the preview; the
   consumer (engine plugin/export) fetches bytes by path/URI.
 
+> **Desktop MCP settings** (UI-SPEC §16, FEATURES.md §6.5): the app's MCP card exposes a **literal
+> per-tool allow-list** — one toggle per tool in the table above — plus the enable flag, port
+> (default **4319**), and rotating token. Toggling a tool gates it on **both** planes (MCP↔REST 1:1);
+> import/export tools stay per-call confirm regardless. Names in the UI must match this canonical
+> inventory exactly.
+
 Realistic agent loop (into the open editor): *"find low-poly stylized rocks under 5k tris, show the
 top 6, stage the 3 I pick and tag them `level-3`, then import them into my project under `Rocks/`"* →
 `semantic_search` → `get_asset_preview×N` → `stage_asset` → `add_tag` → `import_to_project` →

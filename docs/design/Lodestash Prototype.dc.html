@@ -2531,8 +2531,8 @@ class Component extends DCLogic {
       onRegenToken: () => this.regenMcpToken(),
       mcpCaps: [
         ['allowIdentify', 'identify_asset', 'Let an agent run appraisal on Unidentified files and write back status.'],
-        ['allowTag', 'tag_trait', 'Let an agent apply, promote, and remove traits on your assets.'],
-        ['allowRead', 'search_library', 'Let an agent read the catalog, tags, and metadata (read-only).']
+        ['allowTag', 'add_tag', 'Let an agent apply, promote, and remove traits on your assets.'],
+        ['allowRead', 'search_assets', 'Let an agent read the catalog, tags, and metadata (read-only).']
       ].map(([k, name, desc]) => ({ name, desc, ...tog(mc[k], () => this.setMcp({ [k]: !mc[k] })) }))
     };
   }
