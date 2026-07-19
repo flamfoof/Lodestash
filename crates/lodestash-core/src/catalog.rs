@@ -130,6 +130,7 @@ impl Catalog {
             (4, MIGRATION_04_RATING_PIPELINE),
             (5, MIGRATION_05_UI_SPEC_ALIGNMENT),
             (6, MIGRATION_06_PACKAGE_ENTRIES),
+            (7, MIGRATION_07_PACKAGE_PINNED),
         ];
 
         for (version, sql) in migrations {
@@ -946,13 +947,35 @@ CREATE TABLE IF NOT EXISTS package_entry (
 CREATE INDEX IF NOT EXISTS idx_pkgentry_pkg ON package_entry(package_id);
 ";
 
+/// M7 — Unity Assets library pinning (DATA-MODEL §7, FEATURES.md §5.5): a pinned
+/// package is promoted to a durable sidebar LIBRARIES row; its extracted entries
+/// rehydrate regardless of the global "cache extracted packs" toggle.
+const MIGRATION_07_PACKAGE_PINNED: &str = "
+ALTER TABLE package ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+";
+
 /// A package-extracted asset rehydrated from the catalog (UI "cache extracted packs" toggle).
 #[derive(Debug, Clone)]
 pub struct HydratedExtracted {
     pub package_name: String,
     /// Path inside the extraction workspace (workspace-relative).
     pub workspace_rel: String,
+    /// The owning package's Add-to-Library pin (M7).
+    pub pinned: bool,
     pub asset: HydratedAsset,
+}
+
+/// One `package` row for the Unity Assets screen (DATA-MODEL §7).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackageListing {
+    pub id: i64,
+    pub name: String,
+    pub publisher: Option<String>,
+    pub category: Option<String>,
+    pub package_path: String,
+    pub asset_count: Option<i64>,
+    pub unpacked_at: Option<i64>,
+    pub pinned: bool,
 }
 
 /// One payload's location inside a `.unitypackage` (DATA-MODEL §13 M6; INGESTION §2
@@ -974,7 +997,7 @@ impl Catalog {
             .prepare(
                 "SELECT af.rel_path, a.id, mt.code, af.size_bytes, af.mtime,
                         a.status, a.deleted_at IS NOT NULL, a.rating,
-                        p.name, af.workspace_rel
+                        p.name, af.workspace_rel, p.pinned
                  FROM asset a
                  JOIN asset_file af ON af.id = a.primary_file_id
                  JOIN media_type mt ON mt.id = a.media_type_id
@@ -988,6 +1011,7 @@ impl Catalog {
                 Ok(HydratedExtracted {
                     package_name: r.get(8)?,
                     workspace_rel: r.get(9)?,
+                    pinned: r.get(10)?,
                     asset: HydratedAsset {
                         rel_path: r.get(0)?,
                         asset_id: r.get(1)?,
@@ -1054,6 +1078,46 @@ impl Catalog {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| CoreError::Catalog(format!("pkg entries row: {e}")))
     }
+
+    /// Pin/unpin a package as a sidebar library (M7; FEATURES.md §5.5 Add to Library).
+    pub fn set_package_pinned(&self, package_id: i64, pinned: bool) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE package SET pinned = ?2 WHERE id = ?1",
+                params![package_id, pinned as i64],
+            )
+            .map_err(|e| CoreError::Catalog(format!("package pin: {e}")))?;
+        Ok(())
+    }
+
+    /// Every `package` row, publisher-then-name ordered — the Unity Assets screen's
+    /// listing (DATA-MODEL §7).
+    pub fn list_packages(&self) -> Result<Vec<PackageListing>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, name, publisher, category, package_path,
+                        asset_count, unpacked_at, pinned
+                 FROM package ORDER BY publisher, name",
+            )
+            .map_err(|e| CoreError::Catalog(format!("pkg list prep: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(PackageListing {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    publisher: r.get(2)?,
+                    category: r.get(3)?,
+                    package_path: r.get(4)?,
+                    asset_count: r.get(5)?,
+                    unpacked_at: r.get(6)?,
+                    pinned: r.get(7)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("pkg list query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("pkg list row: {e}")))
+    }
 }
 
 #[cfg(test)]
@@ -1067,7 +1131,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 6, "all 6 migrations should have run");
+        assert_eq!(version, 7, "all 7 migrations should have run");
     }
 
     /// A catalog stopped at schema v4, for exercising M5's data steps.
@@ -1259,6 +1323,20 @@ mod tests {
         assert_eq!(ex[0].package_name, "Pack");
         assert_eq!(ex[0].workspace_rel, "abc123/Rock.fbx");
         assert_eq!(ex[0].asset.rel_path, "Pack/Models/Rock.fbx");
+        assert!(!ex[0].pinned, "packages start unpinned (M7)");
+
+        // M7 pin round-trip: listing + the extracted hydrate both see the flag.
+        c.set_package_pinned(pid, true).expect("pin");
+        let listing = c.list_packages().expect("list");
+        assert_eq!(listing.len(), 1);
+        assert!(listing[0].pinned);
+        assert_eq!(listing[0].name, "Pack");
+        assert!(
+            c.extracted_entries_for_source(sid).expect("extracted")[0].pinned,
+            "pin visible on rehydrated entries"
+        );
+        c.set_package_pinned(pid, false).expect("unpin");
+        assert!(!c.list_packages().expect("list")[0].pinned);
 
         // package_entry offsets round-trip + upsert semantics.
         let entries = vec![

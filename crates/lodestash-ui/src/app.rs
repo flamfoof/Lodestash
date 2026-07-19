@@ -406,6 +406,7 @@ enum Screen {
     Identify,
     Collections,
     Packages,
+    Unity,
     Vocabulary,
     Stats,
     Duplicates,
@@ -414,12 +415,13 @@ enum Screen {
 }
 
 impl Screen {
-    /// Sidebar navigation order (UI-SPEC §0.2).
-    const NAV: [Screen; 9] = [
+    /// Sidebar navigation order (UI-SPEC §0.2 — 10 destinations).
+    const NAV: [Screen; 10] = [
         Screen::Library,
         Screen::Identify,
         Screen::Collections,
         Screen::Packages,
+        Screen::Unity,
         Screen::Vocabulary,
         Screen::Stats,
         Screen::Duplicates,
@@ -433,6 +435,7 @@ impl Screen {
             Screen::Identify => "Identify",
             Screen::Collections => "Collections",
             Screen::Packages => "Packages",
+            Screen::Unity => "Unity Assets",
             Screen::Vocabulary => "Vocabulary",
             Screen::Stats => "Stats",
             Screen::Duplicates => "Duplicates",
@@ -448,6 +451,9 @@ impl Screen {
             Screen::Identify => "\u{2726}",
             Screen::Collections => "\u{27E1}",
             Screen::Packages => "\u{25A4}",
+            // ponytail: Unicode cube stands in for the `ls-unitypackage` SVG until the
+            // sidebar renders vector icons (UI-SPEC §0.2).
+            Screen::Unity => "\u{2B22}",
             Screen::Vocabulary => "\u{2756}",
             Screen::Stats => "\u{25C9}",
             Screen::Duplicates => "\u{29C9}",
@@ -462,6 +468,8 @@ impl Screen {
             Screen::Identify | Screen::Vocabulary => theme::ARCANE_BRIGHT,
             Screen::Duplicates => theme::WARNING,
             Screen::Trash => theme::DANGER,
+            // SUCCESS green per the design's `ls-unitypackage` mark (FEATURES.md §11).
+            Screen::Unity => theme::SUCCESS,
             Screen::Packages | Screen::Stats | Screen::Settings => theme::TEXT_MUTED,
         }
     }
@@ -475,6 +483,9 @@ impl Screen {
             }
             Screen::Collections => "Pinned loadouts \u{2014} stash tabs for your best assets.",
             Screen::Packages => "Everything you own, by publisher and pack.",
+            Screen::Unity => {
+                ".unitypackage libraries \u{2014} indexed in place, surgically extracted on demand."
+            }
             Screen::Vocabulary => {
                 "Traits and the mapping library \u{2014} your canonical tag vocabulary."
             }
@@ -601,6 +612,9 @@ pub struct LodestashApp {
     store_scanned: bool,
     /// Feedback when a user-picked cache folder fails validation.
     store_add_error: Option<String>,
+    /// Unity Assets screen: catalog `package` rows (DATA-MODEL §7), loaded on first
+    /// open and after a pin toggle. `None` until first read.
+    unity_packages: Option<Vec<lodestash_core::catalog::PackageListing>>,
     /// Latest per-status counts read back from the catalog for the open project's
     /// sources (None until the first persist lands). Feeds the health meter + sidebar.
     catalog_counts: Option<StatusCounts>,
@@ -702,6 +716,7 @@ impl LodestashApp {
             nudge_dismissed: false,
             store_roots: Vec::new(),
             store_packages: Vec::new(),
+            unity_packages: None,
             store_scanned: false,
             store_add_error: None,
             catalog_counts: None,
@@ -1561,6 +1576,9 @@ impl LodestashApp {
             if msg.generation != self.scan_generation {
                 continue;
             }
+            // Package rows may have changed (extraction persisted new ones) — let the
+            // Unity Assets screen lazily reload its listing next open.
+            self.unity_packages = None;
             match msg.counts {
                 Some(counts) => self.catalog_counts = Some(counts),
                 // The persist thread already logged the error; surface it honestly.
@@ -2583,6 +2601,172 @@ impl LodestashApp {
         if let Some(idx) = extract_idx {
             self.extract_package(ctx, idx);
         }
+    }
+
+    // ── Unity Assets screen (UI-SPEC §0.2, FEATURES.md §5) ──────────────────────
+
+    /// The `.unitypackage` library manager: catalog `package` rows, each pinnable into
+    /// the sidebar LIBRARIES facet (`package.pinned`, M7). Distinct from Packages (§4,
+    /// the aggregate indexed-asset view). ponytail: this first slice is the listing +
+    /// pin/unpin; the in-screen browse tree + per-asset preview (FEATURES §5.4) reuse
+    /// the pending-packages bar's extraction for now and land as a follow-on.
+    fn unity_screen(&mut self, ui: &mut Ui, _ctx: &egui::Context) {
+        if self.unity_packages.is_none() {
+            self.reload_unity_packages();
+        }
+
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Unity Assets")
+                    .color(theme::TEXT)
+                    .font(crate::fonts::display(24.0)),
+            );
+            if ui
+                .button(RichText::new("\u{27F3} Refresh").size(11.0))
+                .clicked()
+            {
+                self.reload_unity_packages();
+            }
+        });
+        ui.label(
+            RichText::new(
+                "Your .unitypackage libraries \u{2014} indexed in place, surgically extracted on \
+                 demand. Pin a package to keep it as a sidebar library.",
+            )
+            .color(theme::TEXT_MUTED)
+            .size(12.0),
+        );
+        ui.add_space(8.0);
+
+        let packages = self.unity_packages.clone().unwrap_or_default();
+        if packages.is_empty() {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("\u{2B22}").size(48.0).color(theme::TEXT_DIM));
+                ui.label(
+                    RichText::new("No packages indexed yet")
+                        .color(theme::TEXT)
+                        .size(14.0),
+                );
+                ui.label(
+                    RichText::new(
+                        "Extract a .unitypackage (Packages screen, or drop one in a source \
+                         folder) and it shows up here.",
+                    )
+                    .color(theme::TEXT_DIM)
+                    .size(11.0),
+                );
+            });
+            return;
+        }
+
+        let mut toggle: Option<(i64, bool)> = None;
+        ScrollArea::vertical().show(ui, |ui| {
+            for pkg in &packages {
+                egui::Frame::none()
+                    .fill(theme::SURFACE)
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                    .rounding(4.0)
+                    .inner_margin(egui::Margin::symmetric(10.0, 7.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("\u{2B22}").color(theme::SUCCESS).size(14.0));
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(&pkg.name).color(theme::TEXT).size(13.0));
+                                let sub = match (&pkg.publisher, &pkg.category) {
+                                    (Some(p), Some(c)) => format!("{p} \u{2022} {c}"),
+                                    (Some(p), None) => p.clone(),
+                                    _ => String::new(),
+                                };
+                                if !sub.is_empty() {
+                                    ui.label(RichText::new(sub).color(theme::TEXT_DIM).size(10.0));
+                                }
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let pinned = pkg.pinned;
+                                    let (label, color) = if pinned {
+                                        ("\u{2605} In Libraries \u{00B7} remove", theme::GOLD)
+                                    } else {
+                                        ("\u{2606} Add to Library", theme::TEXT_MUTED)
+                                    };
+                                    if ui
+                                        .button(RichText::new(label).color(color).size(11.0))
+                                        .clicked()
+                                    {
+                                        toggle = Some((pkg.id, !pinned));
+                                    }
+                                    if let Some(n) = pkg.asset_count {
+                                        ui.label(
+                                            RichText::new(format!("{n} assets"))
+                                                .color(theme::TEXT_DIM)
+                                                .size(10.0),
+                                        );
+                                    } else {
+                                        ui.label(
+                                            RichText::new("browsed \u{00B7} not extracted")
+                                                .color(theme::TEXT_DIM)
+                                                .size(10.0),
+                                        );
+                                    }
+                                },
+                            );
+                        });
+                    });
+                ui.add_space(4.0);
+            }
+        });
+
+        if let Some((id, pin)) = toggle {
+            self.set_package_pinned(id, pin);
+        }
+    }
+
+    /// Read the catalog's `package` rows into `unity_packages` (cheap single SELECT).
+    fn reload_unity_packages(&mut self) {
+        let Some(db_path) = catalog_db_path() else {
+            self.unity_packages = Some(Vec::new());
+            return;
+        };
+        match Catalog::open(&db_path).and_then(|c| c.list_packages()) {
+            Ok(list) => self.unity_packages = Some(list),
+            Err(err) => {
+                tracing::warn!(%err, "unity package listing failed");
+                self.unity_packages = Some(Vec::new());
+                self.jobs
+                    .toast("Couldn't read packages from the catalog", Intent::Danger);
+            }
+        }
+    }
+
+    /// Pin/unpin a package (M7). Optimistic in-memory flip + a detached write (the pin
+    /// is a single-row UPDATE; `busy_timeout` covers any overlap with a persist).
+    fn set_package_pinned(&mut self, package_id: i64, pinned: bool) {
+        if let Some(list) = &mut self.unity_packages {
+            if let Some(p) = list.iter_mut().find(|p| p.id == package_id) {
+                p.pinned = pinned;
+                self.jobs.toast(
+                    if pinned {
+                        format!("Pinned {} to Libraries", p.name)
+                    } else {
+                        format!("Removed {} from Libraries", p.name)
+                    },
+                    Intent::Success,
+                );
+            }
+        }
+        let Some(db_path) = catalog_db_path() else {
+            return;
+        };
+        std::thread::spawn(move || {
+            if let Err(err) = Catalog::open(&db_path).and_then(|c| {
+                c.set_package_pinned(package_id, pinned)?;
+                Ok(())
+            }) {
+                tracing::warn!(%err, package_id, "package pin write failed");
+            }
+        });
     }
 
     // ── Trash screen (UI-SPEC §7) ───────────────────────────────────────────────
@@ -4370,6 +4554,10 @@ impl eframe::App for LodestashApp {
                     }
                     Screen::Packages => {
                         self.packages_screen(ui, ctx);
+                        return;
+                    }
+                    Screen::Unity => {
+                        self.unity_screen(ui, ctx);
                         return;
                     }
                     Screen::Trash => {
