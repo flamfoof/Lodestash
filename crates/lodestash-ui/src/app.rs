@@ -539,6 +539,15 @@ pub struct LodestashApp {
     /// Name of the open LibraryProject (if any).
     project_name: Option<String>,
     search: String,
+    /// Read-only catalog connection for Search-by-Tags (FTS5). Separate from the
+    /// single writer (ARCHITECTURE §5) — WAL lets it read committed rows concurrently.
+    /// `None` when no catalog exists yet (search falls back to path substring).
+    search_catalog: Option<Catalog>,
+    /// Asset ids matching the current Tags query via FTS5/BM25, or `None` when the
+    /// query is empty (show everything). Recomputed only when the query text changes.
+    search_hits: Option<std::collections::HashSet<i64>>,
+    /// The query the current `search_hits` were computed for — the recompute guard.
+    search_hits_key: Option<String>,
     active_tab: Category,
     sort_by: SortBy,
     sort_asc: bool,
@@ -675,6 +684,9 @@ impl LodestashApp {
             scan_roots: Vec::new(),
             project_name: None,
             search: String::new(),
+            search_catalog: catalog_db_path().and_then(|p| Catalog::open(&p).ok()),
+            search_hits: None,
+            search_hits_key: None,
             active_tab: Category::All,
             sort_by,
             sort_asc,
@@ -1922,7 +1934,39 @@ impl LodestashApp {
     /// Rebuild the sorted+filtered index cache. Called only when `cache_dirty`.
     /// Selection is preserved by entry, not by grid slot — a filter change must not
     /// silently move the selection onto a different asset.
+    /// Recompute the FTS5 hit set for the current Tags query (Search by Tags, Surface A).
+    /// Guarded by the query text so it runs once per change, not once per rebuild. Falls
+    /// back to `None` (path-substring only) when there's no catalog or the query is empty.
+    fn refresh_search_hits(&mut self) {
+        // Membership filter, not ranked retrieval — a high cap so a broad query keeps every
+        // match (the grid re-scopes by source/tab/folder afterwards).
+        const HIT_CAP: usize = 100_000;
+        let key = match self.search_mode {
+            SearchMode::Tags if !self.search.trim().is_empty() => Some(self.search.to_lowercase()),
+            _ => None,
+        };
+        if key == self.search_hits_key {
+            return;
+        }
+        self.search_hits_key = key.clone();
+        // Lazily open the read connection: on a fresh install the catalog doesn't exist
+        // at startup, but the first scan creates it — pick it up on the first query rather
+        // than needing a restart.
+        if key.is_some() && self.search_catalog.is_none() {
+            self.search_catalog = catalog_db_path().and_then(|p| Catalog::open(&p).ok());
+        }
+        self.search_hits = match (&key, &self.search_catalog) {
+            (Some(q), Some(cat)) => cat
+                .search_assets(q, HIT_CAP)
+                .ok()
+                .flatten()
+                .map(|ids| ids.into_iter().collect()),
+            _ => None,
+        };
+    }
+
     fn rebuild_cache(&mut self) {
+        self.refresh_search_hits();
         let selected_entry = self
             .selected_cache_idx
             .and_then(|ci| self.sorted_cache.get(ci).copied());
@@ -1934,13 +1978,26 @@ impl LodestashApp {
         };
         let tab = self.active_tab;
 
+        // Search by Tags (IDENTIFICATION-AND-SEARCH §5.A): catalogued entries match through
+        // the FTS5 index (name/tags/description, prefix-tokenised); path substring is kept as
+        // a union so uncatalogued entries (pre-persist / just-extracted) and mid-word matches
+        // still work — nothing that matched before stops matching. BM25 relevance ordering
+        // becomes a sort option in a later slice.
+        let hits = self.search_hits.as_ref();
         let name_matches = |e: &AssetEntry| {
-            q.is_empty()
-                || e.file
-                    .rel_path
-                    .to_string_lossy()
-                    .to_lowercase()
-                    .contains(&q)
+            if q.is_empty() {
+                return true;
+            }
+            if let (Some(hits), Some(id)) = (hits, e.asset_id) {
+                if hits.contains(&id) {
+                    return true;
+                }
+            }
+            e.file
+                .rel_path
+                .to_string_lossy()
+                .to_lowercase()
+                .contains(&q)
         };
 
         let (mut idxs, tiles): (Vec<usize>, Vec<(String, usize)>) =
