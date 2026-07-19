@@ -2,7 +2,7 @@
 //! Spec: DESIGN-GUIDELINES.md §4, §7, §9; ARCHITECTURE.md §6.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,6 +17,7 @@ use lodestash_ingest::crawler::{self, CrawledFile};
 use lodestash_ingest::{detect, thumb, unitypackage};
 
 use crate::config::{self, AppConfig, SizeTier, SizeTiers, SortBy, ViewMode};
+use crate::jobs::{Intent, JobProgress, Jobs};
 use crate::theme;
 use crate::viewport3d::{self, Viewport3d};
 
@@ -95,26 +96,6 @@ struct ScanDone {
     pending_packages: Vec<PendingPackage>,
 }
 
-/// A `.unitypackage` found while crawling, not yet extracted into the grid. Its manifest is
-/// already resolved (read on the same background crawl thread) so the UI can offer an "Extract"
-/// action immediately, with no separate loading step.
-/// Shared byte-progress of a running extraction (written by the worker, read by the UI).
-#[derive(Default)]
-struct ExtractProgress {
-    done: AtomicU64,
-    total: AtomicU64,
-}
-
-impl ExtractProgress {
-    fn fraction(&self) -> f32 {
-        let total = self.total.load(Ordering::Relaxed);
-        if total == 0 {
-            return 0.0;
-        }
-        (self.done.load(Ordering::Relaxed) as f32 / total as f32).clamp(0.0, 1.0)
-    }
-}
-
 /// Sidebar LIBRARIES facet selection: a source root, or one extracted package.
 #[derive(Clone, PartialEq)]
 enum LibraryFilter {
@@ -122,6 +103,9 @@ enum LibraryFilter {
     Package(String),
 }
 
+/// A `.unitypackage` found while crawling, not yet extracted into the grid. Its manifest is
+/// already resolved (read on the same background crawl thread) so the UI can offer an "Extract"
+/// action immediately, with no separate loading step.
 struct PendingPackage {
     source_idx: usize,
     abs_path: PathBuf,
@@ -133,11 +117,13 @@ struct PendingPackage {
     /// Index into `nested_candidates`, defaulted to the URP variant when one exists.
     chosen_variant: usize,
     extracting: bool,
-    progress: Arc<ExtractProgress>,
+    progress: Arc<JobProgress>,
     /// Manifest locators (guid/pathname/tar-offset/size) captured at browse time —
     /// persisted as `package_entry` rows on extraction so surgical re-extraction never
     /// needs a second full scan (DATA-MODEL §7, INGESTION §2).
     entries: Vec<PackageEntryRecord>,
+    /// Tray row of the running extraction (full or surgical), if any.
+    job: Option<u64>,
     /// Contents list expanded under the package row (pick-and-extract).
     browsing: bool,
     /// Indices into `entries` picked for surgical extraction.
@@ -645,6 +631,10 @@ pub struct LodestashApp {
     /// Show the first-run onboarding modal over the (dimmed) library. Design §1; suppressed by
     /// `config.skip_onboarding`.
     onboarding_open: bool,
+    /// Job tray + toasts (DESIGN-GUIDELINES §7, UI-SPEC §18).
+    jobs: Jobs,
+    /// The running scan's tray row, finished/cancelled on ScanDone or generation bump.
+    scan_job: Option<u64>,
 }
 
 impl LodestashApp {
@@ -739,6 +729,8 @@ impl LodestashApp {
             expanded_source: None,
             blacklist_input: String::new(),
             onboarding_open: show_onboarding,
+            jobs: Jobs::default(),
+            scan_job: None,
             config,
         };
 
@@ -876,6 +868,16 @@ impl LodestashApp {
 
         self.scan_generation += 1;
         self.scanning = true;
+        // Tray row (indeterminate — the crawl has no cheap total). A superseded scan's
+        // row is finished here; its late ScanDone is dropped by the generation guard.
+        if let Some(id) = self.scan_job.take() {
+            self.jobs.finish(id);
+        }
+        let scan_label = match self.scan_roots.len() {
+            1 => format!("Scanning {}", config::stem_name(&self.scan_roots[0])),
+            n => format!("Scanning {n} sources"),
+        };
+        self.scan_job = Some(self.jobs.start(scan_label, Arc::default(), true));
         let generation = self.scan_generation;
         let tx = self.scan_tx.clone();
         std::thread::spawn(move || {
@@ -1053,6 +1055,13 @@ impl LodestashApp {
                 continue; // stale scan from a superseded load
             }
             self.scanning = false;
+            if let Some(id) = self.scan_job.take() {
+                self.jobs.finish(id);
+            }
+            self.jobs.toast(
+                format!("Scan complete — {} assets", msg.entries.len()),
+                Intent::Success,
+            );
             // Carry catalog identity over from the outgoing entries (a hydrate or an
             // earlier read-back) so trashed/identified state doesn't flash back to
             // defaults between the crawl landing and the next persist read-back.
@@ -1552,8 +1561,13 @@ impl LodestashApp {
             if msg.generation != self.scan_generation {
                 continue;
             }
-            if let Some(counts) = msg.counts {
-                self.catalog_counts = Some(counts);
+            match msg.counts {
+                Some(counts) => self.catalog_counts = Some(counts),
+                // The persist thread already logged the error; surface it honestly.
+                None => self.jobs.toast(
+                    "Catalog sync failed — changes not persisted",
+                    Intent::Danger,
+                ),
             }
             if msg.assets.is_empty() {
                 continue;
@@ -1605,7 +1619,7 @@ impl LodestashApp {
         pkg.extracting = true;
         pkg.progress = Arc::default();
         let progress = pkg.progress.clone();
-
+        let job_label = format!("Extracting {}", pkg.display_name);
         let abs_path = pkg.abs_path.clone();
         let source_idx = pkg.source_idx;
         let display_name = pkg.display_name.clone();
@@ -1614,6 +1628,7 @@ impl LodestashApp {
             .get(pkg.chosen_variant)
             .map(|(_, pathname)| pathname.clone());
         let entries = pkg.entries.clone();
+        pkg.job = Some(self.jobs.start(job_label, progress.clone(), true));
         let tx = self.extract_tx.clone();
 
         std::thread::spawn(move || {
@@ -1668,6 +1683,17 @@ impl LodestashApp {
         let source_idx = pkg.source_idx;
         let display_name = pkg.display_name.clone();
         let entries = pkg.entries.clone();
+        // Indeterminate row: the skip-scan reports no byte progress, and it can't stop
+        // mid-payload — not cancellable.
+        pkg.job = Some(self.jobs.start(
+            format!(
+                "Extracting {} assets from {}",
+                locators.len(),
+                pkg.display_name
+            ),
+            Arc::default(),
+            false,
+        ));
         let tx = self.extract_tx.clone();
 
         std::thread::spawn(move || {
@@ -1697,8 +1723,39 @@ impl LodestashApp {
             done.push(msg);
         }
         for msg in done {
-            if msg.partial {
-                // Surgical pull: the card stays armed for further picks.
+            let mut cancelled = false;
+            if let Some(pkg) = self
+                .pending_packages
+                .iter_mut()
+                .find(|p| p.abs_path == msg.abs_path)
+            {
+                cancelled = pkg.progress.is_cancelled();
+                if let Some(id) = pkg.job.take() {
+                    self.jobs.finish(id);
+                }
+            }
+            if cancelled {
+                self.jobs.toast(
+                    format!("Extraction cancelled — {}", msg.display_name),
+                    Intent::Info,
+                );
+            } else if msg.files.is_empty() {
+                self.jobs.toast(
+                    format!("Extraction produced no assets — {}", msg.display_name),
+                    Intent::Warning,
+                );
+            } else {
+                self.jobs.toast(
+                    format!(
+                        "Extracted {} assets from {}",
+                        msg.files.len(),
+                        msg.display_name
+                    ),
+                    Intent::Success,
+                );
+            }
+            if msg.partial || cancelled {
+                // Surgical pull (or an aborted full extract): the card stays armed.
                 if let Some(pkg) = self
                     .pending_packages
                     .iter_mut()
@@ -1728,6 +1785,111 @@ impl LodestashApp {
             self.recompute_tab_counts();
             self.cache_dirty = true;
         }
+    }
+
+    /// Bottom job tray (DESIGN-GUIDELINES §7 "Jobs / progress"): one row per running
+    /// job — gold progress bar (or spinner when the total is unknown), ✕ where
+    /// cooperative cancel is wired, a brief ✓ flash when done.
+    fn jobs_tray(&mut self, ctx: &egui::Context) {
+        if self.jobs.jobs.is_empty() {
+            return;
+        }
+        egui::TopBottomPanel::bottom("jobs_tray")
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::SURFACE)
+                    .inner_margin(egui::Margin::symmetric(12.0, 5.0))
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+            )
+            .show(ctx, |ui| {
+                for job in &self.jobs.jobs {
+                    ui.horizontal(|ui| {
+                        if job.finished.is_some() {
+                            ui.label(RichText::new("\u{2713}").color(theme::SUCCESS).size(11.0));
+                            ui.label(RichText::new(&job.label).color(theme::TEXT_DIM).size(11.0));
+                            return;
+                        }
+                        let total = job.progress.total.load(Ordering::Relaxed);
+                        if total == 0 {
+                            ui.add(egui::Spinner::new().size(12.0));
+                        } else {
+                            ui.add(
+                                egui::ProgressBar::new(job.progress.fraction())
+                                    .desired_width(120.0)
+                                    .desired_height(10.0)
+                                    .fill(theme::GOLD),
+                            );
+                        }
+                        ui.label(
+                            RichText::new(&job.label)
+                                .color(theme::TEXT_MUTED)
+                                .size(11.0),
+                        );
+                        if job.progress.is_cancelled() {
+                            ui.label(
+                                RichText::new("cancelling\u{2026}")
+                                    .color(theme::TEXT_DIM)
+                                    .size(10.0),
+                            );
+                        } else if job.cancellable
+                            && ui
+                                .add(
+                                    egui::Button::new(RichText::new("\u{2715}").size(10.0)).small(),
+                                )
+                                .on_hover_text("Cancel")
+                                .clicked()
+                        {
+                            job.progress.cancelled.store(true, Ordering::Relaxed);
+                        }
+                    });
+                }
+            });
+    }
+
+    /// Bottom-right toast stack (UI-SPEC §18): overlay fill, 3px intent accent, ~3.2s.
+    fn toasts_overlay(&self, ctx: &egui::Context) {
+        if self.jobs.toasts.is_empty() {
+            return;
+        }
+        egui::Area::new(egui::Id::new("toasts"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -16.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                for toast in &self.jobs.toasts {
+                    let accent = match toast.intent {
+                        Intent::Success => theme::SUCCESS,
+                        Intent::Warning => theme::WARNING,
+                        Intent::Danger => theme::DANGER,
+                        Intent::Info => theme::TYPE_IMAGE,
+                    };
+                    let resp = egui::Frame::none()
+                        .fill(theme::OVERLAY)
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER_STRONG))
+                        .rounding(4.0)
+                        .inner_margin(egui::Margin {
+                            left: 12.0,
+                            right: 10.0,
+                            top: 6.0,
+                            bottom: 6.0,
+                        })
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(&toast.text).color(theme::TEXT).size(11.5));
+                        })
+                        .response;
+                    // The 3px intent accent along the frame's left edge.
+                    let r = resp.rect;
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_max(r.min, egui::pos2(r.min.x + 3.0, r.max.y)),
+                        egui::Rounding {
+                            nw: 4.0,
+                            sw: 4.0,
+                            ..Default::default()
+                        },
+                        accent,
+                    );
+                    ui.add_space(6.0);
+                }
+            });
     }
 
     fn receive_thumbnails(&mut self) {
@@ -3167,6 +3329,23 @@ impl eframe::App for LodestashApp {
         self.receive_extracts();
         self.receive_catalog();
         self.receive_viewer(ctx);
+        // Tray ✕ on the scan row: the crawl thread finishes harmlessly (read-only) and
+        // its ScanDone is dropped by the generation guard — semantically a cancel.
+        if let Some(id) = self.scan_job {
+            let cancelled = self
+                .jobs
+                .jobs
+                .iter()
+                .any(|j| j.id == id && j.progress.is_cancelled());
+            if cancelled && self.scanning {
+                self.scanning = false;
+                self.scan_generation += 1;
+                self.scan_job = None;
+                self.jobs.finish(id);
+                self.jobs.toast("Scan cancelled", Intent::Info);
+            }
+        }
+        self.jobs.prune();
         if self.pending_packages.iter().any(|p| p.extracting) {
             // Keep the extraction progress bar moving without input events.
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -3182,6 +3361,10 @@ impl eframe::App for LodestashApp {
         // extra frames during resize events.
         if self.pending_thumbs > 0 || self.scanning || self.catalog_persisting {
             ctx.request_repaint_after(Duration::from_millis(33));
+        }
+        // Job-tray rows and toast expiry need clock ticks, not input events.
+        if self.jobs.any_active() {
+            ctx.request_repaint_after(Duration::from_millis(200));
         }
 
         if self.cache_dirty {
@@ -3833,6 +4016,10 @@ impl eframe::App for LodestashApp {
                     });
                 });
         }
+
+        // ── Job tray + toasts (DESIGN-GUIDELINES §7, UI-SPEC §18) ─────────────
+        self.jobs_tray(ctx);
+        self.toasts_overlay(ctx);
 
         // ── Pending packages bar ────────────────────────────────────────────────
         // .unitypackage files found while crawling — shown here rather than as opaque grid
@@ -4838,6 +5025,7 @@ fn resolve_pending_package(source_idx: usize, file: &CrawledFile) -> Option<Pend
         extracting: false,
         progress: Arc::default(),
         entries,
+        job: None,
         browsing: false,
         picked: std::collections::BTreeSet::new(),
     })
@@ -4856,11 +5044,13 @@ fn extract_package_contents(
     workspace_dir: &std::path::Path,
     nested_pathname: Option<&str>,
     display_name: &str,
-    progress: &ExtractProgress,
+    progress: &JobProgress,
 ) -> Vec<CrawledFile> {
     let report = |done: u64, total: u64| {
         progress.done.store(done, Ordering::Relaxed);
         progress.total.store(total, Ordering::Relaxed);
+        // false stops the extractor at the next read (tray ✕ — cooperative cancel).
+        !progress.is_cancelled()
     };
     let Ok(outer) = unitypackage::extract_to_workspace_with_progress(path, workspace_dir, &report)
     else {
@@ -7023,7 +7213,7 @@ mod tests {
             &workspace,
             Some(&nested_pathname),
             &pkg.display_name,
-            &ExtractProgress::default(),
+            &JobProgress::default(),
         );
 
         assert_eq!(files.len(), 1);

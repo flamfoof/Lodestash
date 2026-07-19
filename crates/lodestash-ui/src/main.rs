@@ -4,6 +4,7 @@
 mod app;
 mod config;
 mod fonts;
+mod jobs;
 mod theme;
 mod viewport3d;
 

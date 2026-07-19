@@ -184,19 +184,23 @@ pub struct ExtractedAsset {
     pub size_bytes: u64,
 }
 
-/// Wraps a reader and reports cumulative bytes read after every chunk.
+/// Wraps a reader and reports cumulative bytes read after every chunk. The callback
+/// returns `false` to abort the extraction (cooperative cancel): the read errors with
+/// `ErrorKind::Interrupted`... which `io` retries — so `Other` is used instead.
 struct ProgressReader<'a, R> {
     inner: R,
     read: u64,
     total: u64,
-    on_progress: &'a (dyn Fn(u64, u64) + Sync),
+    on_progress: &'a (dyn Fn(u64, u64) -> bool + Sync),
 }
 
 impl<R: Read> Read for ProgressReader<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
         self.read += n as u64;
-        (self.on_progress)(self.read, self.total);
+        if !(self.on_progress)(self.read, self.total) {
+            return Err(io::Error::other("extraction cancelled"));
+        }
         Ok(n)
     }
 }
@@ -205,16 +209,18 @@ impl<R: Read> Read for ProgressReader<'_, R> {
 /// Content-addressed and idempotent — if the destination already exists (same bytes, same hash),
 /// the freshly-extracted temp copy is discarded rather than rewritten.
 pub fn extract_to_workspace(path: &Path, dest: &Path) -> io::Result<Vec<ExtractedAsset>> {
-    extract_to_workspace_with_progress(path, dest, &|_, _| {})
+    extract_to_workspace_with_progress(path, dest, &|_, _| true)
 }
 
 /// [`extract_to_workspace`] with byte-level progress: `on_progress(read, total)` is called with
 /// **compressed** bytes consumed vs. the archive's file size — accurate activity even when the
-/// entry count isn't known upfront (streamed tar).
+/// entry count isn't known upfront (streamed tar). Return `false` to cancel: extraction
+/// stops at the next read and errors out (already-placed payloads stay — idempotent re-runs
+/// skip them by content hash).
 pub fn extract_to_workspace_with_progress(
     path: &Path,
     dest: &Path,
-    on_progress: &(dyn Fn(u64, u64) + Sync),
+    on_progress: &(dyn Fn(u64, u64) -> bool + Sync),
 ) -> io::Result<Vec<ExtractedAsset>> {
     let tmp_dir = dest.join(".tmp");
     std::fs::create_dir_all(&tmp_dir)?;
