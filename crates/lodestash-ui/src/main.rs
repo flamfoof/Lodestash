@@ -2,6 +2,7 @@
 //! Spec: ARCHITECTURE.md §6, DESIGN-GUIDELINES.md.
 
 mod app;
+mod audio;
 mod config;
 mod fonts;
 mod jobs;

@@ -16,6 +16,7 @@ use lodestash_ingest::asset_store::{self, AssetStorePackage};
 use lodestash_ingest::crawler::{self, CrawledFile};
 use lodestash_ingest::{detect, thumb, unitypackage};
 
+use crate::audio::AudioPlayer;
 use crate::config::{self, AppConfig, SizeTier, SizeTiers, SortBy, ViewMode};
 use crate::jobs::{Intent, JobProgress, Jobs};
 use crate::theme;
@@ -640,6 +641,8 @@ pub struct LodestashApp {
     viewer_tx: Sender<ViewerLoaded>,
     /// Quick Look 3D orbit viewport (issue #29 item 3) — None if GL context handoff failed.
     viewport3d: Option<Viewport3d>,
+    /// Quick Look audio player — None if no audio output device is available.
+    audio_player: Option<AudioPlayer>,
     /// Faint background radial gradients (UI-SPEC §0): gold top-right, arcane bottom-left.
     bg_gold: Option<TextureHandle>,
     bg_arcane: Option<TextureHandle>,
@@ -742,6 +745,7 @@ impl LodestashApp {
             viewer_rx,
             viewer_tx,
             viewport3d: cc.gl.clone().and_then(Viewport3d::new),
+            audio_player: AudioPlayer::new(),
             bg_gold: Some(cc.egui_ctx.load_texture(
                 "bg_radial_gold",
                 radial_image(theme::GOLD, 15), // rgba(231,183,101,.06)
@@ -1496,6 +1500,12 @@ impl LodestashApp {
                     vp.clear();
                 }
             }
+            // Stop audio + free its waveform.
+            if let Some(ap) = &mut self.audio_player {
+                if ap.entry_idx.is_some() {
+                    ap.clear();
+                }
+            }
             return;
         }
         let Some(&entry_idx) = self
@@ -1543,6 +1553,16 @@ impl LodestashApp {
             if let Some(vp) = &mut self.viewport3d {
                 if vp.entry_idx != Some(entry_idx) {
                     vp.load(entry_idx, path, tex_files, ctx);
+                }
+            }
+            return;
+        }
+        // Audio branch — decode the waveform on a worker thread, like the image branch.
+        if entry.file.media_type == Some(MediaType::Audio) {
+            let path = entry.file.abs_path.clone();
+            if let Some(ap) = &mut self.audio_player {
+                if ap.entry_idx != Some(entry_idx) {
+                    ap.load(entry_idx, path, ctx);
                 }
             }
             return;
@@ -3641,6 +3661,13 @@ impl eframe::App for LodestashApp {
         if let Some(vp) = &mut self.viewport3d {
             vp.poll();
         }
+        if let Some(ap) = &mut self.audio_player {
+            ap.poll();
+            // Keep the playhead moving while a clip plays (no input events otherwise).
+            if ap.is_playing() {
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+        }
         self.ensure_viewer_loaded(ctx);
 
         // While a scan, thumbnails, or a catalog persist are in flight, wake up at
@@ -4889,6 +4916,7 @@ impl eframe::App for LodestashApp {
                         let mut open = self.quick_look;
                         let viewer = &mut self.image_viewer;
                         let viewport = self.viewport3d.as_mut();
+                        let audio = self.audio_player.as_mut();
                         egui::Window::new("Quick Look")
                             .id(egui::Id::new("quick_look"))
                             .open(&mut open)
@@ -4911,6 +4939,7 @@ impl eframe::App for LodestashApp {
                                     viewer,
                                     direct_model,
                                     viewport,
+                                    audio,
                                 );
                             });
                         self.quick_look = open;
@@ -6794,9 +6823,11 @@ fn quick_look_content(
     viewer: &mut ImageViewer,
     direct_model: bool,
     viewport: Option<&mut Viewport3d>,
+    audio: Option<&mut AudioPlayer>,
 ) {
     let is_image = is_viewer_image(media_type);
     let is_model = direct_model && viewport.is_some();
+    let is_audio = media_type == Some(MediaType::Audio) && audio.is_some();
 
     // Toolbar (image assets only): Fit / 1:1 / pixel-perfect toggle / zoom readout.
     if is_image {
@@ -6949,9 +6980,94 @@ fn quick_look_content(
                 );
             }
         }
+    } else if is_audio {
+        // Audio: transport row + peak waveform with a click-to-seek playhead.
+        let ap = audio.expect("is_audio implies audio");
+        let dur = ap.meta.as_ref().map_or(0.0, |m| m.duration);
+        ui.horizontal(|ui| {
+            let label = if ap.is_playing() {
+                "\u{23F8} Pause"
+            } else {
+                "\u{25B6} Play"
+            };
+            if ui
+                .add(egui::Button::new(RichText::new(label).size(12.0)))
+                .clicked()
+            {
+                ap.toggle();
+            }
+            ui.label(
+                RichText::new(format!(
+                    "{} / {}",
+                    crate::audio::fmt_time(ap.position()),
+                    crate::audio::fmt_time(dur)
+                ))
+                .monospace()
+                .color(theme::TEXT_DIM)
+                .size(11.0),
+            );
+            // Sample-rate / channels stat facets (DESIGN-GUIDELINES §7).
+            if let Some(meta) = &ap.meta {
+                let chans = match meta.channels {
+                    1 => "mono".to_string(),
+                    2 => "stereo".to_string(),
+                    n => format!("{n} ch"),
+                };
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{:.1} kHz \u{2022} {chans}",
+                            meta.sample_rate as f32 / 1000.0
+                        ))
+                        .color(theme::TEXT_DIM)
+                        .size(10.0),
+                    );
+                });
+            }
+        });
+        ui.add_space(4.0);
+
+        let wave = Vec2::new(canvas.x, (canvas.y - 40.0).max(64.0));
+        let (resp, painter) = ui.allocate_painter(wave, egui::Sense::click());
+        painter.rect_filled(resp.rect, 4.0, theme::BG);
+        if let Some(meta) = &ap.meta {
+            draw_waveform(
+                &painter,
+                resp.rect,
+                &meta.peaks,
+                ap.position(),
+                meta.duration,
+            );
+            if resp.clicked() {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let frac = ((p.x - resp.rect.left()) / resp.rect.width()).clamp(0.0, 1.0);
+                    ap.seek(frac * meta.duration);
+                }
+            }
+        } else {
+            let (msg, color) = if ap.loading {
+                (
+                    "\u{25CC} decoding waveform\u{2026}".to_string(),
+                    theme::ARCANE,
+                )
+            } else if let Some(err) = &ap.error {
+                (format!("\u{2298} couldn't decode: {err}"), theme::DANGER)
+            } else {
+                (String::new(), theme::TEXT_DIM)
+            };
+            if !msg.is_empty() {
+                painter.text(
+                    resp.rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    msg,
+                    egui::FontId::proportional(11.0),
+                    color,
+                );
+            }
+        }
     } else {
-        // Non-image assets keep the typed placeholder card (audio arrives per
-        // issue #29; FBX models render once the normalize→glTF cache lands).
+        // Remaining non-previewable types keep the typed placeholder card
+        // (sprite sheets / material spheres / font specimens arrive per issue #29).
         let preview_size = canvas.min_elem().max(64.0);
         ui.vertical_centered(|ui| {
             if let Some(tex) = thumb {
@@ -6995,6 +7111,8 @@ fn quick_look_content(
                 "scroll zoom \u{2022} drag pan \u{2022} double-click fit \u{2022} \u{2190}\u{2192} navigate \u{2022} Esc close"
             } else if is_model {
                 "drag orbit \u{2022} right-drag pan \u{2022} scroll zoom \u{2022} double-click reframe \u{2022} Esc close"
+            } else if is_audio {
+                "\u{25B6} play/pause \u{2022} click waveform to seek \u{2022} \u{2190}\u{2192} navigate \u{2022} Esc close"
             } else {
                 "Space / Esc \u{2192} close  \u{2022}  \u{2190}\u{2192} navigate"
             })
@@ -7002,6 +7120,40 @@ fn quick_look_content(
             .size(10.0),
         );
     });
+}
+
+/// Paint a peak waveform in `rect`: centered vertical bars, the played portion in the
+/// bright sound token and the rest dimmed, plus a playhead line at `pos/dur`.
+fn draw_waveform(painter: &egui::Painter, rect: egui::Rect, peaks: &[f32], pos: f32, dur: f32) {
+    if peaks.is_empty() {
+        return;
+    }
+    let played = theme::TYPE_SOUND;
+    let ahead = theme::TYPE_SOUND.linear_multiply(0.35);
+    let mid = rect.center().y;
+    let half = rect.height() * 0.45;
+    let n = peaks.len();
+    let play_frac = if dur > 0.0 {
+        (pos / dur).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    for (i, &p) in peaks.iter().enumerate() {
+        let frac = (i as f32 + 0.5) / n as f32;
+        let x = rect.left() + frac * rect.width();
+        let h = (p * half).max(1.0);
+        let color = if frac <= play_frac { played } else { ahead };
+        painter.line_segment(
+            [egui::pos2(x, mid - h), egui::pos2(x, mid + h)],
+            egui::Stroke::new(1.0, color),
+        );
+    }
+    // Playhead.
+    let px = rect.left() + play_frac * rect.width();
+    painter.line_segment(
+        [egui::pos2(px, rect.top()), egui::pos2(px, rect.bottom())],
+        egui::Stroke::new(1.0, theme::GOLD),
+    );
 }
 
 fn type_label_char(mt: Option<MediaType>) -> &'static str {

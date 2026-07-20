@@ -63,6 +63,8 @@ dirs   = "5"
 # upgrade the two together — TECH-STACK §7). default-features off: no window/glutin.
 three-d       = { version = "0.18.2", default-features = false }
 three-d-asset = { version = "0.9", features = ["gltf", "obj", "png", "jpeg", "tga"] }
+# Audio playback + decode (rodio bundles symphonia): wav/flac/vorbis/mp3.
+rodio = "0.20"
 
 # Testing
 tempfile = "3"

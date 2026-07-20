@@ -1,0 +1,270 @@
+//! Quick Look audio player — rodio playback + a peak waveform (DESIGN-GUIDELINES §7,
+//! INGESTION.md viewers; TECH-STACK §2 "Audio"). rodio bundles symphonia, so one crate
+//! both decodes for the waveform and streams playback.
+//!
+//! Lifecycle mirrors `ImageViewer`/`Viewport3d`: the waveform decodes on a background
+//! thread; playback (the rodio `OutputStream`/`Sink`, which are `!Send`) lives on the UI
+//! thread. Buffers free when Quick Look closes (`clear`).
+
+use std::fs::File;
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
+use std::time::Duration;
+
+use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
+
+/// Bars in the rendered waveform (fixed resolution regardless of clip length).
+const WAVEFORM_BARS: usize = 256;
+
+/// Decoded waveform + basic audio facts for the stat line.
+pub struct AudioMeta {
+    /// Per-bar peak magnitude, normalised to `0.0..=1.0` by the loudest bar.
+    pub peaks: Vec<f32>,
+    pub duration: f32,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+/// Decode `path` into a `bars`-resolution peak waveform. ponytail: full-decodes into a
+/// mono buffer — game audio is short (SFX/loops), and even a multi-minute track is only
+/// tens of MB; revisit with streaming peaks if long-form audio shows up.
+pub fn load_waveform(path: &Path, bars: usize) -> Result<AudioMeta, String> {
+    let file = File::open(path).map_err(|e| e.to_string())?;
+    let dec = Decoder::new(BufReader::new(file)).map_err(|e| e.to_string())?;
+    let channels = dec.channels().max(1);
+    let sample_rate = dec.sample_rate().max(1);
+
+    let samples: Vec<f32> = dec.convert_samples::<f32>().collect();
+    let frames = samples.len() / channels as usize;
+    if frames == 0 {
+        return Err("no audio samples".into());
+    }
+    let duration = frames as f32 / sample_rate as f32;
+
+    let bars = bars.max(1);
+    let mut peaks = vec![0.0f32; bars];
+    for (i, frame) in samples.chunks(channels as usize).enumerate() {
+        // Downmix to a single magnitude by taking the loudest channel of the frame.
+        let mag = frame.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let b = ((i * bars) / frames).min(bars - 1);
+        if mag > peaks[b] {
+            peaks[b] = mag;
+        }
+    }
+    let max = peaks.iter().copied().fold(0.0f32, f32::max);
+    if max > 0.0 {
+        for p in &mut peaks {
+            *p /= max;
+        }
+    }
+    Ok(AudioMeta {
+        peaks,
+        duration,
+        sample_rate,
+        channels,
+    })
+}
+
+/// The Quick Look audio player: async waveform load + rodio transport.
+pub struct AudioPlayer {
+    // Kept alive for the stream's lifetime; dropping it silences output.
+    _stream: OutputStream,
+    handle: OutputStreamHandle,
+    sink: Option<Sink>,
+    pub entry_idx: Option<usize>,
+    path: Option<PathBuf>,
+    pub meta: Option<AudioMeta>,
+    pub loading: bool,
+    pub error: Option<String>,
+    rx: Option<Receiver<Result<AudioMeta, String>>>,
+}
+
+impl AudioPlayer {
+    /// `None` if no audio output device is available (headless / no sound card).
+    pub fn new() -> Option<Self> {
+        let (stream, handle) = OutputStream::try_default()
+            .map_err(|e| tracing::warn!("audio unavailable: {e}"))
+            .ok()?;
+        Some(Self {
+            _stream: stream,
+            handle,
+            sink: None,
+            entry_idx: None,
+            path: None,
+            meta: None,
+            loading: false,
+            error: None,
+            rx: None,
+        })
+    }
+
+    /// Load `path`'s waveform on a worker thread, stopping any current playback.
+    pub fn load(&mut self, entry_idx: usize, path: PathBuf, egui_ctx: &egui::Context) {
+        self.stop();
+        self.entry_idx = Some(entry_idx);
+        self.path = Some(path.clone());
+        self.meta = None;
+        self.error = None;
+        self.loading = true;
+
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        let egui_ctx = egui_ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(load_waveform(&path, WAVEFORM_BARS));
+            egui_ctx.request_repaint();
+        });
+    }
+
+    /// Drain a finished waveform decode.
+    pub fn poll(&mut self) {
+        let Some(rx) = &self.rx else { return };
+        let Ok(result) = rx.try_recv() else { return };
+        self.rx = None;
+        self.loading = false;
+        match result {
+            Ok(meta) => self.meta = Some(meta),
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    /// Stop playback and drop everything (Quick Look closed / navigated away).
+    pub fn clear(&mut self) {
+        self.stop();
+        self.entry_idx = None;
+        self.path = None;
+        self.meta = None;
+        self.error = None;
+        self.loading = false;
+        self.rx = None;
+    }
+
+    fn stop(&mut self) {
+        if let Some(sink) = self.sink.take() {
+            sink.stop();
+        }
+    }
+
+    /// Play/pause. Restarts from the beginning if the clip has finished (or never started).
+    pub fn toggle(&mut self) {
+        match &self.sink {
+            Some(sink) if !sink.empty() => {
+                if sink.is_paused() {
+                    sink.play();
+                } else {
+                    sink.pause();
+                }
+            }
+            _ => self.start(),
+        }
+    }
+
+    fn start(&mut self) {
+        let Some(path) = &self.path else { return };
+        let decode = File::open(path)
+            .map_err(|e| e.to_string())
+            .and_then(|f| Decoder::new(BufReader::new(f)).map_err(|e| e.to_string()));
+        match decode.and_then(|dec| {
+            let sink = Sink::try_new(&self.handle).map_err(|e| e.to_string())?;
+            sink.append(dec);
+            Ok(sink)
+        }) {
+            Ok(sink) => self.sink = Some(sink),
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    /// Seek to `secs`; if the clip already finished, restart then seek.
+    pub fn seek(&mut self, secs: f32) {
+        let secs = secs.max(0.0);
+        if self.sink.as_ref().map_or(true, |s| s.empty()) {
+            self.start();
+            // A fresh sink plays; pause so a seek-scrub doesn't blast audio unexpectedly.
+            if let Some(sink) = &self.sink {
+                sink.pause();
+            }
+        }
+        if let Some(sink) = &self.sink {
+            let _ = sink.try_seek(Duration::from_secs_f32(secs));
+        }
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.sink
+            .as_ref()
+            .is_some_and(|s| !s.is_paused() && !s.empty())
+    }
+
+    /// Current playhead in seconds, clamped to the clip duration.
+    pub fn position(&self) -> f32 {
+        let dur = self.meta.as_ref().map_or(0.0, |m| m.duration);
+        self.sink
+            .as_ref()
+            .map(|s| s.get_pos().as_secs_f32().min(dur))
+            .unwrap_or(0.0)
+    }
+}
+
+/// `mm:ss` for the transport readout.
+pub fn fmt_time(secs: f32) -> String {
+    let secs = secs.max(0.0) as u32;
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmt_time_is_mmss() {
+        assert_eq!(fmt_time(0.0), "0:00");
+        assert_eq!(fmt_time(9.7), "0:09");
+        assert_eq!(fmt_time(75.0), "1:15");
+        assert_eq!(fmt_time(-3.0), "0:00");
+    }
+
+    #[test]
+    fn load_waveform_of_a_synthetic_wav() {
+        // 0.1s of 440Hz sine, mono 44.1k, written as a minimal PCM16 WAV.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tone.wav");
+        write_sine_wav(&path, 44_100, 4410);
+        let meta = load_waveform(&path, 64).expect("decodes");
+        assert_eq!(meta.sample_rate, 44_100);
+        assert_eq!(meta.channels, 1);
+        assert!((meta.duration - 0.1).abs() < 0.01, "≈0.1s");
+        assert_eq!(meta.peaks.len(), 64);
+        assert!(meta.peaks.iter().any(|&p| p > 0.5), "a loud bar exists");
+        assert!(meta.peaks.iter().all(|&p| (0.0..=1.0).contains(&p)));
+    }
+
+    fn write_sine_wav(path: &Path, sample_rate: u32, frames: u32) {
+        use std::io::Write;
+        let bytes_per_sample = 2u32;
+        let data_len = frames * bytes_per_sample;
+        let mut f = File::create(path).unwrap();
+        // RIFF/WAVE header (PCM16 mono).
+        f.write_all(b"RIFF").unwrap();
+        f.write_all(&(36 + data_len).to_le_bytes()).unwrap();
+        f.write_all(b"WAVE").unwrap();
+        f.write_all(b"fmt ").unwrap();
+        f.write_all(&16u32.to_le_bytes()).unwrap();
+        f.write_all(&1u16.to_le_bytes()).unwrap(); // PCM
+        f.write_all(&1u16.to_le_bytes()).unwrap(); // mono
+        f.write_all(&sample_rate.to_le_bytes()).unwrap();
+        f.write_all(&(sample_rate * bytes_per_sample).to_le_bytes())
+            .unwrap();
+        f.write_all(&(bytes_per_sample as u16).to_le_bytes())
+            .unwrap();
+        f.write_all(&16u16.to_le_bytes()).unwrap();
+        f.write_all(b"data").unwrap();
+        f.write_all(&data_len.to_le_bytes()).unwrap();
+        for i in 0..frames {
+            let t = i as f32 / sample_rate as f32;
+            let s = (t * 440.0 * std::f32::consts::TAU).sin();
+            let v = (s * 30000.0) as i16;
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+    }
+}
