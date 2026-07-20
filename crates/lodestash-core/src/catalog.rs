@@ -131,6 +131,7 @@ impl Catalog {
             (5, MIGRATION_05_UI_SPEC_ALIGNMENT),
             (6, MIGRATION_06_PACKAGE_ENTRIES),
             (7, MIGRATION_07_PACKAGE_PINNED),
+            (8, MIGRATION_08_EMBEDDINGS),
         ];
 
         for (version, sql) in migrations {
@@ -954,6 +955,26 @@ const MIGRATION_07_PACKAGE_PINNED: &str = "
 ALTER TABLE package ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
 ";
 
+/// M8 — semantic embeddings (DATA-MODEL §2 vec_asset, §3 hybrid search). Interim store:
+/// a plain BLOB table (dim × f32 little-endian) with brute-force cosine KNN in Rust
+/// ([`crate::vector`]) behind the `VectorIndex` seam. The sqlite-vec `vec0` virtual table
+/// is the same-file optimisation adopted behind that seam once brute force stops being
+/// comfortable (~1M vectors). `media_type_id`/`source_id` are the pre-filter columns.
+const MIGRATION_08_EMBEDDINGS: &str = "
+CREATE TABLE IF NOT EXISTS asset_embedding (
+    asset_id      INTEGER NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+    model_id      TEXT    NOT NULL,
+    modality      TEXT    NOT NULL,   -- image|audio|text (which encoder produced it)
+    dim           INTEGER NOT NULL,
+    media_type_id INTEGER,            -- pre-filter / shard column
+    source_id     INTEGER,            -- pre-filter column
+    embedding     BLOB    NOT NULL,   -- dim * f32, little-endian
+    created_at    INTEGER NOT NULL,
+    PRIMARY KEY (asset_id, model_id)
+);
+CREATE INDEX IF NOT EXISTS idx_embed_prefilter ON asset_embedding(media_type_id);
+";
+
 /// A package-extracted asset rehydrated from the catalog (UI "cache extracted packs" toggle).
 #[derive(Debug, Clone)]
 pub struct HydratedExtracted {
@@ -1119,6 +1140,82 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("pkg list row: {e}")))
     }
 
+    /// Upsert an asset's embedding (M8; DATA-MODEL §3). Stores `vector` as little-endian
+    /// f32 BLOB and clears `asset.embedding_dirty` in one transaction (index-sync rule).
+    /// `media_type_id`/`source_id` are denormalised for KNN pre-filtering.
+    pub fn upsert_embedding(
+        &mut self,
+        asset_id: i64,
+        model_id: &str,
+        modality: &str,
+        media_type_id: Option<i64>,
+        source_id: Option<i64>,
+        vector: &[f32],
+    ) -> Result<()> {
+        let blob = encode_vector(vector);
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| CoreError::Catalog(format!("embed begin: {e}")))?;
+        tx.execute(
+            "INSERT INTO asset_embedding
+                (asset_id, model_id, modality, dim, media_type_id, source_id, embedding, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(asset_id, model_id) DO UPDATE SET
+                modality = excluded.modality, dim = excluded.dim,
+                media_type_id = excluded.media_type_id, source_id = excluded.source_id,
+                embedding = excluded.embedding, created_at = excluded.created_at",
+            params![
+                asset_id,
+                model_id,
+                modality,
+                vector.len() as i64,
+                media_type_id,
+                source_id,
+                blob,
+                unix_now(),
+            ],
+        )
+        .map_err(|e| CoreError::Catalog(format!("embed upsert: {e}")))?;
+        tx.execute(
+            "UPDATE asset SET embedding_dirty = 0 WHERE id = ?1",
+            params![asset_id],
+        )
+        .map_err(|e| CoreError::Catalog(format!("embed clear dirty: {e}")))?;
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("embed commit: {e}")))?;
+        Ok(())
+    }
+
+    /// Load candidate vectors for a model, optionally pre-filtered by media type (the
+    /// KNN shard column). Soft-deleted assets are excluded. Feeds
+    /// [`crate::vector::BruteForceIndex`] — the structural pre-filter of DATA-MODEL §3.
+    pub fn embeddings_for_knn(
+        &self,
+        model_id: &str,
+        media_type_id: Option<i64>,
+    ) -> Result<Vec<(i64, Vec<f32>)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT e.asset_id, e.embedding
+                 FROM asset_embedding e
+                 JOIN asset a ON a.id = e.asset_id
+                 WHERE e.model_id = ?1 AND a.deleted_at IS NULL
+                   AND (?2 IS NULL OR e.media_type_id = ?2)",
+            )
+            .map_err(|e| CoreError::Catalog(format!("knn load prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![model_id, media_type_id], |r| {
+                let id: i64 = r.get(0)?;
+                let blob: Vec<u8> = r.get(1)?;
+                Ok((id, decode_vector(&blob)))
+            })
+            .map_err(|e| CoreError::Catalog(format!("knn load query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("knn load row: {e}")))
+    }
+
     /// Search by Tags (IDENTIFICATION-AND-SEARCH §5.A): FTS5/BM25 over asset name +
     /// description + denormalised tags. Returns matching asset ids **most-relevant
     /// first**, capped at `limit`, soft-deleted rows excluded. An empty or
@@ -1155,6 +1252,23 @@ impl Catalog {
 /// prefix-quote each term (`"term"*`), AND them together. Quoting neutralises FTS5
 /// operators/syntax in the term body; the trailing `*` makes each a prefix match so
 /// typing "roc" already finds "rock". Returns `None` when nothing tokenisable remains.
+/// Pack an f32 vector into little-endian bytes for BLOB storage (M8). `decode_vector`
+/// is the exact inverse; trailing bytes that don't fill a full f32 are ignored (never
+/// panics on a malformed BLOB).
+fn encode_vector(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+fn decode_vector(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
 fn fts_match_query(query: &str) -> Option<String> {
     let terms: Vec<String> = query
         .split(|c: char| !c.is_alphanumeric())
@@ -1175,7 +1289,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 7, "all 7 migrations should have run");
+        assert_eq!(version, 8, "all 8 migrations should have run");
     }
 
     /// A catalog stopped at schema v4, for exercising M5's data steps.
@@ -1333,6 +1447,88 @@ mod tests {
             size_bytes: size,
             mtime,
         }
+    }
+
+    #[test]
+    fn embedding_round_trips_and_prefilters() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let src = c
+            .upsert_import_source("Lib", "C:/lib", "folder")
+            .expect("src");
+        c.record_crawl(src, None, &[rec("a.png", 1, 1), rec("b.png", 2, 1)])
+            .expect("crawl");
+        let ids: Vec<i64> = c
+            .conn
+            .prepare("SELECT id FROM asset ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        let img: i64 = c
+            .conn
+            .query_row("SELECT id FROM media_type WHERE code='image'", [], |r| {
+                r.get(0)
+            })
+            .expect("image media type");
+
+        c.upsert_embedding(
+            ids[0],
+            "siglip2",
+            "image",
+            Some(img),
+            Some(src),
+            &[1.0, 0.0, 0.0],
+        )
+        .expect("embed 0");
+        c.upsert_embedding(
+            ids[1],
+            "siglip2",
+            "image",
+            Some(img),
+            Some(src),
+            &[0.0, 1.0, 0.0],
+        )
+        .expect("embed 1");
+
+        // Round-trip: vectors decode exactly, and embedding_dirty was cleared.
+        let cands = c.embeddings_for_knn("siglip2", None).expect("knn load");
+        assert_eq!(cands.len(), 2);
+        let v0 = &cands.iter().find(|(id, _)| *id == ids[0]).unwrap().1;
+        assert_eq!(v0, &vec![1.0, 0.0, 0.0]);
+        let dirty: i64 = c
+            .conn
+            .query_row(
+                "SELECT embedding_dirty FROM asset WHERE id=?1",
+                [ids[0]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dirty, 0, "upsert clears embedding_dirty");
+
+        // Upsert replaces (same asset+model), doesn't duplicate.
+        c.upsert_embedding(
+            ids[0],
+            "siglip2",
+            "image",
+            Some(img),
+            Some(src),
+            &[0.5, 0.5, 0.0],
+        )
+        .expect("re-embed");
+        assert_eq!(c.embeddings_for_knn("siglip2", None).unwrap().len(), 2);
+
+        // Media-type pre-filter: a bogus type yields nothing.
+        assert!(c
+            .embeddings_for_knn("siglip2", Some(9999))
+            .unwrap()
+            .is_empty());
+        // Soft-deleted assets drop out.
+        c.conn
+            .execute("UPDATE asset SET deleted_at=1 WHERE id=?1", [ids[0]])
+            .unwrap();
+        assert_eq!(c.embeddings_for_knn("siglip2", None).unwrap().len(), 1);
     }
 
     #[test]

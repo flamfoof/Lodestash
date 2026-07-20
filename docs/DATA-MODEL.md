@@ -164,6 +164,22 @@ CREATE VIRTUAL TABLE vec_asset USING vec0(
   source_id     INTEGER,                  -- metadata filter column
   +model_id     TEXT
 );
+-- SHIPPED (M8, interim): embeddings live in a plain BLOB table with brute-force cosine
+-- KNN in Rust (crate::vector::BruteForceIndex behind the VectorIndex seam) — zero new
+-- deps, comfortably fast to ~100k vectors (§3). The vec0 virtual table above is the
+-- sqlite-vec optimisation adopted *behind the same seam* once brute force stops being
+-- comfortable (then LanceDB past ~1M, §1). Both are interchangeable under VectorIndex.
+CREATE TABLE asset_embedding (
+  asset_id      INTEGER NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+  model_id      TEXT    NOT NULL,
+  modality      TEXT    NOT NULL,          -- image|audio|text (which encoder)
+  dim           INTEGER NOT NULL,
+  media_type_id INTEGER,                   -- pre-filter / shard column
+  source_id     INTEGER,                   -- pre-filter column
+  embedding     BLOB    NOT NULL,          -- dim * f32, little-endian
+  created_at    INTEGER NOT NULL,
+  PRIMARY KEY (asset_id, model_id)
+);
 
 -- Full-text search (FTS5 external-content over asset)
 CREATE VIRTUAL TABLE asset_fts USING fts5(
@@ -606,7 +622,8 @@ transaction, in order, on open. Shipped so far:
 | **M4** | `asset.rating`, `package.pipeline`, `project.pipeline` (§12) |
 | **M5** | UI-SPEC alignment (below) |
 | **M6** | Extracted-pack persistence + surgical extraction: `asset_file.workspace_rel` (locates a package-extracted file in the content-addressed workspace, so extracted packs rehydrate across sessions behind the **Keep extracted packs cached** toggle, default off) + `package_entry` (per-payload guid/pathname/**tar offset**/size from the browse pass — selected assets re-extract with one gzip skip-scan instead of a full unpack, [`INGESTION.md`](INGESTION.md) §2) |
-| **M7** | *(planned)* Unity Assets library pinning: `package.pinned` (`ALTER TABLE package ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`) — backs the Add-to-Library pin (FEATURES.md §5.5, §7 above) so a promoted pack is a durable sidebar LIBRARIES row |
+| **M7** | Unity Assets library pinning: `package.pinned` (`ALTER TABLE package ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`) — backs the Add-to-Library pin (FEATURES.md §5.5, §7 above) so a promoted pack is a durable sidebar LIBRARIES row |
+| **M8** | Semantic embeddings (interim): `asset_embedding` BLOB table (dim × f32 little-endian + `model_id`/`modality`/`media_type_id`/`source_id`) — `Catalog::upsert_embedding` clears `embedding_dirty` in-txn; `embeddings_for_knn` loads the pre-filtered candidate set for `crate::vector::BruteForceIndex`. sqlite-vec `vec_asset` is the drop-in optimisation behind the `VectorIndex` seam (§2). |
 | **M5** | UI-SPEC alignment: per-project staging trays, `import_record.batch_id` + backfill, `tag` trait columns, `asset_relationship` (final form), `import_source.blacklist` — DDL + data steps below |
 
 ### M5 — UI-SPEC alignment (shipped 2026-07-16)
