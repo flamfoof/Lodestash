@@ -7054,10 +7054,10 @@ fn quick_look_content(
                     };
                     let play = ui.add(
                         egui::Button::new(
-                            RichText::new(glyph).color(theme::ARCANE_BRIGHT).size(14.0),
+                            RichText::new(glyph).color(theme::ARCANE_BRIGHT).size(15.0),
                         )
-                        .min_size(Vec2::splat(34.0))
-                        .rounding(17.0)
+                        .min_size(Vec2::splat(38.0))
+                        .rounding(19.0)
                         .fill(theme::ARCANE.linear_multiply(0.14))
                         .stroke(egui::Stroke::new(1.0, theme::ARCANE)),
                     );
@@ -7065,22 +7065,22 @@ fn quick_look_content(
                         ap.toggle();
                     }
                     ui.add_space(8.0);
-                    // Scrub bar fills the row up to the time readout.
-                    let time = format!(
-                        "{} / {}",
-                        crate::audio::fmt_time(ap.position()),
-                        crate::audio::fmt_time(dur)
-                    );
-                    let seek_w = (ui.available_width() - 82.0).max(60.0);
-                    if let Some(t) = seek_bar(ui, seek_w, ap.position(), dur) {
+                    // Fixed scrub width — sizing it from available_width feeds the
+                    // auto-sizing window and creeps wider each frame (as the fixed
+                    // waveform height fixed the vertical creep).
+                    if let Some(t) = seek_bar(ui, 360.0, ap.position(), dur) {
                         ap.seek(t);
                     }
                     ui.add_space(8.0);
                     ui.label(
-                        RichText::new(time)
-                            .monospace()
-                            .color(theme::TEXT_MUTED)
-                            .size(11.0),
+                        RichText::new(format!(
+                            "{} / {}",
+                            crate::audio::fmt_time(ap.position()),
+                            crate::audio::fmt_time(dur)
+                        ))
+                        .monospace()
+                        .color(theme::TEXT_MUTED)
+                        .size(11.0),
                     );
                 });
                 ui.add_space(7.0);
