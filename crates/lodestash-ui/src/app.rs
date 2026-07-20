@@ -745,7 +745,7 @@ impl LodestashApp {
             viewer_rx,
             viewer_tx,
             viewport3d: cc.gl.clone().and_then(Viewport3d::new),
-            audio_player: AudioPlayer::new(),
+            audio_player: AudioPlayer::new(config.volume),
             bg_gold: Some(cc.egui_ctx.load_texture(
                 "bg_radial_gold",
                 radial_image(theme::GOLD, 15), // rgba(231,183,101,.06)
@@ -4943,6 +4943,13 @@ impl eframe::App for LodestashApp {
                                 );
                             });
                         self.quick_look = open;
+                        // Persist a volume change from the audio player's slider (global).
+                        if let Some(ap) = &self.audio_player {
+                            if (ap.volume() - self.config.volume).abs() > 1e-4 {
+                                self.config.volume = ap.volume();
+                                self.config.save();
+                            }
+                        }
                     }
                 }
             }
@@ -7006,6 +7013,18 @@ fn quick_look_content(
                 .color(theme::TEXT_DIM)
                 .size(11.0),
             );
+            // Global volume (persisted to config by the caller when it changes).
+            ui.add_space(10.0);
+            ui.label(RichText::new("\u{1F509}").size(13.0));
+            ui.spacing_mut().slider_width = 90.0;
+            let mut vol = ap.volume();
+            if ui
+                .add(egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false))
+                .on_hover_text("Playback volume (applies to all audio)")
+                .changed()
+            {
+                ap.set_volume(vol);
+            }
             // Sample-rate / channels stat facets (DESIGN-GUIDELINES §7).
             if let Some(meta) = &ap.meta {
                 let chans = match meta.channels {
@@ -7027,7 +7046,9 @@ fn quick_look_content(
         });
         ui.add_space(4.0);
 
-        let wave = Vec2::new(canvas.x, (canvas.y - 40.0).max(64.0));
+        // Fixed height — deriving it from available height feeds back into the
+        // auto-sizing window and creeps taller each frame.
+        let wave = Vec2::new(ui.available_width(), 150.0);
         let (resp, painter) = ui.allocate_painter(wave, egui::Sense::click());
         painter.rect_filled(resp.rect, 4.0, theme::BG);
         if let Some(meta) = &ap.meta {

@@ -298,7 +298,12 @@ impl PreviewQuality {
 
 // ── AppConfig ─────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Default playback volume — a moderate level so audio previews aren't jarring.
+fn default_volume() -> f32 {
+    0.5
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     /// Name of the project that was open when the app last closed.
     pub last_project_name: Option<String>,
@@ -330,6 +335,27 @@ pub struct AppConfig {
     /// per-OS default (INGESTION.md §2 discovery order; UI-SPEC §4).
     #[serde(default)]
     pub asset_store_roots: Vec<PathBuf>,
+    /// Global audio-preview playback volume, `0.0..=1.0` (applies to every clip).
+    #[serde(default = "default_volume")]
+    pub volume: f32,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            last_project_name: None,
+            last_root: None,
+            recent_roots: Vec::new(),
+            projects: Vec::new(),
+            view: ViewPrefs::default(),
+            size_tiers: SizeTiers::default(),
+            preview_quality: PreviewQuality::default(),
+            skip_onboarding: false,
+            cache_extracted: false,
+            asset_store_roots: Vec::new(),
+            volume: default_volume(),
+        }
+    }
 }
 
 impl AppConfig {

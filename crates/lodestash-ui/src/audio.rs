@@ -78,11 +78,13 @@ pub struct AudioPlayer {
     pub loading: bool,
     pub error: Option<String>,
     rx: Option<Receiver<Result<AudioMeta, String>>>,
+    /// Global playback volume `0.0..=1.0`, applied to every sink (mirrors `config.volume`).
+    volume: f32,
 }
 
 impl AudioPlayer {
     /// `None` if no audio output device is available (headless / no sound card).
-    pub fn new() -> Option<Self> {
+    pub fn new(volume: f32) -> Option<Self> {
         let (stream, handle) = OutputStream::try_default()
             .map_err(|e| tracing::warn!("audio unavailable: {e}"))
             .ok()?;
@@ -96,7 +98,20 @@ impl AudioPlayer {
             loading: false,
             error: None,
             rx: None,
+            volume: volume.clamp(0.0, 1.0),
         })
+    }
+
+    pub fn volume(&self) -> f32 {
+        self.volume
+    }
+
+    /// Set the global volume and apply it to any currently playing sink.
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = volume.clamp(0.0, 1.0);
+        if let Some(sink) = &self.sink {
+            sink.set_volume(self.volume);
+        }
     }
 
     /// Load `path`'s waveform on a worker thread, stopping any current playback.
@@ -167,6 +182,7 @@ impl AudioPlayer {
             .and_then(|f| Decoder::new(BufReader::new(f)).map_err(|e| e.to_string()));
         match decode.and_then(|dec| {
             let sink = Sink::try_new(&self.handle).map_err(|e| e.to_string())?;
+            sink.set_volume(self.volume);
             sink.append(dec);
             Ok(sink)
         }) {
