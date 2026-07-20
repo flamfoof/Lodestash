@@ -7045,8 +7045,8 @@ fn quick_look_content(
             .rounding(8.0)
             .inner_margin(egui::Margin::symmetric(12.0, 8.0))
             .show(ui, |ui| {
+                // Row 1 — transport: play · timeline scrub · time (prototype's sound row).
                 ui.horizontal(|ui| {
-                    // Circular arcane play/pause button (prototype: 38px arcane pill).
                     let glyph = if ap.is_playing() {
                         "\u{23F8}"
                     } else {
@@ -7064,26 +7064,39 @@ fn quick_look_content(
                     if play.clicked() {
                         ap.toggle();
                     }
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(format!(
-                            "{} / {}",
-                            crate::audio::fmt_time(ap.position()),
-                            crate::audio::fmt_time(dur)
-                        ))
-                        .monospace()
-                        .color(theme::TEXT_MUTED)
-                        .size(11.0),
+                    ui.add_space(8.0);
+                    // Scrub bar fills the row up to the time readout.
+                    let time = format!(
+                        "{} / {}",
+                        crate::audio::fmt_time(ap.position()),
+                        crate::audio::fmt_time(dur)
                     );
-
-                    // Trailing group (right-aligned): volume control, then the audio facts.
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if let Some(meta) = &ap.meta {
-                            let chans = match meta.channels {
-                                1 => "mono".to_string(),
-                                2 => "stereo".to_string(),
-                                n => format!("{n} ch"),
-                            };
+                    let seek_w = (ui.available_width() - 82.0).max(60.0);
+                    if let Some(t) = seek_bar(ui, seek_w, ap.position(), dur) {
+                        ap.seek(t);
+                    }
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(time)
+                            .monospace()
+                            .color(theme::TEXT_MUTED)
+                            .size(11.0),
+                    );
+                });
+                ui.add_space(7.0);
+                // Row 2 — volume control (left) + audio facts (right).
+                ui.horizontal(|ui| {
+                    let mut vol = ap.volume();
+                    if volume_control(ui, &mut vol) {
+                        ap.set_volume(vol);
+                    }
+                    if let Some(meta) = &ap.meta {
+                        let chans = match meta.channels {
+                            1 => "mono".to_string(),
+                            2 => "stereo".to_string(),
+                            n => format!("{n} ch"),
+                        };
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(
                                 RichText::new(format!(
                                     "{:.1} kHz \u{2022} {chans}",
@@ -7092,13 +7105,8 @@ fn quick_look_content(
                                 .color(theme::TEXT_DIM)
                                 .size(10.0),
                             );
-                            ui.add_space(10.0);
-                        }
-                        let mut vol = ap.volume();
-                        if volume_control(ui, &mut vol) {
-                            ap.set_volume(vol);
-                        }
-                    });
+                        });
+                    }
                 });
             });
     } else {
@@ -7218,6 +7226,39 @@ fn volume_control(ui: &mut Ui, value: &mut f32) -> bool {
             });
         });
     changed
+}
+
+/// Timeline scrub bar (prototype's transport `<input type=range>`): a `width`-wide gold
+/// progress track with a knob at `pos/dur`. Returns `Some(secs)` when clicked/dragged to
+/// seek. Gold matches the waveform playhead so the two read as the same position.
+fn seek_bar(ui: &mut Ui, width: f32, pos: f32, dur: f32) -> Option<f32> {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 8.0), egui::Sense::click_and_drag());
+    let painter = ui.painter();
+    let r = rect.height() / 2.0;
+    painter.rect_filled(rect, r, theme::BORDER_STRONG);
+    let frac = if dur > 0.0 {
+        (pos / dur).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if frac > 0.0 {
+        let filled =
+            egui::Rect::from_min_size(rect.min, Vec2::new(rect.width() * frac, rect.height()));
+        painter.rect_filled(filled, r, theme::GOLD);
+    }
+    let kx = rect.left() + rect.width() * frac;
+    painter.circle_filled(
+        egui::pos2(kx, rect.center().y),
+        rect.height() * 0.85,
+        theme::GOLD_BRIGHT,
+    );
+    if (resp.dragged() || resp.clicked()) && dur > 0.0 && rect.width() > 0.0 {
+        if let Some(p) = resp.interact_pointer_pos() {
+            let frac = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            return Some(frac * dur);
+        }
+    }
+    None
 }
 
 /// A filled, draggable level bar (rounded track + arcane fill + a bright knob) — the
