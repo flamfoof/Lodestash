@@ -24,35 +24,46 @@ use crate::viewport3d::{self, Viewport3d};
 
 // ── Category tabs ─────────────────────────────────────────────────────────────
 
+/// The top-bar category tabs (UI-SPEC §0.3, prototype `catDefs`): four coarse buckets
+/// grouping the 7-value `media_type` enum. The enum itself is unchanged (a data-model
+/// invariant) — these are a presentation grouping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Category {
     All,
-    Type(MediaType),
+    Models,
+    Sounds,
+    Images,
 }
 
 impl Category {
     const TABS: &'static [(Category, &'static str)] = &[
-        (Category::All, "All"),
-        (Category::Type(MediaType::Model3d), "3D Models"),
-        (Category::Type(MediaType::Audio), "Audio"),
-        (Category::Type(MediaType::Image), "Images"),
-        (Category::Type(MediaType::Texture), "Textures"),
-        (Category::Type(MediaType::Sprite), "Sprites"),
-        (Category::Type(MediaType::Material), "Materials"),
-        (Category::Type(MediaType::Font), "Fonts"),
+        (Category::All, "\u{25C6} All"),
+        (Category::Models, "\u{2B21} Models"),
+        (Category::Sounds, "\u{266A} Sounds"),
+        (Category::Images, "\u{25A6} Images"),
     ];
 
+    /// Bucket → `media_type` mapping: Models = model_3d+material, Sounds = audio,
+    /// Images = image+texture+sprite+font (UI-SPEC §0.3).
     fn matches(self, mt: Option<MediaType>) -> bool {
         match self {
             Category::All => true,
-            Category::Type(t) => mt == Some(t),
+            Category::Models => matches!(mt, Some(MediaType::Model3d | MediaType::Material)),
+            Category::Sounds => mt == Some(MediaType::Audio),
+            Category::Images => matches!(
+                mt,
+                Some(MediaType::Image | MediaType::Texture | MediaType::Sprite | MediaType::Font)
+            ),
         }
     }
 
+    /// Active-tab color (prototype `catColors`).
     fn color(self) -> egui::Color32 {
         match self {
-            Category::All => theme::TEXT_MUTED,
-            Category::Type(mt) => theme::media_type_color(mt),
+            Category::All => theme::GOLD,
+            Category::Models => theme::TYPE_MODEL,
+            Category::Sounds => theme::TYPE_SOUND,
+            Category::Images => theme::TYPE_IMAGE,
         }
     }
 }
@@ -3968,7 +3979,8 @@ impl eframe::App for LodestashApp {
                             .id(egui::Id::new("search_field"))
                             .hint_text(hint)
                             .desired_width(
-                                (ui.available_width() - 420.0).clamp(140.0, 400.0),
+                                // Leave room for the category chips + right-hand group.
+                                (ui.available_width() - 660.0).clamp(120.0, 320.0),
                             ),
                     );
                     // Border follows the active mode; brighter while focused (§0.1).
@@ -3989,6 +4001,36 @@ impl eframe::App for LodestashApp {
                                 .color(theme::TEXT_DIM)
                                 .size(10.0),
                         );
+                    }
+
+                    // Category buckets (prototype top-bar `cats`): bordered chips, active =
+                    // bucket color border+text, inactive = muted. Library screen only.
+                    if self.screen == Screen::Library {
+                        ui.add_space(4.0);
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        for &(cat, label) in Category::TABS {
+                            let active = self.active_tab == cat;
+                            let color = cat.color();
+                            let resp = ui.add(
+                                egui::Button::new(
+                                    RichText::new(label).size(12.0).color(if active {
+                                        color
+                                    } else {
+                                        theme::TEXT_MUTED
+                                    }),
+                                )
+                                .fill(egui::Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::new(
+                                    1.0,
+                                    if active { color } else { theme::BORDER },
+                                ))
+                                .rounding(6.0),
+                            );
+                            if resp.clicked() && !active {
+                                self.active_tab = cat;
+                                self.cache_dirty = true;
+                            }
+                        }
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4117,64 +4159,9 @@ impl eframe::App for LodestashApp {
         // ── Sidebar (left, UI-SPEC §0.2) ──────────────────────────────────────
         self.sidebar(ctx);
 
-        // ── Category tab bar + view toolbar ──────────────────────────────────
+        // ── View toolbar ──────────────────────────────────────────────────────
+        // (Category buckets moved into the top bar next to search — prototype §top bar.)
         if self.screen == Screen::Library && !self.entries.is_empty() {
-            egui::TopBottomPanel::top("tabbar")
-                .frame(
-                    egui::Frame::none()
-                        .fill(theme::SURFACE)
-                        .inner_margin(egui::Margin {
-                            left: 12.0,
-                            right: 12.0,
-                            top: 4.0,
-                            bottom: 0.0,
-                        })
-                        .stroke(egui::Stroke::new(1.0, theme::BORDER)),
-                )
-                .show(ctx, |ui| {
-                    // (Library pill tabs lived here; the sidebar LIBRARIES facet group
-                    // absorbed them — UI-SPEC §0.2.)
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0;
-                        for (i, &(cat, label)) in Category::TABS.iter().enumerate() {
-                            let n = self.tab_counts[i];
-                            if n == 0 && cat != Category::All {
-                                continue;
-                            }
-                            let is_active = self.active_tab == cat;
-                            let tab_color = cat.color();
-                            let rich = RichText::new(format!("{label}  {n}")).size(12.0).color(
-                                if is_active {
-                                    tab_color
-                                } else {
-                                    theme::TEXT_DIM
-                                },
-                            );
-                            let resp = ui.add(
-                                egui::Button::new(rich)
-                                    .fill(egui::Color32::TRANSPARENT)
-                                    .stroke(egui::Stroke::NONE)
-                                    .frame(false),
-                            );
-                            if resp.clicked() {
-                                self.active_tab = cat;
-                                self.cache_dirty = true;
-                            }
-                            if is_active {
-                                let rect = resp.rect;
-                                ui.painter().line_segment(
-                                    [
-                                        egui::pos2(rect.min.x, rect.max.y),
-                                        egui::pos2(rect.max.x, rect.max.y),
-                                    ],
-                                    egui::Stroke::new(2.0, tab_color),
-                                );
-                            }
-                            ui.add_space(8.0);
-                        }
-                    });
-                });
-
             egui::TopBottomPanel::top("toolbar")
                 .frame(
                     egui::Frame::none()
@@ -7584,12 +7571,8 @@ mod tests {
             entry(0, "PolygonCity/tex.png", Some(MediaType::Image)),
             entry(0, "PolygonCity/m.fbx", Some(MediaType::Model3d)),
         ];
-        let (idxs, tiles) = folder_children(
-            &entries,
-            0,
-            std::path::Path::new(""),
-            Category::Type(MediaType::Model3d),
-        );
+        let (idxs, tiles) =
+            folder_children(&entries, 0, std::path::Path::new(""), Category::Models);
         assert!(idxs.is_empty());
         assert_eq!(
             tiles,
