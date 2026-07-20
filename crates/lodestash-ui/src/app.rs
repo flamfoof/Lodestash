@@ -579,10 +579,11 @@ pub struct LodestashApp {
     search_ranks: Option<std::collections::HashMap<i64, usize>>,
     /// The query the current `search_ranks` were computed for — the recompute guard.
     search_ranks_key: Option<String>,
-    /// The local text encoder for Search-with-AI (IDENTIFICATION-AND-SEARCH §5.B), shared
-    /// by the query side (this thread) and the persist-thread embed drain. `None` when the
-    /// ONNX Runtime + model artifacts aren't present — AI search then stays a stub.
-    text_embedder: Option<Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
+    /// The local SigLIP joint image↔text embedder for Search-with-AI (IDENTIFICATION-AND-SEARCH
+    /// §5.B), shared by the query side (this thread, text tower) and the persist-thread image
+    /// drain (vision tower). `None` when the ONNX Runtime + model artifacts aren't present — AI
+    /// search then stays a stub.
+    ai_embedder: Option<Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
     active_tab: Category,
     sort_by: SortBy,
     sort_asc: bool,
@@ -726,7 +727,7 @@ impl LodestashApp {
             search_catalog: catalog_db_path().and_then(|p| Catalog::open(&p).ok()),
             search_ranks: None,
             search_ranks_key: None,
-            text_embedder: resolve_text_embedder(),
+            ai_embedder: resolve_embedder(),
             active_tab: Category::All,
             sort_by,
             sort_asc,
@@ -1223,7 +1224,7 @@ impl LodestashApp {
 
         let generation = self.scan_generation;
         let tx = self.catalog_tx.clone();
-        let embedder = self.text_embedder.clone();
+        let embedder = self.ai_embedder.clone();
         self.catalog_persisting = true;
         std::thread::spawn(move || {
             let (counts, assets, catalog) = match persist_to_catalog(&db_path, &batches) {
@@ -1243,7 +1244,7 @@ impl LodestashApp {
             // (still the sole writer). Runs *after* the grid gets its identity, so a large
             // first scan doesn't stall the UI on inference. Search-with-AI needs these.
             if let (Some(mut cat), Some(emb)) = (catalog, embedder) {
-                drain_embeddings(&mut cat, emb.as_ref());
+                drain_image_embeddings(&mut cat, emb.as_ref());
             }
         });
     }
@@ -2010,7 +2011,7 @@ impl LodestashApp {
     fn run_ai_search(&mut self) {
         const HIT_CAP: usize = 100_000;
         let query = self.search.trim().to_string();
-        let Some(emb) = self.text_embedder.clone() else {
+        let Some(emb) = self.ai_embedder.clone() else {
             return; // no model → AI stays stubbed
         };
         if query.is_empty() {
@@ -4114,11 +4115,11 @@ impl eframe::App for LodestashApp {
                         self.run_ai_search();
                     }
                     if self.search_mode == SearchMode::Ai {
-                        let (msg, col) = if self.text_embedder.is_some() {
-                            ("\u{2726} semantic search ready \u{2014} press Enter", theme::ARCANE)
+                        let (msg, col) = if self.ai_embedder.is_some() {
+                            ("\u{2726} visual search ready \u{2014} press Enter", theme::ARCANE)
                         } else {
                             // ponytail: engine is done; the gap is the model artifact (P4 manager).
-                            ("\u{2726} add a text model to enable (Settings \u{25B8} AI)", theme::TEXT_DIM)
+                            ("\u{2726} add a vision model to enable (Settings \u{25B8} AI)", theme::TEXT_DIM)
                         };
                         ui.label(RichText::new(msg).color(col).size(10.0));
                     }
@@ -6118,62 +6119,99 @@ fn catalog_db_path() -> Option<PathBuf> {
     Some(dir.join("catalog.db"))
 }
 
-/// Model id recorded with every text vector; the query side reads back under the same id.
-/// Bump if the encoder changes (old vectors then simply don't match — no collision).
-const TEXT_MODEL_ID: &str = "all-minilm-l6-v2";
-/// all-MiniLM-L6-v2 output width.
-const TEXT_EMBED_DIM: usize = 384;
+/// Model id recorded with every vector; the query side reads back under the same id. Bump if
+/// the encoder changes (old vectors then simply don't match — no collision).
+const SIGLIP_MODEL_ID: &str = "siglip2-base-patch16-256";
 
-/// Locate the text encoder + tokenizer: `LODESTASH_ONNX_{MODEL,TOKENIZER}` env override
-/// (dev / the probe test), else `<data>/Lodestash/models/text/{model.onnx,tokenizer.json}`
-/// where the P4 model manager will download them. `None` when neither is present.
-fn text_model_paths() -> Option<(PathBuf, PathBuf)> {
-    if let (Ok(m), Ok(t)) = (
-        std::env::var("LODESTASH_ONNX_MODEL"),
-        std::env::var("LODESTASH_ONNX_TOKENIZER"),
+/// Locate the SigLIP towers + tokenizer: `SIGLIP_{VISION,TEXT,TOKENIZER}` env override (dev),
+/// else `<data>/Lodestash/models/siglip/{vision.onnx,text.onnx,tokenizer.json}` where the model
+/// manager downloads them. `None` unless all three are present.
+fn siglip_model_paths() -> Option<(PathBuf, PathBuf, PathBuf)> {
+    if let (Ok(v), Ok(t), Ok(k)) = (
+        std::env::var("SIGLIP_VISION"),
+        std::env::var("SIGLIP_TEXT"),
+        std::env::var("SIGLIP_TOKENIZER"),
     ) {
-        return Some((PathBuf::from(m), PathBuf::from(t)));
+        return Some((PathBuf::from(v), PathBuf::from(t), PathBuf::from(k)));
     }
-    let dir = dirs::data_dir()?.join("Lodestash").join("models").join("text");
-    let (m, t) = (dir.join("model.onnx"), dir.join("tokenizer.json"));
-    (m.exists() && t.exists()).then_some((m, t))
+    let dir = dirs::data_dir()?.join("Lodestash").join("models").join("siglip");
+    let (v, t, k) = (
+        dir.join("vision.onnx"),
+        dir.join("text.onnx"),
+        dir.join("tokenizer.json"),
+    );
+    (v.exists() && t.exists() && k.exists()).then_some((v, t, k))
 }
 
-/// Load the local text embedder if its artifacts (+ a matching ONNX Runtime, discovered via
-/// `load-dynamic`) are present. Any failure is `None` — AI search falls back to its stub,
-/// never crashes. On a stock machine with no model this returns `None` immediately.
-fn resolve_text_embedder() -> Option<Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>> {
-    let (model, tok) = text_model_paths()?;
-    match lodestash_ai::onnx::OnnxTextEmbedder::load(&model, &tok, TEXT_MODEL_ID, TEXT_EMBED_DIM) {
+/// Load the SigLIP joint image↔text embedder if its artifacts (+ a matching ONNX Runtime,
+/// discovered via `load-dynamic`) are present. Any failure is `None` — AI search falls back to
+/// its stub, never crashes. On a stock machine with no model this returns `None` immediately.
+fn resolve_embedder() -> Option<Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>> {
+    let (vision, text, tok) = siglip_model_paths()?;
+    match lodestash_ai::siglip::SiglipEmbedder::load(&vision, &text, &tok, SIGLIP_MODEL_ID) {
         Ok(e) => {
-            tracing::info!("onnx text embedder loaded — Search-with-AI is live");
+            tracing::info!("siglip embedder loaded — Search-with-AI (visual) is live");
             Some(Arc::new(e))
         }
         Err(e) => {
-            tracing::info!(%e, "no local text embedder; Search-with-AI stays stubbed");
+            tracing::info!(%e, "no local siglip model; Search-with-AI stays stubbed");
             None
         }
     }
 }
 
-/// Drain the whole `embedding_dirty` queue in batches, encoding each with `emb`. Runs on the
-/// persist thread over its own (sole-writer) connection. A batch error stops the drain rather
-/// than spinning — the rows stay dirty and the next scan retries them.
-fn drain_embeddings(cat: &mut Catalog, emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync)) {
-    const BATCH: usize = 256;
+/// Embed the dirty **image** assets (SigLIP vision tower) in batches over the persist thread's
+/// own sole-writer connection. Decode failures store a zero vector — which cosine-scores 0, so
+/// it never matches — solely to clear `embedding_dirty` and guarantee forward progress (no
+/// infinite re-query of an undecodable file). Non-image assets await their own encoder.
+fn drain_image_embeddings(
+    cat: &mut Catalog,
+    emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync),
+) {
+    const BATCH: usize = 64;
     let mut total = 0usize;
     loop {
-        match lodestash_ai::worker::embed_dirty(cat, emb, BATCH) {
-            Ok(0) => break,
-            Ok(n) => total += n,
+        let jobs = match cat.image_assets_needing_embedding(BATCH) {
+            Ok(j) => j,
             Err(e) => {
-                tracing::warn!(%e, "embed drain stopped; dirty rows retry next scan");
+                tracing::warn!(%e, "image embed queue query failed; retries next scan");
                 break;
             }
+        };
+        if jobs.is_empty() {
+            break;
+        }
+        let n = jobs.len();
+        for job in jobs {
+            let vector = match lodestash_ingest::raster::decode(std::path::Path::new(&job.abs_path))
+            {
+                Ok(img) => emb.embed_image(&img.to_rgba8()),
+                Err(e) => {
+                    // ponytail: undecodable → zero vec clears the flag (permanent-ish failure);
+                    // no infinite loop, and it never surfaces in KNN.
+                    tracing::warn!(%e, path = %job.abs_path, "image decode failed; storing zero vec");
+                    vec![0.0; emb.dim()]
+                }
+            };
+            if let Err(e) = cat.upsert_embedding(
+                job.asset_id,
+                emb.model_id(),
+                "image",
+                Some(job.media_type_id),
+                Some(job.source_id),
+                &vector,
+            ) {
+                tracing::warn!(%e, "upsert_embedding failed; stopping image drain");
+                return;
+            }
+            total += 1;
+        }
+        if n < BATCH {
+            break;
         }
     }
     if total > 0 {
-        tracing::info!(embedded = total, "text embeddings written");
+        tracing::info!(embedded = total, "siglip image embeddings written");
     }
 }
 

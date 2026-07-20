@@ -58,6 +58,16 @@ pub struct EmbedJob {
     pub source_id: i64,
 }
 
+/// A dirty **image-type** asset for the vision embedder (SigLIP): its on-disk path plus the
+/// pre-filter columns. Image/texture/sprite only — the modalities the image tower can encode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageEmbedJob {
+    pub asset_id: i64,
+    pub abs_path: String,
+    pub media_type_id: i64,
+    pub source_id: i64,
+}
+
 impl StatusCounts {
     pub fn total(&self) -> usize {
         self.unidentified + self.identified + self.confirmed
@@ -1185,6 +1195,38 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("embed queue query: {e}")))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| CoreError::Catalog(format!("embed queue row: {e}")))
+    }
+
+    /// Dirty **image-type** assets (image/texture/sprite) with a resolvable on-disk path, for
+    /// the SigLIP vision drain. On-disk sources only (`workspace_rel IS NULL`) — extracted-package
+    /// images join through the workspace and land in a later slice. Path = `root_path/rel_path`.
+    pub fn image_assets_needing_embedding(&self, limit: usize) -> Result<Vec<ImageEmbedJob>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT a.id, s.root_path || '/' || af.rel_path, a.media_type_id, a.source_id
+                 FROM asset a
+                 JOIN media_type mt   ON mt.id = a.media_type_id
+                 JOIN import_source s ON s.id = a.source_id
+                 JOIN asset_file af   ON af.asset_id = a.id
+                 WHERE a.embedding_dirty = 1 AND a.deleted_at IS NULL
+                   AND af.workspace_rel IS NULL AND af.missing = 0
+                   AND mt.code IN ('image', 'texture', 'sprite')
+                 ORDER BY a.id LIMIT ?1",
+            )
+            .map_err(|e| CoreError::Catalog(format!("image embed queue prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(ImageEmbedJob {
+                    asset_id: r.get(0)?,
+                    abs_path: r.get(1)?,
+                    media_type_id: r.get(2)?,
+                    source_id: r.get(3)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("image embed queue query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("image embed queue row: {e}")))
     }
 
     pub fn upsert_embedding(

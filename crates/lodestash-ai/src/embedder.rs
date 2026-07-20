@@ -13,6 +13,18 @@ pub trait Embedder {
     fn dim(&self) -> usize;
     /// Embed text into a `dim`-length, L2-normalised vector.
     fn embed_text(&self, text: &str) -> Vec<f32>;
+    /// Embed a decoded image into the **same** space as [`Self::embed_text`] (a joint
+    /// image↔text model like SigLIP). Default: unsupported → zero vector, so text-only
+    /// embedders don't have to implement it. Query text still matches image vectors when
+    /// this returns a real joint-space embedding.
+    fn embed_image(&self, _img: &image::RgbaImage) -> Vec<f32> {
+        vec![0.0; self.dim()]
+    }
+    /// Whether this embedder produces real image vectors (joint space). Drives whether the
+    /// worker embeds image-asset pixels or skips them.
+    fn supports_image(&self) -> bool {
+        false
+    }
 }
 
 /// Deterministic, dependency-free stand-in used until the ONNX encoders exist: hashes each

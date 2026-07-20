@@ -2571,6 +2571,7 @@ dependencies = [
 name = "lodestash-ai"
 version = "0.1.0"
 dependencies = [
+ "image",
  "lodestash-core",
  "ndarray",
  "ort",

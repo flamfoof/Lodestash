@@ -3,4 +3,5 @@
 
 pub mod embedder;
 pub mod onnx;
+pub mod siglip;
 pub mod worker;
