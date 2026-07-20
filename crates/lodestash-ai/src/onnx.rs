@@ -190,6 +190,53 @@ mod tests {
         assert!(err.is_err(), "a missing model must Err, not panic");
     }
 
+    /// Full Search-with-AI path over the real encoder, mirroring the app: seed a catalog,
+    /// drain `embedding_dirty` with the ONNX embedder (as the persist thread does), then
+    /// `hybrid_search` a query whose terms do NOT lexically appear in the target's name —
+    /// so a hit can only come from the vector arm. Proves semantic recall end to end.
+    /// Same env + `--ignored` as `probe_real_model`.
+    #[test]
+    #[ignore]
+    fn hybrid_search_recalls_semantic_match() {
+        use lodestash_core::catalog::{Catalog, CrawlRecord};
+
+        let model = std::env::var("LODESTASH_ONNX_MODEL").expect("set LODESTASH_ONNX_MODEL");
+        let tok = std::env::var("LODESTASH_ONNX_TOKENIZER").expect("set LODESTASH_ONNX_TOKENIZER");
+        let emb = OnnxTextEmbedder::load(Path::new(&model), Path::new(&tok), "all-minilm-l6-v2", 384)
+            .expect("load");
+
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let sid = c.upsert_import_source("Lib", "C:/lib", "folder").expect("src");
+        let rec = |n: &str| CrawlRecord {
+            rel_path: format!("{n}.glb"),
+            name: n.to_string(),
+            media_type: "model_3d".into(),
+            size_bytes: 1,
+            mtime: 1,
+            workspace_rel: None,
+        };
+        // "boulder" shares no token with the query "rock"; "cello" is the distractor.
+        c.record_crawl(sid, None, &[rec("mossy_boulder"), rec("cello_solo")])
+            .expect("crawl");
+
+        // Drain like the persist thread does.
+        crate::worker::embed_dirty(&mut c, &emb, 100).expect("embed");
+
+        let qv = emb.embed_text("a rock");
+        let ids = c
+            .hybrid_search("a rock", Some(&qv), emb.model_id(), None, 10)
+            .expect("hybrid");
+        println!("hybrid ids for 'a rock': {ids:?}");
+        assert!(!ids.is_empty(), "vector arm must recall something for 'a rock'");
+        // The boulder (asset id 1) must outrank the cello — semantic, not lexical.
+        let pos = |want: i64| ids.iter().position(|&i| i == want);
+        assert!(
+            pos(1).is_some() && (pos(2).is_none() || pos(1) < pos(2)),
+            "mossy_boulder should rank above cello_solo for 'a rock'"
+        );
+    }
+
     /// Real-model probe: point at an exported sentence encoder + tokenizer and run it.
     /// `LODESTASH_ONNX_MODEL=model.onnx LODESTASH_ONNX_TOKENIZER=tokenizer.json \
     ///  cargo test -p lodestash-ai probe -- --ignored --nocapture`

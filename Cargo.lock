@@ -2669,6 +2669,7 @@ dependencies = [
  "egui_extras",
  "flate2",
  "image",
+ "lodestash-ai",
  "lodestash-core",
  "lodestash-ingest",
  "proptest",

@@ -579,6 +579,10 @@ pub struct LodestashApp {
     search_ranks: Option<std::collections::HashMap<i64, usize>>,
     /// The query the current `search_ranks` were computed for — the recompute guard.
     search_ranks_key: Option<String>,
+    /// The local text encoder for Search-with-AI (IDENTIFICATION-AND-SEARCH §5.B), shared
+    /// by the query side (this thread) and the persist-thread embed drain. `None` when the
+    /// ONNX Runtime + model artifacts aren't present — AI search then stays a stub.
+    text_embedder: Option<Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
     active_tab: Category,
     sort_by: SortBy,
     sort_asc: bool,
@@ -722,6 +726,7 @@ impl LodestashApp {
             search_catalog: catalog_db_path().and_then(|p| Catalog::open(&p).ok()),
             search_ranks: None,
             search_ranks_key: None,
+            text_embedder: resolve_text_embedder(),
             active_tab: Category::All,
             sort_by,
             sort_asc,
@@ -1218,13 +1223,14 @@ impl LodestashApp {
 
         let generation = self.scan_generation;
         let tx = self.catalog_tx.clone();
+        let embedder = self.text_embedder.clone();
         self.catalog_persisting = true;
         std::thread::spawn(move || {
-            let (counts, assets) = match persist_to_catalog(&db_path, &batches) {
-                Ok((counts, assets)) => (Some(counts), assets),
+            let (counts, assets, catalog) = match persist_to_catalog(&db_path, &batches) {
+                Ok((counts, assets, cat)) => (Some(counts), assets, Some(cat)),
                 Err(err) => {
                     tracing::warn!(%err, "catalog persist failed; UI stays on in-memory counts");
-                    (None, Vec::new())
+                    (None, Vec::new(), None)
                 }
             };
             // Send even on failure so the in-flight flag always clears.
@@ -1233,6 +1239,12 @@ impl LodestashApp {
                 counts,
                 assets,
             });
+            // Then embed the rows `record_crawl` just marked dirty, on this same connection
+            // (still the sole writer). Runs *after* the grid gets its identity, so a large
+            // first scan doesn't stall the UI on inference. Search-with-AI needs these.
+            if let (Some(mut cat), Some(emb)) = (catalog, embedder) {
+                drain_embeddings(&mut cat, emb.as_ref());
+            }
         });
     }
 
@@ -1991,7 +2003,51 @@ impl LodestashApp {
     /// back to `None` (path-substring only) when there's no catalog or the query is empty.
     /// The map is `asset_id → BM25 rank` (0 = best): membership for filtering, order for
     /// the Relevance sort.
+    /// Search-with-AI (IDENTIFICATION-AND-SEARCH §5.B): embed the query locally, fuse BM25 ⊕
+    /// vector KNN via `hybrid_search`, and drop the ranked result ids into `search_ranks` — the
+    /// same map Tags search uses, so the grid filter/sort just works. No-op (leaves the stub)
+    /// when no embedder is loaded. Runs inline: a query is one short forward pass (~ms on CPU).
+    fn run_ai_search(&mut self) {
+        const HIT_CAP: usize = 100_000;
+        let query = self.search.trim().to_string();
+        let Some(emb) = self.text_embedder.clone() else {
+            return; // no model → AI stays stubbed
+        };
+        if query.is_empty() {
+            self.search_ranks = None;
+            self.search_ranks_key = None;
+            self.cache_dirty = true;
+            return;
+        }
+        if self.search_catalog.is_none() {
+            self.search_catalog = catalog_db_path().and_then(|p| Catalog::open(&p).ok());
+        }
+        let Some(cat) = &self.search_catalog else {
+            return;
+        };
+        let qv = emb.embed_text(&query);
+        // Bucket pre-filter is left to the grid's tab.matches (a Category spans several
+        // media_types; hybrid_search takes a single one) — pass None here.
+        let ids = cat
+            .hybrid_search(&query, Some(&qv), emb.model_id(), None, HIT_CAP)
+            .unwrap_or_default();
+        self.search_ranks = Some(
+            ids.into_iter()
+                .enumerate()
+                .map(|(rank, id)| (id, rank))
+                .collect(),
+        );
+        self.search_ranks_key = Some(format!("\0ai:{query}"));
+        self.sort_by = SortBy::Relevance; // fused order is the point of an AI search
+        self.cache_dirty = true;
+    }
+
     fn refresh_search_ranks(&mut self) {
+        // AI ranks are set explicitly by run_ai_search (on Enter), not recomputed per rebuild —
+        // leave them untouched here so a rebuild doesn't wipe the last AI result set.
+        if self.search_mode == SearchMode::Ai {
+            return;
+        }
         // Ranked retrieval with a high cap so a broad query keeps every match (the grid
         // re-scopes by source/tab/folder afterwards).
         const HIT_CAP: usize = 100_000;
@@ -2039,7 +2095,16 @@ impl LodestashApp {
         // still work — nothing that matched before stops matching. The BM25 order feeds the
         // Relevance sort (sort_indices).
         let ranks = self.search_ranks.as_ref();
+        // AI mode with a result set: the fused ids ARE the result — match iff the asset is in
+        // it (no path-substring union; the semantic set is exact). Until Enter runs (ranks
+        // None) nothing filters, so the grid is unchanged.
+        let ai_active = self.search_mode == SearchMode::Ai && ranks.is_some();
         let name_matches = |e: &AssetEntry| {
+            if ai_active {
+                return e
+                    .asset_id
+                    .is_some_and(|id| ranks.unwrap().contains_key(&id));
+            }
             if q.is_empty() {
                 return true;
             }
@@ -2076,7 +2141,7 @@ impl LodestashApp {
                 }
                 // Folders, top level: one tile per source; searching searches everything.
                 (ViewMode::Folders, None) => {
-                    if q.is_empty() {
+                    if q.is_empty() && !ai_active {
                         let tiles = self
                             .scan_roots
                             .iter()
@@ -2109,7 +2174,7 @@ impl LodestashApp {
                 // Folders, inside a source: direct children + subfolder tiles;
                 // searching searches the current subtree.
                 (ViewMode::Folders, Some((src, dir))) => {
-                    if q.is_empty() {
+                    if q.is_empty() && !ai_active {
                         folder_children(&self.entries, src, &dir, tab)
                     } else {
                         let idxs = self
@@ -3991,6 +4056,11 @@ impl eframe::App for LodestashApp {
                                 );
                                 if seg.clicked() && !active {
                                     self.search_mode = mode;
+                                    // Ranks belong to the old mode's query — drop them so the
+                                    // new mode starts clean (AI won't inherit Tags' ids as a
+                                    // result set, and vice-versa). Re-run recomputes them.
+                                    self.search_ranks = None;
+                                    self.search_ranks_key = None;
                                     self.cache_dirty = true;
                                 }
                             }
@@ -4006,6 +4076,7 @@ impl eframe::App for LodestashApp {
                     };
                     let search_w = (ui.available_width() - 560.0).clamp(120.0, 340.0);
                     let mut search_changed = false;
+                    let mut ai_submit = false;
                     egui::Frame::none()
                         .fill(theme::SURFACE)
                         .stroke(egui::Stroke::new(1.0, mode_color.linear_multiply(0.6)))
@@ -4028,17 +4099,28 @@ impl eframe::App for LodestashApp {
                             if resp.changed() && self.search_mode == SearchMode::Tags {
                                 search_changed = true;
                             }
+                            // AI mode is Enter-to-run (semantic search is not live-per-keystroke).
+                            if self.search_mode == SearchMode::Ai
+                                && resp.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            {
+                                ai_submit = true;
+                            }
                         });
                     if search_changed {
                         self.cache_dirty = true;
                     }
+                    if ai_submit {
+                        self.run_ai_search();
+                    }
                     if self.search_mode == SearchMode::Ai {
-                        // ponytail: stub — Enter will run §5B semantic search when P3/P4 land.
-                        ui.label(
-                            RichText::new("\u{2726} arrives with the AI pipeline (P4)")
-                                .color(theme::TEXT_DIM)
-                                .size(10.0),
-                        );
+                        let (msg, col) = if self.text_embedder.is_some() {
+                            ("\u{2726} semantic search ready \u{2014} press Enter", theme::ARCANE)
+                        } else {
+                            // ponytail: engine is done; the gap is the model artifact (P4 manager).
+                            ("\u{2726} add a text model to enable (Settings \u{25B8} AI)", theme::TEXT_DIM)
+                        };
+                        ui.label(RichText::new(msg).color(col).size(10.0));
                     }
 
                     // Category buckets (prototype top-bar `cats`): bordered chips, active =
@@ -6036,6 +6118,65 @@ fn catalog_db_path() -> Option<PathBuf> {
     Some(dir.join("catalog.db"))
 }
 
+/// Model id recorded with every text vector; the query side reads back under the same id.
+/// Bump if the encoder changes (old vectors then simply don't match — no collision).
+const TEXT_MODEL_ID: &str = "all-minilm-l6-v2";
+/// all-MiniLM-L6-v2 output width.
+const TEXT_EMBED_DIM: usize = 384;
+
+/// Locate the text encoder + tokenizer: `LODESTASH_ONNX_{MODEL,TOKENIZER}` env override
+/// (dev / the probe test), else `<data>/Lodestash/models/text/{model.onnx,tokenizer.json}`
+/// where the P4 model manager will download them. `None` when neither is present.
+fn text_model_paths() -> Option<(PathBuf, PathBuf)> {
+    if let (Ok(m), Ok(t)) = (
+        std::env::var("LODESTASH_ONNX_MODEL"),
+        std::env::var("LODESTASH_ONNX_TOKENIZER"),
+    ) {
+        return Some((PathBuf::from(m), PathBuf::from(t)));
+    }
+    let dir = dirs::data_dir()?.join("Lodestash").join("models").join("text");
+    let (m, t) = (dir.join("model.onnx"), dir.join("tokenizer.json"));
+    (m.exists() && t.exists()).then_some((m, t))
+}
+
+/// Load the local text embedder if its artifacts (+ a matching ONNX Runtime, discovered via
+/// `load-dynamic`) are present. Any failure is `None` — AI search falls back to its stub,
+/// never crashes. On a stock machine with no model this returns `None` immediately.
+fn resolve_text_embedder() -> Option<Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>> {
+    let (model, tok) = text_model_paths()?;
+    match lodestash_ai::onnx::OnnxTextEmbedder::load(&model, &tok, TEXT_MODEL_ID, TEXT_EMBED_DIM) {
+        Ok(e) => {
+            tracing::info!("onnx text embedder loaded — Search-with-AI is live");
+            Some(Arc::new(e))
+        }
+        Err(e) => {
+            tracing::info!(%e, "no local text embedder; Search-with-AI stays stubbed");
+            None
+        }
+    }
+}
+
+/// Drain the whole `embedding_dirty` queue in batches, encoding each with `emb`. Runs on the
+/// persist thread over its own (sole-writer) connection. A batch error stops the drain rather
+/// than spinning — the rows stay dirty and the next scan retries them.
+fn drain_embeddings(cat: &mut Catalog, emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync)) {
+    const BATCH: usize = 256;
+    let mut total = 0usize;
+    loop {
+        match lodestash_ai::worker::embed_dirty(cat, emb, BATCH) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) => {
+                tracing::warn!(%e, "embed drain stopped; dirty rows retry next scan");
+                break;
+            }
+        }
+    }
+    if total > 0 {
+        tracing::info!(embedded = total, "text embeddings written");
+    }
+}
+
 /// Raster types the Quick Look viewer can decode via the shared raster seam
 /// (`image` formats + DDS/PSD). HDR/EXR tone-map is the remaining #29 follow-up.
 fn is_viewer_image(mt: Option<MediaType>) -> bool {
@@ -6173,7 +6314,7 @@ fn read_back_assets(
 fn persist_to_catalog(
     db_path: &std::path::Path,
     batches: &[PersistBatch],
-) -> Result<CatalogReadBack, String> {
+) -> Result<(StatusCounts, AssetIdentityMaps, Catalog), String> {
     let mut catalog = Catalog::open(db_path).map_err(|e| e.to_string())?;
     catalog.seed_media_types().map_err(|e| e.to_string())?;
 
@@ -6217,7 +6358,9 @@ fn persist_to_catalog(
         .status_counts_for_sources(&ids)
         .map_err(|e| e.to_string())?;
     let assets = read_back_assets(&catalog, &sources)?;
-    Ok((counts, assets))
+    // Hand the open connection back so the caller can drain `embedding_dirty` on this same
+    // thread — keeps the single-writer rule (ARCHITECTURE §5) with no extra writer thread.
+    Ok((counts, assets, catalog))
 }
 
 /// A 128×128 radial-falloff sprite in `color`, peaking at `max_alpha` in the centre.
