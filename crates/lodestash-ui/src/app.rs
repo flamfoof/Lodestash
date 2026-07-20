@@ -3953,64 +3953,83 @@ impl eframe::App for LodestashApp {
                         }
                     }
 
-                    // Search mode toggle + search box (UI-SPEC §0.1). Tags is the live
-                    // substring filter; AI is a stub until the P3/P4 semantic pipeline.
-                    ui.separator();
+                    // Search mode toggle + search box (UI-SPEC §0.1, prototype top bar).
+                    ui.add_space(6.0);
                     let mode_color = match self.search_mode {
                         SearchMode::Tags => theme::GOLD,
                         SearchMode::Ai => theme::ARCANE,
                     };
-                    for (mode, label) in [
-                        (SearchMode::Tags, "\u{27E1} Tags"),
-                        (SearchMode::Ai, "\u{2726} AI"),
-                    ] {
-                        let active = self.search_mode == mode;
-                        let color = match mode {
-                            SearchMode::Tags => theme::GOLD,
-                            SearchMode::Ai => theme::ARCANE,
-                        };
-                        if ui
-                            .selectable_label(
-                                active,
-                                RichText::new(label).size(11.0).color(if active {
-                                    color
-                                } else {
-                                    theme::TEXT_DIM
-                                }),
-                            )
-                            .clicked()
-                            && !active
-                        {
-                            self.search_mode = mode;
-                            // Switching to Tags clears AI results (§0.1); the query
-                            // re-applies (or stops applying) as a live filter.
-                            self.cache_dirty = true;
-                        }
-                    }
+
+                    // Segmented mode toggle in a container pill (prototype `#232C3D` / `#3A465C`).
+                    egui::Frame::none()
+                        .fill(theme::OVERLAY)
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER_STRONG))
+                        .rounding(6.0)
+                        .inner_margin(egui::Margin::same(2.0))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            for (mode, label) in [
+                                (SearchMode::Tags, "\u{27E1} Tags"),
+                                (SearchMode::Ai, "\u{2726} AI"),
+                            ] {
+                                let active = self.search_mode == mode;
+                                let color = match mode {
+                                    SearchMode::Tags => theme::GOLD,
+                                    SearchMode::Ai => theme::ARCANE,
+                                };
+                                let seg = ui.add(
+                                    egui::Button::new(RichText::new(label).size(11.0).color(
+                                        if active { color } else { theme::TEXT_DIM },
+                                    ))
+                                    .fill(if active {
+                                        color.linear_multiply(0.16)
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    })
+                                    .stroke(egui::Stroke::NONE)
+                                    .rounding(4.0),
+                                );
+                                if seg.clicked() && !active {
+                                    self.search_mode = mode;
+                                    self.cache_dirty = true;
+                                }
+                            }
+                        });
+
+                    ui.add_space(8.0);
+                    // Contained search box: `#161B26` bg, mode-colored border, magnifier + input.
                     let hint = match self.search_mode {
                         SearchMode::Tags => "Search\u{2026}  /",
                         SearchMode::Ai => {
                             "describe what you need \u{2014} e.g. \u{BB}pickup sound for rocks\u{AB} \u{2014} then Enter"
                         }
                     };
-                    let search_resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.search)
-                            .id(egui::Id::new("search_field"))
-                            .hint_text(hint)
-                            .desired_width(
-                                // Leave room for the category chips + right-hand group.
-                                (ui.available_width() - 660.0).clamp(120.0, 320.0),
-                            ),
-                    );
-                    // Border follows the active mode; brighter while focused (§0.1).
-                    let border = if search_resp.has_focus() {
-                        egui::Stroke::new(1.5, mode_color)
-                    } else {
-                        egui::Stroke::new(1.0, mode_color.linear_multiply(0.4))
-                    };
-                    ui.painter()
-                        .rect_stroke(search_resp.rect.expand(1.0), 4.0, border);
-                    if search_resp.changed() && self.search_mode == SearchMode::Tags {
+                    let search_w = (ui.available_width() - 560.0).clamp(120.0, 340.0);
+                    let mut search_changed = false;
+                    egui::Frame::none()
+                        .fill(theme::SURFACE)
+                        .stroke(egui::Stroke::new(1.0, mode_color.linear_multiply(0.6)))
+                        .rounding(6.0)
+                        .inner_margin(egui::Margin::symmetric(10.0, 7.0))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = 7.0;
+                            let (icon_rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(14.0), egui::Sense::hover());
+                            egui::Image::new(egui::include_image!("../assets/icons/search.svg"))
+                                .tint(theme::TEXT_DIM)
+                                .paint_at(ui, icon_rect);
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut self.search)
+                                    .id(egui::Id::new("search_field"))
+                                    .frame(false)
+                                    .hint_text(hint)
+                                    .desired_width(search_w),
+                            );
+                            if resp.changed() && self.search_mode == SearchMode::Tags {
+                                search_changed = true;
+                            }
+                        });
+                    if search_changed {
                         self.cache_dirty = true;
                     }
                     if self.search_mode == SearchMode::Ai {
