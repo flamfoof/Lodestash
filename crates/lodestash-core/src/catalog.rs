@@ -48,6 +48,16 @@ pub struct StatusCounts {
     pub confirmed: usize,
 }
 
+/// One asset awaiting an embedding (the embed worker's unit of work): the display text to
+/// encode plus the pre-filter columns stored alongside its vector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbedJob {
+    pub asset_id: i64,
+    pub text: String,
+    pub media_type_id: i64,
+    pub source_id: i64,
+}
+
 impl StatusCounts {
     pub fn total(&self) -> usize {
         self.unidentified + self.identified + self.confirmed
@@ -1145,6 +1155,38 @@ impl Catalog {
     /// Upsert an asset's embedding (M8; DATA-MODEL §3). Stores `vector` as little-endian
     /// f32 BLOB and clears `asset.embedding_dirty` in one transaction (index-sync rule).
     /// `media_type_id`/`source_id` are denormalised for KNN pre-filtering.
+    /// Assets whose embedding is stale (`embedding_dirty=1`), with the display text to
+    /// embed (name + description) and the pre-filter columns — the embed worker's queue.
+    pub fn assets_needing_embedding(&self, limit: usize) -> Result<Vec<EmbedJob>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, name, description, media_type_id, source_id
+                 FROM asset
+                 WHERE embedding_dirty = 1 AND deleted_at IS NULL
+                 ORDER BY id LIMIT ?1",
+            )
+            .map_err(|e| CoreError::Catalog(format!("embed queue prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                let name: String = r.get(1)?;
+                let desc: Option<String> = r.get(2)?;
+                let text = match desc {
+                    Some(d) if !d.trim().is_empty() => format!("{name} {d}"),
+                    _ => name,
+                };
+                Ok(EmbedJob {
+                    asset_id: r.get(0)?,
+                    text,
+                    media_type_id: r.get(3)?,
+                    source_id: r.get(4)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("embed queue query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("embed queue row: {e}")))
+    }
+
     pub fn upsert_embedding(
         &mut self,
         asset_id: i64,
