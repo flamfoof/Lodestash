@@ -437,7 +437,8 @@ impl Screen {
             Screen::Collections => "Collections",
             Screen::Packages => "Packages",
             Screen::Unity => "Unity Assets",
-            Screen::Vocabulary => "Vocabulary",
+            // Prototype nav label is "Traits" (the Mapping tab lives inside this screen).
+            Screen::Vocabulary => "Traits",
             Screen::Stats => "Stats",
             Screen::Duplicates => "Duplicates",
             Screen::Trash => "Trash",
@@ -2285,7 +2286,7 @@ impl LodestashApp {
                         }
                     }
 
-                    ui.add_space(14.0);
+                    sidebar_divider(ui);
                     facet_group_label(ui, "STATUS");
                     if facets_open {
                         for (sf, label, color, count) in [
@@ -2317,7 +2318,7 @@ impl LodestashApp {
                         }
                     }
 
-                    ui.add_space(14.0);
+                    sidebar_divider(ui);
                     facet_group_label(ui, "LIBRARIES");
                     if facets_open {
                         if facet_row(
@@ -4336,11 +4337,10 @@ impl eframe::App for LodestashApp {
         self.jobs_tray(ctx);
         self.toasts_overlay(ctx);
 
-        // ── Pending packages bar ────────────────────────────────────────────────
-        // .unitypackage files found while crawling — shown here rather than as opaque grid
-        // cards, since a raw archive isn't browseable until extracted (see the KANBAN Phase 2
-        // "wiring" note this closes: extraction is user-triggered, never automatic on scan).
-        if !self.pending_packages.is_empty() {
+        // ── Pending packages bar (Unity Assets screen only) ─────────────────────
+        // .unitypackage files found while crawling — the Extract/Browse affordance lives on
+        // the dedicated Unity Assets screen, not cluttering the Library view.
+        if !self.pending_packages.is_empty() && self.screen == Screen::Unity {
             let mut extract_clicked: Option<usize> = None;
             let mut picked_clicked: Option<usize> = None;
             egui::TopBottomPanel::top("packages_bar")
@@ -6271,6 +6271,20 @@ fn sidebar_nav_row(
 }
 
 /// A letter-spaced dim facet-group label (STATUS / LIBRARIES).
+/// A 1px sidebar divider inset from the edges (prototype: `height:1px; background:#2C3547;
+/// margin:12px 14px`), separating the nav list from the facet groups.
+fn sidebar_divider(ui: &mut Ui) {
+    ui.add_space(11.0);
+    let (rect, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().hline(
+        (rect.left() + 6.0)..=(rect.right() - 6.0),
+        rect.center().y,
+        egui::Stroke::new(1.0, theme::BORDER),
+    );
+    ui.add_space(9.0);
+}
+
 fn facet_group_label(ui: &mut Ui, text: &str) {
     // ponytail: egui has no letter-spacing; spaced chars approximate the design token.
     let spaced: String = text.chars().flat_map(|c| [c, ' ']).collect();
@@ -6988,63 +7002,58 @@ fn quick_look_content(
             }
         }
     } else if is_audio {
-        // Audio (prototype §"Quick Look → sound"): waveform in the #141926 recess on top,
-        // then a grounded controls bar — circular arcane play button, mono time, and a
-        // contained volume bar.
+        // Audio (prototype §"Quick Look → sound"): waveform + transport together in one
+        // #141926 sound recess.
         let ap = audio.expect("is_audio implies audio");
         let dur = ap.meta.as_ref().map_or(0.0, |m| m.duration);
 
-        // Waveform recess. Fixed height — deriving it from available height feeds back
-        // into the auto-sizing window and creeps taller each frame.
-        let wave = Vec2::new(ui.available_width(), 150.0);
-        let (resp, painter) = ui.allocate_painter(wave, egui::Sense::click());
-        painter.rect_filled(resp.rect, 6.0, theme::RECESS);
-        if let Some(meta) = &ap.meta {
-            draw_waveform(
-                &painter,
-                resp.rect,
-                &meta.peaks,
-                ap.position(),
-                meta.duration,
-            );
-            if resp.clicked() {
-                if let Some(p) = resp.interact_pointer_pos() {
-                    let frac = ((p.x - resp.rect.left()) / resp.rect.width()).clamp(0.0, 1.0);
-                    ap.seek(frac * meta.duration);
-                }
-            }
-        } else {
-            let (msg, color) = if ap.loading {
-                (
-                    "\u{25CC} decoding waveform\u{2026}".to_string(),
-                    theme::ARCANE,
-                )
-            } else if let Some(err) = &ap.error {
-                (format!("\u{2298} couldn't decode: {err}"), theme::DANGER)
-            } else {
-                (String::new(), theme::TEXT_DIM)
-            };
-            if !msg.is_empty() {
-                painter.text(
-                    resp.rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    msg,
-                    egui::FontId::proportional(11.0),
-                    color,
-                );
-            }
-        }
-
-        ui.add_space(10.0);
-
-        // Controls bar — a contained panel grounding the transport (design: transport row
-        // inside the sound preview area).
         egui::Frame::none()
-            .fill(theme::OVERLAY)
+            .fill(theme::RECESS)
             .stroke(egui::Stroke::new(1.0, theme::BORDER))
             .rounding(8.0)
-            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+            .inner_margin(egui::Margin::symmetric(16.0, 14.0))
             .show(ui, |ui| {
+                // Waveform — fixed height (an available-derived height feeds the
+                // auto-sizing window and creeps taller each frame).
+                let wave = Vec2::new(ui.available_width(), 120.0);
+                let (resp, painter) = ui.allocate_painter(wave, egui::Sense::click());
+                if let Some(meta) = &ap.meta {
+                    draw_waveform(
+                        &painter,
+                        resp.rect,
+                        &meta.peaks,
+                        ap.position(),
+                        meta.duration,
+                    );
+                    if resp.clicked() {
+                        if let Some(p) = resp.interact_pointer_pos() {
+                            let frac =
+                                ((p.x - resp.rect.left()) / resp.rect.width()).clamp(0.0, 1.0);
+                            ap.seek(frac * meta.duration);
+                        }
+                    }
+                } else {
+                    let (msg, color) = if ap.loading {
+                        (
+                            "\u{25CC} decoding waveform\u{2026}".to_string(),
+                            theme::ARCANE,
+                        )
+                    } else if let Some(err) = &ap.error {
+                        (format!("\u{2298} couldn't decode: {err}"), theme::DANGER)
+                    } else {
+                        (String::new(), theme::TEXT_DIM)
+                    };
+                    if !msg.is_empty() {
+                        painter.text(
+                            resp.rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            msg,
+                            egui::FontId::proportional(11.0),
+                            color,
+                        );
+                    }
+                }
+                ui.add_space(14.0);
                 // Row 1 — transport: play · timeline scrub · time (prototype's sound row).
                 ui.horizontal(|ui| {
                     let glyph = if ap.is_playing() {
@@ -7168,36 +7177,39 @@ fn quick_look_content(
 
 /// Paint a peak waveform in `rect`: centered vertical bars, the played portion in the
 /// bright sound token and the rest dimmed, plus a playhead line at `pos/dur`.
+/// Chunky rounded peak bars (prototype: 8px rounded bars, gap, played vs unplayed color).
+/// The 256 source peaks are aggregated down to however many bars fit; played bars take the
+/// bright sound token, the rest the base one — position is read from the color split, no
+/// separate playhead line (matches the prototype).
 fn draw_waveform(painter: &egui::Painter, rect: egui::Rect, peaks: &[f32], pos: f32, dur: f32) {
     if peaks.is_empty() {
         return;
     }
-    let played = theme::TYPE_SOUND;
-    let ahead = theme::TYPE_SOUND.linear_multiply(0.35);
+    let played = theme::ARCANE_BRIGHT; // #7BF0E5
+    let ahead = theme::TYPE_SOUND; // #49C9E0
     let mid = rect.center().y;
-    let half = rect.height() * 0.45;
-    let n = peaks.len();
+    let half = rect.height() * 0.46;
+    let (bar_w, gap) = (4.0f32, 3.0f32);
+    let step = bar_w + gap;
+    let n = (((rect.width() + gap) / step).floor() as usize).max(1);
     let play_frac = if dur > 0.0 {
         (pos / dur).clamp(0.0, 1.0)
     } else {
         0.0
     };
-    for (i, &p) in peaks.iter().enumerate() {
+    let src = peaks.len();
+    for i in 0..n {
+        // Aggregate the source peaks covering this display bar (peak of the window).
+        let lo = i * src / n;
+        let hi = (((i + 1) * src / n).max(lo + 1)).min(src);
+        let p = peaks[lo..hi].iter().copied().fold(0.0f32, f32::max);
+        let x = rect.left() + i as f32 * step + bar_w * 0.5;
+        let h = (p * half).max(1.5);
         let frac = (i as f32 + 0.5) / n as f32;
-        let x = rect.left() + frac * rect.width();
-        let h = (p * half).max(1.0);
         let color = if frac <= play_frac { played } else { ahead };
-        painter.line_segment(
-            [egui::pos2(x, mid - h), egui::pos2(x, mid + h)],
-            egui::Stroke::new(1.0, color),
-        );
+        let bar = egui::Rect::from_center_size(egui::pos2(x, mid), Vec2::new(bar_w, 2.0 * h));
+        painter.rect_filled(bar, bar_w * 0.5, color);
     }
-    // Playhead.
-    let px = rect.left() + play_frac * rect.width();
-    painter.line_segment(
-        [egui::pos2(px, rect.top()), egui::pos2(px, rect.bottom())],
-        egui::Stroke::new(1.0, theme::GOLD),
-    );
 }
 
 /// A contained volume control: a pill holding a speaker icon, a filled level bar, and a
