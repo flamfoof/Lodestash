@@ -6988,69 +6988,17 @@ fn quick_look_content(
             }
         }
     } else if is_audio {
-        // Audio: transport row + peak waveform with a click-to-seek playhead.
+        // Audio (prototype §"Quick Look → sound"): waveform in the #141926 recess on top,
+        // then a grounded controls bar — circular arcane play button, mono time, and a
+        // contained volume bar.
         let ap = audio.expect("is_audio implies audio");
         let dur = ap.meta.as_ref().map_or(0.0, |m| m.duration);
-        ui.horizontal(|ui| {
-            let label = if ap.is_playing() {
-                "\u{23F8} Pause"
-            } else {
-                "\u{25B6} Play"
-            };
-            if ui
-                .add(egui::Button::new(RichText::new(label).size(12.0)))
-                .clicked()
-            {
-                ap.toggle();
-            }
-            ui.label(
-                RichText::new(format!(
-                    "{} / {}",
-                    crate::audio::fmt_time(ap.position()),
-                    crate::audio::fmt_time(dur)
-                ))
-                .monospace()
-                .color(theme::TEXT_DIM)
-                .size(11.0),
-            );
-            // Global volume (persisted to config by the caller when it changes).
-            ui.add_space(10.0);
-            ui.label(RichText::new("\u{1F509}").size(13.0));
-            ui.spacing_mut().slider_width = 90.0;
-            let mut vol = ap.volume();
-            if ui
-                .add(egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false))
-                .on_hover_text("Playback volume (applies to all audio)")
-                .changed()
-            {
-                ap.set_volume(vol);
-            }
-            // Sample-rate / channels stat facets (DESIGN-GUIDELINES §7).
-            if let Some(meta) = &ap.meta {
-                let chans = match meta.channels {
-                    1 => "mono".to_string(),
-                    2 => "stereo".to_string(),
-                    n => format!("{n} ch"),
-                };
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "{:.1} kHz \u{2022} {chans}",
-                            meta.sample_rate as f32 / 1000.0
-                        ))
-                        .color(theme::TEXT_DIM)
-                        .size(10.0),
-                    );
-                });
-            }
-        });
-        ui.add_space(4.0);
 
-        // Fixed height — deriving it from available height feeds back into the
-        // auto-sizing window and creeps taller each frame.
+        // Waveform recess. Fixed height — deriving it from available height feeds back
+        // into the auto-sizing window and creeps taller each frame.
         let wave = Vec2::new(ui.available_width(), 150.0);
         let (resp, painter) = ui.allocate_painter(wave, egui::Sense::click());
-        painter.rect_filled(resp.rect, 4.0, theme::BG);
+        painter.rect_filled(resp.rect, 6.0, theme::RECESS);
         if let Some(meta) = &ap.meta {
             draw_waveform(
                 &painter,
@@ -7086,6 +7034,73 @@ fn quick_look_content(
                 );
             }
         }
+
+        ui.add_space(10.0);
+
+        // Controls bar — a contained panel grounding the transport (design: transport row
+        // inside the sound preview area).
+        egui::Frame::none()
+            .fill(theme::OVERLAY)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // Circular arcane play/pause button (prototype: 38px arcane pill).
+                    let glyph = if ap.is_playing() {
+                        "\u{23F8}"
+                    } else {
+                        "\u{25B6}"
+                    };
+                    let play = ui.add(
+                        egui::Button::new(
+                            RichText::new(glyph).color(theme::ARCANE_BRIGHT).size(14.0),
+                        )
+                        .min_size(Vec2::splat(34.0))
+                        .rounding(17.0)
+                        .fill(theme::ARCANE.linear_multiply(0.14))
+                        .stroke(egui::Stroke::new(1.0, theme::ARCANE)),
+                    );
+                    if play.clicked() {
+                        ap.toggle();
+                    }
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "{} / {}",
+                            crate::audio::fmt_time(ap.position()),
+                            crate::audio::fmt_time(dur)
+                        ))
+                        .monospace()
+                        .color(theme::TEXT_MUTED)
+                        .size(11.0),
+                    );
+
+                    // Trailing group (right-aligned): volume control, then the audio facts.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(meta) = &ap.meta {
+                            let chans = match meta.channels {
+                                1 => "mono".to_string(),
+                                2 => "stereo".to_string(),
+                                n => format!("{n} ch"),
+                            };
+                            ui.label(
+                                RichText::new(format!(
+                                    "{:.1} kHz \u{2022} {chans}",
+                                    meta.sample_rate as f32 / 1000.0
+                                ))
+                                .color(theme::TEXT_DIM)
+                                .size(10.0),
+                            );
+                            ui.add_space(10.0);
+                        }
+                        let mut vol = ap.volume();
+                        if volume_control(ui, &mut vol) {
+                            ap.set_volume(vol);
+                        }
+                    });
+                });
+            });
     } else {
         // Remaining non-previewable types keep the typed placeholder card
         // (sprite sheets / material spheres / font specimens arrive per issue #29).
@@ -7175,6 +7190,88 @@ fn draw_waveform(painter: &egui::Painter, rect: egui::Rect, peaks: &[f32], pos: 
         [egui::pos2(px, rect.top()), egui::pos2(px, rect.bottom())],
         egui::Stroke::new(1.0, theme::GOLD),
     );
+}
+
+/// A contained volume control: a pill holding a speaker icon, a filled level bar, and a
+/// percentage. Returns true when the value changed. The prototype has no volume control, so
+/// this follows the design's rounded-track + contained-panel language (JRPG chrome §4).
+fn volume_control(ui: &mut Ui, value: &mut f32) -> bool {
+    let mut changed = false;
+    egui::Frame::none()
+        .fill(theme::SURFACE)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+        .rounding(999.0)
+        .inner_margin(egui::Margin::symmetric(9.0, 4.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 7.0;
+                let (icon_rect, _) =
+                    ui.allocate_exact_size(Vec2::new(13.0, 13.0), egui::Sense::hover());
+                draw_speaker(ui.painter(), icon_rect, *value, theme::TEXT_MUTED);
+                changed = volume_bar(ui, value);
+                ui.label(
+                    RichText::new(format!("{:.0}%", (*value * 100.0).round()))
+                        .monospace()
+                        .color(theme::TEXT_DIM)
+                        .size(10.0),
+                );
+            });
+        });
+    changed
+}
+
+/// A filled, draggable level bar (rounded track + arcane fill + a bright knob) — the
+/// "more visible bar" the default egui slider wasn't. Click or drag anywhere to set.
+fn volume_bar(ui: &mut Ui, value: &mut f32) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(84.0, 8.0), egui::Sense::click_and_drag());
+    let painter = ui.painter();
+    let r = rect.height() / 2.0;
+    let v = value.clamp(0.0, 1.0);
+    painter.rect_filled(rect, r, theme::BORDER_STRONG);
+    if v > 0.0 {
+        let filled =
+            egui::Rect::from_min_size(rect.min, Vec2::new(rect.width() * v, rect.height()));
+        painter.rect_filled(filled, r, theme::ARCANE);
+    }
+    let kx = rect.left() + rect.width() * v;
+    painter.circle_filled(
+        egui::pos2(kx, rect.center().y),
+        rect.height() * 0.85,
+        theme::ARCANE_BRIGHT,
+    );
+    let mut changed = false;
+    if (resp.dragged() || resp.clicked()) && rect.width() > 0.0 {
+        if let Some(p) = resp.interact_pointer_pos() {
+            *value = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Draw a small speaker glyph (cone + level-dependent sound waves) filling `rect`.
+fn draw_speaker(painter: &egui::Painter, rect: egui::Rect, level: f32, color: egui::Color32) {
+    let s = rect.size().min_elem();
+    let o = rect.min;
+    let p = |fx: f32, fy: f32| egui::pos2(o.x + fx * s, o.y + fy * s);
+    // Cone silhouette (back plate + flared front).
+    let cone = vec![
+        p(0.06, 0.38),
+        p(0.26, 0.38),
+        p(0.48, 0.16),
+        p(0.48, 0.84),
+        p(0.26, 0.62),
+        p(0.06, 0.62),
+    ];
+    painter.add(egui::Shape::convex_polygon(cone, color, egui::Stroke::NONE));
+    // Sound waves — one at low volume, two above half, none when muted.
+    let stroke = egui::Stroke::new(1.4, color);
+    if level > 0.02 {
+        painter.line_segment([p(0.60, 0.34), p(0.60, 0.66)], stroke);
+    }
+    if level > 0.5 {
+        painter.line_segment([p(0.74, 0.24), p(0.74, 0.76)], stroke);
+    }
 }
 
 fn type_label_char(mt: Option<MediaType>) -> &'static str {

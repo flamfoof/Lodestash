@@ -10,6 +10,8 @@ pub const BG: Color32 = Color32::from_rgb(0x0E, 0x11, 0x17); // #0E1117
 pub const SURFACE: Color32 = Color32::from_rgb(0x16, 0x1B, 0x26); // #161B26
 pub const SURFACE_RAISED: Color32 = Color32::from_rgb(0x1E, 0x25, 0x33); // #1E2533
 pub const OVERLAY: Color32 = Color32::from_rgb(0x23, 0x2C, 0x3D); // #232C3D
+/// Sunken preview recess behind Quick Look 3D/audio previews (prototype #141926).
+pub const RECESS: Color32 = Color32::from_rgb(0x14, 0x19, 0x26); // #141926
 pub const BORDER: Color32 = Color32::from_rgb(0x2C, 0x35, 0x47); // #2C3547
 pub const BORDER_STRONG: Color32 = Color32::from_rgb(0x3A, 0x46, 0x5C); // #3A465C
 pub const TEXT: Color32 = Color32::from_rgb(0xE6, 0xE9, 0xF0); // #E6E9F0
