@@ -78,7 +78,7 @@ One vertical panel, three stacked groups:
    | Collections | `nav-collections` | — |
    | Packages | `nav-packages` | — |
    | Unity Assets | `unitypackage` | — |
-   | Vocabulary | `nav-traits` | — |
+   | Traits | `nav-traits` | — |
    | Stats | `nav-stats` | — |
    | Duplicates | `nav-duplicates` | open dup-group count |
    | Trash | `nav-trash` | trashed count |
@@ -323,7 +323,10 @@ exist: *"? N Unidentified assets have no tags yet — they're not in the graph."
 
 ---
 
-## 9. Vocabulary (Traits & Mapping)
+## 9. Traits (Traits & Mapping)
+
+> Nav label is **Traits** (matching the prototype); this screen still hosts both the Traits and
+> Mapping tabs — "Traits" is the destination name, Mapping is a tab within it.
 
 **One screen, two tabs** (header segmented control, same pattern as Stats §8): **❖ Traits** — the
 vocabulary you tag with — and **⇢ Mapping** — the rules that interpret tags into canonical

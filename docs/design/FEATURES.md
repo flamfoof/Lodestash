@@ -44,9 +44,9 @@ serving in `lodestash-api` (REST) and `lodestash-mcp` (MCP) — **REST and MCP s
 
 ### 0.3 Sidebar (left rail)
 - **Nav list** (`navItems`): Library, Identify (badge = unidentified count), Collections, Packages,
-  Unity Assets, Vocabulary, Stats, Duplicates (badge = dup groups), Trash (badge = trashed count),
-  Settings. Active row = `TEXT` fg, `SURFACE_RAISED` bg, `GOLD` left-border. **Vocabulary** is the
-  Traits + Mapping umbrella screen (§4.6, DATA-MODEL §4), not a bare "Traits" destination.
+  Unity Assets, Traits, Stats, Duplicates (badge = dup groups), Trash (badge = trashed count),
+  Settings. Active row = `TEXT` fg, `SURFACE_RAISED` bg, `GOLD` left-border. **Traits** is the nav
+  label (matching the prototype); the screen hosts both Traits and Mapping tabs (§4.6, DATA-MODEL §4).
 - **Facet sections** (only while on Library, `filterOpen`): **STATUS** (All/Unidentified/Identified/
   Confirmed with counts), **LIBRARIES** (All + each source library + pinned Unity libraries + `Add
   source…`). See §1.2 and §5.4.
@@ -167,8 +167,8 @@ heaviest packs (bar chart), heaviest assets, a **trait/link graph** canvas, and 
 rows** (unidentified count, duplicate groups, heaviest-model share, heaviest pack, teaching traits).
 Tabs switch between overview and graph. All derived from the live asset set.
 
-### 4.6 Vocabulary — Trait library (Traits tab)
-The **Vocabulary** destination hosts two tabs: **Traits** (below) and **Mapping** (the
+### 4.6 Traits — Trait library (+ Mapping tab)
+The **Traits** destination hosts two tabs: **Traits** (below) and **Mapping** (the
 taxonomy/category/alias/rule library — DATA-MODEL §4, unchanged here). This section specs the
 Traits tab: user-defined traits that teach the identifier.
 - **Create** a trait: name, scope (any/model/sound/image), optional usage description (advanced), and
