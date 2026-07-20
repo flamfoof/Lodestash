@@ -20,10 +20,14 @@ pub enum SortBy {
     Size,
     Modified,
     Rating,
+    /// BM25 match quality for the active Tags query (IDENTIFICATION-AND-SEARCH §5.A).
+    /// Falls back to name order when no query is active.
+    Relevance,
 }
 
 impl SortBy {
     pub const OPTIONS: &'static [(SortBy, &'static str)] = &[
+        (SortBy::Relevance, "Relevance"),
         (SortBy::Name, "Name"),
         (SortBy::Type, "Type"),
         (SortBy::Size, "Size"),

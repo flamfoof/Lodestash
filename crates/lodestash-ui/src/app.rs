@@ -543,11 +543,12 @@ pub struct LodestashApp {
     /// single writer (ARCHITECTURE §5) — WAL lets it read committed rows concurrently.
     /// `None` when no catalog exists yet (search falls back to path substring).
     search_catalog: Option<Catalog>,
-    /// Asset ids matching the current Tags query via FTS5/BM25, or `None` when the
-    /// query is empty (show everything). Recomputed only when the query text changes.
-    search_hits: Option<std::collections::HashSet<i64>>,
-    /// The query the current `search_hits` were computed for — the recompute guard.
-    search_hits_key: Option<String>,
+    /// Asset id → BM25 rank (0 = best) for the current Tags query, or `None` when the
+    /// query is empty (show everything). Drives both membership (Search by Tags) and the
+    /// Relevance sort. Recomputed only when the query text changes.
+    search_ranks: Option<std::collections::HashMap<i64, usize>>,
+    /// The query the current `search_ranks` were computed for — the recompute guard.
+    search_ranks_key: Option<String>,
     active_tab: Category,
     sort_by: SortBy,
     sort_asc: bool,
@@ -685,8 +686,8 @@ impl LodestashApp {
             project_name: None,
             search: String::new(),
             search_catalog: catalog_db_path().and_then(|p| Catalog::open(&p).ok()),
-            search_hits: None,
-            search_hits_key: None,
+            search_ranks: None,
+            search_ranks_key: None,
             active_tab: Category::All,
             sort_by,
             sort_asc,
@@ -1934,39 +1935,42 @@ impl LodestashApp {
     /// Rebuild the sorted+filtered index cache. Called only when `cache_dirty`.
     /// Selection is preserved by entry, not by grid slot — a filter change must not
     /// silently move the selection onto a different asset.
-    /// Recompute the FTS5 hit set for the current Tags query (Search by Tags, Surface A).
+    /// Recompute the FTS5 ranks for the current Tags query (Search by Tags, Surface A).
     /// Guarded by the query text so it runs once per change, not once per rebuild. Falls
     /// back to `None` (path-substring only) when there's no catalog or the query is empty.
-    fn refresh_search_hits(&mut self) {
-        // Membership filter, not ranked retrieval — a high cap so a broad query keeps every
-        // match (the grid re-scopes by source/tab/folder afterwards).
+    /// The map is `asset_id → BM25 rank` (0 = best): membership for filtering, order for
+    /// the Relevance sort.
+    fn refresh_search_ranks(&mut self) {
+        // Ranked retrieval with a high cap so a broad query keeps every match (the grid
+        // re-scopes by source/tab/folder afterwards).
         const HIT_CAP: usize = 100_000;
         let key = match self.search_mode {
             SearchMode::Tags if !self.search.trim().is_empty() => Some(self.search.to_lowercase()),
             _ => None,
         };
-        if key == self.search_hits_key {
+        if key == self.search_ranks_key {
             return;
         }
-        self.search_hits_key = key.clone();
+        self.search_ranks_key = key.clone();
         // Lazily open the read connection: on a fresh install the catalog doesn't exist
         // at startup, but the first scan creates it — pick it up on the first query rather
         // than needing a restart.
         if key.is_some() && self.search_catalog.is_none() {
             self.search_catalog = catalog_db_path().and_then(|p| Catalog::open(&p).ok());
         }
-        self.search_hits = match (&key, &self.search_catalog) {
-            (Some(q), Some(cat)) => cat
-                .search_assets(q, HIT_CAP)
-                .ok()
-                .flatten()
-                .map(|ids| ids.into_iter().collect()),
+        self.search_ranks = match (&key, &self.search_catalog) {
+            (Some(q), Some(cat)) => cat.search_assets(q, HIT_CAP).ok().flatten().map(|ids| {
+                ids.into_iter()
+                    .enumerate()
+                    .map(|(rank, id)| (id, rank))
+                    .collect()
+            }),
             _ => None,
         };
     }
 
     fn rebuild_cache(&mut self) {
-        self.refresh_search_hits();
+        self.refresh_search_ranks();
         let selected_entry = self
             .selected_cache_idx
             .and_then(|ci| self.sorted_cache.get(ci).copied());
@@ -1981,15 +1985,15 @@ impl LodestashApp {
         // Search by Tags (IDENTIFICATION-AND-SEARCH §5.A): catalogued entries match through
         // the FTS5 index (name/tags/description, prefix-tokenised); path substring is kept as
         // a union so uncatalogued entries (pre-persist / just-extracted) and mid-word matches
-        // still work — nothing that matched before stops matching. BM25 relevance ordering
-        // becomes a sort option in a later slice.
-        let hits = self.search_hits.as_ref();
+        // still work — nothing that matched before stops matching. The BM25 order feeds the
+        // Relevance sort (sort_indices).
+        let ranks = self.search_ranks.as_ref();
         let name_matches = |e: &AssetEntry| {
             if q.is_empty() {
                 return true;
             }
-            if let (Some(hits), Some(id)) = (hits, e.asset_id) {
-                if hits.contains(&id) {
+            if let (Some(ranks), Some(id)) = (ranks, e.asset_id) {
+                if ranks.contains_key(&id) {
                     return true;
                 }
             }
@@ -2108,7 +2112,13 @@ impl LodestashApp {
             idxs.retain(|&i| sf.matches(entries[i].status));
         }
 
-        sort_indices(&mut idxs, &self.entries, self.sort_by, self.sort_asc);
+        sort_indices(
+            &mut idxs,
+            &self.entries,
+            self.sort_by,
+            self.sort_asc,
+            self.search_ranks.as_ref(),
+        );
 
         self.sorted_cache = idxs;
         self.selected_cache_idx =
@@ -3447,8 +3457,45 @@ fn type_key(e: &AssetEntry) -> u8 {
 /// Sort `idxs` (indices into `entries`) in place per the view/sort toolbar's `sort_by`/`asc`.
 /// Name pre-computes keys once (decorate-sort-undecorate) since `name_key` allocates —
 /// worth avoiding at O(n log n) comparisons on 10k+ entry libraries.
-fn sort_indices(idxs: &mut Vec<usize>, entries: &[AssetEntry], sort_by: SortBy, asc: bool) {
+fn sort_indices(
+    idxs: &mut Vec<usize>,
+    entries: &[AssetEntry],
+    sort_by: SortBy,
+    asc: bool,
+    ranks: Option<&std::collections::HashMap<i64, usize>>,
+) {
     match sort_by {
+        // BM25 match quality (Search by Tags): FTS-ranked entries first in rank order,
+        // then the path-substring-only matches (and everything, when no query is active)
+        // in name order. Decorate once — `name_key` allocates.
+        SortBy::Relevance => {
+            let keys: Vec<(Option<usize>, String)> = idxs
+                .iter()
+                .map(|&i| {
+                    let rank = entries[i]
+                        .asset_id
+                        .and_then(|id| ranks.and_then(|r| r.get(&id).copied()));
+                    (rank, name_key(&entries[i]))
+                })
+                .collect();
+            let mut paired: Vec<(usize, usize)> = idxs.iter().copied().zip(0..).collect();
+            paired.sort_by(|&(_, ka), &(_, kb)| {
+                let (ra, na) = &keys[ka];
+                let (rb, nb) = &keys[kb];
+                let o = match (ra, rb) {
+                    (Some(x), Some(y)) => x.cmp(y).then_with(|| na.cmp(nb)),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => na.cmp(nb),
+                };
+                if asc {
+                    o
+                } else {
+                    o.reverse()
+                }
+            });
+            *idxs = paired.into_iter().map(|(i, _)| i).collect();
+        }
         SortBy::Name => {
             let keys: Vec<String> = idxs.iter().map(|&i| name_key(&entries[i])).collect();
             let mut paired: Vec<(usize, usize)> = idxs.iter().copied().zip(0..).collect();
@@ -7282,14 +7329,14 @@ mod tests {
             entry_full("cherry.png", 1, 1, Some(MediaType::Image)),
         ];
         let mut idxs = vec![0, 1, 2];
-        sort_indices(&mut idxs, &entries, SortBy::Name, true);
+        sort_indices(&mut idxs, &entries, SortBy::Name, true, None);
         assert_eq!(
             idxs,
             vec![1, 0, 2],
             "Apple < banana < cherry, ignoring case"
         );
 
-        sort_indices(&mut idxs, &entries, SortBy::Name, false);
+        sort_indices(&mut idxs, &entries, SortBy::Name, false, None);
         assert_eq!(idxs, vec![2, 0, 1], "descending reverses the same order");
     }
 
@@ -7301,11 +7348,11 @@ mod tests {
             entry_full("c", 200, 2, None),
         ];
         let mut idxs = vec![0, 1, 2];
-        sort_indices(&mut idxs, &entries, SortBy::Size, true);
+        sort_indices(&mut idxs, &entries, SortBy::Size, true, None);
         assert_eq!(idxs, vec![1, 2, 0], "ascending by size_bytes");
 
         let mut idxs = vec![0, 1, 2];
-        sort_indices(&mut idxs, &entries, SortBy::Modified, true);
+        sort_indices(&mut idxs, &entries, SortBy::Modified, true, None);
         assert_eq!(idxs, vec![1, 2, 0], "ascending by mtime");
     }
 
@@ -7318,12 +7365,36 @@ mod tests {
             entry_full("c", 1, 1, Some(MediaType::Model3d)),
         ];
         let mut idxs = vec![0, 1, 2];
-        sort_indices(&mut idxs, &entries, SortBy::Type, true);
+        sort_indices(&mut idxs, &entries, SortBy::Type, true, None);
         assert_eq!(
             idxs.last(),
             Some(&0),
             "unclassified entries sink to the end"
         );
+    }
+
+    #[test]
+    fn sort_indices_by_relevance_orders_by_bm25_rank() {
+        // Three catalogued entries; ranks say #2 is the best match, #0 next, #1 unranked.
+        let mut entries = vec![
+            entry_full("alpha.png", 1, 1, Some(MediaType::Image)),
+            entry_full("bravo.png", 1, 1, Some(MediaType::Image)),
+            entry_full("charlie.png", 1, 1, Some(MediaType::Image)),
+        ];
+        entries[0].asset_id = Some(10);
+        entries[1].asset_id = Some(20);
+        entries[2].asset_id = Some(30);
+        let ranks: std::collections::HashMap<i64, usize> = [(30, 0), (10, 1)].into_iter().collect(); // 20 is unranked
+
+        let mut idxs = vec![0, 1, 2];
+        sort_indices(&mut idxs, &entries, SortBy::Relevance, true, Some(&ranks));
+        // charlie (rank 0) then alpha (rank 1) then bravo (unranked, name-last).
+        assert_eq!(idxs, vec![2, 0, 1], "ranked entries lead in BM25 order");
+
+        // No ranks → pure name order (the no-query fallback).
+        let mut idxs = vec![2, 1, 0];
+        sort_indices(&mut idxs, &entries, SortBy::Relevance, true, None);
+        assert_eq!(idxs, vec![0, 1, 2], "no query → name order");
     }
 
     use proptest::prelude::*;
