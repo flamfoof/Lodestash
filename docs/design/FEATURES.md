@@ -217,7 +217,10 @@ mono path, `N assets · size`, **↻ Sync** (re-scan archive index), **Open →*
 - **Right pane — per-asset preview**, extracted without unpacking the whole archive:
   - **3D model** → orbit/zoom viewport with tri/vert/material readout.
   - **Texture / material** → checker-backed swatch + dimensions/format.
-  - **Audio** → waveform + play/pause transport + duration.
+  - **Audio** → peak waveform + transport: circular play/pause, a **seek timeline** (drag/click
+    to scrub), elapsed/total time, sample-rate/channels, and a **global volume** control
+    (persisted, applies to all playback). *(App-added beyond the prototype's static waveform +
+    play/pause; the prototype has no volume control.)*
   - **Prefab** → resolved object hierarchy tree.
   - **Script** → line-numbered code peek.
 - **⇢ Add to project** (per asset) copies that file **plus its resolved dependencies** into the open
