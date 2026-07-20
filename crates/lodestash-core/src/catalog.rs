@@ -12,6 +12,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use tracing::info;
 
 use crate::error::{CoreError, Result};
+use crate::fusion::rrf_fuse;
+use crate::vector::{BruteForceIndex, VectorIndex};
 
 /// One crawled file to persist — the crawl→catalog handoff (INGESTION.md §1).
 #[derive(Debug, Clone)]
@@ -1246,6 +1248,50 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("search row: {e}")))?;
         Ok(Some(ids))
     }
+
+    /// Hybrid search (IDENTIFICATION-AND-SEARCH §5.B, DATA-MODEL §3): run the two
+    /// retrievers over the (media-type pre-filtered) set and fuse them with RRF.
+    ///
+    /// - **BM25** over `query` (skipped when the query is empty/punctuation-only).
+    /// - **Vector KNN** over `query_vec` against the `model_id` embeddings (skipped when
+    ///   `query_vec` is `None` — then this degrades to pure structural, i.e. Search by Tags).
+    ///
+    /// Returns fused asset ids, most-relevant first, capped at `limit`. The caller supplies
+    /// `query_vec` (embedding the query is `lodestash-ai`'s job — keeps this crate model-free).
+    /// ponytail: no cross-encoder rerank step yet (§5.B step 4, opt-in) — add it behind a flag
+    /// if top-N precision needs it.
+    pub fn hybrid_search(
+        &self,
+        query: &str,
+        query_vec: Option<&[f32]>,
+        model_id: &str,
+        media_type_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<i64>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Retrieve deeper than `limit` from each side so RRF has ranks to fuse; the fused
+        // list is truncated to `limit` at the end.
+        let depth = limit.saturating_mul(5).max(50);
+
+        let bm25 = self.search_assets(query, depth)?.unwrap_or_default();
+
+        let knn = match query_vec {
+            Some(qv) => {
+                let candidates = self.embeddings_for_knn(model_id, media_type_id)?;
+                BruteForceIndex::new(candidates)
+                    .knn(qv, depth)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+
+        // RRF fuses on rank, so an empty retriever simply contributes nothing (k≈60, §3).
+        Ok(rrf_fuse(&[bm25, knn], 60.0, limit))
+    }
 }
 
 /// Turn free user text into a safe FTS5 MATCH expression: split on non-alphanumerics,
@@ -1529,6 +1575,70 @@ mod tests {
             .execute("UPDATE asset SET deleted_at=1 WHERE id=?1", [ids[0]])
             .unwrap();
         assert_eq!(c.embeddings_for_knn("siglip2", None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hybrid_search_fuses_bm25_and_knn() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let src = c
+            .upsert_import_source("Lib", "C:/lib", "folder")
+            .expect("src");
+        c.record_crawl(
+            src,
+            None,
+            &[
+                rec("rock_wall.png", 1, 1), // BM25-matches "rock"; vector identical to query
+                rec("rock_floor.png", 2, 1), // BM25-matches "rock"; vector orthogonal
+                rec("tree_oak.png", 3, 1),  // no BM25 match; vector close to query
+            ],
+        )
+        .expect("crawl");
+        // Map name → id so assertions don't depend on insertion order.
+        let id_of = |name: &str| -> i64 {
+            c.conn
+                .query_row("SELECT id FROM asset WHERE name=?1", [name], |r| r.get(0))
+                .unwrap()
+        };
+        let (wall, floor, oak) = (
+            id_of("rock_wall.png"),
+            id_of("rock_floor.png"),
+            id_of("tree_oak.png"),
+        );
+        let img: i64 = c
+            .conn
+            .query_row("SELECT id FROM media_type WHERE code='image'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        c.upsert_embedding(wall, "m", "image", Some(img), Some(src), &[1.0, 0.0, 0.0])
+            .unwrap();
+        c.upsert_embedding(floor, "m", "image", Some(img), Some(src), &[0.0, 1.0, 0.0])
+            .unwrap();
+        c.upsert_embedding(oak, "m", "image", Some(img), Some(src), &[0.9, 0.1, 0.0])
+            .unwrap();
+
+        // Query "rock" (BM25 → wall, floor) + vector [1,0,0] (KNN → wall, oak, floor).
+        let fused = c
+            .hybrid_search("rock", Some(&[1.0, 0.0, 0.0]), "m", None, 10)
+            .expect("hybrid");
+        assert_eq!(fused[0], wall, "wall wins — high in both retrievers");
+        assert!(
+            fused.contains(&oak),
+            "oak enters via the vector retriever alone"
+        );
+        assert!(fused.contains(&floor));
+
+        // query_vec = None → pure structural (BM25 only): oak (no name match) is absent.
+        let structural = c
+            .hybrid_search("rock", None, "m", None, 10)
+            .expect("structural");
+        assert!(!structural.contains(&oak), "no vector → tree not found");
+        assert!(structural.contains(&wall) && structural.contains(&floor));
+        assert!(c
+            .hybrid_search("rock", None, "m", None, 0)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
