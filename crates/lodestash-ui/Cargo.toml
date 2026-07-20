@@ -27,6 +27,7 @@ egui   = { workspace = true }
 three-d       = { workspace = true }
 three-d-asset = { workspace = true }
 rodio         = { workspace = true }
+egui_extras   = { workspace = true }
 rfd    = { workspace = true }
 image  = { workspace = true }
 dirs   = { workspace = true }

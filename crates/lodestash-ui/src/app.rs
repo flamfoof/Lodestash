@@ -475,6 +475,23 @@ impl Screen {
         }
     }
 
+    /// White-stroke SVG nav icon (tinted per row state in the sidebar). Design icons from
+    /// `docs/design/icons/`, recolored to white so egui can tint them.
+    fn icon(self) -> egui::ImageSource<'static> {
+        match self {
+            Screen::Library => egui::include_image!("../assets/icons/nav-library.svg"),
+            Screen::Identify => egui::include_image!("../assets/icons/nav-identify.svg"),
+            Screen::Collections => egui::include_image!("../assets/icons/nav-collections.svg"),
+            Screen::Packages => egui::include_image!("../assets/icons/nav-packages.svg"),
+            Screen::Unity => egui::include_image!("../assets/icons/unitypackage.svg"),
+            Screen::Vocabulary => egui::include_image!("../assets/icons/nav-traits.svg"),
+            Screen::Stats => egui::include_image!("../assets/icons/nav-stats.svg"),
+            Screen::Duplicates => egui::include_image!("../assets/icons/nav-duplicates.svg"),
+            Screen::Trash => egui::include_image!("../assets/icons/nav-trash.svg"),
+            Screen::Settings => egui::include_image!("../assets/icons/nav-settings.svg"),
+        }
+    }
+
     fn glyph_color(self) -> egui::Color32 {
         match self {
             Screen::Library | Screen::Collections => theme::GOLD,
@@ -679,6 +696,8 @@ pub struct LodestashApp {
 impl LodestashApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         crate::fonts::install(&cc.egui_ctx);
+        // SVG/image loaders for the sidebar nav icons (egui_extras).
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx);
 
         let (thumb_tx, thumb_rx) = mpsc::channel();
@@ -2281,7 +2300,7 @@ impl LodestashApp {
                         };
                         if sidebar_nav_row(
                             ui,
-                            screen.glyph(),
+                            screen.icon(),
                             screen.glyph_color(),
                             screen.label(),
                             (badge > 0).then_some(badge),
@@ -6205,32 +6224,38 @@ fn radial_image(color: egui::Color32, max_alpha: u8) -> egui::ColorImage {
 /// Active shows an `--ls-overlay` fill + 2px gold left border (UI-SPEC §0.2).
 fn sidebar_nav_row(
     ui: &mut Ui,
-    glyph: &str,
-    glyph_color: egui::Color32,
+    icon: egui::ImageSource<'static>,
+    icon_color: egui::Color32,
     label: &str,
     badge: Option<usize>,
     active: bool,
 ) -> egui::Response {
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::click());
-    let painter = ui.painter();
+    // Row background first, so the icon draws on top of it.
     if active {
-        painter.rect_filled(rect, 4.0, theme::OVERLAY);
-        painter.rect_filled(
+        ui.painter().rect_filled(rect, 4.0, theme::OVERLAY);
+        ui.painter().rect_filled(
             egui::Rect::from_min_size(rect.left_top(), egui::vec2(2.0, rect.height())),
             0.0,
             theme::GOLD,
         );
     } else if resp.hovered() {
-        painter.rect_filled(rect, 4.0, theme::OVERLAY.linear_multiply(0.5));
+        ui.painter()
+            .rect_filled(rect, 4.0, theme::OVERLAY.linear_multiply(0.5));
     }
-    painter.text(
-        rect.left_center() + egui::vec2(12.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        glyph,
-        egui::FontId::proportional(15.0),
-        glyph_color,
+    // The 16px SVG icon, tinted by row state (its own accent when active, muted otherwise).
+    let tint = if active {
+        icon_color
+    } else {
+        theme::TEXT_MUTED
+    };
+    let icon_rect = egui::Rect::from_center_size(
+        rect.left_center() + egui::vec2(20.0, 0.0),
+        Vec2::splat(16.0),
     );
+    egui::Image::new(icon).tint(tint).paint_at(ui, icon_rect);
+    let painter = ui.painter();
     painter.text(
         rect.left_center() + egui::vec2(36.0, 0.0),
         egui::Align2::LEFT_CENTER,
