@@ -2,3 +2,4 @@
 //! Spec: docs/AI-PIPELINE.md, docs/IDENTIFICATION-AND-SEARCH.md §3-4
 
 pub mod embedder;
+pub mod onnx;

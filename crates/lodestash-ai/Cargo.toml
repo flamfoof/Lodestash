@@ -16,8 +16,11 @@ thiserror      = { workspace = true }
 tracing        = { workspace = true }
 tokio          = { workspace = true }
 
-# Added in Phase 3/4:
-# ort        = { version = "2", features = ["load-dynamic"] }  # ONNX Runtime
-# tokenizers = "0.20"
-# ndarray    = "0.16"
+# Phase 3 local embeddings (ONNX Runtime via ort; load-dynamic = dlopen at runtime,
+# so the build never needs the ~200MB native binary — see TECH-STACK §7).
+ort        = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic", "ndarray"] }
+tokenizers = "0.20"
+ndarray    = "0.16"
+
+# Added in Phase 4:
 # reqwest    = { version = "0.12", features = ["json", "stream"] }  # Ollama + cloud
