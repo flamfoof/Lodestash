@@ -32,7 +32,7 @@ flagged.
 
 | Concern | Choice | Notes |
 |---|---|---|
-| **DB / search** | SQLite (WAL) via `rusqlite` (bundled) + **FTS5** + **sqlite-vec** (loadable ext) | one file; `VectorIndex` trait → **LanceDB** (`lancedb` crate) past ~500k–1M vectors |
+| **DB / search** | SQLite (WAL) via `rusqlite` (bundled) + **FTS5**; vectors are BLOBs scanned by `BruteForceIndex` behind the `VectorIndex` trait | one file. **`sqlite-vec` is deferred, not shipped** — measured 2026-07-20 (`perf_probe_knn_scaling`): at 50k×768-d a query is 212ms, of which the BLOB reload+decode is ~5.6× the cosine scan, so an ANN index would optimise the cheap half *and* reintroduce a native loadable-extension to bundle. AI search is submit-driven (once per Enter), so this is fine to ~100k. Swap in `sqlite-vec` (or LanceDB past ~500k–1M) behind the trait when a real library shows it's needed |
 | **3D render** | `three-d` **0.18** on eframe's shared **Glow** GL context (§7 — glow-version lockstep) | FBX flattens in-process via `ufbx`; glTF/GLB/OBJ load directly via `three-d-asset` (Assimp/`FBX2glTF` deferred — §7) |
 | **Audio** | `symphonia` (decode) + `rodio` (playback) | waveform drawn with egui painter |
 | **Images** | `image` + `image_dds` (BCn/DDS) + `psd` + EXR/HDR via `image` | dominant color via `color-thief`/k-means → `dominant_color` |

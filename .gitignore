@@ -33,3 +33,6 @@ desktop.ini
 .claude-flow/
 .claude/proven-config.json
 .claude/.proven-config-version
+
+# Claudenator isolate worktrees (ephemeral, agent-owned)
+.claudenator-wt-*/

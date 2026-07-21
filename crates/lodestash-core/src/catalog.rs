@@ -1793,6 +1793,71 @@ mod tests {
         assert_eq!(hits.len(), 1, "trashed asset excluded");
     }
 
+    /// Perf probe (not an assertion of speed — a measurement): how does the brute-force KNN
+    /// path scale? Splits the two costs so we optimise the real one instead of guessing —
+    /// reloading+decoding every BLOB per query vs. the cosine scan + full sort.
+    /// `cargo test -p lodestash-core perf_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn perf_probe_knn_scaling() {
+        use std::time::Instant;
+        const DIM: usize = 768;
+
+        for n in [10_000usize, 50_000] {
+            let dir = tempfile::tempdir().expect("tmp");
+            let mut c = Catalog::open(&dir.path().join("perf.db")).expect("open");
+            c.seed_media_types().expect("seed");
+            let sid = c.upsert_import_source("s", "G:/s", "folder").expect("sid");
+
+            let recs: Vec<CrawlRecord> = (0..n)
+                .map(|i| {
+                    let mut r = rec(&format!("a{i}.png"), 1, 1);
+                    r.media_type = "image".into();
+                    r
+                })
+                .collect();
+            c.record_crawl(sid, None, &recs).expect("crawl");
+
+            // Deterministic pseudo-random unit-ish vectors.
+            let mk = |seed: usize| -> Vec<f32> {
+                let mut h = seed as u64 ^ 0x9E37_79B9_7F4A_7C15;
+                (0..DIM)
+                    .map(|_| {
+                        h ^= h << 13;
+                        h ^= h >> 7;
+                        h ^= h << 17;
+                        (h as u32 as f32 / u32::MAX as f32) - 0.5
+                    })
+                    .collect()
+            };
+            let t = Instant::now();
+            for i in 0..n {
+                c.upsert_embedding(i as i64 + 1, "m", "image", Some(1), Some(sid), &mk(i))
+                    .expect("upsert");
+            }
+            let seed_time = t.elapsed();
+
+            let t = Instant::now();
+            let cands = c.embeddings_for_knn("m", None).expect("load");
+            let load = t.elapsed();
+            assert_eq!(cands.len(), n);
+
+            let q = mk(12345);
+            let t = Instant::now();
+            let idx = crate::vector::BruteForceIndex::new(cands);
+            let hits = <crate::vector::BruteForceIndex as crate::vector::VectorIndex>::knn(
+                &idx, &q, 20,
+            );
+            let scan = t.elapsed();
+            assert_eq!(hits.len(), 20);
+
+            println!(
+                "n={n:>6} dim={DIM}  seed={seed_time:>10.2?}  LOAD={load:>10.2?}  SCAN+SORT={scan:>10.2?}  total_query={:?}",
+                load + scan
+            );
+        }
+    }
+
     #[test]
     fn visual_embed_queue_covers_images_models_on_disk_and_extracted() {
         let mut c = Catalog::open_in_memory().expect("open");
