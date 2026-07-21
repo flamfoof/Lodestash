@@ -25,6 +25,18 @@ pub trait Embedder {
     fn supports_image(&self) -> bool {
         false
     }
+    /// Embed a precomputed **log-mel spectrogram** (row-major `[frames][mels]`) into the same
+    /// space as [`Self::embed_text`] — a joint audio↔text model like CLAP. Takes the mel rather
+    /// than raw samples so the DSP stays in `lodestash-ingest` and this crate stays models-only,
+    /// mirroring how [`Self::embed_image`] takes an already-decoded image.
+    /// Default: unsupported → zero vector.
+    fn embed_audio(&self, _mel: &[f32], _frames: usize) -> Vec<f32> {
+        vec![0.0; self.dim()]
+    }
+    /// Whether this embedder produces real audio vectors (joint space).
+    fn supports_audio(&self) -> bool {
+        false
+    }
 }
 
 /// Deterministic, dependency-free stand-in used until the ONNX encoders exist: hashes each
