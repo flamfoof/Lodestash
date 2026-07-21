@@ -5,6 +5,7 @@
 pub mod asset_store;
 pub mod crawler;
 pub mod detect;
+pub mod melspec;
 pub mod mesh;
 pub mod raster;
 pub mod render3d;
