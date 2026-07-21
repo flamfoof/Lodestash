@@ -124,6 +124,7 @@ alternatives (Tauri+three.js, pure-Python/PySide6).
 | [`docs/TECH-STACK.md`](docs/TECH-STACK.md) | Implementation-ready stack — crates/libraries per module, AI runtime, sidecar, build/test/CI/packaging |
 | [`docs/MILESTONES.md`](docs/MILESTONES.md) | Release milestones (M0–M6 core path to v1) + **Extra Wins** (incl. ★ Unity Account Sync) |
 | [`docs/KANBAN.md`](docs/KANBAN.md) | Kanban board (Backlog → Ready → In Progress → Review → Done) tracking the build |
+| [`docs/HANDOFF.md`](docs/HANDOFF.md) | Working handoff — state of play, settled decisions, how to run the AI parts, environment traps (not a design spec) |
 
 > Working in this repo? Read [`CLAUDE.md`](CLAUDE.md) — the docs are the source of truth, and code must
 > conform to them (update the doc in the same change if it diverges).
