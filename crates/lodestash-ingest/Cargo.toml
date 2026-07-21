@@ -17,6 +17,8 @@ tracing        = { workspace = true }
 rayon          = { workspace = true }
 blake3         = { workspace = true }
 ufbx           = { workspace = true }
+# glTF/GLB geometry for multiview embedding renders (data-only loader, no GPU).
+three-d-asset  = { workspace = true }
 
 walkdir    = { workspace = true }
 image      = { workspace = true }

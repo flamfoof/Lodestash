@@ -67,7 +67,9 @@ dirs   = "5"
 # 3D viewport — three-d 0.18 shares eframe 0.29's GL context (both pin glow 0.14;
 # upgrade the two together — TECH-STACK §7). default-features off: no window/glutin.
 three-d       = { version = "0.18.2", default-features = false }
-three-d-asset = { version = "0.9", features = ["gltf", "obj", "png", "jpeg", "tga"] }
+# data-url: self-contained .gltf files embed their buffers as base64 data URIs — without this
+# feature they fail to load (in the viewer as well as the embedding renderer).
+three-d-asset = { version = "0.9", features = ["gltf", "obj", "png", "jpeg", "tga", "data-url"] }
 # Audio playback + decode (rodio bundles symphonia): wav/flac/vorbis/mp3.
 rodio = "0.20"
 # SVG nav-icon rendering (resvg via the svg feature); tinted per row state.

@@ -63,6 +63,26 @@ fn norm(v: V3) -> V3 {
     }
 }
 
+/// Nearest-neighbour albedo lookup, tinted by the shading term. UVs wrap (tiling is normal on
+/// game meshes). `AlbedoTex` rows are stored **bottom-up** (see `mesh::AlbedoTex`), which matches
+/// the bottom-left UV origin the loaders emit — so `v` indexes rows directly, no flip.
+fn sample(t: &crate::mesh::AlbedoTex, u: f32, v: f32, shade: f32) -> [u8; 3] {
+    if t.width == 0 || t.height == 0 || t.rgba.is_empty() {
+        return [128, 128, 128];
+    }
+    let wrap = |x: f32, n: u32| -> usize {
+        let f = x - x.floor(); // → [0,1)
+        ((f * n as f32) as usize).min(n as usize - 1)
+    };
+    let (px, py) = (wrap(u, t.width), wrap(v, t.height));
+    let texel = t.rgba[(py * t.width as usize + px).min(t.rgba.len() - 1)];
+    [
+        (texel[0] as f32 * shade) as u8,
+        (texel[1] as f32 * shade) as u8,
+        (texel[2] as f32 * shade) as u8,
+    ]
+}
+
 /// World-space bounds of every mesh: `(center, radius)`. Radius is 0 for empty/degenerate input.
 fn bounds(meshes: &[MeshData]) -> (V3, f32) {
     let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
@@ -144,11 +164,18 @@ fn render_one(meshes: &[MeshData], size: u32, view: View, center: V3, radius: f3
             // Two-sided lighting: many game meshes have inconsistent winding.
             let lambert = dot(fnorm, light).abs();
             let shade = (0.35 + 0.65 * lambert).clamp(0.0, 1.0);
-            let color = [
+            // Untextured triangles are a flat shaded material colour.
+            let flat = [
                 (base[0] as f32 * shade) as u8,
                 (base[1] as f32 * shade) as u8,
                 (base[2] as f32 * shade) as u8,
             ];
+            // Textured: interpolate UVs per pixel and sample the albedo. Real albedo matters
+            // to the encoder — "rusty barrel" needs the rust, not just the barrel shape.
+            let tex = m.albedo.as_ref().filter(|_| m.uvs.is_some());
+            let uv = m.uvs.as_ref().and_then(|us| {
+                Some([*us.get(i0)?, *us.get(i1)?, *us.get(i2)?])
+            });
 
             // View space (x,y in [-1,1]) → pixels, y down.
             let half = size as f32 * 0.5;
@@ -184,6 +211,14 @@ fn render_one(meshes: &[MeshData], size: u32, view: View, center: V3, radius: f3
                     let idx = y * n + x;
                     if z < depth[idx] {
                         depth[idx] = z;
+                        let color = match (tex, uv) {
+                            (Some(t), Some(uv)) => {
+                                let u = w0 * uv[0][0] + w1 * uv[1][0] + w2 * uv[2][0];
+                                let v = w0 * uv[0][1] + w1 * uv[1][1] + w2 * uv[2][1];
+                                sample(t, u, v, shade)
+                            }
+                            _ => flat,
+                        };
                         img.put_pixel(
                             x as u32,
                             y as u32,
@@ -255,6 +290,41 @@ mod tests {
                 "view {i}: coverage {cov} — geometry should be visible and inside the margin"
             );
         }
+    }
+
+    /// A textured mesh must render its albedo, not the flat material colour — otherwise the
+    /// encoder only ever sees shape and "rusty barrel" can't beat "clean barrel".
+    #[test]
+    fn albedo_texture_is_sampled() {
+        use crate::mesh::AlbedoTex;
+        use std::sync::Arc;
+
+        let mut m = cube();
+        // Per-corner UVs spanning the whole texture, and a vivid 2×2 texture that shares no
+        // channel pattern with `base_color` (200,90,60).
+        m.uvs = Some(m.positions.iter().map(|p| [p[0] * 0.5 + 0.5, p[1] * 0.5 + 0.5]).collect());
+        m.albedo = Some(Arc::new(AlbedoTex {
+            width: 2,
+            height: 2,
+            rgba: vec![
+                [0, 0, 255, 255],
+                [0, 255, 0, 255],
+                [0, 255, 0, 255],
+                [0, 0, 255, 255],
+            ],
+        }));
+        let img = &render_views(&[m], 96, &[DEFAULT_VIEWS[0]])[0];
+
+        // Every drawn texel comes from a blue/green texture, so no pixel should be red-dominant
+        // (which is what the untextured base colour would produce).
+        let bg = Rgba([BG[0], BG[1], BG[2], 255]);
+        let drawn: Vec<_> = img.pixels().filter(|p| **p != bg).collect();
+        assert!(!drawn.is_empty(), "nothing rendered");
+        let red_dominant = drawn.iter().filter(|p| p[0] > p[1] && p[0] > p[2]).count();
+        assert_eq!(
+            red_dominant, 0,
+            "texture ignored — {red_dominant} pixels still show the flat material colour"
+        );
     }
 
     #[test]

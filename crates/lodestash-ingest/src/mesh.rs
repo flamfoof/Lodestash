@@ -242,6 +242,135 @@ fn resolve_texture_path(
     })
 }
 
+/// glTF/GLB, loaded through `three-d-asset` (data-only; the same loader the viewer uses) and
+/// flattened to the identical world-space `MeshData` the ufbx path produces — so the multiview
+/// renderer and thumbnailer don't care which format an asset came in.
+pub fn is_gltf_model(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("gltf") || e.eq_ignore_ascii_case("glb"))
+}
+
+pub fn load_gltf(path: &Path) -> Result<Vec<MeshData>, String> {
+    let mut raw = three_d_asset::io::load(&[path]).map_err(|e| e.to_string())?;
+    let model: three_d_asset::Model = raw.deserialize(path).map_err(|e| e.to_string())?;
+
+    let mut out = Vec::new();
+    for prim in &model.geometries {
+        let three_d_asset::geometry::Geometry::Triangles(tri) = &prim.geometry else {
+            continue; // point clouds carry no silhouette
+        };
+        // Bake the node transform in, so every mesh is world-space like the ufbx path.
+        let m = prim.transformation;
+        let positions: Vec<[f32; 3]> = tri
+            .positions
+            .to_f32()
+            .iter()
+            .map(|p| {
+                let v = m * three_d_asset::prelude::Vec4::new(p.x, p.y, p.z, 1.0);
+                [v.x, v.y, v.z]
+            })
+            .collect();
+        // No indices ⇒ every three consecutive positions form a triangle.
+        let indices = tri
+            .indices
+            .to_u32()
+            .unwrap_or_else(|| (0..positions.len() as u32).collect());
+        let base_color = prim
+            .material_index
+            .and_then(|i| model.materials.get(i))
+            .map(|mat| {
+                let c = mat.albedo;
+                [c.r, c.g, c.b, c.a]
+            })
+            .unwrap_or([180, 180, 185, 255]);
+        out.push(MeshData {
+            name: prim.name.clone(),
+            positions,
+            // The renderer derives face normals, so skipping them costs nothing here.
+            normals: None,
+            uvs: tri.uvs.as_ref().map(|us| us.iter().map(|u| [u.x, u.y]).collect()),
+            indices,
+            base_color,
+            albedo: None,
+        });
+    }
+    if out.is_empty() {
+        return Err("no triangle geometry in model".into());
+    }
+    Ok(out)
+}
+
+/// Load any supported 3D format into world-space `MeshData`: FBX/OBJ via ufbx, glTF/GLB via
+/// three-d-asset. The single entry point for the embed drain and thumbnailer.
+pub fn load_any(path: &Path, tex_files: &BTreeMap<String, PathBuf>) -> Result<Vec<MeshData>, String> {
+    if is_gltf_model(path) {
+        load_gltf(path)
+    } else {
+        // ufbx covers FBX and OBJ (and is tolerant of a few other odds and ends).
+        load_meshes(path, tex_files)
+    }
+}
+
+#[cfg(test)]
+mod gltf_tests {
+    use super::*;
+
+    /// Minimal base64 (no padding shortcuts) so the fixture can embed its buffer as a data URI
+    /// and stay a single self-contained file — no external .bin to resolve.
+    fn b64(data: &[u8]) -> String {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for c in data.chunks(3) {
+            let (b0, b1, b2) = (c[0] as u32, *c.get(1).unwrap_or(&0) as u32, *c.get(2).unwrap_or(&0) as u32);
+            let n = (b0 << 16) | (b1 << 8) | b2;
+            out.push(T[(n >> 18) as usize & 63] as char);
+            out.push(T[(n >> 12) as usize & 63] as char);
+            out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+            out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        }
+        out
+    }
+
+    /// A non-indexed single-triangle glTF — exercises the real `three-d-asset` path including
+    /// the "no indices ⇒ sequential" branch.
+    #[test]
+    fn load_gltf_reads_a_minimal_model() {
+        let verts: [[f32; 3]; 3] = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let mut buf = Vec::new();
+        for v in verts {
+            for f in v {
+                buf.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        let json = format!(
+            r#"{{"asset":{{"version":"2.0"}},"scene":0,"scenes":[{{"nodes":[0]}}],
+"nodes":[{{"mesh":0}}],"meshes":[{{"primitives":[{{"attributes":{{"POSITION":0}}}}]}}],
+"buffers":[{{"byteLength":{len},"uri":"data:application/octet-stream;base64,{b}"}}],
+"bufferViews":[{{"buffer":0,"byteOffset":0,"byteLength":{len}}}],
+"accessors":[{{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3",
+"min":[0.0,0.0,0.0],"max":[1.0,1.0,0.0]}}]}}"#,
+            len = buf.len(),
+            b = b64(&buf)
+        );
+        let dir = std::env::temp_dir().join(format!("lodestash_gltf_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tri.gltf");
+        std::fs::write(&path, json).unwrap();
+
+        assert!(is_gltf_model(&path));
+        let meshes = load_any(&path, &BTreeMap::new()).expect("load gltf");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(meshes.len(), 1, "one primitive");
+        assert_eq!(meshes[0].positions.len(), 3);
+        assert_eq!(meshes[0].indices, vec![0, 1, 2], "sequential indices generated");
+        // And it renders (the whole point of loading it).
+        let views = crate::render3d::render_views(&meshes, 64, &crate::render3d::DEFAULT_VIEWS[..1]);
+        assert_eq!(views.len(), 1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

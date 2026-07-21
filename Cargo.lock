@@ -2670,6 +2670,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror 2.0.18",
+ "three-d-asset",
  "tracing",
  "ufbx",
  "walkdir",
@@ -4718,6 +4719,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95c40cd76bbe3751f6a286dd09c9971766d37b3a9c222e926f622d098bdcc424"
 dependencies = [
  "cgmath",
+ "data-url",
  "gltf",
  "half",
  "image",

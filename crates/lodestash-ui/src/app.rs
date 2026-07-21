@@ -6346,9 +6346,8 @@ fn embed_model_multiview(
     path: &std::path::Path,
     emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync),
 ) -> Option<Vec<f32>> {
-    // ufbx handles FBX (Unity's native mesh format) and OBJ; glTF/GLB come through
-    // three-d-asset in the viewer and get their own slice.
-    let meshes = lodestash_ingest::mesh::load_meshes(path, &std::collections::BTreeMap::new())
+    // FBX/OBJ via ufbx, glTF/GLB via three-d-asset — one entry point, world-space MeshData.
+    let meshes = lodestash_ingest::mesh::load_any(path, &std::collections::BTreeMap::new())
         .map_err(|e| tracing::warn!(%e, "mesh load failed"))
         .ok()?;
     let views = lodestash_ingest::render3d::render_views(
