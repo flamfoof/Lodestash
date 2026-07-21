@@ -75,6 +75,63 @@ pub fn generate(
     Ok(dest)
 }
 
+/// The sound token (`#49C9E0`), so a waveform thumb reads as audio at a glance the same way the
+/// type diamond does (DESIGN-GUIDELINES §7).
+pub const WAVEFORM_RGB: [u8; 3] = [0x49, 0xC9, 0xE0];
+
+/// Bars a waveform thumbnail of `width` px draws (2 px bar + 1 px gap).
+pub fn waveform_bars(width: u32) -> usize {
+    (width as usize / 3).max(8)
+}
+
+/// Write a waveform thumbnail to the cache, calling `peaks` only on a cache miss — decoding the
+/// audio is the expensive half. `peaks` yields per-bar magnitudes in `0.0..=1.0`
+/// ([`waveform_bars`] of them); audio decoding lives with the player, so the caller supplies it.
+pub fn generate_waveform(
+    cache_dir: &Path,
+    content_hash: &str,
+    params: ThumbParams,
+    peaks: impl FnOnce(usize) -> Result<Vec<f32>, String>,
+) -> std::io::Result<PathBuf> {
+    let dest = cache_path(cache_dir, content_hash, params);
+    if dest.exists() {
+        return Ok(dest);
+    }
+    std::fs::create_dir_all(cache_dir)?;
+    let peaks = peaks(waveform_bars(params.width)).map_err(std::io::Error::other)?;
+    draw_waveform(&peaks, params.width, params.height)
+        .save_with_format(&dest, ImageFormat::Png)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    Ok(dest)
+}
+
+/// Draw peaks as a centre-mirrored bar waveform on a **transparent** background (same contract as
+/// the 3D hero render: the dark grid card shows through). Silence still draws a 1 px centre line so
+/// an empty clip looks like a clip, not a failed thumbnail.
+pub fn draw_waveform(peaks: &[f32], width: u32, height: u32) -> DynamicImage {
+    let (w, h) = (width.max(1), height.max(1));
+    let mut img = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 0]));
+    let [r, g, b] = WAVEFORM_RGB;
+    let mid = (h - 1) as f32 / 2.0;
+    let bars = peaks.len().max(1);
+    for x in 0..w {
+        // Bars are 2 px wide with a 1 px gap; skip the gap column.
+        if x % 3 == 2 {
+            continue;
+        }
+        let p = peaks[(x as usize * bars / w as usize).min(bars - 1)].clamp(0.0, 1.0);
+        let half = (p * mid).max(0.5);
+        let (y0, y1) = (
+            (mid - half).round() as u32,
+            (mid + half).round().min((h - 1) as f32) as u32,
+        );
+        for y in y0..=y1 {
+            img.put_pixel(x, y, image::Rgba([r, g, b, 255]));
+        }
+    }
+    DynamicImage::ImageRgba8(img)
+}
+
 /// Formats the mesh loaders handle (`mesh::load_any`): FBX/OBJ via ufbx, glTF/GLB via
 /// three-d-asset.
 fn is_model(path: &Path) -> bool {
@@ -194,6 +251,57 @@ mod tests {
         );
         assert_eq!(p1, p2);
         assert!(p1.to_str().unwrap().contains("128x128"));
+    }
+
+    /// A waveform thumb must be transparent outside the wave, taller where the clip is louder,
+    /// and still draw something for silence.
+    #[test]
+    fn waveform_thumb_is_transparent_and_amplitude_shaped() {
+        let bars = waveform_bars(96);
+        let loud: Vec<f32> = (0..bars)
+            .map(|i| if i < bars / 2 { 0.9 } else { 0.05 })
+            .collect();
+        let img = draw_waveform(&loud, 96, 96).to_rgba8();
+        assert_eq!(
+            img.get_pixel(0, 0)[3],
+            0,
+            "corner transparent for the grid card"
+        );
+        let ink = |x: u32| (0..96).filter(|&y| img.get_pixel(x, y)[3] > 0).count();
+        assert!(
+            ink(0) > ink(90),
+            "loud half must be taller than the quiet half"
+        );
+        assert_eq!(ink(2), 0, "every third column is the bar gap");
+
+        let silence = draw_waveform(&vec![0.0; bars], 96, 96).to_rgba8();
+        assert!(
+            silence.pixels().any(|p| p[3] > 0),
+            "silence still draws a centre line"
+        );
+    }
+
+    #[test]
+    fn generate_waveform_caches_and_only_decodes_on_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = ThumbParams {
+            width: 64,
+            height: 64,
+        };
+        let calls = std::cell::Cell::new(0);
+        let peaks = |n: usize| {
+            calls.set(calls.get() + 1);
+            Ok(vec![0.7; n])
+        };
+        let a = generate_waveform(dir.path(), "wav1", params, peaks).unwrap();
+        let b = generate_waveform(dir.path(), "wav1", params, |n| {
+            calls.set(calls.get() + 1);
+            Ok(vec![0.7; n])
+        })
+        .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(calls.get(), 1, "cache hit must not decode the audio again");
+        assert!(image::open(&a).unwrap().width() == 64);
     }
 
     /// A 3D model must thumbnail through the render path: real geometry drawn, and the corners

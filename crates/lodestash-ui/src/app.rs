@@ -3790,6 +3790,7 @@ impl LodestashApp {
             // On-screen quality drives the grid thumbnail render size (design §5.2). Quick Look is
             // unaffected — it decodes the original at full detail.
             let gen_px = self.config.preview_quality.thumb_px();
+            let is_audio = self.entries[idx].file.media_type == Some(MediaType::Audio);
             let tx = self.thumb_tx.clone();
             let ctx2 = ctx.clone();
 
@@ -3805,6 +3806,7 @@ impl LodestashApp {
                     mtime,
                     cache_dir.as_deref(),
                     gen_px,
+                    is_audio,
                 );
                 let _ = tx.send(ThumbReady {
                     index: idx,
@@ -8031,10 +8033,19 @@ fn needs_thumbnail(mt: Option<MediaType>) -> bool {
         mt,
         // Model3d thumbnails are rendered offscreen by the CPU rasteriser in `thumb::generate`
         // (no GPU context needed, so it runs on the same worker threads as image decoding).
-        Some(MediaType::Image | MediaType::Texture | MediaType::Sprite | MediaType::Model3d)
+        // Audio takes the waveform branch in `generate_texture`.
+        Some(
+            MediaType::Image
+                | MediaType::Texture
+                | MediaType::Sprite
+                | MediaType::Model3d
+                | MediaType::Audio
+        )
     )
 }
 
+// ponytail: 8 flat args instead of a params struct — one call site, all of them primitives.
+#[allow(clippy::too_many_arguments)]
 fn generate_texture(
     ctx: &egui::Context,
     abs_path: &std::path::Path,
@@ -8043,6 +8054,7 @@ fn generate_texture(
     mtime: i64,
     cache_dir: Option<&std::path::Path>,
     gen_px: u32,
+    is_audio: bool,
 ) -> Option<TextureHandle> {
     // Serve from / populate the on-disk thumbnail cache (INGESTION.md §6): restarts then
     // decode cached PNGs instead of full-size originals. The cache filename embeds WxH
@@ -8055,7 +8067,17 @@ fn generate_texture(
                 width: gen_px,
                 height: gen_px,
             };
-            thumb::generate(abs_path, dir, &key, params).ok()
+            if is_audio {
+                // Audio has no pixels: draw the peak waveform the Quick Look player already
+                // decodes (rodio lives in this crate, so the decode stays here and `thumb` only
+                // owns the cache key + drawing).
+                thumb::generate_waveform(dir, &key, params, |bars| {
+                    crate::audio::load_waveform(abs_path, bars).map(|m| m.peaks)
+                })
+                .ok()
+            } else {
+                thumb::generate(abs_path, dir, &key, params).ok()
+            }
         })
         .and_then(|cached| image::open(cached).ok())
         .or_else(|| image::open(abs_path).ok())?;
