@@ -58,12 +58,15 @@ pub struct EmbedJob {
     pub source_id: i64,
 }
 
-/// A dirty **image-type** asset for the vision embedder (SigLIP): its on-disk path plus the
-/// pre-filter columns. Image/texture/sprite only — the modalities the image tower can encode.
+/// A dirty **image-type** asset for the vision embedder (SigLIP) — image/texture/sprite only.
+/// Exactly one path is set: `disk_path` for on-disk source files, or `workspace_rel` for
+/// package-extracted files (the caller joins it onto the extraction workspace dir, which the
+/// catalog doesn't know).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageEmbedJob {
     pub asset_id: i64,
-    pub abs_path: String,
+    pub disk_path: Option<String>,
+    pub workspace_rel: Option<String>,
     pub media_type_id: i64,
     pub source_id: i64,
 }
@@ -1197,20 +1200,23 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("embed queue row: {e}")))
     }
 
-    /// Dirty **image-type** assets (image/texture/sprite) with a resolvable on-disk path, for
-    /// the SigLIP vision drain. On-disk sources only (`workspace_rel IS NULL`) — extracted-package
-    /// images join through the workspace and land in a later slice. Path = `root_path/rel_path`.
+    /// Dirty **image-type** assets (image/texture/sprite) for the SigLIP vision drain. Returns
+    /// on-disk sources (`disk_path = root_path/rel_path`) *and* package-extracted files
+    /// (`workspace_rel` set — the caller joins it onto the workspace dir). `missing` rows excluded.
     pub fn image_assets_needing_embedding(&self, limit: usize) -> Result<Vec<ImageEmbedJob>> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT a.id, s.root_path || '/' || af.rel_path, a.media_type_id, a.source_id
+                "SELECT a.id,
+                        CASE WHEN af.workspace_rel IS NULL
+                             THEN s.root_path || '/' || af.rel_path END,
+                        af.workspace_rel, a.media_type_id, a.source_id
                  FROM asset a
                  JOIN media_type mt   ON mt.id = a.media_type_id
                  JOIN import_source s ON s.id = a.source_id
                  JOIN asset_file af   ON af.asset_id = a.id
                  WHERE a.embedding_dirty = 1 AND a.deleted_at IS NULL
-                   AND af.workspace_rel IS NULL AND af.missing = 0
+                   AND af.missing = 0
                    AND mt.code IN ('image', 'texture', 'sprite')
                  ORDER BY a.id LIMIT ?1",
             )
@@ -1219,9 +1225,10 @@ impl Catalog {
             .query_map(params![limit as i64], |r| {
                 Ok(ImageEmbedJob {
                     asset_id: r.get(0)?,
-                    abs_path: r.get(1)?,
-                    media_type_id: r.get(2)?,
-                    source_id: r.get(3)?,
+                    disk_path: r.get(1)?,
+                    workspace_rel: r.get(2)?,
+                    media_type_id: r.get(3)?,
+                    source_id: r.get(4)?,
                 })
             })
             .map_err(|e| CoreError::Catalog(format!("image embed queue query: {e}")))?;
@@ -1779,6 +1786,38 @@ mod tests {
             .expect("trash");
         let hits = c.search_assets("rock", 50).expect("s").expect("some");
         assert_eq!(hits.len(), 1, "trashed asset excluded");
+    }
+
+    #[test]
+    fn image_embed_queue_covers_on_disk_and_extracted() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let sid = c.upsert_import_source("src", "G:/src", "folder").expect("sid");
+        let pid = c
+            .upsert_package(sid, "G:/src/Pack.unitypackage", "Pack", None, None)
+            .expect("pid");
+
+        // On-disk image, extracted-package image, and a non-image (audio) that must NOT appear.
+        let mut on_disk = rec("tex/brick.png", 5, 1);
+        on_disk.media_type = "image".into();
+        let mut extracted = rec("Pack/Sprites/hero.png", 6, 1);
+        extracted.media_type = "sprite".into();
+        extracted.workspace_rel = Some("hash7/hero.png".into());
+        let mut audio = rec("sfx/boom.wav", 7, 1);
+        audio.media_type = "audio".into();
+        c.record_crawl(sid, None, &[on_disk, audio]).expect("crawl1");
+        c.record_crawl(sid, Some(pid), &[extracted]).expect("crawl2");
+
+        let jobs = c.image_assets_needing_embedding(100).expect("queue");
+        assert_eq!(jobs.len(), 2, "both images queued; audio excluded");
+
+        let disk = jobs.iter().find(|j| j.disk_path.is_some()).expect("on-disk job");
+        assert_eq!(disk.disk_path.as_deref(), Some("G:/src/tex/brick.png"));
+        assert!(disk.workspace_rel.is_none());
+
+        let ext = jobs.iter().find(|j| j.workspace_rel.is_some()).expect("extracted job");
+        assert_eq!(ext.workspace_rel.as_deref(), Some("hash7/hero.png"));
+        assert!(ext.disk_path.is_none(), "extracted files resolve via the workspace, not root");
     }
 
     #[test]

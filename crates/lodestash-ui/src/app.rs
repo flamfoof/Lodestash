@@ -1235,6 +1235,7 @@ impl LodestashApp {
         let generation = self.scan_generation;
         let tx = self.catalog_tx.clone();
         let embedder = self.ai_embedder.clone();
+        let workspace_dir = self.workspace_dir.clone();
         self.catalog_persisting = true;
         std::thread::spawn(move || {
             let (counts, assets, catalog) = match persist_to_catalog(&db_path, &batches) {
@@ -1254,7 +1255,7 @@ impl LodestashApp {
             // (still the sole writer). Runs *after* the grid gets its identity, so a large
             // first scan doesn't stall the UI on inference. Search-with-AI needs these.
             if let (Some(mut cat), Some(emb)) = (catalog, embedder) {
-                drain_image_embeddings(&mut cat, emb.as_ref());
+                drain_image_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
             }
         });
     }
@@ -1329,13 +1330,15 @@ impl LodestashApp {
 
         let generation = self.scan_generation;
         let tx = self.catalog_tx.clone();
+        let embedder = self.ai_embedder.clone();
+        let workspace_dir = self.workspace_dir.clone();
         self.catalog_persisting = true;
         std::thread::spawn(move || {
-            let (counts, assets) = match persist_package_to_catalog(&db_path, &job) {
-                Ok((counts, assets)) => (Some(counts), assets),
+            let (counts, assets, catalog) = match persist_package_to_catalog(&db_path, &job) {
+                Ok((counts, assets, cat)) => (Some(counts), assets, Some(cat)),
                 Err(err) => {
                     tracing::warn!(%err, "package persist failed; UI stays on in-memory counts");
-                    (None, Vec::new())
+                    (None, Vec::new(), None)
                 }
             };
             let _ = tx.send(CatalogSynced {
@@ -1343,6 +1346,11 @@ impl LodestashApp {
                 counts,
                 assets,
             });
+            // Embed the freshly-extracted images now, while their files are guaranteed present in
+            // the workspace (same sole-writer connection).
+            if let (Some(mut cat), Some(emb)) = (catalog, embedder) {
+                drain_image_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
+            }
         });
     }
 
@@ -6338,6 +6346,7 @@ fn resolve_embedder() -> Option<Arc<dyn lodestash_ai::embedder::Embedder + Send 
 fn drain_image_embeddings(
     cat: &mut Catalog,
     emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync),
+    workspace_dir: Option<&std::path::Path>,
 ) {
     const BATCH: usize = 64;
     let mut total = 0usize;
@@ -6354,13 +6363,21 @@ fn drain_image_embeddings(
         }
         let n = jobs.len();
         for job in jobs {
-            let vector = match lodestash_ingest::raster::decode(std::path::Path::new(&job.abs_path))
-            {
-                Ok(img) => emb.embed_image(&img.to_rgba8()),
-                Err(e) => {
-                    // ponytail: undecodable → zero vec clears the flag (permanent-ish failure);
-                    // no infinite loop, and it never surfaces in KNN.
-                    tracing::warn!(%e, path = %job.abs_path, "image decode failed; storing zero vec");
+            // On-disk source file, or a package-extracted file resolved against the workspace.
+            let path = match (&job.disk_path, &job.workspace_rel) {
+                (Some(p), _) => Some(std::path::PathBuf::from(p)),
+                (None, Some(rel)) => workspace_dir.map(|w| w.join(rel)),
+                _ => None,
+            };
+            let vector = match path.as_deref().map(lodestash_ingest::raster::decode) {
+                Some(Ok(img)) => emb.embed_image(&img.to_rgba8()),
+                other => {
+                    // ponytail: undecodable / unresolvable / evicted-from-workspace → zero vec
+                    // clears the flag so the drain always advances (never re-queries the same
+                    // row forever); it scores 0 in KNN so it never surfaces.
+                    if let Some(Err(e)) = other {
+                        tracing::warn!(%e, "image decode failed; storing zero vec");
+                    }
                     vec![0.0; emb.dim()]
                 }
             };
@@ -6444,7 +6461,7 @@ fn crawl_records<'a>(files: impl Iterator<Item = &'a CrawledFile>) -> Vec<CrawlR
 fn persist_package_to_catalog(
     db_path: &std::path::Path,
     job: &PackagePersist,
-) -> Result<CatalogReadBack, String> {
+) -> Result<(StatusCounts, AssetIdentityMaps, Catalog), String> {
     let mut catalog = Catalog::open(db_path).map_err(|e| e.to_string())?;
     catalog.seed_media_types().map_err(|e| e.to_string())?;
 
@@ -6488,11 +6505,9 @@ fn persist_package_to_catalog(
         .status_counts_for_sources(&ids)
         .map_err(|e| e.to_string())?;
     let assets = read_back_assets(&catalog, &sources)?;
-    Ok((counts, assets))
+    Ok((counts, assets, catalog))
 }
 
-/// The persist threads' read-back payload: counts + per-root asset identity maps.
-type CatalogReadBack = (StatusCounts, AssetIdentityMaps);
 
 /// Read every live asset row back for the given `(root, source_id)` pairs, keyed for
 /// the UI-side join (unknown status strings are dropped, not fatal).
