@@ -58,17 +58,20 @@ pub struct EmbedJob {
     pub source_id: i64,
 }
 
-/// A dirty **image-type** asset for the vision embedder (SigLIP) — image/texture/sprite only.
-/// Exactly one path is set: `disk_path` for on-disk source files, or `workspace_rel` for
+/// A dirty asset the **vision** embedder can encode (SigLIP): a 2D image, or a 3D model that
+/// gets multiview-rendered first. `media_code` tells the caller which path to take.
+/// Exactly one location is set: `disk_path` for on-disk source files, or `workspace_rel` for
 /// package-extracted files (the caller joins it onto the extraction workspace dir, which the
 /// catalog doesn't know).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImageEmbedJob {
+pub struct VisualEmbedJob {
     pub asset_id: i64,
     pub disk_path: Option<String>,
     pub workspace_rel: Option<String>,
     pub media_type_id: i64,
     pub source_id: i64,
+    /// `media_type.code` — `image`/`texture`/`sprite` decode directly, `model_3d` renders first.
+    pub media_code: String,
 }
 
 impl StatusCounts {
@@ -1200,40 +1203,42 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("embed queue row: {e}")))
     }
 
-    /// Dirty **image-type** assets (image/texture/sprite) for the SigLIP vision drain. Returns
-    /// on-disk sources (`disk_path = root_path/rel_path`) *and* package-extracted files
-    /// (`workspace_rel` set — the caller joins it onto the workspace dir). `missing` rows excluded.
-    pub fn image_assets_needing_embedding(&self, limit: usize) -> Result<Vec<ImageEmbedJob>> {
+    /// Dirty assets the vision tower can encode — 2D (`image`/`texture`/`sprite`) and 3D
+    /// (`model_3d`, multiview-rendered by the caller). Returns on-disk sources
+    /// (`disk_path = root_path/rel_path`) *and* package-extracted files (`workspace_rel` set —
+    /// the caller joins it onto the workspace dir). `missing` rows excluded.
+    pub fn visual_assets_needing_embedding(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT a.id,
                         CASE WHEN af.workspace_rel IS NULL
                              THEN s.root_path || '/' || af.rel_path END,
-                        af.workspace_rel, a.media_type_id, a.source_id
+                        af.workspace_rel, a.media_type_id, a.source_id, mt.code
                  FROM asset a
                  JOIN media_type mt   ON mt.id = a.media_type_id
                  JOIN import_source s ON s.id = a.source_id
                  JOIN asset_file af   ON af.asset_id = a.id
                  WHERE a.embedding_dirty = 1 AND a.deleted_at IS NULL
                    AND af.missing = 0
-                   AND mt.code IN ('image', 'texture', 'sprite')
+                   AND mt.code IN ('image', 'texture', 'sprite', 'model_3d')
                  ORDER BY a.id LIMIT ?1",
             )
-            .map_err(|e| CoreError::Catalog(format!("image embed queue prep: {e}")))?;
+            .map_err(|e| CoreError::Catalog(format!("visual embed queue prep: {e}")))?;
         let rows = stmt
             .query_map(params![limit as i64], |r| {
-                Ok(ImageEmbedJob {
+                Ok(VisualEmbedJob {
                     asset_id: r.get(0)?,
                     disk_path: r.get(1)?,
                     workspace_rel: r.get(2)?,
                     media_type_id: r.get(3)?,
                     source_id: r.get(4)?,
+                    media_code: r.get(5)?,
                 })
             })
-            .map_err(|e| CoreError::Catalog(format!("image embed queue query: {e}")))?;
+            .map_err(|e| CoreError::Catalog(format!("visual embed queue query: {e}")))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| CoreError::Catalog(format!("image embed queue row: {e}")))
+            .map_err(|e| CoreError::Catalog(format!("visual embed queue row: {e}")))
     }
 
     pub fn upsert_embedding(
@@ -1789,7 +1794,7 @@ mod tests {
     }
 
     #[test]
-    fn image_embed_queue_covers_on_disk_and_extracted() {
+    fn visual_embed_queue_covers_images_models_on_disk_and_extracted() {
         let mut c = Catalog::open_in_memory().expect("open");
         c.seed_media_types().expect("seed");
         let sid = c.upsert_import_source("src", "G:/src", "folder").expect("sid");
@@ -1797,25 +1802,31 @@ mod tests {
             .upsert_package(sid, "G:/src/Pack.unitypackage", "Pack", None, None)
             .expect("pid");
 
-        // On-disk image, extracted-package image, and a non-image (audio) that must NOT appear.
+        // On-disk image, on-disk 3D model, extracted-package sprite, and audio (NOT visual).
         let mut on_disk = rec("tex/brick.png", 5, 1);
         on_disk.media_type = "image".into();
+        let mut model = rec("models/sword.fbx", 8, 1);
+        model.media_type = "model_3d".into();
         let mut extracted = rec("Pack/Sprites/hero.png", 6, 1);
         extracted.media_type = "sprite".into();
         extracted.workspace_rel = Some("hash7/hero.png".into());
         let mut audio = rec("sfx/boom.wav", 7, 1);
         audio.media_type = "audio".into();
-        c.record_crawl(sid, None, &[on_disk, audio]).expect("crawl1");
+        c.record_crawl(sid, None, &[on_disk, model, audio]).expect("crawl1");
         c.record_crawl(sid, Some(pid), &[extracted]).expect("crawl2");
 
-        let jobs = c.image_assets_needing_embedding(100).expect("queue");
-        assert_eq!(jobs.len(), 2, "both images queued; audio excluded");
+        let jobs = c.visual_assets_needing_embedding(100).expect("queue");
+        assert_eq!(jobs.len(), 3, "2 images + 1 model queued; audio excluded");
 
-        let disk = jobs.iter().find(|j| j.disk_path.is_some()).expect("on-disk job");
-        assert_eq!(disk.disk_path.as_deref(), Some("G:/src/tex/brick.png"));
-        assert!(disk.workspace_rel.is_none());
+        let img = jobs.iter().find(|j| j.media_code == "image").expect("image job");
+        assert_eq!(img.disk_path.as_deref(), Some("G:/src/tex/brick.png"));
+        assert!(img.workspace_rel.is_none());
+
+        let m = jobs.iter().find(|j| j.media_code == "model_3d").expect("model job");
+        assert_eq!(m.disk_path.as_deref(), Some("G:/src/models/sword.fbx"));
 
         let ext = jobs.iter().find(|j| j.workspace_rel.is_some()).expect("extracted job");
+        assert_eq!(ext.media_code, "sprite");
         assert_eq!(ext.workspace_rel.as_deref(), Some("hash7/hero.png"));
         assert!(ext.disk_path.is_none(), "extracted files resolve via the workspace, not root");
     }

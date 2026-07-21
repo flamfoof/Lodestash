@@ -51,9 +51,9 @@ fn visual_search_ranks_by_appearance() {
         .expect("crawl");
 
     // Drain image assets exactly as the app does (decode → vision embed → store).
-    let jobs = c.image_assets_needing_embedding(100).expect("queue");
+    let jobs = c.visual_assets_needing_embedding(100).expect("queue");
     assert_eq!(jobs.len(), 2, "both images dirty");
-    let disk = |j: &lodestash_core::catalog::ImageEmbedJob| j.disk_path.clone().unwrap();
+    let disk = |j: &lodestash_core::catalog::VisualEmbedJob| j.disk_path.clone().unwrap();
     let red_id = jobs.iter().find(|j| disk(j).ends_with("asset_a.png")).unwrap().asset_id;
     for job in jobs {
         let img = image::open(disk(&job)).expect("decode").to_rgba8();

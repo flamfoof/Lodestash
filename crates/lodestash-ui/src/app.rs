@@ -6339,10 +6339,53 @@ fn resolve_embedder() -> Option<Arc<dyn lodestash_ai::embedder::Embedder + Send 
     }
 }
 
-/// Embed the dirty **image** assets (SigLIP vision tower) in batches over the persist thread's
-/// own sole-writer connection. Decode failures store a zero vector — which cosine-scores 0, so
-/// it never matches — solely to clear `embedding_dirty` and guarantee forward progress (no
-/// infinite re-query of an undecodable file). Non-image assets await their own encoder.
+/// Encode one 3D model by rendering it from a few orbit views and mean-pooling the per-view
+/// SigLIP embeddings (IDENTIFICATION-AND-SEARCH §3 Tier 1, "SigLIP 2 image / 3D-multiview").
+/// `None` when the mesh can't be loaded or carries no geometry.
+fn embed_model_multiview(
+    path: &std::path::Path,
+    emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync),
+) -> Option<Vec<f32>> {
+    // ufbx handles FBX (Unity's native mesh format) and OBJ; glTF/GLB come through
+    // three-d-asset in the viewer and get their own slice.
+    let meshes = lodestash_ingest::mesh::load_meshes(path, &std::collections::BTreeMap::new())
+        .map_err(|e| tracing::warn!(%e, "mesh load failed"))
+        .ok()?;
+    let views = lodestash_ingest::render3d::render_views(
+        &meshes,
+        RENDER_SIZE,
+        lodestash_ingest::render3d::DEFAULT_VIEWS,
+    );
+    if views.is_empty() {
+        return None;
+    }
+    // Mean-pool then L2-normalise: the standard multiview aggregation, and it keeps the result
+    // in the same unit-sphere space as the single-image and text vectors.
+    let mut acc = vec![0.0f32; emb.dim()];
+    for v in &views {
+        for (a, x) in acc.iter_mut().zip(emb.embed_image(v)) {
+            *a += x;
+        }
+    }
+    let norm: f32 = acc.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm <= 0.0 {
+        return None;
+    }
+    for a in &mut acc {
+        *a /= norm;
+    }
+    Some(acc)
+}
+
+/// Offscreen render resolution per view — SigLIP resizes to 256² anyway, so rendering larger
+/// only costs rasterisation time.
+const RENDER_SIZE: u32 = 256;
+
+/// Embed the dirty **visual** assets (SigLIP vision tower) in batches over the persist thread's
+/// own sole-writer connection: 2D files decode directly, 3D models are multiview-rendered first.
+/// Failures store a zero vector — which cosine-scores 0, so it never matches — solely to clear
+/// `embedding_dirty` and guarantee forward progress (no infinite re-query of a bad file).
+/// Audio still awaits its own encoder (CLAP).
 fn drain_image_embeddings(
     cat: &mut Catalog,
     emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync),
@@ -6351,10 +6394,10 @@ fn drain_image_embeddings(
     const BATCH: usize = 64;
     let mut total = 0usize;
     loop {
-        let jobs = match cat.image_assets_needing_embedding(BATCH) {
+        let jobs = match cat.visual_assets_needing_embedding(BATCH) {
             Ok(j) => j,
             Err(e) => {
-                tracing::warn!(%e, "image embed queue query failed; retries next scan");
+                tracing::warn!(%e, "visual embed queue query failed; retries next scan");
                 break;
             }
         };
@@ -6369,27 +6412,32 @@ fn drain_image_embeddings(
                 (None, Some(rel)) => workspace_dir.map(|w| w.join(rel)),
                 _ => None,
             };
-            let vector = match path.as_deref().map(lodestash_ingest::raster::decode) {
-                Some(Ok(img)) => emb.embed_image(&img.to_rgba8()),
-                other => {
-                    // ponytail: undecodable / unresolvable / evicted-from-workspace → zero vec
-                    // clears the flag so the drain always advances (never re-queries the same
-                    // row forever); it scores 0 in KNN so it never surfaces.
-                    if let Some(Err(e)) = other {
-                        tracing::warn!(%e, "image decode failed; storing zero vec");
-                    }
-                    vec![0.0; emb.dim()]
-                }
+            let modality = if job.media_code == "model_3d" {
+                "model_3d"
+            } else {
+                "image"
             };
+            let vector = match path.as_deref() {
+                Some(p) if job.media_code == "model_3d" => embed_model_multiview(p, emb),
+                Some(p) => lodestash_ingest::raster::decode(p)
+                    .map_err(|e| tracing::warn!(%e, "image decode failed"))
+                    .ok()
+                    .map(|img| emb.embed_image(&img.to_rgba8())),
+                None => None,
+            }
+            // ponytail: unusable (undecodable / unrenderable / evicted from the workspace) →
+            // zero vec clears the flag so the drain always advances and never re-queries the
+            // same row forever; it scores 0 in KNN so it never surfaces.
+            .unwrap_or_else(|| vec![0.0; emb.dim()]);
             if let Err(e) = cat.upsert_embedding(
                 job.asset_id,
                 emb.model_id(),
-                "image",
+                modality,
                 Some(job.media_type_id),
                 Some(job.source_id),
                 &vector,
             ) {
-                tracing::warn!(%e, "upsert_embedding failed; stopping image drain");
+                tracing::warn!(%e, "upsert_embedding failed; stopping visual drain");
                 return;
             }
             total += 1;

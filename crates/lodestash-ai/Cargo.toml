@@ -25,3 +25,7 @@ image      = { workspace = true }
 
 # Added in Phase 4:
 # reqwest    = { version = "0.12", features = ["json", "stream"] }  # Ollama + cloud
+
+[dev-dependencies]
+# Multiview 3D embedding tests need the mesh loader + CPU renderer.
+lodestash-ingest = { workspace = true }

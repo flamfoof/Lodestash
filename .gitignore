@@ -28,3 +28,8 @@ desktop.ini
 .vscode/
 .idea/
 *.swp
+
+# Local agent-tooling state (claude-flow / ruflo daemons, metrics, generated configs)
+.claude-flow/
+.claude/proven-config.json
+.claude/.proven-config-version
