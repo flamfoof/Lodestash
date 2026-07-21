@@ -6,5 +6,6 @@
 pub mod catalog;
 pub mod error;
 pub mod fusion;
+pub mod query;
 pub mod types;
 pub mod vector;

@@ -589,6 +589,9 @@ pub struct LodestashApp {
     /// 768-d visual one. Queries are embedded into both and the two KNN result lists are fused
     /// by RRF; the vectors themselves are never compared across spaces.
     audio_embedder: Option<Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
+    /// Structural constraints parsed out of the last AI query (§5.B step 1) — applied to the
+    /// grid on top of the fused vector/BM25 ranking.
+    ai_filters: Option<lodestash_core::query::ParsedQuery>,
     /// Job-tray id of an in-flight SigLIP download (`Some` while downloading), and the channel
     /// its worker thread reports completion on. On success the UI reloads `ai_embedder` live.
     siglip_dl_job: Option<u64>,
@@ -740,6 +743,7 @@ impl LodestashApp {
             search_ranks_key: None,
             ai_embedder: resolve_embedder(),
             audio_embedder: resolve_audio_embedder(),
+            ai_filters: None,
             siglip_dl_job: None,
             siglip_dl_rx,
             siglip_dl_tx,
@@ -2052,6 +2056,7 @@ impl LodestashApp {
         if query.is_empty() {
             self.search_ranks = None;
             self.search_ranks_key = None;
+            self.ai_filters = None;
             self.cache_dirty = true;
             return;
         }
@@ -2061,11 +2066,28 @@ impl LodestashApp {
         let Some(cat) = &self.search_catalog else {
             return;
         };
+        // §5.B step 1: split structural constraints out first. "rocks under 5mb" embeds
+        // "rocks" — the size words would otherwise pollute the query vector as if they
+        // described appearance — and becomes an exact filter instead.
+        let parsed = lodestash_core::query::parse_query(&query);
+        let semantic = parsed.semantic_text.clone();
+        self.ai_filters = Some(parsed);
+
+        // A filters-only query ("audio under 1mb") has nothing to embed: skip the vector arms
+        // and let the structural filters do the work.
+        if semantic.is_empty() {
+            self.search_ranks = None;
+            self.search_ranks_key = None;
+            self.sort_by = SortBy::Name;
+            self.cache_dirty = true;
+            return;
+        }
+
         // Embed the query into every loaded space: SigLIP (visual, 768-d) and CLAP (audio,
         // 512-d) are separate and non-comparable, so each is searched on its own and the
         // results fused on *rank* by RRF (§5.B "joint SigLIP/CLAP space").
-        let visual = emb.embed_text(&query);
-        let audio = self.audio_embedder.as_ref().map(|a| (a.clone(), a.embed_text(&query)));
+        let visual = emb.embed_text(&semantic);
+        let audio = self.audio_embedder.as_ref().map(|a| (a.clone(), a.embed_text(&semantic)));
         let mut spaces: Vec<(&str, &[f32])> = vec![(emb.model_id(), &visual)];
         if let Some((a, v)) = &audio {
             spaces.push((a.model_id(), v));
@@ -2073,7 +2095,7 @@ impl LodestashApp {
         // Bucket pre-filter is left to the grid's tab.matches (a Category spans several
         // media_types; hybrid_search takes a single one) — pass None here.
         let ids = cat
-            .hybrid_search(&query, &spaces, None, HIT_CAP)
+            .hybrid_search(&semantic, &spaces, None, HIT_CAP)
             .unwrap_or_default();
         self.search_ranks = Some(
             ids.into_iter()
@@ -2326,6 +2348,23 @@ impl LodestashApp {
         {
             let entries = &self.entries;
             idxs.retain(|&i| !entries[i].trashed);
+        }
+
+        // Structural constraints parsed out of the AI query (§5.B step 1) compose on top of
+        // the fused ranking — "audio under 1mb" is a vector search AND two exact filters.
+        if self.search_mode == SearchMode::Ai {
+            if let Some(f) = self.ai_filters.as_ref().filter(|f| f.has_filters()) {
+                let entries = &self.entries;
+                idxs.retain(|&i| {
+                    let e = &entries[i];
+                    f.media_type.map_or(true, |mt| e.file.media_type == Some(mt))
+                        // Unrated counts as 0, so it never satisfies a "4 stars" filter.
+                        && f.min_rating.map_or(true, |r| e.rating.unwrap_or(0) >= r)
+                        && f.max_size_bytes.map_or(true, |b| e.file.size_bytes as i64 <= b)
+                        && f.min_size_bytes.map_or(true, |b| e.file.size_bytes as i64 >= b)
+                        && f.status.map_or(true, |st| e.status.code() == st)
+                });
+            }
         }
 
         // STATUS facet (UI-SPEC §0.2): a real per-asset match now that entries carry
@@ -4273,6 +4312,7 @@ impl eframe::App for LodestashApp {
                                     // result set, and vice-versa). Re-run recomputes them.
                                     self.search_ranks = None;
                                     self.search_ranks_key = None;
+                                    self.ai_filters = None;
                                     self.cache_dirty = true;
                                 }
                             }
@@ -4326,7 +4366,33 @@ impl eframe::App for LodestashApp {
                         self.run_ai_search();
                     }
                     if self.search_mode == SearchMode::Ai {
-                        let (msg, col) = if self.ai_embedder.is_some() {
+                        // Show what was parsed out, so a shrunken result set is never a mystery.
+                        let parsed_hint = self
+                            .ai_filters
+                            .as_ref()
+                            .filter(|f| f.has_filters())
+                            .map(|f| {
+                                let mut parts: Vec<String> = Vec::new();
+                                if let Some(mt) = f.media_type {
+                                    parts.push(mt.code().to_string());
+                                }
+                                if let Some(r) = f.min_rating {
+                                    parts.push(format!("\u{2605}{r}+"));
+                                }
+                                if let Some(b) = f.max_size_bytes {
+                                    parts.push(format!("< {}", format_bytes(b as u64)));
+                                }
+                                if let Some(b) = f.min_size_bytes {
+                                    parts.push(format!("> {}", format_bytes(b as u64)));
+                                }
+                                if let Some(st) = f.status {
+                                    parts.push(st.to_string());
+                                }
+                                format!("\u{2726} {}", parts.join(" \u{00B7} "))
+                            });
+                        let (msg, col) = if let Some(h) = &parsed_hint {
+                            (h.as_str(), theme::GOLD)
+                        } else if self.ai_embedder.is_some() {
                             ("\u{2726} visual search ready \u{2014} press Enter", theme::ARCANE)
                         } else {
                             // ponytail: engine is done; the gap is the model artifact (P4 manager).
