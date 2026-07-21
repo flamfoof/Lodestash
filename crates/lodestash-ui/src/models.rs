@@ -29,6 +29,104 @@ pub fn siglip_dir() -> Option<PathBuf> {
     Some(dirs::data_dir()?.join("Lodestash").join("models").join("siglip"))
 }
 
+// ── ONNX Runtime (the native dll `ort` dlopens) ─────────────────────────────────────────────
+//
+// The version is *strict*: `ort 2.0.0-rc.10` binds ORT **1.22.x** — a mismatch makes ort panic
+// (caught in `*::load`). We fetch the official win-x64 1.22.0 release and extract onnxruntime.dll
+// into a writable data dir, then point `ORT_DYLIB_PATH` at it (set in main / after download), so a
+// stock install needs neither a system-wide runtime nor bundling it in the installer.
+
+const ORT_VERSION: &str = "1.22.0";
+const ORT_ZIP_URL: &str =
+    "https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-win-x64-1.22.0.zip";
+/// Files pulled out of the release zip (basename match on the archive entries).
+const ORT_DLLS: &[&str] = &["onnxruntime.dll", "onnxruntime_providers_shared.dll"];
+
+pub fn runtime_dir() -> Option<PathBuf> {
+    Some(dirs::data_dir()?.join("Lodestash").join("runtime"))
+}
+
+/// Path the app points `ORT_DYLIB_PATH` at.
+pub fn ort_dll_path() -> Option<PathBuf> {
+    Some(runtime_dir()?.join("onnxruntime.dll"))
+}
+
+pub fn ort_installed() -> bool {
+    ort_dll_path().is_some_and(|p| p.exists())
+}
+
+/// Download + extract the ONNX Runtime dll. Windows-x64 only (the release archive is
+/// platform-specific); other platforms get an instructive error and use the manual path.
+pub fn download_ort(progress: Arc<JobProgress>) -> Result<(), String> {
+    if std::env::consts::OS != "windows" || std::env::consts::ARCH != "x86_64" {
+        return Err(format!(
+            "auto-download is win-x64 only; install ONNX Runtime {ORT_VERSION} manually (AI-MODELS-BY-GPU.md)"
+        ));
+    }
+    let dir = runtime_dir().ok_or("no data directory")?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create runtime dir: {e}"))?;
+
+    // Stream the zip to a temp file (progress by bytes), then extract just the dll(s).
+    let resp = ureq::get(ORT_ZIP_URL).call().map_err(|e| format!("GET runtime: {e}"))?;
+    let len: u64 = resp
+        .header("Content-Length")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    progress.total.fetch_add(len, Ordering::Relaxed);
+    let zip_path = dir.join("onnxruntime.zip.part");
+    let mut file = std::fs::File::create(&zip_path).map_err(|e| format!("create zip: {e}"))?;
+    let mut reader = resp.into_reader();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        if progress.is_cancelled() {
+            let _ = std::fs::remove_file(&zip_path);
+            return Err("cancelled".into());
+        }
+        let n = reader.read(&mut buf).map_err(|e| format!("read runtime: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n]).map_err(|e| format!("write runtime: {e}"))?;
+        progress.done.fetch_add(n as u64, Ordering::Relaxed);
+    }
+    file.flush().map_err(|e| e.to_string())?;
+    drop(file);
+
+    // Extract onnxruntime.dll (+ providers_shared) by basename, ignoring the archive's dir prefix.
+    let zf = std::fs::File::open(&zip_path).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipArchive::new(zf).map_err(|e| format!("open zip: {e}"))?;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        let name = entry.name().rsplit('/').next().unwrap_or("").to_string();
+        if ORT_DLLS.contains(&name.as_str()) {
+            let out = dir.join(&name);
+            let tmp = dir.join(format!("{name}.part"));
+            let mut w = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+            std::io::copy(&mut entry, &mut w).map_err(|e| format!("extract {name}: {e}"))?;
+            drop(w);
+            std::fs::rename(&tmp, &out).map_err(|e| format!("finalize {name}: {e}"))?;
+        }
+    }
+    let _ = std::fs::remove_file(&zip_path);
+    if !ort_installed() {
+        return Err("onnxruntime.dll not found in the release archive".into());
+    }
+    Ok(())
+}
+
+/// Point `ort` at the downloaded runtime, unless the user already set `ORT_DYLIB_PATH`. Safe to
+/// call before the first embedder load (ort reads the var when it first dlopens).
+pub fn apply_ort_dylib_env() {
+    if std::env::var_os("ORT_DYLIB_PATH").is_some() {
+        return; // respect an explicit override
+    }
+    if let Some(p) = ort_dll_path() {
+        if p.exists() {
+            std::env::set_var("ORT_DYLIB_PATH", p);
+        }
+    }
+}
+
 /// Are all three SigLIP files already on disk?
 pub fn siglip_installed() -> bool {
     siglip_dir().is_some_and(|d| FILES.iter().all(|(_, dest)| d.join(dest).exists()))

@@ -34,6 +34,7 @@ image  = { workspace = true }
 dirs   = { workspace = true }
 rayon  = { workspace = true }
 ureq   = { workspace = true }
+zip    = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

@@ -20,6 +20,11 @@ fn main() -> eframe::Result {
 
     tracing::info!("Lodestash starting");
 
+    // Point `ort` at a previously-downloaded ONNX Runtime (if the user hasn't set ORT_DYLIB_PATH
+    // themselves) *before* any embedder load. On a fresh install neither exists, so ort is left
+    // untouched until the model+runtime are downloaded and the first search runs.
+    models::apply_ort_dylib_env();
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Lodestash")

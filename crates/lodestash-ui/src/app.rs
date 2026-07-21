@@ -2053,20 +2053,30 @@ impl LodestashApp {
         self.cache_dirty = true;
     }
 
-    /// Kick off the SigLIP model download on a worker thread, tracked by a cancellable job-tray
-    /// row. Idempotent-ish: no-op if one is already running.
+    /// Kick off the AI download on a worker thread (ONNX Runtime if missing, then the SigLIP
+    /// model), tracked by a cancellable job-tray row. No-op if one is already running.
     fn start_siglip_download(&mut self) {
         if self.siglip_dl_job.is_some() {
             return;
         }
+        let need_ort = !models::ort_installed();
+        let label = if need_ort {
+            "Downloading AI runtime + model (~480 MB)"
+        } else {
+            "Downloading AI model (~412 MB)"
+        };
         let progress = Arc::new(JobProgress::default());
-        let id = self
-            .jobs
-            .start("Downloading SigLIP model (~412 MB)".into(), progress.clone(), true);
+        let id = self.jobs.start(label.into(), progress.clone(), true);
         self.siglip_dl_job = Some(id);
         let tx = self.siglip_dl_tx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(models::download_siglip(progress));
+            let res = (|| {
+                if need_ort {
+                    models::download_ort(progress.clone())?;
+                }
+                models::download_siglip(progress)
+            })();
+            let _ = tx.send(res);
         });
     }
 
@@ -2080,15 +2090,20 @@ impl LodestashApp {
             }
             match res {
                 Ok(()) => {
+                    // Point ort at the just-downloaded runtime before the first load (ort reads
+                    // ORT_DYLIB_PATH when it dlopens). Fresh installs never touched ort at
+                    // startup, so this first load picks it up live — no restart.
+                    models::apply_ort_dylib_env();
                     self.ai_embedder = resolve_embedder();
                     if self.ai_embedder.is_some() {
                         self.jobs
                             .toast("Vision model ready — Search with AI is live", Intent::Success);
                     } else {
-                        // Files landed but the model won't load — almost always the ONNX Runtime.
+                        // Files landed but the model won't load. If ort was already initialised
+                        // this session (e.g. a stale runtime), a restart picks up the new one.
                         self.jobs.toast(
-                            "Model downloaded, but it won't load — check onnxruntime.dll (ORT 1.22)",
-                            Intent::Danger,
+                            "Downloaded — restart Lodestash to finish enabling Search with AI",
+                            Intent::Warning,
                         );
                     }
                 }
@@ -3371,29 +3386,36 @@ impl LodestashApp {
                             } else if ai_files {
                                 ui.label(
                                     RichText::new(
-                                        "Model files present but not loaded \u{2014} check the ONNX \
-                                         Runtime (onnxruntime.dll, ORT 1.22) beside the app.",
+                                        "Model files present but not loaded \u{2014} the ONNX \
+                                         Runtime is missing. Click below to fetch it, or restart if \
+                                         you just installed it.",
                                     )
                                     .size(12.0)
                                     .color(theme::WARNING),
                                 );
                             } else {
-                                ui.label(
-                                    RichText::new(
+                                let need_ort = !models::ort_installed();
+                                let (blurb, label) = if need_ort {
+                                    (
                                         "Describe an asset in plain language and find the ones that \
-                                         look like it. Downloads SigLIP 2 base (~412 MB) for fully \
-                                         offline, CPU-friendly visual search.",
+                                         look like it. Downloads the ONNX Runtime (1.22) + SigLIP 2 \
+                                         base (~480 MB total) for fully offline, CPU-friendly visual \
+                                         search.",
+                                        "\u{2B73} Download AI runtime + model (~480 MB)",
                                     )
-                                    .size(11.0)
-                                    .color(theme::TEXT_DIM),
-                                );
+                                } else {
+                                    (
+                                        "Downloads SigLIP 2 base (~412 MB) for fully offline, \
+                                         CPU-friendly visual search. Runtime already installed.",
+                                        "\u{2B73} Download AI model (~412 MB)",
+                                    )
+                                };
+                                ui.label(RichText::new(blurb).size(11.0).color(theme::TEXT_DIM));
                                 ui.add_space(8.0);
                                 if ui
                                     .add(
                                         egui::Button::new(
-                                            RichText::new("\u{2B73} Download model (~412 MB)")
-                                                .size(12.0)
-                                                .color(theme::ARCANE),
+                                            RichText::new(label).size(12.0).color(theme::ARCANE),
                                         )
                                         .stroke(egui::Stroke::new(1.0, theme::ARCANE))
                                         .rounding(6.0),
@@ -3401,6 +3423,38 @@ impl LodestashApp {
                                     .clicked()
                                 {
                                     start_dl = true;
+                                }
+                                // Offline / manual fallback (the version is strict — ORT 1.22.x).
+                                if let (Some(md), Some(rd)) =
+                                    (models::siglip_dir(), models::runtime_dir())
+                                {
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        RichText::new(
+                                            "Offline install: put onnxruntime.dll (ORT 1.22, win-x64) in",
+                                        )
+                                        .size(10.0)
+                                        .color(theme::TEXT_DIM),
+                                    );
+                                    ui.label(
+                                        RichText::new(rd.to_string_lossy())
+                                            .size(10.0)
+                                            .monospace()
+                                            .color(theme::TEXT_MUTED),
+                                    );
+                                    ui.label(
+                                        RichText::new(
+                                            "and the SigLIP vision.onnx / text.onnx / tokenizer.json in",
+                                        )
+                                        .size(10.0)
+                                        .color(theme::TEXT_DIM),
+                                    );
+                                    ui.label(
+                                        RichText::new(md.to_string_lossy())
+                                            .size(10.0)
+                                            .monospace()
+                                            .color(theme::TEXT_MUTED),
+                                    );
                                 }
                             }
                         });
