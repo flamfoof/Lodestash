@@ -27,10 +27,22 @@ pub struct View {
 /// Four orbit views at a slight downward tilt — enough to disambiguate front/back/side shapes
 /// without paying for more encoder passes.
 pub const DEFAULT_VIEWS: &[View] = &[
-    View { azimuth: 45.0, elevation: 20.0 },
-    View { azimuth: 135.0, elevation: 20.0 },
-    View { azimuth: 225.0, elevation: 20.0 },
-    View { azimuth: 315.0, elevation: 20.0 },
+    View {
+        azimuth: 45.0,
+        elevation: 20.0,
+    },
+    View {
+        azimuth: 135.0,
+        elevation: 20.0,
+    },
+    View {
+        azimuth: 225.0,
+        elevation: 20.0,
+    },
+    View {
+        azimuth: 315.0,
+        elevation: 20.0,
+    },
 ];
 
 /// Neutral studio-ish background (a plain light backdrop reads like a product render, which is
@@ -113,22 +125,41 @@ fn bounds(meshes: &[MeshData]) -> (V3, f32) {
     (center, radius)
 }
 
-/// Render `meshes` from each of `views` at `size`×`size`. Returns one RGBA image per view;
-/// empty if the meshes carry no geometry.
+/// Render `meshes` from each of `views` at `size`×`size` on the neutral studio backdrop — what
+/// the encoder sees. Returns one RGBA image per view; empty if the meshes carry no geometry.
 pub fn render_views(meshes: &[MeshData], size: u32, views: &[View]) -> Vec<RgbaImage> {
+    render_views_on(meshes, size, views, [BG[0], BG[1], BG[2], 255])
+}
+
+/// As [`render_views`], but with an explicit background. Grid thumbnails pass a **transparent**
+/// one so the card shows through (the app is dark-themed; the light studio backdrop that suits
+/// the encoder would be visually loud in the grid).
+pub fn render_views_on(
+    meshes: &[MeshData],
+    size: u32,
+    views: &[View],
+    bg: [u8; 4],
+) -> Vec<RgbaImage> {
     let (center, radius) = bounds(meshes);
     if radius <= 0.0 || size == 0 {
         return Vec::new();
     }
     views
         .iter()
-        .map(|v| render_one(meshes, size, *v, center, radius))
+        .map(|v| render_one(meshes, size, *v, center, radius, bg))
         .collect()
 }
 
-fn render_one(meshes: &[MeshData], size: u32, view: View, center: V3, radius: f32) -> RgbaImage {
+fn render_one(
+    meshes: &[MeshData],
+    size: u32,
+    view: View,
+    center: V3,
+    radius: f32,
+    bg: [u8; 4],
+) -> RgbaImage {
     let n = size as usize;
-    let mut img = RgbaImage::from_pixel(size, size, Rgba([BG[0], BG[1], BG[2], 255]));
+    let mut img = RgbaImage::from_pixel(size, size, Rgba(bg));
     let mut depth = vec![f32::MAX; n * n];
 
     // Camera basis: eye on the unit sphere at (azimuth, elevation), looking at the origin.
@@ -144,9 +175,15 @@ fn render_one(meshes: &[MeshData], size: u32, view: View, center: V3, radius: f3
         let base = m.base_color;
         for tri in m.indices.chunks_exact(3) {
             let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
-            let Some(p0) = m.positions.get(i0) else { continue };
-            let Some(p1) = m.positions.get(i1) else { continue };
-            let Some(p2) = m.positions.get(i2) else { continue };
+            let Some(p0) = m.positions.get(i0) else {
+                continue;
+            };
+            let Some(p1) = m.positions.get(i1) else {
+                continue;
+            };
+            let Some(p2) = m.positions.get(i2) else {
+                continue;
+            };
 
             // Normalise into the unit sphere, then project onto the camera basis (orthographic).
             let to_view = |p: &[f32; 3]| -> V3 {
@@ -173,9 +210,10 @@ fn render_one(meshes: &[MeshData], size: u32, view: View, center: V3, radius: f3
             // Textured: interpolate UVs per pixel and sample the albedo. Real albedo matters
             // to the encoder — "rusty barrel" needs the rust, not just the barrel shape.
             let tex = m.albedo.as_ref().filter(|_| m.uvs.is_some());
-            let uv = m.uvs.as_ref().and_then(|us| {
-                Some([*us.get(i0)?, *us.get(i1)?, *us.get(i2)?])
-            });
+            let uv = m
+                .uvs
+                .as_ref()
+                .and_then(|us| Some([*us.get(i0)?, *us.get(i1)?, *us.get(i2)?]));
 
             // View space (x,y in [-1,1]) → pixels, y down.
             let half = size as f32 * 0.5;
@@ -302,7 +340,12 @@ mod tests {
         let mut m = cube();
         // Per-corner UVs spanning the whole texture, and a vivid 2×2 texture that shares no
         // channel pattern with `base_color` (200,90,60).
-        m.uvs = Some(m.positions.iter().map(|p| [p[0] * 0.5 + 0.5, p[1] * 0.5 + 0.5]).collect());
+        m.uvs = Some(
+            m.positions
+                .iter()
+                .map(|p| [p[0] * 0.5 + 0.5, p[1] * 0.5 + 0.5])
+                .collect(),
+        );
         m.albedo = Some(Arc::new(AlbedoTex {
             width: 2,
             height: 2,
@@ -349,12 +392,18 @@ mod tests {
         let end_on = render_views(
             std::slice::from_ref(&m),
             96,
-            &[View { azimuth: 0.0, elevation: 0.0 }],
+            &[View {
+                azimuth: 0.0,
+                elevation: 0.0,
+            }],
         );
         let broadside = render_views(
             std::slice::from_ref(&m),
             96,
-            &[View { azimuth: 90.0, elevation: 0.0 }],
+            &[View {
+                azimuth: 90.0,
+                elevation: 0.0,
+            }],
         );
         let (a, b) = (coverage(&end_on[0]), coverage(&broadside[0]));
         assert!(
@@ -373,7 +422,11 @@ mod tests {
             p[0] *= 3.0;
         }
         let v = render_views(&[m], 96, DEFAULT_VIEWS);
-        let differing = v[1].pixels().zip(v[0].pixels()).filter(|(x, y)| x != y).count();
+        let differing = v[1]
+            .pixels()
+            .zip(v[0].pixels())
+            .filter(|(x, y)| x != y)
+            .count();
         assert!(
             differing > 100,
             "views 0 and 1 are near-identical ({differing} px differ)"

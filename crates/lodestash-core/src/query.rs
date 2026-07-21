@@ -58,7 +58,11 @@ impl ParsedQuery {
                 self.min_size_bytes = None;
             }
         }
-        self.semantic_text = self.semantic_text.split_whitespace().collect::<Vec<_>>().join(" ");
+        self.semantic_text = self
+            .semantic_text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         self
     }
 }
@@ -173,9 +177,7 @@ pub fn parse_query(query: &str) -> ParsedQuery {
         // ── rating: "4 stars" / "4-star" / "4+ stars" / "rated 4"
         if let Some((n, suffix)) = number_with_suffix(w) {
             let n_ok = (1.0..=5.0).contains(&n);
-            let next_is_star = lower
-                .get(i + 1)
-                .is_some_and(|t| t.starts_with("star"));
+            let next_is_star = lower.get(i + 1).is_some_and(|t| t.starts_with("star"));
             if n_ok && (suffix.starts_with("star") || next_is_star) {
                 out.min_rating = Some(n as u8);
                 used[i] = true;
@@ -193,7 +195,11 @@ pub fn parse_query(query: &str) -> ParsedQuery {
             }
         }
         if w == "rated" {
-            if let Some(n) = lower.get(i + 1).and_then(|t| number_with_suffix(t)).map(|(n, _)| n) {
+            if let Some(n) = lower
+                .get(i + 1)
+                .and_then(|t| number_with_suffix(t))
+                .map(|(n, _)| n)
+            {
                 if (1.0..=5.0).contains(&n) {
                     out.min_rating = Some(n as u8);
                     used[i] = true;
@@ -230,7 +236,12 @@ pub fn parse_query(query: &str) -> ParsedQuery {
         .zip(&used)
         .filter(|(_, u)| !**u)
         .map(|(w, _)| w.as_str())
-        .filter(|w| !matches!(w.to_lowercase().as_str(), "that" | "are" | "is" | "with" | "and"))
+        .filter(|w| {
+            !matches!(
+                w.to_lowercase().as_str(),
+                "that" | "are" | "is" | "with" | "and"
+            )
+        })
         .collect::<Vec<_>>()
         .join(" ");
     out.validate()
@@ -257,7 +268,10 @@ mod tests {
         ] {
             let p = parse_query(q);
             assert_eq!(p.max_size_bytes, Some(5 * 1024 * 1024), "{q}");
-            assert_eq!(p.semantic_text, "stylized rock", "{q}: size words must not pollute the vector");
+            assert_eq!(
+                p.semantic_text, "stylized rock",
+                "{q}: size words must not pollute the vector"
+            );
         }
         let p = parse_query("music over 2 gb");
         assert_eq!(p.min_size_bytes, Some(2 * 1024 * 1024 * 1024));
@@ -309,7 +323,11 @@ mod tests {
         }
         .validate();
         assert_eq!(p.min_rating, Some(5), "rating clamped into 1..=5");
-        assert_eq!(p.min_size_bytes, Some(0), "negatives clamp to 0, not dropped");
+        assert_eq!(
+            p.min_size_bytes,
+            Some(0),
+            "negatives clamp to 0, not dropped"
+        );
         assert_eq!(p.max_size_bytes, Some(0));
         assert_eq!(p.semantic_text, "rock", "whitespace normalised");
 
@@ -323,7 +341,15 @@ mod tests {
         assert_eq!(inverted.min_size_bytes, None);
         assert_eq!(inverted.max_size_bytes, Some(1_000_000));
 
-        assert_eq!(ParsedQuery { min_rating: Some(0), ..Default::default() }.validate().min_rating, Some(1));
+        assert_eq!(
+            ParsedQuery {
+                min_rating: Some(0),
+                ..Default::default()
+            }
+            .validate()
+            .min_rating,
+            Some(1)
+        );
     }
 
     #[test]

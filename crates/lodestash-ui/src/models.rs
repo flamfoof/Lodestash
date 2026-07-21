@@ -26,12 +26,22 @@ const FILES: &[(&str, &str)] = &[
 const APPROX_TOTAL: u64 = 412_538_967;
 
 pub fn siglip_dir() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("Lodestash").join("models").join("siglip"))
+    Some(
+        dirs::data_dir()?
+            .join("Lodestash")
+            .join("models")
+            .join("siglip"),
+    )
 }
 
 /// CLAP (audio↔text) lives beside SigLIP; separate model, separate vector space.
 pub fn clap_dir() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("Lodestash").join("models").join("clap"))
+    Some(
+        dirs::data_dir()?
+            .join("Lodestash")
+            .join("models")
+            .join("clap"),
+    )
 }
 
 const CLAP_BASE: &str = "https://huggingface.co/Xenova/clap-htsat-unfused/resolve/main";
@@ -51,7 +61,9 @@ pub fn clap_installed() -> bool {
 /// Download the CLAP towers + tokenizer. Same streaming/`.part`/resume rules as SigLIP.
 pub fn download_clap(progress: Arc<JobProgress>) -> Result<(), String> {
     let dir = clap_dir().ok_or("no data directory")?;
-    progress.total.fetch_add(CLAP_APPROX_TOTAL, Ordering::Relaxed);
+    progress
+        .total
+        .fetch_add(CLAP_APPROX_TOTAL, Ordering::Relaxed);
     fetch_all(&dir, CLAP_BASE, CLAP_FILES, &progress)
 }
 
@@ -93,7 +105,9 @@ pub fn download_ort(progress: Arc<JobProgress>) -> Result<(), String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("create runtime dir: {e}"))?;
 
     // Stream the zip to a temp file (progress by bytes), then extract just the dll(s).
-    let resp = ureq::get(ORT_ZIP_URL).call().map_err(|e| format!("GET runtime: {e}"))?;
+    let resp = ureq::get(ORT_ZIP_URL)
+        .call()
+        .map_err(|e| format!("GET runtime: {e}"))?;
     let len: u64 = resp
         .header("Content-Length")
         .and_then(|s| s.parse().ok())
@@ -108,11 +122,14 @@ pub fn download_ort(progress: Arc<JobProgress>) -> Result<(), String> {
             let _ = std::fs::remove_file(&zip_path);
             return Err("cancelled".into());
         }
-        let n = reader.read(&mut buf).map_err(|e| format!("read runtime: {e}"))?;
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| format!("read runtime: {e}"))?;
         if n == 0 {
             break;
         }
-        file.write_all(&buf[..n]).map_err(|e| format!("write runtime: {e}"))?;
+        file.write_all(&buf[..n])
+            .map_err(|e| format!("write runtime: {e}"))?;
         progress.done.fetch_add(n as u64, Ordering::Relaxed);
     }
     file.flush().map_err(|e| e.to_string())?;
@@ -190,7 +207,9 @@ fn fetch_all(
             continue;
         }
         let url = format!("{base}/{rel}");
-        let resp = ureq::get(&url).call().map_err(|e| format!("GET {dest}: {e}"))?;
+        let resp = ureq::get(&url)
+            .call()
+            .map_err(|e| format!("GET {dest}: {e}"))?;
         let tmp = dir.join(format!("{dest}.part"));
         let mut file = std::fs::File::create(&tmp).map_err(|e| format!("create {dest}: {e}"))?;
         let mut reader = resp.into_reader();
@@ -200,11 +219,14 @@ fn fetch_all(
                 let _ = std::fs::remove_file(&tmp);
                 return Err("cancelled".into());
             }
-            let n = reader.read(&mut buf).map_err(|e| format!("read {dest}: {e}"))?;
+            let n = reader
+                .read(&mut buf)
+                .map_err(|e| format!("read {dest}: {e}"))?;
             if n == 0 {
                 break;
             }
-            file.write_all(&buf[..n]).map_err(|e| format!("write {dest}: {e}"))?;
+            file.write_all(&buf[..n])
+                .map_err(|e| format!("write {dest}: {e}"))?;
             progress.done.fetch_add(n as u64, Ordering::Relaxed);
         }
         file.flush().map_err(|e| e.to_string())?;

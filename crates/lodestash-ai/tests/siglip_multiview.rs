@@ -77,11 +77,15 @@ fn text_query_finds_the_right_3d_model_by_shape() {
     let v = std::env::var("SIGLIP_VISION").expect("SIGLIP_VISION");
     let t = std::env::var("SIGLIP_TEXT").expect("SIGLIP_TEXT");
     let tok = std::env::var("SIGLIP_TOKENIZER").expect("SIGLIP_TOKENIZER");
-    let emb = SiglipEmbedder::load(Path::new(&v), Path::new(&t), Path::new(&tok), "siglip2-base")
-        .expect("load");
+    let emb = SiglipEmbedder::load(
+        Path::new(&v),
+        Path::new(&t),
+        Path::new(&tok),
+        "siglip2-base",
+    )
+    .expect("load");
 
-    let root: PathBuf =
-        std::env::temp_dir().join(format!("lodestash_mv_{}", std::process::id()));
+    let root: PathBuf = std::env::temp_dir().join(format!("lodestash_mv_{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     // Neutral filenames: a compact block vs a long thin rod.
     write_box_obj(&root.join("mesh_a.obj"), 1.0, 1.0, 1.0);
@@ -100,8 +104,12 @@ fn text_query_finds_the_right_3d_model_by_shape() {
         mtime: 1,
         workspace_rel: None,
     };
-    c.record_crawl(sid, None, &[rec("mesh_a.obj", "mesh_a"), rec("mesh_b.obj", "mesh_b")])
-        .expect("crawl");
+    c.record_crawl(
+        sid,
+        None,
+        &[rec("mesh_a.obj", "mesh_a"), rec("mesh_b.obj", "mesh_b")],
+    )
+    .expect("crawl");
 
     // Drain like the app: the queue hands back model_3d jobs, each rendered then embedded.
     let jobs = c.visual_assets_needing_embedding(100).expect("queue");

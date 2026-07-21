@@ -312,6 +312,9 @@ mod tests {
 
         // Silence must be finite (the 1e-10 clamp), never -inf/NaN.
         let (_, quiet) = log_mel_spectrogram(&vec![0.0; 4800]);
-        assert!(quiet.iter().all(|x| x.is_finite()), "silence produced non-finite dB");
+        assert!(
+            quiet.iter().all(|x| x.is_finite()),
+            "silence produced non-finite dB"
+        );
     }
 }

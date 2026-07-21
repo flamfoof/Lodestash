@@ -45,8 +45,13 @@ fn text_descriptions_match_their_own_sounds() {
     let a = std::env::var("CLAP_AUDIO").expect("CLAP_AUDIO");
     let t = std::env::var("CLAP_TEXT").expect("CLAP_TEXT");
     let tok = std::env::var("CLAP_TOKENIZER").expect("CLAP_TOKENIZER");
-    let emb = ClapEmbedder::load(Path::new(&a), Path::new(&t), Path::new(&tok), "clap-htsat-unfused")
-        .expect("load");
+    let emb = ClapEmbedder::load(
+        Path::new(&a),
+        Path::new(&t),
+        Path::new(&tok),
+        "clap-htsat-unfused",
+    )
+    .expect("load");
     assert!(emb.supports_audio());
     assert_eq!(emb.dim(), 512);
 
@@ -75,7 +80,10 @@ fn text_descriptions_match_their_own_sounds() {
 
     let cos = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(a, b)| a * b).sum::<f32>();
 
-    println!("\n            {:>12} {:>12} {:>12}", sounds[0].0, sounds[1].0, sounds[2].0);
+    println!(
+        "\n            {:>12} {:>12} {:>12}",
+        sounds[0].0, sounds[1].0, sounds[2].0
+    );
     let mut correct = 0;
     for (qi, q) in queries.iter().enumerate() {
         let qv = emb.embed_text(q);

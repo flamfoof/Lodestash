@@ -1767,15 +1767,10 @@ mod tests {
         assert!(fused.contains(&floor));
 
         // query_vec = None → pure structural (BM25 only): oak (no name match) is absent.
-        let structural = c
-            .hybrid_search("rock", &[], None, 10)
-            .expect("structural");
+        let structural = c.hybrid_search("rock", &[], None, 10).expect("structural");
         assert!(!structural.contains(&oak), "no vector → tree not found");
         assert!(structural.contains(&wall) && structural.contains(&floor));
-        assert!(c
-            .hybrid_search("rock", &[], None, 0)
-            .unwrap()
-            .is_empty());
+        assert!(c.hybrid_search("rock", &[], None, 0).unwrap().is_empty());
     }
 
     #[test]
@@ -1886,9 +1881,8 @@ mod tests {
             let q = mk(12345);
             let t = Instant::now();
             let idx = crate::vector::BruteForceIndex::new(cands);
-            let hits = <crate::vector::BruteForceIndex as crate::vector::VectorIndex>::knn(
-                &idx, &q, 20,
-            );
+            let hits =
+                <crate::vector::BruteForceIndex as crate::vector::VectorIndex>::knn(&idx, &q, 20);
             let scan = t.elapsed();
             assert_eq!(hits.len(), 20);
 
@@ -1903,7 +1897,9 @@ mod tests {
     fn visual_embed_queue_covers_images_models_on_disk_and_extracted() {
         let mut c = Catalog::open_in_memory().expect("open");
         c.seed_media_types().expect("seed");
-        let sid = c.upsert_import_source("src", "G:/src", "folder").expect("sid");
+        let sid = c
+            .upsert_import_source("src", "G:/src", "folder")
+            .expect("sid");
         let pid = c
             .upsert_package(sid, "G:/src/Pack.unitypackage", "Pack", None, None)
             .expect("pid");
@@ -1918,23 +1914,37 @@ mod tests {
         extracted.workspace_rel = Some("hash7/hero.png".into());
         let mut audio = rec("sfx/boom.wav", 7, 1);
         audio.media_type = "audio".into();
-        c.record_crawl(sid, None, &[on_disk, model, audio]).expect("crawl1");
-        c.record_crawl(sid, Some(pid), &[extracted]).expect("crawl2");
+        c.record_crawl(sid, None, &[on_disk, model, audio])
+            .expect("crawl1");
+        c.record_crawl(sid, Some(pid), &[extracted])
+            .expect("crawl2");
 
         let jobs = c.visual_assets_needing_embedding(100).expect("queue");
         assert_eq!(jobs.len(), 3, "2 images + 1 model queued; audio excluded");
 
-        let img = jobs.iter().find(|j| j.media_code == "image").expect("image job");
+        let img = jobs
+            .iter()
+            .find(|j| j.media_code == "image")
+            .expect("image job");
         assert_eq!(img.disk_path.as_deref(), Some("G:/src/tex/brick.png"));
         assert!(img.workspace_rel.is_none());
 
-        let m = jobs.iter().find(|j| j.media_code == "model_3d").expect("model job");
+        let m = jobs
+            .iter()
+            .find(|j| j.media_code == "model_3d")
+            .expect("model job");
         assert_eq!(m.disk_path.as_deref(), Some("G:/src/models/sword.fbx"));
 
-        let ext = jobs.iter().find(|j| j.workspace_rel.is_some()).expect("extracted job");
+        let ext = jobs
+            .iter()
+            .find(|j| j.workspace_rel.is_some())
+            .expect("extracted job");
         assert_eq!(ext.media_code, "sprite");
         assert_eq!(ext.workspace_rel.as_deref(), Some("hash7/hero.png"));
-        assert!(ext.disk_path.is_none(), "extracted files resolve via the workspace, not root");
+        assert!(
+            ext.disk_path.is_none(),
+            "extracted files resolve via the workspace, not root"
+        );
     }
 
     #[test]

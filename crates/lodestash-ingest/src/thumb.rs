@@ -58,7 +58,13 @@ pub fn generate(
 
     std::fs::create_dir_all(cache_dir)?;
 
-    let img = crate::raster::decode(source)?;
+    // 3D models have no pixels to decode — render one hero view instead. Same cache key and
+    // same output contract, so callers don't care which branch produced the PNG.
+    let img = if is_model(source) {
+        render_model_thumb(source, params.width.max(params.height))?
+    } else {
+        crate::raster::decode(source)?
+    };
 
     let thumb = resize_fit(&img, params.width, params.height);
 
@@ -67,6 +73,36 @@ pub fn generate(
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     Ok(dest)
+}
+
+/// Formats the mesh loaders handle (`mesh::load_any`): FBX/OBJ via ufbx, glTF/GLB via
+/// three-d-asset.
+fn is_model(path: &Path) -> bool {
+    crate::mesh::is_fbx_model(path)
+        || crate::mesh::is_gltf_model(path)
+        || path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("obj"))
+}
+
+/// Render a 3D model to a single 3/4 hero view on a **transparent** background, so the grid card
+/// shows through. Reuses the same CPU rasteriser the embedding pipeline uses — no GPU context,
+/// so this runs happily on the thumbnail worker threads.
+fn render_model_thumb(source: &Path, size: u32) -> std::io::Result<DynamicImage> {
+    let meshes = crate::mesh::load_any(source, &std::collections::BTreeMap::new())
+        .map_err(std::io::Error::other)?;
+    let views = crate::render3d::render_views_on(
+        &meshes,
+        size.max(1),
+        &crate::render3d::DEFAULT_VIEWS[..1],
+        [0, 0, 0, 0],
+    );
+    let img = views
+        .into_iter()
+        .next()
+        .ok_or_else(|| std::io::Error::other("model has no renderable geometry"))?;
+    Ok(DynamicImage::ImageRgba8(img))
 }
 
 /// Resize an image to fit within `max_w × max_h`, preserving aspect ratio.
@@ -158,5 +194,69 @@ mod tests {
         );
         assert_eq!(p1, p2);
         assert!(p1.to_str().unwrap().contains("128x128"));
+    }
+
+    /// A 3D model must thumbnail through the render path: real geometry drawn, and the corners
+    /// left transparent so the dark grid card shows through.
+    #[test]
+    fn generates_a_thumbnail_for_a_3d_model() {
+        let dir = std::env::temp_dir().join(format!("lodestash_thumb3d_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A wide, flat box as a handwritten OBJ (ufbx parses OBJ).
+        let mut obj = String::new();
+        for (dx, dy, dz) in [
+            (-1.0f32, -0.3f32, -0.3f32),
+            (1.0, -0.3, -0.3),
+            (1.0, 0.3, -0.3),
+            (-1.0, 0.3, -0.3),
+            (-1.0, -0.3, 0.3),
+            (1.0, -0.3, 0.3),
+            (1.0, 0.3, 0.3),
+            (-1.0, 0.3, 0.3),
+        ] {
+            obj.push_str(&format!("v {dx} {dy} {dz}\n"));
+        }
+        for f in [
+            [1, 2, 3],
+            [1, 3, 4],
+            [6, 5, 8],
+            [6, 8, 7],
+            [5, 1, 4],
+            [5, 4, 8],
+            [2, 6, 7],
+            [2, 7, 3],
+            [4, 3, 7],
+            [4, 7, 8],
+            [5, 6, 2],
+            [5, 2, 1],
+        ] {
+            obj.push_str(&format!("f {} {} {}\n", f[0], f[1], f[2]));
+        }
+        let src = dir.join("box.obj");
+        std::fs::write(&src, obj).unwrap();
+
+        let params = ThumbParams {
+            width: 96,
+            height: 96,
+        };
+        let out = generate(&src, &dir, "hash3d", params).expect("generate 3d thumb");
+        assert!(out.exists());
+        let img = image::open(&out).expect("decode thumb").to_rgba8();
+        assert!(img.width() <= 96 && img.height() <= 96);
+
+        let opaque = img.pixels().filter(|p| p[3] > 0).count();
+        assert!(
+            opaque > 200,
+            "expected rendered geometry, got {opaque} opaque px"
+        );
+        assert_eq!(
+            img.get_pixel(0, 0)[3],
+            0,
+            "corner must stay transparent for the grid card"
+        );
+
+        // Regenerating is a cache hit (same path, no re-render).
+        assert_eq!(generate(&src, &dir, "hash3d", params).unwrap(), out);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

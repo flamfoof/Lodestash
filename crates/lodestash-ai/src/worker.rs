@@ -84,7 +84,10 @@ mod tests {
 
         // Identical text embeds identically → self-retrieval works through hybrid_search's
         // vector arm (query_vec = the same asset's embedding).
-        let rock_vec = cands.iter().find(|(_, v)| v == &embedder.embed_text("rock")).map(|(id, _)| *id);
+        let rock_vec = cands
+            .iter()
+            .find(|(_, v)| v == &embedder.embed_text("rock"))
+            .map(|(id, _)| *id);
         assert!(rock_vec.is_some(), "the stub is deterministic across calls");
     }
 }

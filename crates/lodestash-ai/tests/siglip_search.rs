@@ -25,11 +25,17 @@ fn visual_search_ranks_by_appearance() {
     let v = std::env::var("SIGLIP_VISION").expect("SIGLIP_VISION");
     let t = std::env::var("SIGLIP_TEXT").expect("SIGLIP_TEXT");
     let tok = std::env::var("SIGLIP_TOKENIZER").expect("SIGLIP_TOKENIZER");
-    let emb =
-        SiglipEmbedder::load(Path::new(&v), Path::new(&t), Path::new(&tok), "siglip2-base").expect("load");
+    let emb = SiglipEmbedder::load(
+        Path::new(&v),
+        Path::new(&t),
+        Path::new(&tok),
+        "siglip2-base",
+    )
+    .expect("load");
 
     // A private temp dir as the "library root".
-    let root: PathBuf = std::env::temp_dir().join(format!("lodestash_siglip_{}", std::process::id()));
+    let root: PathBuf =
+        std::env::temp_dir().join(format!("lodestash_siglip_{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     write_solid(&root.join("asset_a.png"), 210, 30, 30); // red
     write_solid(&root.join("asset_b.png"), 30, 160, 40); // green
@@ -47,19 +53,34 @@ fn visual_search_ranks_by_appearance() {
         mtime: 1,
         workspace_rel: None,
     };
-    c.record_crawl(sid, None, &[rec("asset_a.png", "asset_a"), rec("asset_b.png", "asset_b")])
-        .expect("crawl");
+    c.record_crawl(
+        sid,
+        None,
+        &[rec("asset_a.png", "asset_a"), rec("asset_b.png", "asset_b")],
+    )
+    .expect("crawl");
 
     // Drain image assets exactly as the app does (decode → vision embed → store).
     let jobs = c.visual_assets_needing_embedding(100).expect("queue");
     assert_eq!(jobs.len(), 2, "both images dirty");
     let disk = |j: &lodestash_core::catalog::VisualEmbedJob| j.disk_path.clone().unwrap();
-    let red_id = jobs.iter().find(|j| disk(j).ends_with("asset_a.png")).unwrap().asset_id;
+    let red_id = jobs
+        .iter()
+        .find(|j| disk(j).ends_with("asset_a.png"))
+        .unwrap()
+        .asset_id;
     for job in jobs {
         let img = image::open(disk(&job)).expect("decode").to_rgba8();
         let vec = emb.embed_image(&img);
-        c.upsert_embedding(job.asset_id, emb.model_id(), "image", Some(job.media_type_id), Some(job.source_id), &vec)
-            .expect("store");
+        c.upsert_embedding(
+            job.asset_id,
+            emb.model_id(),
+            "image",
+            Some(job.media_type_id),
+            Some(job.source_id),
+            &vec,
+        )
+        .expect("store");
     }
 
     // Query text that matches NO name → only the vision arm can rank.
@@ -70,5 +91,9 @@ fn visual_search_ranks_by_appearance() {
     println!("visual-search ids for 'a red square': {ids:?} (red={red_id})");
     let _ = std::fs::remove_dir_all(&root);
 
-    assert_eq!(ids.first(), Some(&red_id), "the red image must rank first for 'a red square'");
+    assert_eq!(
+        ids.first(),
+        Some(&red_id),
+        "the red image must rank first for 'a red square'"
+    );
 }

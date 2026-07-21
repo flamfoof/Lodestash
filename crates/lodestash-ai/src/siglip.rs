@@ -52,9 +52,12 @@ impl SiglipEmbedder {
             let text = Session::builder()?.commit_from_file(text_path)?;
             Ok::<_, ort::Error>((vision, text))
         }))
-        .map_err(|_| "ONNX Runtime unavailable or incompatible (ort rc.10 needs ORT 1.22.x)".to_string())?;
+        .map_err(|_| {
+            "ONNX Runtime unavailable or incompatible (ort rc.10 needs ORT 1.22.x)".to_string()
+        })?;
         let (vision, text) = build.map_err(|e| format!("load SigLIP towers: {e}"))?;
-        let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| format!("tokenizer: {e}"))?;
+        let tokenizer =
+            Tokenizer::from_file(tokenizer_path).map_err(|e| format!("tokenizer: {e}"))?;
         Ok(Self {
             vision: Mutex::new(vision),
             text: Mutex::new(text),
@@ -64,15 +67,25 @@ impl SiglipEmbedder {
     }
 
     fn try_text(&self, text: &str) -> Result<Vec<f32>, String> {
-        let enc = self.tokenizer.encode(text, true).map_err(|e| format!("encode: {e}"))?;
+        let enc = self
+            .tokenizer
+            .encode(text, true)
+            .map_err(|e| format!("encode: {e}"))?;
         // Pad/truncate to exactly TEXT_LEN (SigLIP was trained with max_length=64 padding and
         // pools the final position, so the length must be fixed).
-        let mut ids: Vec<i64> = enc.get_ids().iter().take(TEXT_LEN).map(|&x| x as i64).collect();
+        let mut ids: Vec<i64> = enc
+            .get_ids()
+            .iter()
+            .take(TEXT_LEN)
+            .map(|&x| x as i64)
+            .collect();
         ids.resize(TEXT_LEN, PAD_ID);
         let arr = Array2::from_shape_vec((1, TEXT_LEN), ids).map_err(|e| e.to_string())?;
         let input = Tensor::from_array(arr).map_err(|e| e.to_string())?;
         let mut sess = self.text.lock().map_err(|e| e.to_string())?;
-        let out = sess.run(vec![("input_ids", input)]).map_err(|e| format!("text run: {e}"))?;
+        let out = sess
+            .run(vec![("input_ids", input)])
+            .map_err(|e| format!("text run: {e}"))?;
         pooled(&out)
     }
 
@@ -80,7 +93,11 @@ impl SiglipEmbedder {
         // Resize to a square 256×256 (bilinear ≈ Triangle; SigLIP squashes, no crop).
         let dyn_img = image::DynamicImage::ImageRgba8(img.clone());
         let resized = dyn_img
-            .resize_exact(IMAGE_SIZE, IMAGE_SIZE, image::imageops::FilterType::Triangle)
+            .resize_exact(
+                IMAGE_SIZE,
+                IMAGE_SIZE,
+                image::imageops::FilterType::Triangle,
+            )
             .to_rgb8();
         // CHW, normalise [0,255] → [-1,1]  ((x/255 - 0.5)/0.5 == x/127.5 - 1).
         let n = (IMAGE_SIZE * IMAGE_SIZE) as usize;
@@ -94,7 +111,9 @@ impl SiglipEmbedder {
             .map_err(|e| e.to_string())?;
         let input = Tensor::from_array(arr).map_err(|e| e.to_string())?;
         let mut sess = self.vision.lock().map_err(|e| e.to_string())?;
-        let out = sess.run(vec![("pixel_values", input)]).map_err(|e| format!("vision run: {e}"))?;
+        let out = sess
+            .run(vec![("pixel_values", input)])
+            .map_err(|e| format!("vision run: {e}"))?;
         pooled(&out)
     }
 }
@@ -102,7 +121,9 @@ impl SiglipEmbedder {
 /// Extract `pooler_output` `[1,768]` and L2-normalise it (so cosine == dot in the joint space).
 fn pooled(out: &ort::session::SessionOutputs) -> Result<Vec<f32>, String> {
     let t = out.get("pooler_output").ok_or("no pooler_output")?;
-    let (_shape, data) = t.try_extract_tensor::<f32>().map_err(|e| format!("extract: {e}"))?;
+    let (_shape, data) = t
+        .try_extract_tensor::<f32>()
+        .map_err(|e| format!("extract: {e}"))?;
     let mut v = data.to_vec();
     l2_normalise(&mut v);
     Ok(v)
@@ -158,8 +179,13 @@ mod tests {
         let v = std::env::var("SIGLIP_VISION").expect("SIGLIP_VISION");
         let t = std::env::var("SIGLIP_TEXT").expect("SIGLIP_TEXT");
         let tok = std::env::var("SIGLIP_TOKENIZER").expect("SIGLIP_TOKENIZER");
-        let emb = SiglipEmbedder::load(Path::new(&v), Path::new(&t), Path::new(&tok), "siglip2-base")
-            .expect("load");
+        let emb = SiglipEmbedder::load(
+            Path::new(&v),
+            Path::new(&t),
+            Path::new(&tok),
+            "siglip2-base",
+        )
+        .expect("load");
 
         let cos = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
         let red = emb.embed_image(&solid(220, 30, 30));
@@ -168,8 +194,14 @@ mod tests {
 
         let s_red = cos(&q_red, &red);
         let s_green = cos(&q_red, &green);
-        println!("dim={} sim(red_q,red)={s_red:.3} sim(red_q,green)={s_green:.3}", red.len());
+        println!(
+            "dim={} sim(red_q,red)={s_red:.3} sim(red_q,green)={s_green:.3}",
+            red.len()
+        );
         assert_eq!(red.len(), DIM);
-        assert!(s_red > s_green, "'red' query should match the red image over the green one");
+        assert!(
+            s_red > s_green,
+            "'red' query should match the red image over the green one"
+        );
     }
 }

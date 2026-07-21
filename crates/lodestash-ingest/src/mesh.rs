@@ -289,7 +289,10 @@ pub fn load_gltf(path: &Path) -> Result<Vec<MeshData>, String> {
             positions,
             // The renderer derives face normals, so skipping them costs nothing here.
             normals: None,
-            uvs: tri.uvs.as_ref().map(|us| us.iter().map(|u| [u.x, u.y]).collect()),
+            uvs: tri
+                .uvs
+                .as_ref()
+                .map(|us| us.iter().map(|u| [u.x, u.y]).collect()),
             indices,
             base_color,
             albedo: None,
@@ -303,7 +306,10 @@ pub fn load_gltf(path: &Path) -> Result<Vec<MeshData>, String> {
 
 /// Load any supported 3D format into world-space `MeshData`: FBX/OBJ via ufbx, glTF/GLB via
 /// three-d-asset. The single entry point for the embed drain and thumbnailer.
-pub fn load_any(path: &Path, tex_files: &BTreeMap<String, PathBuf>) -> Result<Vec<MeshData>, String> {
+pub fn load_any(
+    path: &Path,
+    tex_files: &BTreeMap<String, PathBuf>,
+) -> Result<Vec<MeshData>, String> {
     if is_gltf_model(path) {
         load_gltf(path)
     } else {
@@ -322,12 +328,24 @@ mod gltf_tests {
         const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::new();
         for c in data.chunks(3) {
-            let (b0, b1, b2) = (c[0] as u32, *c.get(1).unwrap_or(&0) as u32, *c.get(2).unwrap_or(&0) as u32);
+            let (b0, b1, b2) = (
+                c[0] as u32,
+                *c.get(1).unwrap_or(&0) as u32,
+                *c.get(2).unwrap_or(&0) as u32,
+            );
             let n = (b0 << 16) | (b1 << 8) | b2;
             out.push(T[(n >> 18) as usize & 63] as char);
             out.push(T[(n >> 12) as usize & 63] as char);
-            out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-            out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+            out.push(if c.len() > 1 {
+                T[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if c.len() > 2 {
+                T[n as usize & 63] as char
+            } else {
+                '='
+            });
         }
         out
     }
@@ -364,9 +382,14 @@ mod gltf_tests {
 
         assert_eq!(meshes.len(), 1, "one primitive");
         assert_eq!(meshes[0].positions.len(), 3);
-        assert_eq!(meshes[0].indices, vec![0, 1, 2], "sequential indices generated");
+        assert_eq!(
+            meshes[0].indices,
+            vec![0, 1, 2],
+            "sequential indices generated"
+        );
         // And it renders (the whole point of loading it).
-        let views = crate::render3d::render_views(&meshes, 64, &crate::render3d::DEFAULT_VIEWS[..1]);
+        let views =
+            crate::render3d::render_views(&meshes, 64, &crate::render3d::DEFAULT_VIEWS[..1]);
         assert_eq!(views.len(), 1);
     }
 }

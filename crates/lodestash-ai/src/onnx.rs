@@ -202,12 +202,15 @@ mod tests {
 
         let model = std::env::var("LODESTASH_ONNX_MODEL").expect("set LODESTASH_ONNX_MODEL");
         let tok = std::env::var("LODESTASH_ONNX_TOKENIZER").expect("set LODESTASH_ONNX_TOKENIZER");
-        let emb = OnnxTextEmbedder::load(Path::new(&model), Path::new(&tok), "all-minilm-l6-v2", 384)
-            .expect("load");
+        let emb =
+            OnnxTextEmbedder::load(Path::new(&model), Path::new(&tok), "all-minilm-l6-v2", 384)
+                .expect("load");
 
         let mut c = Catalog::open_in_memory().expect("open");
         c.seed_media_types().expect("seed");
-        let sid = c.upsert_import_source("Lib", "C:/lib", "folder").expect("src");
+        let sid = c
+            .upsert_import_source("Lib", "C:/lib", "folder")
+            .expect("src");
         let rec = |n: &str| CrawlRecord {
             rel_path: format!("{n}.glb"),
             name: n.to_string(),
@@ -228,7 +231,10 @@ mod tests {
             .hybrid_search("a rock", &[(emb.model_id(), &qv[..])], None, 10)
             .expect("hybrid");
         println!("hybrid ids for 'a rock': {ids:?}");
-        assert!(!ids.is_empty(), "vector arm must recall something for 'a rock'");
+        assert!(
+            !ids.is_empty(),
+            "vector arm must recall something for 'a rock'"
+        );
         // The boulder (asset id 1) must outrank the cello — semantic, not lexical.
         let pos = |want: i64| ids.iter().position(|&i| i == want);
         assert!(
@@ -245,13 +251,21 @@ mod tests {
     fn probe_real_model() {
         let model = std::env::var("LODESTASH_ONNX_MODEL").expect("set LODESTASH_ONNX_MODEL");
         let tok = std::env::var("LODESTASH_ONNX_TOKENIZER").expect("set LODESTASH_ONNX_TOKENIZER");
-        let emb = OnnxTextEmbedder::load(Path::new(&model), Path::new(&tok), "probe", 384)
-            .expect("load");
+        let emb =
+            OnnxTextEmbedder::load(Path::new(&model), Path::new(&tok), "probe", 384).expect("load");
         let a = emb.embed_text("a low-poly stylized rock");
         let b = emb.embed_text("a stylized boulder, low poly");
         let c = emb.embed_text("orchestral battle music");
         let cos = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| p * q).sum::<f32>();
-        println!("dim={} sim(rock,boulder)={:.3} sim(rock,music)={:.3}", a.len(), cos(&a, &b), cos(&a, &c));
-        assert!(cos(&a, &b) > cos(&a, &c), "related text is closer than unrelated");
+        println!(
+            "dim={} sim(rock,boulder)={:.3} sim(rock,music)={:.3}",
+            a.len(),
+            cos(&a, &b),
+            cos(&a, &c)
+        );
+        assert!(
+            cos(&a, &b) > cos(&a, &c),
+            "related text is closer than unrelated"
+        );
     }
 }

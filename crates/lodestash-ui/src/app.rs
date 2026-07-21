@@ -2087,7 +2087,10 @@ impl LodestashApp {
         // 512-d) are separate and non-comparable, so each is searched on its own and the
         // results fused on *rank* by RRF (§5.B "joint SigLIP/CLAP space").
         let visual = emb.embed_text(&semantic);
-        let audio = self.audio_embedder.as_ref().map(|a| (a.clone(), a.embed_text(&semantic)));
+        let audio = self
+            .audio_embedder
+            .as_ref()
+            .map(|a| (a.clone(), a.embed_text(&semantic)));
         let mut spaces: Vec<(&str, &[f32])> = vec![(emb.model_id(), &visual)];
         if let Some((a, v)) = &audio {
             spaces.push((a.model_id(), v));
@@ -2153,8 +2156,10 @@ impl LodestashApp {
                     self.ai_embedder = resolve_embedder();
                     self.audio_embedder = resolve_audio_embedder();
                     if self.ai_embedder.is_some() {
-                        self.jobs
-                            .toast("Vision model ready — Search with AI is live", Intent::Success);
+                        self.jobs.toast(
+                            "Vision model ready — Search with AI is live",
+                            Intent::Success,
+                        );
                     } else {
                         // Files landed but the model won't load. If ort was already initialised
                         // this session (e.g. a stale runtime), a restart picks up the new one.
@@ -2167,7 +2172,9 @@ impl LodestashApp {
                 Err(e) if e == "cancelled" => {
                     self.jobs.toast("Model download cancelled", Intent::Info)
                 }
-                Err(e) => self.jobs.toast(format!("Model download failed: {e}"), Intent::Danger),
+                Err(e) => self
+                    .jobs
+                    .toast(format!("Model download failed: {e}"), Intent::Danger),
             }
         }
     }
@@ -6411,7 +6418,10 @@ fn siglip_model_paths() -> Option<(PathBuf, PathBuf, PathBuf)> {
     ) {
         return Some((PathBuf::from(v), PathBuf::from(t), PathBuf::from(k)));
     }
-    let dir = dirs::data_dir()?.join("Lodestash").join("models").join("siglip");
+    let dir = dirs::data_dir()?
+        .join("Lodestash")
+        .join("models")
+        .join("siglip");
     let (v, t, k) = (
         dir.join("vision.onnx"),
         dir.join("text.onnx"),
@@ -6527,7 +6537,9 @@ fn decode_audio_48k_mono(path: &std::path::Path) -> Result<Vec<f32>, String> {
     let mono: Vec<f32> = if ch <= 1 {
         raw
     } else {
-        raw.chunks(ch).map(|c| c.iter().sum::<f32>() / ch as f32).collect()
+        raw.chunks(ch)
+            .map(|c| c.iter().sum::<f32>() / ch as f32)
+            .collect()
     };
     if sr == lodestash_ingest::melspec::SAMPLE_RATE {
         return Ok(mono);
@@ -6782,7 +6794,6 @@ fn persist_package_to_catalog(
     let assets = read_back_assets(&catalog, &sources)?;
     Ok((counts, assets, catalog))
 }
-
 
 /// Read every live asset row back for the given `(root, source_id)` pairs, keyed for
 /// the UI-side join (unknown status strings are dropped, not fatal).
@@ -8018,7 +8029,9 @@ fn type_label_char(mt: Option<MediaType>) -> &'static str {
 fn needs_thumbnail(mt: Option<MediaType>) -> bool {
     matches!(
         mt,
-        Some(MediaType::Image | MediaType::Texture | MediaType::Sprite)
+        // Model3d thumbnails are rendered offscreen by the CPU rasteriser in `thumb::generate`
+        // (no GPU context needed, so it runs on the same worker threads as image decoding).
+        Some(MediaType::Image | MediaType::Texture | MediaType::Sprite | MediaType::Model3d)
     )
 }
 
