@@ -225,7 +225,7 @@ mod tests {
 
         let qv = emb.embed_text("a rock");
         let ids = c
-            .hybrid_search("a rock", Some(&qv), emb.model_id(), None, 10)
+            .hybrid_search("a rock", &[(emb.model_id(), &qv[..])], None, 10)
             .expect("hybrid");
         println!("hybrid ids for 'a rock': {ids:?}");
         assert!(!ids.is_empty(), "vector arm must recall something for 'a rock'");

@@ -7,7 +7,7 @@
 //! arrive with the full P4 model-manager card; a stranger just needs "download and it works".
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -27,6 +27,32 @@ const APPROX_TOTAL: u64 = 412_538_967;
 
 pub fn siglip_dir() -> Option<PathBuf> {
     Some(dirs::data_dir()?.join("Lodestash").join("models").join("siglip"))
+}
+
+/// CLAP (audio↔text) lives beside SigLIP; separate model, separate vector space.
+pub fn clap_dir() -> Option<PathBuf> {
+    Some(dirs::data_dir()?.join("Lodestash").join("models").join("clap"))
+}
+
+const CLAP_BASE: &str = "https://huggingface.co/Xenova/clap-htsat-unfused/resolve/main";
+/// Quantized towers keep the audio download reasonable (~33MB + ~121MB).
+const CLAP_FILES: &[(&str, &str)] = &[
+    ("onnx/audio_model_quantized.onnx", "audio.onnx"),
+    ("onnx/text_model_quantized.onnx", "text.onnx"),
+    ("tokenizer.json", "tokenizer.json"),
+];
+/// Approximate combined CLAP size, for the progress bar.
+const CLAP_APPROX_TOTAL: u64 = 163_000_000;
+
+pub fn clap_installed() -> bool {
+    clap_dir().is_some_and(|d| CLAP_FILES.iter().all(|(_, dest)| d.join(dest).exists()))
+}
+
+/// Download the CLAP towers + tokenizer. Same streaming/`.part`/resume rules as SigLIP.
+pub fn download_clap(progress: Arc<JobProgress>) -> Result<(), String> {
+    let dir = clap_dir().ok_or("no data directory")?;
+    progress.total.fetch_add(CLAP_APPROX_TOTAL, Ordering::Relaxed);
+    fetch_all(&dir, CLAP_BASE, CLAP_FILES, &progress)
 }
 
 // ── ONNX Runtime (the native dll `ort` dlopens) ─────────────────────────────────────────────
@@ -137,22 +163,33 @@ pub fn siglip_installed() -> bool {
 /// `progress.cancelled`. Runs on a worker thread; `progress` is shared with the job tray.
 pub fn download_siglip(progress: Arc<JobProgress>) -> Result<(), String> {
     let dir = siglip_dir().ok_or("no data directory")?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create models dir: {e}"))?;
-    progress.total.store(APPROX_TOTAL, Ordering::Relaxed);
+    progress.total.fetch_add(APPROX_TOTAL, Ordering::Relaxed);
+    fetch_all(&dir, BASE, FILES, &progress)
+}
 
-    for (rel, dest) in FILES {
+/// Stream each `(remote, local)` file into `dir`, writing to a `.part` and renaming on completion
+/// (so a crash never leaves a half-file that looks installed). Already-present files are counted
+/// toward progress and skipped, which makes an interrupted install resumable. Cooperative cancel
+/// via `progress.cancelled`. Shared by every model download.
+fn fetch_all(
+    dir: &Path,
+    base: &str,
+    files: &[(&str, &str)],
+    progress: &Arc<JobProgress>,
+) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("create models dir: {e}"))?;
+    for (rel, dest) in files {
         if progress.is_cancelled() {
             return Err("cancelled".into());
         }
         let final_path = dir.join(dest);
         if final_path.exists() {
-            // Resume a partial install: count it toward progress, skip the fetch.
             if let Ok(m) = final_path.metadata() {
                 progress.done.fetch_add(m.len(), Ordering::Relaxed);
             }
             continue;
         }
-        let url = format!("{BASE}/{rel}");
+        let url = format!("{base}/{rel}");
         let resp = ureq::get(&url).call().map_err(|e| format!("GET {dest}: {e}"))?;
         let tmp = dir.join(format!("{dest}.part"));
         let mut file = std::fs::File::create(&tmp).map_err(|e| format!("create {dest}: {e}"))?;

@@ -1241,6 +1241,43 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("visual embed queue row: {e}")))
     }
 
+    /// Dirty **audio** assets for the CLAP drain. Same shape and path rules as
+    /// [`Self::visual_assets_needing_embedding`]; separate because audio is encoded by a
+    /// different model into a different vector space.
+    pub fn audio_assets_needing_embedding(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT a.id,
+                        CASE WHEN af.workspace_rel IS NULL
+                             THEN s.root_path || '/' || af.rel_path END,
+                        af.workspace_rel, a.media_type_id, a.source_id, mt.code
+                 FROM asset a
+                 JOIN media_type mt   ON mt.id = a.media_type_id
+                 JOIN import_source s ON s.id = a.source_id
+                 JOIN asset_file af   ON af.asset_id = a.id
+                 WHERE a.embedding_dirty = 1 AND a.deleted_at IS NULL
+                   AND af.missing = 0
+                   AND mt.code = 'audio'
+                 ORDER BY a.id LIMIT ?1",
+            )
+            .map_err(|e| CoreError::Catalog(format!("audio embed queue prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(VisualEmbedJob {
+                    asset_id: r.get(0)?,
+                    disk_path: r.get(1)?,
+                    workspace_rel: r.get(2)?,
+                    media_type_id: r.get(3)?,
+                    source_id: r.get(4)?,
+                    media_code: r.get(5)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("audio embed queue query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("audio embed queue row: {e}")))
+    }
+
     pub fn upsert_embedding(
         &mut self,
         asset_id: i64,
@@ -1345,22 +1382,26 @@ impl Catalog {
         Ok(Some(ids))
     }
 
-    /// Hybrid search (IDENTIFICATION-AND-SEARCH §5.B, DATA-MODEL §3): run the two
-    /// retrievers over the (media-type pre-filtered) set and fuse them with RRF.
+    /// Hybrid search (IDENTIFICATION-AND-SEARCH §5.B, DATA-MODEL §3): run every retriever over
+    /// the (media-type pre-filtered) set and fuse them with RRF.
     ///
     /// - **BM25** over `query` (skipped when the query is empty/punctuation-only).
-    /// - **Vector KNN** over `query_vec` against the `model_id` embeddings (skipped when
-    ///   `query_vec` is `None` — then this degrades to pure structural, i.e. Search by Tags).
+    /// - **Vector KNN** once per entry in `spaces`, each `(model_id, query_vec)`.
     ///
-    /// Returns fused asset ids, most-relevant first, capped at `limit`. The caller supplies
-    /// `query_vec` (embedding the query is `lodestash-ai`'s job — keeps this crate model-free).
+    /// `spaces` is a list because the modalities live in **separate, non-comparable vector
+    /// spaces** (§5.B "joint SigLIP/CLAP space"): SigLIP embeds visuals at 768-d, CLAP embeds
+    /// audio at 512-d, and a query is embedded into each. Searching them independently and
+    /// fusing on *rank* is precisely what RRF is for — raw scores across different models are
+    /// meaningless to compare. An empty `spaces` degrades to pure structural (Search by Tags).
+    ///
+    /// Returns fused asset ids, most-relevant first, capped at `limit`. The caller supplies the
+    /// query vectors (embedding is `lodestash-ai`'s job — keeps this crate model-free).
     /// ponytail: no cross-encoder rerank step yet (§5.B step 4, opt-in) — add it behind a flag
     /// if top-N precision needs it.
     pub fn hybrid_search(
         &self,
         query: &str,
-        query_vec: Option<&[f32]>,
-        model_id: &str,
+        spaces: &[(&str, &[f32])],
         media_type_id: Option<i64>,
         limit: usize,
     ) -> Result<Vec<i64>> {
@@ -1371,22 +1412,22 @@ impl Catalog {
         // list is truncated to `limit` at the end.
         let depth = limit.saturating_mul(5).max(50);
 
-        let bm25 = self.search_assets(query, depth)?.unwrap_or_default();
+        let mut rankings = Vec::with_capacity(spaces.len() + 1);
+        rankings.push(self.search_assets(query, depth)?.unwrap_or_default());
 
-        let knn = match query_vec {
-            Some(qv) => {
-                let candidates = self.embeddings_for_knn(model_id, media_type_id)?;
+        for (model_id, query_vec) in spaces {
+            let candidates = self.embeddings_for_knn(model_id, media_type_id)?;
+            rankings.push(
                 BruteForceIndex::new(candidates)
-                    .knn(qv, depth)
+                    .knn(query_vec, depth)
                     .into_iter()
                     .map(|(id, _)| id)
-                    .collect()
-            }
-            None => Vec::new(),
-        };
+                    .collect(),
+            );
+        }
 
         // RRF fuses on rank, so an empty retriever simply contributes nothing (k≈60, §3).
-        Ok(rrf_fuse(&[bm25, knn], 60.0, limit))
+        Ok(rrf_fuse(&rankings, 60.0, limit))
     }
 }
 
@@ -1716,7 +1757,7 @@ mod tests {
 
         // Query "rock" (BM25 → wall, floor) + vector [1,0,0] (KNN → wall, oak, floor).
         let fused = c
-            .hybrid_search("rock", Some(&[1.0, 0.0, 0.0]), "m", None, 10)
+            .hybrid_search("rock", &[("m", &[1.0, 0.0, 0.0][..])], None, 10)
             .expect("hybrid");
         assert_eq!(fused[0], wall, "wall wins — high in both retrievers");
         assert!(
@@ -1727,12 +1768,12 @@ mod tests {
 
         // query_vec = None → pure structural (BM25 only): oak (no name match) is absent.
         let structural = c
-            .hybrid_search("rock", None, "m", None, 10)
+            .hybrid_search("rock", &[], None, 10)
             .expect("structural");
         assert!(!structural.contains(&oak), "no vector → tree not found");
         assert!(structural.contains(&wall) && structural.contains(&floor));
         assert!(c
-            .hybrid_search("rock", None, "m", None, 0)
+            .hybrid_search("rock", &[], None, 0)
             .unwrap()
             .is_empty());
     }

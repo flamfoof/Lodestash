@@ -128,7 +128,7 @@ fn text_query_finds_the_right_3d_model_by_shape() {
     let query = "a long thin stick";
     let qv = emb.embed_text(query);
     let ids = c
-        .hybrid_search(query, Some(&qv), emb.model_id(), None, 10)
+        .hybrid_search(query, &[(emb.model_id(), &qv[..])], None, 10)
         .expect("hybrid");
     println!("3D visual-search ids for {query:?}: {ids:?} (rod={rod_id})");
     let _ = std::fs::remove_dir_all(&root);

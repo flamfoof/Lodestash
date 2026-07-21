@@ -585,6 +585,10 @@ pub struct LodestashApp {
     /// drain (vision tower). `None` when the ONNX Runtime + model artifacts aren't present — AI
     /// search then stays a stub.
     ai_embedder: Option<Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
+    /// The local CLAP joint audio↔text embedder — a **separate** 512-d space from SigLIP's
+    /// 768-d visual one. Queries are embedded into both and the two KNN result lists are fused
+    /// by RRF; the vectors themselves are never compared across spaces.
+    audio_embedder: Option<Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
     /// Job-tray id of an in-flight SigLIP download (`Some` while downloading), and the channel
     /// its worker thread reports completion on. On success the UI reloads `ai_embedder` live.
     siglip_dl_job: Option<u64>,
@@ -735,6 +739,7 @@ impl LodestashApp {
             search_ranks: None,
             search_ranks_key: None,
             ai_embedder: resolve_embedder(),
+            audio_embedder: resolve_audio_embedder(),
             siglip_dl_job: None,
             siglip_dl_rx,
             siglip_dl_tx,
@@ -1235,6 +1240,7 @@ impl LodestashApp {
         let generation = self.scan_generation;
         let tx = self.catalog_tx.clone();
         let embedder = self.ai_embedder.clone();
+        let audio_embedder = self.audio_embedder.clone();
         let workspace_dir = self.workspace_dir.clone();
         self.catalog_persisting = true;
         std::thread::spawn(move || {
@@ -1254,8 +1260,13 @@ impl LodestashApp {
             // Then embed the rows `record_crawl` just marked dirty, on this same connection
             // (still the sole writer). Runs *after* the grid gets its identity, so a large
             // first scan doesn't stall the UI on inference. Search-with-AI needs these.
-            if let (Some(mut cat), Some(emb)) = (catalog, embedder) {
-                drain_image_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
+            if let Some(mut cat) = catalog {
+                if let Some(emb) = embedder {
+                    drain_image_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
+                }
+                if let Some(emb) = audio_embedder {
+                    drain_audio_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
+                }
             }
         });
     }
@@ -1331,6 +1342,7 @@ impl LodestashApp {
         let generation = self.scan_generation;
         let tx = self.catalog_tx.clone();
         let embedder = self.ai_embedder.clone();
+        let audio_embedder = self.audio_embedder.clone();
         let workspace_dir = self.workspace_dir.clone();
         self.catalog_persisting = true;
         std::thread::spawn(move || {
@@ -1348,8 +1360,13 @@ impl LodestashApp {
             });
             // Embed the freshly-extracted images now, while their files are guaranteed present in
             // the workspace (same sole-writer connection).
-            if let (Some(mut cat), Some(emb)) = (catalog, embedder) {
-                drain_image_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
+            if let Some(mut cat) = catalog {
+                if let Some(emb) = embedder {
+                    drain_image_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
+                }
+                if let Some(emb) = audio_embedder {
+                    drain_audio_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
+                }
             }
         });
     }
@@ -2044,11 +2061,19 @@ impl LodestashApp {
         let Some(cat) = &self.search_catalog else {
             return;
         };
-        let qv = emb.embed_text(&query);
+        // Embed the query into every loaded space: SigLIP (visual, 768-d) and CLAP (audio,
+        // 512-d) are separate and non-comparable, so each is searched on its own and the
+        // results fused on *rank* by RRF (§5.B "joint SigLIP/CLAP space").
+        let visual = emb.embed_text(&query);
+        let audio = self.audio_embedder.as_ref().map(|a| (a.clone(), a.embed_text(&query)));
+        let mut spaces: Vec<(&str, &[f32])> = vec![(emb.model_id(), &visual)];
+        if let Some((a, v)) = &audio {
+            spaces.push((a.model_id(), v));
+        }
         // Bucket pre-filter is left to the grid's tab.matches (a Category spans several
         // media_types; hybrid_search takes a single one) — pass None here.
         let ids = cat
-            .hybrid_search(&query, Some(&qv), emb.model_id(), None, HIT_CAP)
+            .hybrid_search(&query, &spaces, None, HIT_CAP)
             .unwrap_or_default();
         self.search_ranks = Some(
             ids.into_iter()
@@ -2069,9 +2094,9 @@ impl LodestashApp {
         }
         let need_ort = !models::ort_installed();
         let label = if need_ort {
-            "Downloading AI runtime + model (~480 MB)"
+            "Downloading AI runtime + models (~645 MB)"
         } else {
-            "Downloading AI model (~412 MB)"
+            "Downloading AI models (~575 MB)"
         };
         let progress = Arc::new(JobProgress::default());
         let id = self.jobs.start(label.into(), progress.clone(), true);
@@ -2082,7 +2107,8 @@ impl LodestashApp {
                 if need_ort {
                     models::download_ort(progress.clone())?;
                 }
-                models::download_siglip(progress)
+                models::download_siglip(progress.clone())?;
+                models::download_clap(progress)
             })();
             let _ = tx.send(res);
         });
@@ -2103,6 +2129,7 @@ impl LodestashApp {
                     // startup, so this first load picks it up live — no restart.
                     models::apply_ort_dylib_env();
                     self.ai_embedder = resolve_embedder();
+                    self.audio_embedder = resolve_audio_embedder();
                     if self.ai_embedder.is_some() {
                         self.jobs
                             .toast("Vision model ready — Search with AI is live", Intent::Success);
@@ -3374,14 +3401,19 @@ impl LodestashApp {
                         // Scaffold cards — controls shown; backends not built yet.
                         // AI · SEARCH MODEL — the SigLIP download that powers Search-with-AI.
                         let ai_loaded = self.ai_embedder.is_some();
+                        let audio_loaded = self.audio_embedder.is_some();
                         let ai_downloading = self.siglip_dl_job.is_some();
-                        let ai_files = models::siglip_installed();
+                        let ai_files = models::siglip_installed() && models::clap_installed();
                         settings_card(ui, "AI \u{00B7} SEARCH MODEL", |ui| {
                             if ai_loaded {
                                 ui.label(
-                                    RichText::new(
-                                        "\u{2713} SigLIP 2 base loaded \u{2014} visual Search with AI is active.",
-                                    )
+                                    RichText::new(if audio_loaded {
+                                        "\u{2713} SigLIP 2 + CLAP loaded \u{2014} Search with AI covers \
+                                         images, 3D models and audio."
+                                    } else {
+                                        "\u{2713} SigLIP 2 loaded \u{2014} visual Search with AI is active \
+                                         (audio model not installed)."
+                                    })
                                     .size(12.0)
                                     .color(theme::SUCCESS),
                                 );
@@ -3406,16 +3438,16 @@ impl LodestashApp {
                                 let (blurb, label) = if need_ort {
                                     (
                                         "Describe an asset in plain language and find the ones that \
-                                         look like it. Downloads the ONNX Runtime (1.22) + SigLIP 2 \
-                                         base (~480 MB total) for fully offline, CPU-friendly visual \
-                                         search.",
-                                        "\u{2B73} Download AI runtime + model (~480 MB)",
+                                         look like it, and audio by how it sounds. Downloads the ONNX \
+                                         Runtime (1.22) + SigLIP 2 base + CLAP (~645 MB total) for fully \
+                                         offline, CPU-friendly search.",
+                                        "\u{2B73} Download AI runtime + models (~645 MB)",
                                     )
                                 } else {
                                     (
-                                        "Downloads SigLIP 2 base (~412 MB) for fully offline, \
-                                         CPU-friendly visual search. Runtime already installed.",
-                                        "\u{2B73} Download AI model (~412 MB)",
+                                        "Downloads SigLIP 2 base + CLAP (~575 MB) for fully offline, \
+                                         CPU-friendly visual and audio search. Runtime already installed.",
+                                        "\u{2B73} Download AI models (~575 MB)",
                                     )
                                 };
                                 ui.label(RichText::new(blurb).size(11.0).color(theme::TEXT_DIM));
@@ -6379,6 +6411,136 @@ fn embed_model_multiview(
 /// Offscreen render resolution per view — SigLIP resizes to 256² anyway, so rendering larger
 /// only costs rasterisation time.
 const RENDER_SIZE: u32 = 256;
+
+/// Model id for the audio space. Kept distinct from the visual one so the two never mix in
+/// `asset_embedding` — `embeddings_for_knn` shards on `model_id`.
+const CLAP_MODEL_ID: &str = "clap-htsat-unfused";
+
+/// Load the CLAP audio embedder if its artifacts are present, else `None` (audio simply gets no
+/// vectors — visual search is unaffected). Mirrors `resolve_embedder`.
+fn resolve_audio_embedder() -> Option<Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>> {
+    let dir = models::clap_dir()?;
+    let (a, t, k) = (
+        dir.join("audio.onnx"),
+        dir.join("text.onnx"),
+        dir.join("tokenizer.json"),
+    );
+    if !(a.exists() && t.exists() && k.exists()) {
+        return None;
+    }
+    match lodestash_ai::clap::ClapEmbedder::load(&a, &t, &k, CLAP_MODEL_ID) {
+        Ok(e) => {
+            tracing::info!("clap embedder loaded — audio is searchable");
+            Some(Arc::new(e))
+        }
+        Err(e) => {
+            tracing::info!(%e, "no local clap model; audio stays unsearchable");
+            None
+        }
+    }
+}
+
+/// Decode an audio file to mono f32 at CLAP's 48 kHz. `rodio` bundles symphonia, so this needs
+/// no new dependency. Capped at a little over the 10 s the encoder consumes.
+/// ponytail: linear resampling — inaudible at mel resolution; swap in a windowed-sinc if audio
+/// retrieval quality ever demands it.
+fn decode_audio_48k_mono(path: &std::path::Path) -> Result<Vec<f32>, String> {
+    use rodio::Source;
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let dec = rodio::Decoder::new(std::io::BufReader::new(file)).map_err(|e| e.to_string())?;
+    let (sr, ch) = (dec.sample_rate(), dec.channels() as usize);
+    if sr == 0 || ch == 0 {
+        return Err("bad audio header".into());
+    }
+    // Only the first ~12s can matter (CLAP consumes 10s); bounds work on long music beds.
+    let cap = sr as usize * ch * 12;
+    let raw: Vec<f32> = dec.take(cap).map(|s| s as f32 / 32768.0).collect();
+    if raw.is_empty() {
+        return Err("no samples decoded".into());
+    }
+    let mono: Vec<f32> = if ch <= 1 {
+        raw
+    } else {
+        raw.chunks(ch).map(|c| c.iter().sum::<f32>() / ch as f32).collect()
+    };
+    if sr == lodestash_ingest::melspec::SAMPLE_RATE {
+        return Ok(mono);
+    }
+    let ratio = lodestash_ingest::melspec::SAMPLE_RATE as f64 / sr as f64;
+    let out_len = (mono.len() as f64 * ratio) as usize;
+    Ok((0..out_len)
+        .map(|i| {
+            let src = i as f64 / ratio;
+            let i0 = src.floor() as usize;
+            let frac = (src - i0 as f64) as f32;
+            let a = mono.get(i0).copied().unwrap_or(0.0);
+            let b = mono.get(i0 + 1).copied().unwrap_or(a);
+            a + (b - a) * frac
+        })
+        .collect())
+}
+
+/// Embed dirty **audio** assets with CLAP: decode → 48 kHz mono → log-mel → audio tower.
+/// Same sole-writer connection and same forward-progress rule as the visual drain (an
+/// undecodable file stores a zero vector so it's never re-queried forever).
+fn drain_audio_embeddings(
+    cat: &mut Catalog,
+    emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync),
+    workspace_dir: Option<&std::path::Path>,
+) {
+    const BATCH: usize = 32;
+    let mut total = 0usize;
+    loop {
+        let jobs = match cat.audio_assets_needing_embedding(BATCH) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(%e, "audio embed queue query failed; retries next scan");
+                break;
+            }
+        };
+        if jobs.is_empty() {
+            break;
+        }
+        let n = jobs.len();
+        for job in jobs {
+            let path = match (&job.disk_path, &job.workspace_rel) {
+                (Some(p), _) => Some(std::path::PathBuf::from(p)),
+                (None, Some(rel)) => workspace_dir.map(|w| w.join(rel)),
+                _ => None,
+            };
+            let vector = path
+                .as_deref()
+                .and_then(|p| {
+                    decode_audio_48k_mono(p)
+                        .map_err(|e| tracing::warn!(%e, "audio decode failed"))
+                        .ok()
+                })
+                .map(|samples| {
+                    let (frames, mel) = lodestash_ingest::melspec::log_mel_spectrogram(&samples);
+                    emb.embed_audio(&mel, frames)
+                })
+                .unwrap_or_else(|| vec![0.0; emb.dim()]);
+            if let Err(e) = cat.upsert_embedding(
+                job.asset_id,
+                emb.model_id(),
+                "audio",
+                Some(job.media_type_id),
+                Some(job.source_id),
+                &vector,
+            ) {
+                tracing::warn!(%e, "upsert_embedding failed; stopping audio drain");
+                return;
+            }
+            total += 1;
+        }
+        if n < BATCH {
+            break;
+        }
+    }
+    if total > 0 {
+        tracing::info!(embedded = total, "clap audio embeddings written");
+    }
+}
 
 /// Embed the dirty **visual** assets (SigLIP vision tower) in batches over the persist thread's
 /// own sole-writer connection: 2D files decode directly, 3D models are multiview-rendered first.

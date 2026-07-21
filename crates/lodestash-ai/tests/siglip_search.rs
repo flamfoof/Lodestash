@@ -65,7 +65,7 @@ fn visual_search_ranks_by_appearance() {
     // Query text that matches NO name → only the vision arm can rank.
     let qv = emb.embed_text("a red square");
     let ids = c
-        .hybrid_search("a red square", Some(&qv), emb.model_id(), None, 10)
+        .hybrid_search("a red square", &[(emb.model_id(), &qv[..])], None, 10)
         .expect("hybrid");
     println!("visual-search ids for 'a red square': {ids:?} (red={red_id})");
     let _ = std::fs::remove_dir_all(&root);
