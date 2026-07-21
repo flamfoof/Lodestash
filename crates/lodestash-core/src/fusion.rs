@@ -138,3 +138,100 @@ mod tests {
         );
     }
 }
+
+/// Property-based invariants (P3 QA card: "RRF fusion order — proptest invariant under rank
+/// perturbation"). The example-based tests above pin specific orderings; these pin the
+/// *properties* that must hold for any input.
+#[cfg(test)]
+mod proptest_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::HashSet;
+
+    /// Bounded ranges keep the suite fast; k is fixed since it only scales scores, never order.
+    fn rankings_strategy() -> impl Strategy<Value = (Vec<Vec<i64>>, f32, usize)> {
+        let id = 0i64..50;
+        let list = prop::collection::vec(id, 0..20);
+        let rankings = prop::collection::vec(list, 1..4);
+        let limit = 0usize..30;
+        (rankings, Just(60.0f32), limit)
+    }
+
+    proptest! {
+        /// Never returns more than asked for, nor more than the distinct ids available.
+        #[test]
+        fn bounded((rankings, k, limit) in rankings_strategy()) {
+            let result = rrf_fuse(&rankings, k, limit);
+            prop_assert!(result.len() <= limit);
+            let distinct: HashSet<i64> = rankings.iter().flatten().copied().collect();
+            prop_assert!(result.len() <= distinct.len());
+        }
+
+        #[test]
+        fn no_duplicates((rankings, k, limit) in rankings_strategy()) {
+            let result = rrf_fuse(&rankings, k, limit);
+            let seen: HashSet<i64> = result.iter().copied().collect();
+            prop_assert_eq!(result.len(), seen.len());
+        }
+
+        /// Nothing is invented: every fused id came from some retriever.
+        #[test]
+        fn sound((rankings, k, limit) in rankings_strategy()) {
+            let result = rrf_fuse(&rankings, k, limit);
+            let input_ids: HashSet<i64> = rankings.iter().flatten().copied().collect();
+            for id in &result {
+                prop_assert!(input_ids.contains(id));
+            }
+        }
+
+        /// Scores accumulate in a HashMap — iteration order must never leak into the result.
+        #[test]
+        fn deterministic_total_order((rankings, k, limit) in rankings_strategy()) {
+            let a = rrf_fuse(&rankings, k, limit);
+            let b = rrf_fuse(&rankings, k, limit);
+            prop_assert_eq!(a, b);
+        }
+
+        /// Rank-perturbation monotonicity: promoting an id one place earlier in a single list
+        /// strictly raises its own score and lowers only the id it displaced, so its position in
+        /// the fused output can never get worse. (Duplicated ids dedup to their best rank, which
+        /// degrades safely to "no change".)
+        #[test]
+        fn rank_perturbation_monotonicity(
+            (rankings, k, limit) in rankings_strategy(),
+            pick in 0usize..200
+        ) {
+            // Promotable slots only: pos>0, and a distinct neighbour so the swap isn't a no-op.
+            let candidates: Vec<(usize, usize)> = rankings
+                .iter()
+                .enumerate()
+                .flat_map(|(li, list)| {
+                    (1..list.len())
+                        .filter(move |&pos| list[pos] != list[pos - 1])
+                        .map(move |pos| (li, pos))
+                })
+                .collect();
+            prop_assume!(!candidates.is_empty());
+
+            let (list_idx, pos) = candidates[pick % candidates.len()];
+            let id = rankings[list_idx][pos];
+            let mut perturbed = rankings.clone();
+            perturbed[list_idx].swap(pos, pos - 1);
+
+            let before = rrf_fuse(&rankings, k, limit);
+            let after = rrf_fuse(&perturbed, k, limit);
+
+            // Only comparable when the id survives the limit in both runs.
+            if let (Some(pb), Some(pa)) = (
+                before.iter().position(|&x| x == id),
+                after.iter().position(|&x| x == id),
+            ) {
+                prop_assert!(
+                    pa <= pb,
+                    "promoted id {} moved from idx {} to {} (must not worsen)",
+                    id, pb, pa
+                );
+            }
+        }
+    }
+}
