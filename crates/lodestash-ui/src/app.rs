@@ -19,6 +19,7 @@ use lodestash_ingest::{detect, thumb, unitypackage};
 use crate::audio::AudioPlayer;
 use crate::config::{self, AppConfig, SizeTier, SizeTiers, SortBy, ViewMode};
 use crate::jobs::{Intent, JobProgress, Jobs};
+use crate::models;
 use crate::theme;
 use crate::viewport3d::{self, Viewport3d};
 
@@ -584,6 +585,11 @@ pub struct LodestashApp {
     /// drain (vision tower). `None` when the ONNX Runtime + model artifacts aren't present — AI
     /// search then stays a stub.
     ai_embedder: Option<Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
+    /// Job-tray id of an in-flight SigLIP download (`Some` while downloading), and the channel
+    /// its worker thread reports completion on. On success the UI reloads `ai_embedder` live.
+    siglip_dl_job: Option<u64>,
+    siglip_dl_rx: Receiver<Result<(), String>>,
+    siglip_dl_tx: Sender<Result<(), String>>,
     active_tab: Category,
     sort_by: SortBy,
     sort_asc: bool,
@@ -705,6 +711,7 @@ impl LodestashApp {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx);
 
+        let (siglip_dl_tx, siglip_dl_rx) = mpsc::channel();
         let (thumb_tx, thumb_rx) = mpsc::channel();
         let (scan_tx, scan_rx) = mpsc::channel();
         let (extract_tx, extract_rx) = mpsc::channel();
@@ -728,6 +735,9 @@ impl LodestashApp {
             search_ranks: None,
             search_ranks_key: None,
             ai_embedder: resolve_embedder(),
+            siglip_dl_job: None,
+            siglip_dl_rx,
+            siglip_dl_tx,
             active_tab: Category::All,
             sort_by,
             sort_asc,
@@ -2043,6 +2053,53 @@ impl LodestashApp {
         self.cache_dirty = true;
     }
 
+    /// Kick off the SigLIP model download on a worker thread, tracked by a cancellable job-tray
+    /// row. Idempotent-ish: no-op if one is already running.
+    fn start_siglip_download(&mut self) {
+        if self.siglip_dl_job.is_some() {
+            return;
+        }
+        let progress = Arc::new(JobProgress::default());
+        let id = self
+            .jobs
+            .start("Downloading SigLIP model (~412 MB)".into(), progress.clone(), true);
+        self.siglip_dl_job = Some(id);
+        let tx = self.siglip_dl_tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(models::download_siglip(progress));
+        });
+    }
+
+    /// Finish the download job when the worker reports back: on success reload the embedder live
+    /// (Search-with-AI lights up without a restart); otherwise toast the reason. A tray ✕ sets
+    /// `progress.cancelled`, which surfaces here as an `Err("cancelled")`.
+    fn receive_model_download(&mut self) {
+        while let Ok(res) = self.siglip_dl_rx.try_recv() {
+            if let Some(id) = self.siglip_dl_job.take() {
+                self.jobs.finish(id);
+            }
+            match res {
+                Ok(()) => {
+                    self.ai_embedder = resolve_embedder();
+                    if self.ai_embedder.is_some() {
+                        self.jobs
+                            .toast("Vision model ready — Search with AI is live", Intent::Success);
+                    } else {
+                        // Files landed but the model won't load — almost always the ONNX Runtime.
+                        self.jobs.toast(
+                            "Model downloaded, but it won't load — check onnxruntime.dll (ORT 1.22)",
+                            Intent::Danger,
+                        );
+                    }
+                }
+                Err(e) if e == "cancelled" => {
+                    self.jobs.toast("Model download cancelled", Intent::Info)
+                }
+                Err(e) => self.jobs.toast(format!("Model download failed: {e}"), Intent::Danger),
+            }
+        }
+    }
+
     fn refresh_search_ranks(&mut self) {
         // AI ranks are set explicitly by run_ai_search (on Enter), not recomputed per rebuild —
         // leave them untouched here so a rebuild doesn't wipe the last AI result set.
@@ -3065,6 +3122,7 @@ impl LodestashApp {
     fn settings_screen(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let mut save = false;
         let mut quality_changed = false;
+        let mut start_dl = false;
         // Blacklist actions collected during render, applied after (avoids borrowing self while
         // iterating scan_roots). Each is (source_idx, exclude).
         let mut toggle_expand: Option<usize> = None;
@@ -3291,6 +3349,61 @@ impl LodestashApp {
                         });
 
                         // Scaffold cards — controls shown; backends not built yet.
+                        // AI · SEARCH MODEL — the SigLIP download that powers Search-with-AI.
+                        let ai_loaded = self.ai_embedder.is_some();
+                        let ai_downloading = self.siglip_dl_job.is_some();
+                        let ai_files = models::siglip_installed();
+                        settings_card(ui, "AI \u{00B7} SEARCH MODEL", |ui| {
+                            if ai_loaded {
+                                ui.label(
+                                    RichText::new(
+                                        "\u{2713} SigLIP 2 base loaded \u{2014} visual Search with AI is active.",
+                                    )
+                                    .size(12.0)
+                                    .color(theme::SUCCESS),
+                                );
+                            } else if ai_downloading {
+                                ui.label(
+                                    RichText::new("Downloading\u{2026} see the job tray below.")
+                                        .size(12.0)
+                                        .color(theme::TEXT_DIM),
+                                );
+                            } else if ai_files {
+                                ui.label(
+                                    RichText::new(
+                                        "Model files present but not loaded \u{2014} check the ONNX \
+                                         Runtime (onnxruntime.dll, ORT 1.22) beside the app.",
+                                    )
+                                    .size(12.0)
+                                    .color(theme::WARNING),
+                                );
+                            } else {
+                                ui.label(
+                                    RichText::new(
+                                        "Describe an asset in plain language and find the ones that \
+                                         look like it. Downloads SigLIP 2 base (~412 MB) for fully \
+                                         offline, CPU-friendly visual search.",
+                                    )
+                                    .size(11.0)
+                                    .color(theme::TEXT_DIM),
+                                );
+                                ui.add_space(8.0);
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("\u{2B73} Download model (~412 MB)")
+                                                .size(12.0)
+                                                .color(theme::ARCANE),
+                                        )
+                                        .stroke(egui::Stroke::new(1.0, theme::ARCANE))
+                                        .rounding(6.0),
+                                    )
+                                    .clicked()
+                                {
+                                    start_dl = true;
+                                }
+                            }
+                        });
                         settings_card(ui, "AI \u{00B7} IDENTIFY PROFILE", |ui| {
                             ui.label(
                                 RichText::new(
@@ -3360,6 +3473,9 @@ impl LodestashApp {
         }
         if quality_changed {
             self.invalidate_thumbnails();
+        }
+        if start_dl {
+            self.start_siglip_download();
         }
 
         // Apply blacklist actions (collected during render to avoid borrowing self mid-iteration).
@@ -3733,6 +3849,7 @@ impl eframe::App for LodestashApp {
         self.receive_thumbnails();
         self.receive_extracts();
         self.receive_catalog();
+        self.receive_model_download();
         self.receive_viewer(ctx);
         // Tray ✕ on the scan row: the crawl thread finishes harmlessly (read-only) and
         // its ScanDone is dropped by the generation guard — semantically a cancel.

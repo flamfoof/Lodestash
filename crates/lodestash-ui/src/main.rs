@@ -6,6 +6,7 @@ mod audio;
 mod config;
 mod fonts;
 mod jobs;
+mod models;
 mod theme;
 mod viewport3d;
 

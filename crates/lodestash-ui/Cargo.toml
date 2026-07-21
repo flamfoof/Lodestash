@@ -33,6 +33,7 @@ rfd    = { workspace = true }
 image  = { workspace = true }
 dirs   = { workspace = true }
 rayon  = { workspace = true }
+ureq   = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

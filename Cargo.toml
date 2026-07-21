@@ -42,6 +42,9 @@ ufbx = "0.11"
 # Catalog / storage
 rusqlite = { version = "0.32", features = ["bundled", "blob", "load_extension"] }
 
+# Model manager (P4) — blocking HTTP download of ONNX models on a worker thread.
+ureq       = { version = "2", features = ["tls"] }
+
 # Ingest
 walkdir    = "2"
 notify     = { version = "7", features = ["serde"] }
