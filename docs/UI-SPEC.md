@@ -260,7 +260,8 @@ packs not yet started.
 
 *(Shipped slice: cache discovery/validation with persisted custom roots, publisher→pack browse
 straight off the download cache with pack counts + sizes, per-root "Use as library source",
-per-pack Extract through the pending-package flow, and the batch tick/queue described above. The `N unid` pill, ◉ Stats, and Browse→ need
+per-pack Extract through the pending-package flow, the batch tick/queue described above, and —
+for packs extracted this session — the `N assets` / `N unid` counts and **Browse →**. The `N unid` pill, ◉ Stats, and Browse→ need
 catalog `package` rows — they land with the P2 Packages model.)*
 
 ---

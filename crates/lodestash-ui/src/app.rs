@@ -1824,6 +1824,20 @@ impl LodestashApp {
         ctx.request_repaint();
     }
 
+    /// Assets in the library per extracted pack: `(total, unidentified)` (UI-SPEC §4 pack row).
+    /// Counted off the in-memory entries — they already carry their pack name, so this needs no
+    /// catalog round-trip and stays correct for packs extracted this session.
+    fn package_asset_counts(&self) -> std::collections::HashMap<String, (usize, usize)> {
+        package_asset_counts(&self.entries)
+    }
+
+    /// Jump to the Library filtered to one pack (UI-SPEC §4 "Browse →").
+    fn browse_package(&mut self, name: String) {
+        self.source_filter = Some(LibraryFilter::Package(name));
+        self.screen = Screen::Library;
+        self.nav_to(None);
+    }
+
     /// Queue every selected pack that can actually be unpacked, then start the first one.
     /// Selections whose cache root isn't a library source yet are left ticked and reported —
     /// silently dropping them would look like the button did nothing.
@@ -2829,6 +2843,7 @@ impl LodestashApp {
         let mut refresh_clicked = false;
         let mut source_to_add: Option<PathBuf> = None;
         let mut extract_idx: Option<usize> = None;
+        let mut browse_pkg: Option<String> = None;
 
         ui.horizontal(|ui| {
             if ui
@@ -2947,6 +2962,7 @@ impl LodestashApp {
             ui.separator();
             // Taken out of `self` for the closure, which also borrows `self.store_packages`.
             let mut selected = std::mem::take(&mut self.store_selected);
+            let counts = self.package_asset_counts();
             ScrollArea::vertical().show(ui, |ui| {
                 for run in publisher_runs(&self.store_packages) {
                     let pkgs = &self.store_packages[run];
@@ -3051,17 +3067,43 @@ impl LodestashApp {
                                                 extract_idx = Some(idx);
                                             }
                                         }
-                                        None if root_is_source => {
-                                            ui.label(
-                                                RichText::new(if self.scanning {
-                                                    "scanning\u{2026}"
-                                                } else {
-                                                    "\u{2713} extracted"
-                                                })
-                                                .color(theme::TEXT_DIM)
-                                                .size(10.0),
-                                            );
-                                        }
+                                        None if root_is_source => match counts.get(&pkg.name) {
+                                            Some(&(total, unid)) => {
+                                                if ui
+                                                    .button(
+                                                        RichText::new("Browse \u{2192}")
+                                                            .color(theme::GOLD)
+                                                            .size(11.0),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    browse_pkg = Some(pkg.name.clone());
+                                                }
+                                                if unid > 0 {
+                                                    ui.label(
+                                                        RichText::new(format!("{unid} unid"))
+                                                            .color(theme::WARNING)
+                                                            .size(10.0),
+                                                    );
+                                                }
+                                                ui.label(
+                                                    RichText::new(format!("{total} assets"))
+                                                        .color(theme::TEXT_DIM)
+                                                        .size(10.0),
+                                                );
+                                            }
+                                            None => {
+                                                ui.label(
+                                                    RichText::new(if self.scanning {
+                                                        "scanning\u{2026}"
+                                                    } else {
+                                                        "\u{2713} extracted"
+                                                    })
+                                                    .color(theme::TEXT_DIM)
+                                                    .size(10.0),
+                                                );
+                                            }
+                                        },
                                         None => {
                                             ui.label(
                                                 RichText::new("needs the cache as a source")
@@ -3111,6 +3153,9 @@ impl LodestashApp {
         }
         if enqueue_clicked {
             self.enqueue_selected_extracts(ctx);
+        }
+        if let Some(name) = browse_pkg {
+            self.browse_package(name);
         }
     }
 
@@ -3172,6 +3217,8 @@ impl LodestashApp {
         }
 
         let mut toggle: Option<(i64, bool)> = None;
+        let mut browse_pkg: Option<String> = None;
+        let counts = self.package_asset_counts();
         ScrollArea::vertical().show(ui, |ui| {
             for pkg in &packages {
                 egui::Frame::none()
@@ -3209,6 +3256,19 @@ impl LodestashApp {
                                         toggle = Some((pkg.id, !pinned));
                                     }
                                     if let Some(n) = pkg.asset_count {
+                                        // Extracted this session ⇒ its assets are in the grid,
+                                        // so the row can jump straight there (UI-SPEC §4).
+                                        if counts.contains_key(&pkg.name)
+                                            && ui
+                                                .button(
+                                                    RichText::new("Browse \u{2192}")
+                                                        .color(theme::GOLD)
+                                                        .size(11.0),
+                                                )
+                                                .clicked()
+                                        {
+                                            browse_pkg = Some(pkg.name.clone());
+                                        }
                                         ui.label(
                                             RichText::new(format!("{n} assets"))
                                                 .color(theme::TEXT_DIM)
@@ -3231,6 +3291,9 @@ impl LodestashApp {
 
         if let Some((id, pin)) = toggle {
             self.set_package_pinned(id, pin);
+        }
+        if let Some(name) = browse_pkg {
+            self.browse_package(name);
         }
     }
 
@@ -7698,6 +7761,24 @@ fn inspector_pane(
     rating_clicked
 }
 
+/// Assets per extracted pack as `(total, unidentified)`, trashed rows excluded (they left the
+/// grid, so counting them would contradict what Browse → shows). Free function so the rule is
+/// testable without an egui context.
+fn package_asset_counts(
+    entries: &[AssetEntry],
+) -> std::collections::HashMap<String, (usize, usize)> {
+    let mut out: std::collections::HashMap<String, (usize, usize)> = Default::default();
+    for e in entries.iter().filter(|e| !e.trashed) {
+        let Some(pkg) = e.package.as_deref() else {
+            continue;
+        };
+        let slot = out.entry(pkg.to_string()).or_default();
+        slot.0 += 1;
+        slot.1 += usize::from(e.status.is_unidentified());
+    }
+    out
+}
+
 /// Split ticked packs into the ones the extractor can act on now (their cache root is a library
 /// source, so they have a `pending_packages` row) and the ones still blocked on that. Pure so the
 /// batch rule is testable without an egui context.
@@ -8545,6 +8626,23 @@ mod tests {
             texture: None,
             thumb_spawned: false,
         }
+    }
+
+    #[test]
+    fn pack_counts_exclude_trashed_and_count_unidentified() {
+        let mut a = entry(0, "a.png", Some(MediaType::Image));
+        a.package = Some("Pack".into());
+        let mut b = entry(0, "b.png", Some(MediaType::Image));
+        b.package = Some("Pack".into());
+        b.status = AssetStatus::Identified;
+        let mut trashed = entry(0, "c.png", Some(MediaType::Image));
+        trashed.package = Some("Pack".into());
+        trashed.trashed = true;
+        let loose = entry(0, "d.png", Some(MediaType::Image));
+
+        let counts = package_asset_counts(&[a, b, trashed, loose]);
+        assert_eq!(counts.get("Pack"), Some(&(2, 1)));
+        assert_eq!(counts.len(), 1, "assets outside a pack are not counted");
     }
 
     #[test]
