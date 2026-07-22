@@ -95,6 +95,29 @@ pub struct HydratedAsset {
     pub trashed: bool,
     /// 1..=5 stars; None = unrated (DATA-MODEL §12).
     pub rating: Option<u8>,
+    pub metrics: AssetMetrics,
+}
+
+/// Technical facets extracted from the file itself (DATA-MODEL §14). Every field is optional:
+/// a facet may not apply to the media type, and extraction may fail on a file we still catalogue.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AssetMetrics {
+    /// Triangles in a 3D model (all meshes, after triangulation).
+    pub tri_count: Option<i64>,
+    pub width_px: Option<i64>,
+    pub height_px: Option<i64>,
+    pub duration_ms: Option<i64>,
+}
+
+impl AssetMetrics {
+    fn from_row(row: &rusqlite::Row, first: usize) -> rusqlite::Result<Self> {
+        Ok(Self {
+            tri_count: row.get(first)?,
+            width_px: row.get(first + 1)?,
+            height_px: row.get(first + 2)?,
+            duration_ms: row.get(first + 3)?,
+        })
+    }
 }
 
 /// One asset's catalog identity for the UI join (grid read path).
@@ -107,6 +130,7 @@ pub struct AssetIdentity {
     pub status: String,
     pub trashed: bool,
     pub rating: Option<u8>,
+    pub metrics: AssetMetrics,
 }
 
 /// The fully-opened, migration-applied catalog database.
@@ -160,6 +184,7 @@ impl Catalog {
             (6, MIGRATION_06_PACKAGE_ENTRIES),
             (7, MIGRATION_07_PACKAGE_PINNED),
             (8, MIGRATION_08_EMBEDDINGS),
+            (9, MIGRATION_09_ASSET_METRICS),
         ];
 
         for (version, sql) in migrations {
@@ -407,7 +432,10 @@ impl Catalog {
                         )
                         .map_err(|e| CoreError::Catalog(format!("asset_file update: {e}")))?;
                         tx.execute(
-                            "UPDATE asset SET updated_at = ?2, embedding_dirty = 1 WHERE id = ?1",
+                            // The bytes changed, so the extracted facets are stale too.
+                            "UPDATE asset SET updated_at = ?2, embedding_dirty = 1,
+                                              metrics_dirty = 1
+                             WHERE id = ?1",
                             params![asset_id, now],
                         )
                         .map_err(|e| CoreError::Catalog(format!("asset touch: {e}")))?;
@@ -434,7 +462,8 @@ impl Catalog {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT af.rel_path, a.id, a.status, a.deleted_at IS NOT NULL, a.rating
+                "SELECT af.rel_path, a.id, a.status, a.deleted_at IS NOT NULL, a.rating,
+                        a.tri_count, a.width_px, a.height_px, a.duration_ms
                  FROM asset a JOIN asset_file af ON af.id = a.primary_file_id
                  WHERE a.source_id = ?1",
             )
@@ -447,6 +476,7 @@ impl Catalog {
                     status: r.get(2)?,
                     trashed: r.get(3)?,
                     rating: r.get(4)?,
+                    metrics: AssetMetrics::from_row(r, 5)?,
                 })
             })
             .map_err(|e| CoreError::Catalog(format!("assets query: {e}")))?;
@@ -464,7 +494,8 @@ impl Catalog {
             .conn
             .prepare(
                 "SELECT af.rel_path, a.id, mt.code, af.size_bytes, af.mtime,
-                        a.status, a.deleted_at IS NOT NULL, a.rating
+                        a.status, a.deleted_at IS NOT NULL, a.rating,
+                        a.tri_count, a.width_px, a.height_px, a.duration_ms
                  FROM asset a
                  JOIN asset_file af ON af.id = a.primary_file_id
                  JOIN media_type mt ON mt.id = a.media_type_id
@@ -482,6 +513,7 @@ impl Catalog {
                     status: r.get(5)?,
                     trashed: r.get(6)?,
                     rating: r.get(7)?,
+                    metrics: AssetMetrics::from_row(r, 8)?,
                 })
             })
             .map_err(|e| CoreError::Catalog(format!("hydrate query: {e}")))?;
@@ -1003,6 +1035,18 @@ CREATE TABLE IF NOT EXISTS asset_embedding (
 CREATE INDEX IF NOT EXISTS idx_embed_prefilter ON asset_embedding(media_type_id);
 ";
 
+/// M9 — technical facets (DATA-MODEL §2 `asset`, §14): tri counts, pixel dimensions and audio
+/// duration, extracted lazily by a dirty-flag drain like embeddings. Nullable because a facet only
+/// applies to some media types, and because extraction can fail on a file we still want catalogued.
+const MIGRATION_09_ASSET_METRICS: &str = "
+ALTER TABLE asset ADD COLUMN tri_count     INTEGER;
+ALTER TABLE asset ADD COLUMN width_px      INTEGER;
+ALTER TABLE asset ADD COLUMN height_px     INTEGER;
+ALTER TABLE asset ADD COLUMN duration_ms   INTEGER;
+ALTER TABLE asset ADD COLUMN metrics_dirty INTEGER NOT NULL DEFAULT 1;
+CREATE INDEX IF NOT EXISTS idx_asset_metrics_dirty ON asset(metrics_dirty) WHERE metrics_dirty=1;
+";
+
 /// A package-extracted asset rehydrated from the catalog (UI "cache extracted packs" toggle).
 #[derive(Debug, Clone)]
 pub struct HydratedExtracted {
@@ -1046,7 +1090,8 @@ impl Catalog {
             .prepare(
                 "SELECT af.rel_path, a.id, mt.code, af.size_bytes, af.mtime,
                         a.status, a.deleted_at IS NOT NULL, a.rating,
-                        p.name, af.workspace_rel, p.pinned
+                        p.name, af.workspace_rel, p.pinned,
+                        a.tri_count, a.width_px, a.height_px, a.duration_ms
                  FROM asset a
                  JOIN asset_file af ON af.id = a.primary_file_id
                  JOIN media_type mt ON mt.id = a.media_type_id
@@ -1070,6 +1115,7 @@ impl Catalog {
                         status: r.get(5)?,
                         trashed: r.get(6)?,
                         rating: r.get(7)?,
+                        metrics: AssetMetrics::from_row(r, 11)?,
                     },
                 })
             })
@@ -1278,6 +1324,63 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("audio embed queue row: {e}")))
     }
 
+    /// Assets whose technical facets need (re)extracting — any media type, since the extractor
+    /// dispatches per type. Same path rules and job shape as the embedding queues (on-disk
+    /// `disk_path`, or `workspace_rel` for package-extracted payloads); `missing` rows excluded.
+    pub fn assets_needing_metrics(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT a.id,
+                        CASE WHEN af.workspace_rel IS NULL
+                             THEN s.root_path || '/' || af.rel_path END,
+                        af.workspace_rel, a.media_type_id, a.source_id, mt.code
+                 FROM asset a
+                 JOIN media_type mt   ON mt.id = a.media_type_id
+                 JOIN import_source s ON s.id = a.source_id
+                 JOIN asset_file af   ON af.id = a.primary_file_id
+                 WHERE a.metrics_dirty = 1 AND a.deleted_at IS NULL
+                   AND af.missing = 0
+                 ORDER BY a.id LIMIT ?1",
+            )
+            .map_err(|e| CoreError::Catalog(format!("metrics queue prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(VisualEmbedJob {
+                    asset_id: r.get(0)?,
+                    disk_path: r.get(1)?,
+                    workspace_rel: r.get(2)?,
+                    media_type_id: r.get(3)?,
+                    source_id: r.get(4)?,
+                    media_code: r.get(5)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("metrics queue query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("metrics queue row: {e}")))
+    }
+
+    /// Store extracted facets and clear the dirty flag. The flag clears even when every field is
+    /// `None` — same forward-progress rule as the embedding drain's zero vector, so an
+    /// unparseable file isn't retried on every scan.
+    pub fn set_metrics(&self, asset_id: i64, m: AssetMetrics) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE asset SET tri_count = ?2, width_px = ?3, height_px = ?4,
+                                  duration_ms = ?5, metrics_dirty = 1
+                 WHERE id = ?1",
+                params![
+                    asset_id,
+                    m.tri_count,
+                    m.width_px,
+                    m.height_px,
+                    m.duration_ms
+                ],
+            )
+            .map_err(|e| CoreError::Catalog(format!("set_metrics: {e}")))?;
+        Ok(())
+    }
+
     pub fn upsert_embedding(
         &mut self,
         asset_id: i64,
@@ -1472,7 +1575,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 8, "all 8 migrations should have run");
+        assert_eq!(version, 9, "all 9 migrations should have run");
     }
 
     /// A catalog stopped at schema v4, for exercising M5's data steps.
@@ -1630,6 +1733,41 @@ mod tests {
             size_bytes: size,
             mtime,
         }
+    }
+
+    /// New assets queue for extraction; storing facets clears the flag and the values reach the
+    /// read paths; a changed file re-queues.
+    #[test]
+    fn metrics_queue_clears_on_write_and_re_dirties_on_change() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let src = c
+            .upsert_import_source("Lib", "C:/lib", "folder")
+            .expect("src");
+        c.record_crawl(src, None, &[rec("a.png", 1, 1)])
+            .expect("crawl");
+
+        let job = c.assets_needing_metrics(10).expect("queue");
+        assert_eq!(job.len(), 1, "a fresh asset needs extraction");
+        assert_eq!(job[0].disk_path.as_deref(), Some("C:/lib/a.png"));
+
+        let m = AssetMetrics {
+            width_px: Some(1024),
+            height_px: Some(512),
+            ..Default::default()
+        };
+        c.set_metrics(job[0].asset_id, m).expect("set");
+        assert!(c.assets_needing_metrics(10).expect("queue").is_empty());
+        assert_eq!(c.entries_for_source(src).expect("hydrate")[0].metrics, m);
+        assert_eq!(c.assets_for_source(src).expect("identity")[0].metrics, m);
+
+        // Extraction that finds nothing still clears the flag (forward progress).
+        c.record_crawl(src, None, &[rec("a.png", 9, 9)])
+            .expect("rescan");
+        assert_eq!(c.assets_needing_metrics(10).expect("queue").len(), 1);
+        c.set_metrics(job[0].asset_id, AssetMetrics::default())
+            .expect("set empty");
+        assert!(c.assets_needing_metrics(10).expect("queue").is_empty());
     }
 
     #[test]

@@ -67,6 +67,12 @@ CREATE TABLE asset (
   content_kind    TEXT,                   -- 'model_3d'|'audio'|'image'|'material'|'prefab'|'script'|'dll'|'shader'|'editor_tool'|'data'|'other'
   status          TEXT NOT NULL DEFAULT 'discovered', -- lifecycle: discovered→indexed→identified→confirmed
   dominant_color  TEXT,                   -- hex of the asset's dominant color (color search/sort; §10)
+  -- Technical facets, extracted from the file (§14). NULL = not applicable or not yet extracted.
+  tri_count       INTEGER,                -- 3D: triangles across all meshes
+  width_px        INTEGER,                -- 2D: pixel dimensions
+  height_px       INTEGER,
+  duration_ms     INTEGER,                -- audio: clip length
+  metrics_dirty   INTEGER NOT NULL DEFAULT 1,  -- extraction queue flag (mirrors embedding_dirty)
   variant_group_id INTEGER,               -- groups near-identical variants under one grid tile (§10)
   embedding_dirty INTEGER NOT NULL DEFAULT 1,
   created_at      INTEGER NOT NULL,
@@ -77,6 +83,7 @@ CREATE INDEX idx_asset_source ON asset(source_id);
 CREATE INDEX idx_asset_media  ON asset(media_type_id);
 CREATE INDEX idx_asset_hash   ON asset(content_hash);
 CREATE INDEX idx_asset_dirty  ON asset(embedding_dirty) WHERE embedding_dirty=1;
+CREATE INDEX idx_asset_metrics_dirty ON asset(metrics_dirty) WHERE metrics_dirty=1;
 CREATE INDEX idx_asset_content ON asset(is_content) WHERE is_content=1;
 CREATE INDEX idx_asset_status  ON asset(status);
 CREATE INDEX idx_asset_variant ON asset(variant_group_id) WHERE variant_group_id IS NOT NULL;
@@ -624,6 +631,7 @@ transaction, in order, on open. Shipped so far:
 | **M6** | Extracted-pack persistence + surgical extraction: `asset_file.workspace_rel` (locates a package-extracted file in the content-addressed workspace, so extracted packs rehydrate across sessions behind the **Keep extracted packs cached** toggle, default off) + `package_entry` (per-payload guid/pathname/**tar offset**/size from the browse pass — selected assets re-extract with one gzip skip-scan instead of a full unpack, [`INGESTION.md`](INGESTION.md) §2) |
 | **M7** | Unity Assets library pinning: `package.pinned` (`ALTER TABLE package ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`) — backs the Add-to-Library pin (FEATURES.md §5.5, §7 above) so a promoted pack is a durable sidebar LIBRARIES row |
 | **M8** | Semantic embeddings (interim): `asset_embedding` BLOB table (dim × f32 little-endian + `model_id`/`modality`/`media_type_id`/`source_id`) — `Catalog::upsert_embedding` clears `embedding_dirty` in-txn; `embeddings_for_knn` loads the pre-filtered candidate set for `crate::vector::BruteForceIndex`. sqlite-vec `vec_asset` is the drop-in optimisation behind the `VectorIndex` seam (§2). |
+| **M9** | Technical facets: `asset.tri_count/width_px/height_px/duration_ms` + `asset.metrics_dirty` (partial index) — extracted from the file itself by a dirty-flag drain, exactly like embeddings (§14) |
 | **M5** | UI-SPEC alignment: per-project staging trays, `import_record.batch_id` + backfill, `tag` trait columns, `asset_relationship` (final form), `import_source.blacklist` — DDL + data steps below |
 
 ### M5 — UI-SPEC alignment (shipped 2026-07-16)
@@ -685,3 +693,23 @@ ALTER TABLE import_source ADD COLUMN blacklist TEXT;               -- JSON [{ "k
 
 Not in M5: MCP port/token, size tiers, quality, and cap settings stay in the app config file — they
 are per-machine preferences, not catalog data.
+
+---
+
+## 14. Technical facets (extracted metrics)
+
+`asset.tri_count`, `width_px`/`height_px` and `duration_ms` are the **technical facets**: measured
+properties of the file rather than anything a model or a user asserts. They back the ⚑ Filters
+Triangles chip, the inspector stat block, and the `tris:`/`duration:` structural filters of
+[`IDENTIFICATION-AND-SEARCH.md`](IDENTIFICATION-AND-SEARCH.md) §6.
+
+Rules:
+
+- **Extraction is lazy and queued**, mirroring embeddings: `metrics_dirty=1` on insert and whenever
+  a crawl sees changed bytes; `Catalog::assets_needing_metrics` is the queue, `set_metrics` stores
+  the result and clears the flag. Writes happen on the single writer connection (ARCHITECTURE §5).
+- **The flag clears even when nothing was extracted** — an unparseable file must not re-queue on
+  every scan (the same forward-progress rule as the embedding drain's zero vector).
+- **Every field is nullable.** A facet that does not apply to a media type stays NULL; so does one
+  whose extraction failed. UI and filters treat NULL as "unknown", never as zero.
+- Extraction is **read-only** on the source file, like everything else in the catalog (§6).
