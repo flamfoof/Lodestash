@@ -1,6 +1,5 @@
 //! The `/v1/` read routes and the auth guard (ENGINE-API §1, §2, §4).
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -92,11 +91,11 @@ fn is_loopback_authority(authority: &str) -> bool {
 // ---------------------------------------------------------------------------------------------
 
 async fn server_info(State(state): State<Shared>) -> Response {
-    let schema = match state.catalog.lock().unwrap().schema_version() {
+    let (app, schema) = match state.server_info() {
         Ok(v) => v,
         Err(e) => return db_err(e),
     };
-    Json(json!({ "app": env!("CARGO_PKG_VERSION"), "schema": schema, "api": "v1" })).into_response()
+    Json(json!({ "app": app, "schema": schema, "api": "v1" })).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,31 +117,18 @@ async fn search(State(state): State<Shared>, Query(p): Query<SearchParams>) -> R
         );
     }
     let limit = p.limit.unwrap_or(50).clamp(1, 500);
-    let cat = state.catalog.lock().unwrap();
     // ponytail: blocking sqlite on the async thread — these are indexed point queries; move to
     // spawn_blocking if a slow route ever shows up in a trace.
-    let ids = match cat.search_assets(&p.q, limit) {
-        Ok(Some(ids)) => ids,
-        Ok(None) => match cat.recent_asset_ids(limit) {
-            Ok(ids) => ids,
-            Err(e) => return db_err(e),
-        },
-        Err(e) => return db_err(e),
-    };
-    let rows = match cat.asset_summaries(&ids) {
+    let rows = match state.search(&p.q, limit, p.media_type.as_deref()) {
         Ok(rows) => rows,
         Err(e) => return db_err(e),
     };
-    let out: Vec<Value> = rows
-        .into_iter()
-        .filter(|r| p.media_type.as_ref().map_or(true, |m| *m == r.media_type))
-        .map(|r| summary_json(&r))
-        .collect();
+    let out: Vec<Value> = rows.iter().map(summary_json).collect();
     Json(json!({ "results": out })).into_response()
 }
 
 async fn asset_detail(State(state): State<Shared>, Path(id): Path<i64>) -> Response {
-    let Some(row) = (match lookup(&state, id) {
+    let Some(row) = (match state.asset(id) {
         Ok(row) => row,
         Err(e) => return db_err(e),
     }) else {
@@ -159,24 +145,19 @@ async fn asset_detail(State(state): State<Shared>, Path(id): Path<i64>) -> Respo
 }
 
 async fn preview(State(state): State<Shared>, Path(id): Path<i64>) -> Response {
-    let row = match lookup(&state, id) {
-        Ok(Some(row)) => row,
-        Ok(None) => return not_found(),
-        Err(e) => return db_err(e),
-    };
-    match source_path(&state, &row).and_then(|p| (state.preview)(&p)) {
+    match state.preview_path(id) {
         Some(path) => serve_file(&path, "image/png").await,
         None => not_found(),
     }
 }
 
 async fn file(State(state): State<Shared>, Path(id): Path<i64>) -> Response {
-    let row = match lookup(&state, id) {
+    let row = match state.asset(id) {
         Ok(Some(row)) => row,
         Ok(None) => return not_found(),
         Err(e) => return db_err(e),
     };
-    match source_path(&state, &row) {
+    match state.source_path(&row) {
         Some(path) => serve_file(&path, "application/octet-stream").await,
         None => not_found(),
     }
@@ -186,25 +167,9 @@ async fn file(State(state): State<Shared>, Path(id): Path<i64>) -> Response {
 // Shared bits
 // ---------------------------------------------------------------------------------------------
 
-fn lookup(state: &ServerState, id: i64) -> lodestash_core::error::Result<Option<AssetSummaryRow>> {
-    let cat = state.catalog.lock().unwrap();
-    Ok(cat.asset_summaries(&[id])?.into_iter().next())
-}
-
-/// Where the asset's bytes actually live: an on-disk source file, or a payload we extracted into
-/// the workspace.
-fn source_path(state: &ServerState, row: &AssetSummaryRow) -> Option<PathBuf> {
-    if let Some(p) = &row.disk_path {
-        return Some(PathBuf::from(p));
-    }
-    row.workspace_rel
-        .as_ref()
-        .map(|rel| state.workspace_dir.join(rel))
-}
-
 /// ENGINE-API §3 `AssetSummary`. `tags` is present but empty until P4 ships tagging — the shape
 /// stays stable for clients rather than growing a field later.
-fn summary_json(r: &AssetSummaryRow) -> Value {
+pub fn summary_json(r: &AssetSummaryRow) -> Value {
     json!({
         "id": r.id,
         "uuid": r.uuid,

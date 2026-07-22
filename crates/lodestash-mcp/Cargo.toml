@@ -15,6 +15,10 @@ serde_json     = { workspace = true }
 thiserror      = { workspace = true }
 tracing        = { workspace = true }
 tokio          = { workspace = true }
+lodestash-api  = { workspace = true }
+rmcp           = { workspace = true }
+schemars       = { workspace = true }
+base64         = { workspace = true }
 
-# Added in Phase 5:
-# rmcp = "0.2"   # official Rust MCP SDK (stdio transport)
+[dev-dependencies]
+tempfile = { workspace = true }

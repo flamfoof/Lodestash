@@ -50,7 +50,14 @@ against the `claude-api` skill before implementing.
   import/export tools stay confirm-gated per call regardless. The old HTTP+SSE transport is
   deprecated — do not build on it.
 - **Registration**: `claude mcp add --transport stdio lodestash -- <lodestash --mcp>` for Claude Code;
-  JSON config entry for Claude Desktop.
+  JSON config entry for Claude Desktop. **Shipped**: `lodestash --mcp` runs the stdio server in the
+  desktop binary with no window; logs go to **stderr** because stdout carries the protocol.
+
+> **Implementation status (interim).** Four read tools exist — `get_server_info`, `search_assets`,
+> `get_asset`, `get_asset_preview`. The rest of the table below lands with the matching REST route,
+> one operation at a time, so the 1:1 rule holds at every commit (a parity test enforces it).
+> `search_assets` is structural-only today; `semantic_search` waits on the query embedder being
+> reachable from this plane.
 
 ### Proposed MCP surface
 

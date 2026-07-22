@@ -6,15 +6,15 @@
 //! with it.
 
 pub mod handshake;
-mod routes;
+pub mod routes;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use lodestash_core::catalog::Catalog;
+use lodestash_core::catalog::{AssetSummaryRow, Catalog};
 
 pub use handshake::{write_handshake, Handshake};
-pub use routes::router;
+pub use routes::{router, summary_json};
 
 /// Every agent-facing operation in ENGINE-API §2, by MCP tool name. The MCP crate asserts its
 /// own tool list against this, which is how the 1:1 invariant stays enforced rather than hoped
@@ -27,6 +27,9 @@ pub const AGENT_OPERATIONS: &[(&str, &str)] = &[
     ("get_asset_preview", "GET /v1/assets/{id}/preview"),
 ];
 
+/// Resolves an asset's source file to a cached preview PNG, generating it on a miss.
+pub type PreviewFn = Box<dyn Fn(&Path) -> Option<PathBuf> + Send + Sync>;
+
 /// What a handler needs to answer a request. The API owns its **own** catalog connection
 /// (read-only queries) so it never contends with the UI's single writer — DATA-MODEL §1.
 pub struct ServerState {
@@ -35,7 +38,7 @@ pub struct ServerState {
     /// Given an asset's source file, the cached preview PNG for it (generating on a miss).
     /// Supplied by the caller because the thumbnail cache layout — and, for audio, the decoder —
     /// live outside this crate.
-    preview: Box<dyn Fn(&Path) -> Option<PathBuf> + Send + Sync>,
+    preview: PreviewFn,
     token: String,
 }
 
@@ -43,7 +46,7 @@ impl ServerState {
     pub fn new(
         catalog_path: &Path,
         workspace_dir: PathBuf,
-        preview: Box<dyn Fn(&Path) -> Option<PathBuf> + Send + Sync>,
+        preview: PreviewFn,
     ) -> lodestash_core::error::Result<Self> {
         Ok(Self {
             catalog: Mutex::new(Catalog::open(catalog_path)?),
@@ -55,6 +58,57 @@ impl ServerState {
 
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    // ── The agent operations. Both planes call *these*, never the catalog directly — that's
+    //    what makes the MCP↔REST 1:1 rule structural instead of aspirational.
+
+    /// `{app, schema, api}` versions (ENGINE-API §4 "Versioning").
+    pub fn server_info(&self) -> lodestash_core::error::Result<(String, u32)> {
+        let schema = self.catalog.lock().unwrap().schema_version()?;
+        Ok((env!("CARGO_PKG_VERSION").to_string(), schema))
+    }
+
+    /// Structural search. An empty/punctuation-only query falls back to the most recent assets so
+    /// a client that just connected sees the library rather than nothing.
+    pub fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        media_type: Option<&str>,
+    ) -> lodestash_core::error::Result<Vec<AssetSummaryRow>> {
+        let cat = self.catalog.lock().unwrap();
+        let ids = match cat.search_assets(query, limit)? {
+            Some(ids) => ids,
+            None => cat.recent_asset_ids(limit)?,
+        };
+        let rows = cat.asset_summaries(&ids)?;
+        Ok(match media_type {
+            Some(m) => rows.into_iter().filter(|r| r.media_type == m).collect(),
+            None => rows,
+        })
+    }
+
+    pub fn asset(&self, id: i64) -> lodestash_core::error::Result<Option<AssetSummaryRow>> {
+        let cat = self.catalog.lock().unwrap();
+        Ok(cat.asset_summaries(&[id])?.into_iter().next())
+    }
+
+    /// Where an asset's bytes live: an on-disk source file, or a payload extracted into the
+    /// workspace.
+    pub fn source_path(&self, row: &AssetSummaryRow) -> Option<PathBuf> {
+        if let Some(p) = &row.disk_path {
+            return Some(PathBuf::from(p));
+        }
+        row.workspace_rel
+            .as_ref()
+            .map(|rel| self.workspace_dir.join(rel))
+    }
+
+    /// The asset's preview PNG on disk, generated on a cache miss.
+    pub fn preview_path(&self, id: i64) -> Option<PathBuf> {
+        let row = self.asset(id).ok().flatten()?;
+        (self.preview)(&self.source_path(&row)?)
     }
 }
 

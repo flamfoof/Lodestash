@@ -11,6 +11,29 @@ mod theme;
 mod viewport3d;
 
 fn main() -> eframe::Result {
+    // `lodestash --mcp` is the MCP stdio server (MCP-AND-ENGINES §2 "Registration"): same binary,
+    // no window. stdout is the protocol channel, so logs must go to stderr.
+    if std::env::args().any(|a| a == "--mcp") {
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "lodestash=info".into()),
+            )
+            .init();
+        let (thumbs, ws) = app::default_cache_dirs();
+        let Some(state) = app::agent_state(thumbs, ws) else {
+            eprintln!("lodestash --mcp: no catalog available");
+            std::process::exit(1);
+        };
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        if let Err(e) = rt.block_on(lodestash_mcp::serve_stdio(std::sync::Arc::new(state))) {
+            eprintln!("lodestash --mcp: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

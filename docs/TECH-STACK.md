@@ -21,7 +21,7 @@ flagged.
 | `lodestash-ingest` | crawl, detect, untar, normalize, thumbnail, watch | `notify` (source-root watch, DATA-MODEL §6), `flate2`+`tar` (.unitypackage), `zip` (zip packs/.kra/.aseprite), `serde_yaml` (.meta), `image`, `image_dds`, `psd`, `texture2ddecoder`, `gltf`/`easy-gltf`, `ufbx` (FBX; single C file via `cc`), `symphonia`, `ab_glyph`/`fontdue` (font specimens), `blake3`, `img_hash` (pHash) |
 | `lodestash-ai` | Tagger/Embedder traits + impls | `ort` (ONNX Runtime; CUDA/DirectML/CPU EPs) — alt `candle`/`fastembed`, `tokenizers`, `ndarray`, `reqwest` (Ollama + cloud HTTP), `whisper-rs` (speech), `image` (preprocess) |
 | `lodestash-ui` | egui app + 3D/audio/image preview | `eframe`/`egui` + **`egui_glow`** (OpenGL renderer — see §7), `three-d` + `three-d-asset` (3D viewport; glow-lockstep with eframe, §7), `rodio` (+ `symphonia`) audio, `egui_extras` (`svg` feature — resvg; renders the sidebar nav icons, tinted per row state) + `egui_plot` (waveform), `rfd` (file dialogs), `poll-promise` (async UI) |
-| `lodestash-mcp` | MCP server | `rmcp` (official Rust MCP SDK), `tokio`, `serde_json` |
+| `lodestash-mcp` | MCP server | `rmcp` **2.2** (official Rust MCP SDK; features `server, macros, transport-io, schemars`), `schemars` (tool JSON Schema from the arg structs), `base64` (image content blocks), `tokio`, `serde_json` |
 | `lodestash-api` | loopback HTTP/JSON | `axum` + `tower`/`tower-http` (limits, CORS-off), `tokio`, `serde_json` |
 | `lodestash-cli` | headless ops (scan/index/tag) | `clap`, `lodestash-core` |
 | **shared** | — | `serde`, `serde_json`, `thiserror`, `anyhow`, `tracing`+`tracing-subscriber`, `tokio`, `rayon`, `uuid`, `blake3` |

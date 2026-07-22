@@ -856,10 +856,10 @@ impl LodestashApp {
             onboarding_open: show_onboarding,
             jobs: Jobs::default(),
             scan_job: None,
-            engine: start_engine_api(
-                dirs::cache_dir().map(|d| d.join("Lodestash").join("thumbs")),
-                dirs::cache_dir().map(|d| d.join("Lodestash").join("workspace")),
-            ),
+            engine: {
+                let (thumbs, ws) = default_cache_dirs();
+                start_engine_api(thumbs, ws)
+            },
             config,
         };
 
@@ -6963,8 +6963,21 @@ fn start_engine_api(
     thumb_cache_dir: Option<PathBuf>,
     workspace_dir: Option<PathBuf>,
 ) -> Option<lodestash_api::Handshake> {
+    let state = agent_state(thumb_cache_dir, workspace_dir)?;
+    lodestash_api::serve(std::sync::Arc::new(state))
+        .map_err(|e| tracing::warn!(%e, "engine API did not start"))
+        .ok()
+}
+
+/// The shared read state both agent planes run on (REST here, MCP in `--mcp` mode). The preview
+/// closure reuses the grid's thumbnail cache, so an agent asking for a preview gets the same
+/// rendered image the user sees — generated on a miss at a fixed 256 px.
+pub fn agent_state(
+    thumb_cache_dir: Option<PathBuf>,
+    workspace_dir: Option<PathBuf>,
+) -> Option<lodestash_api::ServerState> {
     let db = catalog_db_path()?;
-    let ws = workspace_dir.clone().unwrap_or_default();
+    let ws = workspace_dir.unwrap_or_default();
     let preview = move |path: &std::path::Path| -> Option<PathBuf> {
         let dir = thumb_cache_dir.as_deref()?;
         let meta = std::fs::metadata(path).ok()?;
@@ -6987,12 +7000,17 @@ fn start_engine_api(
             thumb::generate(path, dir, &key, params).ok()
         }
     };
-    let state = lodestash_api::ServerState::new(&db, ws, Box::new(preview))
-        .map_err(|e| tracing::warn!(%e, "engine API: catalog unavailable"))
-        .ok()?;
-    lodestash_api::serve(std::sync::Arc::new(state))
-        .map_err(|e| tracing::warn!(%e, "engine API did not start"))
+    lodestash_api::ServerState::new(&db, ws, Box::new(preview))
+        .map_err(|e| tracing::warn!(%e, "agent plane: catalog unavailable"))
         .ok()
+}
+
+/// Default cache locations, shared by the GUI and the `--mcp` entry point.
+pub fn default_cache_dirs() -> (Option<PathBuf>, Option<PathBuf>) {
+    (
+        dirs::cache_dir().map(|d| d.join("Lodestash").join("thumbs")),
+        dirs::cache_dir().map(|d| d.join("Lodestash").join("workspace")),
+    )
 }
 
 fn catalog_db_path() -> Option<PathBuf> {

@@ -57,8 +57,11 @@ flate2     = "1"
 tar        = "0.4"
 serde_yaml = "0.9"
 
-# Agent plane (ENGINE-API) — loopback HTTP/JSON server.
+# Agent plane (ENGINE-API) — loopback HTTP/JSON server + the MCP control plane.
 axum       = "0.8"
+rmcp       = { version = "2.2", features = ["server", "macros", "transport-io", "schemars"] }
+schemars   = "1"
+base64     = "0.22"
 tower      = { version = "0.5", features = ["util"] }
 
 # UI

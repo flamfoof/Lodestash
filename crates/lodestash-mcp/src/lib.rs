@@ -1,2 +1,214 @@
 //! MCP server (rmcp, stdio transport). 1:1 with the loopback REST surface.
 //! Spec: docs/MCP-AND-ENGINES.md, docs/ENGINE-API.md
+//!
+//! Every tool here calls a [`lodestash_api::ServerState`] operation — the same method the REST
+//! handler calls. That's what makes "MCP↔REST 1:1" structural: an operation is written once and
+//! both planes expose it, and the parity test fails the build if one plane grows a name the
+//! other lacks.
+
+use std::sync::Arc;
+
+use lodestash_api::ServerState;
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{
+    CallToolResult, ContentBlock, ProtocolVersion, Resource, ServerCapabilities, ServerInfo,
+};
+use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone)]
+pub struct Lodestash {
+    state: Arc<ServerState>,
+    tool_router: ToolRouter<Self>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SearchArgs {
+    /// Words to match against asset names, descriptions and tags. Empty returns the most
+    /// recently catalogued assets.
+    #[serde(default)]
+    pub query: String,
+    /// Maximum results (default 25).
+    pub limit: Option<usize>,
+    /// Restrict to one media type: model_3d | texture | audio | image | sprite | material | font.
+    pub media_type: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct AssetArgs {
+    /// The asset's catalog id.
+    pub id: i64,
+}
+
+#[tool_router(router = tool_router)]
+impl Lodestash {
+    pub fn new(state: Arc<ServerState>) -> Self {
+        Self {
+            state,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    /// App, schema and API versions of the running Lodestash.
+    #[tool(
+        name = "get_server_info",
+        description = "App, schema and API versions."
+    )]
+    pub async fn get_server_info(&self) -> Result<CallToolResult, ErrorData> {
+        let (app, schema) = self.state.server_info().map_err(internal)?;
+        Ok(CallToolResult::success(vec![ContentBlock::json(
+            serde_json::json!({ "app": app, "schema": schema, "api": "v1" }),
+        )?]))
+    }
+
+    /// Search the catalog by text (name, description, tags).
+    #[tool(
+        name = "search_assets",
+        description = "Search the asset catalog by text; returns asset summaries."
+    )]
+    pub async fn search_assets(
+        &self,
+        Parameters(args): Parameters<SearchArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let rows = self
+            .state
+            .search(
+                &args.query,
+                args.limit.unwrap_or(25).clamp(1, 200),
+                args.media_type.as_deref(),
+            )
+            .map_err(internal)?;
+        let json: Vec<_> = rows.iter().map(lodestash_api::summary_json).collect();
+        Ok(CallToolResult::success(vec![ContentBlock::json(json)?]))
+    }
+
+    /// One asset's full record.
+    #[tool(
+        name = "get_asset",
+        description = "Full metadata for one asset, including technical facets."
+    )]
+    pub async fn get_asset(
+        &self,
+        Parameters(args): Parameters<AssetArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Some(row) = self.state.asset(args.id).map_err(internal)? else {
+            return Err(ErrorData::invalid_params("no such asset", None));
+        };
+        let mut body = lodestash_api::summary_json(&row);
+        body["size_bytes"] = serde_json::json!(row.size_bytes);
+        body["stats"] = serde_json::json!({
+            "tris": row.metrics.tri_count, "width_px": row.metrics.width_px,
+            "height_px": row.metrics.height_px, "duration_ms": row.metrics.duration_ms,
+        });
+        Ok(CallToolResult::success(vec![ContentBlock::json(body)?]))
+    }
+
+    /// A viewable preview plus a link to the real bytes.
+    #[tool(
+        name = "get_asset_preview",
+        description = "A rendered preview image of the asset (3D turntable, texture, or audio \
+                       waveform), plus a resource link to the source file."
+    )]
+    pub async fn get_asset_preview(
+        &self,
+        Parameters(args): Parameters<AssetArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Some(row) = self.state.asset(args.id).map_err(internal)? else {
+            return Err(ErrorData::invalid_params("no such asset", None));
+        };
+        let Some(png) = self.state.preview_path(args.id) else {
+            return Err(ErrorData::internal_error("no preview for this asset", None));
+        };
+        let bytes = std::fs::read(&png)
+            .map_err(|e| ErrorData::internal_error(format!("preview unreadable: {e}"), None))?;
+
+        // MCP-AND-ENGINES "Returning previews — the rule": always pair a viewable image with a
+        // resource_link. The model reasons over the image; the consumer fetches the bytes.
+        let mut content = vec![ContentBlock::image(b64(&bytes), "image/png")];
+        if let Some(src) = self.state.source_path(&row) {
+            content.push(ContentBlock::resource_link(
+                Resource::new(file_uri(&src), row.name.clone())
+                    .with_description(format!("{} source file", row.media_type)),
+            ));
+        }
+        Ok(CallToolResult::success(content))
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for Lodestash {
+    fn get_info(&self) -> ServerInfo {
+        // `ServerInfo`/`Implementation` are #[non_exhaustive] — build from Default and set fields.
+        let mut info = ServerInfo::default();
+        info.protocol_version = ProtocolVersion::LATEST;
+        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.server_info.name = "lodestash".into();
+        info.server_info.version = env!("CARGO_PKG_VERSION").into();
+        info.instructions = Some(
+            "Local game-asset catalog. Search, inspect and preview the 3D models, textures, \
+             images and audio the user already owns."
+                .into(),
+        );
+        info
+    }
+}
+
+/// Serve MCP over stdio (the transport Claude Desktop/Code expect). Blocks until the client
+/// disconnects.
+pub async fn serve_stdio(state: Arc<ServerState>) -> std::io::Result<()> {
+    use rmcp::ServiceExt;
+    let service = Lodestash::new(state)
+        .serve(rmcp::transport::stdio())
+        .await
+        .map_err(std::io::Error::other)?;
+    service.waiting().await.map_err(std::io::Error::other)?;
+    Ok(())
+}
+
+fn internal(e: lodestash_core::error::CoreError) -> ErrorData {
+    ErrorData::internal_error(e.to_string(), None)
+}
+
+/// `file://` URI for a local path. Windows paths arrive with backslashes and a drive letter;
+/// a URI wants forward slashes throughout, or clients read `G:\a\b` as one opaque segment.
+/// ponytail: no percent-encoding — spaces and `#` in asset paths would need it; add an encoder
+/// if a client trips over one.
+fn file_uri(path: &std::path::Path) -> String {
+    format!("file:///{}", path.display().to_string().replace('\\', "/"))
+}
+
+/// ponytail: `base64` is already in the tree for rmcp's image blocks — no reason to hand-roll.
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The MCP↔REST 1:1 invariant (ENGINE-API §2): every agent operation exists on **both**
+    /// planes. Adding a route without its tool — or a tool without its route — fails here.
+    #[test]
+    fn tool_set_matches_the_rest_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        let state = ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap();
+
+        let mut tools: Vec<String> = Lodestash::new(Arc::new(state))
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let mut expected: Vec<String> = lodestash_api::AGENT_OPERATIONS
+            .iter()
+            .map(|(tool, _)| tool.to_string())
+            .collect();
+        tools.sort();
+        expected.sort();
+        assert_eq!(tools, expected, "MCP tools must mirror the REST operations");
+    }
+}
