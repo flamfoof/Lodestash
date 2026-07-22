@@ -25,6 +25,8 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/search", get(search))
         .route("/v1/assets/{id}", get(asset_detail))
         .route("/v1/assets/{id}/preview", get(preview))
+        .route("/v1/assets/{id}/similar", get(similar))
+        .route("/v1/packages", get(packages))
         .route("/v1/assets/{id}/file", get(file))
         .layer(from_fn_with_state(state.clone(), guard))
         .with_state(state)
@@ -144,6 +146,35 @@ async fn asset_detail(State(state): State<Shared>, Path(id): Path<i64>) -> Respo
     Json(body).into_response()
 }
 
+#[derive(Debug, Deserialize)]
+struct LimitParam {
+    limit: Option<usize>,
+}
+
+async fn similar(
+    State(state): State<Shared>,
+    Path(id): Path<i64>,
+    Query(p): Query<LimitParam>,
+) -> Response {
+    match state.similar(id, p.limit.unwrap_or(20).clamp(1, 200)) {
+        Ok(rows) => {
+            let out: Vec<Value> = rows.iter().map(summary_json).collect();
+            Json(json!({ "results": out })).into_response()
+        }
+        Err(e) => db_err(e),
+    }
+}
+
+async fn packages(State(state): State<Shared>) -> Response {
+    match state.packages() {
+        Ok(rows) => {
+            let out: Vec<Value> = rows.iter().map(package_json).collect();
+            Json(json!({ "packages": out })).into_response()
+        }
+        Err(e) => db_err(e),
+    }
+}
+
 async fn preview(State(state): State<Shared>, Path(id): Path<i64>) -> Response {
     match state.preview_path(id) {
         Some(path) => serve_file(&path, "image/png").await,
@@ -181,6 +212,18 @@ pub fn summary_json(r: &AssetSummaryRow) -> Value {
         "tags": [],
         "preview_url": format!("/v1/assets/{}/preview", r.id),
         "file_url": format!("/v1/assets/{}/file", r.id),
+    })
+}
+
+/// ENGINE-API §3 `Package`. `license`/`attribution` land with the P2 license harvest.
+pub fn package_json(p: &lodestash_core::catalog::PackageListing) -> Value {
+    json!({
+        "id": p.id,
+        "name": p.name,
+        "publisher": p.publisher,
+        "category": p.category,
+        "asset_count": p.asset_count,
+        "unpacked_at": p.unpacked_at,
     })
 }
 
@@ -300,6 +343,82 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::OK, "loopback origin is fine");
+    }
+
+    /// Seed three embedded assets and return their ids in insertion order.
+    fn seed_embedded(db: &std::path::Path) -> Vec<i64> {
+        use lodestash_core::catalog::{Catalog, CrawlRecord};
+        let mut cat = Catalog::open(db).unwrap();
+        cat.seed_media_types().unwrap();
+        let src = cat.upsert_import_source("Lib", "C:/lib", "folder").unwrap();
+        let rec = |rel: &str| CrawlRecord {
+            workspace_rel: None,
+            rel_path: rel.into(),
+            name: rel.into(),
+            media_type: "image".into(),
+            size_bytes: 1,
+            mtime: 1,
+        };
+        cat.record_crawl(src, None, &[rec("a.png"), rec("b.png"), rec("c.png")])
+            .unwrap();
+        let recent = cat.recent_asset_ids(10).unwrap();
+        let rows = cat.asset_summaries(&recent).unwrap();
+        let ids: Vec<i64> = ["a.png", "b.png", "c.png"]
+            .iter()
+            .map(|n| rows.iter().find(|r| r.name == *n).unwrap().id)
+            .collect();
+        // a is the query; c sits nearer to it than b.
+        let vecs: [(i64, [f32; 3]); 3] = [
+            (ids[0], [1.0, 0.0, 0.0]),
+            (ids[1], [0.0, 1.0, 0.0]),
+            (ids[2], [0.9, 0.1, 0.0]),
+        ];
+        for (id, v) in vecs {
+            cat.upsert_embedding(id, "m", "image", None, None, &v)
+                .unwrap();
+        }
+        ids
+    }
+
+    /// find_similar ranks by cosine, never returns the query asset, and answers an unembedded
+    /// asset with an empty list rather than an error.
+    #[tokio::test]
+    async fn similar_ranks_neighbours_and_excludes_the_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        let ids = seed_embedded(&db);
+        let st =
+            Arc::new(ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap());
+        let token = st.token.clone();
+
+        let (s, b) = send(
+            router(st.clone()),
+            get_req(
+                &format!("/v1/assets/{}/similar", ids[0]),
+                Some(&token),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let got: Vec<i64> = b["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(got, vec![ids[2], ids[1]], "nearest first, query excluded");
+
+        // An asset with no embedding: empty, not an error.
+        let (_d2, empty) = state();
+        let t2 = empty.token.clone();
+        let (s, b) = send(
+            router(empty),
+            get_req("/v1/assets/1/similar", Some(&t2), None),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(b["results"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

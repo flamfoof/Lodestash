@@ -37,6 +37,14 @@ pub struct SearchArgs {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SimilarArgs {
+    /// The asset to find neighbours for.
+    pub id: i64,
+    /// Maximum neighbours (default 10).
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AssetArgs {
     /// The asset's catalog id.
     pub id: i64,
@@ -103,6 +111,35 @@ impl Lodestash {
             "height_px": row.metrics.height_px, "duration_ms": row.metrics.duration_ms,
         });
         Ok(CallToolResult::success(vec![ContentBlock::json(body)?]))
+    }
+
+    /// Assets most like this one.
+    #[tool(
+        name = "find_similar",
+        description = "Assets most visually (or sonically) similar to the given one. Empty if \
+                       the library has not been embedded yet."
+    )]
+    pub async fn find_similar(
+        &self,
+        Parameters(args): Parameters<SimilarArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let rows = self
+            .state
+            .similar(args.id, args.limit.unwrap_or(10).clamp(1, 200))
+            .map_err(internal)?;
+        let json: Vec<_> = rows.iter().map(lodestash_api::summary_json).collect();
+        Ok(CallToolResult::success(vec![ContentBlock::json(json)?]))
+    }
+
+    /// The downloaded Asset Store packages.
+    #[tool(
+        name = "list_packages",
+        description = "Asset Store packages in the library (publisher, category, asset count)."
+    )]
+    pub async fn list_packages(&self) -> Result<CallToolResult, ErrorData> {
+        let rows = self.state.packages().map_err(internal)?;
+        let json: Vec<_> = rows.iter().map(lodestash_api::package_json).collect();
+        Ok(CallToolResult::success(vec![ContentBlock::json(json)?]))
     }
 
     /// A viewable preview plus a link to the real bytes.

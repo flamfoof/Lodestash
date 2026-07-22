@@ -11,10 +11,11 @@ pub mod routes;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use lodestash_core::catalog::{AssetSummaryRow, Catalog};
+use lodestash_core::catalog::{AssetSummaryRow, Catalog, PackageListing};
+use lodestash_core::vector::{BruteForceIndex, VectorIndex};
 
 pub use handshake::{write_handshake, Handshake};
-pub use routes::{router, summary_json};
+pub use routes::{package_json, router, summary_json};
 
 /// Every agent-facing operation in ENGINE-API §2, by MCP tool name. The MCP crate asserts its
 /// own tool list against this, which is how the 1:1 invariant stays enforced rather than hoped
@@ -25,6 +26,8 @@ pub const AGENT_OPERATIONS: &[(&str, &str)] = &[
     ("search_assets", "GET /v1/search"),
     ("get_asset", "GET /v1/assets/{id}"),
     ("get_asset_preview", "GET /v1/assets/{id}/preview"),
+    ("find_similar", "GET /v1/assets/{id}/similar"),
+    ("list_packages", "GET /v1/packages"),
 ];
 
 /// Resolves an asset's source file to a cached preview PNG, generating it on a miss.
@@ -103,6 +106,34 @@ impl ServerState {
         row.workspace_rel
             .as_ref()
             .map(|rel| self.workspace_dir.join(rel))
+    }
+
+    /// "More like this" (ENGINE-API §2 `find_similar`): cosine KNN in the asset's own embedding
+    /// space, the asset itself dropped from its own results. Empty when the asset has no
+    /// embedding yet — a not-yet-encoded library isn't an error, it just has no neighbours.
+    pub fn similar(
+        &self,
+        id: i64,
+        limit: usize,
+    ) -> lodestash_core::error::Result<Vec<AssetSummaryRow>> {
+        let cat = self.catalog.lock().unwrap();
+        let Some((model_id, query)) = cat.embedding_of(id)? else {
+            return Ok(Vec::new());
+        };
+        let index = BruteForceIndex::new(cat.embeddings_for_knn(&model_id, None)?);
+        let ids: Vec<i64> = index
+            .knn(&query, limit + 1)
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|&other| other != id)
+            .take(limit)
+            .collect();
+        cat.asset_summaries(&ids)
+    }
+
+    /// Downloaded Asset Store packages (ENGINE-API §3 `Package`).
+    pub fn packages(&self) -> lodestash_core::error::Result<Vec<PackageListing>> {
+        self.catalog.lock().unwrap().list_packages()
     }
 
     /// The asset's preview PNG on disk, generated on a cache miss.

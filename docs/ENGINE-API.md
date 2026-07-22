@@ -100,6 +100,9 @@ in-editor import (§5). Both reuse the **same dependency-closure resolution** de
 > **Implementation status (interim).** The read routes exist; nothing else does yet. Until the
 > remaining slices land: `GET /v1/search?mode=ai` answers `501 ai_unavailable`, `AssetSummary.tags`
 > is always `[]` (tagging is P4) and `package` carries `{id, name}` without `publisher`, and
+> `Package` carries `{id, name, publisher, category, asset_count, unpacked_at}` — `version`,
+> `license` and `attribution` wait on the P2 license harvest. `find_similar` answers `[]` for an
+> asset with no embedding (an un-encoded library is not an error).
 > `AssetDetail` extends the summary with `size_bytes` + `stats` only — `description`, `files`,
 > `collections`, `license`, `dependencies` and `imported_in` arrive with the features that populate
 > them. Clients should treat missing fields as "not known yet", never as "empty".

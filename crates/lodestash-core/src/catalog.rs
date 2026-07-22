@@ -1449,6 +1449,26 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("recent row: {e}")))
     }
 
+    /// The asset's own embedding, if it has one: `(model_id, vector)`. "More like this" runs in
+    /// whichever space the asset was encoded into — SigLIP for visuals, CLAP for audio — because
+    /// the two are not comparable (IDENTIFICATION-AND-SEARCH §5.B). An asset with several rows
+    /// yields the largest vector, which in practice is the visual one.
+    pub fn embedding_of(&self, asset_id: i64) -> Result<Option<(String, Vec<f32>)>> {
+        self.conn
+            .query_row(
+                "SELECT model_id, embedding FROM asset_embedding
+                 WHERE asset_id = ?1 ORDER BY dim DESC LIMIT 1",
+                params![asset_id],
+                |r| {
+                    let model_id: String = r.get(0)?;
+                    let blob: Vec<u8> = r.get(1)?;
+                    Ok((model_id, decode_vector(&blob)))
+                },
+            )
+            .optional()
+            .map_err(|e| CoreError::Catalog(format!("embedding_of: {e}")))
+    }
+
     /// Look up a `media_type.code`'s id (the pre-filter column the search paths take).
     pub fn media_type_id(&self, code: &str) -> Result<Option<i64>> {
         self.conn
