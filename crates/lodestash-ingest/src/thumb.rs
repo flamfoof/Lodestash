@@ -79,9 +79,10 @@ pub fn generate(
 /// type diamond does (DESIGN-GUIDELINES §7).
 pub const WAVEFORM_RGB: [u8; 3] = [0x49, 0xC9, 0xE0];
 
-/// Bars a waveform thumbnail of `width` px draws (2 px bar + 1 px gap).
+/// Bars a waveform thumbnail of `width` px draws (2 px bar + 2 px gap). Sparse on purpose: the
+/// grid downscales these to ~100 px, where denser bars merge into one loud cyan block.
 pub fn waveform_bars(width: u32) -> usize {
-    (width as usize / 3).max(8)
+    (width as usize / 4).max(8)
 }
 
 /// Write a waveform thumbnail to the cache, calling `peaks` only on a cache miss — decoding the
@@ -115,12 +116,13 @@ pub fn draw_waveform(peaks: &[f32], width: u32, height: u32) -> DynamicImage {
     let mid = (h - 1) as f32 / 2.0;
     let bars = peaks.len().max(1);
     for x in 0..w {
-        // Bars are 2 px wide with a 1 px gap; skip the gap column.
-        if x % 3 == 2 {
+        // Bars are 2 px wide with a 2 px gap; skip the gap columns.
+        if x % 4 >= 2 {
             continue;
         }
         let p = peaks[(x as usize * bars / w as usize).min(bars - 1)].clamp(0.0, 1.0);
-        let half = (p * mid).max(0.5);
+        // 8% headroom so a full-scale clip doesn't run into the card edge.
+        let half = (p * mid * 0.92).max(0.5);
         let (y0, y1) = (
             (mid - half).round() as u32,
             (mid + half).round().min((h - 1) as f32) as u32,
@@ -272,7 +274,7 @@ mod tests {
             ink(0) > ink(90),
             "loud half must be taller than the quiet half"
         );
-        assert_eq!(ink(2), 0, "every third column is the bar gap");
+        assert_eq!(ink(2), 0, "columns 2-3 of every 4 are the bar gap");
 
         let silence = draw_waveform(&vec![0.0; bars], 96, 96).to_rgba8();
         assert!(

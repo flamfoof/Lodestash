@@ -1885,6 +1885,8 @@ impl LodestashApp {
         self.load_paths(ctx, roots, name);
     }
 
+    // ponytail: the spec's ◉ prefix is dropped — the bundled text fonts have no glyph for it and
+    // it renders as tofu; it comes back with the icon sprite (DESIGN-GUIDELINES §5).
     /// Pack stats modal (UI-SPEC §15): tiles, per-type contents, heaviest assets, and a jump
     /// into the Library. Tags are P4 — the spec's empty state stands in until tagging exists.
     fn pack_stats_modal(&mut self, ctx: &egui::Context) {
@@ -3299,9 +3301,7 @@ impl LodestashApp {
                                                     browse_pkg = Some(pkg.name.clone());
                                                 }
                                                 if ui
-                                                    .button(
-                                                        RichText::new("\u{25C9} Stats").size(11.0),
-                                                    )
+                                                    .button(RichText::new("Stats").size(11.0))
                                                     .clicked()
                                                 {
                                                     stats_pkg = Some(pkg.name.clone());
@@ -3500,22 +3500,25 @@ impl LodestashApp {
                                     if let Some(n) = pkg.asset_count {
                                         // Extracted this session ⇒ its assets are in the grid,
                                         // so the row can jump straight there (UI-SPEC §4).
-                                        if counts.contains_key(&pkg.name)
-                                            && ui
+                                        // Both need this pack's assets in memory: Browse filters
+                                        // the grid, and the stats are computed off the entries.
+                                        if counts.contains_key(&pkg.name) {
+                                            if ui
                                                 .button(
                                                     RichText::new("Browse \u{2192}")
                                                         .color(theme::GOLD)
                                                         .size(11.0),
                                                 )
                                                 .clicked()
-                                        {
-                                            browse_pkg = Some(pkg.name.clone());
-                                        }
-                                        if ui
-                                            .button(RichText::new("\u{25C9} Stats").size(11.0))
-                                            .clicked()
-                                        {
-                                            stats_pkg = Some(pkg.name.clone());
+                                            {
+                                                browse_pkg = Some(pkg.name.clone());
+                                            }
+                                            if ui
+                                                .button(RichText::new("Stats").size(11.0))
+                                                .clicked()
+                                            {
+                                                stats_pkg = Some(pkg.name.clone());
+                                            }
                                         }
                                         ui.label(
                                             RichText::new(format!("{n} assets"))

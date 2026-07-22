@@ -549,11 +549,13 @@ click = search that tag *scoped to the pack*; empty → *"no tags yet — assets
 Unidentified"*); **HEAVIEST IN PACK** top 3 (tier badge + name + stats, click → select in Library);
 footer **Browse <pack> in Library →** (gold primary).
 
-*(Shipped: tiles, CONTENTS, HEAVIEST, footer — opened by ◉ Stats on the Packages and Unity Assets
+*(Shipped: tiles, CONTENTS, HEAVIEST, footer — opened by a plain **Stats** button on the Packages
+and Unity Assets
 pack rows, for packs whose assets are in the library. Triangles show `—` when nothing in the pack
 has been measured yet (DATA-MODEL §14: unknown, not zero). Not yet: the license/exported meta line
 (needs the license harvest + `import_record` join) and TAGS, which shows the empty state above
-until P4 tagging.)*
+until P4 tagging. The spec's ◉ prefix is dropped for now: the bundled text fonts have no glyph
+for it and it renders as tofu — it returns with the icon sprite, DESIGN-GUIDELINES §5.)*
 
 ---
 

@@ -126,6 +126,13 @@ fixture.
 - **Run `cargo fmt --all` before committing.** Format drift accumulated silently over ~13 commits once.
 - Python heredocs used for bulk edits need **raw** strings (`r'''…'''`) or `\u{…}` in Rust source gets
   eaten as a Python escape.
+- **Reverting a mutation-check with `shutil.move`/`copy2` restores the file's old mtime**, so cargo
+  thinks the crate is unchanged and reruns the *mutated* binary — the test looks broken after you
+  fixed it. `touch` the file (or write it in place) after any revert.
+- **To look at the running app**, `PrintWindow(hwnd, hdc, 2)` from PowerShell captures the window
+  even when another window covers it; `CopyFromScreen` captures whatever is on top, which in this
+  setup is usually the terminal. Screenshot coordinates are window-relative *originals* — the
+  images you view are downscaled, so multiply by the ratio the viewer reports before clicking.
 - Git Bash maps `/tmp` to the Windows temp dir, and job-scoped env vars aren't guaranteed to persist
   between shell invocations — prefer absolute paths in long-running work.
 
