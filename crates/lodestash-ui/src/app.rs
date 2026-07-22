@@ -680,6 +680,13 @@ pub struct LodestashApp {
     store_roots: Vec<PathBuf>,
     store_packages: Vec<AssetStorePackage>,
     store_scanned: bool,
+    /// Packs ticked on the Packages screen, by cache path (survives a refresh, which
+    /// rebuilds `store_packages`).
+    store_selected: std::collections::BTreeSet<PathBuf>,
+    /// Packs waiting their turn to unpack. ponytail: one extraction at a time — each is a
+    /// gzip stream-through plus a catalog persist, so running them in parallel mostly
+    /// contends on disk; widen this to N workers only if a measurement says so.
+    extract_queue: std::collections::VecDeque<PathBuf>,
     /// Feedback when a user-picked cache folder fails validation.
     store_add_error: Option<String>,
     /// Unity Assets screen: catalog `package` rows (DATA-MODEL §7), loaded on first
@@ -800,6 +807,8 @@ impl LodestashApp {
             nudge_dismissed: false,
             store_roots: Vec::new(),
             store_packages: Vec::new(),
+            store_selected: Default::default(),
+            extract_queue: Default::default(),
             unity_packages: None,
             store_scanned: false,
             store_add_error: None,
@@ -1815,6 +1824,59 @@ impl LodestashApp {
         ctx.request_repaint();
     }
 
+    /// Queue every selected pack that can actually be unpacked, then start the first one.
+    /// Selections whose cache root isn't a library source yet are left ticked and reported —
+    /// silently dropping them would look like the button did nothing.
+    fn enqueue_selected_extracts(&mut self, ctx: &egui::Context) {
+        let pending: Vec<PathBuf> = self
+            .pending_packages
+            .iter()
+            .map(|p| p.abs_path.clone())
+            .collect();
+        let (ready, blocked) = split_extractable(&self.store_selected, &pending);
+        for path in &ready {
+            if !self.extract_queue.contains(path) {
+                self.extract_queue.push_back(path.clone());
+            }
+            self.store_selected.remove(path);
+        }
+        if !blocked.is_empty() {
+            self.jobs.toast(
+                format!(
+                    "{} pack(s) need their cache added as a library source first",
+                    blocked.len()
+                ),
+                Intent::Warning,
+            );
+        }
+        if !ready.is_empty() {
+            self.jobs.toast(
+                format!("Queued {} pack(s) to unpack", ready.len()),
+                Intent::Info,
+            );
+        }
+        self.pump_extract_queue(ctx);
+    }
+
+    /// Start the next queued pack once nothing is extracting. Called after enqueuing and after
+    /// every finished extraction, so the queue drains itself.
+    fn pump_extract_queue(&mut self, ctx: &egui::Context) {
+        if self.pending_packages.iter().any(|p| p.extracting) {
+            return;
+        }
+        while let Some(path) = self.extract_queue.pop_front() {
+            if let Some(idx) = self
+                .pending_packages
+                .iter()
+                .position(|p| p.abs_path == path && !p.extracting)
+            {
+                self.extract_package(ctx, idx);
+                return;
+            }
+            // Dropped from pending (already extracted, or its source was removed) — skip it.
+        }
+    }
+
     /// Surgical extraction of the picked entries of `pending_packages[idx]` — one
     /// skip-scan pulling only those payloads (INGESTION.md §2), never the whole pack.
     fn extract_picked(&mut self, ctx: &egui::Context, idx: usize) {
@@ -2815,6 +2877,50 @@ impl LodestashApp {
             });
         }
 
+        // Batch bar (UI-SPEC §4 "batch unpack"): only meaningful once something is ticked.
+        let mut enqueue_clicked = false;
+        if !self.store_selected.is_empty() || !self.extract_queue.is_empty() {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if !self.store_selected.is_empty() {
+                    if ui
+                        .button(
+                            RichText::new(format!(
+                                "\u{25B6} Extract selected ({})",
+                                self.store_selected.len()
+                            ))
+                            .color(theme::GOLD)
+                            .size(11.0),
+                        )
+                        .clicked()
+                    {
+                        enqueue_clicked = true;
+                    }
+                    if ui
+                        .button(RichText::new("Clear selection").size(11.0))
+                        .clicked()
+                    {
+                        self.store_selected.clear();
+                    }
+                }
+                if !self.extract_queue.is_empty() {
+                    ui.label(
+                        RichText::new(format!("{} queued", self.extract_queue.len()))
+                            .color(theme::TEXT_DIM)
+                            .size(11.0),
+                    );
+                    if ui
+                        .button(RichText::new("Cancel queue").size(11.0))
+                        .clicked()
+                    {
+                        // Only the waiting packs — the one already unpacking has its own ✕ in
+                        // the job tray.
+                        self.extract_queue.clear();
+                    }
+                }
+            });
+        }
+
         if self.store_roots.is_empty() {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
@@ -2839,6 +2945,8 @@ impl LodestashApp {
         } else {
             ui.add_space(4.0);
             ui.separator();
+            // Taken out of `self` for the closure, which also borrows `self.store_packages`.
+            let mut selected = std::mem::take(&mut self.store_selected);
             ScrollArea::vertical().show(ui, |ui| {
                 for run in publisher_runs(&self.store_packages) {
                     let pkgs = &self.store_packages[run];
@@ -2862,10 +2970,33 @@ impl LodestashApp {
                             .size(11.0)
                             .monospace(),
                         );
+                        let all_ticked = pkgs.iter().all(|p| selected.contains(&p.path));
+                        let label = if all_ticked { "none" } else { "all" };
+                        if ui
+                            .button(RichText::new(label).size(10.0))
+                            .on_hover_text("Tick or untick every pack by this publisher")
+                            .clicked()
+                        {
+                            for p in pkgs {
+                                if all_ticked {
+                                    selected.remove(&p.path);
+                                } else {
+                                    selected.insert(p.path.clone());
+                                }
+                            }
+                        }
                     });
                     for pkg in pkgs {
                         ui.horizontal(|ui| {
-                            ui.add_space(22.0);
+                            ui.add_space(6.0);
+                            let mut ticked = selected.contains(&pkg.path);
+                            if ui.checkbox(&mut ticked, "").changed() {
+                                if ticked {
+                                    selected.insert(pkg.path.clone());
+                                } else {
+                                    selected.remove(&pkg.path);
+                                }
+                            }
                             ui.label(RichText::new(&pkg.name).color(theme::TEXT_MUTED).size(12.0));
                             if !pkg.category.is_empty() {
                                 ui.label(
@@ -2949,6 +3080,7 @@ impl LodestashApp {
                     }
                 }
             });
+            self.store_selected = selected;
         }
 
         if add_clicked {
@@ -2976,6 +3108,9 @@ impl LodestashApp {
         }
         if let Some(idx) = extract_idx {
             self.extract_package(ctx, idx);
+        }
+        if enqueue_clicked {
+            self.enqueue_selected_extracts(ctx);
         }
     }
 
@@ -4029,6 +4164,8 @@ impl eframe::App for LodestashApp {
         self.receive_scan();
         self.receive_thumbnails();
         self.receive_extracts();
+        // A finished extraction frees the slot the batch queue waits on.
+        self.pump_extract_queue(ctx);
         self.receive_catalog();
         self.receive_model_download();
         self.receive_viewer(ctx);
@@ -7561,6 +7698,19 @@ fn inspector_pane(
     rating_clicked
 }
 
+/// Split ticked packs into the ones the extractor can act on now (their cache root is a library
+/// source, so they have a `pending_packages` row) and the ones still blocked on that. Pure so the
+/// batch rule is testable without an egui context.
+fn split_extractable(
+    selected: &std::collections::BTreeSet<PathBuf>,
+    pending: &[PathBuf],
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    selected
+        .iter()
+        .cloned()
+        .partition(|path| pending.contains(path))
+}
+
 fn stat_row(ui: &mut Ui, label: &str, value: &str) {
     ui.label(RichText::new(label).color(theme::TEXT_DIM).size(11.0));
     ui.add(egui::Label::new(RichText::new(value).color(theme::TEXT).size(11.0)).truncate());
@@ -8395,6 +8545,21 @@ mod tests {
             texture: None,
             thumb_spawned: false,
         }
+    }
+
+    #[test]
+    fn batch_extract_splits_ready_from_blocked_packs() {
+        let sel: std::collections::BTreeSet<PathBuf> = ["a.unitypackage", "b.unitypackage"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let (ready, blocked) = split_extractable(&sel, &[PathBuf::from("b.unitypackage")]);
+        assert_eq!(ready, vec![PathBuf::from("b.unitypackage")]);
+        assert_eq!(
+            blocked,
+            vec![PathBuf::from("a.unitypackage")],
+            "a pack whose cache isn't a source yet stays blocked, not silently dropped"
+        );
     }
 
     #[test]

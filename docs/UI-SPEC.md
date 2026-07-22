@@ -252,11 +252,15 @@ One card per publisher: header row (▤ gold + name + total asset count) then a 
 name · amber `N unid` outline pill (when > 0) · asset count · **◉ Stats** (→ Pack stats modal §15)
 · **Browse →** (→ Library filtered to that pack). Package rows for still-packed Asset Store
 `.unitypackage`s (status `discovered`) also offer **Extract** per INGESTION §2 — browse-without-
-unpack stays cheap, extraction is on demand.
+unpack stays cheap, extraction is on demand. Packs also carry a **tick box**, with an all/none
+toggle on each publisher header and an **▶ Extract selected (N)** bar above the list: the ticked
+packs queue and unpack **one at a time**, each through the normal job tray row (so each is
+individually cancellable), and the bar shows the remaining queue with a **Cancel queue** for the
+packs not yet started.
 
 *(Shipped slice: cache discovery/validation with persisted custom roots, publisher→pack browse
-straight off the download cache with pack counts + sizes, per-root "Use as library source", and
-per-pack Extract through the pending-package flow. The `N unid` pill, ◉ Stats, and Browse→ need
+straight off the download cache with pack counts + sizes, per-root "Use as library source",
+per-pack Extract through the pending-package flow, and the batch tick/queue described above. The `N unid` pill, ◉ Stats, and Browse→ need
 catalog `package` rows — they land with the P2 Packages model.)*
 
 ---
