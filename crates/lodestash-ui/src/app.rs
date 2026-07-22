@@ -683,6 +683,13 @@ pub struct LodestashApp {
     /// Packs ticked on the Packages screen, by cache path (survives a refresh, which
     /// rebuilds `store_packages`).
     store_selected: std::collections::BTreeSet<PathBuf>,
+    /// Live watch over the source roots (DATA-MODEL §6). `None` when disabled or unavailable.
+    watcher: Option<lodestash_ingest::watch::RootWatcher>,
+    /// A watched root changed; the rescan waits for the library to be idle.
+    watch_dirty: bool,
+    /// When the last watch-triggered rescan ran — a busy tree (a Unity project writing its
+    /// Library folder) must not put the app in a rescan loop.
+    last_watch_rescan: Option<std::time::Instant>,
     /// Packs waiting their turn to unpack. ponytail: one extraction at a time — each is a
     /// gzip stream-through plus a catalog persist, so running them in parallel mostly
     /// contends on disk; widen this to N workers only if a measurement says so.
@@ -808,6 +815,9 @@ impl LodestashApp {
             store_roots: Vec::new(),
             store_packages: Vec::new(),
             store_selected: Default::default(),
+            watcher: None,
+            watch_dirty: false,
+            last_watch_rescan: None,
             extract_queue: Default::default(),
             unity_packages: None,
             store_scanned: false,
@@ -975,6 +985,7 @@ impl LodestashApp {
             None => roots.iter().map(|_| Vec::new()).collect(),
         };
 
+        self.start_watching();
         self.scan_generation += 1;
         self.scanning = true;
         // Tray row (indeterminate — the crawl has no cheap total). A superseded scan's
@@ -1822,6 +1833,53 @@ impl LodestashApp {
             });
         });
         ctx.request_repaint();
+    }
+
+    /// (Re)start the filesystem watch over the current source roots. Dropping the old watcher
+    /// unregisters its handles, so this is also how watching stops when a project closes.
+    fn start_watching(&mut self) {
+        self.watcher = None;
+        self.watch_dirty = false;
+        if !self.config.watch_sources || self.scan_roots.is_empty() {
+            return;
+        }
+        // A pack landing in a cache root is hundreds of events; one second of quiet is plenty
+        // to let a copy finish before we look.
+        self.watcher = lodestash_ingest::watch::watch_roots(
+            &self.scan_roots,
+            std::time::Duration::from_secs(1),
+        );
+    }
+
+    /// Drain watch signals and rescan when the library is idle. Deliberately *not* immediate: a
+    /// rescan rebuilds the entry list, so doing it under an active selection or an open Quick
+    /// Look would yank the ground out from under the user. The flag just waits.
+    fn poll_watch(&mut self, ctx: &egui::Context) {
+        if let Some(w) = &self.watcher {
+            while w.rx.try_recv().is_ok() {
+                self.watch_dirty = true;
+            }
+        }
+        let busy = self.scanning
+            || self.catalog_persisting
+            || self.pending_packages.iter().any(|p| p.extracting)
+            || !self.selected.is_empty()
+            || self.quick_look;
+        // ponytail: fixed 30 s floor between watch rescans. Cheap guard against a chatty tree;
+        // if a crawl ever costs more than that, scale it off the last scan's duration instead.
+        let too_soon = self
+            .last_watch_rescan
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(30));
+        if !self.watch_dirty || busy || too_soon {
+            return;
+        }
+        self.watch_dirty = false;
+        self.last_watch_rescan = Some(std::time::Instant::now());
+        self.jobs
+            .toast("Sources changed \u{2014} rescanning", Intent::Info);
+        let roots = self.scan_roots.clone();
+        let name = self.project_name.clone();
+        self.load_paths(ctx, roots, name);
     }
 
     /// Assets in the library per extracted pack: `(total, unidentified)` (UI-SPEC §4 pack row).
@@ -3478,6 +3536,7 @@ impl LodestashApp {
 
     fn settings_screen(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let mut save = false;
+        let mut watch_changed = false;
         let mut quality_changed = false;
         let mut start_dl = false;
         // Blacklist actions collected during render, applied after (avoids borrowing self while
@@ -3827,6 +3886,26 @@ impl LodestashApp {
                                 .color(theme::TEXT_DIM),
                             );
                         });
+                        settings_card(ui, "SOURCES", |ui| {
+                            let mut watch = self.config.watch_sources;
+                            if ui
+                                .checkbox(
+                                    &mut watch,
+                                    RichText::new("Watch sources for changes").size(12.0),
+                                )
+                                .on_hover_text(
+                                    "Rescan automatically when files appear or change under a \
+                                     source root (DATA-MODEL \u{00A7}6). The rescan waits until \
+                                     the library is idle, and never runs more than once every \
+                                     30 seconds.",
+                                )
+                                .changed()
+                            {
+                                self.config.watch_sources = watch;
+                                save = true;
+                                watch_changed = true;
+                            }
+                        });
                         settings_card(ui, "STORAGE CAPS", |ui| {
                             let mut cache = self.config.cache_extracted;
                             if ui
@@ -3871,6 +3950,10 @@ impl LodestashApp {
         if save {
             self.config.save();
             self.cache_dirty = true;
+        }
+        if watch_changed {
+            // Takes effect now: either start watching the open roots, or drop the handles.
+            self.start_watching();
         }
         if quality_changed {
             self.invalidate_thumbnails();
@@ -4253,6 +4336,7 @@ impl eframe::App for LodestashApp {
         self.receive_extracts();
         // A finished extraction frees the slot the batch queue waits on.
         self.pump_extract_queue(ctx);
+        self.poll_watch(ctx);
         self.receive_catalog();
         self.receive_model_download();
         self.receive_viewer(ctx);

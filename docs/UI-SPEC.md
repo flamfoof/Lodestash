@@ -421,6 +421,12 @@ stop scanning). Expanded blacklist panel: excluded chips (folder amber / asset r
 remove) + input + **⊘ folder** / **⊘ asset** add buttons (DATA-MODEL §10 per-source blacklist).
 Header: **+ Add source** (folder picker; Asset Store cache is offered via auto-detect).
 
+*(Shipped interim: watching is real but **library-wide**, not per source — a **SOURCES ▸ Watch
+sources for changes** checkbox (`AppConfig.watch_sources`, default on) drives one `notify` watcher
+over every open root, debounced 1 s, rescanning only while the library is idle and at most once
+every 30 s. The per-source pause toggle here needs `import_source.watch_enabled` (DATA-MODEL §2) to
+be read by the app, which lands with the Sources-manager card.)*
+
 ### 11.2 IDENTIFY PROFILE
 Three selectable tier cards — **Integrated / Balanced / Dedicated GPU** — each naming its model set
 and preview quality. **⚖ Resolution:** tiers bind to the real per-GPU model sets in

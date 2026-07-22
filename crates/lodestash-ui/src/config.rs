@@ -299,6 +299,10 @@ impl PreviewQuality {
 // ── AppConfig ─────────────────────────────────────────────────────────────────
 
 /// Default playback volume — a moderate level so audio previews aren't jarring.
+fn default_true() -> bool {
+    true
+}
+
 fn default_volume() -> f32 {
     0.5
 }
@@ -338,6 +342,10 @@ pub struct AppConfig {
     /// Global audio-preview playback volume, `0.0..=1.0` (applies to every clip).
     #[serde(default = "default_volume")]
     pub volume: f32,
+    /// Watch the source roots and rescan when they change (DATA-MODEL §6). On by default;
+    /// the rescan only fires while the library is idle, never mid-selection.
+    #[serde(default = "default_true")]
+    pub watch_sources: bool,
 }
 
 impl Default for AppConfig {
@@ -354,6 +362,7 @@ impl Default for AppConfig {
             cache_extracted: false,
             asset_store_roots: Vec::new(),
             volume: default_volume(),
+            watch_sources: true,
         }
     }
 }

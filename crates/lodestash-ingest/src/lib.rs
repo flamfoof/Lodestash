@@ -12,6 +12,7 @@ pub mod raster;
 pub mod render3d;
 pub mod thumb;
 pub mod unitypackage;
+pub mod watch;
 pub mod workspace;
 
 pub use lodestash_core::types::MediaType;

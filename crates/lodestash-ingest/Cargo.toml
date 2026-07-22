@@ -27,9 +27,10 @@ psd        = { workspace = true }
 flate2     = { workspace = true }
 tar        = { workspace = true }
 serde_yaml = { workspace = true }
+# Filesystem watch over source roots (DATA-MODEL §6).
+notify     = { workspace = true }
 
 # Added later in P2:
-# notify    = { workspace = true }  # file watching
 # image_dds = "0.7" # DDS/BCn textures
 
 [dev-dependencies]

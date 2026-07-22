@@ -17,8 +17,8 @@ flagged.
 
 | Crate | Purpose | Key dependencies |
 |---|---|---|
-| `lodestash-core` | catalog, search, mapping, jobs, asset ops | `rusqlite` (bundled SQLite + FTS5 + loadable-ext), `sqlite-vec`, `blake3`, `serde`/`serde_json`, `tokio`, `rayon`, `notify`, `uuid`, `thiserror`/`anyhow`, `tracing` |
-| `lodestash-ingest` | crawl, detect, untar, normalize, thumbnail | `flate2`+`tar` (.unitypackage), `zip` (zip packs/.kra/.aseprite), `serde_yaml` (.meta), `image`, `image_dds`, `psd`, `texture2ddecoder`, `gltf`/`easy-gltf`, `ufbx` (FBX; single C file via `cc`), `symphonia`, `ab_glyph`/`fontdue` (font specimens), `blake3`, `img_hash` (pHash) |
+| `lodestash-core` | catalog, search, mapping, jobs, asset ops | `rusqlite` (bundled SQLite + FTS5 + loadable-ext), `sqlite-vec`, `blake3`, `serde`/`serde_json`, `tokio`, `rayon`, `uuid`, `thiserror`/`anyhow`, `tracing` |
+| `lodestash-ingest` | crawl, detect, untar, normalize, thumbnail, watch | `notify` (source-root watch, DATA-MODEL §6), `flate2`+`tar` (.unitypackage), `zip` (zip packs/.kra/.aseprite), `serde_yaml` (.meta), `image`, `image_dds`, `psd`, `texture2ddecoder`, `gltf`/`easy-gltf`, `ufbx` (FBX; single C file via `cc`), `symphonia`, `ab_glyph`/`fontdue` (font specimens), `blake3`, `img_hash` (pHash) |
 | `lodestash-ai` | Tagger/Embedder traits + impls | `ort` (ONNX Runtime; CUDA/DirectML/CPU EPs) — alt `candle`/`fastembed`, `tokenizers`, `ndarray`, `reqwest` (Ollama + cloud HTTP), `whisper-rs` (speech), `image` (preprocess) |
 | `lodestash-ui` | egui app + 3D/audio/image preview | `eframe`/`egui` + **`egui_glow`** (OpenGL renderer — see §7), `three-d` + `three-d-asset` (3D viewport; glow-lockstep with eframe, §7), `rodio` (+ `symphonia`) audio, `egui_extras` (`svg` feature — resvg; renders the sidebar nav icons, tinted per row state) + `egui_plot` (waveform), `rfd` (file dialogs), `poll-promise` (async UI) |
 | `lodestash-mcp` | MCP server | `rmcp` (official Rust MCP SDK), `tokio`, `serde_json` |
