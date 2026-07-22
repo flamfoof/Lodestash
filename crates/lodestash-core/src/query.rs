@@ -14,9 +14,10 @@
 //! parser slots in later and goes through exactly the same clamping.
 //!
 //! ponytail: the deterministic parser below covers only the unambiguous, *already-filterable*
-//! surface — media type, size, rating, status. `tris`/`color`/`duration`/facets are in the §6
-//! grammar but nothing stores them yet (P1 metadata, P3 colour, P4 tags), so parsing them would
-//! build filters no query could apply. They join when their data does.
+//! surface — media type, size, rating, status, and (since the M9 technical facets landed)
+//! triangle count and audio duration. `color`/`verts`/`bones`/facets are in the §6 grammar but
+//! nothing stores them yet (P3 colour, P4 tags), so parsing them would build filters no query
+//! could apply. They join when their data does.
 
 use crate::types::MediaType;
 
@@ -31,6 +32,12 @@ pub struct ParsedQuery {
     pub min_rating: Option<u8>,
     pub max_size_bytes: Option<i64>,
     pub min_size_bytes: Option<i64>,
+    /// Triangle-count range, models only (§6 numeric ranges; DATA-MODEL §14).
+    pub max_tris: Option<i64>,
+    pub min_tris: Option<i64>,
+    /// Audio clip length in milliseconds (§6 `duration_ms`).
+    pub max_duration_ms: Option<i64>,
+    pub min_duration_ms: Option<i64>,
     /// User-facing status term, normalised to a catalog code.
     pub status: Option<&'static str>,
 }
@@ -42,6 +49,10 @@ impl ParsedQuery {
             || self.min_rating.is_some()
             || self.max_size_bytes.is_some()
             || self.min_size_bytes.is_some()
+            || self.max_tris.is_some()
+            || self.min_tris.is_some()
+            || self.max_duration_ms.is_some()
+            || self.min_duration_ms.is_some()
             || self.status.is_some()
     }
 
@@ -52,10 +63,18 @@ impl ParsedQuery {
         self.min_rating = self.min_rating.map(|r| r.clamp(1, 5));
         self.min_size_bytes = self.min_size_bytes.map(|b| b.max(0));
         self.max_size_bytes = self.max_size_bytes.map(|b| b.max(0));
+        self.min_tris = self.min_tris.map(|t| t.max(0));
+        self.max_tris = self.max_tris.map(|t| t.max(0));
+        self.min_duration_ms = self.min_duration_ms.map(|d| d.max(0));
+        self.max_duration_ms = self.max_duration_ms.map(|d| d.max(0));
         // An inverted range matches nothing and is always a parse artefact — drop the weaker end.
-        if let (Some(lo), Some(hi)) = (self.min_size_bytes, self.max_size_bytes) {
-            if lo > hi {
-                self.min_size_bytes = None;
+        for (lo, hi) in [
+            (&mut self.min_size_bytes, self.max_size_bytes),
+            (&mut self.min_tris, self.max_tris),
+            (&mut self.min_duration_ms, self.max_duration_ms),
+        ] {
+            if matches!((*lo, hi), (Some(l), Some(h)) if l > h) {
+                *lo = None;
             }
         }
         self.semantic_text = self
@@ -99,6 +118,77 @@ fn unit_scale(u: &str) -> Option<i64> {
         "g" | "gb" => 1024 * 1024 * 1024,
         _ => return None,
     })
+}
+
+/// The three numeric ranges the catalog can actually filter on (§6 numeric ranges).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Quantity {
+    Bytes(i64),
+    Tris(i64),
+    Millis(i64),
+}
+
+fn tri_word(w: &str) -> bool {
+    matches!(
+        w,
+        "tri" | "tris" | "triangle" | "triangles" | "poly" | "polys" | "polygon" | "polygons"
+    )
+}
+
+/// Seconds-per-unit for a duration word, as a float so `ms` works.
+fn time_scale(w: &str) -> Option<f64> {
+    Some(match w {
+        "ms" | "millisecond" | "milliseconds" => 0.001,
+        "s" | "sec" | "secs" | "second" | "seconds" => 1.0,
+        "min" | "mins" | "minute" | "minutes" => 60.0,
+        _ => return None,
+    })
+}
+
+/// A bare magnitude prefix — only meaningful in front of a counted unit ("5k tris"), never in
+/// front of bytes, where "k"/"m" already mean kb/mb.
+fn magnitude(w: &str) -> Option<f64> {
+    Some(match w {
+        "k" => 1_000.0,
+        "m" => 1_000_000.0,
+        _ => return None,
+    })
+}
+
+/// Read a quantity starting at `at`: `"5mb"`, `"5 mb"`, `"5k tris"`, `"5000 triangles"`,
+/// `"3 seconds"`, `"500ms"`. Returns the value and the index of its last token, so the caller can
+/// mark the whole phrase consumed. The unit word decides which range it is — that is what keeps
+/// "5k tris" out of the size filter, where a bare "k" would otherwise read as kilobytes.
+fn read_quantity(tokens: &[String], at: usize) -> Option<(Quantity, usize)> {
+    let (n, suffix) = number_with_suffix(tokens.get(at)?)?;
+    // Unit glued to the number, else the following token.
+    let (unit, last) = if suffix.is_empty() || magnitude(&suffix).is_some() {
+        match tokens.get(at + 1) {
+            Some(next) if tri_word(next) || time_scale(next).is_some() => (next.as_str(), at + 1),
+            _ => (suffix.as_str(), at),
+        }
+    } else {
+        (suffix.as_str(), at)
+    };
+    let scaled = n * magnitude(&suffix).unwrap_or(1.0);
+    if tri_word(unit) {
+        return Some((Quantity::Tris(scaled as i64), last));
+    }
+    if let Some(secs) = time_scale(unit) {
+        return Some((Quantity::Millis((scaled * secs * 1000.0) as i64), last));
+    }
+    // Bytes: the unit may still be one token further out ("5 mb" parsed as number then unit).
+    if let Some(scale) = unit_scale(unit) {
+        return Some((Quantity::Bytes((n * scale as f64) as i64), last));
+    }
+    let unit = tokens.get(at + 1)?;
+    if tri_word(unit) {
+        Some((Quantity::Tris(scaled as i64), at + 1))
+    } else if let Some(secs) = time_scale(unit) {
+        Some((Quantity::Millis((scaled * secs * 1000.0) as i64), at + 1))
+    } else {
+        unit_scale(unit).map(|s| (Quantity::Bytes((n * s as f64) as i64), at + 1))
+    }
 }
 
 /// Split a token into its leading number and trailing alphabetic suffix (`"5mb"` → `(5.0, "mb")`).
@@ -149,28 +239,22 @@ pub fn parse_query(query: &str) -> ParsedQuery {
             if lower.get(j).map(String::as_str) == Some("than") {
                 j += 1;
             }
-            // The number may carry its unit ("5mb") or have it in the next token ("5 mb").
-            if let Some((n, suffix)) = lower.get(j).and_then(|t| number_with_suffix(t)) {
-                let (scale, last) = match unit_scale(&suffix) {
-                    Some(s) => (Some(s), j),
-                    None => match lower.get(j + 1).and_then(|u| unit_scale(u)) {
-                        Some(s) => (Some(s), j + 1),
-                        None => (None, j),
-                    },
+            // The unit decides which range this is: bytes, triangles or duration.
+            if let Some((q, last)) = read_quantity(&lower, j) {
+                let (slot, value) = match q {
+                    Quantity::Bytes(v) if dir_max => (&mut out.max_size_bytes, v),
+                    Quantity::Bytes(v) => (&mut out.min_size_bytes, v),
+                    Quantity::Tris(v) if dir_max => (&mut out.max_tris, v),
+                    Quantity::Tris(v) => (&mut out.min_tris, v),
+                    Quantity::Millis(v) if dir_max => (&mut out.max_duration_ms, v),
+                    Quantity::Millis(v) => (&mut out.min_duration_ms, v),
                 };
-                if let Some(scale) = scale {
-                    let bytes = (n * scale as f64) as i64;
-                    if dir_max {
-                        out.max_size_bytes = Some(bytes);
-                    } else {
-                        out.min_size_bytes = Some(bytes);
-                    }
-                    for u in used.iter_mut().take(last + 1).skip(i) {
-                        *u = true;
-                    }
-                    i = last + 1;
-                    continue;
+                *slot = Some(value);
+                for u in used.iter_mut().take(last + 1).skip(i) {
+                    *u = true;
                 }
+                i = last + 1;
+                continue;
             }
         }
 
@@ -256,6 +340,57 @@ mod tests {
         let p = parse_query("a low poly stylized rock");
         assert_eq!(p.semantic_text, "a low poly stylized rock");
         assert!(!p.has_filters());
+    }
+
+    #[test]
+    fn triangle_budgets_are_a_range_not_a_size() {
+        // "5k tris" must not read as 5 kilobytes — the unit word decides the range.
+        for q in [
+            "stylized rock under 5k tris",
+            "stylized rock under 5000 triangles",
+            "stylized rock <5k polys",
+        ] {
+            let p = parse_query(q);
+            assert_eq!(p.max_tris, Some(5000), "{q}");
+            assert_eq!(p.max_size_bytes, None, "{q}");
+            assert_eq!(p.semantic_text, "stylized rock", "{q}");
+        }
+        let p = parse_query("hero mesh over 20k tris");
+        assert_eq!(p.min_tris, Some(20_000));
+        assert_eq!(p.max_tris, None);
+    }
+
+    #[test]
+    fn audio_durations_parse_in_seconds_and_milliseconds() {
+        assert_eq!(
+            parse_query("footstep under 2 seconds").max_duration_ms,
+            Some(2000)
+        );
+        assert_eq!(
+            parse_query("footstep under 500ms").max_duration_ms,
+            Some(500)
+        );
+        assert_eq!(
+            parse_query("loop over 3 min").min_duration_ms,
+            Some(180_000)
+        );
+        let p = parse_query("sword swing under 2 seconds");
+        assert_eq!(p.semantic_text, "sword swing");
+        assert!(p.has_filters());
+    }
+
+    #[test]
+    fn inverted_ranges_are_clamped_away() {
+        let p = ParsedQuery {
+            min_tris: Some(9000),
+            max_tris: Some(100),
+            min_duration_ms: Some(-5),
+            ..Default::default()
+        }
+        .validate();
+        assert_eq!(p.min_tris, None, "inverted tri range drops its weaker end");
+        assert_eq!(p.max_tris, Some(100));
+        assert_eq!(p.min_duration_ms, Some(0), "negative duration clamps to 0");
     }
 
     #[test]

@@ -2400,6 +2400,14 @@ impl LodestashApp {
                         && f.min_rating.map_or(true, |r| e.rating.unwrap_or(0) >= r)
                         && f.max_size_bytes.map_or(true, |b| e.file.size_bytes as i64 <= b)
                         && f.min_size_bytes.map_or(true, |b| e.file.size_bytes as i64 >= b)
+                        // Unmeasured facets can't satisfy a numeric range — an unknown tri
+                        // count is not a small one (DATA-MODEL §14).
+                        && f.max_tris.map_or(true, |t| e.metrics.tri_count.is_some_and(|n| n <= t))
+                        && f.min_tris.map_or(true, |t| e.metrics.tri_count.is_some_and(|n| n >= t))
+                        && f.max_duration_ms
+                            .map_or(true, |d| e.metrics.duration_ms.is_some_and(|n| n <= d))
+                        && f.min_duration_ms
+                            .map_or(true, |d| e.metrics.duration_ms.is_some_and(|n| n >= d))
                         && f.status.map_or(true, |st| e.status.code() == st)
                 });
             }
