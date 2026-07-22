@@ -685,6 +685,8 @@ pub struct LodestashApp {
     store_selected: std::collections::BTreeSet<PathBuf>,
     /// Live watch over the source roots (DATA-MODEL §6). `None` when disabled or unavailable.
     watcher: Option<lodestash_ingest::watch::RootWatcher>,
+    /// Pack whose stats modal is open (UI-SPEC §15), by pack name.
+    pack_stats_open: Option<String>,
     /// A watched root changed; the rescan waits for the library to be idle.
     watch_dirty: bool,
     /// When the last watch-triggered rescan ran — a busy tree (a Unity project writing its
@@ -816,6 +818,7 @@ impl LodestashApp {
             store_packages: Vec::new(),
             store_selected: Default::default(),
             watcher: None,
+            pack_stats_open: None,
             watch_dirty: false,
             last_watch_rescan: None,
             extract_queue: Default::default(),
@@ -1882,6 +1885,150 @@ impl LodestashApp {
         self.load_paths(ctx, roots, name);
     }
 
+    /// Pack stats modal (UI-SPEC §15): tiles, per-type contents, heaviest assets, and a jump
+    /// into the Library. Tags are P4 — the spec's empty state stands in until tagging exists.
+    fn pack_stats_modal(&mut self, ctx: &egui::Context) {
+        let Some(pack) = self.pack_stats_open.clone() else {
+            return;
+        };
+        let stats = pack_stats(&self.entries, &pack);
+        let mut close = false;
+        let mut browse = false;
+
+        egui::Area::new(egui::Id::new("pack_stats_scrim"))
+            .order(egui::Order::Middle)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                let screen = ctx.screen_rect();
+                if ui.allocate_rect(screen, egui::Sense::click()).clicked() {
+                    close = true;
+                }
+                ui.painter()
+                    .rect_filled(screen, 0.0, theme::BG.linear_multiply(0.6));
+            });
+
+        egui::Window::new("pack_stats")
+            .title_bar(false)
+            .resizable(false)
+            .collapsible(false)
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(620.0)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(theme::SURFACE_RAISED)
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                    .inner_margin(egui::Margin::same(20.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(&pack)
+                            .color(theme::TEXT)
+                            .font(crate::fonts::display(20.0)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(RichText::new("\u{2715}").size(13.0)).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.label(
+                    RichText::new("extracted pack \u{00B7} license unknown")
+                        .color(theme::TEXT_DIM)
+                        .size(11.0)
+                        .monospace(),
+                );
+                ui.add_space(10.0);
+
+                // Four stat tiles.
+                ui.horizontal(|ui| {
+                    stat_tile(ui, "ASSETS", &stats.assets.to_string(), theme::TEXT);
+                    stat_tile(ui, "ON DISK", &format_bytes(stats.bytes), theme::TEXT);
+                    stat_tile(
+                        ui,
+                        "TRIANGLES",
+                        &stats
+                            .tris
+                            .map(format_thousands)
+                            .unwrap_or_else(|| "\u{2014}".into()),
+                        theme::TEXT,
+                    );
+                    let (unid, color) = if stats.unidentified > 0 {
+                        (stats.unidentified.to_string(), theme::WARNING)
+                    } else {
+                        ("0".to_string(), theme::TEXT_DIM)
+                    };
+                    stat_tile(ui, "UNIDENTIFIED", &unid, color);
+                });
+                ui.add_space(12.0);
+
+                section_label(ui, "CONTENTS");
+                for (mt, count, bytes) in &stats.contents {
+                    ui.horizontal(|ui| {
+                        let color = mt.map(theme::media_type_color).unwrap_or(theme::TEXT_DIM);
+                        ui.label(RichText::new("\u{25C6}").color(color).size(10.0));
+                        ui.label(
+                            RichText::new(media_type_label(*mt))
+                                .color(theme::TEXT_MUTED)
+                                .size(11.0),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format!("{count} \u{00B7} {}", format_bytes(*bytes)))
+                                    .color(theme::TEXT_DIM)
+                                    .size(11.0)
+                                    .monospace(),
+                            );
+                        });
+                    });
+                }
+                ui.add_space(10.0);
+
+                section_label(ui, "TAGS IN THIS PACK");
+                ui.label(
+                    RichText::new("no tags yet \u{2014} assets in this pack are Unidentified")
+                        .color(theme::TEXT_DIM)
+                        .size(11.0),
+                );
+                ui.add_space(10.0);
+
+                section_label(ui, "HEAVIEST IN PACK");
+                for (name, bytes) in &stats.heaviest {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(name).color(theme::TEXT_MUTED).size(11.0));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format_bytes(*bytes))
+                                    .color(theme::TEXT_DIM)
+                                    .size(11.0)
+                                    .monospace(),
+                            );
+                        });
+                    });
+                }
+                ui.add_space(14.0);
+
+                if ui
+                    .button(
+                        RichText::new(format!("Browse {pack} in Library \u{2192}"))
+                            .color(theme::GOLD)
+                            .size(12.0),
+                    )
+                    .clicked()
+                {
+                    browse = true;
+                }
+            });
+
+        if browse {
+            self.pack_stats_open = None;
+            self.browse_package(pack);
+        } else if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.pack_stats_open = None;
+        }
+    }
+
     /// Assets in the library per extracted pack: `(total, unidentified)` (UI-SPEC §4 pack row).
     /// Counted off the in-memory entries — they already carry their pack name, so this needs no
     /// catalog round-trip and stays correct for packs extracted this session.
@@ -2908,6 +3055,7 @@ impl LodestashApp {
         let mut source_to_add: Option<PathBuf> = None;
         let mut extract_idx: Option<usize> = None;
         let mut browse_pkg: Option<String> = None;
+        let mut stats_pkg: Option<String> = None;
 
         ui.horizontal(|ui| {
             if ui
@@ -3150,6 +3298,14 @@ impl LodestashApp {
                                                 {
                                                     browse_pkg = Some(pkg.name.clone());
                                                 }
+                                                if ui
+                                                    .button(
+                                                        RichText::new("\u{25C9} Stats").size(11.0),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    stats_pkg = Some(pkg.name.clone());
+                                                }
                                                 if unid > 0 {
                                                     ui.label(
                                                         RichText::new(format!("{unid} unid"))
@@ -3239,6 +3395,9 @@ impl LodestashApp {
         if let Some(name) = browse_pkg {
             self.browse_package(name);
         }
+        if let Some(name) = stats_pkg {
+            self.pack_stats_open = Some(name);
+        }
     }
 
     // ── Unity Assets screen (UI-SPEC §0.2, FEATURES.md §5) ──────────────────────
@@ -3300,6 +3459,7 @@ impl LodestashApp {
 
         let mut toggle: Option<(i64, bool)> = None;
         let mut browse_pkg: Option<String> = None;
+        let mut stats_pkg: Option<String> = None;
         let counts = self.package_asset_counts();
         ScrollArea::vertical().show(ui, |ui| {
             for pkg in &packages {
@@ -3351,6 +3511,12 @@ impl LodestashApp {
                                         {
                                             browse_pkg = Some(pkg.name.clone());
                                         }
+                                        if ui
+                                            .button(RichText::new("\u{25C9} Stats").size(11.0))
+                                            .clicked()
+                                        {
+                                            stats_pkg = Some(pkg.name.clone());
+                                        }
                                         ui.label(
                                             RichText::new(format!("{n} assets"))
                                                 .color(theme::TEXT_DIM)
@@ -3376,6 +3542,9 @@ impl LodestashApp {
         }
         if let Some(name) = browse_pkg {
             self.browse_package(name);
+        }
+        if let Some(name) = stats_pkg {
+            self.pack_stats_open = Some(name);
         }
     }
 
@@ -4337,6 +4506,7 @@ impl eframe::App for LodestashApp {
         // A finished extraction frees the slot the batch queue waits on.
         self.pump_extract_queue(ctx);
         self.poll_watch(ctx);
+        self.pack_stats_modal(ctx);
         self.receive_catalog();
         self.receive_model_download();
         self.receive_viewer(ctx);
@@ -7887,6 +8057,70 @@ fn package_asset_counts(
     out
 }
 
+/// What the pack-stats modal shows (UI-SPEC §15), computed off the in-memory entries.
+#[derive(Debug, Default, PartialEq)]
+struct PackStats {
+    assets: usize,
+    bytes: u64,
+    /// Summed triangles across the pack's measured models; `None` when nothing is measured yet.
+    tris: Option<i64>,
+    unidentified: usize,
+    /// Per media type: (type, count, bytes), heaviest type first.
+    contents: Vec<(Option<MediaType>, usize, u64)>,
+    /// Biggest three assets: (name, bytes).
+    heaviest: Vec<(String, u64)>,
+}
+
+/// Summarise one pack. Trashed assets are excluded, matching the counts on the pack row.
+fn pack_stats(entries: &[AssetEntry], pack: &str) -> PackStats {
+    let mine: Vec<&AssetEntry> = entries
+        .iter()
+        .filter(|e| !e.trashed && e.package.as_deref() == Some(pack))
+        .collect();
+    let mut out = PackStats {
+        assets: mine.len(),
+        bytes: mine.iter().map(|e| e.file.size_bytes).sum(),
+        unidentified: mine.iter().filter(|e| e.status.is_unidentified()).count(),
+        ..Default::default()
+    };
+    let measured: i64 = mine.iter().filter_map(|e| e.metrics.tri_count).sum();
+    // Nothing measured ⇒ unknown, not "0 triangles" (DATA-MODEL §14).
+    out.tris = mine
+        .iter()
+        .any(|e| e.metrics.tri_count.is_some())
+        .then_some(measured);
+
+    let mut by_type: std::collections::HashMap<Option<MediaType>, (usize, u64)> =
+        Default::default();
+    for e in &mine {
+        let slot = by_type.entry(e.file.media_type).or_default();
+        slot.0 += 1;
+        slot.1 += e.file.size_bytes;
+    }
+    out.contents = by_type.into_iter().map(|(mt, (n, b))| (mt, n, b)).collect();
+    out.contents.sort_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then_with(|| media_type_label(a.0).cmp(media_type_label(b.0)))
+    });
+
+    let mut biggest: Vec<&&AssetEntry> = mine.iter().collect();
+    biggest.sort_by_key(|e| std::cmp::Reverse(e.file.size_bytes));
+    out.heaviest = biggest
+        .iter()
+        .take(3)
+        .map(|e| {
+            let name = e
+                .file
+                .rel_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            (name, e.file.size_bytes)
+        })
+        .collect();
+    out
+}
+
 /// Split ticked packs into the ones the extractor can act on now (their cache root is a library
 /// source, so they have a `pending_packages` row) and the ones still blocked on that. Pure so the
 /// batch rule is testable without an egui context.
@@ -7898,6 +8132,21 @@ fn split_extractable(
         .iter()
         .cloned()
         .partition(|path| pending.contains(path))
+}
+
+/// One stat tile in the pack-stats modal (UI-SPEC §15).
+fn stat_tile(ui: &mut Ui, label: &str, value: &str, color: egui::Color32) {
+    egui::Frame::none()
+        .fill(theme::SURFACE)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+        .rounding(4.0)
+        .inner_margin(egui::Margin::symmetric(14.0, 8.0))
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new(label).color(theme::TEXT_DIM).size(9.0));
+                ui.label(RichText::new(value).color(color).size(15.0));
+            });
+        });
 }
 
 fn stat_row(ui: &mut Ui, label: &str, value: &str) {
@@ -8734,6 +8983,52 @@ mod tests {
             texture: None,
             thumb_spawned: false,
         }
+    }
+
+    #[test]
+    fn pack_stats_summarise_only_that_pack() {
+        let mk = |rel: &str, size: u64, mt: Option<MediaType>, pkg: Option<&str>, tris| {
+            let mut e = entry_full(rel, size, 0, mt);
+            e.package = pkg.map(str::to_string);
+            e.metrics.tri_count = tris;
+            e
+        };
+        let entries = vec![
+            mk(
+                "rock.fbx",
+                900,
+                Some(MediaType::Model3d),
+                Some("Pack"),
+                Some(1200),
+            ),
+            mk(
+                "rock_d.png",
+                400,
+                Some(MediaType::Texture),
+                Some("Pack"),
+                None,
+            ),
+            mk(
+                "other.fbx",
+                5000,
+                Some(MediaType::Model3d),
+                Some("Other"),
+                Some(99),
+            ),
+        ];
+
+        let st = pack_stats(&entries, "Pack");
+        assert_eq!(st.assets, 2);
+        assert_eq!(st.bytes, 1300);
+        assert_eq!(st.tris, Some(1200), "only this pack's measured models");
+        assert_eq!(st.unidentified, 2, "fresh entries are Discovered");
+        assert_eq!(st.contents.len(), 2);
+        assert_eq!(st.contents[0].1, 1, "heaviest type first");
+        assert_eq!(st.heaviest[0].0, "rock.fbx");
+
+        // Nothing measured ⇒ unknown, not zero.
+        let unmeasured = vec![mk("a.png", 1, Some(MediaType::Image), Some("P"), None)];
+        assert_eq!(pack_stats(&unmeasured, "P").tris, None);
     }
 
     #[test]

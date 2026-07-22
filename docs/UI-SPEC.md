@@ -549,6 +549,12 @@ click = search that tag *scoped to the pack*; empty → *"no tags yet — assets
 Unidentified"*); **HEAVIEST IN PACK** top 3 (tier badge + name + stats, click → select in Library);
 footer **Browse <pack> in Library →** (gold primary).
 
+*(Shipped: tiles, CONTENTS, HEAVIEST, footer — opened by ◉ Stats on the Packages and Unity Assets
+pack rows, for packs whose assets are in the library. Triangles show `—` when nothing in the pack
+has been measured yet (DATA-MODEL §14: unknown, not zero). Not yet: the license/exported meta line
+(needs the license harvest + `import_record` join) and TAGS, which shows the empty state above
+until P4 tagging.)*
+
 ---
 
 ## 16. Projects, staging tray & the import pipeline
