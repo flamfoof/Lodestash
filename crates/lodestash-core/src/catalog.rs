@@ -120,6 +120,30 @@ impl AssetMetrics {
     }
 }
 
+/// One asset as the agent-facing planes present it (ENGINE-API §3 `AssetSummary`, minus the
+/// fields whose data doesn't exist yet — tags arrive with P4). Shared by REST and MCP so the two
+/// can't describe an asset differently.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssetSummaryRow {
+    pub id: i64,
+    pub uuid: String,
+    pub name: String,
+    /// `media_type.code`.
+    pub media_type: String,
+    /// Primary file's extension, lowercased (`fbx`, `png`, …).
+    pub format: Option<String>,
+    /// `asset.status` code.
+    pub status: String,
+    pub size_bytes: i64,
+    pub package_id: Option<i64>,
+    pub package_name: Option<String>,
+    /// Absolute path of the primary file, or `None` for a package-extracted payload that only
+    /// exists in the workspace (the caller joins `workspace_rel` onto its workspace dir).
+    pub disk_path: Option<String>,
+    pub workspace_rel: Option<String>,
+    pub metrics: AssetMetrics,
+}
+
 /// One asset's catalog identity for the UI join (grid read path).
 #[derive(Debug, Clone)]
 pub struct AssetIdentity {
@@ -1381,6 +1405,85 @@ impl Catalog {
         Ok(())
     }
 
+    /// Summaries for `ids`, in the order given (the agent planes rank first, then hydrate).
+    /// Unknown or soft-deleted ids are dropped rather than erroring — a stale id from a client
+    /// is a miss, not a fault.
+    pub fn asset_summaries(&self, ids: &[i64]) -> Result<Vec<AssetSummaryRow>> {
+        let mut found: HashMap<i64, AssetSummaryRow> = HashMap::new();
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT a.id, a.uuid, a.name, mt.code, af.ext, a.status,
+                        COALESCE(af.size_bytes, 0),
+                        a.package_id, p.name,
+                        CASE WHEN af.workspace_rel IS NULL
+                             THEN s.root_path || '/' || af.rel_path END,
+                        af.workspace_rel,
+                        a.tri_count, a.width_px, a.height_px, a.duration_ms
+                 FROM asset a
+                 JOIN media_type mt    ON mt.id = a.media_type_id
+                 JOIN import_source s  ON s.id = a.source_id
+                 JOIN asset_file af    ON af.id = a.primary_file_id
+                 LEFT JOIN package p   ON p.id = a.package_id
+                 WHERE a.id = ?1 AND a.deleted_at IS NULL",
+            )
+            .map_err(|e| CoreError::Catalog(format!("summary prep: {e}")))?;
+        for id in ids {
+            let row = stmt
+                .query_row(params![id], |r| {
+                    Ok(AssetSummaryRow {
+                        id: r.get(0)?,
+                        uuid: r.get(1)?,
+                        name: r.get(2)?,
+                        media_type: r.get(3)?,
+                        format: r.get(4)?,
+                        status: r.get(5)?,
+                        size_bytes: r.get(6)?,
+                        package_id: r.get(7)?,
+                        package_name: r.get(8)?,
+                        disk_path: r.get(9)?,
+                        workspace_rel: r.get(10)?,
+                        metrics: AssetMetrics::from_row(r, 11)?,
+                    })
+                })
+                .optional()
+                .map_err(|e| CoreError::Catalog(format!("summary query: {e}")))?;
+            if let Some(row) = row {
+                found.insert(row.id, row);
+            }
+        }
+        Ok(ids.iter().filter_map(|id| found.remove(id)).collect())
+    }
+
+    /// The most recently catalogued assets — what a search with no query returns, so a client
+    /// that just connected sees something real instead of an empty list.
+    pub fn recent_asset_ids(&self, limit: usize) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id FROM asset WHERE deleted_at IS NULL
+                 ORDER BY updated_at DESC, id DESC LIMIT ?1",
+            )
+            .map_err(|e| CoreError::Catalog(format!("recent prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| r.get::<_, i64>(0))
+            .map_err(|e| CoreError::Catalog(format!("recent query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("recent row: {e}")))
+    }
+
+    /// Look up a `media_type.code`'s id (the pre-filter column the search paths take).
+    pub fn media_type_id(&self, code: &str) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM media_type WHERE code = ?1",
+                params![code],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| CoreError::Catalog(format!("media_type lookup: {e}")))
+    }
+
     pub fn upsert_embedding(
         &mut self,
         asset_id: i64,
@@ -1768,6 +1871,37 @@ mod tests {
         c.set_metrics(job[0].asset_id, AssetMetrics::default())
             .expect("set empty");
         assert!(c.assets_needing_metrics(10).expect("queue").is_empty());
+    }
+
+    #[test]
+    fn asset_summaries_keep_request_order_and_drop_misses() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let src = c
+            .upsert_import_source("Lib", "C:/lib", "folder")
+            .expect("src");
+        c.record_crawl(src, None, &[rec("a.png", 10, 1), rec("b.png", 20, 1)])
+            .expect("crawl");
+        let ids = c.recent_asset_ids(10).expect("recent");
+        assert_eq!(ids.len(), 2);
+
+        // Reversed order, plus an id that doesn't exist.
+        let want = vec![ids[1], 9999, ids[0]];
+        let rows = c.asset_summaries(&want).expect("summaries");
+        assert_eq!(rows.len(), 2, "the unknown id is a miss, not an error");
+        assert_eq!(rows[0].id, ids[1], "request order is preserved");
+        assert_eq!(rows[1].id, ids[0]);
+        assert_eq!(rows[0].media_type, "image");
+        assert_eq!(rows[0].format.as_deref(), Some("png"));
+        assert_eq!(
+            rows[0].disk_path.as_deref(),
+            Some(format!("C:/lib/{}", rows[0].name).as_str()),
+            "the summary carries the primary file's absolute path"
+        );
+        assert!(rows[0].uuid.len() >= 32, "uuid travels to the agent planes");
+
+        assert!(c.media_type_id("audio").expect("lookup").is_some());
+        assert_eq!(c.media_type_id("nope").expect("lookup"), None);
     }
 
     #[test]
