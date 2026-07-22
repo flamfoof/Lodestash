@@ -7,7 +7,7 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use lodestash_core::catalog::AssetSummaryRow;
 use serde::Deserialize;
@@ -27,6 +27,9 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/assets/{id}/preview", get(preview))
         .route("/v1/assets/{id}/similar", get(similar))
         .route("/v1/packages", get(packages))
+        .route("/v1/export", post(export))
+        .route("/v1/jobs/{id}", get(job_status))
+        .route("/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/v1/assets/{id}/file", get(file))
         .layer(from_fn_with_state(state.clone(), guard))
         .with_state(state)
@@ -172,6 +175,45 @@ async fn packages(State(state): State<Shared>) -> Response {
             Json(json!({ "packages": out })).into_response()
         }
         Err(e) => db_err(e),
+    }
+}
+
+/// *Side-effecting* (ENGINE-API §2). Returns `202` with a job that is **not running**: it waits
+/// on the desktop app's approval (MCP-AND-ENGINES §5 "confirm mutating ops server-side").
+async fn export(
+    State(state): State<Shared>,
+    Json(req): Json<crate::export::ExportRequest>,
+) -> Response {
+    if req.asset_ids.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "asset_ids must not be empty.",
+            "",
+        );
+    }
+    match state.request_export(req) {
+        Ok(job) => (StatusCode::ACCEPTED, Json(job.to_json())).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e.code(), e.message(), ""),
+    }
+}
+
+async fn job_status(State(state): State<Shared>, Path(id): Path<String>) -> Response {
+    match state.jobs.get(&id) {
+        Some(job) => Json(job.to_json()).into_response(),
+        None => err(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "No such job.",
+            "Jobs live for the session that created them.",
+        ),
+    }
+}
+
+async fn cancel_job(State(state): State<Shared>, Path(id): Path<String>) -> Response {
+    match state.jobs.cancel(&id) {
+        Some(job) => Json(job.to_json()).into_response(),
+        None => err(StatusCode::NOT_FOUND, "not_found", "No such job.", ""),
     }
 }
 

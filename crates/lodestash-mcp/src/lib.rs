@@ -45,6 +45,22 @@ pub struct SimilarArgs {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ExportArgs {
+    /// Assets to copy out.
+    pub asset_ids: Vec<i64>,
+    /// Absolute destination folder. Must be outside every library source root.
+    pub dest_path: String,
+    /// Accepted but not yet honoured — the dependency graph arrives with package relationships.
+    pub with_dependencies: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct JobArgs {
+    /// Job id returned by a long-running tool.
+    pub job_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AssetArgs {
     /// The asset's catalog id.
     pub id: i64,
@@ -140,6 +156,71 @@ impl Lodestash {
         let rows = self.state.packages().map_err(internal)?;
         let json: Vec<_> = rows.iter().map(lodestash_api::package_json).collect();
         Ok(CallToolResult::success(vec![ContentBlock::json(json)?]))
+    }
+
+    /// Copy assets out to a folder. Waits for the person at the machine to approve.
+    #[tool(
+        name = "export_asset",
+        description = "Copy assets to a folder outside the library. Returns a job that stays in \
+                       state 'awaiting_approval' until the desktop app's owner approves it — \
+                       poll get_job_status."
+    )]
+    pub async fn export_asset(
+        &self,
+        Parameters(args): Parameters<ExportArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if args.asset_ids.is_empty() {
+            return Err(ErrorData::invalid_params(
+                "asset_ids must not be empty",
+                None,
+            ));
+        }
+        let req = lodestash_api::export::ExportRequest {
+            asset_ids: args.asset_ids,
+            dest_path: args.dest_path,
+            with_dependencies: args.with_dependencies.unwrap_or(false),
+        };
+        match self.state.request_export(req) {
+            Ok(job) => Ok(CallToolResult::success(vec![ContentBlock::json(
+                job.to_json(),
+            )?])),
+            Err(e) => Err(ErrorData::invalid_params(e.message(), None)),
+        }
+    }
+
+    /// Progress of a long-running operation.
+    #[tool(
+        name = "get_job_status",
+        description = "State and progress of a job (awaiting_approval | queued | running | \
+                       done | error | cancelled)."
+    )]
+    pub async fn get_job_status(
+        &self,
+        Parameters(args): Parameters<JobArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match self.state.jobs.get(&args.job_id) {
+            Some(job) => Ok(CallToolResult::success(vec![ContentBlock::json(
+                job.to_json(),
+            )?])),
+            None => Err(ErrorData::invalid_params("no such job", None)),
+        }
+    }
+
+    /// Ask a job to stop. Idempotent.
+    #[tool(
+        name = "cancel_job",
+        description = "Request cancellation of a job. Idempotent; finished jobs are unaffected."
+    )]
+    pub async fn cancel_job(
+        &self,
+        Parameters(args): Parameters<JobArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match self.state.jobs.cancel(&args.job_id) {
+            Some(job) => Ok(CallToolResult::success(vec![ContentBlock::json(
+                job.to_json(),
+            )?])),
+            None => Err(ErrorData::invalid_params("no such job", None)),
+        }
     }
 
     /// A viewable preview plus a link to the real bytes.

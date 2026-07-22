@@ -97,12 +97,26 @@ in-editor import (§5). Both reuse the **same dependency-closure resolution** de
 > plugin↔core plumbing, not operations an LLM should call. No *agent* operation is missing from
 > either plane.
 
+> **Server-side confirmation (shipped).** `POST /v1/export` returns `202` with a job in state
+> **`awaiting_approval`** — an extra state beyond the §3 set. Nothing is copied until the person at
+> the desktop app approves the prompt; denial cancels the job permanently. This is
+> [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md) §5 "confirm mutating ops server-side, don't rely
+> solely on the client's human-in-the-loop", made literal. Clients must poll `GET /v1/jobs/{id}`
+> and handle a job that never leaves `awaiting_approval`.
+>
+> **Export sandbox (shipped).** `dest_path` must be absolute, free of `..` (`400 path_traversal`),
+> and outside every registered library source root (`400 forbidden_destination`) — the library is
+> read-only by invariant, so an agent can never turn an export into a write into the user's own
+> asset folders.
+
 > **Implementation status (interim).** The read routes exist; nothing else does yet. Until the
 > remaining slices land: `GET /v1/search?mode=ai` answers `501 ai_unavailable`, `AssetSummary.tags`
 > is always `[]` (tagging is P4) and `package` carries `{id, name}` without `publisher`, and
 > `Package` carries `{id, name, publisher, category, asset_count, unpacked_at}` — `version`,
 > `license` and `attribution` wait on the P2 license harvest. `find_similar` answers `[]` for an
 > asset with no embedding (an un-encoded library is not an error).
+> `export` copies the named assets only — `with_dependencies` is accepted and echoed back as
+> `dependencies_included: false` until the P2 relationship graph can resolve a closure.
 > `AssetDetail` extends the summary with `size_bytes` + `stats` only — `description`, `files`,
 > `collections`, `license`, `dependencies` and `imported_in` arrive with the features that populate
 > them. Clients should treat missing fields as "not known yet", never as "empty".

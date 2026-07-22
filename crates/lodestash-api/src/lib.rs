@@ -5,7 +5,9 @@
 //! `assets/{id}`, `preview`, `file`. Mutating routes need the job engine (§4 "Async") and land
 //! with it.
 
+pub mod export;
 pub mod handshake;
+pub mod jobs;
 pub mod routes;
 
 use std::path::{Path, PathBuf};
@@ -28,6 +30,9 @@ pub const AGENT_OPERATIONS: &[(&str, &str)] = &[
     ("get_asset_preview", "GET /v1/assets/{id}/preview"),
     ("find_similar", "GET /v1/assets/{id}/similar"),
     ("list_packages", "GET /v1/packages"),
+    ("export_asset", "POST /v1/export"),
+    ("get_job_status", "GET /v1/jobs/{id}"),
+    ("cancel_job", "POST /v1/jobs/{id}/cancel"),
 ];
 
 /// Resolves an asset's source file to a cached preview PNG, generating it on a miss.
@@ -37,12 +42,19 @@ pub type PreviewFn = Box<dyn Fn(&Path) -> Option<PathBuf> + Send + Sync>;
 /// (read-only queries) so it never contends with the UI's single writer — DATA-MODEL §1.
 pub struct ServerState {
     catalog: Mutex<Catalog>,
+    pub jobs: jobs::Jobs,
     workspace_dir: PathBuf,
     /// Given an asset's source file, the cached preview PNG for it (generating on a miss).
     /// Supplied by the caller because the thumbnail cache layout — and, for audio, the decoder —
     /// live outside this crate.
     preview: PreviewFn,
     token: String,
+    /// Approved-or-not export requests, keyed by job id. Held apart from the job itself so the
+    /// job record stays a pure status object.
+    pending_exports: Mutex<std::collections::HashMap<String, (export::ExportRequest, PathBuf)>>,
+    /// Called when a job starts waiting on the user. The desktop app repaints on it — without
+    /// this the approval prompt only appears the next time the window happens to redraw.
+    wake: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl ServerState {
@@ -53,14 +65,28 @@ impl ServerState {
     ) -> lodestash_core::error::Result<Self> {
         Ok(Self {
             catalog: Mutex::new(Catalog::open(catalog_path)?),
+            jobs: jobs::Jobs::default(),
             workspace_dir,
             preview,
             token: new_token(),
+            pending_exports: Mutex::new(std::collections::HashMap::new()),
+            wake: Mutex::new(None),
         })
     }
 
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// Register the "something needs the user's attention" callback (the GUI's repaint).
+    pub fn set_wake(&self, f: Box<dyn Fn() + Send + Sync>) {
+        *self.wake.lock().unwrap() = Some(f);
+    }
+
+    fn wake(&self) {
+        if let Some(f) = self.wake.lock().unwrap().as_ref() {
+            f();
+        }
     }
 
     // ── The agent operations. Both planes call *these*, never the catalog directly — that's
@@ -136,10 +162,112 @@ impl ServerState {
         self.catalog.lock().unwrap().list_packages()
     }
 
+    /// Queue an export (ENGINE-API §2 `export_asset`). Validates the destination against the
+    /// sandbox *now* — a bad path is an error, not a job that fails later — then parks the job
+    /// on the approval gate. Nothing is copied until [`Self::approve_job`].
+    pub fn request_export(
+        &self,
+        req: export::ExportRequest,
+    ) -> Result<std::sync::Arc<jobs::Job>, export::SandboxError> {
+        let roots = self
+            .catalog
+            .lock()
+            .unwrap()
+            .source_roots()
+            .unwrap_or_default();
+        let dest = export::check_dest(&req.dest_path, &roots)?;
+        let summary = format!(
+            "Export {} asset(s) to {}",
+            req.asset_ids.len(),
+            dest.display()
+        );
+        let job = self
+            .jobs
+            .create("export", summary, jobs::JobState::AwaitingApproval);
+        self.pending_exports
+            .lock()
+            .unwrap()
+            .insert(job.id.clone(), (req, dest));
+        self.wake();
+        Ok(job)
+    }
+
+    /// The desktop app said yes: run the export on a worker thread. Unknown/already-approved job
+    /// ids are a no-op.
+    pub fn approve_job(self: &std::sync::Arc<Self>, job_id: &str) {
+        let Some(job) = self.jobs.get(job_id) else {
+            return;
+        };
+        if job.state() != jobs::JobState::AwaitingApproval {
+            return;
+        }
+        let Some((req, dest)) = self.pending_exports.lock().unwrap().remove(job_id) else {
+            return;
+        };
+        job.set_state(jobs::JobState::Queued);
+        let state = self.clone();
+        std::thread::spawn(move || state.run_export(job, req, dest));
+    }
+
+    /// The desktop app said no.
+    pub fn deny_job(&self, job_id: &str) {
+        self.pending_exports.lock().unwrap().remove(job_id);
+        if let Some(job) = self.jobs.get(job_id) {
+            if job.state() == jobs::JobState::AwaitingApproval {
+                job.set_state(jobs::JobState::Cancelled);
+            }
+        }
+    }
+
+    fn run_export(
+        &self,
+        job: std::sync::Arc<jobs::Job>,
+        req: export::ExportRequest,
+        dest: PathBuf,
+    ) {
+        job.set_state(jobs::JobState::Running);
+        let rows = match self.catalog.lock().unwrap().asset_summaries(&req.asset_ids) {
+            Ok(rows) => rows,
+            Err(e) => return job.fail(e.to_string()),
+        };
+        // ponytail: no dependency closure — the relationship graph is P2. `with_dependencies`
+        // is accepted and reported back so clients can tell it wasn't honoured.
+        let files: Vec<(PathBuf, String)> = rows
+            .iter()
+            .filter_map(|r| self.source_path(r).map(|p| (p, file_name_for(r))))
+            .collect();
+        let missing = req.asset_ids.len() - files.len();
+        match export::copy_files(&files, &dest, &job) {
+            Ok(written) if job.is_cancelled() => {
+                job.set_state(jobs::JobState::Cancelled);
+                tracing::info!(%job.id, written, "export cancelled part-way");
+            }
+            Ok(written) => job.finish(serde_json::json!({
+                "written": written,
+                "missing": missing,
+                "dest_path": dest.display().to_string(),
+                "dependencies_included": false,
+                "requested_dependencies": req.with_dependencies,
+            })),
+            Err(e) => job.fail(e.to_string()),
+        }
+    }
+
     /// The asset's preview PNG on disk, generated on a cache miss.
     pub fn preview_path(&self, id: i64) -> Option<PathBuf> {
         let row = self.asset(id).ok().flatten()?;
         (self.preview)(&self.source_path(&row)?)
+    }
+}
+
+/// What the exported copy is called on disk: the asset's name, with the primary file's extension
+/// when the name doesn't already carry one.
+fn file_name_for(r: &AssetSummaryRow) -> String {
+    match &r.format {
+        Some(ext) if !r.name.to_lowercase().ends_with(&format!(".{ext}")) => {
+            format!("{}.{ext}", r.name)
+        }
+        _ => r.name.clone(),
     }
 }
 

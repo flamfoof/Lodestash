@@ -672,6 +672,9 @@ pub struct LodestashApp {
     /// The loopback engine API's handshake (port + token), once it's listening (ENGINE-API §1).
     /// `None` when the port or the handshake file couldn't be taken — the GUI works regardless.
     engine: Option<lodestash_api::Handshake>,
+    /// The agent planes' shared read state. Kept so the GUI can answer their approval prompts
+    /// (MCP-AND-ENGINES §5: mutating ops confirm server-side, not in the client).
+    engine_state: Option<std::sync::Arc<lodestash_api::ServerState>>,
     /// The ⚑ Filters content filter (trait / triangles / file-size). Transient. Design §3.
     content_filter: ContentFilter,
     /// Top-bar search mode (UI-SPEC §0.1). AI is a stub until P3/P4.
@@ -856,12 +859,22 @@ impl LodestashApp {
             onboarding_open: show_onboarding,
             jobs: Jobs::default(),
             scan_job: None,
-            engine: {
-                let (thumbs, ws) = default_cache_dirs();
-                start_engine_api(thumbs, ws)
-            },
+            engine: None,
+            engine_state: None,
             config,
         };
+
+        if let Some((handshake, state)) = {
+            let (thumbs, ws) = default_cache_dirs();
+            start_engine_api(thumbs, ws)
+        } {
+            // An agent's request arrives on a server thread; the window must wake to show the
+            // approval prompt rather than wait for the user to jiggle the mouse.
+            let repaint_ctx = cc.egui_ctx.clone();
+            state.set_wake(Box::new(move || repaint_ctx.request_repaint()));
+            app.engine = Some(handshake);
+            app.engine_state = Some(state);
+        }
 
         // Restore the last open project, or fall back to last_root for old configs.
         if let Some(name) = app.config.last_project_name.clone() {
@@ -1896,6 +1909,85 @@ impl LodestashApp {
     // it renders as tofu; it comes back with the icon sprite (DESIGN-GUIDELINES §5).
     /// Pack stats modal (UI-SPEC §15): tiles, per-type contents, heaviest assets, and a jump
     /// into the Library. Tags are P4 — the spec's empty state stands in until tagging exists.
+    /// The server-side confirmation gate (MCP-AND-ENGINES §5). An agent can *ask* to write files
+    /// to disk; nothing happens until the person at the machine approves it here. One prompt at a
+    /// time, oldest first.
+    fn agent_approval_modal(&mut self, ctx: &egui::Context) {
+        let Some(state) = self.engine_state.clone() else {
+            return;
+        };
+        let Some(job) = state.jobs.awaiting_approval().into_iter().next() else {
+            return;
+        };
+
+        egui::Area::new(egui::Id::new("agent_approval_scrim"))
+            .order(egui::Order::Middle)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                let screen = ctx.screen_rect();
+                // No click-to-dismiss: this decision is deliberate, not incidental.
+                ui.allocate_rect(screen, egui::Sense::hover());
+                ui.painter()
+                    .rect_filled(screen, 0.0, theme::BG.linear_multiply(0.6));
+            });
+
+        let mut decision: Option<bool> = None;
+        egui::Window::new("agent_approval")
+            .title_bar(false)
+            .resizable(false)
+            .collapsible(false)
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(460.0)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(theme::SURFACE_RAISED)
+                    .stroke(egui::Stroke::new(1.0, theme::WARNING))
+                    .inner_margin(egui::Margin::same(20.0)),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("An agent is asking to write files")
+                        .color(theme::TEXT)
+                        .font(crate::fonts::display(18.0)),
+                );
+                ui.add_space(8.0);
+                ui.label(RichText::new(&job.summary).color(theme::TEXT).size(13.0));
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Originals are never moved or modified - this copies them.")
+                        .color(theme::TEXT_DIM)
+                        .size(11.0),
+                );
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Deny").size(13.0)).clicked() {
+                        decision = Some(false);
+                    }
+                    if ui
+                        .button(RichText::new("Approve").size(13.0).color(theme::GOLD))
+                        .clicked()
+                    {
+                        decision = Some(true);
+                    }
+                });
+            });
+
+        match decision {
+            Some(true) => {
+                state.approve_job(&job.id);
+                self.jobs
+                    .toast(format!("Approved: {}", job.summary), Intent::Info);
+            }
+            Some(false) => {
+                state.deny_job(&job.id);
+                self.jobs
+                    .toast("Denied the agent's export", Intent::Warning);
+            }
+            None => {}
+        }
+    }
+
     fn pack_stats_modal(&mut self, ctx: &egui::Context) {
         let Some(pack) = self.pack_stats_open.clone() else {
             return;
@@ -4539,6 +4631,7 @@ impl eframe::App for LodestashApp {
         self.pump_extract_queue(ctx);
         self.poll_watch(ctx);
         self.pack_stats_modal(ctx);
+        self.agent_approval_modal(ctx);
         self.receive_catalog();
         self.receive_model_download();
         self.receive_viewer(ctx);
@@ -6951,14 +7044,20 @@ fn logo_diamond(ui: &mut Ui) {
 /// (DATA-MODEL §1 — one SQLite file). None if the platform has no data dir.
 /// Start the loopback `/v1/` API (ENGINE-API §1). Best-effort: a failure here costs the plugin
 /// bridge, not the app, so it logs and returns `None`.
+type EngineHandles = (
+    lodestash_api::Handshake,
+    std::sync::Arc<lodestash_api::ServerState>,
+);
+
 fn start_engine_api(
     thumb_cache_dir: Option<PathBuf>,
     workspace_dir: Option<PathBuf>,
-) -> Option<lodestash_api::Handshake> {
-    let state = agent_state(thumb_cache_dir, workspace_dir)?;
-    lodestash_api::serve(std::sync::Arc::new(state))
+) -> Option<EngineHandles> {
+    let state = std::sync::Arc::new(agent_state(thumb_cache_dir, workspace_dir)?);
+    let handshake = lodestash_api::serve(state.clone())
         .map_err(|e| tracing::warn!(%e, "engine API did not start"))
-        .ok()
+        .ok()?;
+    Some((handshake, state))
 }
 
 /// The shared read state both agent planes run on (REST here, MCP in `--mcp` mode). The preview

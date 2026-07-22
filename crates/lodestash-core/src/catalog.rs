@@ -1469,6 +1469,21 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("embedding_of: {e}")))
     }
 
+    /// Every registered source root. The export sandbox refuses to write inside one — the
+    /// library is read-only by invariant (README "non-destructive"), so a client must not be able
+    /// to turn an export into a write into the user's own asset folders.
+    pub fn source_roots(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT root_path FROM import_source")
+            .map_err(|e| CoreError::Catalog(format!("roots prep: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| CoreError::Catalog(format!("roots query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("roots row: {e}")))
+    }
+
     /// Look up a `media_type.code`'s id (the pre-filter column the search paths take).
     pub fn media_type_id(&self, code: &str) -> Result<Option<i64>> {
         self.conn

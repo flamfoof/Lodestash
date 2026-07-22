@@ -474,6 +474,14 @@ re-extraction; retention-evicted files simply don't return. Off: extractions are
 previews). The extracted-archive **workspace** cap + retention (INGESTION §2) and **Clear cache /
 Clear workspace** actions live in this card too (DESIGN-GUIDELINES §7 Storage group).
 
+### 11.6b Agent approval prompt (shipped)
+A modal over a dimmed library, warning-bordered: **"An agent is asking to write files"**, the job's
+one-line summary (`Export N asset(s) to <path>`), the reassurance that originals are only copied,
+then **Deny** / **Approve**. No click-to-dismiss — the decision is deliberate. One prompt at a time,
+oldest first; the window repaints itself when a request arrives rather than waiting for input.
+Approving or denying raises a toast. This is the desktop half of ENGINE-API's server-side
+confirmation gate.
+
 ### 11.7 ENGINE BRIDGE
 Live status row (verdant dot glow when bridged): `Live — bridged to <project>` / `Bridge paused`,
 sub-line `<engine> · imports sync to <dest> as you stage them`; enable toggle (paused ⇒ staged
