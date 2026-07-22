@@ -4,7 +4,7 @@ Working notes for whoever (or whatever) continues the build. Unlike the rest of 
 is **not** a design spec — it's the state of play, the decisions already settled, and the traps.
 The design docs still win on any question of what the software *should* do.
 
-Last updated: **2026-07-21**, at `52b2967`.
+Last updated: **2026-07-21**, at `71b566c`.
 
 ---
 
@@ -34,7 +34,12 @@ Sanity check before starting: `cargo test --workspace` and `cargo clippy --works
 |---|---|
 | Image / texture / sprite | Decoded thumbnails + SigLIP embeddings, on-disk **and** inside `.unitypackage`s |
 | 3D models | FBX/OBJ (ufbx) + glTF/GLB (three-d-asset) → CPU multiview render → SigLIP; rendered grid thumbnails |
-| Audio | CLAP joint space (512-d), fused with the visual space by RRF |
+| Audio | CLAP joint space (512-d), fused with the visual space by RRF; peak-waveform grid thumbnails |
+
+Every asset also carries **technical facets** — triangles, pixel dimensions, audio duration —
+extracted by a `metrics_dirty` drain (M9, [`DATA-MODEL.md`](DATA-MODEL.md) §14) that runs after every
+scan whether or not the AI stack is installed. They show in the inspector, drive the ⚑ Filters
+Triangles chips, and are parseable from a query (*"under 5k tris"*, *"under 500ms"*).
 
 Plain-language queries are split into semantic text + structural filters before search. The whole AI
 stack is one-click installable on win-x64 (fetches the ONNX Runtime *and* both models, ~645 MB).
@@ -130,13 +135,11 @@ fixture.
 
 Roughly by value:
 
-1. **Audio waveform thumbnails** (P1, same card as the 3D thumbnails). Cheap reuse: `audio.rs` already
-   decodes waveforms for the viewer, and `thumb::generate` already dispatches by type.
-2. **Metadata extraction** (tri counts, dimensions, duration). This lights up the `tris`/`duration`
-   filters that `lodestash_core::query` deliberately does *not* parse yet, because nothing stores them.
-3. **P2 Asset Store batch unpack+ingest**, or **P5 MCP/REST** to open the agent-facing lane — remember
-   MCP↔REST must stay 1:1 (add an operation to both planes or neither).
-4. Optional AI refinements: an LLM query parser (slots in behind `ParsedQuery::validate`, which exists
+1. **P2 Asset Store batch unpack+ingest**, or **P5 MCP/REST** to open the agent-facing lane — remember
+   MCP↔REST must stay 1:1 (add an operation to both planes or neither). The `verts`/`bones`/`colour`
+   halves of the §6 grammar are still unparsed for the same reason `tris` was until M9: nothing
+   stores them.
+2. Optional AI refinements: an LLM query parser (slots in behind `ParsedQuery::validate`, which exists
    precisely so a hallucinated facet gets clamped), cross-encoder rerank, glTF material textures.
-5. **Non-win-x64 ORT auto-fetch** — deliberately skipped. It can't be tested from this machine, and
+3. **Non-win-x64 ORT auto-fetch** — deliberately skipped. It can't be tested from this machine, and
    shipping platform code you can't run is how silent breakage gets in.
