@@ -4,7 +4,7 @@ Working notes for whoever (or whatever) continues the build. Unlike the rest of 
 is **not** a design spec — it's the state of play, the decisions already settled, and the traps.
 The design docs still win on any question of what the software *should* do.
 
-Last updated: **2026-07-21**, at `71b566c`.
+Last updated: **2026-07-22**, at `3845d26`.
 
 ---
 
@@ -44,6 +44,34 @@ Triangles chips, and are parseable from a query (*"under 5k tris"*, *"under 500m
 Plain-language queries are split into semantic text + structural filters before search. The whole AI
 stack is one-click installable on win-x64 (fetches the ONNX Runtime *and* both models, ~645 MB).
 
+**The agent plane is open** (P5, [`ENGINE-API.md`](ENGINE-API.md) + [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md)).
+`lodestash-api` binds an ephemeral loopback port at launch, writes `engine.json`, and serves `/v1/`
+behind a bearer token + loopback `Host`/`Origin` guard. `lodestash --mcp` runs the same operations
+over rmcp stdio. Nine operations exist on **both** planes, and a parity test fails the build if one
+plane grows a name the other lacks:
+
+| Tool / route | Note |
+|---|---|
+| `get_server_info` · `search_assets` · `get_asset` | |
+| `semantic_search` (`?mode=ai`) | 501 only while no model is loaded |
+| `get_asset_preview` | image block + `resource_link`; PNG from the grid's own thumb cache |
+| `find_similar` · `list_packages` | |
+| `export_asset` · `get_job_status` · `cancel_job` | **side-effecting**, see below |
+
+Both planes call the *same* `ServerState` methods the REST handlers call — that is what makes the 1:1
+rule structural rather than a convention. `GET /v1/assets/{id}/file` stays REST-only by design.
+
+**Side-effecting ops are gated on the human.** `export_asset` returns a job in state
+`awaiting_approval` and copies nothing until someone approves the desktop modal (UI-SPEC §11.6b);
+denial cancels it permanently. `dest_path` must be absolute, `..`-free, and outside every library
+source root. This is MCP-AND-ENGINES §5 ("confirm server-side, don't rely on the client's
+human-in-the-loop") made literal — keep it that way for every mutating op that follows.
+
+**This machine's catalog is embedded** (2026-07-22): 1983 SigLIP vectors (1723 `model_3d`, 260
+`image`) + 84 CLAP vectors, from ~2274 assets. The 207 rows still `embedding_dirty` are `.mat`
+materials — there is no material renderer yet, so they legitimately have nothing to encode and will
+drain themselves once one exists.
+
 ---
 
 ## 3. Settled decisions — don't re-litigate
@@ -62,6 +90,12 @@ Each is recorded with rationale in [`TECH-STACK.md`](TECH-STACK.md) §7 and the 
   connection, after the grid sync. Do not add a second writer thread.
 - **`media_type` stays a 7-value enum** — a data-model invariant. The UI's 4 category buckets map onto
   it; they are not a replacement.
+- **No job engine until something long-running needs it** — and now that `export_asset` does, it is
+  in `lodestash-api::jobs`: in-memory, atomics, cooperative cancel. Resist adding job *persistence*
+  or a priority queue before an operation actually demands them.
+- **The agent planes share one ops layer.** Adding an operation means adding a `ServerState` method
+  plus a route plus a tool plus a row in `AGENT_OPERATIONS`. Skipping the last one fails the parity
+  test, which is the point.
 - **Separate, non-comparable vector spaces.** SigLIP (768-d visual) and CLAP (512-d audio) are searched
   independently and fused on *rank* by RRF — comparing raw scores across models is meaningless.
   `hybrid_search` therefore takes `spaces: &[(model_id, query_vec)]`.
@@ -87,6 +121,12 @@ cargo test -p lodestash-ai   --test siglip_multiview -- --ignored --nocapture  #
 cargo test -p lodestash-ai   --test clap_audio       -- --ignored --nocapture  # audio matrix
 cargo test -p lodestash-core perf_probe              -- --ignored --nocapture  # KNN scaling
 ```
+
+**Embedding only drains where a writer already is.** The drains live on the persist thread (single-writer
+rule), so a *hydrate* — the fast path when the catalog already knows the library — used to skip them
+entirely, and a library catalogued before the models arrived would never encode. `spawn_backlog_drain`
+now runs them after a hydrate, taking the same writer slot. If you add a third path that opens the
+catalog for writing, it must respect that slot too.
 
 To get the artifacts: run the app and use **Settings ▸ AI ▸ Download** (sources are in
 `crates/lodestash-ui/src/models.rs`). They install to the OS data dir under
@@ -133,6 +173,14 @@ fixture.
   even when another window covers it; `CopyFromScreen` captures whatever is on top, which in this
   setup is usually the terminal. Screenshot coordinates are window-relative *originals* — the
   images you view are downscaled, so multiply by the ratio the viewer reports before clicking.
+- **Synthetic clicks into the app are unreliable.** `PrintWindow` screenshots work every time;
+  driving the UI does not. `mouse_event` after `SetForegroundWindow` worked once and then stopped
+  (foreground lock), and `PostMessage(WM_LBUTTON*)` never landed at all. Note also that PrintWindow
+  captures the **whole window** while `GetClientRect` reports the **client area**, so image
+  coordinates are offset by the title bar (~31 px) before you convert them. When a click won't
+  land, verify the mechanism headlessly instead of burning the session on input synthesis.
+- **`cargo build` fails with "Access is denied. (os error 5)"** when the app is running — it holds
+  `lodestash.exe`. `Stop-Process -Name lodestash -Force` first. `cargo check` works regardless.
 - Git Bash maps `/tmp` to the Windows temp dir, and job-scoped env vars aren't guaranteed to persist
   between shell invocations — prefer absolute paths in long-running work.
 
@@ -142,11 +190,30 @@ fixture.
 
 Roughly by value:
 
-1. **P2 Asset Store batch unpack+ingest**, or **P5 MCP/REST** to open the agent-facing lane — remember
-   MCP↔REST must stay 1:1 (add an operation to both planes or neither). The `verts`/`bones`/`colour`
-   halves of the §6 grammar are still unparsed for the same reason `tris` was until M9: nothing
-   stores them.
-2. Optional AI refinements: an LLM query parser (slots in behind `ParsedQuery::validate`, which exists
-   precisely so a hallucinated facet gets clamped), cross-encoder rerank, glTF material textures.
-3. **Non-win-x64 ORT auto-fetch** — deliberately skipped. It can't be tested from this machine, and
+1. **P3 status lifecycle** (`discovered → indexed → identified → confirmed`,
+   [`DATA-MODEL.md`](DATA-MODEL.md) §8). Everything currently reads *Unidentified* and the health
+   meter is pinned at 0, which is the UI telling a lie about a library that now has 2067 embeddings.
+   Small state machine, disproportionate effect.
+2. **P5 remainder — the Unity round-trip**: `register_project` → `/v1/import` → import queue →
+   plugin ack → `import_record` ([`ENGINE-API.md`](ENGINE-API.md) §5). The job engine and the
+   approval gate already exist to carry it. The UPM C# plugin is the big piece and cannot be
+   verified without a Unity install.
+3. **P2 dependency closure.** Until the `.meta` GUID graph is harvested, `export_asset` silently
+   omits an asset's materials and textures — it reports `dependencies_included: false`, but that is
+   the sharpest edge currently shipped.
+4. **P4 tagging.** Unblocks Traits, tag filter chips, `AssetSummary.tags`, pack-stats TAGS, and the
+   accept/reject flow. Ollama is installed on this machine (`qwen3:8b`, text-only); a vision tagger
+   would want `moondream` (~1.7 GB) or `qwen2.5vl:3b` (~3 GB) — the 4–6 GB VRAM tier of
+   [`AI-MODELS-BY-GPU.md`](AI-MODELS-BY-GPU.md). Note the machine is AMD (RX 6750 XT): no CUDA, and
+   the bundled ORT is the **CPU** build. DirectML would need a different runtime dll — see the
+   version warning in §4 before trying.
+5. Optional AI refinements: an LLM query parser (slots in behind `ParsedQuery::validate`),
+   cross-encoder rerank, glTF material textures.
+6. **Non-win-x64 ORT auto-fetch** — deliberately skipped. It can't be tested from this machine, and
    shipping platform code you can't run is how silent breakage gets in.
+
+Known gaps that are *recorded* rather than hidden — see the interim-status notes in
+[`ENGINE-API.md`](ENGINE-API.md) §2: `AssetSummary.tags` is always `[]`, `Package` has no
+`license`/`version`, `AssetDetail` carries only `size_bytes` + `stats`, the MCP per-tool allow-list
+(UI-SPEC §16) is still a scaffold so every tool is live when the server runs, and job state is
+in-memory (a crash loses the queue, never the catalog).
