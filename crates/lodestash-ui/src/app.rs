@@ -242,6 +242,9 @@ type AssetIdentityMaps = Vec<(
 struct CatalogSynced {
     generation: u64,
     counts: Option<StatusCounts>,
+    /// True for a backlog drain, which computes no counts — `None` there means "nothing to
+    /// report", not the persist failure it means everywhere else.
+    drain_only: bool,
     /// The read path: per source root, `rel_path → (asset id, status)` for every live
     /// catalog row, joined onto the in-memory entries on receipt.
     assets: AssetIdentityMaps,
@@ -872,6 +875,18 @@ impl LodestashApp {
             // approval prompt rather than wait for the user to jiggle the mouse.
             let repaint_ctx = cc.egui_ctx.clone();
             state.set_wake(Box::new(move || repaint_ctx.request_repaint()));
+            // Same embedders the grid's Search-with-AI uses, so the agent plane ranks
+            // identically instead of running a second, subtly different pipeline.
+            let (visual, audio) = (app.ai_embedder.clone(), app.audio_embedder.clone());
+            if visual.is_some() || audio.is_some() {
+                state.set_query_embedder(Box::new(move |q: &str| {
+                    [visual.as_ref(), audio.as_ref()]
+                        .into_iter()
+                        .flatten()
+                        .map(|e| (e.model_id().to_string(), e.embed_text(q)))
+                        .collect()
+                }));
+            }
             app.engine = Some(handshake);
             app.engine_state = Some(state);
         }
@@ -1189,6 +1204,10 @@ impl LodestashApp {
             self.last_row_start = usize::MAX;
             self.last_row_end = 0;
             tracing::info!(entries = self.entries.len(), "hydrated grid from catalog");
+            // A hydrate skips the persist thread, and the embed/metric drains live inside it —
+            // so a library that was catalogued before the AI models arrived would never encode.
+            // Drain the backlog directly instead of waiting for the next rescan.
+            self.spawn_backlog_drain();
         }
     }
 
@@ -1277,6 +1296,47 @@ impl LodestashApp {
     /// a dedicated thread — the only catalog writer (single-writer rule, ARCHITECTURE
     /// §5). The grid keeps rendering from memory; the thread reports per-status counts
     /// back so the health meter and STATUS facet show catalog truth.
+    /// Encode whatever the catalog still has queued (facets + embeddings), without a scan.
+    /// Takes the same writer slot as the persist thread — never both at once (DATA-MODEL §1
+    /// single writer), so this no-ops while a persist is in flight and retries on the next
+    /// hydrate.
+    fn spawn_backlog_drain(&mut self) {
+        if self.catalog_persisting {
+            return;
+        }
+        let Some(db_path) = catalog_db_path() else {
+            return;
+        };
+        let embedder = self.ai_embedder.clone();
+        let audio_embedder = self.audio_embedder.clone();
+        let workspace_dir = self.workspace_dir.clone();
+        let generation = self.scan_generation;
+        let tx = self.catalog_tx.clone();
+        self.catalog_persisting = true;
+
+        std::thread::spawn(move || {
+            match Catalog::open(&db_path) {
+                Ok(mut cat) => {
+                    drain_metrics(&mut cat, workspace_dir.as_deref());
+                    if let Some(emb) = embedder {
+                        drain_image_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
+                    }
+                    if let Some(emb) = audio_embedder {
+                        drain_audio_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
+                    }
+                }
+                Err(e) => tracing::warn!(%e, "backlog drain: catalog unavailable"),
+            }
+            // Counts are unchanged by a drain; the message just clears the in-flight flag.
+            let _ = tx.send(CatalogSynced {
+                generation,
+                drain_only: true,
+                counts: None,
+                assets: Vec::new(),
+            });
+        });
+    }
+
     fn spawn_catalog_persist(&mut self) {
         let Some(db_path) = catalog_db_path() else {
             return;
@@ -1328,6 +1388,7 @@ impl LodestashApp {
             // Send even on failure so the in-flight flag always clears.
             let _ = tx.send(CatalogSynced {
                 generation,
+                drain_only: false,
                 counts,
                 assets,
             });
@@ -1430,6 +1491,7 @@ impl LodestashApp {
             };
             let _ = tx.send(CatalogSynced {
                 generation,
+                drain_only: false,
                 counts,
                 assets,
             });
@@ -1585,6 +1647,7 @@ impl LodestashApp {
             };
             let _ = tx.send(CatalogSynced {
                 generation,
+                drain_only: false,
                 counts,
                 assets: Vec::new(),
             });
@@ -1630,6 +1693,7 @@ impl LodestashApp {
             }
             let _ = tx.send(CatalogSynced {
                 generation,
+                drain_only: false,
                 counts: None,
                 assets: Vec::new(),
             });
@@ -1769,6 +1833,7 @@ impl LodestashApp {
             self.unity_packages = None;
             match msg.counts {
                 Some(counts) => self.catalog_counts = Some(counts),
+                None if msg.drain_only => {}
                 // The persist thread already logged the error; surface it honestly.
                 None => self.jobs.toast(
                     "Catalog sync failed — changes not persisted",

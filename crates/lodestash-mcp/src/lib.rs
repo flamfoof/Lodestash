@@ -108,6 +108,32 @@ impl Lodestash {
         Ok(CallToolResult::success(vec![ContentBlock::json(json)?]))
     }
 
+    /// Natural-language search over the visual/audio embedding index.
+    #[tool(
+        name = "semantic_search",
+        description = "Find assets by description (\"mossy stone wall\", \"metallic clang\").                        Ranks by meaning, not filename. Errors if no embedding model is loaded."
+    )]
+    pub async fn semantic_search(
+        &self,
+        Parameters(args): Parameters<SearchArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let limit = args.limit.unwrap_or(25).clamp(1, 200);
+        match self
+            .state
+            .semantic_search(&args.query, limit, args.media_type.as_deref())
+        {
+            Some(Ok(rows)) => {
+                let json: Vec<_> = rows.iter().map(lodestash_api::summary_json).collect();
+                Ok(CallToolResult::success(vec![ContentBlock::json(json)?]))
+            }
+            Some(Err(e)) => Err(internal(e)),
+            None => Err(ErrorData::internal_error(
+                "no embedding model is loaded; download the AI models in Lodestash's settings",
+                None,
+            )),
+        }
+    }
+
     /// One asset's full record.
     #[tool(
         name = "get_asset",

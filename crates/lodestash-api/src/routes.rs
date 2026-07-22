@@ -113,15 +113,22 @@ struct SearchParams {
 }
 
 async fn search(State(state): State<Shared>, Query(p): Query<SearchParams>) -> Response {
-    if p.mode.as_deref() == Some("ai") {
-        return err(
-            StatusCode::NOT_IMPLEMENTED,
-            "ai_unavailable",
-            "Semantic search is not served on this plane yet.",
-            "Use the default structural mode.",
-        );
-    }
     let limit = p.limit.unwrap_or(50).clamp(1, 500);
+    if p.mode.as_deref() == Some("ai") {
+        return match state.semantic_search(&p.q, limit, p.media_type.as_deref()) {
+            Some(Ok(rows)) => {
+                let out: Vec<Value> = rows.iter().map(summary_json).collect();
+                Json(json!({ "results": out })).into_response()
+            }
+            Some(Err(e)) => db_err(e),
+            None => err(
+                StatusCode::NOT_IMPLEMENTED,
+                "ai_unavailable",
+                "No embedding model is loaded.",
+                "Download the AI models in Settings, then retry.",
+            ),
+        };
+    }
     // ponytail: blocking sqlite on the async thread — these are indexed point queries; move to
     // spawn_blocking if a slow route ever shows up in a trace.
     let rows = match state.search(&p.q, limit, p.media_type.as_deref()) {

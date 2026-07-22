@@ -26,6 +26,7 @@ pub use routes::{package_json, router, summary_json};
 pub const AGENT_OPERATIONS: &[(&str, &str)] = &[
     ("get_server_info", "GET /v1/server-info"),
     ("search_assets", "GET /v1/search"),
+    ("semantic_search", "GET /v1/search?mode=ai"),
     ("get_asset", "GET /v1/assets/{id}"),
     ("get_asset_preview", "GET /v1/assets/{id}/preview"),
     ("find_similar", "GET /v1/assets/{id}/similar"),
@@ -38,6 +39,11 @@ pub const AGENT_OPERATIONS: &[(&str, &str)] = &[
 /// Resolves an asset's source file to a cached preview PNG, generating it on a miss.
 pub type PreviewFn = Box<dyn Fn(&Path) -> Option<PathBuf> + Send + Sync>;
 
+/// Encodes a natural-language query into every vector space the library has, as
+/// `(model_id, vector)` pairs — SigLIP for visuals, CLAP for audio. Supplied by the caller so
+/// this crate stays model-free; empty (or absent) means semantic search is unavailable.
+pub type QueryEmbedFn = Box<dyn Fn(&str) -> Vec<(String, Vec<f32>)> + Send + Sync>;
+
 /// What a handler needs to answer a request. The API owns its **own** catalog connection
 /// (read-only queries) so it never contends with the UI's single writer — DATA-MODEL §1.
 pub struct ServerState {
@@ -48,6 +54,9 @@ pub struct ServerState {
     /// Supplied by the caller because the thumbnail cache layout — and, for audio, the decoder —
     /// live outside this crate.
     preview: PreviewFn,
+    /// `None` until the desktop app has an embedder loaded — `search(.., ai)` then answers
+    /// `ai_unavailable` rather than silently degrading to keyword matching.
+    query_embed: Mutex<Option<QueryEmbedFn>>,
     token: String,
     /// Approved-or-not export requests, keyed by job id. Held apart from the job itself so the
     /// job record stays a pure status object.
@@ -68,6 +77,7 @@ impl ServerState {
             jobs: jobs::Jobs::default(),
             workspace_dir,
             preview,
+            query_embed: Mutex::new(None),
             token: new_token(),
             pending_exports: Mutex::new(std::collections::HashMap::new()),
             wake: Mutex::new(None),
@@ -76,6 +86,44 @@ impl ServerState {
 
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// Wire the query encoder (the GUI does this once its embedders load).
+    pub fn set_query_embedder(&self, f: QueryEmbedFn) {
+        *self.query_embed.lock().unwrap() = Some(f);
+    }
+
+    pub fn semantic_available(&self) -> bool {
+        self.query_embed.lock().unwrap().is_some()
+    }
+
+    /// Semantic search (ENGINE-API §2 `semantic_search`, `GET /v1/search?mode=ai`): embed the
+    /// query into each space and fuse BM25 + per-space KNN with RRF — the same
+    /// `Catalog::hybrid_search` the desktop grid runs, so both surfaces rank identically.
+    /// `None` when no embedder is loaded.
+    pub fn semantic_search(
+        &self,
+        query: &str,
+        limit: usize,
+        media_type: Option<&str>,
+    ) -> Option<lodestash_core::error::Result<Vec<AssetSummaryRow>>> {
+        let spaces = (self.query_embed.lock().unwrap().as_ref()?)(query);
+        if spaces.is_empty() {
+            return None;
+        }
+        Some((|| {
+            let cat = self.catalog.lock().unwrap();
+            let media_id = match media_type {
+                Some(code) => cat.media_type_id(code)?,
+                None => None,
+            };
+            let borrowed: Vec<(&str, &[f32])> = spaces
+                .iter()
+                .map(|(m, v)| (m.as_str(), v.as_slice()))
+                .collect();
+            let ids = cat.hybrid_search(query, &borrowed, media_id, limit)?;
+            cat.asset_summaries(&ids)
+        })())
     }
 
     /// Register the "something needs the user's attention" callback (the GUI's repaint).
