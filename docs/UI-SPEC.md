@@ -480,6 +480,11 @@ sub-line `<engine> · imports sync to <dest> as you stage them`; enable toggle (
 items queue). Plus: **Confirm before moving to Trash** toggle; **Show the first-run setup screen**
 toggle (binds `skip_onboarding`, same flag as §1).
 
+**Shipped (interim).** The card shows what actually exists: `Listening on 127.0.0.1:<port> · API v1`
+with a **Copy** button for the session token (the manual-paste flow of ENGINE-API §1), or
+"Not listening" when the server couldn't start. The project/bridge status row and the two toggles
+arrive with project registration (ENGINE-API §5).
+
 ---
 
 ## 12. Stub screens

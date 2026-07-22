@@ -2887,6 +2887,7 @@ dependencies = [
  "flate2",
  "image",
  "lodestash-ai",
+ "lodestash-api",
  "lodestash-core",
  "lodestash-ingest",
  "proptest",

@@ -159,7 +159,12 @@ async fn asset_detail(State(state): State<Shared>, Path(id): Path<i64>) -> Respo
 }
 
 async fn preview(State(state): State<Shared>, Path(id): Path<i64>) -> Response {
-    match (state.preview)(id) {
+    let row = match lookup(&state, id) {
+        Ok(Some(row)) => row,
+        Ok(None) => return not_found(),
+        Err(e) => return db_err(e),
+    };
+    match source_path(&state, &row).and_then(|p| (state.preview)(&p)) {
         Some(path) => serve_file(&path, "image/png").await,
         None => not_found(),
     }

@@ -669,6 +669,9 @@ pub struct LodestashApp {
     /// Where extracted package payloads are stored, content-addressed (None if the OS cache dir
     /// is unavailable).
     workspace_dir: Option<PathBuf>,
+    /// The loopback engine API's handshake (port + token), once it's listening (ENGINE-API §1).
+    /// `None` when the port or the handshake file couldn't be taken — the GUI works regardless.
+    engine: Option<lodestash_api::Handshake>,
     /// The ⚑ Filters content filter (trait / triangles / file-size). Transient. Design §3.
     content_filter: ContentFilter,
     /// Top-bar search mode (UI-SPEC §0.1). AI is a stub until P3/P4.
@@ -853,6 +856,10 @@ impl LodestashApp {
             onboarding_open: show_onboarding,
             jobs: Jobs::default(),
             scan_job: None,
+            engine: start_engine_api(
+                dirs::cache_dir().map(|d| d.join("Lodestash").join("thumbs")),
+                dirs::cache_dir().map(|d| d.join("Lodestash").join("workspace")),
+            ),
             config,
         };
 
@@ -4105,11 +4112,41 @@ impl LodestashApp {
                                 .color(theme::TEXT_DIM),
                             );
                         });
+                        let engine = self.engine.clone();
                         settings_card(ui, "ENGINE BRIDGE", |ui| {
+                            match &engine {
+                                // ENGINE-API §1: the GUI shows port/token for the manual paste
+                                // flow, for editors that can't read engine.json themselves.
+                                Some(h) => {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "Listening on 127.0.0.1:{}  -  API {}",
+                                            h.port, h.api_version
+                                        ))
+                                        .size(11.0)
+                                        .color(theme::TEXT),
+                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new("Token").size(11.0).color(theme::TEXT_DIM),
+                                        );
+                                        if ui.small_button("Copy").clicked() {
+                                            ui.output_mut(|o| o.copied_text = h.token.clone());
+                                        }
+                                    });
+                                }
+                                None => {
+                                    ui.label(
+                                        RichText::new("Not listening (no catalog or port).")
+                                            .size(11.0)
+                                            .color(theme::TEXT_DIM),
+                                    );
+                                }
+                            }
                             ui.label(
                                 RichText::new(
-                                    "Live-sync to the active Unity project + confirm-before-Trash. \
-                                     Planned (ENGINE-API.md).",
+                                    "Read routes only; import into the open Unity project is \
+                                     planned (ENGINE-API.md).",
                                 )
                                 .size(11.0)
                                 .color(theme::TEXT_DIM),
@@ -6920,6 +6957,44 @@ fn logo_diamond(ui: &mut Ui) {
 
 /// The single on-disk catalog location: `<OS data dir>/Lodestash/catalog.db`
 /// (DATA-MODEL §1 — one SQLite file). None if the platform has no data dir.
+/// Start the loopback `/v1/` API (ENGINE-API §1). Best-effort: a failure here costs the plugin
+/// bridge, not the app, so it logs and returns `None`.
+fn start_engine_api(
+    thumb_cache_dir: Option<PathBuf>,
+    workspace_dir: Option<PathBuf>,
+) -> Option<lodestash_api::Handshake> {
+    let db = catalog_db_path()?;
+    let ws = workspace_dir.clone().unwrap_or_default();
+    let preview = move |path: &std::path::Path| -> Option<PathBuf> {
+        let dir = thumb_cache_dir.as_deref()?;
+        let meta = std::fs::metadata(path).ok()?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs() as i64);
+        let key = thumb::meta_key(path, meta.len(), mtime);
+        let params = thumb::ThumbParams {
+            width: 256,
+            height: 256,
+        };
+        if detect::by_extension(path) == Some(MediaType::Audio) {
+            thumb::generate_waveform(dir, &key, params, |bars| {
+                crate::audio::load_waveform(path, bars).map(|m| m.peaks)
+            })
+            .ok()
+        } else {
+            thumb::generate(path, dir, &key, params).ok()
+        }
+    };
+    let state = lodestash_api::ServerState::new(&db, ws, Box::new(preview))
+        .map_err(|e| tracing::warn!(%e, "engine API: catalog unavailable"))
+        .ok()?;
+    lodestash_api::serve(std::sync::Arc::new(state))
+        .map_err(|e| tracing::warn!(%e, "engine API did not start"))
+        .ok()
+}
+
 fn catalog_db_path() -> Option<PathBuf> {
     let dir = dirs::data_dir()?.join("Lodestash");
     std::fs::create_dir_all(&dir).ok()?;
