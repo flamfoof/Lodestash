@@ -97,6 +97,13 @@ in-editor import (§5). Both reuse the **same dependency-closure resolution** de
 > plugin↔core plumbing, not operations an LLM should call. No *agent* operation is missing from
 > either plane.
 
+> **Implementation status (interim).** The read routes exist; nothing else does yet. Until the
+> remaining slices land: `GET /v1/search?mode=ai` answers `501 ai_unavailable`, `AssetSummary.tags`
+> is always `[]` (tagging is P4) and `package` carries `{id, name}` without `publisher`, and
+> `AssetDetail` extends the summary with `size_bytes` + `stats` only — `description`, `files`,
+> `collections`, `license`, `dependencies` and `imported_in` arrive with the features that populate
+> them. Clients should treat missing fields as "not known yet", never as "empty".
+
 ---
 
 ## 3. Canonical entity shapes (defined here, referenced by MCP)

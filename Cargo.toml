@@ -57,6 +57,10 @@ flate2     = "1"
 tar        = "0.4"
 serde_yaml = "0.9"
 
+# Agent plane (ENGINE-API) — loopback HTTP/JSON server.
+axum       = "0.8"
+tower      = { version = "0.5", features = ["util"] }
+
 # UI
 # eframe runs the Glow renderer (TECH-STACK §7) — the wgpu backend is not compiled.
 eframe = "0.29"

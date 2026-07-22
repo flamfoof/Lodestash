@@ -184,7 +184,7 @@ impl Catalog {
         Ok(catalog)
     }
 
-    fn schema_version(&self) -> Result<u32> {
+    pub fn schema_version(&self) -> Result<u32> {
         self.conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|e| CoreError::Catalog(format!("user_version query: {e}")))
