@@ -7,6 +7,7 @@ pub mod crawler;
 pub mod detect;
 pub mod melspec;
 pub mod mesh;
+pub mod metrics;
 pub mod raster;
 pub mod render3d;
 pub mod thumb;

@@ -90,6 +90,9 @@ struct AssetEntry {
     trashed: bool,
     /// 1..=5 stars; None = unrated (DATA-MODEL §12).
     rating: Option<u8>,
+    /// Technical facets extracted from the file (DATA-MODEL §14); all-None until the
+    /// extraction drain has reached this asset.
+    metrics: lodestash_core::catalog::AssetMetrics,
     texture: Option<TextureHandle>,
     thumb_spawned: bool,
 }
@@ -222,7 +225,16 @@ struct HydrateDone {
 /// Per-root asset identity maps: root → (rel_path → (asset id, status)).
 type AssetIdentityMaps = Vec<(
     String,
-    std::collections::HashMap<String, (i64, AssetStatus, bool, Option<u8>)>,
+    std::collections::HashMap<
+        String,
+        (
+            i64,
+            AssetStatus,
+            bool,
+            Option<u8>,
+            lodestash_core::catalog::AssetMetrics,
+        ),
+    >,
 )>;
 
 /// Result of the write-behind catalog persist that follows every finished scan.
@@ -1089,6 +1101,7 @@ impl LodestashApp {
                             status: AssetStatus::from_code(&row.status)?,
                             trashed: row.trashed,
                             rating: row.rating,
+                            metrics: row.metrics,
                             texture: None,
                             thumb_spawned: false,
                         })
@@ -1119,6 +1132,7 @@ impl LodestashApp {
                             status,
                             trashed: row.asset.trashed,
                             rating: row.asset.rating,
+                            metrics: row.asset.metrics,
                             texture: None,
                             thumb_spawned: false,
                         });
@@ -1157,13 +1171,19 @@ impl LodestashApp {
             // the workspace. Keep them across rescans instead of silently dropping them.
             let (kept, rest): (Vec<AssetEntry>, Vec<AssetEntry>) =
                 self.entries.drain(..).partition(|e| e.package.is_some());
-            type Carried = (Option<i64>, AssetStatus, bool, Option<u8>);
+            type Carried = (
+                Option<i64>,
+                AssetStatus,
+                bool,
+                Option<u8>,
+                lodestash_core::catalog::AssetMetrics,
+            );
             let carry: std::collections::HashMap<(usize, PathBuf), Carried> = rest
                 .into_iter()
                 .map(|e| {
                     (
                         (e.source_idx, e.file.rel_path),
-                        (e.asset_id, e.status, e.trashed, e.rating),
+                        (e.asset_id, e.status, e.trashed, e.rating, e.metrics),
                     )
                 })
                 .collect();
@@ -1171,10 +1191,16 @@ impl LodestashApp {
                 .entries
                 .into_iter()
                 .map(|(source_idx, f)| {
-                    let (asset_id, status, trashed, rating) = carry
+                    let (asset_id, status, trashed, rating, metrics) = carry
                         .get(&(source_idx, f.rel_path.clone()))
                         .copied()
-                        .unwrap_or((None, AssetStatus::Discovered, false, None));
+                        .unwrap_or((
+                            None,
+                            AssetStatus::Discovered,
+                            false,
+                            None,
+                            Default::default(),
+                        ));
                     AssetEntry {
                         package: None,
                         file: f,
@@ -1183,6 +1209,7 @@ impl LodestashApp {
                         status,
                         trashed,
                         rating,
+                        metrics,
                         texture: None,
                         thumb_spawned: false,
                     }
@@ -1265,6 +1292,7 @@ impl LodestashApp {
             // (still the sole writer). Runs *after* the grid gets its identity, so a large
             // first scan doesn't stall the UI on inference. Search-with-AI needs these.
             if let Some(mut cat) = catalog {
+                drain_metrics(&mut cat, workspace_dir.as_deref());
                 if let Some(emb) = embedder {
                     drain_image_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
                 }
@@ -1365,6 +1393,7 @@ impl LodestashApp {
             // Embed the freshly-extracted images now, while their files are guaranteed present in
             // the workspace (same sole-writer connection).
             if let Some(mut cat) = catalog {
+                drain_metrics(&mut cat, workspace_dir.as_deref());
                 if let Some(emb) = embedder {
                     drain_image_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
                 }
@@ -1726,11 +1755,12 @@ impl LodestashApp {
                     continue;
                 };
                 let rel = entry.file.rel_path.to_string_lossy().replace('\\', "/");
-                if let Some(&(id, status, trashed, rating)) = map.get(&rel) {
+                if let Some(&(id, status, trashed, rating, metrics)) = map.get(&rel) {
                     entry.asset_id = Some(id);
                     entry.status = status;
                     entry.trashed = trashed;
                     entry.rating = rating;
+                    entry.metrics = metrics;
                 }
             }
             // Statuses/trash flags may have changed what the grid and tabs show.
@@ -1912,6 +1942,7 @@ impl LodestashApp {
                     status: AssetStatus::Discovered,
                     trashed: false,
                     rating: None,
+                    metrics: Default::default(),
                     texture: None,
                     thumb_spawned: false,
                 });
@@ -2342,7 +2373,7 @@ impl LodestashApp {
             idxs.retain(|&i| {
                 cf.passes(
                     entries[i].file.size_bytes,
-                    None,
+                    entries[i].metrics.tri_count.map(|t| t.max(0) as u32),
                     entries[i].rating,
                     &[],
                     tiers,
@@ -4919,6 +4950,7 @@ impl eframe::App for LodestashApp {
                                     file,
                                     entry.status,
                                     entry.rating,
+                                    entry.metrics,
                                     entry.texture.as_ref(),
                                     library.as_deref(),
                                 ) {
@@ -6627,6 +6659,69 @@ fn drain_audio_embeddings(
 /// Failures store a zero vector — which cosine-scores 0, so it never matches — solely to clear
 /// `embedding_dirty` and guarantee forward progress (no infinite re-query of a bad file).
 /// Audio still awaits its own encoder (CLAP).
+/// Extract technical facets (tri counts, dimensions, duration) for the rows `record_crawl` marked
+/// `metrics_dirty` (DATA-MODEL §14). Runs on the persist thread's own connection like the embedding
+/// drains, but unconditionally — facets are plain measurements and must not depend on the AI stack
+/// being installed. A file we can't measure still gets its flag cleared (forward progress).
+fn drain_metrics(cat: &mut Catalog, workspace_dir: Option<&std::path::Path>) {
+    const BATCH: usize = 64;
+    let mut total = 0usize;
+    loop {
+        let jobs = match cat.assets_needing_metrics(BATCH) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(%e, "metrics queue query failed; retries next scan");
+                break;
+            }
+        };
+        if jobs.is_empty() {
+            break;
+        }
+        let n = jobs.len();
+        for job in jobs {
+            let path = match (&job.disk_path, &job.workspace_rel) {
+                (Some(p), _) => Some(std::path::PathBuf::from(p)),
+                (None, Some(rel)) => workspace_dir.map(|w| w.join(rel)),
+                _ => None,
+            };
+            let metrics = path
+                .as_deref()
+                .map(|p| {
+                    if job.media_code == "audio" {
+                        lodestash_core::catalog::AssetMetrics {
+                            duration_ms: audio_duration_ms(p),
+                            ..Default::default()
+                        }
+                    } else {
+                        lodestash_ingest::metrics::extract(p, &job.media_code)
+                    }
+                })
+                .unwrap_or_default();
+            if let Err(e) = cat.set_metrics(job.asset_id, metrics) {
+                tracing::warn!(%e, "set_metrics failed; stopping metrics drain");
+                return;
+            }
+            total += 1;
+        }
+        if n < BATCH {
+            break;
+        }
+    }
+    if total > 0 {
+        tracing::info!(measured = total, "technical facets extracted");
+    }
+}
+
+/// Clip length via the decoder the player already uses. `total_duration` answers from the header
+/// for WAV/FLAC; formats that can't (some MP3s) report `None`, which stays "unknown" rather than
+/// paying for a full decode just to fill a stat row.
+fn audio_duration_ms(path: &std::path::Path) -> Option<i64> {
+    use rodio::Source;
+    let file = std::fs::File::open(path).ok()?;
+    let dec = rodio::Decoder::new(std::io::BufReader::new(file)).ok()?;
+    Some(dec.total_duration()?.as_millis() as i64)
+}
+
 fn drain_image_embeddings(
     cat: &mut Catalog,
     emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync),
@@ -6812,7 +6907,7 @@ fn read_back_assets(
                 .into_iter()
                 .filter_map(|a| {
                     AssetStatus::from_code(&a.status)
-                        .map(|s| (a.rel_path, (a.asset_id, s, a.trashed, a.rating)))
+                        .map(|s| (a.rel_path, (a.asset_id, s, a.trashed, a.rating, a.metrics)))
                 })
                 .collect();
             Ok((root.clone(), map))
@@ -7159,18 +7254,22 @@ fn filter_popover(ui: &mut Ui, cf: &mut ContentFilter, tiers: &SizeTiers) -> boo
     );
     ui.add_space(6.0);
 
-    // TRIANGLES — no tri-count data pre-catalog (P1); shown disabled.
+    // TRIANGLES — backed by asset.tri_count (DATA-MODEL §14), extracted after each scan.
     section_label(ui, "TRIANGLES");
-    ui.add_enabled_ui(false, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            for b in TriBucket::ALL {
-                let sel = cf.tri_buckets.contains(&b);
-                let _ = filter_chip(ui, b.label(), sel, theme::TYPE_MODEL);
+    ui.horizontal_wrapped(|ui| {
+        for b in TriBucket::ALL {
+            let sel = cf.tri_buckets.contains(&b);
+            if filter_chip(ui, b.label(), sel, theme::TYPE_MODEL) {
+                if sel {
+                    cf.tri_buckets.remove(&b);
+                } else {
+                    cf.tri_buckets.insert(b);
+                }
             }
-        });
+        }
     });
     ui.label(
-        RichText::new("Available once 3D metadata is extracted.")
+        RichText::new("Models only \u{2014} counts appear as assets are measured.")
             .size(10.0)
             .color(theme::TEXT_DIM),
     );
@@ -7334,6 +7433,7 @@ fn inspector_pane(
     file: &CrawledFile,
     status: AssetStatus,
     rating: Option<u8>,
+    metrics: lodestash_core::catalog::AssetMetrics,
     texture: Option<&TextureHandle>,
     library: Option<&str>,
 ) -> Option<Option<u8>> {
@@ -7388,6 +7488,17 @@ fn inspector_pane(
                     .unwrap_or_default(),
             );
             stat_row(ui, "Size", &format_bytes(file.size_bytes));
+            // Technical facets (DATA-MODEL §14) — a row only appears once measured; NULL is
+            // "unknown", so an absent row never reads as zero.
+            if let (Some(w), Some(h)) = (metrics.width_px, metrics.height_px) {
+                stat_row(ui, "Dimensions", &format!("{w} \u{00D7} {h}"));
+            }
+            if let Some(tris) = metrics.tri_count {
+                stat_row(ui, "Triangles", &format_thousands(tris));
+            }
+            if let Some(ms) = metrics.duration_ms {
+                stat_row(ui, "Duration", &crate::audio::fmt_time(ms as f32 / 1000.0));
+            }
             stat_row(ui, "Modified", &format_mtime(file.mtime));
             // Status row — user-facing terms fold discovered|indexed (DATA-MODEL §8).
             let (term, color) = if status.is_unidentified() {
@@ -7446,6 +7557,23 @@ fn stat_row(ui: &mut Ui, label: &str, value: &str) {
     ui.label(RichText::new(label).color(theme::TEXT_DIM).size(11.0));
     ui.add(egui::Label::new(RichText::new(value).color(theme::TEXT).size(11.0)).truncate());
     ui.end_row();
+}
+
+/// `12345` -> `12,345`. Triangle counts are the only place the UI shows a raw count big enough
+/// to need grouping.
+fn format_thousands(n: i64) -> String {
+    let digits = n.abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    if n < 0 {
+        return format!("-{out}");
+    }
+    out
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -8255,9 +8383,18 @@ mod tests {
             status: AssetStatus::Discovered,
             trashed: false,
             rating: None,
+            metrics: Default::default(),
             texture: None,
             thumb_spawned: false,
         }
+    }
+
+    #[test]
+    fn triangle_counts_are_grouped_for_display() {
+        assert_eq!(format_thousands(7), "7");
+        assert_eq!(format_thousands(999), "999");
+        assert_eq!(format_thousands(1000), "1,000");
+        assert_eq!(format_thousands(1234567), "1,234,567");
     }
 
     #[test]
@@ -8343,6 +8480,7 @@ mod tests {
             status: AssetStatus::Discovered,
             trashed: false,
             rating: None,
+            metrics: Default::default(),
             texture: None,
             thumb_spawned: false,
         }

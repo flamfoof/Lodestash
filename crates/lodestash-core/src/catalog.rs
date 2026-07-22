@@ -1367,7 +1367,7 @@ impl Catalog {
         self.conn
             .execute(
                 "UPDATE asset SET tri_count = ?2, width_px = ?3, height_px = ?4,
-                                  duration_ms = ?5, metrics_dirty = 1
+                                  duration_ms = ?5, metrics_dirty = 0
                  WHERE id = ?1",
                 params![
                     asset_id,
