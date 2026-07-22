@@ -2823,6 +2823,12 @@ impl LodestashApp {
         if !self.store_scanned {
             self.refresh_store_cache();
         }
+        // Packs extracted in an earlier session have catalog rows but no entries yet; the
+        // listing is how their counts survive a restart. Same lazily-loaded list the Unity
+        // Assets screen uses.
+        if self.unity_packages.is_none() {
+            self.reload_unity_packages();
+        }
 
         ui.label(
             RichText::new("Packages")
@@ -2963,6 +2969,13 @@ impl LodestashApp {
             // Taken out of `self` for the closure, which also borrows `self.store_packages`.
             let mut selected = std::mem::take(&mut self.store_selected);
             let counts = self.package_asset_counts();
+            let catalog_counts: std::collections::HashMap<&str, i64> = self
+                .unity_packages
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|p| Some((p.package_path.as_str(), p.asset_count?)))
+                .collect();
             ScrollArea::vertical().show(ui, |ui| {
                 for run in publisher_runs(&self.store_packages) {
                     let pkgs = &self.store_packages[run];
@@ -3093,14 +3106,25 @@ impl LodestashApp {
                                                 );
                                             }
                                             None => {
+                                                // No entries in memory: the pack was extracted
+                                                // in an earlier session, so fall back to the
+                                                // count the catalog recorded then.
+                                                let stored = catalog_counts
+                                                    .get(pkg.path.to_string_lossy().as_ref())
+                                                    .copied();
+                                                let label = match (self.scanning, stored) {
+                                                    (true, _) => "scanning\u{2026}".to_string(),
+                                                    (false, Some(n)) => {
+                                                        format!("\u{2713} {n} assets")
+                                                    }
+                                                    (false, None) => {
+                                                        "\u{2713} extracted".to_string()
+                                                    }
+                                                };
                                                 ui.label(
-                                                    RichText::new(if self.scanning {
-                                                        "scanning\u{2026}"
-                                                    } else {
-                                                        "\u{2713} extracted"
-                                                    })
-                                                    .color(theme::TEXT_DIM)
-                                                    .size(10.0),
+                                                    RichText::new(label)
+                                                        .color(theme::TEXT_DIM)
+                                                        .size(10.0),
                                                 );
                                             }
                                         },
