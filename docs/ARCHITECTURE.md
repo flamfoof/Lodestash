@@ -247,8 +247,9 @@ lodestash/
 │  ├─ lodestash-ai/        # Tagger/Embedder traits + ONNX/Ollama/cloud impls
 │  ├─ lodestash-mcp/       # rmcp server over lodestash-core
 │  ├─ lodestash-api/       # loopback HTTP/JSON API over lodestash-core
-│  ├─ lodestash-ui/        # egui/eframe app + 3D/audio/image preview
-│  └─ lodestash-cli/       # headless ops (scan/index/tag) for power users & CI
+│  └─ lodestash-ui/        # egui/eframe app + 3D/audio/image preview
+│                          #   (lodestash-cli — headless ops for power users & CI — is planned;
+│                          #    the crate lands with the first CLI command, not before)
 ├─ sidecar/
 │  └─ unitypy/          # optional Python UnityPy extractor (bundled)
 ├─ plugins/

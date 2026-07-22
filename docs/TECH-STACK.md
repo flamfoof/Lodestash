@@ -22,8 +22,8 @@ flagged.
 | `lodestash-ai` | Tagger/Embedder traits + impls | `ort` (ONNX Runtime; CUDA/DirectML/CPU EPs) — alt `candle`/`fastembed`, `tokenizers`, `ndarray`, `reqwest` (Ollama + cloud HTTP), `whisper-rs` (speech), `image` (preprocess) |
 | `lodestash-ui` | egui app + 3D/audio/image preview | `eframe`/`egui` + **`egui_glow`** (OpenGL renderer — see §7), `three-d` + `three-d-asset` (3D viewport; glow-lockstep with eframe, §7), `rodio` (+ `symphonia`) audio, `egui_extras` (`svg` feature — resvg; renders the sidebar nav icons, tinted per row state) + `egui_plot` (waveform), `rfd` (file dialogs), `poll-promise` (async UI) |
 | `lodestash-mcp` | MCP server | `rmcp` **2.2** (official Rust MCP SDK; features `server, macros, transport-io, schemars`), `schemars` (tool JSON Schema from the arg structs), `base64` (image content blocks), `tokio`, `serde_json` |
-| `lodestash-api` | loopback HTTP/JSON | `axum` + `tower`/`tower-http` (limits, CORS-off), `tokio`, `serde_json` |
-| `lodestash-cli` | headless ops (scan/index/tag) | `clap`, `lodestash-core` |
+| `lodestash-api` | loopback HTTP/JSON | `axum`, `tokio`, `serde_json`, `uuid` (session token), `dirs` (handshake path); `tower` is a dev-dependency for `oneshot` route tests. `tower-http` limits/tracing arrive with the mutating routes. |
+| `lodestash-cli` *(planned)* | headless ops (scan/index/tag) | `clap`, `lodestash-core`. **Not a crate yet** — an empty skeleton was carrying seven unused dependencies, so it was removed until a real command exists. |
 | **shared** | — | `serde`, `serde_json`, `thiserror`, `anyhow`, `tracing`+`tracing-subscriber`, `tokio`, `rayon`, `uuid`, `blake3` |
 
 ---
@@ -98,7 +98,7 @@ non-trivial (a branch, a parser, a ranking, a money/security/provenance path) le
 | `lodestash-ai` | tag normalization + confidence thresholding; per-modality `local\|api` routing; trait contracts via **mock** impls | unit (mocks) |
 | `lodestash-mcp` + `lodestash-api` | **the MCP↔REST 1:1 invariant is a test** — assert the tool set and the endpoint set are identical (fails CI if one plane gains an op the other lacks); request/response schema snapshots; handshake-token rejection | `insta` + a shared op-registry test |
 | `lodestash-ui` | pure helpers only: `rebuild_cache` sort/filter order, `thumbnail_grid` column math, lookahead-window index range; **not** rendering | unit |
-| `lodestash-cli` | scan a fixture dir → assert JSON output shape | unit (calls core lib directly) |
+| `lodestash-cli` *(planned)* | scan a fixture dir → assert JSON output shape | unit (calls core lib directly) |
 
 **Regression corpus** (`tests/corpus/`, committed): tiny real samples — a few-KB `.unitypackage`
 (GUID folders + `.meta` with `labels:` and GUID refs), a BCn `.dds`, an `.fbx`, a `.wav`, a `.psd`,

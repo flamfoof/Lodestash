@@ -1175,29 +1175,6 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("pkg entries commit: {e}")))
     }
 
-    /// All recorded payload locations of a package, GUID-ordered.
-    pub fn entries_for_package(&self, package_id: i64) -> Result<Vec<PackageEntryRecord>> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT guid, pathname, tar_offset, size_bytes
-                 FROM package_entry WHERE package_id = ?1 ORDER BY guid",
-            )
-            .map_err(|e| CoreError::Catalog(format!("pkg entries prep: {e}")))?;
-        let rows = stmt
-            .query_map(params![package_id], |r| {
-                Ok(PackageEntryRecord {
-                    guid: r.get(0)?,
-                    pathname: r.get(1)?,
-                    tar_offset: r.get(2)?,
-                    size_bytes: r.get(3)?,
-                })
-            })
-            .map_err(|e| CoreError::Catalog(format!("pkg entries query: {e}")))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| CoreError::Catalog(format!("pkg entries row: {e}")))
-    }
-
     /// Pin/unpin a package as a sidebar library (M7; FEATURES.md §5.5 Add to Library).
     pub fn set_package_pinned(&self, package_id: i64, pinned: bool) -> Result<()> {
         self.conn
@@ -2285,7 +2262,27 @@ mod tests {
         let mut updated = entries.clone();
         updated[1].tar_offset = Some(9000);
         c.record_package_entries(pid, &updated).expect("upsert");
-        let got = c.entries_for_package(pid).expect("read");
+        // Read back inline: nothing in the app reads entries per package, so the query lives
+        // here rather than as a pub method with one test caller.
+        let mut stmt = c
+            .conn
+            .prepare(
+                "SELECT guid, pathname, tar_offset, size_bytes
+                 FROM package_entry WHERE package_id = ?1 ORDER BY guid",
+            )
+            .expect("prep");
+        let got: Vec<PackageEntryRecord> = stmt
+            .query_map(params![pid], |r| {
+                Ok(PackageEntryRecord {
+                    guid: r.get(0)?,
+                    pathname: r.get(1)?,
+                    tar_offset: r.get(2)?,
+                    size_bytes: r.get(3)?,
+                })
+            })
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect();
         assert_eq!(got, updated, "guid-keyed upsert, guid-ordered read");
     }
 

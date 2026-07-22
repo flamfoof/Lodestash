@@ -12,9 +12,6 @@ description = "MCP server (rmcp, stdio) — 1:1 with the loopback REST surface"
 lodestash-core = { workspace = true }
 serde          = { workspace = true }
 serde_json     = { workspace = true }
-thiserror      = { workspace = true }
-tracing        = { workspace = true }
-tokio          = { workspace = true }
 lodestash-api  = { workspace = true }
 rmcp           = { workspace = true }
 schemars       = { workspace = true }

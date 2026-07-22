@@ -6,7 +6,6 @@ members = [
     "crates/lodestash-mcp",
     "crates/lodestash-api",
     "crates/lodestash-ui",
-    "crates/lodestash-cli",
 ]
 resolver = "2"
 

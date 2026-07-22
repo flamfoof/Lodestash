@@ -4382,6 +4382,15 @@ fn type_key(e: &AssetEntry) -> u8 {
     e.file.media_type.map(|m| m as u8).unwrap_or(255)
 }
 
+/// Apply the sort direction. Every arm of [`sort_indices`] ends in this.
+fn dir(o: std::cmp::Ordering, asc: bool) -> std::cmp::Ordering {
+    if asc {
+        o
+    } else {
+        o.reverse()
+    }
+}
+
 /// Sort `idxs` (indices into `entries`) in place per the view/sort toolbar's `sort_by`/`asc`.
 /// Name pre-computes keys once (decorate-sort-undecorate) since `name_key` allocates —
 /// worth avoiding at O(n log n) comparisons on 10k+ entry libraries.
@@ -4416,62 +4425,37 @@ fn sort_indices(
                     (None, Some(_)) => std::cmp::Ordering::Greater,
                     (None, None) => na.cmp(nb),
                 };
-                if asc {
-                    o
-                } else {
-                    o.reverse()
-                }
+                dir(o, asc)
             });
             *idxs = paired.into_iter().map(|(i, _)| i).collect();
         }
         SortBy::Name => {
             let keys: Vec<String> = idxs.iter().map(|&i| name_key(&entries[i])).collect();
             let mut paired: Vec<(usize, usize)> = idxs.iter().copied().zip(0..).collect();
-            paired.sort_by(|&(_, ka), &(_, kb)| {
-                let o = keys[ka].cmp(&keys[kb]);
-                if asc {
-                    o
-                } else {
-                    o.reverse()
-                }
-            });
+            paired.sort_by(|&(_, ka), &(_, kb)| dir(keys[ka].cmp(&keys[kb]), asc));
             *idxs = paired.into_iter().map(|(i, _)| i).collect();
         }
-        SortBy::Type => idxs.sort_by(|&a, &b| {
-            let o = type_key(&entries[a]).cmp(&type_key(&entries[b]));
-            if asc {
-                o
-            } else {
-                o.reverse()
-            }
-        }),
+        SortBy::Type => {
+            idxs.sort_by(|&a, &b| dir(type_key(&entries[a]).cmp(&type_key(&entries[b])), asc))
+        }
         SortBy::Size => idxs.sort_by(|&a, &b| {
-            let o = entries[a].file.size_bytes.cmp(&entries[b].file.size_bytes);
-            if asc {
-                o
-            } else {
-                o.reverse()
-            }
+            dir(
+                entries[a].file.size_bytes.cmp(&entries[b].file.size_bytes),
+                asc,
+            )
         }),
-        SortBy::Modified => idxs.sort_by(|&a, &b| {
-            let o = entries[a].file.mtime.cmp(&entries[b].file.mtime);
-            if asc {
-                o
-            } else {
-                o.reverse()
-            }
-        }),
+        SortBy::Modified => {
+            idxs.sort_by(|&a, &b| dir(entries[a].file.mtime.cmp(&entries[b].file.mtime), asc))
+        }
         // Unrated sorts as 0 so rated assets lead when descending (the common use).
         SortBy::Rating => idxs.sort_by(|&a, &b| {
-            let o = entries[a]
-                .rating
-                .unwrap_or(0)
-                .cmp(&entries[b].rating.unwrap_or(0));
-            if asc {
-                o
-            } else {
-                o.reverse()
-            }
+            dir(
+                entries[a]
+                    .rating
+                    .unwrap_or(0)
+                    .cmp(&entries[b].rating.unwrap_or(0)),
+                asc,
+            )
         }),
     }
 }
@@ -4538,6 +4522,14 @@ fn keep_range(row_start: usize, row_end: usize, cols: usize, len: usize) -> (usi
 // ── eframe::App ───────────────────────────────────────────────────────────────
 
 impl eframe::App for LodestashApp {
+    /// Clean shutdown removes the handshake file (ENGINE-API §1) — the port dies with the
+    /// process, so leaving `engine.json` behind makes every client probe a dead pid first.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.engine.is_some() {
+            lodestash_api::handshake::remove_handshake();
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_hydrate();
         self.receive_scan();

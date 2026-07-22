@@ -10,9 +10,6 @@ description = "Tagger/Embedder traits and impls (ONNX, Ollama, cloud Claude)"
 
 [dependencies]
 lodestash-core = { workspace = true }
-serde          = { workspace = true }
-serde_json     = { workspace = true }
-thiserror      = { workspace = true }
 tracing        = { workspace = true }
 tokio          = { workspace = true }
 
