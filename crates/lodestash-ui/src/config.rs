@@ -123,6 +123,7 @@ pub enum ViewMode {
     #[default]
     Flat,
     Folders,
+    List,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,6 +304,18 @@ fn default_true() -> bool {
     true
 }
 
+fn default_preview_cache_cap_gb() -> u32 {
+    8
+}
+
+fn default_workspace_cache_cap_gb() -> u32 {
+    10
+}
+
+fn default_workspace_cache_retention_days() -> u32 {
+    7
+}
+
 fn default_volume() -> f32 {
     0.5
 }
@@ -335,6 +348,19 @@ pub struct AppConfig {
     /// the retention policy, so re-enabling brings them back without re-extracting.
     #[serde(default)]
     pub cache_extracted: bool,
+    /// Preview (thumbnail/embedding) cache cap in gigabytes (UI-SPEC §5.5). Auto-purge drops
+    /// least-recently-viewed previews when the cache exceeds this cap.
+    #[serde(default = "default_preview_cache_cap_gb")]
+    pub preview_cache_cap_gb: u32,
+    /// Drop least-recently-viewed previews when the preview cache grows past the cap.
+    #[serde(default = "default_true")]
+    pub auto_purge_preview_cache: bool,
+    /// Extracted-archive workspace cap in gigabytes (UI-SPEC §5.5).
+    #[serde(default = "default_workspace_cache_cap_gb")]
+    pub workspace_cache_cap_gb: u32,
+    /// Age (days) after which extracted workspace files are eligible for purge.
+    #[serde(default = "default_workspace_cache_retention_days")]
+    pub workspace_cache_retention_days: u32,
     /// User-added Asset Store cache roots, checked after `ASSETSTORE_CACHE_PATH` and the
     /// per-OS default (INGESTION.md §2 discovery order; UI-SPEC §4).
     #[serde(default)]
@@ -346,6 +372,10 @@ pub struct AppConfig {
     /// the rescan only fires while the library is idle, never mid-selection.
     #[serde(default = "default_true")]
     pub watch_sources: bool,
+    /// Show a confirmation dialog before moving assets to Trash (UI-SPEC §11.6).
+    /// On by default; trashed files are recoverable, but the shortcut is noisy.
+    #[serde(default = "default_true")]
+    pub confirm_before_trash: bool,
     /// Ollama model used for local tagging (AI-PIPELINE §2). `None` = tagging off — the drain is
     /// hours of CPU on a real library, so it never starts unasked.
     #[serde(default)]
@@ -368,9 +398,14 @@ impl Default for AppConfig {
             preview_quality: PreviewQuality::default(),
             skip_onboarding: false,
             cache_extracted: false,
+            preview_cache_cap_gb: default_preview_cache_cap_gb(),
+            auto_purge_preview_cache: true,
+            workspace_cache_cap_gb: default_workspace_cache_cap_gb(),
+            workspace_cache_retention_days: default_workspace_cache_retention_days(),
             asset_store_roots: Vec::new(),
             volume: default_volume(),
             watch_sources: true,
+            confirm_before_trash: true,
             tagger_model: None,
             tagger_vision_model: None,
         }

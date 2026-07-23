@@ -40,7 +40,9 @@ serving in `lodestash-api` (REST) and `lodestash-mcp` (MCP) — **REST and MCP s
   | ♪ Sounds | `audio` |
   | ▦ Images | `image`, `texture`, `sprite`, `font` |
 - **Project chip** (right) — shows the active Unity export target; click opens the **Project switcher**
-  (§7.1). Followed by a **`✦ local · RTX 4070`** chip advertising on-device inference.
+  (§7.1). Followed by a **`✦ local · <detected GPU>`** chip advertising on-device inference — the
+  device name is **detected at runtime** (GL renderer string / adapter info), never hardcoded; it
+  reads `✦ local · CPU` when no discrete GPU is in use.
 
 ### 0.3 Sidebar (left rail)
 - **Nav list** (`navItems`): Library, Identify (badge = unidentified count), Collections, Packages,

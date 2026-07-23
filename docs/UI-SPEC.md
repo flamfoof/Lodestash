@@ -126,6 +126,10 @@ made them a thing you reach *for* (a material is what carries an export's textur
 *(The earlier second-row Library tabs are gone — the sidebar LIBRARIES facet group (§0.2) absorbed
 the per-source filter.)*
 
+**⚑ Filters ▸ FAVOURITES** — a single *Favourites only* chip (DATA-MODEL §12). One-way: nobody
+browses for "things I did not favourite". Cards carry a heart top-left, opposite the size tier;
+`F` toggles the pin on the selection (or the lead card).
+
 ### 0.4 Keyboard map (global)
 
 | Key | Context | Action |

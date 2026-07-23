@@ -98,6 +98,8 @@ struct AssetEntry {
     /// Technical facets extracted from the file (DATA-MODEL §14); all-None until the
     /// extraction drain has reached this asset.
     metrics: lodestash_core::catalog::AssetMetrics,
+    /// BLAKE3 hash of the primary file; exact-dedup key for the Duplicates badge.
+    content_hash: Option<String>,
     texture: Option<TextureHandle>,
     thumb_spawned: bool,
 }
@@ -230,7 +232,7 @@ struct HydrateDone {
     extracted: Vec<(usize, Vec<lodestash_core::catalog::HydratedExtracted>)>,
 }
 
-/// Per-root asset identity maps: root → (rel_path → (asset id, status)).
+/// Per-root asset identity maps: root → (rel_path → (asset id, status, content_hash)).
 type AssetIdentityMaps = Vec<(
     String,
     std::collections::HashMap<
@@ -241,6 +243,7 @@ type AssetIdentityMaps = Vec<(
             bool,
             Option<u8>,
             lodestash_core::catalog::AssetMetrics,
+            Option<String>,
         ),
     >,
 )>;
@@ -305,6 +308,9 @@ const CARD_LABEL: f32 = 36.0;
 const CARD_PAD: f32 = 8.0;
 pub const THUMB_MIN: f32 = 64.0;
 pub const THUMB_MAX: f32 = 256.0;
+/// Row height and thumbnail size for the list/table view.
+const LIST_ROW_HEIGHT: f32 = 38.0;
+const LIST_THUMB_SIZE: f32 = 28.0;
 /// Floor for the proportional prefetch window (half the viewport each side),
 /// so tiny windows still get some lookahead.
 const LOOKAHEAD_ROWS_MIN: usize = 2;
@@ -371,6 +377,9 @@ struct ContentFilter {
     min_rating: Option<u8>,
     /// Dependency-graph constraint (DATA-MODEL §10 "Search"). None = no constraint.
     link: Option<LinkFilter>,
+    /// Show only favourites (DATA-MODEL §12). A one-way switch: "not favourited" is not a thing
+    /// anyone browses for.
+    favorites_only: bool,
     trait_search: String,
 }
 
@@ -403,6 +412,7 @@ impl ContentFilter {
             + self.sizes.len()
             + usize::from(self.min_rating.is_some())
             + usize::from(self.link.is_some())
+            + usize::from(self.favorites_only)
     }
 
     fn any_active(&self) -> bool {
@@ -416,6 +426,7 @@ impl ContentFilter {
         self.sizes.clear();
         self.min_rating = None;
         self.link = None;
+        self.favorites_only = false;
         self.trait_search.clear();
     }
 
@@ -431,8 +442,12 @@ impl ContentFilter {
         rating: Option<u8>,
         traits: &[String],
         links: (bool, bool),
+        favorite: bool,
         tiers: &SizeTiers,
     ) -> bool {
+        if self.favorites_only && !favorite {
+            return false;
+        }
         let (has_dependencies, has_dependents) = links;
         match self.link {
             Some(LinkFilter::HasDependencies) if !has_dependencies => return false,
@@ -645,6 +660,10 @@ pub struct LodestashApp {
     /// Material asset id → the absolute path of the texture its preview sphere wears, resolved
     /// from the dependency graph (DATA-MODEL §10). Refreshed per catalog sync with the tag maps.
     material_albedo: std::collections::HashMap<i64, String>,
+    /// Favourited asset ids (DATA-MODEL §12). A set beside the entries, like the tag and edge
+    /// maps: entries outlive any single catalog read, and a favourite toggles far more often than
+    /// the grid rebuilds.
+    favorites: std::collections::HashSet<i64>,
     /// Asset ids with at least one resolved outbound / inbound dependency edge (DATA-MODEL §10).
     /// Reloaded on every catalog sync; drives the grid's link badge and the LINKS filter chips.
     /// Sets rather than a per-entry flag — the grid's entries outlive any single catalog read.
@@ -817,9 +836,19 @@ pub struct LodestashApp {
     source_info_rx: Receiver<Vec<lodestash_core::catalog::SourceInfo>>,
     source_info_tx: Sender<Vec<lodestash_core::catalog::SourceInfo>>,
     source_info_pending: bool,
-    /// Per-source actions collected in Settings and applied after render.
-    pending_rescan: Option<usize>,
-    pending_watch_toggle: Option<(usize, bool)>,
+    /// Cached (thumbnail, workspace) cache sizes in bytes for the Storage caps card.
+    storage_size: Option<(u64, u64)>,
+    storage_size_rx: Option<Receiver<(u64, u64)>>,
+    /// Pending destructive-action confirmations (entry indices).
+    pending_confirm_trash: Option<Vec<usize>>,
+    pending_delete_from_disk: Option<Vec<usize>>,
+    /// Number of exact content_hash duplicate groups (size >= 2) among live entries;
+    /// drives the Duplicates nav badge.
+    duplicate_groups: usize,
+    /// Drag-select state for marquee selection over the grid/list.
+    drag_select_start: Option<egui::Pos2>,
+    drag_select_current: Option<egui::Pos2>,
+    drag_select_active: bool,
 }
 
 impl LodestashApp {
@@ -851,6 +880,7 @@ impl LodestashApp {
             project_name: None,
             search: String::new(),
             search_catalog: catalog_db_path().and_then(|p| Catalog::open(&p).ok()),
+            favorites: std::collections::HashSet::new(),
             asset_tags: std::collections::HashMap::new(),
             tag_usage: Vec::new(),
             material_albedo: std::collections::HashMap::new(),
@@ -952,8 +982,14 @@ impl LodestashApp {
             source_info_rx,
             source_info_tx,
             source_info_pending: false,
-            pending_rescan: None,
-            pending_watch_toggle: None,
+            storage_size: None,
+            storage_size_rx: None,
+            pending_confirm_trash: None,
+            pending_delete_from_disk: None,
+            duplicate_groups: 0,
+            drag_select_start: None,
+            drag_select_current: None,
+            drag_select_active: false,
             config,
         };
 
@@ -1221,6 +1257,90 @@ impl LodestashApp {
         ctx.request_repaint();
     }
 
+    /// Rescan a single source root in the background, merging its results into the existing
+    /// grid instead of replacing everything (ScanDone::partial).
+    fn rescan_source(&mut self, ctx: &egui::Context, source_idx: usize) {
+        let Some(root) = self.scan_roots.get(source_idx).cloned() else {
+            return;
+        };
+        let excludes = self
+            .project_name
+            .as_deref()
+            .map(|p| self.config.source_excludes(p, &root))
+            .unwrap_or_default();
+
+        self.start_watching();
+        self.scan_generation += 1;
+        self.scanning = true;
+        if let Some(id) = self.scan_job.take() {
+            self.jobs.finish(id);
+        }
+        self.scan_job = Some(self.jobs.start(
+            format!("Rescanning {}", config::stem_name(&root)),
+            Arc::default(),
+            true,
+        ));
+        let generation = self.scan_generation;
+        let tx = self.scan_tx.clone();
+        std::thread::spawn(move || {
+            let mut entries = Vec::new();
+            let mut pending_packages = Vec::new();
+            for file in crawler::crawl(&root, &excludes) {
+                if is_unitypackage(&file.abs_path) {
+                    if let Some(pkg) = resolve_pending_package(source_idx, &file) {
+                        pending_packages.push(pkg);
+                    }
+                    continue;
+                }
+                if !is_browseable(&file) {
+                    continue;
+                }
+                entries.push((source_idx, file));
+            }
+            let _ = tx.send(ScanDone {
+                generation,
+                entries,
+                pending_packages,
+                partial: Some(source_idx),
+            });
+        });
+        ctx.request_repaint();
+    }
+
+    /// Toggle filesystem watching for one source and persist it in the catalog. Optimistically
+    /// updates the in-memory cache so the Settings row reflects the change immediately.
+    fn apply_source_watch_toggle(&mut self, ctx: &egui::Context, source_idx: usize, enabled: bool) {
+        let Some(root) = self.scan_roots.get(source_idx).cloned() else {
+            return;
+        };
+        let root_str = root.to_string_lossy().to_string();
+        if let Some(info) = self.source_infos.get_mut(&root_str) {
+            info.watch_enabled = enabled;
+        }
+        // Persist in the background and refresh the cache once the write lands.
+        let db_path = match catalog_db_path() {
+            Some(p) => p,
+            None => {
+                self.start_watching();
+                self.refresh_source_infos();
+                return;
+            }
+        };
+        std::thread::spawn(move || {
+            let _ = Catalog::open(&db_path).and_then(|c| {
+                c.source_info_by_root(&root_str).and_then(|info| {
+                    if let Some(i) = info {
+                        c.set_source_watch(i.id, enabled)?;
+                    }
+                    Ok(())
+                })
+            });
+        });
+        self.start_watching();
+        self.refresh_source_infos();
+        ctx.request_repaint();
+    }
+
     /// Apply a startup hydrate — only while the reconciling crawl is still running
     /// (a landed ScanDone is always fresher) and only for the current generation.
     fn receive_hydrate(&mut self) {
@@ -1254,6 +1374,7 @@ impl LodestashApp {
                             trashed: row.trashed,
                             rating: row.rating,
                             metrics: row.metrics,
+                            content_hash: row.content_hash.clone(),
                             texture: None,
                             thumb_spawned: false,
                         })
@@ -1285,6 +1406,7 @@ impl LodestashApp {
                             trashed: row.asset.trashed,
                             rating: row.asset.rating,
                             metrics: row.asset.metrics,
+                            content_hash: row.asset.content_hash.clone(),
                             texture: None,
                             thumb_spawned: false,
                         });
@@ -1325,37 +1447,52 @@ impl LodestashApp {
             // defaults between the crawl landing and the next persist read-back.
             // Extracted-package entries never appear in a folder crawl — they live in
             // the workspace. Keep them across rescans instead of silently dropping them.
-            let (kept, rest): (Vec<AssetEntry>, Vec<AssetEntry>) =
-                self.entries.drain(..).partition(|e| e.package.is_some());
+            let partial = msg.partial;
+            let (kept, rest): (Vec<AssetEntry>, Vec<AssetEntry>) = if let Some(sidx) = partial {
+                self.entries
+                    .drain(..)
+                    .partition(|e| e.package.is_some() || e.source_idx != sidx)
+            } else {
+                self.entries.drain(..).partition(|e| e.package.is_some())
+            };
             type Carried = (
                 Option<i64>,
                 AssetStatus,
                 bool,
                 Option<u8>,
                 lodestash_core::catalog::AssetMetrics,
+                Option<String>,
             );
             let carry: std::collections::HashMap<(usize, PathBuf), Carried> = rest
                 .into_iter()
                 .map(|e| {
                     (
                         (e.source_idx, e.file.rel_path),
-                        (e.asset_id, e.status, e.trashed, e.rating, e.metrics),
+                        (
+                            e.asset_id,
+                            e.status,
+                            e.trashed,
+                            e.rating,
+                            e.metrics,
+                            e.content_hash,
+                        ),
                     )
                 })
                 .collect();
-            self.entries = msg
+            let new_entries: Vec<AssetEntry> = msg
                 .entries
                 .into_iter()
                 .map(|(source_idx, f)| {
-                    let (asset_id, status, trashed, rating, metrics) = carry
+                    let (asset_id, status, trashed, rating, metrics, content_hash) = carry
                         .get(&(source_idx, f.rel_path.clone()))
-                        .copied()
+                        .cloned()
                         .unwrap_or((
                             None,
                             AssetStatus::Discovered,
                             false,
                             None,
                             Default::default(),
+                            None,
                         ));
                     AssetEntry {
                         package: None,
@@ -1366,14 +1503,21 @@ impl LodestashApp {
                         trashed,
                         rating,
                         metrics,
+                        content_hash,
                         texture: None,
                         thumb_spawned: false,
                     }
                 })
                 .collect();
-            self.entries.extend(kept);
-            self.pending_packages = msg.pending_packages;
-            // Entries were rebuilt — old entry indices are meaningless.
+            self.entries = kept;
+            self.entries.extend(new_entries);
+            if let Some(sidx) = partial {
+                self.pending_packages.retain(|p| p.source_idx != sidx);
+                self.pending_packages.extend(msg.pending_packages);
+            } else {
+                self.pending_packages = msg.pending_packages;
+            }
+            // Entry indices changed; reset selection.
             self.selected.clear();
             self.select_anchor = None;
             self.current_dir = self.default_dir();
@@ -1420,6 +1564,10 @@ impl LodestashApp {
         match cat.tag_usage(60) {
             Ok(v) => self.tag_usage = v,
             Err(e) => tracing::warn!(%e, "tag vocabulary unavailable"),
+        }
+        match cat.favorite_ids() {
+            Ok(ids) => self.favorites = ids.into_iter().collect(),
+            Err(e) => tracing::warn!(%e, "favorites unavailable"),
         }
         match cat.material_albedo_paths() {
             Ok(map) => {
@@ -1836,6 +1984,7 @@ impl LodestashApp {
     }
 
     /// Tab-bar counts over the live (non-trashed) entries.
+    /// Also recomputes exact content_hash duplicate groups for the Duplicates nav badge.
     fn recompute_tab_counts(&mut self) {
         self.tab_counts = Category::TABS
             .iter()
@@ -1846,6 +1995,47 @@ impl LodestashApp {
                     .count()
             })
             .collect();
+
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for e in self.entries.iter().filter(|e| !e.trashed) {
+            if let Some(hash) = e.content_hash.as_deref().filter(|h| !h.is_empty()) {
+                *counts.entry(hash.to_string()).or_insert(0) += 1;
+            }
+        }
+        self.duplicate_groups = counts.values().filter(|&&n| n >= 2).count();
+    }
+
+    /// Delete the original files for the given entries from disk, then keep the catalog
+    /// rows in the Trash as a record. This is the explicit danger flow; it cannot be undone.
+    /// (DESIGN-GUIDELINES.md §Settings).
+    fn delete_files_from_disk(&mut self, entry_idxs: &[usize]) {
+        let mut paths = Vec::new();
+        for &i in entry_idxs {
+            if let Some(e) = self.entries.get(i) {
+                if let Some(root) = self.scan_roots.get(e.source_idx) {
+                    let path = root.join(&e.file.rel_path);
+                    paths.push((e.asset_id, path));
+                }
+            }
+        }
+        if paths.is_empty() {
+            return;
+        }
+        self.set_entries_trashed(entry_idxs, true);
+        std::thread::spawn(move || {
+            for (_, path) in &paths {
+                if path.is_file() {
+                    let _ = std::fs::remove_file(path);
+                } else if path.is_dir() {
+                    let _ = std::fs::remove_dir_all(path);
+                }
+            }
+            for (id, _) in paths {
+                if let Some(id) = id {
+                    tracing::info!(%id, "deleted file from disk");
+                }
+            }
+        });
     }
 
     /// Move entries to / restore them from the Trash: optimistic local flip, then the
@@ -1914,6 +2104,54 @@ impl LodestashApp {
                 generation,
                 drain_only: false,
                 counts,
+                assets: Vec::new(),
+            });
+        });
+    }
+
+    /// Toggle favourite on a selection (DATA-MODEL §12). Optimistic locally, then written on the
+    /// writer thread like every other catalog mutation. If the selection is mixed, favouriting
+    /// wins: the user asked for a pin, and pinning what is already pinned is a no-op.
+    fn toggle_favorite(&mut self, entry_idxs: &[usize]) {
+        let ids: Vec<i64> = entry_idxs
+            .iter()
+            .filter_map(|&i| self.entries.get(i).and_then(|e| e.asset_id))
+            .collect();
+        if ids.is_empty() {
+            // No catalog row yet: the scan hasn't persisted this asset, so there is nothing to
+            // pin *to*. Say so rather than silently doing nothing.
+            self.jobs.toast(
+                "Not catalogued yet — favourites need the scan to finish",
+                Intent::Info,
+            );
+            return;
+        }
+        let make_favorite = !ids.iter().all(|id| self.favorites.contains(id));
+        for id in &ids {
+            if make_favorite {
+                self.favorites.insert(*id);
+            } else {
+                self.favorites.remove(id);
+            }
+        }
+        self.cache_dirty = true; // the favourites filter may include/exclude these now
+
+        let Some(db_path) = catalog_db_path() else {
+            return;
+        };
+        let generation = self.scan_generation;
+        let tx = self.catalog_tx.clone();
+        std::thread::spawn(move || {
+            let result = Catalog::open(&db_path)
+                .and_then(|c| c.set_favorite(&ids, make_favorite))
+                .map_err(|e| e.to_string());
+            if let Err(err) = result {
+                tracing::warn!(%err, "favorite update failed; local flag may diverge until next sync");
+            }
+            let _ = tx.send(CatalogSynced {
+                generation,
+                drain_only: true,
+                counts: None,
                 assets: Vec::new(),
             });
         });
@@ -2134,17 +2372,95 @@ impl LodestashApp {
                     continue;
                 };
                 let rel = entry.file.rel_path.to_string_lossy().replace('\\', "/");
-                if let Some(&(id, status, trashed, rating, metrics)) = map.get(&rel) {
+                if let Some(&(id, status, trashed, rating, metrics, ref content_hash)) =
+                    map.get(&rel)
+                {
                     entry.asset_id = Some(id);
                     entry.status = status;
                     entry.trashed = trashed;
                     entry.rating = rating;
                     entry.metrics = metrics;
+                    entry.content_hash = content_hash.clone();
                 }
             }
             // Statuses/trash flags may have changed what the grid and tabs show.
             self.recompute_tab_counts();
             self.cache_dirty = true;
+            self.refresh_source_infos();
+        }
+    }
+
+    /// Load `import_source` metadata off the main thread so the Settings Sources panel can show
+    /// live counts, watch state, and last-scanned without stalling the UI.
+    fn refresh_source_infos(&mut self) {
+        let Some(db_path) = catalog_db_path() else {
+            return;
+        };
+        if self.source_info_pending {
+            return;
+        }
+        self.source_info_pending = true;
+        let tx = self.source_info_tx.clone();
+        std::thread::spawn(move || {
+            let infos = match Catalog::open(&db_path).and_then(|c| c.source_infos()) {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!(%err, "source info load failed");
+                    Vec::new()
+                }
+            };
+            let _ = tx.send(infos);
+        });
+    }
+
+    /// Merge loaded source metadata into the cache and restart watching so per-source watch
+    /// toggles take effect immediately.
+    fn receive_source_infos(&mut self) {
+        let mut dirty = false;
+        while let Ok(infos) = self.source_info_rx.try_recv() {
+            self.source_info_pending = false;
+            let old: std::collections::HashSet<_> =
+                self.source_infos.values().map(|i| i.id).collect();
+            self.source_infos.clear();
+            for info in infos {
+                self.source_infos.insert(info.root_path.clone(), info);
+            }
+            let new: std::collections::HashSet<_> =
+                self.source_infos.values().map(|i| i.id).collect();
+            dirty = old != new
+                || self.scan_roots.iter().any(|r| {
+                    self.source_infos
+                        .get(&r.to_string_lossy().to_string())
+                        .is_some()
+                });
+        }
+        if dirty {
+            self.start_watching();
+        }
+    }
+
+    /// Kick off a background measurement of the thumbnail and workspace cache directories.
+    fn refresh_storage_size(&mut self) {
+        if self.storage_size_rx.is_some() {
+            return;
+        }
+        let (thumb_dir, ws_dir) = default_cache_dirs();
+        let (tx, rx) = mpsc::channel();
+        self.storage_size_rx = Some(rx);
+        std::thread::spawn(move || {
+            let thumb = thumb_dir.as_deref().map_or(0, dir_size);
+            let ws = ws_dir.as_deref().map_or(0, dir_size);
+            let _ = tx.send((thumb, ws));
+        });
+    }
+
+    /// Receive the latest cache-size measurement and cache it for the Settings Storage card.
+    fn receive_storage_size(&mut self) {
+        if let Some(rx) = &self.storage_size_rx {
+            if let Ok((thumb, ws)) = rx.try_recv() {
+                self.storage_size = Some((thumb, ws));
+                self.storage_size_rx = None;
+            }
         }
     }
 
@@ -2196,18 +2512,30 @@ impl LodestashApp {
 
     /// (Re)start the filesystem watch over the current source roots. Dropping the old watcher
     /// unregisters its handles, so this is also how watching stops when a project closes.
+    /// Watches only roots whose `import_source.watch_enabled` is true (UI-SPEC §11.1).
     fn start_watching(&mut self) {
         self.watcher = None;
         self.watch_dirty = false;
         if !self.config.watch_sources || self.scan_roots.is_empty() {
             return;
         }
+        let watched: Vec<PathBuf> = self
+            .scan_roots
+            .iter()
+            .filter(|r| {
+                self.source_infos
+                    .get(&r.to_string_lossy().to_string())
+                    .map_or(true, |info| info.watch_enabled)
+            })
+            .cloned()
+            .collect();
+        if watched.is_empty() {
+            return;
+        }
         // A pack landing in a cache root is hundreds of events; one second of quiet is plenty
         // to let a copy finish before we look.
-        self.watcher = lodestash_ingest::watch::watch_roots(
-            &self.scan_roots,
-            std::time::Duration::from_secs(1),
-        );
+        self.watcher =
+            lodestash_ingest::watch::watch_roots(&watched, std::time::Duration::from_secs(1));
     }
 
     /// Drain watch signals and rescan when the library is idle. Deliberately *not* immediate: a
@@ -2319,6 +2647,154 @@ impl LodestashApp {
                 state.deny_job(&job.id);
                 self.jobs
                     .toast("Denied the agent's export", Intent::Warning);
+            }
+            None => {}
+        }
+    }
+
+    /// Render destructive-action confirmation modals (Trash and delete-from-disk). These are
+    /// simple centered windows; the dangerous primary action is colored DANGER.
+    fn render_modals(&mut self, ctx: &egui::Context) {
+        // Dim the rest of the UI while any destructive confirmation is open.
+        let any_open =
+            self.pending_confirm_trash.is_some() || self.pending_delete_from_disk.is_some();
+        if any_open {
+            egui::Area::new(egui::Id::new("destructive_modal_scrim"))
+                .order(egui::Order::Middle)
+                .fixed_pos(egui::Pos2::ZERO)
+                .show(ctx, |ui| {
+                    let screen = ctx.screen_rect();
+                    ui.allocate_rect(screen, egui::Sense::hover());
+                    ui.painter()
+                        .rect_filled(screen, 0.0, theme::BG.linear_multiply(0.6));
+                });
+        }
+
+        let mut confirm_trash: Option<bool> = None;
+        if let Some(targets) = &self.pending_confirm_trash {
+            egui::Window::new("confirm_trash")
+                .title_bar(false)
+                .resizable(false)
+                .collapsible(false)
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .default_width(420.0)
+                .frame(
+                    egui::Frame::window(&ctx.style())
+                        .fill(theme::SURFACE_RAISED)
+                        .stroke(egui::Stroke::new(1.0, theme::WARNING))
+                        .inner_margin(egui::Margin::same(20.0)),
+                )
+                .show(ctx, |ui| {
+                    ui.label(
+                        RichText::new("Move to Trash?")
+                            .color(theme::TEXT)
+                            .font(crate::fonts::display(18.0)),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "{} asset(s) will be moved to Trash. Files stay on disk and can be \
+                             restored any time.",
+                            targets.len()
+                        ))
+                        .color(theme::TEXT)
+                        .size(13.0),
+                    );
+                    ui.add_space(14.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(RichText::new("Cancel").size(13.0)).clicked() {
+                            confirm_trash = Some(false);
+                        }
+                        if ui
+                            .button(
+                                RichText::new("Move to Trash")
+                                    .size(13.0)
+                                    .color(theme::WARNING),
+                            )
+                            .clicked()
+                        {
+                            confirm_trash = Some(true);
+                        }
+                    });
+                });
+        }
+        match confirm_trash {
+            Some(true) => {
+                let targets = self.pending_confirm_trash.take().unwrap_or_default();
+                self.set_entries_trashed(&targets, true);
+            }
+            Some(false) => {
+                self.pending_confirm_trash = None;
+            }
+            None => {}
+        }
+
+        let mut confirm_delete: Option<bool> = None;
+        if let Some(targets) = &self.pending_delete_from_disk {
+            egui::Window::new("confirm_delete_from_disk")
+                .title_bar(false)
+                .resizable(false)
+                .collapsible(false)
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .default_width(460.0)
+                .frame(
+                    egui::Frame::window(&ctx.style())
+                        .fill(theme::SURFACE_RAISED)
+                        .stroke(egui::Stroke::new(2.0, theme::DANGER))
+                        .inner_margin(egui::Margin::same(20.0)),
+                )
+                .show(ctx, |ui| {
+                    ui.label(
+                        RichText::new("Delete file from disk?")
+                            .color(theme::DANGER)
+                            .font(crate::fonts::display(18.0)),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "{} file(s) will be permanently deleted from your disk. This cannot be \
+                             undone and breaks the non-destructive default.",
+                            targets.len()
+                        ))
+                        .color(theme::TEXT)
+                        .size(13.0),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "The catalog entry will remain in Trash as a record, but restoring it \
+                             will not bring the file back.",
+                        )
+                        .color(theme::TEXT_DIM)
+                        .size(11.0),
+                    );
+                    ui.add_space(14.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(RichText::new("Cancel").size(13.0)).clicked() {
+                            confirm_delete = Some(false);
+                        }
+                        if ui
+                            .button(
+                                RichText::new("Delete from disk")
+                                    .size(13.0)
+                                    .color(theme::DANGER),
+                            )
+                            .clicked()
+                        {
+                            confirm_delete = Some(true);
+                        }
+                    });
+                });
+        }
+        match confirm_delete {
+            Some(true) => {
+                let targets = self.pending_delete_from_disk.take().unwrap_or_default();
+                self.delete_files_from_disk(&targets);
+            }
+            Some(false) => {
+                self.pending_delete_from_disk = None;
             }
             None => {}
         }
@@ -2661,6 +3137,7 @@ impl LodestashApp {
                     trashed: false,
                     rating: None,
                     metrics: Default::default(),
+                    content_hash: None,
                     texture: None,
                     thumb_spawned: false,
                 });
@@ -3008,7 +3485,7 @@ impl LodestashApp {
 
         let (mut idxs, tiles): (Vec<usize>, Vec<(String, usize)>) =
             match (self.view_mode, self.current_dir.clone()) {
-                (ViewMode::Flat, _) => {
+                (ViewMode::Flat, _) | (ViewMode::List, _) => {
                     let filter = self.source_filter.clone();
                     let idxs = self
                         .entries
@@ -3090,6 +3567,7 @@ impl LodestashApp {
             // No trait/tri data pre-catalog → None/&[]; wire real values when P1/P4 land.
             let (edges_out, edges_in) = (&self.edges_out, &self.edges_in);
             let asset_tags = &self.asset_tags;
+            let favorites = &self.favorites;
             idxs.retain(|&i| {
                 let id = entries[i].asset_id;
                 let links = (
@@ -3106,6 +3584,7 @@ impl LodestashApp {
                     entries[i].rating,
                     &traits,
                     links,
+                    id.is_some_and(|id| favorites.contains(&id)),
                     tiers,
                 )
             });
@@ -3216,6 +3695,79 @@ impl LodestashApp {
         }
     }
 
+    /// Track pointer drag state for marquee selection over the grid/list.
+    /// On release after a real drag, selects all visible cards whose rectangles intersect
+    /// the marquee. Returns `true` if a marquee selection was just finalised, so the caller
+    /// can suppress the ordinary click for this frame.
+    fn update_drag_select(&mut self, ui: &egui::Ui, rects: &[(usize, usize, egui::Rect)]) -> bool {
+        let (pos, down, released, mods) = ui.input(|i| {
+            (
+                i.pointer.interact_pos(),
+                i.pointer.button_down(egui::PointerButton::Primary),
+                i.pointer.button_released(egui::PointerButton::Primary),
+                i.modifiers,
+            )
+        });
+
+        if down {
+            if let Some(p) = pos {
+                if self.drag_select_start.is_none() {
+                    self.drag_select_start = Some(p);
+                    self.drag_select_current = Some(p);
+                    self.drag_select_active = false;
+                } else {
+                    self.drag_select_current = Some(p);
+                    if let Some(start) = self.drag_select_start {
+                        if p.distance(start) > 4.0 {
+                            self.drag_select_active = true;
+                        }
+                    }
+                }
+            }
+        } else if released {
+            if self.drag_select_active {
+                if let (Some(start), Some(current)) =
+                    (self.drag_select_start, self.drag_select_current)
+                {
+                    let select_rect = egui::Rect::from_two_pos(start, current);
+                    let add = mods.command || mods.shift;
+                    if !add {
+                        self.selected.clear();
+                    }
+                    let mut last_cache: Option<usize> = None;
+                    for (cache_idx, entry_idx, rect) in rects {
+                        if rect.intersects(select_rect) {
+                            if add {
+                                if !self.selected.insert(*entry_idx) {
+                                    self.selected.remove(entry_idx);
+                                }
+                            } else {
+                                self.selected.insert(*entry_idx);
+                            }
+                            last_cache = Some(*cache_idx);
+                        }
+                    }
+                    if let Some(cache_idx) = last_cache {
+                        self.selected_cache_idx = Some(cache_idx);
+                        self.select_anchor = Some(cache_idx);
+                    }
+                }
+                self.drag_select_start = None;
+                self.drag_select_current = None;
+                self.drag_select_active = false;
+                return true;
+            }
+            self.drag_select_start = None;
+            self.drag_select_current = None;
+            self.drag_select_active = false;
+        } else if !self.drag_select_active {
+            self.drag_select_start = None;
+            self.drag_select_current = None;
+        }
+
+        false
+    }
+
     fn save_view_prefs(&mut self) {
         self.config.view.sort_by = self.sort_by;
         self.config.view.sort_asc = self.sort_asc;
@@ -3283,7 +3835,7 @@ impl LodestashApp {
                         let badge = match screen {
                             Screen::Identify => unidentified,
                             Screen::Trash => trashed_count,
-                            // Dup-group counts need P2 dedup; 0 hides the pill.
+                            Screen::Duplicates => self.duplicate_groups,
                             _ => 0,
                         };
                         if sidebar_nav_row(
@@ -3447,6 +3999,17 @@ impl LodestashApp {
         for custom in &self.config.asset_store_roots {
             if !roots.contains(custom) {
                 roots.push(custom.clone());
+            }
+        }
+        // A cache the user moved off the default drive is invisible to the env var and the per-OS
+        // default — but if they added a pack folder from it as a library source, they have already
+        // told us where it is. Infer it rather than making them configure the same path twice.
+        for root in &self.scan_roots {
+            if let Some(inferred) = asset_store::infer_root_from(root) {
+                if !roots.contains(&inferred) {
+                    tracing::info!(root = %inferred.display(), "inferred Asset Store cache root");
+                    roots.push(inferred);
+                }
             }
         }
         self.store_roots = roots
@@ -4084,6 +4647,7 @@ impl LodestashApp {
         }
 
         let mut restore: Option<usize> = None;
+        let mut delete_from_disk: Option<usize> = None;
         let many_sources = self.scan_roots.len() > 1;
         ScrollArea::vertical().show(ui, |ui| {
             for (row, &i) in trashed.iter().enumerate() {
@@ -4140,6 +4704,16 @@ impl LodestashApp {
                                     {
                                         restore = Some(i);
                                     }
+                                    if ui
+                                        .button(
+                                            RichText::new("\u{2716} Delete from disk")
+                                                .color(theme::DANGER)
+                                                .size(11.0),
+                                        )
+                                        .clicked()
+                                    {
+                                        delete_from_disk = Some(i);
+                                    }
                                 },
                             );
                         });
@@ -4148,6 +4722,9 @@ impl LodestashApp {
         });
         if let Some(i) = restore {
             self.set_entries_trashed(&[i], false);
+        }
+        if let Some(i) = delete_from_disk {
+            self.pending_delete_from_disk = Some(vec![i]);
         }
     }
 
@@ -4158,11 +4735,12 @@ impl LodestashApp {
         let mut watch_changed = false;
         let mut quality_changed = false;
         let mut start_dl = false;
-        // Blacklist actions collected during render, applied after (avoids borrowing self while
-        // iterating scan_roots). Each is (source_idx, exclude).
+        // Per-source actions collected during render, applied after.
         let mut toggle_expand: Option<usize> = None;
         let mut add_exclude: Option<(usize, lodestash_core::types::Exclude)> = None;
         let mut remove_exclude: Option<(usize, lodestash_core::types::Exclude)> = None;
+        let mut rescan: Option<usize> = None;
+        let mut toggle_watch: Option<(usize, bool)> = None;
 
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
@@ -4183,6 +4761,23 @@ impl LodestashApp {
 
                         // 5.1 Sources (Library) + per-source blacklist (§5.1).
                         settings_card(ui, "LIBRARY \u{00B7} SOURCES", |ui| {
+                            let mut master_watch = self.config.watch_sources;
+                            if ui
+                                .checkbox(
+                                    &mut master_watch,
+                                    RichText::new("Watch sources for changes").size(12.0),
+                                )
+                                .on_hover_text(
+                                    "Rescan automatically when files appear or change under a \
+                                     source root (DATA-MODEL \u{00A7}6). Per-source pause toggles \
+                                     below override this for each source.",
+                                )
+                                .changed()
+                            {
+                                self.config.watch_sources = master_watch;
+                                save = true;
+                                watch_changed = true;
+                            }
                             if self.scan_roots.is_empty() {
                                 ui.label(
                                     RichText::new("No sources yet \u{2014} open a folder to start.")
@@ -4197,16 +4792,46 @@ impl LodestashApp {
                                     .as_deref()
                                     .map(|p| self.config.source_excludes(p, root))
                                     .unwrap_or_default();
+                                let root_str = root.to_string_lossy().to_string();
+                                let info = self.source_infos.get(&root_str);
+                                let watch = info.map_or(true, |s| s.watch_enabled);
+                                let master_watch = self.config.watch_sources;
                                 ui.horizontal(|ui| {
                                     let (dot, p) = ui
                                         .allocate_painter(Vec2::splat(10.0), egui::Sense::hover());
-                                    p.circle_filled(dot.rect.center(), 4.0, theme::GOLD);
+                                    let dot_color = if watch && master_watch {
+                                        theme::GOLD
+                                    } else {
+                                        theme::TEXT_DIM
+                                    };
+                                    p.circle_filled(dot.rect.center(), 4.0, dot_color);
                                     ui.vertical(|ui| {
                                         ui.label(
                                             RichText::new(config::stem_name(root))
                                                 .size(13.0)
                                                 .color(theme::TEXT),
                                         );
+                                        let mut meta_parts = Vec::new();
+                                        if let Some(info) = info {
+                                            meta_parts.push(format!("{} assets", info.asset_count));
+                                            meta_parts.push(info.kind.replace('_', " "));
+                                            if let Some(ts) = info.last_scanned_at {
+                                                meta_parts.push(format!(
+                                                    "scanned {}",
+                                                    format_relative_time(ts)
+                                                ));
+                                            } else {
+                                                meta_parts.push("not scanned".into());
+                                            }
+                                        }
+                                        if !meta_parts.is_empty() {
+                                            ui.label(
+                                                RichText::new(meta_parts.join(" \u{B7} "))
+                                                    .size(10.0)
+                                                    .color(theme::TEXT_DIM)
+                                                    .monospace(),
+                                            );
+                                        }
                                         ui.label(
                                             RichText::new(root.to_string_lossy())
                                                 .size(10.0)
@@ -4234,6 +4859,31 @@ impl LodestashApp {
                                             );
                                             if btn.clicked() {
                                                 toggle_expand = Some(i);
+                                            }
+                                            // Rescan this source.
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        RichText::new("\u{21BB} rescan")
+                                                            .size(11.0)
+                                                            .color(theme::ARCANE),
+                                                    )
+                                                    .frame(false),
+                                                )
+                                                .clicked()
+                                            {
+                                                rescan = Some(i);
+                                            }
+                                            // Watch toggle per source.
+                                            let mut watch_value = watch;
+                                            if ui
+                                                .checkbox(
+                                                    &mut watch_value,
+                                                    RichText::new("watch").size(11.0),
+                                                )
+                                                .changed()
+                                            {
+                                                toggle_watch = Some((i, watch_value));
                                             }
                                         },
                                     );
@@ -4639,27 +5289,14 @@ impl LodestashApp {
                                 .color(theme::TEXT_DIM),
                             );
                         });
-                        settings_card(ui, "SOURCES", |ui| {
-                            let mut watch = self.config.watch_sources;
-                            if ui
-                                .checkbox(
-                                    &mut watch,
-                                    RichText::new("Watch sources for changes").size(12.0),
-                                )
-                                .on_hover_text(
-                                    "Rescan automatically when files appear or change under a \
-                                     source root (DATA-MODEL \u{00A7}6). The rescan waits until \
-                                     the library is idle, and never runs more than once every \
-                                     30 seconds.",
-                                )
-                                .changed()
-                            {
-                                self.config.watch_sources = watch;
-                                save = true;
-                                watch_changed = true;
-                            }
-                        });
                         settings_card(ui, "STORAGE CAPS", |ui| {
+                            // Start measuring cache directories once the Settings screen is open.
+                            if self.storage_size.is_none() && self.storage_size_rx.is_none() {
+                                self.refresh_storage_size();
+                            }
+                            let (thumb_used, ws_used) = self.storage_size.unwrap_or((0, 0));
+
+                            // Keep extracted packs cached toggle.
                             let mut cache = self.config.cache_extracted;
                             if ui
                                 .checkbox(
@@ -4676,15 +5313,180 @@ impl LodestashApp {
                                 self.config.cache_extracted = cache;
                                 save = true;
                             }
-                            ui.add_space(6.0);
-                            ui.label(
-                                RichText::new(
-                                    "Preview-cache limit + auto-purge. Planned (DESIGN-GUIDELINES.md \
-                                     \u{00A7}7 Storage).",
+                            ui.add_space(10.0);
+
+                            // Preview cache cap.
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("Preview cache limit").size(12.0).color(theme::TEXT),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{} GB",
+                                                self.config.preview_cache_cap_gb
+                                            ))
+                                            .size(12.0)
+                                            .color(theme::TEXT_DIM)
+                                            .monospace(),
+                                        );
+                                    },
+                                );
+                            });
+                            let mut preview_cap = self.config.preview_cache_cap_gb;
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut preview_cap, 1..=16)
+                                        .show_value(false)
+                                        .suffix(" GB"),
                                 )
-                                .size(11.0)
-                                .color(theme::TEXT_DIM),
+                                .changed()
+                            {
+                                self.config.preview_cache_cap_gb = preview_cap;
+                                save = true;
+                            }
+                            // Preview-cache usage bar scaled by on-screen quality.
+                            let quality_scale = match self.config.preview_quality {
+                                config::PreviewQuality::Low => 0.5,
+                                config::PreviewQuality::Medium => 1.0,
+                                config::PreviewQuality::High => 2.0,
+                            };
+                            let preview_used = (thumb_used as f64 * quality_scale) as u64;
+                            let preview_cap_bytes =
+                                self.config.preview_cache_cap_gb as u64 * (1u64 << 30);
+                            let preview_frac = if preview_cap_bytes > 0 {
+                                ((preview_used as f64 / preview_cap_bytes as f64) as f32)
+                                    .clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            };
+                            let preview_color = if preview_used > preview_cap_bytes {
+                                theme::DANGER
+                            } else if preview_used as f64
+                                > preview_cap_bytes as f64 * 0.8
+                            {
+                                theme::WARNING
+                            } else {
+                                theme::GOLD
+                            };
+                            let preview_text = if preview_frac > 0.0 || thumb_used > 0 {
+                                format!(
+                                    "{} of {} used",
+                                    format_bytes(preview_used),
+                                    format_bytes(preview_cap_bytes)
+                                )
+                            } else {
+                                "No preview cache yet".to_string()
+                            };
+                            ui.add(
+                                egui::ProgressBar::new(preview_frac)
+                                    .fill(preview_color)
+                                    .text(RichText::new(preview_text).size(11.0)),
                             );
+                            ui.add_space(6.0);
+
+                            // Auto-purge toggle.
+                            let mut auto_purge = self.config.auto_purge_preview_cache;
+                            if ui
+                                .checkbox(
+                                    &mut auto_purge,
+                                    RichText::new("Auto-purge over cap").size(12.0),
+                                )
+                                .on_hover_text(
+                                    "Drop the least-recently-viewed previews when the cache \
+                                     exceeds the cap.",
+                                )
+                                .changed()
+                            {
+                                self.config.auto_purge_preview_cache = auto_purge;
+                                save = true;
+                            }
+
+                            ui.add_space(10.0);
+                            ui.label(
+                                RichText::new("Extracted archive workspace")
+                                    .size(12.0)
+                                    .color(theme::TEXT),
+                            );
+                            // Workspace cache cap.
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("Workspace cap").size(11.0).color(theme::TEXT_MUTED),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{} GB",
+                                                self.config.workspace_cache_cap_gb
+                                            ))
+                                            .size(11.0)
+                                            .color(theme::TEXT_DIM)
+                                            .monospace(),
+                                        );
+                                    },
+                                );
+                            });
+                            let mut ws_cap = self.config.workspace_cache_cap_gb;
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut ws_cap, 1..=128)
+                                        .show_value(false)
+                                        .suffix(" GB"),
+                                )
+                                .changed()
+                            {
+                                self.config.workspace_cache_cap_gb = ws_cap;
+                                save = true;
+                            }
+                            let ws_cap_bytes =
+                                self.config.workspace_cache_cap_gb as u64 * (1u64 << 30);
+                            let ws_frac = if ws_cap_bytes > 0 {
+                                ((ws_used as f64 / ws_cap_bytes as f64) as f32).clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            };
+                            let ws_color = if ws_used > ws_cap_bytes {
+                                theme::DANGER
+                            } else if ws_used as f64 > ws_cap_bytes as f64 * 0.8 {
+                                theme::WARNING
+                            } else {
+                                theme::ARCANE
+                            };
+                            let ws_text = if ws_used > 0 {
+                                format!(
+                                    "{} of {} used",
+                                    format_bytes(ws_used),
+                                    format_bytes(ws_cap_bytes)
+                                )
+                            } else {
+                                "No extracted workspace yet".to_string()
+                            };
+                            ui.add(
+                                egui::ProgressBar::new(ws_frac)
+                                    .fill(ws_color)
+                                    .text(RichText::new(ws_text).size(11.0)),
+                            );
+                            // Retention days.
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("Retention").size(11.0).color(theme::TEXT_MUTED),
+                                );
+                                let mut retention = self.config.workspace_cache_retention_days;
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut retention, 1..=90)
+                                            .suffix(" days"),
+                                    )
+                                    .changed()
+                                {
+                                    self.config.workspace_cache_retention_days = retention;
+                                    save = true;
+                                }
+                            });
                         });
                         let engine = self.engine.clone();
                         settings_card(ui, "ENGINE BRIDGE", |ui| {
@@ -4725,6 +5527,18 @@ impl LodestashApp {
                                 .size(11.0)
                                 .color(theme::TEXT_DIM),
                             );
+                            ui.add_space(8.0);
+                            let mut confirm = self.config.confirm_before_trash;
+                            if setting_toggle(
+                                ui,
+                                "Confirm before moving to Trash",
+                                "Show a confirmation dialog before the Delete key moves assets \
+                                 to Trash. Trashed files are recoverable and stay on disk.",
+                                &mut confirm,
+                            ) {
+                                self.config.confirm_before_trash = confirm;
+                                save = true;
+                            }
                         });
                     });
                 });
@@ -4774,6 +5588,12 @@ impl LodestashApp {
         // A changed blacklist re-indexes the current library so the exclusion takes effect.
         if blacklist_changed {
             self.load_paths(ctx, self.scan_roots.clone(), self.project_name.clone());
+        }
+        if let Some(i) = rescan {
+            self.rescan_source(ctx, i);
+        }
+        if let Some((i, enabled)) = toggle_watch {
+            self.apply_source_watch_toggle(ctx, i, enabled);
         }
     }
 
@@ -5124,7 +5944,10 @@ impl eframe::App for LodestashApp {
         self.poll_watch(ctx);
         self.pack_stats_modal(ctx);
         self.agent_approval_modal(ctx);
+        self.render_modals(ctx);
         self.receive_catalog();
+        self.receive_source_infos();
+        self.receive_storage_size();
         self.receive_model_download();
         self.receive_viewer(ctx);
         // Tray ✕ on the scan row: the crawl thread finishes harmlessly (read-only) and
@@ -5225,8 +6048,6 @@ impl eframe::App for LodestashApp {
                 self.selected = self.sorted_cache.iter().copied().collect();
             }
             // Del: move the selection (or the lead card) to the Trash (design §9).
-            // ponytail: no confirm modal — Trash is catalog-only and restorable; the
-            // §11.6 confirm-before-Trash toggle arrives with the Settings backend.
             if self.screen == Screen::Library && ctx.input(|i| i.key_pressed(Key::Delete)) {
                 let targets: Vec<usize> = if self.selected.is_empty() {
                     self.selected_cache_idx
@@ -5236,7 +6057,11 @@ impl eframe::App for LodestashApp {
                 } else {
                     self.selected.iter().copied().collect()
                 };
-                self.set_entries_trashed(&targets, true);
+                if self.config.confirm_before_trash {
+                    self.pending_confirm_trash = Some(targets);
+                } else {
+                    self.set_entries_trashed(&targets, true);
+                }
             }
             // Keys 1-5: rate the selection (or the lead card); same value again clears.
             if self.screen == Screen::Library {
@@ -5255,6 +6080,19 @@ impl eframe::App for LodestashApp {
                         self.selected.iter().copied().collect()
                     };
                     self.set_entries_rating(&targets, Some(n as u8 + 1));
+                }
+                // F: pin the selection as a favourite (DATA-MODEL §12). Same target rule as
+                // rating — the selection, or the lead card when nothing is multi-selected.
+                if ctx.input(|i| i.key_pressed(Key::F) && i.modifiers.is_none()) {
+                    let targets: Vec<usize> = if self.selected.is_empty() {
+                        self.selected_cache_idx
+                            .and_then(|ci| self.sorted_cache.get(ci).copied())
+                            .into_iter()
+                            .collect()
+                    } else {
+                        self.selected.iter().copied().collect()
+                    };
+                    self.toggle_favorite(&targets);
                 }
             }
 
@@ -5752,9 +6590,11 @@ impl eframe::App for LodestashApp {
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             // Browse view toggle (DESIGN-GUIDELINES.md §7 "Browse views").
-                            for (mode, label) in
-                                [(ViewMode::Folders, "Folders"), (ViewMode::Flat, "Grid")]
-                            {
+                            for (mode, label) in [
+                                (ViewMode::Folders, "Folders"),
+                                (ViewMode::Flat, "Grid"),
+                                (ViewMode::List, "List"),
+                            ] {
                                 let active = self.view_mode == mode;
                                 if ui
                                     .selectable_label(active, RichText::new(label).size(11.0))
@@ -6337,21 +7177,37 @@ impl eframe::App for LodestashApp {
                     // grid, so decode work and textures stay bounded per page.
                     let page_range = self.page_range();
                     let page_start = page_range.start;
-                    let out = thumbnail_grid(
-                        ui,
-                        &self.entries,
-                        &self.sorted_cache[page_range],
-                        page_start,
-                        self.thumb_size,
-                        self.last_cols,
-                        self.last_row_start,
-                        self.last_row_end,
-                        self.selected_cache_idx,
-                        &self.selected,
-                        self.nav_generation.wrapping_add(self.page as u64),
-                        &self.edges_out,
-                        &self.config.size_tiers,
-                    );
+                    let out = if self.view_mode == ViewMode::List {
+                        asset_list(
+                            ui,
+                            &self.entries,
+                            &self.sorted_cache[page_range],
+                            page_start,
+                            self.last_row_start,
+                            self.last_row_end,
+                            self.selected_cache_idx,
+                            &self.selected,
+                            self.nav_generation.wrapping_add(self.page as u64),
+                            &self.edges_out,
+                        )
+                    } else {
+                        thumbnail_grid(
+                            ui,
+                            &self.entries,
+                            &self.sorted_cache[page_range],
+                            page_start,
+                            self.thumb_size,
+                            self.last_cols,
+                            self.last_row_start,
+                            self.last_row_end,
+                            self.selected_cache_idx,
+                            &self.selected,
+                            self.nav_generation.wrapping_add(self.page as u64),
+                            &self.edges_out,
+                            &self.favorites,
+                            &self.config.size_tiers,
+                        )
+                    };
                     if out.cols != self.last_cols
                         || out.row_start != self.last_row_start
                         || out.row_end != self.last_row_end
@@ -6364,6 +7220,27 @@ impl eframe::App for LodestashApp {
                     spawn_queue = out.to_spawn;
                     clicked_cache = out.clicked;
                     context_action = out.context;
+
+                    // Marquee drag-select: track pointer drag, draw overlay, and on release
+                    // select all visible cards/rows that intersect the rubber-band rectangle.
+                    let suppress_click = self.update_drag_select(ui, &out.rects);
+                    if suppress_click {
+                        clicked_cache = None;
+                    }
+                    if self.drag_select_active {
+                        if let (Some(start), Some(current)) =
+                            (self.drag_select_start, self.drag_select_current)
+                        {
+                            let rect = egui::Rect::from_two_pos(start, current);
+                            ui.painter()
+                                .rect_filled(rect, 0.0, theme::GOLD.linear_multiply(0.15));
+                            ui.painter().rect_stroke(
+                                rect,
+                                0.0,
+                                egui::Stroke::new(1.0, theme::GOLD),
+                            );
+                        }
+                    }
                 }
             });
 
@@ -6422,6 +7299,14 @@ impl eframe::App for LodestashApp {
                     ContextAction::OpenWithDefault => {
                         // Opens the file with its default handler on every platform.
                         reveal_in_file_manager(&self.entries[entry_idx].file.abs_path);
+                    }
+                    ContextAction::ToggleFavorite => {
+                        let targets: Vec<usize> = if self.selected.contains(&entry_idx) {
+                            self.selected.iter().copied().collect()
+                        } else {
+                            vec![entry_idx]
+                        };
+                        self.toggle_favorite(&targets);
                     }
                     ContextAction::Trash => {
                         let targets: Vec<usize> = if self.selected.contains(&entry_idx) {
@@ -7350,6 +8235,7 @@ fn no_results_state(ui: &mut Ui, query: &str) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextAction {
     QuickLook,
+    ToggleFavorite,
     Reveal,
     OpenWithDefault,
     CopyPath,
@@ -7366,6 +8252,9 @@ struct GridOutput {
     clicked: Option<(usize, egui::Modifiers)>,
     /// (cache index, chosen action)
     context: Option<(usize, ContextAction)>,
+    /// Visible rows/cards with their screen-space rectangles for marquee drag-select.
+    /// (cache_idx, entry_idx, rect).
+    rects: Vec<(usize, usize, egui::Rect)>,
 }
 
 #[allow(clippy::too_many_arguments)] // ponytail: internal fn mirroring grid state; a struct would just rename the args
@@ -7384,6 +8273,8 @@ fn thumbnail_grid(
     nav_salt: u64,
     // Asset ids with outbound dependency edges — drives the card's link badge (DATA-MODEL §10).
     linked_ids: &std::collections::HashSet<i64>,
+    // Favourited asset ids — drives the card's heart (DATA-MODEL §12).
+    favorite_ids: &std::collections::HashSet<i64>,
     tiers: &SizeTiers,
 ) -> GridOutput {
     let card_h = thumb_size + CARD_LABEL;
@@ -7396,6 +8287,7 @@ fn thumbnail_grid(
     let mut row_end_out: usize = prev_row_end;
     let mut clicked: Option<(usize, egui::Modifiers)> = None;
     let mut context: Option<(usize, ContextAction)> = None;
+    let mut rects: Vec<(usize, usize, egui::Rect)> = Vec::new();
 
     ScrollArea::vertical()
         .id_salt(("asset_grid", nav_salt)) // fresh scroll state per folder navigation
@@ -7443,8 +8335,12 @@ fn thumbnail_grid(
                             entries[idx]
                                 .asset_id
                                 .is_some_and(|id| linked_ids.contains(&id)),
+                            entries[idx]
+                                .asset_id
+                                .is_some_and(|id| favorite_ids.contains(&id)),
                             tiers,
                         );
+                        rects.push((cache_idx, idx, resp.rect));
                         if resp.clicked() {
                             clicked = Some((cache_idx, ui.input(|i| i.modifiers)));
                         }
@@ -7471,6 +8367,181 @@ fn thumbnail_grid(
         row_end: row_end_out,
         clicked,
         context,
+        rects,
+    }
+}
+
+/// List/table view: one asset per row with a small thumbnail, name, type, size and rating.
+/// Returns a `GridOutput` with `cols == 1` so the caller can reuse the same post-render plumbing.
+fn asset_list(
+    ui: &mut Ui,
+    entries: &[AssetEntry],
+    indices: &[usize],
+    index_offset: usize,
+    prev_row_start: usize,
+    prev_row_end: usize,
+    selected_cache_idx: Option<usize>,
+    selected_entries: &std::collections::BTreeSet<usize>,
+    nav_salt: u64,
+    linked_ids: &std::collections::HashSet<i64>,
+) -> GridOutput {
+    let total_rows = indices.len();
+    let mut to_spawn: Vec<usize> = Vec::new();
+    let mut row_start_out: usize = prev_row_start;
+    let mut row_end_out: usize = prev_row_end;
+    let mut clicked: Option<(usize, egui::Modifiers)> = None;
+    let mut context: Option<(usize, ContextAction)> = None;
+    let mut rects: Vec<(usize, usize, egui::Rect)> = Vec::new();
+
+    ScrollArea::vertical()
+        .id_salt(("asset_list", nav_salt))
+        .auto_shrink([false; 2])
+        .show_rows(ui, LIST_ROW_HEIGHT, total_rows, |ui, row_range| {
+            row_start_out = row_range.start;
+            row_end_out = row_range.end;
+
+            if row_range.start != prev_row_start || row_range.end != prev_row_end {
+                let (buf_start, buf_end) =
+                    lookahead_window(row_range.start, row_range.end, total_rows);
+                for row in buf_start..buf_end {
+                    let idx = indices[row];
+                    if !entries[idx].thumb_spawned && needs_thumbnail(entries[idx].file.media_type)
+                    {
+                        to_spawn.push(idx);
+                    }
+                }
+            }
+
+            for row_idx in row_range {
+                let idx = indices[row_idx];
+                let cache_idx = index_offset + row_idx;
+                let entry = &entries[idx];
+                let is_lead = selected_cache_idx == Some(cache_idx);
+                let in_selection = selected_entries.contains(&idx);
+                let selected = is_lead || in_selection;
+
+                let type_color = entry
+                    .file
+                    .media_type
+                    .map(theme::media_type_color)
+                    .unwrap_or(theme::TEXT_DIM);
+                let border_color = if selected { theme::GOLD } else { theme::BORDER };
+                let border_width = if selected { 2.0 } else { 1.0 };
+
+                let frame = egui::Frame::none()
+                    .fill(theme::SURFACE)
+                    .rounding(4.0)
+                    .stroke(egui::Stroke::new(border_width, border_color))
+                    .inner_margin(egui::Margin::symmetric(6.0, 4.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.set_min_size(egui::Vec2::new(0.0, LIST_THUMB_SIZE));
+                            // Thumbnail or placeholder
+                            if let Some(tex) = &entry.texture {
+                                ui.add(
+                                    egui::Image::new((
+                                        tex.id(),
+                                        egui::Vec2::splat(LIST_THUMB_SIZE),
+                                    ))
+                                    .fit_to_exact_size(egui::Vec2::splat(LIST_THUMB_SIZE))
+                                    .rounding(3.0),
+                                );
+                            } else {
+                                let (resp, painter) = ui.allocate_painter(
+                                    egui::Vec2::splat(LIST_THUMB_SIZE),
+                                    egui::Sense::hover(),
+                                );
+                                painter.rect_filled(
+                                    resp.rect,
+                                    3.0,
+                                    type_color.linear_multiply(0.12),
+                                );
+                                painter.text(
+                                    resp.rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    type_label_char(entry.file.media_type),
+                                    egui::FontId::proportional((LIST_THUMB_SIZE * 0.35).max(10.0)),
+                                    type_color.linear_multiply(0.6),
+                                );
+                            }
+
+                            ui.add_space(6.0);
+                            let name = entry
+                                .file
+                                .rel_path
+                                .file_stem()
+                                .map(|s| s.to_string_lossy())
+                                .unwrap_or_default();
+                            ui.label(
+                                egui::RichText::new(name.as_ref())
+                                    .color(theme::TEXT)
+                                    .size(12.0),
+                            );
+
+                            // Metadata flushed to the right
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if entry.asset_id.is_some_and(|id| linked_ids.contains(&id)) {
+                                        ui.label(
+                                            egui::RichText::new("\u{26AD}")
+                                                .color(theme::TYPE_MATERIAL)
+                                                .size(11.0),
+                                        );
+                                    }
+                                    if let Some(r) = entry.rating {
+                                        ui.label(
+                                            egui::RichText::new(format!("\u{2605} {r}"))
+                                                .color(theme::GOLD)
+                                                .size(11.0),
+                                        );
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(format_bytes(entry.file.size_bytes))
+                                            .color(theme::TEXT_DIM)
+                                            .size(11.0),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(media_type_label(
+                                            entry.file.media_type,
+                                        ))
+                                        .color(type_color)
+                                        .size(11.0),
+                                    );
+                                },
+                            );
+                        });
+                    });
+
+                let resp = frame.response.interact(egui::Sense::click());
+                rects.push((cache_idx, idx, resp.rect));
+                if resp.clicked() {
+                    clicked = Some((cache_idx, ui.input(|i| i.modifiers)));
+                }
+                if resp.secondary_clicked() && !in_selection {
+                    clicked = Some((cache_idx, egui::Modifiers::NONE));
+                }
+                let can_trash = entry.asset_id.is_some();
+                resp.context_menu(|ui| {
+                    ui.set_min_width(190.0);
+                    if let Some(action) = card_context_menu(ui, can_trash) {
+                        context = Some((cache_idx, action));
+                    }
+                });
+
+                // Add a tiny gap between rows
+                ui.add_space(2.0);
+            }
+        });
+
+    GridOutput {
+        to_spawn,
+        cols: 1,
+        row_start: row_start_out,
+        row_end: row_end_out,
+        clicked,
+        context,
+        rects,
     }
 }
 
@@ -7488,6 +8559,11 @@ fn card_context_menu(ui: &mut Ui, can_trash: bool) -> Option<ContextAction> {
     ui.add_enabled(false, egui::Button::new("Open"))
         .on_disabled_hover_text("In-app viewers land in P1");
     act(ui, ContextAction::QuickLook, "Quick Look        Space");
+    act(
+        ui,
+        ContextAction::ToggleFavorite,
+        "\u{2665} Favourite          F",
+    );
     ui.separator();
     act(ui, ContextAction::Reveal, "Reveal in Explorer");
     act(ui, ContextAction::OpenWithDefault, "Open with default app");
@@ -8515,8 +9591,19 @@ fn read_back_assets(
                 .map_err(|e| e.to_string())?
                 .into_iter()
                 .filter_map(|a| {
-                    AssetStatus::from_code(&a.status)
-                        .map(|s| (a.rel_path, (a.asset_id, s, a.trashed, a.rating, a.metrics)))
+                    AssetStatus::from_code(&a.status).map(|s| {
+                        (
+                            a.rel_path,
+                            (
+                                a.asset_id,
+                                s,
+                                a.trashed,
+                                a.rating,
+                                a.metrics,
+                                a.content_hash,
+                            ),
+                        )
+                    })
                 })
                 .collect();
             Ok((root.clone(), map))
@@ -8937,6 +10024,19 @@ fn filter_popover(
     });
     ui.add_space(6.0);
 
+    // FAVOURITES — a pin, not a rating (DATA-MODEL §12).
+    section_label(ui, "FAVOURITES");
+    if filter_chip(
+        ui,
+        "\u{2665} Favourites only",
+        cf.favorites_only,
+        theme::DANGER,
+    ) {
+        cf.favorites_only = !cf.favorites_only;
+        changed = true;
+    }
+    ui.add_space(6.0);
+
     // LINKS — the dependency graph (DATA-MODEL §10). Single-select; same chip toggles off.
     section_label(ui, "LINKS");
     ui.horizontal_wrapped(|ui| {
@@ -8982,6 +10082,8 @@ fn asset_card(
     check_overlay: bool,
     // Has at least one resolved outbound dependency edge (DATA-MODEL §10).
     linked: bool,
+    // Favourited (DATA-MODEL §12).
+    favorite: bool,
     tiers: &SizeTiers,
 ) -> egui::Response {
     let type_color = entry
@@ -9050,6 +10152,18 @@ fn asset_card(
                     let stroke = egui::Stroke::new(1.4, theme::TYPE_MATERIAL);
                     painter.circle_stroke(c + egui::vec2(-2.5, 0.0), 3.0, stroke);
                     painter.circle_stroke(c + egui::vec2(2.5, 0.0), 3.0, stroke);
+                }
+
+                // Favourite heart, top-left of the thumbnail — opposite the size tier so the two
+                // never collide, and above the multi-select check which only shows while selecting.
+                if favorite {
+                    painter.text(
+                        thumb_rect.left_top() + egui::vec2(4.0, 2.0),
+                        egui::Align2::LEFT_TOP,
+                        "\u{2665}",
+                        egui::FontId::proportional(12.0),
+                        theme::DANGER,
+                    );
                 }
 
                 // Star rating, bottom-left of the thumbnail (DATA-MODEL §12).
@@ -9530,6 +10644,41 @@ fn format_mtime(mtime_secs: i64) -> String {
         m += 1;
     }
     format!("{y}-{m:02}-{:02}", d + 1)
+}
+
+/// Human-readable relative time from a Unix timestamp (e.g. "just now", "5m ago").
+fn format_relative_time(secs: i64) -> String {
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return "unknown".to_string();
+    };
+    let elapsed = now.as_secs().saturating_sub(secs.max(0) as u64);
+    match elapsed {
+        0..=59 => "just now".to_string(),
+        60..=3_599 => format!("{}m ago", elapsed / 60),
+        3_600..=86_399 => format!("{}h ago", elapsed / 3_600),
+        86_400..=2_592_000 => format!("{}d ago", elapsed / 86_400),
+        _ => format_mtime(secs),
+    }
+}
+
+/// Recursively sum the file sizes under `dir`. Skips unreadable entries rather than failing.
+fn dir_size(dir: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(t) if t.is_file() => {
+                    total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+                Ok(t) if t.is_dir() => {
+                    total += dir_size(&path);
+                }
+                _ => {}
+            }
+        }
+    }
+    total
 }
 
 fn media_type_label(mt: Option<MediaType>) -> &'static str {
@@ -10391,7 +11540,7 @@ mod tests {
         let cf = ContentFilter::default();
         let tiers = SizeTiers::default();
         assert!(
-            cf.passes(10, None, None, &[], (false, false), &tiers),
+            cf.passes(10, None, None, &[], (false, false), false, &tiers),
             "no active facet = no constraint"
         );
         assert!(cf.passes(
@@ -10400,6 +11549,7 @@ mod tests {
             None,
             &["a".into()],
             (false, false),
+            false,
             &tiers
         ));
     }
@@ -10419,6 +11569,7 @@ mod tests {
             None,
             &t(&["rock", "grey"]),
             (false, false),
+            false,
             &tiers
         ));
         assert!(
@@ -10428,14 +11579,45 @@ mod tests {
                 None,
                 &t(&["stone", "rock"]),
                 (false, false),
+                false,
                 &tiers
             ),
             "any selected trait matches"
         );
-        assert!(!cf.passes(10, None, None, &t(&["sword"]), (false, false), &tiers));
+        assert!(!cf.passes(
+            10,
+            None,
+            None,
+            &t(&["sword"]),
+            (false, false),
+            false,
+            &tiers
+        ));
         assert!(
-            !cf.passes(10, None, None, &[], (false, false), &tiers),
+            !cf.passes(10, None, None, &[], (false, false), false, &tiers),
             "an untagged asset is not a match"
+        );
+    }
+
+    /// The favourites filter is a pin filter: it must not care about rating, tags or links, and an
+    /// asset with no catalog row (hence no favourite) must fail it rather than sneak through.
+    #[test]
+    fn content_filter_favorites_only_selects_pins() {
+        let tiers = SizeTiers::default();
+        let mut cf = ContentFilter {
+            favorites_only: true,
+            ..Default::default()
+        };
+        assert!(cf.passes(10, None, None, &[], (false, false), true, &tiers));
+        assert!(!cf.passes(10, None, None, &[], (false, false), false, &tiers));
+        // A 5-star asset is not a favourite unless it was pinned.
+        assert!(!cf.passes(10, None, Some(5), &[], (false, false), false, &tiers));
+        assert_eq!(cf.active_count(), 1, "the chip counts as an active facet");
+
+        cf.favorites_only = false;
+        assert!(
+            cf.passes(10, None, None, &[], (false, false), false, &tiers),
+            "off, it constrains nothing"
         );
     }
 
@@ -10449,23 +11631,23 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            cf.passes(10, None, None, &[], (true, false), &tiers),
+            cf.passes(10, None, None, &[], (true, false), false, &tiers),
             "uses others"
         );
         assert!(
-            !cf.passes(10, None, None, &[], (false, true), &tiers),
+            !cf.passes(10, None, None, &[], (false, true), false, &tiers),
             "only used by others"
         );
         assert!(
-            !cf.passes(10, None, None, &[], (false, false), &tiers),
+            !cf.passes(10, None, None, &[], (false, false), false, &tiers),
             "no edges at all"
         );
 
         cf.link = Some(LinkFilter::HasDependents);
-        assert!(cf.passes(10, None, None, &[], (false, true), &tiers));
-        assert!(!cf.passes(10, None, None, &[], (true, false), &tiers));
+        assert!(cf.passes(10, None, None, &[], (false, true), false, &tiers));
+        assert!(!cf.passes(10, None, None, &[], (true, false), false, &tiers));
         // A material sits in the middle of a chain and satisfies both.
-        assert!(cf.passes(10, None, None, &[], (true, true), &tiers));
+        assert!(cf.passes(10, None, None, &[], (true, true), false, &tiers));
         assert_eq!(cf.active_count(), 1, "the chip counts as an active facet");
     }
 
@@ -10477,19 +11659,19 @@ mod tests {
         cf.sizes.insert(SizeTier::L);
         let mb = |n: u64| n * 1024 * 1024;
         assert!(
-            cf.passes(mb(0), None, None, &[], (false, false), &tiers),
+            cf.passes(mb(0), None, None, &[], (false, false), false, &tiers),
             "500 KB → S, selected"
         );
         assert!(
-            !cf.passes(mb(2), None, None, &[], (false, false), &tiers),
+            !cf.passes(mb(2), None, None, &[], (false, false), false, &tiers),
             "2 MB → M, not selected"
         );
         assert!(
-            cf.passes(mb(5), None, None, &[], (false, false), &tiers),
+            cf.passes(mb(5), None, None, &[], (false, false), false, &tiers),
             "5 MB → L, selected"
         );
         assert!(
-            !cf.passes(mb(9), None, None, &[], (false, false), &tiers),
+            !cf.passes(mb(9), None, None, &[], (false, false), false, &tiers),
             "9 MB → XL, not selected"
         );
     }
@@ -10500,15 +11682,15 @@ mod tests {
         let mut cf = ContentFilter::default();
         cf.tri_buckets.insert(TriBucket::K1to3);
         assert!(
-            cf.passes(10, Some(2000), None, &[], (false, false), &tiers),
+            cf.passes(10, Some(2000), None, &[], (false, false), false, &tiers),
             "2000 tris → 1k–3k, selected"
         );
         assert!(
-            !cf.passes(10, Some(500), None, &[], (false, false), &tiers),
+            !cf.passes(10, Some(500), None, &[], (false, false), false, &tiers),
             "500 tris → ≤1k, not selected"
         );
         assert!(
-            !cf.passes(10, None, None, &[], (false, false), &tiers),
+            !cf.passes(10, None, None, &[], (false, false), false, &tiers),
             "no tri count is excluded when a tri facet is active"
         );
     }
@@ -10524,11 +11706,20 @@ mod tests {
             None,
             &["rusty".into(), "barrel".into()],
             (false, false),
+            false,
             &tiers
         ));
-        assert!(!cf.passes(10, None, None, &["barrel".into()], (false, false), &tiers));
+        assert!(!cf.passes(
+            10,
+            None,
+            None,
+            &["barrel".into()],
+            (false, false),
+            false,
+            &tiers
+        ));
         assert!(
-            !cf.passes(10, None, None, &[], (false, false), &tiers),
+            !cf.passes(10, None, None, &[], (false, false), false, &tiers),
             "an asset with no traits fails a trait filter"
         );
     }
@@ -10586,6 +11777,7 @@ mod tests {
             trashed: false,
             rating: None,
             metrics: Default::default(),
+            content_hash: None,
             texture: None,
             thumb_spawned: false,
         }
@@ -10761,6 +11953,7 @@ mod tests {
             trashed: false,
             rating: None,
             metrics: Default::default(),
+            content_hash: None,
             texture: None,
             thumb_spawned: false,
         }

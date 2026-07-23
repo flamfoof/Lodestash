@@ -109,6 +109,8 @@ pub struct HydratedAsset {
     /// 1..=5 stars; None = unrated (DATA-MODEL §12).
     pub rating: Option<u8>,
     pub metrics: AssetMetrics,
+    /// BLAKE3 hash of the primary file; exact-dedup key (DATA-MODEL).
+    pub content_hash: Option<String>,
 }
 
 /// Technical facets extracted from the file itself (DATA-MODEL §14). Every field is optional:
@@ -168,6 +170,8 @@ pub struct AssetIdentity {
     pub trashed: bool,
     pub rating: Option<u8>,
     pub metrics: AssetMetrics,
+    /// BLAKE3 hash of the primary file; exact-dedup key (DATA-MODEL).
+    pub content_hash: Option<String>,
 }
 
 /// The fully-opened, migration-applied catalog database.
@@ -224,6 +228,7 @@ impl Catalog {
             (9, MIGRATION_09_ASSET_METRICS),
             (10, MIGRATION_10_DEPENDENCY_SCAN),
             (11, MIGRATION_11_TAGGING),
+            (12, MIGRATION_12_FAVORITES),
         ];
 
         for (version, sql) in migrations {
@@ -575,7 +580,7 @@ impl Catalog {
             .conn
             .prepare(
                 "SELECT af.rel_path, a.id, a.status, a.deleted_at IS NOT NULL, a.rating,
-                        a.tri_count, a.width_px, a.height_px, a.duration_ms
+                        a.tri_count, a.width_px, a.height_px, a.duration_ms, a.content_hash
                  FROM asset a JOIN asset_file af ON af.id = a.primary_file_id
                  WHERE a.source_id = ?1",
             )
@@ -589,6 +594,7 @@ impl Catalog {
                     trashed: r.get(3)?,
                     rating: r.get(4)?,
                     metrics: AssetMetrics::from_row(r, 5)?,
+                    content_hash: r.get(9)?,
                 })
             })
             .map_err(|e| CoreError::Catalog(format!("assets query: {e}")))?;
@@ -607,7 +613,7 @@ impl Catalog {
             .prepare(
                 "SELECT af.rel_path, a.id, mt.code, af.size_bytes, af.mtime,
                         a.status, a.deleted_at IS NOT NULL, a.rating,
-                        a.tri_count, a.width_px, a.height_px, a.duration_ms
+                        a.tri_count, a.width_px, a.height_px, a.duration_ms, a.content_hash
                  FROM asset a
                  JOIN asset_file af ON af.id = a.primary_file_id
                  JOIN media_type mt ON mt.id = a.media_type_id
@@ -626,6 +632,7 @@ impl Catalog {
                     trashed: r.get(6)?,
                     rating: r.get(7)?,
                     metrics: AssetMetrics::from_row(r, 8)?,
+                    content_hash: r.get(12)?,
                 })
             })
             .map_err(|e| CoreError::Catalog(format!("hydrate query: {e}")))?;
@@ -704,6 +711,40 @@ impl Catalog {
                 params![rating],
             )
             .map_err(|e| CoreError::Catalog(format!("set_rating: {e}")))
+    }
+
+    /// Flag (or unflag) assets as favourites (§12). Catalog-only, like ratings and the Trash: the
+    /// files on disk are never touched. Returns rows changed.
+    pub fn set_favorite(&self, asset_ids: &[i64], favorite: bool) -> Result<usize> {
+        if asset_ids.is_empty() {
+            return Ok(0);
+        }
+        // asset_ids are i64s the caller already holds — safe to inline (rusqlite has no array binds).
+        let id_list = asset_ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.conn
+            .execute(
+                &format!("UPDATE asset SET favorite = ?1 WHERE id IN ({id_list})"),
+                params![favorite as i64],
+            )
+            .map_err(|e| CoreError::Catalog(format!("set_favorite: {e}")))
+    }
+
+    /// Every live favourite's id — read once per catalog sync, like the tag and edge sets, so the
+    /// grid can mark and filter without a query per row.
+    pub fn favorite_ids(&self) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM asset WHERE favorite = 1 AND deleted_at IS NULL")
+            .map_err(|e| CoreError::Catalog(format!("favorites prep: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))
+            .map_err(|e| CoreError::Catalog(format!("favorites query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("favorites row: {e}")))
     }
 
     /// Move assets to / restore them from the Trash (catalog-only soft delete —
@@ -1307,6 +1348,14 @@ pub struct RelatedAsset {
 /// M10 — dependency-graph queue (§10). `deps_dirty` is the third drain flag, next to
 /// `embedding_dirty` and `metrics_dirty`: set on insert and whenever a file's bytes change,
 /// cleared once the asset's `.meta` GUID and outbound references have been harvested.
+/// M12 — favourites (§12). A pin, not a rating: "I want to find this again" is a different
+/// question from "how good is it", and collapsing the two would make a 5-star asset a favourite by
+/// accident. Partial index because the interesting set is always the small one.
+const MIGRATION_12_FAVORITES: &str = "
+ALTER TABLE asset ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_asset_favorite ON asset(favorite) WHERE favorite=1;
+";
+
 /// M11 — tagging queue + working FTS tag column (§2 facets, IDENTIFICATION-AND-SEARCH §2).
 /// `tags_dirty` is the fourth drain flag, beside `metrics_dirty`/`embedding_dirty`/`deps_dirty`.
 ///
@@ -1402,7 +1451,7 @@ impl Catalog {
                 "SELECT af.rel_path, a.id, mt.code, af.size_bytes, af.mtime,
                         a.status, a.deleted_at IS NOT NULL, a.rating,
                         p.name, af.workspace_rel, p.pinned,
-                        a.tri_count, a.width_px, a.height_px, a.duration_ms
+                        a.tri_count, a.width_px, a.height_px, a.duration_ms, a.content_hash
                  FROM asset a
                  JOIN asset_file af ON af.id = a.primary_file_id
                  JOIN media_type mt ON mt.id = a.media_type_id
@@ -1427,6 +1476,7 @@ impl Catalog {
                         trashed: r.get(6)?,
                         rating: r.get(7)?,
                         metrics: AssetMetrics::from_row(r, 11)?,
+                        content_hash: r.get(15)?,
                     },
                 })
             })
@@ -2525,7 +2575,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 11, "all 11 migrations should have run");
+        assert_eq!(version, 12, "all 12 migrations should have run");
     }
 
     /// A catalog stopped at schema v4, for exercising M5's data steps.
@@ -3766,6 +3816,47 @@ mod tests {
 
     /// The grid reads tags in bulk, and the filter chips read the vocabulary with counts; both
     /// must exclude trashed assets, or the UI offers a facet that filters to nothing.
+    /// A favourite is a pin, independent of rating and status, and a trashed asset stops being
+    /// listed as one — it left the grid, so offering it as a favourite would be a dead link.
+    #[test]
+    fn favorites_are_independent_of_rating_and_hide_when_trashed() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let s = c.upsert_import_source("A", "C:/a", "folder").expect("src");
+        c.record_crawl(s, None, &[rec("a.png", 1, 1), rec("b.png", 2, 2)])
+            .expect("crawl");
+        let ids: Vec<i64> = c
+            .conn
+            .prepare("SELECT id FROM asset ORDER BY id")
+            .and_then(|mut st| {
+                st.query_map([], |r| r.get(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .expect("ids");
+
+        assert!(c.favorite_ids().expect("none yet").is_empty());
+        assert_eq!(c.set_favorite(&ids[..1], true).expect("fav"), 1);
+        assert_eq!(c.favorite_ids().expect("one"), vec![ids[0]]);
+
+        // Rating the *other* asset must not make it a favourite, and vice versa.
+        c.set_rating(&ids[1..], Some(5)).expect("rate");
+        assert_eq!(c.favorite_ids().expect("still one"), vec![ids[0]]);
+
+        c.set_trashed(&ids[..1], true).expect("trash");
+        assert!(
+            c.favorite_ids().expect("after trash").is_empty(),
+            "a trashed favourite is not listed"
+        );
+        c.set_trashed(&ids[..1], false).expect("restore");
+        assert_eq!(
+            c.favorite_ids().expect("after restore"),
+            vec![ids[0]],
+            "restoring brings the pin back — it was never cleared"
+        );
+        assert_eq!(c.set_favorite(&ids[..1], false).expect("unfav"), 1);
+        assert!(c.favorite_ids().expect("cleared").is_empty());
+    }
+
     #[test]
     fn bulk_tag_reads_skip_trashed_assets() {
         let mut c = Catalog::open_in_memory().expect("open");

@@ -490,6 +490,13 @@ ALTER TABLE asset ADD COLUMN license_url TEXT;
 - **Import batches**: `import_record` rows from one tray/queue run share a `batch_id`, so the UI can
   list "Recent exports" per project and **undo a batch** — delete the copied files it produced and
   its records; catalog assets are untouched (confirm-gated, [`UI-SPEC.md`](UI-SPEC.md) §16.1).
+**Favourites** (`asset.favorite`, M12) are a **pin, not a rating**: "I want to find this again" is
+a different question from "how good is this", and folding the two together would make every 5-star
+asset a favourite by accident. Catalog-only like ratings and the Trash — the file on disk is never
+touched — and the pin survives a trip through the Trash, so restoring an asset brings its
+favourite back. Surfaced as a heart on the card, `F` on the selection, and a **Favourites only**
+filter chip; a trashed asset stops being listed as a favourite because it has left the grid.
+
 - **License** resolves **asset → package**: an asset's effective license is `asset.license` when set,
   else `package.license`. Surfaced on the detail stat block and on every export/import so credits
   travel with the asset.
@@ -690,6 +697,7 @@ transaction, in order, on open. Shipped so far:
 | **M7** | Unity Assets library pinning: `package.pinned` (`ALTER TABLE package ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`) — backs the Add-to-Library pin (FEATURES.md §5.5, §7 above) so a promoted pack is a durable sidebar LIBRARIES row |
 | **M8** | Semantic embeddings (interim): `asset_embedding` BLOB table (dim × f32 little-endian + `model_id`/`modality`/`media_type_id`/`source_id`) — `Catalog::upsert_embedding` clears `embedding_dirty` in-txn; `embeddings_for_knn` loads the pre-filtered candidate set for `crate::vector::BruteForceIndex`. sqlite-vec `vec_asset` is the drop-in optimisation behind the `VectorIndex` seam (§2). |
 | **M9** | Technical facets: `asset.tri_count/width_px/height_px/duration_ms` + `asset.metrics_dirty` (partial index) — extracted from the file itself by a dirty-flag drain, exactly like embeddings (§14) |
+| **M12** | Favourites: `asset.favorite` + partial index — a pin, independent of `rating` (§12) |
 | **M11** | Tagging: `asset.tags_dirty` (partial index) — the fourth drain flag — and the three `asset_fts` triggers **replaced** so `tags_concat` is a real denormalisation of `asset_tag` instead of the literal `''` they wrote before (a rename would otherwise `delete` under the wrong text and strand tokens in the index) |
 | **M10** | Dependency scan queue: `asset.deps_dirty` (partial index) + a partial index on `asset.unity_guid` — the third drain flag beside `embedding_dirty`/`metrics_dirty`, cleared once an asset's `.meta` GUID and outbound refs are harvested into `asset_relationship` (§10) |
 | **M5** | UI-SPEC alignment: per-project staging trays, `import_record.batch_id` + backfill, `tag` trait columns, `asset_relationship` (final form), `import_source.blacklist` — DDL + data steps below |

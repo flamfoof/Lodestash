@@ -67,6 +67,33 @@ pub fn candidate_roots() -> Vec<PathBuf> {
     roots
 }
 
+/// The directory Unity names its download cache. A moved cache keeps the name, which makes it the
+/// one reliable signal that a path sits inside one.
+pub const CACHE_DIR_NAME: &str = "Asset Store-5.x";
+
+/// Infer the cache root that `path` lives inside, if any (INGESTION.md §2 discovery).
+///
+/// The env var and the per-OS default only find a cache that is where Unity put it. A user who
+/// moved theirs to another drive — and then added a *pack folder* from it as a library source —
+/// has told us where it is without knowing it; this reads that. Matching on the directory name
+/// rather than on "contains a `.unitypackage` somewhere above" is what stops it walking up to the
+/// drive root and calling `G:\` an Asset Store cache.
+pub fn infer_root_from(path: &Path) -> Option<PathBuf> {
+    let mut cur = Some(path);
+    while let Some(dir) = cur {
+        if dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case(CACHE_DIR_NAME))
+            && is_asset_store_cache(dir)
+        {
+            return Some(dir.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
 /// Does `root` look like a real Asset Store cache — a directory holding at least one
 /// `.unitypackage` within a `<Publisher>/<Category>/` tree (INGESTION.md §2 first-run validation)?
 /// Cheap: stops at the first match within 3 levels.
@@ -137,6 +164,32 @@ fn is_unitypackage(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn infer_root_finds_the_cache_from_a_pack_folder_inside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("Asset Store-5.x");
+        let pack_dir = cache.join("SomePublisher").join("3D Models");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(pack_dir.join("Pack.unitypackage"), b"x").unwrap();
+
+        assert_eq!(
+            super::infer_root_from(&pack_dir).as_deref(),
+            Some(cache.as_path())
+        );
+        assert_eq!(
+            super::infer_root_from(&pack_dir.join("Pack.unitypackage")).as_deref(),
+            Some(cache.as_path()),
+            "a file inside the tree works too"
+        );
+        // Nothing above the cache is a cache: the walk must not reach the drive root.
+        assert_eq!(super::infer_root_from(dir.path()), None);
+
+        // A directory with the right name but no packages is not a cache.
+        let empty = dir.path().join("elsewhere").join("Asset Store-5.x");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(super::infer_root_from(&empty), None);
+    }
+
     use super::*;
     use std::fs;
 
