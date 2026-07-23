@@ -4,7 +4,8 @@ Working notes for whoever (or whatever) continues the build. Unlike the rest of 
 is **not** a design spec — it's the state of play, the decisions already settled, and the traps.
 The design docs still win on any question of what the software *should* do.
 
-Last updated: **2026-07-22**, at `7efcb01` + the P2 dependency-graph slice.
+Last updated: **2026-07-23**, at `cc79e64`. A paste-ready session-start prompt lives in
+[`HANDOFF-PROMPT.md`](HANDOFF-PROMPT.md).
 
 ---
 
@@ -113,6 +114,34 @@ promote, then re-read counts + identities and send them, because a drain is no l
 Since tags became part of the definition (2026-07-23) the meter reads the *tagged* count — 19
 on this machine until a full Identify pass runs, which is the honest number.
 
+**Materials, packages and the Unity cache.** Materials render as **shader balls** in the grid
+(`lodestash_ingest::material` → the same CPU rasteriser as model thumbs), wearing the albedo the
+dependency graph resolved — the first thing that graph pays for outside export. `read_package_meta`
+harvests a pack's own `.icon.png` (every Asset Store pack has one), any embedded UPM `package.json`
+(version / displayName / license) and any bundled licence file, identified by its **body** rather
+than its filename; it runs at extraction, not browse, and early-exits, so a 20 GB pack is not
+re-inflated for a 2 KB file. Asset Store discovery now **infers a moved cache** from the library
+sources already added — this machine's cache is on `G:`, which is why the Unity Assets screen was
+empty (env var + per-OS default only find a cache where Unity put it).
+
+**Favourites exist** (`asset.favorite`, M12): a pin, not a rating, catalog-side, surviving the Trash.
+The **shipped UI diverges from the design bundle** on four presentation points (star not heart, gold
+not danger, top-right not top-left, a toolbar toggle + dedicated screen rather than a Filters-popover
+section) — written up on the KANBAN card; storage is unaffected.
+
+**A second lane ships UI/Settings work in this same tree** (the SWE-1.7 Max handoff): per-source
+rescan/watch/counts, Storage caps, workspace cap + retention, confirm-before-Trash, the Duplicates
+badge, the **list-row view**, and marquee drag-select. Consequences worth knowing: the list view does
+**not** yet draw the favourite star, the link badge, or material spheres; and `app.rs` is now ~12k
+lines, which is a splitting card waiting to be written.
+
+**Delete-from-disk is the one destructive exception**, and it is fenced: an explicit confirmation
+modal, `under_known_root` refusing anything outside the user's source roots and the app's own
+workspace, `abs_path` (never a recomposed `scan_root.join(rel_path)`, which mis-resolved
+package-extracted entries), no `remove_dir_all`, and the catalog row marked trashed **only after**
+the file actually left the disk. DATA-MODEL §12 and FEATURES.md §9 name the exception — an
+undocumented exception is an invariant break.
+
 ---
 
 ## 3. Settled decisions — don't re-litigate
@@ -137,6 +166,21 @@ Each is recorded with rationale in [`TECH-STACK.md`](TECH-STACK.md) §7 and the 
 - **The agent planes share one ops layer.** Adding an operation means adding a `ServerState` method
   plus a route plus a tool plus a row in `AGENT_OPERATIONS`. Skipping the last one fails the parity
   test, which is the point.
+- **The local tagger is two models, and the drain is staged — both forced by measurement.** Asked
+  for facet JSON directly, `moondream` answers with arrays of *numbers* (its JSON mode is trained for
+  grounding boxes) while captioning the same preview correctly in prose; so the VLM captions and a
+  text model writes the facets. And running both per asset made Ollama evict multi-GB weights on
+  every call — **~50 s/asset**, against **~7-8 s** once each model stays resident for a batch. Hence
+  caption-the-batch-then-facet-the-batch, plus `keep_alive`. Re-measure before assuming a bigger
+  model is affordable.
+- **Identification means tags *and* embeddings.** An embedding makes an asset findable; nothing has
+  been *said* about it until it is tagged. Counting embeddings alone had the meter reporting
+  2067/2274 identified for a library where 19 assets had tags. Don't relax it back.
+- **Unclassified files never reach the grid.** No `media_type` ⇒ the catalog could never hold it, so
+  it was a grid-only ghost. Widen `detect::by_extension` if a real asset goes missing; do not
+  re-admit everything.
+- **Favourites are a pin, not a rating.** Separate column, separate affordance — folding them into
+  the star rating would make every 5-star asset a favourite by accident.
 - **Separate, non-comparable vector spaces.** SigLIP (768-d visual) and CLAP (512-d audio) are searched
   independently and fused on *rank* by RRF — comparing raw scores across models is meaningless.
   `hybrid_search` therefore takes `spaces: &[(model_id, query_vec)]`.
@@ -222,6 +266,15 @@ fixture.
   land, verify the mechanism headlessly instead of burning the session on input synthesis.
 - **`cargo build` fails with "Access is denied. (os error 5)"** when the app is running — it holds
   `lodestash.exe`. `Stop-Process -Name lodestash -Force` first. `cargo check` works regardless.
+- **You may not be the only writer in this tree.** A second agent lane edits `crates/lodestash-ui`
+  concurrently. Two rules: never run `git checkout <path>` on a file you have not read (that
+  discarded a live edit to `docs/design/FEATURES.md` — unstaged changes are unrecoverable), and
+  prefer state that lives *beside* `AssetEntry` (a `HashSet`/`HashMap` refreshed per catalog sync)
+  over new fields on it, which is what let favourites, tags and dependency edges merge cleanly
+  against a rewritten grid.
+- **Ollama evicts models between calls.** Alternating two models per asset costs ~6× — batch by
+  stage and send `keep_alive`. A small VLM asked for JSON may degenerate into numeric arrays; ask it
+  for prose and let a text model do the schema.
 - Git Bash maps `/tmp` to the Windows temp dir, and job-scoped env vars aren't guaranteed to persist
   between shell invocations — prefer absolute paths in long-running work.
 
@@ -229,29 +282,41 @@ fixture.
 
 ## 7. Suggested next work
 
-Roughly by value:
+The user's stated order, then value:
 
-1. **P5 remainder — the Unity round-trip**: `register_project` → `/v1/import` → import queue →
-   plugin ack → `import_record` ([`ENGINE-API.md`](ENGINE-API.md) §5). The job engine and the
-   approval gate already exist to carry it. The UPM C# plugin is the big piece and cannot be
-   verified without a Unity install.
-2. **P2 relationship graph, remainder.** The GUID pass and export closure are in; what's left is
-   **mesh → material** (naming heuristic or a prefab reader — see the coverage caveat above), the
-   inspector "Related" tab, the grid link-chain badge, and the
-   `has_dependents`/`has_dependencies` filters.
-3. **P4 tagging.** Unblocks Traits, tag filter chips, `AssetSummary.tags`, pack-stats TAGS, and the
-   accept/reject flow. Ollama is installed on this machine (`qwen3:8b`, text-only); a vision tagger
-   would want `moondream` (~1.7 GB) or `qwen2.5vl:3b` (~3 GB) — the 4–6 GB VRAM tier of
-   [`AI-MODELS-BY-GPU.md`](AI-MODELS-BY-GPU.md). Note the machine is AMD (RX 6750 XT): no CUDA, and
-   the bundled ORT is the **CPU** build. DirectML would need a different runtime dll — see the
-   version warning in §4 before trying.
-4. Optional AI refinements: an LLM query parser (slots in behind `ParsedQuery::validate`),
-   cross-encoder rerank, glTF material textures.
-5. **Non-win-x64 ORT auto-fetch** — deliberately skipped. It can't be tested from this machine, and
-   shipping platform code you can't run is how silent breakage gets in.
+1. **Unity Assets, end to end** — the next task they asked for. The pieces exist and are not joined:
+   `.unitypackage` manifest + surgical extraction (`unitypackage.rs`), pack rows with icons and
+   licence (`read_package_meta`), cache-root inference, and a `Screen::Unity` that renders little.
+   Wanted: packs listed as **Libraries**, surgical extract → identify → index so a pack's contents
+   are retrievable after it has been opened once, and the **Unity Assets menu** built from
+   `docs/design/` (§5 of FEATURES.md; note that bundle's prototype has **no** Unity screen — §5 is
+   the contract, not the prototype).
+2. **Favourites design conformance** — four presentation deltas listed on the KANBAN card. Contained:
+   glyph/colour/position, chip moves to the toolbar, plus a Favorites screen reusing the grid.
+3. **P5 — the Unity round-trip**: `register_project` → `/v1/import` → import queue → `import_record`
+   → dup-guard, then the UPM C# plugin (the big piece; unverifiable without a Unity install). Land
+   the MCP per-tool allow-list *before* the import ops, since those mutate a project.
+4. **P4 remainder** — audio taggers (CLAP/PANNs, not a language model guessing from a filename),
+   accept/reject → `confirmed`, the Traits screen, `+ trait` quick-add. A full Identify pass over
+   this library is ~5 h of CPU; it is manual and resumable for that reason.
+5. **P2 remainder** — the naming heuristic for assets with no `.meta` (no GUID ⇒ no edges at all),
+   prefabs inside an extracted workspace, the §13.6 relink panel, and `has_dependents`/
+   `has_dependencies` as search filters rather than only chips.
+6. **List-view parity** — the new list rows show neither the favourite star, the link badge, nor
+   material previews. Also worth a card: `app.rs` is ~12k lines.
+7. Optional AI refinements: an LLM query parser (slots in behind `ParsedQuery::validate`),
+   cross-encoder rerank, glTF material textures. **Non-win-x64 ORT auto-fetch stays skipped** — it
+   can't be tested from this machine.
+
+**Design assets** live in the Claude Design project *LodeStash*
+(`f1fd4bce-f7bc-4b33-b099-d74b78f31998`, path `design_handoff_settings_and_library/`), reachable via
+the `DesignSync` tool (`list_files` / `get_file`). Its markdown is the **original** handoff and is
+older than `docs/design/*.md` — the provenance block at the top of `docs/design/README.md` lists what
+a straight re-import would regress. Ask for the prototype HTML to be exported locally rather than
+pulling ~260 KB through context.
 
 Known gaps that are *recorded* rather than hidden — see the interim-status notes in
-[`ENGINE-API.md`](ENGINE-API.md) §2: `AssetSummary.tags` is always `[]`, `Package` has no
-`license`/`version`, `AssetDetail` carries only `size_bytes` + `stats`, the MCP per-tool allow-list
+[`ENGINE-API.md`](ENGINE-API.md) §2: `AssetSummary.tags` is always `[]` (tags exist in the catalog but the summary doesn't carry them
+yet), `Package` now has `license`/`version` for packs that state them, `AssetDetail` carries only `size_bytes` + `stats`, the MCP per-tool allow-list
 (UI-SPEC §16) is still a scaffold so every tool is live when the server runs, and job state is
 in-memory (a crash loses the queue, never the catalog).
