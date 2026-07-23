@@ -20,8 +20,11 @@ tokenizers = "0.20"
 ndarray    = "0.16"
 image      = { workspace = true }
 
-# Added in Phase 4:
-# reqwest    = { version = "0.12", features = ["json", "stream"] }  # Ollama + cloud
+# Phase 4 tagging: Ollama over loopback HTTP. `ureq` (already used for the model downloads)
+# rather than reqwest — the calls are blocking, one at a time, on the persist thread.
+ureq       = { workspace = true, features = ["json"] }
+serde      = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # Multiview 3D embedding tests need the mesh loader + CPU renderer.

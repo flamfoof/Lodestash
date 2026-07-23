@@ -3,6 +3,7 @@
 
 pub mod clap;
 pub mod embedder;
+pub mod ollama;
 pub mod onnx;
 pub mod siglip;
 pub mod tagger;
