@@ -32,6 +32,7 @@ use crate::viewport3d::{self, Viewport3d};
 enum Category {
     All,
     Models,
+    Materials,
     Sounds,
     Images,
 }
@@ -40,16 +41,19 @@ impl Category {
     const TABS: &'static [(Category, &'static str)] = &[
         (Category::All, "\u{25C6} All"),
         (Category::Models, "\u{2B21} Models"),
+        (Category::Materials, "\u{25C7} Materials"),
         (Category::Sounds, "\u{266A} Sounds"),
         (Category::Images, "\u{25A6} Images"),
     ];
 
-    /// Bucket → `media_type` mapping: Models = model_3d+material, Sounds = audio,
-    /// Images = image+texture+sprite+font (UI-SPEC §0.3).
+    /// Bucket → `media_type` mapping: Models = model_3d, Materials = material, Sounds = audio,
+    /// Images = image+texture+sprite+font (UI-SPEC §0.3). Materials used to ride along with
+    /// Models; they carry their own texture dependencies, so they are worth reaching directly.
     fn matches(self, mt: Option<MediaType>) -> bool {
         match self {
             Category::All => true,
-            Category::Models => matches!(mt, Some(MediaType::Model3d | MediaType::Material)),
+            Category::Models => mt == Some(MediaType::Model3d),
+            Category::Materials => mt == Some(MediaType::Material),
             Category::Sounds => mt == Some(MediaType::Audio),
             Category::Images => matches!(
                 mt,
@@ -63,6 +67,7 @@ impl Category {
         match self {
             Category::All => theme::GOLD,
             Category::Models => theme::TYPE_MODEL,
+            Category::Materials => theme::TYPE_MATERIAL,
             Category::Sounds => theme::TYPE_SOUND,
             Category::Images => theme::TYPE_IMAGE,
         }
@@ -1094,6 +1099,9 @@ impl LodestashApp {
                         if let Some(pkg) = resolve_pending_package(source_idx, &file) {
                             pending_packages.push(pkg);
                         }
+                        continue;
+                    }
+                    if !is_browseable(&file) {
                         continue;
                     }
                     entries.push((source_idx, file));
@@ -2507,7 +2515,7 @@ impl LodestashApp {
             }
             // Write-behind: package row + extracted asset rows (DATA-MODEL §7).
             self.spawn_package_persist(msg.source_idx, &msg.abs_path, &msg.files, msg.entries);
-            for file in msg.files {
+            for file in msg.files.into_iter().filter(is_browseable) {
                 self.entries.push(AssetEntry {
                     package: Some(msg.display_name.clone()),
                     file,
@@ -6567,6 +6575,20 @@ fn size_tiers_editor(ui: &mut Ui, tiers: &mut SizeTiers) -> bool {
 
 // ── .unitypackage discovery & extraction ──────────────────────────────────────
 
+/// Is this file a game asset the library should show?
+///
+/// The catalog only ever stored classified files (`asset.media_type_id` is NOT NULL), so an
+/// unclassified one — a `.url` shortcut, a `.pdf` readme, a `.prefab`, a `.cs` script — could
+/// only ever be a grid-only ghost: no status, no facets, no embedding, nothing an agent could
+/// retrieve. Dropping them at the crawl makes the grid and the catalog agree
+/// (INGESTION §3 "non-content", DATA-MODEL §2 media_type).
+///
+/// ponytail: extension-only, matching `detect::by_extension`. A real asset with an unknown
+/// extension is dropped too — wire the magic-byte fallback in if that shows up in practice.
+fn is_browseable(file: &CrawledFile) -> bool {
+    file.media_type.is_some()
+}
+
 fn is_unitypackage(path: &std::path::Path) -> bool {
     path.extension()
         .map(|e| e.eq_ignore_ascii_case("unitypackage"))
@@ -9515,6 +9537,58 @@ mod tests {
             pkg("Zerin", "d"),
         ];
         assert_eq!(publisher_runs(&pkgs), vec![0..2, 2..3, 3..4]);
+    }
+
+    /// The category buckets partition the 7-value `media_type` enum — every type lands in exactly
+    /// one tab, and Materials is its own now that materials carry texture dependencies.
+    #[test]
+    fn category_tabs_partition_the_media_types() {
+        use MediaType::*;
+        for mt in [Model3d, Texture, Audio, Image, Sprite, Material, Font] {
+            let hits: Vec<Category> = Category::TABS
+                .iter()
+                .map(|&(c, _)| c)
+                .filter(|c| *c != Category::All && c.matches(Some(mt)))
+                .collect();
+            assert_eq!(
+                hits.len(),
+                1,
+                "{mt:?} landed in {hits:?}, want exactly one tab"
+            );
+        }
+        assert!(Category::Materials.matches(Some(Material)));
+        assert!(
+            !Category::Models.matches(Some(Material)),
+            "materials left the Models bucket"
+        );
+        assert!(
+            Category::All.matches(None),
+            "All still shows anything the grid holds"
+        );
+    }
+
+    /// Only real game assets reach the grid: a `.url` shortcut or a `.pdf` readme has no
+    /// `media_type`, so the catalog would never hold it either.
+    #[test]
+    fn unclassified_files_are_not_browseable() {
+        let f = |rel: &str| CrawledFile {
+            abs_path: PathBuf::from(rel),
+            rel_path: PathBuf::from(rel),
+            size_bytes: 1,
+            mtime: 1,
+            media_type: lodestash_ingest::detect::by_extension(std::path::Path::new(rel)),
+        };
+        assert!(is_browseable(&f("Models/rock.fbx")));
+        assert!(is_browseable(&f("Materials/rock.mat")));
+        for junk in [
+            "Docs/readme.pdf",
+            "Asset Store.url",
+            "Prefabs/rock.prefab",
+            "Scripts/Player.cs",
+            "notes.txt",
+        ] {
+            assert!(!is_browseable(&f(junk)), "{junk} is not a game asset");
+        }
     }
 
     // ── Content filter predicate (design §3) ──────────────────────────────────

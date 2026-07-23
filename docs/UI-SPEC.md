@@ -105,18 +105,23 @@ are Library filters). Sidebar scrolls as one column.
 
 ### 0.3 Type tab row
 
-Under the top bar, on Library and Identify: **four coarse category tabs** — `All · Models · Sounds ·
-Images` (FEATURES.md §0.2) — each showing its count and colored by its bucket token when active (2px
-underline). `All` never hides; a bucket with a zero count hides. The tabs are a **presentation
+Under the top bar, on Library and Identify: **five coarse category tabs** — `All · Models ·
+Materials · Sounds · Images` (FEATURES.md §0.2) — each showing its count and colored by its bucket
+token when active (2px underline). `All` never hides; a bucket with a zero count hides. The tabs are a **presentation
 grouping over the unchanged 7-value `media_type` enum** (the enum stays
 `model_3d | texture | audio | image | sprite | material | font` — a data-model invariant); finer
 type distinctions live in the ⚑ Filters popover, not the top bar. Bucket → `media_type`:
 
 | Tab | `media_type`(s) |
 |---|---|
-| Models | `model_3d`, `material` |
+| Models | `model_3d` |
+| Materials | `material` |
 | Sounds | `audio` |
 | Images | `image`, `texture`, `sprite`, `font` |
+
+Materials were originally folded into Models; they became their own tab once the dependency graph
+made them a thing you reach *for* (a material is what carries an export's textures — DATA-MODEL
+§10), not just a by-product of a mesh.
 
 *(The earlier second-row Library tabs are gone — the sidebar LIBRARIES facet group (§0.2) absorbed
 the per-source filter.)*

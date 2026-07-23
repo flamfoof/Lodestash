@@ -90,6 +90,12 @@ directions, click to select, missing refs called out), a **painted** link badge 
 outbound edges (the bundled fonts have no chain glyph — U+26AD is tofu, like the dropped ◉), and
 **⚑ Filters ▸ LINKS**. The relink panel from §13.6 is not built.
 
+**The grid shows game assets only.** A file with no `media_type` (`.url`, `.pdf`, `.txt`,
+`.prefab`, `.cs`) is dropped by the crawl — the catalog never held it anyway, so it was a
+grid-only ghost with no status, no facets and no embedding. Grid total went 3768 → 1728, which
+is exactly the catalog's on-disk row count. Prefabs are still read for the dependency graph.
+The category tabs are now five: Materials split out of Models.
+
 **The status lifecycle is live** (P3, [`DATA-MODEL.md`](DATA-MODEL.md) §8). `status` is *derived*,
 not hand-set: `Catalog::promote_statuses` reads the ingest state already on the row — facets
 extracted ⇒ `indexed`, an embedding stored ⇒ `identified`, embedding re-dirtied (file changed) ⇒ back

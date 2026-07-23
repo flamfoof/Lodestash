@@ -222,6 +222,15 @@ non-content so it stays out of content searches**:
   them), but excluded from the default grid and search. Stored as `asset.content_kind` + `is_content=0`
   (see [`DATA-MODEL.md`](DATA-MODEL.md)).
 
+**Unclassified files never reach the grid.** A file whose extension maps to no `media_type` — a
+`.url` shortcut, a `.pdf` readme, a `.txt`, a `.prefab`, a `.cs` — is dropped by the crawl rather
+than shown. The catalog could never hold it anyway (`asset.media_type_id` is NOT NULL), so showing
+it produced a grid-only ghost: no status, no facets, no embedding, invisible to every agent
+operation, and a grid total that disagreed with the health meter. Prefabs are still *read* for the
+dependency graph (DATA-MODEL §10) — read as evidence, not listed as assets. The one cost is that a
+genuine asset with an unrecognised extension is dropped too; the fix there is to widen
+`detect::by_extension` (or wire in the magic-byte fallback), not to re-admit everything.
+
 ---
 
 ## 4. Normalization targets
