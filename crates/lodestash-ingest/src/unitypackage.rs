@@ -76,6 +76,166 @@ pub struct PackageEntry {
     pub has_preview: bool,
 }
 
+/// Pack-level metadata harvested from a `.unitypackage` (DATA-MODEL §7, INGESTION §2): the icon
+/// the Asset Store ships with every pack, plus whatever licence and version the pack states about
+/// itself.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct PackageMeta {
+    /// Raw bytes of the pack's `.icon.png`, when it has one (Asset Store packs always do).
+    pub icon_png: Option<Vec<u8>>,
+    /// From an embedded UPM `package.json`.
+    pub version: Option<String>,
+    pub display_name: Option<String>,
+    /// SPDX-ish identifier: from `package.json`'s `license` field, or recognised from a bundled
+    /// LICENSE file. `None` means "the pack does not say" — the caller supplies the Asset Store
+    /// EULA default, since that is a fact about *where the pack came from*, not about the pack.
+    pub license: Option<String>,
+    pub license_url: Option<String>,
+}
+
+/// Largest text payload worth reading while harvesting: a licence or manifest that exceeds this
+/// is not one.
+const META_PAYLOAD_CAP: u64 = 256 * 1024;
+/// The pack icon is a small square PNG; anything larger is not it.
+const ICON_CAP: u64 = 4 * 1024 * 1024;
+
+/// Does this in-pack path look like a licence document?
+fn is_license_path(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+    let stem = name.split('.').next().unwrap_or(&name);
+    matches!(stem, "license" | "licence" | "copying" | "eula")
+        || stem.starts_with("third-party")
+        || stem.starts_with("third_party")
+}
+
+fn is_package_json(path: &str) -> bool {
+    path.rsplit('/').next().is_some_and(|n| n == "package.json")
+}
+
+/// Recognise a licence from its text. Deliberately a short table of the identifiers that actually
+/// show up in game-asset packs, matched on the distinctive phrase rather than the title line — a
+/// file headed "License" says nothing, its body says which one.
+///
+/// ponytail: no SPDX matcher crate for six needles. Add one when a pack ships something exotic
+/// *and* the answer matters.
+pub fn detect_license(text: &str) -> Option<String> {
+    let head: String = text.chars().take(4000).collect::<String>().to_lowercase();
+    let id = if head.contains("mit license")
+        || head.contains("permission is hereby granted, free of charge")
+    {
+        "MIT"
+    } else if head.contains("apache license") {
+        "Apache-2.0"
+    } else if head.contains("creative commons zero") || head.contains("cc0 1.0") {
+        "CC0-1.0"
+    } else if head.contains("creative commons attribution") {
+        "CC-BY-4.0"
+    } else if head.contains("gnu general public license") {
+        "GPL-3.0"
+    } else if head.contains("redistribution and use in source and binary forms") {
+        "BSD-3-Clause"
+    } else if head.contains("unity asset store") {
+        "Unity Asset Store EULA"
+    } else {
+        return None;
+    };
+    Some(id.to_string())
+}
+
+/// Pull `version`, `displayName` and `license` out of a UPM `package.json` without a schema: the
+/// file is small and only three fields matter.
+fn parse_package_json(text: &str, meta: &mut PackageMeta) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    let get = |key: &str| v.get(key).and_then(|x| x.as_str()).map(str::to_string);
+    // Never overwrite a value an earlier (outer) manifest set: a pack can embed several UPM
+    // packages, and the first one seen is the closest to the pack root.
+    if meta.version.is_none() {
+        meta.version = get("version");
+    }
+    if meta.display_name.is_none() {
+        meta.display_name = get("displayName");
+    }
+    if meta.license.is_none() {
+        meta.license = get("license");
+    }
+    if meta.license_url.is_none() {
+        meta.license_url = get("licensesUrl");
+    }
+}
+
+/// Harvest [`PackageMeta`] from a `.unitypackage`, given the manifest [`read_manifest`] already
+/// produced (which is how the browse pass learns the pathnames without buffering payloads).
+///
+/// Runs a second, targeted pass: only the pack icon and the handful of GUID folders whose pathname
+/// looks like a manifest or a licence are read, and the scan stops as soon as every candidate has
+/// been seen — a 20 GB pack is not re-inflated for a 2 KB file it does not have.
+pub fn read_package_meta(path: &Path, entries: &[PackageEntry]) -> io::Result<PackageMeta> {
+    // guid → (is_package_json)
+    let wanted: BTreeMap<&str, bool> = entries
+        .iter()
+        .filter_map(|e| {
+            let p = e.pathname.as_deref()?;
+            // Only real payloads; a folder entry has no `asset`.
+            // ponytail: map_or, not is_none_or — the workspace MSRV is 1.80.
+            if e.asset_size
+                .map_or(true, |n| n == 0 || n > META_PAYLOAD_CAP)
+            {
+                return None;
+            }
+            if is_package_json(p) {
+                Some((e.guid.as_str(), true))
+            } else if is_license_path(p) {
+                Some((e.guid.as_str(), false))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut meta = PackageMeta::default();
+    let file = File::open(path)?;
+    let gz = GzDecoder::new(file);
+    let mut archive = tar::Archive::new(gz);
+    let mut icon_seen = false;
+    let mut found = 0usize;
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let entry_path = entry.path()?.to_path_buf();
+        let name = entry_path.to_string_lossy().replace('\\', "/");
+        if name == ".icon.png" {
+            icon_seen = true;
+            if entry.header().size().unwrap_or(0) <= ICON_CAP {
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf)?;
+                meta.icon_png = Some(buf);
+            }
+        } else if let Some((guid, member)) = guid_and_member(&entry_path) {
+            if member == "asset" {
+                if let Some(&is_json) = wanted.get(guid.as_str()) {
+                    let mut text = String::new();
+                    // A binary payload that happened to be named LICENSE is simply skipped.
+                    if entry.read_to_string(&mut text).is_ok() {
+                        if is_json {
+                            parse_package_json(&text, &mut meta);
+                        } else if meta.license.is_none() {
+                            meta.license = detect_license(&text);
+                        }
+                    }
+                    found += 1;
+                }
+            }
+        }
+        // Everything asked for has been read; the rest of a multi-GB archive is not our business.
+        if found >= wanted.len() && (icon_seen || meta.icon_png.is_some()) {
+            break;
+        }
+    }
+    Ok(meta)
+}
+
 /// Extract the real path from a `pathname` entry's raw content. Spec is one line, but some
 /// third-party repackaging tools append trailing garbage after a newline (observed in the wild:
 /// a bundled-variant wrapper package appending a stray `00` line) — only the first line is ever
@@ -496,6 +656,112 @@ mod tests {
             }],
         );
         assert!(bad.is_err());
+    }
+
+    #[test]
+    fn license_text_is_recognised_by_its_body_not_its_title() {
+        assert_eq!(
+            detect_license(
+                "MIT License
+
+Permission is hereby granted, free of charge"
+            ),
+            Some("MIT".into())
+        );
+        assert_eq!(
+            detect_license(
+                "                     Apache License
+     Version 2.0"
+            ),
+            Some("Apache-2.0".into())
+        );
+        assert_eq!(
+            detect_license("Creative Commons Attribution 4.0 International"),
+            Some("CC-BY-4.0".into())
+        );
+        // A file headed "License" that says nothing recognisable stays unknown rather than
+        // guessing — a wrong licence is worse than no licence.
+        assert_eq!(
+            detect_license(
+                "License
+
+See our website."
+            ),
+            None
+        );
+        assert_eq!(detect_license(""), None);
+    }
+
+    #[test]
+    fn license_and_manifest_paths_are_spotted() {
+        for p in [
+            "Assets/Pack/LICENSE",
+            "Assets/Pack/license.txt",
+            "Assets/Pack/COPYING.md",
+            "Assets/EULA.txt",
+            "Assets/Third-Party Notices.md",
+        ] {
+            assert!(is_license_path(p), "{p} should look like a licence");
+        }
+        for p in ["Assets/Pack/LicensePlate.fbx", "Assets/Readme.txt"] {
+            assert!(!is_license_path(p), "{p} should not");
+        }
+        assert!(is_package_json("Packages/com.x.y/package.json"));
+        assert!(!is_package_json("Assets/manifest/package.json.bak"));
+    }
+
+    #[test]
+    fn package_json_fills_version_and_licence_without_overwriting() {
+        let mut meta = PackageMeta::default();
+        parse_package_json(
+            r#"{"name":"com.x.y","displayName":"Pathfinding","version":"5.2.1","license":"Custom"}"#,
+            &mut meta,
+        );
+        assert_eq!(meta.version.as_deref(), Some("5.2.1"));
+        assert_eq!(meta.display_name.as_deref(), Some("Pathfinding"));
+        assert_eq!(meta.license.as_deref(), Some("Custom"));
+        // A nested package must not overwrite the outer one's answer.
+        parse_package_json(r#"{"version":"0.0.1","license":"MIT"}"#, &mut meta);
+        assert_eq!(meta.version.as_deref(), Some("5.2.1"));
+        assert_eq!(meta.license.as_deref(), Some("Custom"));
+        // Malformed JSON is ignored, not fatal.
+        parse_package_json("{not json", &mut meta);
+        assert_eq!(meta.version.as_deref(), Some("5.2.1"));
+    }
+
+    /// Against the real Asset Store cache: every pack there ships a `.icon.png`, and newer ones
+    /// embed a UPM manifest. `#[ignore]` — it needs that cache.
+    #[test]
+    #[ignore = "needs a real Asset Store cache"]
+    fn harvest_real_packages() {
+        let root = std::path::PathBuf::from(
+            std::env::var("ASSET_STORE_ROOT").expect("set ASSET_STORE_ROOT"),
+        );
+        let mut seen = 0;
+        for entry in walkdir::WalkDir::new(&root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("unitypackage"))
+            })
+            .take(6)
+        {
+            let path = entry.path();
+            let entries = read_manifest(path).expect("manifest");
+            let meta = read_package_meta(path, &entries).expect("meta");
+            println!(
+                "{:44} icon={:>7} version={:?} license={:?}",
+                path.file_stem().unwrap().to_string_lossy(),
+                meta.icon_png.as_ref().map_or(0, |b| b.len()),
+                meta.version,
+                meta.license
+            );
+            assert!(meta.icon_png.is_some(), "Asset Store packs carry an icon");
+            seen += 1;
+        }
+        assert!(seen > 0, "no packages found under ASSET_STORE_ROOT");
     }
 
     #[test]

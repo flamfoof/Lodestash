@@ -75,6 +75,26 @@ pub fn generate(
     Ok(dest)
 }
 
+/// Where a pack's own icon lives once harvested (`.icon.png` out of the `.unitypackage`).
+/// Keyed by the package path, so two packs never collide and a re-harvest overwrites in place.
+pub fn package_icon_path(cache_dir: &Path, package_path: &str) -> PathBuf {
+    let key = blake3::hash(package_path.as_bytes()).to_hex();
+    cache_dir.join(format!("pkgicon-{}.png", &key[..32]))
+}
+
+/// Store a harvested pack icon. Written verbatim — it is already a small PNG, and re-encoding it
+/// would only lose fidelity for no gain.
+pub fn write_package_icon(
+    cache_dir: &Path,
+    package_path: &str,
+    png: &[u8],
+) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(cache_dir)?;
+    let dest = package_icon_path(cache_dir, package_path);
+    std::fs::write(&dest, png)?;
+    Ok(dest)
+}
+
 /// Render (or serve from cache) a **material sphere** thumbnail: the material's albedo painted on
 /// a ball (UI-SPEC §13.1). `albedo` is resolved by the caller from the dependency graph, so this
 /// module still never touches the catalog.

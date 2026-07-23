@@ -24,6 +24,8 @@ psd        = { workspace = true }
 flate2     = { workspace = true }
 tar        = { workspace = true }
 serde_yaml = { workspace = true }
+# Pack metadata: UPM `package.json` embedded in a .unitypackage (INGESTION §2).
+serde_json = { workspace = true }
 # Filesystem watch over source roots (DATA-MODEL §6).
 notify     = { workspace = true }
 

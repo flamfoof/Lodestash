@@ -92,8 +92,17 @@ Selecting one or multiple packages enqueues a **batch unpack+ingest** job (via t
 - Ingest assets into the catalog **linked back to their origin `package`** (publisher/category/version)
   so you can filter/search "everything from pack X." See [`DATA-MODEL.md`](DATA-MODEL.md) §7.
 - **Harvest license/attribution** while ingesting a pack: the publisher comes free from the cache tree
-  (`<Publisher>/`), and any `LICENSE`/`README`/`Third-Party Notices` text or embedded pack metadata is
-  captured into `package.license`/`attribution`/`license_url`. This is surfaced on every export/import
+  (`<Publisher>/`), and any `LICENSE`/`Third-Party Notices` text or embedded pack metadata is
+  captured into `package.license`/`attribution`/`license_url`. *(Shipped 2026-07-23,
+  `unitypackage::read_package_meta`: a targeted second pass reads the pack's `.icon.png`, any UPM
+  `package.json` — `version`/`displayName`/`license` — and any licence file, matching its **body**
+  against a short identifier table rather than its title, because a file headed "License" says
+  nothing. It early-exits once its candidates are read, so a 20 GB pack is not re-inflated for a
+  2 KB file it doesn't have, and it runs at **extraction** rather than browse for the same reason.
+  A pack with a publisher came from the store cache, which is enough to know its licence: the Asset
+  Store EULA fills in only where the pack itself said nothing. Verified against the real cache —
+  every pack sampled carries a 16-35 KB icon; `A Pathfinding Project Pro` states its version via
+  UPM manifests, the older packs state nothing and are recorded as saying nothing.)* This is surfaced on every export/import
   so credits for bought assets travel with them (an individual asset can override its pack's license).
 - **Harvest the render pipeline** while ingesting: shader GUID references in the pack's `.mat` files
   (URP/HDRP shaders have well-known GUIDs; `Standard`/custom CG shaders ⇒ `built_in`) and any

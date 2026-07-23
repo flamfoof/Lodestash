@@ -39,6 +39,19 @@ pub struct CrawlStats {
     pub unchanged: usize,
 }
 
+/// Catalog metadata for one `import_source` row — feeds the Settings Sources panel
+/// (UI-SPEC §11.1) and the watcher (DATA-MODEL §6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceInfo {
+    pub id: i64,
+    pub name: String,
+    pub root_path: String,
+    pub kind: String,
+    pub last_scanned_at: Option<i64>,
+    pub watch_enabled: bool,
+    pub asset_count: i64,
+}
+
 /// Per-status asset counts (soft-deleted rows excluded). `unidentified` folds
 /// `discovered|indexed` per DATA-MODEL §8.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -296,6 +309,77 @@ impl Catalog {
             )
             .map_err(|e| CoreError::Catalog(format!("source insert: {e}")))?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Metadata for every `import_source` row, with a live asset count.
+    pub fn source_infos(&self) -> Result<Vec<SourceInfo>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT s.id, s.name, s.root_path, s.kind, s.last_scanned_at, s.watch_enabled,
+                        COUNT(a.id) AS asset_count
+                 FROM import_source s
+                 LEFT JOIN asset a ON a.source_id = s.id AND a.deleted_at IS NULL
+                 GROUP BY s.id, s.name, s.root_path, s.kind, s.last_scanned_at, s.watch_enabled
+                 ORDER BY s.name",
+            )
+            .map_err(|e| CoreError::Catalog(format!("source infos prep: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(SourceInfo {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    root_path: r.get(2)?,
+                    kind: r.get(3)?,
+                    last_scanned_at: r.get(4)?,
+                    watch_enabled: r.get::<_, i64>(5)? != 0,
+                    asset_count: r.get::<_, i64>(6)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("source infos query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("source infos row: {e}")))
+    }
+
+    /// Metadata for one source by its absolute root path, if it exists.
+    pub fn source_info_by_root(&self, root_path: &str) -> Result<Option<SourceInfo>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT s.id, s.name, s.root_path, s.kind, s.last_scanned_at, s.watch_enabled,
+                        COUNT(a.id) AS asset_count
+                 FROM import_source s
+                 LEFT JOIN asset a ON a.source_id = s.id AND a.deleted_at IS NULL
+                 WHERE s.root_path = ?1
+                 GROUP BY s.id, s.name, s.root_path, s.kind, s.last_scanned_at, s.watch_enabled",
+            )
+            .map_err(|e| CoreError::Catalog(format!("source info prep: {e}")))?;
+        let row = stmt
+            .query_row(params![root_path], |r| {
+                Ok(SourceInfo {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    root_path: r.get(2)?,
+                    kind: r.get(3)?,
+                    last_scanned_at: r.get(4)?,
+                    watch_enabled: r.get::<_, i64>(5)? != 0,
+                    asset_count: r.get::<_, i64>(6)?,
+                })
+            })
+            .optional()
+            .map_err(|e| CoreError::Catalog(format!("source info row: {e}")))?;
+        Ok(row)
+    }
+
+    /// Enable or disable filesystem watching for one source.
+    pub fn set_source_watch(&self, source_id: i64, enabled: bool) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE import_source SET watch_enabled = ?2 WHERE id = ?1",
+                params![source_id, enabled as i64],
+            )
+            .map_err(|e| CoreError::Catalog(format!("set source watch: {e}")))?;
+        Ok(())
     }
 
     /// Find-or-create a `package` row by `(source_id, package_path)` — the browse-only
@@ -1293,6 +1377,9 @@ pub struct PackageListing {
     pub asset_count: Option<i64>,
     pub unpacked_at: Option<i64>,
     pub pinned: bool,
+    /// Harvested from the pack (DATA-MODEL §7). `None` = the pack didn't say.
+    pub version: Option<String>,
+    pub license: Option<String>,
 }
 
 /// One payload's location inside a `.unitypackage` (DATA-MODEL §13 M6; INGESTION §2
@@ -1393,7 +1480,7 @@ impl Catalog {
             .conn
             .prepare(
                 "SELECT id, name, publisher, category, package_path,
-                        asset_count, unpacked_at, pinned
+                        asset_count, unpacked_at, pinned, version, license
                  FROM package ORDER BY publisher, name",
             )
             .map_err(|e| CoreError::Catalog(format!("pkg list prep: {e}")))?;
@@ -1408,6 +1495,8 @@ impl Catalog {
                     asset_count: r.get(5)?,
                     unpacked_at: r.get(6)?,
                     pinned: r.get(7)?,
+                    version: r.get(8)?,
+                    license: r.get(9)?,
                 })
             })
             .map_err(|e| CoreError::Catalog(format!("pkg list query: {e}")))?;
@@ -1786,6 +1875,33 @@ impl Catalog {
                 |r| r.get(0),
             )
             .map_err(|e| CoreError::Catalog(format!("tag queue count: {e}")))
+    }
+
+    /// Store what a pack says about itself (DATA-MODEL §7): version, licence, attribution and a
+    /// licence URL, harvested from its embedded manifest/licence files or defaulted by origin.
+    ///
+    /// Every field is "set only if we learned something": a later browse of a pack that states
+    /// less must not erase what an earlier ingest found.
+    pub fn set_package_metadata(
+        &self,
+        package_id: i64,
+        version: Option<&str>,
+        license: Option<&str>,
+        attribution: Option<&str>,
+        license_url: Option<&str>,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE package
+                    SET version     = COALESCE(?2, version),
+                        license     = COALESCE(?3, license),
+                        attribution = COALESCE(?4, attribution),
+                        license_url = COALESCE(?5, license_url)
+                  WHERE id = ?1",
+                params![package_id, version, license, attribution, license_url],
+            )
+            .map(|_| ())
+            .map_err(|e| CoreError::Catalog(format!("set_package_metadata: {e}")))
     }
 
     /// For every material that resolves a `uses_texture` edge, the **absolute path** of the

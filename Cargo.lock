@@ -2941,6 +2941,7 @@ dependencies = [
  "notify",
  "psd",
  "rayon",
+ "serde_json",
  "serde_yaml",
  "tar",
  "tempfile",

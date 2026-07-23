@@ -110,11 +110,14 @@ struct ThumbReady {
 
 /// Result of a background crawl. `generation` guards against a stale scan landing
 /// after the user has already opened a different folder/project.
+/// `partial` is `Some(source_idx)` when only one source was rescanned; the handler merges
+/// those entries into the existing grid instead of replacing everything.
 struct ScanDone {
     generation: u64,
     /// (source index into scan_roots, crawled file)
     entries: Vec<(usize, CrawledFile)>,
     pending_packages: Vec<PendingPackage>,
+    partial: Option<usize>,
 }
 
 /// Sidebar LIBRARIES facet selection: a source root, or one extracted package.
@@ -807,6 +810,16 @@ pub struct LodestashApp {
     /// Models Ollama reports as installed, fetched once when the Settings AI card first opens
     /// (the daemon may not be running, and asking every frame would block the UI thread).
     ollama_models: Option<Vec<String>>,
+    /// Catalog `import_source` metadata keyed by root path, cached for the Settings panel.
+    /// Refreshed after catalog sync and after source-related mutations (watch toggle/rescan).
+    source_infos: std::collections::HashMap<String, lodestash_core::catalog::SourceInfo>,
+    /// In-flight source-info refresh.
+    source_info_rx: Receiver<Vec<lodestash_core::catalog::SourceInfo>>,
+    source_info_tx: Sender<Vec<lodestash_core::catalog::SourceInfo>>,
+    source_info_pending: bool,
+    /// Per-source actions collected in Settings and applied after render.
+    pending_rescan: Option<usize>,
+    pending_watch_toggle: Option<(usize, bool)>,
 }
 
 impl LodestashApp {
@@ -823,6 +836,7 @@ impl LodestashApp {
         let (catalog_tx, catalog_rx) = mpsc::channel();
         let (hydrate_tx, hydrate_rx) = mpsc::channel();
         let (viewer_tx, viewer_rx) = mpsc::channel();
+        let (source_info_tx, source_info_rx) = mpsc::channel();
         let config = AppConfig::load();
         let sort_by = config.view.sort_by;
         let sort_asc = config.view.sort_asc;
@@ -934,6 +948,12 @@ impl LodestashApp {
             ollama_models: None,
             engine: None,
             engine_state: None,
+            source_infos: std::collections::HashMap::new(),
+            source_info_rx,
+            source_info_tx,
+            source_info_pending: false,
+            pending_rescan: None,
+            pending_watch_toggle: None,
             config,
         };
 
@@ -1130,6 +1150,7 @@ impl LodestashApp {
                 generation,
                 entries,
                 pending_packages,
+                partial: None,
             });
         });
 
@@ -8387,6 +8408,7 @@ fn persist_package_to_catalog(
             job.category.as_deref(),
         )
         .map_err(|e| e.to_string())?;
+    harvest_package_metadata(&catalog, package_id, job);
     let stats = catalog
         .record_crawl(source_id, Some(package_id), &job.records)
         .map_err(|e| e.to_string())?;
@@ -8416,6 +8438,67 @@ fn persist_package_to_catalog(
         .map_err(|e| e.to_string())?;
     let assets = read_back_assets(&catalog, &sources)?;
     Ok((counts, assets, catalog))
+}
+
+/// Harvest what a pack says about itself and store it (DATA-MODEL §7, INGESTION §2).
+///
+/// Runs at **extraction** time rather than at browse time: the harvest re-reads the archive, and a
+/// 20 GB pack should not be inflated twice just to fill in a version string the user hasn't asked
+/// to see. The entries the extraction already produced tell it which GUIDs are worth reading.
+///
+/// A pack with a publisher came from the Asset Store cache tree, and that is enough to know its
+/// licence — the EULA is a fact about where the pack came from, so it fills in only when the pack
+/// itself said nothing.
+fn harvest_package_metadata(catalog: &Catalog, package_id: i64, job: &PackagePersist) {
+    let entries: Vec<unitypackage::PackageEntry> = job
+        .entries
+        .iter()
+        .map(|e| unitypackage::PackageEntry {
+            guid: e.guid.clone(),
+            pathname: e.pathname.clone(),
+            asset_size: e.size_bytes.map(|n| n as u64),
+            ..Default::default()
+        })
+        .collect();
+    let path = std::path::Path::new(&job.package_path);
+    let meta = match unitypackage::read_package_meta(path, &entries) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(%e, "package metadata harvest failed");
+            return;
+        }
+    };
+    if let (Some(png), Some(cache)) = (&meta.icon_png, default_cache_dirs().0) {
+        if let Err(e) = thumb::write_package_icon(&cache, &job.package_path, png) {
+            tracing::warn!(%e, "pack icon write failed");
+        }
+    }
+    let store_pack = job.publisher.is_some();
+    let license = meta
+        .license
+        .clone()
+        .or_else(|| store_pack.then(|| "Unity Asset Store EULA".to_string()));
+    let license_url = meta
+        .license_url
+        .clone()
+        .or_else(|| store_pack.then(|| "https://unity.com/legal/as-terms".to_string()));
+    if let Err(e) = catalog.set_package_metadata(
+        package_id,
+        meta.version.as_deref(),
+        license.as_deref(),
+        job.publisher.as_deref(),
+        license_url.as_deref(),
+    ) {
+        tracing::warn!(%e, "package metadata write failed");
+    } else {
+        tracing::info!(
+            package = %job.name,
+            version = ?meta.version,
+            license = ?license,
+            icon = meta.icon_png.as_ref().map_or(0, |b| b.len()),
+            "pack metadata harvested"
+        );
+    }
 }
 
 /// Read every live asset row back for the given `(root, source_id)` pairs, keyed for
