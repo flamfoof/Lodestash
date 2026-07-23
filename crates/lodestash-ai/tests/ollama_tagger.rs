@@ -44,11 +44,14 @@ fn names_produce_distinguishing_facets() {
     let mut rows = Vec::new();
     for (name, media, _) in cases {
         let tags = validate(
-            t.tag(&TagInput {
-                media_code: media,
-                name,
-                image: None,
-            })
+            t.tag(
+                &TagInput {
+                    media_code: media,
+                    name,
+                    image: None,
+                },
+                None,
+            )
             .tags,
         );
         let flat: Vec<String> = tags

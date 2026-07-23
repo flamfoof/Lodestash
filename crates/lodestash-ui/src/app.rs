@@ -633,6 +633,12 @@ pub struct LodestashApp {
     search_ranks: Option<std::collections::HashMap<i64, usize>>,
     /// The query the current `search_ranks` were computed for — the recompute guard.
     search_ranks_key: Option<String>,
+    /// Every asset's tags, refreshed per catalog sync (IDENTIFICATION-AND-SEARCH §2). Held beside
+    /// the entries rather than inside them for the same reason as the edge sets: entries outlive
+    /// any single catalog read, and a tagging pass changes tags without rebuilding the grid.
+    asset_tags: std::collections::HashMap<i64, Vec<lodestash_core::catalog::TagAssignment>>,
+    /// Tag vocabulary with usage counts, most-used first — the ⚑ Filters TRAIT chips.
+    tag_usage: Vec<(String, String, i64)>,
     /// Asset ids with at least one resolved outbound / inbound dependency edge (DATA-MODEL §10).
     /// Reloaded on every catalog sync; drives the grid's link badge and the LINKS filter chips.
     /// Sets rather than a per-entry flag — the grid's entries outlive any single catalog read.
@@ -828,6 +834,8 @@ impl LodestashApp {
             project_name: None,
             search: String::new(),
             search_catalog: catalog_db_path().and_then(|p| Catalog::open(&p).ok()),
+            asset_tags: std::collections::HashMap::new(),
+            tag_usage: Vec::new(),
             edges_out: std::collections::HashSet::new(),
             edges_in: std::collections::HashSet::new(),
             related: Vec::new(),
@@ -1378,6 +1386,15 @@ impl LodestashApp {
                 self.related_for = None; // force the inspector panel to re-read
             }
             Err(e) => tracing::warn!(%e, "dependency edge sets unavailable"),
+        }
+        // Tags move on the same beat: a tagging pass reports back through the same message.
+        match cat.all_asset_tags() {
+            Ok(map) => self.asset_tags = map,
+            Err(e) => tracing::warn!(%e, "asset tags unavailable"),
+        }
+        match cat.tag_usage(60) {
+            Ok(v) => self.tag_usage = v,
+            Err(e) => tracing::warn!(%e, "tag vocabulary unavailable"),
         }
     }
 
@@ -3029,17 +3046,22 @@ impl LodestashApp {
             let entries = &self.entries;
             // No trait/tri data pre-catalog → None/&[]; wire real values when P1/P4 land.
             let (edges_out, edges_in) = (&self.edges_out, &self.edges_in);
+            let asset_tags = &self.asset_tags;
             idxs.retain(|&i| {
                 let id = entries[i].asset_id;
                 let links = (
                     id.is_some_and(|id| edges_out.contains(&id)),
                     id.is_some_and(|id| edges_in.contains(&id)),
                 );
+                let traits: Vec<String> = id
+                    .and_then(|id| asset_tags.get(&id))
+                    .map(|tags| tags.iter().map(|t| t.value.clone()).collect())
+                    .unwrap_or_default();
                 cf.passes(
                     entries[i].file.size_bytes,
                     entries[i].metrics.tri_count.map(|t| t.max(0) as u32),
                     entries[i].rating,
-                    &[],
+                    &traits,
                     links,
                     tiers,
                 )
@@ -5738,6 +5760,7 @@ impl eframe::App for LodestashApp {
                             }
                             let cf = &mut self.content_filter;
                             let tiers = &self.config.size_tiers;
+                            let tag_usage = &self.tag_usage;
                             let mut filter_changed = false;
                             egui::popup::popup_below_widget(
                                 ui,
@@ -5745,7 +5768,8 @@ impl eframe::App for LodestashApp {
                                 &fresp,
                                 egui::PopupCloseBehavior::CloseOnClickOutside,
                                 |ui| {
-                                    filter_changed = filter_popover(ui, cf, tiers);
+                                    filter_changed =
+                                        filter_popover(ui, cf, tag_usage, tiers);
                                 },
                             );
                             if filter_changed {
@@ -5966,6 +5990,7 @@ impl eframe::App for LodestashApp {
                 self.ensure_related_loaded(id);
             }
             let related = &self.related;
+            let entry_tags = &self.asset_tags;
             if let Some(cache_idx) = self.selected_cache_idx {
                 if let Some(&entry_idx) = self.sorted_cache.get(cache_idx) {
                     if let Some(entry) = self.entries.get(entry_idx) {
@@ -5993,6 +6018,11 @@ impl eframe::App for LodestashApp {
                                     entry.texture.as_ref(),
                                     library.as_deref(),
                                     related,
+                                    entry
+                                        .asset_id
+                                        .and_then(|id| entry_tags.get(&id))
+                                        .map(Vec::as_slice)
+                                        .unwrap_or(&[]),
                                     &mut inspector_nav,
                                 ) {
                                     inspector_rating = Some((entry_idx, new_rating));
@@ -6645,6 +6675,20 @@ fn reveal_in_file_manager(path: &std::path::Path) {
 // ── Settings screen widgets (design §5) ────────────────────────────────────────
 
 /// A settings section card: `SURFACE` fill, `BORDER`, 10px radius, letter-spaced title.
+/// Chip colour per facet (IDENTIFICATION-AND-SEARCH §2). Facets are the vocabulary's structure,
+/// so they get the type palette rather than one flat "tag" colour.
+fn facet_color(namespace: &str) -> egui::Color32 {
+    match namespace {
+        "subject" => theme::TYPE_MODEL,
+        "style" => theme::ARCANE,
+        "material" => theme::TYPE_MATERIAL,
+        "mood" => theme::GOLD,
+        "usage" => theme::TYPE_IMAGE,
+        "audio" => theme::TYPE_SOUND,
+        _ => theme::TEXT_MUTED,
+    }
+}
+
 /// Whether an Ollama model name looks like a vision model. Ollama's `/api/tags` doesn't report
 /// capability, so the name is the only signal available — and handing pixels to a text-only model
 /// wastes the call, while withholding them from a vision model wastes the model.
@@ -8073,6 +8117,14 @@ fn drain_tags(
         if jobs.is_empty() {
             break;
         }
+        // Two passes over the batch, not one pass doing both stages. Interleaving the vision and
+        // text models makes Ollama evict and reload multi-GB weights on every asset — measured
+        // ~50 s/asset that way, against a few seconds when each model stays resident for a batch.
+        let mut prepared: Vec<(
+            lodestash_core::catalog::VisualEmbedJob,
+            String,
+            Option<String>,
+        )> = Vec::with_capacity(jobs.len());
         for job in jobs {
             if progress.is_cancelled() {
                 return;
@@ -8087,16 +8139,36 @@ fn drain_tags(
                 .and_then(|p| p.file_stem())
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let preview = path
-                .as_deref()
-                .zip(cache_dir)
-                .and_then(|(p, cache)| tag_preview(p, cache, TAG_PX));
+            let caption = if tagger.supports(&job.media_code) {
+                path.as_deref()
+                    .zip(cache_dir)
+                    .and_then(|(p, cache)| tag_preview(p, cache, TAG_PX))
+                    .and_then(|img| {
+                        tagger.caption(&lodestash_ai::tagger::TagInput {
+                            media_code: &job.media_code,
+                            name: &name,
+                            image: Some(&img),
+                        })
+                    })
+            } else {
+                None
+            };
+            prepared.push((job, name, caption));
+        }
+
+        for (job, name, caption) in prepared {
+            if progress.is_cancelled() {
+                return;
+            }
             let result = if tagger.supports(&job.media_code) {
-                tagger.tag(&lodestash_ai::tagger::TagInput {
-                    media_code: &job.media_code,
-                    name: &name,
-                    image: preview.as_ref(),
-                })
+                tagger.tag(
+                    &lodestash_ai::tagger::TagInput {
+                        media_code: &job.media_code,
+                        name: &name,
+                        image: None,
+                    },
+                    caption.as_deref(),
+                )
             } else {
                 lodestash_ai::tagger::TagResult::default()
             };
@@ -8631,7 +8703,12 @@ fn section_label(ui: &mut Ui, text: &str) {
 /// Only the FILE SIZE section is interactive today; TRAIT and TRIANGLES are shown but disabled
 /// until their backing data exists (traits → P4 AI tagging, tri counts → P1 3D metadata), so a
 /// user can never select a facet that would filter the grid to empty.
-fn filter_popover(ui: &mut Ui, cf: &mut ContentFilter, tiers: &SizeTiers) -> bool {
+fn filter_popover(
+    ui: &mut Ui,
+    cf: &mut ContentFilter,
+    tag_usage: &[(String, String, i64)],
+    tiers: &SizeTiers,
+) -> bool {
     ui.set_min_width(320.0);
     let mut changed = false;
 
@@ -8661,19 +8738,48 @@ fn filter_popover(ui: &mut Ui, cf: &mut ContentFilter, tiers: &SizeTiers) -> boo
     });
     ui.separator();
 
-    // TRAIT — no tag data pre-catalog (P4).
+    // TRAIT — the tag vocabulary, most-used first (IDENTIFICATION-AND-SEARCH §2).
     section_label(ui, "TRAIT");
-    ui.add_enabled(
-        false,
-        egui::TextEdit::singleline(&mut cf.trait_search)
-            .hint_text("search traits\u{2026}")
-            .desired_width(140.0),
-    );
-    ui.label(
-        RichText::new("No traits yet \u{2014} assets gain traits after AI identification.")
+    if tag_usage.is_empty() {
+        ui.label(
+            RichText::new(
+                "No traits yet \u{2014} run Settings \u{25b8} AI \u{00b7} Identify to tag the library.",
+            )
             .size(10.0)
             .color(theme::TEXT_DIM),
-    );
+        );
+    } else {
+        ui.add(
+            egui::TextEdit::singleline(&mut cf.trait_search)
+                .hint_text("search traits\u{2026}")
+                .desired_width(140.0),
+        );
+        let needle = cf.trait_search.trim().to_lowercase();
+        ui.horizontal_wrapped(|ui| {
+            let mut shown = 0usize;
+            for (namespace, value, count) in tag_usage {
+                // Selected chips always stay visible, or a search would hide the filter that is
+                // currently narrowing the grid.
+                let selected = cf.traits.contains(value);
+                if !selected && !needle.is_empty() && !value.to_lowercase().contains(&needle) {
+                    continue;
+                }
+                if !selected && shown >= 18 {
+                    continue;
+                }
+                shown += 1;
+                let label = format!("{value}  {count}");
+                if filter_chip(ui, &label, selected, facet_color(namespace)) {
+                    if selected {
+                        cf.traits.remove(value);
+                    } else {
+                        cf.traits.insert(value.clone());
+                    }
+                    changed = true;
+                }
+            }
+        });
+    }
     ui.add_space(6.0);
 
     // TRIANGLES — backed by asset.tri_count (DATA-MODEL §14), extracted after each scan.
@@ -8897,6 +9003,7 @@ fn inspector_pane(
     texture: Option<&TextureHandle>,
     library: Option<&str>,
     related: &[lodestash_core::catalog::RelatedAsset],
+    tags: &[lodestash_core::catalog::TagAssignment],
     nav_to: &mut Option<i64>,
 ) -> Option<Option<u8>> {
     let mut rating_clicked: Option<Option<u8>> = None;
@@ -9003,6 +9110,55 @@ fn inspector_pane(
             }
             stat_row(ui, "Path", &file.abs_path.to_string_lossy());
         });
+
+    // TRAITS (UI-SPEC §13.5) — the facet tags identification produced. AI tags carry a confidence
+    // underbar; the value itself is never hidden, since the threshold is a display rule and not a
+    // deletion (IDENTIFICATION-AND-SEARCH §2).
+    ui.add_space(10.0);
+    section_label(ui, "TRAITS");
+    if tags.is_empty() {
+        ui.label(
+            RichText::new(if status.is_unidentified() {
+                "No traits yet \u{2014} run Identify."
+            } else {
+                "No traits on this asset."
+            })
+            .size(10.0)
+            .color(theme::TEXT_DIM),
+        );
+    } else {
+        ui.horizontal_wrapped(|ui| {
+            for tag in tags {
+                let color = facet_color(&tag.namespace);
+                let resp = ui
+                    .add(
+                        egui::Button::new(RichText::new(&tag.value).size(10.0).color(color))
+                            .fill(color.linear_multiply(0.10))
+                            .stroke(egui::Stroke::new(1.0, color.linear_multiply(0.55)))
+                            .rounding(8.0),
+                    )
+                    .on_hover_text(match tag.confidence {
+                        Some(c) => {
+                            format!("{} \u{00b7} {:.0}% confident", tag.namespace, c * 100.0)
+                        }
+                        None => format!("{} \u{00b7} exact", tag.namespace),
+                    });
+                // Confidence underbar: a model's self-estimate, drawn rather than written so a
+                // chip stays a chip.
+                if let Some(c) = tag.confidence {
+                    let r = resp.rect;
+                    let w = (r.width() - 8.0) * (c as f32).clamp(0.0, 1.0);
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(r.left() + 4.0, r.bottom() - 1.5),
+                            egui::pos2(r.left() + 4.0 + w, r.bottom() - 1.5),
+                        ],
+                        egui::Stroke::new(1.5, color),
+                    );
+                }
+            }
+        });
+    }
 
     // LINKED FILES (UI-SPEC §13.6) — what this asset drags along, and what would drag it.
     if !related.is_empty() {
@@ -10025,6 +10181,54 @@ mod tests {
         println!("search 'red' -> {hits:?}");
     }
 
+    /// Tag a slice of the **real** library, then cancel — proving the pass is interruptible and
+    /// resumable (`tags_dirty` is per asset) and giving the UI something real to draw.
+    ///
+    /// ```bash
+    /// LODESTASH_DB=".../catalog.db" OLLAMA_MODEL=qwen3:8b OLLAMA_VISION=moondream:latest     ///   cargo test -p lodestash-ui tag_real_library_slice -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes tags into a real catalog; needs Ollama"]
+    fn tag_real_library_slice() {
+        let db = std::env::var("LODESTASH_DB").expect("set LODESTASH_DB");
+        let model = std::env::var("OLLAMA_MODEL").expect("set OLLAMA_MODEL");
+        let seconds: u64 = std::env::var("TAG_SECONDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(120);
+        let mut cat = Catalog::open(std::path::Path::new(&db)).expect("open real catalog");
+        let before = cat.count_needing_tags().expect("count");
+
+        let tagger = match std::env::var("OLLAMA_VISION") {
+            Ok(v) => lodestash_ai::ollama::OllamaTagger::new(model).with_vision(v),
+            Err(_) => lodestash_ai::ollama::OllamaTagger::new(model),
+        };
+        let progress = std::sync::Arc::new(crate::jobs::JobProgress::default());
+        let stop = progress.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(seconds));
+            stop.cancelled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let cache = dirs::cache_dir()
+            .map(|d| d.join("Lodestash").join("thumbs"))
+            .expect("cache dir");
+        drain_tags(&mut cat, &tagger, None, Some(&cache), &progress);
+
+        let after = cat.count_needing_tags().expect("count after");
+        let done = progress.done.load(std::sync::atomic::Ordering::Relaxed);
+        println!("tagged {done} assets; queue {before} -> {after}");
+        assert!(done > 0, "nothing was tagged");
+        assert_eq!(
+            after,
+            before - done as i64,
+            "the queue shrank by exactly what was tagged — the rest stays queued"
+        );
+        for (ns, value, n) in cat.tag_usage(15).expect("usage") {
+            println!("  {ns:9} {value:24} {n}");
+        }
+    }
+
     /// Vision detection is name-based (Ollama reports no capability flag), so it has to catch the
     /// families people actually pull and not fire on a text model that merely contains a letter
     /// pair.
@@ -10062,6 +10266,41 @@ mod tests {
             (false, false),
             &tiers
         ));
+    }
+
+    /// The TRAIT chips filter on tag *values*, and an asset with no tags must fail the filter
+    /// rather than pass it — otherwise selecting a trait would show the untagged backlog too.
+    #[test]
+    fn content_filter_traits_match_tag_values() {
+        let tiers = SizeTiers::default();
+        let mut cf = ContentFilter::default();
+        cf.traits.insert("rock".to_string());
+        let t = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+
+        assert!(cf.passes(
+            10,
+            None,
+            None,
+            &t(&["rock", "grey"]),
+            (false, false),
+            &tiers
+        ));
+        assert!(
+            cf.passes(
+                10,
+                None,
+                None,
+                &t(&["stone", "rock"]),
+                (false, false),
+                &tiers
+            ),
+            "any selected trait matches"
+        );
+        assert!(!cf.passes(10, None, None, &t(&["sword"]), (false, false), &tiers));
+        assert!(
+            !cf.passes(10, None, None, &[], (false, false), &tiers),
+            "an untagged asset is not a match"
+        );
     }
 
     /// The LINKS chips read the dependency graph, not the file (DATA-MODEL §10): an asset with no

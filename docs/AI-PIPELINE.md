@@ -40,6 +40,13 @@ trait Embedder {
 }
 ```
 
+**Run the stages in batches, not per asset.** Measured on this box: alternating the vision and
+text models per asset costs **~50 s/asset**, because Ollama evicts and reloads multi-GB weights on
+every call. Captioning a whole batch, then facet-passing that batch, keeps each model resident and
+brings a facet call to **~7-8 s**. Requests also send `keep_alive` so the weights survive between
+batches. This is why the drain is staged rather than a single loop, and it is the number to
+re-measure before assuming a bigger model is affordable.
+
 **Why the local tagger is two models.** Measured, not assumed: asked for facet JSON directly,
 `moondream` degenerates into arrays of numbers (its JSON mode is trained for grounding boxes, not
 objects) — while the *same* model captions the *same* preview accurately in prose. So the vision

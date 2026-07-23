@@ -46,10 +46,20 @@ pub trait Tagger {
     /// Whether this tagger can say anything about a given `media_type.code`. A vision tagger
     /// returns false for audio rather than guessing from the filename.
     fn supports(&self, media_code: &str) -> bool;
-    /// Propose tags (and optionally a caption). An empty result is a valid answer — "nothing
-    /// recognisable" is information, and the caller still clears the queue flag so the asset isn't
-    /// re-run forever.
-    fn tag(&self, input: &TagInput<'_>) -> TagResult;
+    /// Describe the asset's preview in prose, when this tagger has a model that can.
+    ///
+    /// Split from [`Self::tag`] so a caller can run all the captions first and all the facet
+    /// passes second. That is not a style choice: alternating two Ollama models per asset makes
+    /// the daemon evict and reload multi-GB weights on every call, which measured **~50 s/asset**
+    /// against a few seconds when each model stays resident for a batch.
+    fn caption(&self, _input: &TagInput<'_>) -> Option<String> {
+        None
+    }
+
+    /// Propose tags, optionally given a caption produced earlier by [`Self::caption`]. An empty
+    /// result is a valid answer — "nothing recognisable" is information, and the caller still
+    /// clears the queue flag so the asset isn't re-run forever.
+    fn tag(&self, input: &TagInput<'_>, caption: Option<&str>) -> TagResult;
 }
 
 /// The facet namespaces a *model* is allowed to fill (IDENTIFICATION-AND-SEARCH §2).
@@ -124,7 +134,7 @@ impl Tagger for FilenameTagger {
         true // a filename exists for every asset
     }
 
-    fn tag(&self, input: &TagInput<'_>) -> TagResult {
+    fn tag(&self, input: &TagInput<'_>, _caption: Option<&str>) -> TagResult {
         // Split on the separators asset names actually use, so `SM_Chr_Ghost_01` yields tokens
         // rather than one long word.
         let lower = input.name.to_lowercase();
@@ -163,7 +173,7 @@ mod tests {
             name: "SM_Chr_Ghost_01",
             image: None,
         };
-        let tags = t.tag(&input).tags;
+        let tags = t.tag(&input, None).tags;
         assert_eq!(
             tags.iter().map(|t| t.value.as_str()).collect::<Vec<_>>(),
             vec!["character"]
@@ -171,10 +181,13 @@ mod tests {
 
         // Two conventions in one name, and the same value twice collapses.
         let tags = t
-            .tag(&TagInput {
-                name: "SM_Env_Wall_01_Wall_Alt",
-                ..input
-            })
+            .tag(
+                &TagInput {
+                    name: "SM_Env_Wall_01_Wall_Alt",
+                    ..input
+                },
+                None,
+            )
             .tags;
         let mut values: Vec<&str> = tags.iter().map(|t| t.value.as_str()).collect();
         values.sort();
@@ -182,10 +195,13 @@ mod tests {
 
         // A substring is not a match: "character" must not fire on "chrome".
         assert!(t
-            .tag(&TagInput {
-                name: "chrome_panel",
-                ..input
-            })
+            .tag(
+                &TagInput {
+                    name: "chrome_panel",
+                    ..input
+                },
+                None
+            )
             .tags
             .is_empty());
     }

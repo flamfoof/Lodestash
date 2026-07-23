@@ -1777,6 +1777,68 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("tag queue count: {e}")))
     }
 
+    /// Every live asset's tags in one query, keyed by asset id — what the grid needs to draw
+    /// chips and filter on a trait without a query per row.
+    ///
+    /// ponytail: whole-library read, refreshed per catalog sync like the dependency edge sets. At
+    /// ~10 tags per asset that is tens of thousands of small rows, which SQLite hands over in
+    /// milliseconds; page it if a library ever makes that false.
+    pub fn all_asset_tags(&self) -> Result<std::collections::HashMap<i64, Vec<TagAssignment>>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT at.asset_id, COALESCE(t.namespace, 'free'), t.name, at.confidence
+                   FROM asset_tag at
+                   JOIN tag t   ON t.id = at.tag_id
+                   JOIN asset a ON a.id = at.asset_id AND a.deleted_at IS NULL
+                  ORDER BY at.asset_id, t.namespace, t.name",
+            )
+            .map_err(|e| CoreError::Catalog(format!("all tags prep: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    TagAssignment {
+                        namespace: r.get(1)?,
+                        value: r.get(2)?,
+                        confidence: r.get(3)?,
+                    },
+                ))
+            })
+            .map_err(|e| CoreError::Catalog(format!("all tags query: {e}")))?;
+        let mut out: std::collections::HashMap<i64, Vec<TagAssignment>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let (id, tag) = row.map_err(|e| CoreError::Catalog(format!("all tags row: {e}")))?;
+            out.entry(id).or_default().push(tag);
+        }
+        Ok(out)
+    }
+
+    /// Tag vocabulary with usage counts, most-used first — the Filters TRAIT chips and the Traits
+    /// screen. Returns `(namespace, value, asset count)`.
+    pub fn tag_usage(&self, limit: usize) -> Result<Vec<(String, String, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT COALESCE(t.namespace, 'free'), t.name, COUNT(DISTINCT at.asset_id) n
+                   FROM tag t
+                   JOIN asset_tag at ON at.tag_id = t.id
+                   JOIN asset a      ON a.id = at.asset_id AND a.deleted_at IS NULL
+                  GROUP BY t.id
+                  ORDER BY n DESC, t.name
+                  LIMIT ?1",
+            )
+            .map_err(|e| CoreError::Catalog(format!("tag usage prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(|e| CoreError::Catalog(format!("tag usage query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("tag usage row: {e}")))
+    }
+
     /// Assets still awaiting identification (`tags_dirty`), for the tagging drain. Same job shape
     /// and path rules as the other queues.
     pub fn assets_needing_tags(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
@@ -3528,6 +3590,51 @@ mod tests {
             )
             .expect("flag");
         assert_eq!(dirty, 0, "tagging clears the queue flag");
+    }
+
+    /// The grid reads tags in bulk, and the filter chips read the vocabulary with counts; both
+    /// must exclude trashed assets, or the UI offers a facet that filters to nothing.
+    #[test]
+    fn bulk_tag_reads_skip_trashed_assets() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let s = c.upsert_import_source("A", "C:/a", "folder").expect("src");
+        c.record_crawl(s, None, &[rec("a.png", 1, 1), rec("b.png", 2, 2)])
+            .expect("crawl");
+        let ids: Vec<i64> = c
+            .conn
+            .prepare("SELECT id FROM asset ORDER BY id")
+            .and_then(|mut st| {
+                st.query_map([], |r| r.get(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .expect("ids");
+        for id in &ids {
+            c.set_tags(
+                *id,
+                "ai",
+                Some("m"),
+                &[TagAssignment::exact("subject", "rock")],
+            )
+            .expect("tag");
+        }
+        assert_eq!(c.all_asset_tags().expect("bulk").len(), 2);
+        assert_eq!(
+            c.tag_usage(10).expect("usage"),
+            vec![("subject".to_string(), "rock".to_string(), 2)]
+        );
+
+        c.set_trashed(&[ids[0]], true).expect("trash");
+        assert_eq!(
+            c.all_asset_tags().expect("bulk after trash").len(),
+            1,
+            "a trashed asset leaves the grid, so its tags do too"
+        );
+        assert_eq!(
+            c.tag_usage(10).expect("usage after trash")[0].2,
+            1,
+            "the chip count follows"
+        );
     }
 
     /// Namespaces share the `tag` table, and `norm_name` is globally UNIQUE — so the same word in

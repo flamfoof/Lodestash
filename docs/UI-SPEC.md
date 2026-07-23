@@ -525,6 +525,11 @@ Opens when an asset is selected; ✕ / Esc closes. Top→bottom:
 5. **TRAITS**: chips (manual = trait-colored w/ icon; AI = arcane outline + confidence underbar,
    AI-PIPELINE §6); Unidentified → *"No traits yet — run Identify."*; below, dashed **`+ trait`**
    quick-add chips from the Trait Library (scope-matched, not yet applied).
+   *(Shipped 2026-07-23: the chips — one per facet value, coloured by facet (subject / style /
+   material / mood / usage / audio / free), AI tags carrying a drawn confidence underbar and a
+   hover reading `facet · NN% confident`. Empty state is "No traits yet — run Identify." Not yet:
+   the dashed `+ trait` quick-add chips from the Trait Library, and accept/reject.)*
+
 6. **LINKED FILES** (when the asset has dependencies — `asset_relationship`, DATA-MODEL §10):
    caption notes the parse source (`parsed from FBX bindings` / `.mtl sidecar` / `.meta GUID refs`);
    rows: kind glyph (◇ material violet / ▦ texture sapphire, textures indented) + mono name +

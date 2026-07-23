@@ -91,6 +91,10 @@ impl OllamaTagger {
             "prompt": prompt,
             "stream": false,
             "options": { "temperature": 0.0 },
+            // Keep the weights resident between calls. Ollama evicts on its own schedule, and a
+            // reload of a multi-GB model costs more than the inference does — the drain measured
+            // ~50 s/asset while two models took turns, and ~8 s once each stayed loaded.
+            "keep_alive": "10m",
         });
         if json {
             // Constrained decoding removes the commonest failure of small models on the facet
@@ -223,27 +227,20 @@ impl Tagger for OllamaTagger {
         media_code != "audio"
     }
 
-    fn tag(&self, input: &TagInput<'_>) -> TagResult {
-        // Stage 1 (optional): caption the preview with the vision model.
-        let caption = match (&self.vision_model, input.image) {
-            (Some(model), Some(img)) => match encode_png(img) {
-                Ok(png) => self
-                    .generate(model, &caption_prompt(input.media_code), Some(&png), false)
-                    .map_err(
-                        |e| tracing::warn!(%model, %e, "captioning failed; using the name alone"),
-                    )
-                    .ok()
-                    .and_then(|c| clean_caption(&c)),
-                Err(e) => {
-                    tracing::warn!(%e, "preview encode failed; using the name alone");
-                    None
-                }
-            },
-            _ => None,
-        };
+    fn caption(&self, input: &TagInput<'_>) -> Option<String> {
+        let model = self.vision_model.as_ref()?;
+        let img = input.image?;
+        let png = encode_png(img)
+            .map_err(|e| tracing::warn!(%e, "preview encode failed; tagging from the name"))
+            .ok()?;
+        self.generate(model, &caption_prompt(input.media_code), Some(&png), false)
+            .map_err(|e| tracing::warn!(%model, %e, "captioning failed; tagging from the name"))
+            .ok()
+            .and_then(|c| clean_caption(&c))
+    }
 
-        // Stage 2: the text model turns the evidence into the facet schema.
-        let prompt = build_prompt(input, caption.as_deref());
+    fn tag(&self, input: &TagInput<'_>, caption: Option<&str>) -> TagResult {
+        let prompt = build_prompt(input, caption);
         let tags = match self.generate(&self.text_model, &prompt, None, true) {
             // Pixels make a stronger claim than a filename, and the confidence has to say so:
             // the UI hides low-confidence tags rather than deleting them.
@@ -253,7 +250,10 @@ impl Tagger for OllamaTagger {
                 Vec::new()
             }
         };
-        TagResult { tags, caption }
+        TagResult {
+            tags,
+            caption: caption.map(str::to_string),
+        }
     }
 }
 
