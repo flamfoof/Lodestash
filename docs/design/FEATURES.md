@@ -68,6 +68,10 @@ The core screen: a responsive grid of asset cards with a filter/sort toolbar and
 - **Thumbnail** (procedurally tinted in the prototype; real app renders a cached preview), a **size
   tier badge** (S/M/L/XL, coloured by tier — see §5.3), a **status gem** (`?` unid / `✓` identified /
   `★` confirmed), **stage** button (adds to the staging tray), and a **⤢ full-size** affordance.
+- **Favourite heart** (top-left, `DANGER` token) on pinned assets — `F` toggles it on the selection
+  (or the lead card), and the card right-click menu carries the same action. A favourite is a **pin,
+  not a rating**: "find this again" and "how good is it" are different questions, so the star rating
+  and the heart never imply each other (DATA-MODEL §12).
 - **Body:** name, `pack · stats` line, and **tag chips** (first 3 + “+N” expander). Confirmed/AI tags
   show a confidence bar; unidentified cards show a `???` placeholder.
 - **Click** selects (opens inspector); **Space** on a selection opens Quick Look; **⟡ stage** stages.
@@ -86,13 +90,19 @@ largest / smallest / tri count), **view mode** (grid / list), **grid-size** sele
 **⚑ Filters** popover trigger (badge = active filter count).
 
 ### 1.4 Filters popover
-Three multi-select sections (an asset passes if it matches **selected traits (any)** AND **selected
-tri buckets (any)** AND **selected size tiers (any)**):
+Multi-select sections (an asset passes if it matches **selected traits (any)** AND **selected
+tri buckets (any)** AND **selected size tiers (any)** AND every single-select switch below):
 - **TRAIT** — chips of the library’s tags, most-frequent first, with a **search field** to filter the
   chip list. Selected = `ARCANE` outline + `ARCANE_BRIGHT` text.
 - **TRIANGLES** (models only) — `≤1k / 1k–3k / 3k–6k / 6k+`. Selected tinted `TYPE_MODEL`.
 - **FILE SIZE** — S/M/L/XL, ranges driven by the Settings size-tier thresholds (§5.3). Selected
   tinted by tier colour.
+- **FAVOURITES** — one *Favourites only* switch (DATA-MODEL §12). One-way on purpose: nobody
+  browses for "things I did **not** favourite". An asset with no catalog row cannot be a favourite,
+  so it fails this filter rather than slipping through.
+- **LINKS** — *uses others* / *used by others*, from the harvested dependency graph (DATA-MODEL §10).
+  Single-select: a material sits in the middle of a chain and satisfies either, so combining them
+  would silently mean "intersection".
 - Header has **Clear all** (danger on hover). Implement the pass function as a pure, unit-tested
   predicate.
 
@@ -318,7 +328,11 @@ rows.
   everything” affordance. Keep these two code paths separate in `app.rs`.
 - **Staging is per-project;** switching projects never mixes picks.
 - **Nothing is destructive without intent:** Trash is catalog-only and restorable; duplicates are
-  never auto-deleted; imports/pins copy nothing.
+  never auto-deleted; imports/pins copy nothing. The **one** exception is **delete from disk**
+  (Settings danger flow): it is gated behind an explicit confirmation modal naming the file count,
+  deletes only files that sit under a source root the user opened or inside the app's own extraction
+  workspace, and marks a catalog row trashed **only after** its file actually left the disk — a
+  failed delete says so rather than leaving the catalog claiming the file is gone.
 - **Motion:** honour `prefers-reduced-motion`; popovers ~160ms fade+rise; no gratuitous animation.
 - **Derived logic** (`size_tier_of`, filter predicate, grid column math, duplicate match, dependency
   resolution) lives as **pure, unit-tested functions** — the egui render loop stays thin
@@ -338,6 +352,8 @@ rows.
   promoted to the sidebar. Config persists only what isn't catalog-derived (custom Asset Store cache
   roots, `cache_extracted`).
 - Collections; user traits (name, scope, usage, teach flag, colour/icon).
+- **Favourites live in the catalog, not config** — `asset.favorite` (DATA-MODEL §12, M12), so a pin
+  travels with the library rather than with one machine's settings file.
 - MCP (enabled, transport/port, token, per-tool allow-list); auto-identify, auto-purge, cache cap,
   engine-bridge, confirm-trash flags; active export target + per-project staging/history.
 - **Transient (not persisted):** active filter sets, trait-search string, popover/expanded state,

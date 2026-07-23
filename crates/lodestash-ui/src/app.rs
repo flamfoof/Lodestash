@@ -435,6 +435,8 @@ impl ContentFilter {
     /// imposes no constraint. Assets lacking a tri count are excluded when any tri-bucket is
     /// selected (design §3). Kept pure over primitives so it's unit-testable without an
     /// `AssetEntry` (TECH-STACK.md §5.1).
+    // ponytail: a predicate over primitives, kept free of an AssetEntry so it stays unit-testable.
+    #[allow(clippy::too_many_arguments)]
     fn passes(
         &self,
         size: u64,
@@ -2009,33 +2011,61 @@ impl LodestashApp {
     /// rows in the Trash as a record. This is the explicit danger flow; it cannot be undone.
     /// (DESIGN-GUIDELINES.md §Settings).
     fn delete_files_from_disk(&mut self, entry_idxs: &[usize]) {
-        let mut paths = Vec::new();
+        let mut deleted = Vec::new();
+        let mut failed = 0usize;
+        let mut refused = 0usize;
         for &i in entry_idxs {
-            if let Some(e) = self.entries.get(i) {
-                if let Some(root) = self.scan_roots.get(e.source_idx) {
-                    let path = root.join(&e.file.rel_path);
-                    paths.push((e.asset_id, path));
+            let Some(entry) = self.entries.get(i) else {
+                continue;
+            };
+            // `abs_path` is the authoritative location every other action uses (Reveal, Open,
+            // thumbnails). Rebuilding it as `scan_root.join(rel_path)` is wrong for
+            // package-extracted entries, whose `rel_path` is relative to the **workspace** — that
+            // reconstruction can name a real, unrelated file under the source root.
+            let path = entry.file.abs_path.clone();
+            if !self.is_deletable_path(&path) {
+                tracing::warn!(path = %path.display(), "refused to delete: outside every known root");
+                refused += 1;
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    tracing::info!(path = %path.display(), "deleted file from disk");
+                    deleted.push(i);
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), %e, "delete from disk failed");
+                    failed += 1;
                 }
             }
         }
-        if paths.is_empty() {
-            return;
+        // Only what actually left the disk is recorded as gone. Trashing first and deleting
+        // afterwards let a failed delete leave the catalog claiming the file was removed.
+        if !deleted.is_empty() {
+            self.set_entries_trashed(&deleted, true);
+            self.jobs.toast(
+                format!("Deleted {} file(s) from disk", deleted.len()),
+                Intent::Warning,
+            );
         }
-        self.set_entries_trashed(entry_idxs, true);
-        std::thread::spawn(move || {
-            for (_, path) in &paths {
-                if path.is_file() {
-                    let _ = std::fs::remove_file(path);
-                } else if path.is_dir() {
-                    let _ = std::fs::remove_dir_all(path);
-                }
-            }
-            for (id, _) in paths {
-                if let Some(id) = id {
-                    tracing::info!(%id, "deleted file from disk");
-                }
-            }
-        });
+        if failed + refused > 0 {
+            self.jobs.toast(
+                format!(
+                    "{} file(s) could not be deleted — they are still on disk",
+                    failed + refused
+                ),
+                Intent::Danger,
+            );
+        }
+    }
+
+    /// Guard for the one destructive path in the app: a file may only be deleted when it sits
+    /// under a source root the user opened, or inside the extraction workspace this app owns.
+    ///
+    /// Defence in depth, not the primary check — the primary check is using `abs_path` rather than
+    /// recomposing a path. This is what bounds the blast radius if a future change gets that wrong.
+    fn is_deletable_path(&self, path: &std::path::Path) -> bool {
+        path.is_file() && under_known_root(path, &self.scan_roots, self.workspace_dir.as_deref())
     }
 
     /// Move entries to / restore them from the Trash: optimistic local flip, then the
@@ -2428,11 +2458,12 @@ impl LodestashApp {
             let new: std::collections::HashSet<_> =
                 self.source_infos.values().map(|i| i.id).collect();
             dirty = old != new
-                || self.scan_roots.iter().any(|r| {
-                    self.source_infos
-                        .get(&r.to_string_lossy().to_string())
-                        .is_some()
-                });
+                || self
+                    .scan_roots
+                    .iter()
+                    // `contains_key` over a `str` — the previous `get(&…to_string())` allocated
+                    // twice per root on a path that runs every frame.
+                    .any(|r| self.source_infos.contains_key(r.to_string_lossy().as_ref()));
         }
         if dirty {
             self.start_watching();
@@ -8373,6 +8404,7 @@ fn thumbnail_grid(
 
 /// List/table view: one asset per row with a small thumbnail, name, type, size and rating.
 /// Returns a `GridOutput` with `cols == 1` so the caller can reuse the same post-render plumbing.
+#[allow(clippy::too_many_arguments)] // ponytail: mirrors grid state; an args struct would just rename them
 fn asset_list(
     ui: &mut Ui,
     entries: &[AssetEntry],
@@ -8403,8 +8435,7 @@ fn asset_list(
             if row_range.start != prev_row_start || row_range.end != prev_row_end {
                 let (buf_start, buf_end) =
                     lookahead_window(row_range.start, row_range.end, total_rows);
-                for row in buf_start..buf_end {
-                    let idx = indices[row];
+                for &idx in &indices[buf_start..buf_end] {
                     if !entries[idx].thumb_spawned && needs_thumbnail(entries[idx].file.media_type)
                     {
                         to_spawn.push(idx);
@@ -10074,6 +10105,7 @@ fn filter_popover(
 }
 
 /// Returns true if the card was clicked.
+#[allow(clippy::too_many_arguments)] // ponytail: mirrors grid state; an args struct would just rename them
 fn asset_card(
     ui: &mut Ui,
     entry: &AssetEntry,
@@ -11216,6 +11248,16 @@ enum ThumbKind {
     },
 }
 
+/// Is `path` inside a source root the user opened, or the extraction workspace this app owns?
+/// Pure so the one destructive path in the app has a testable guard (TECH-STACK §5.1).
+fn under_known_root(
+    path: &std::path::Path,
+    roots: &[PathBuf],
+    workspace: Option<&std::path::Path>,
+) -> bool {
+    roots.iter().any(|r| path.starts_with(r)) || workspace.is_some_and(|w| path.starts_with(w))
+}
+
 fn needs_thumbnail(mt: Option<MediaType>) -> bool {
     matches!(
         mt,
@@ -11596,6 +11638,36 @@ mod tests {
         assert!(
             !cf.passes(10, None, None, &[], (false, false), false, &tiers),
             "an untagged asset is not a match"
+        );
+    }
+
+    /// The delete-from-disk guard: only files under a source root the user opened, or inside the
+    /// workspace this app owns. Everything else is refused, whatever path composition produced it.
+    #[test]
+    fn only_paths_under_known_roots_may_be_deleted() {
+        let roots = vec![
+            PathBuf::from("G:/Game_Assets/Synty"),
+            PathBuf::from("C:/lib"),
+        ];
+        let ws = PathBuf::from("C:/cache/Lodestash/workspace");
+        let ok = |p: &str| under_known_root(std::path::Path::new(p), &roots, Some(&ws));
+
+        assert!(ok("G:/Game_Assets/Synty/Models/rock.fbx"));
+        assert!(
+            ok("C:/cache/Lodestash/workspace/abc/tex.png"),
+            "workspace is ours"
+        );
+        assert!(
+            !ok("C:/Windows/System32/kernel32.dll"),
+            "outside every root"
+        );
+        assert!(
+            !ok("G:/Game_Assets/Other/rock.fbx"),
+            "sibling of a root is not in it"
+        );
+        assert!(
+            !under_known_root(std::path::Path::new("C:/anything"), &roots, None),
+            "no workspace configured means no workspace deletions"
         );
     }
 

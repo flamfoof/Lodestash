@@ -490,6 +490,13 @@ ALTER TABLE asset ADD COLUMN license_url TEXT;
 - **Import batches**: `import_record` rows from one tray/queue run share a `batch_id`, so the UI can
   list "Recent exports" per project and **undo a batch** — delete the copied files it produced and
   its records; catalog assets are untouched (confirm-gated, [`UI-SPEC.md`](UI-SPEC.md) §16.1).
+**Delete from disk is the one destructive exception.** The catalog is otherwise non-destructive —
+Trash is a soft delete and originals are never touched. The Settings danger flow may permanently
+remove a file, and it is fenced: an explicit confirmation modal naming the file count, a guard that
+refuses any path outside the user's source roots and the app's own extraction workspace, and the
+catalog row is marked trashed **only after** the file actually left the disk, so a failed delete
+cannot leave the catalog claiming otherwise.
+
 **Favourites** (`asset.favorite`, M12) are a **pin, not a rating**: "I want to find this again" is
 a different question from "how good is this", and folding the two together would make every 5-star
 asset a favourite by accident. Catalog-only like ratings and the Trash — the file on disk is never
