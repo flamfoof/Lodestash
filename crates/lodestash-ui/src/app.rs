@@ -732,8 +732,8 @@ pub struct LodestashApp {
     bg_arcane: Option<TextureHandle>,
     /// Active top-level screen (UI-SPEC §0.2 sidebar).
     screen: Screen,
-    /// STATUS facet selection (UI-SPEC §0.2). Pre-catalog every entry is `discovered`,
-    /// which folds into Unidentified — so Identified/Confirmed currently match nothing.
+    /// STATUS facet selection (UI-SPEC §0.2). Entries start `discovered` (folding into
+    /// Unidentified) and move as `promote_statuses` reconciles them (DATA-MODEL §8).
     status_filter: StatusFilter,
     /// Index into `scan_roots` of the source whose blacklist panel is expanded in Settings. §5.1.
     expanded_source: Option<usize>,
@@ -1300,6 +1300,15 @@ impl LodestashApp {
     /// Takes the same writer slot as the persist thread — never both at once (DATA-MODEL §1
     /// single writer), so this no-ops while a persist is in flight and retries on the next
     /// hydrate.
+    /// `(source name, root path)` per scan root — what `upsert_import_source` wants on the
+    /// persist thread.
+    fn scan_root_names(&self) -> Vec<(String, String)> {
+        self.scan_roots
+            .iter()
+            .map(|r| (config::stem_name(r), r.to_string_lossy().into_owned()))
+            .collect()
+    }
+
     fn spawn_backlog_drain(&mut self) {
         if self.catalog_persisting {
             return;
@@ -1312,27 +1321,29 @@ impl LodestashApp {
         let workspace_dir = self.workspace_dir.clone();
         let generation = self.scan_generation;
         let tx = self.catalog_tx.clone();
+        let roots = self.scan_root_names();
         self.catalog_persisting = true;
 
         std::thread::spawn(move || {
-            match Catalog::open(&db_path) {
-                Ok(mut cat) => {
-                    drain_metrics(&mut cat, workspace_dir.as_deref());
-                    if let Some(emb) = embedder {
-                        drain_image_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
-                    }
-                    if let Some(emb) = audio_embedder {
-                        drain_audio_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
-                    }
+            let (counts, assets) = match Catalog::open(&db_path) {
+                Ok(mut cat) => drain_promote_resync(
+                    &mut cat,
+                    embedder,
+                    audio_embedder,
+                    workspace_dir.as_deref(),
+                    &roots,
+                ),
+                Err(e) => {
+                    tracing::warn!(%e, "backlog drain: catalog unavailable");
+                    (None, Vec::new())
                 }
-                Err(e) => tracing::warn!(%e, "backlog drain: catalog unavailable"),
-            }
-            // Counts are unchanged by a drain; the message just clears the in-flight flag.
+            };
+            // `drain_only` keeps a `None` here quiet: it means "nothing moved", not a failure.
             let _ = tx.send(CatalogSynced {
                 generation,
                 drain_only: true,
-                counts: None,
-                assets: Vec::new(),
+                counts,
+                assets,
             });
         });
     }
@@ -1376,6 +1387,7 @@ impl LodestashApp {
         let embedder = self.ai_embedder.clone();
         let audio_embedder = self.audio_embedder.clone();
         let workspace_dir = self.workspace_dir.clone();
+        let roots = self.scan_root_names();
         self.catalog_persisting = true;
         std::thread::spawn(move || {
             let (counts, assets, catalog) = match persist_to_catalog(&db_path, &batches) {
@@ -1396,12 +1408,22 @@ impl LodestashApp {
             // (still the sole writer). Runs *after* the grid gets its identity, so a large
             // first scan doesn't stall the UI on inference. Search-with-AI needs these.
             if let Some(mut cat) = catalog {
-                drain_metrics(&mut cat, workspace_dir.as_deref());
-                if let Some(emb) = embedder {
-                    drain_image_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
-                }
-                if let Some(emb) = audio_embedder {
-                    drain_audio_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
+                let (counts, assets) = drain_promote_resync(
+                    &mut cat,
+                    embedder,
+                    audio_embedder,
+                    workspace_dir.as_deref(),
+                    &roots,
+                );
+                // Second message: the drain promoted rows, so the meter and STATUS facet
+                // are now stale. `drain_only` keeps a no-op quiet.
+                if counts.is_some() {
+                    let _ = tx.send(CatalogSynced {
+                        generation,
+                        drain_only: true,
+                        counts,
+                        assets,
+                    });
                 }
             }
         });
@@ -1480,6 +1502,7 @@ impl LodestashApp {
         let embedder = self.ai_embedder.clone();
         let audio_embedder = self.audio_embedder.clone();
         let workspace_dir = self.workspace_dir.clone();
+        let roots = job.all_roots.clone();
         self.catalog_persisting = true;
         std::thread::spawn(move || {
             let (counts, assets, catalog) = match persist_package_to_catalog(&db_path, &job) {
@@ -1498,12 +1521,20 @@ impl LodestashApp {
             // Embed the freshly-extracted images now, while their files are guaranteed present in
             // the workspace (same sole-writer connection).
             if let Some(mut cat) = catalog {
-                drain_metrics(&mut cat, workspace_dir.as_deref());
-                if let Some(emb) = embedder {
-                    drain_image_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
-                }
-                if let Some(emb) = audio_embedder {
-                    drain_audio_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
+                let (counts, assets) = drain_promote_resync(
+                    &mut cat,
+                    embedder,
+                    audio_embedder,
+                    workspace_dir.as_deref(),
+                    &roots,
+                );
+                if counts.is_some() {
+                    let _ = tx.send(CatalogSynced {
+                        generation,
+                        drain_only: true,
+                        counts,
+                        assets,
+                    });
                 }
             }
         });
@@ -1612,11 +1643,7 @@ impl LodestashApp {
         let Some(db_path) = catalog_db_path() else {
             return;
         };
-        let roots: Vec<(String, String)> = self
-            .scan_roots
-            .iter()
-            .map(|r| (config::stem_name(r), r.to_string_lossy().into_owned()))
-            .collect();
+        let roots = self.scan_root_names();
         let generation = self.scan_generation;
         let tx = self.catalog_tx.clone();
         self.catalog_persisting = true;
@@ -5814,10 +5841,14 @@ impl eframe::App for LodestashApp {
                     }
                     return;
                 }
-                // Unidentified nudge (UI-SPEC §2.1) — pre-catalog, every asset is
-                // Unidentified, so the count is the whole library until P3 status lands.
-                if !self.nudge_dismissed && !self.entries.is_empty() {
-                    let n = self.entries.len();
+                // Unidentified nudge (UI-SPEC §2.1) — the real backlog now that
+                // `promote_statuses` moves rows (DATA-MODEL §8); nothing left ⇒ no banner.
+                let n = self
+                    .entries
+                    .iter()
+                    .filter(|e| !e.trashed && e.status.is_unidentified())
+                    .count();
+                if !self.nudge_dismissed && n > 0 {
                     egui::Frame::none()
                         .fill(theme::WARNING.linear_multiply(0.10))
                         .stroke(egui::Stroke::new(1.0, theme::WARNING.linear_multiply(0.45)))
@@ -7458,6 +7489,57 @@ fn audio_duration_ms(path: &std::path::Path) -> Option<i64> {
     let file = std::fs::File::open(path).ok()?;
     let dec = rodio::Decoder::new(std::io::BufReader::new(file)).ok()?;
     Some(dec.total_duration()?.as_millis() as i64)
+}
+
+/// Drain everything the catalog still has queued (facets, then vectors), reconcile the
+/// status lifecycle (DATA-MODEL §8), and read the fresh counts + asset identities back for
+/// `roots` (`(name, root_path)`). A drain now *moves* statuses, so it is no longer
+/// count-neutral: the health meter and STATUS facet need the re-read.
+///
+/// Runs on the persist thread's own connection — the sole writer (ARCHITECTURE §5).
+fn drain_promote_resync(
+    cat: &mut Catalog,
+    embedder: Option<Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
+    audio_embedder: Option<Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
+    workspace_dir: Option<&std::path::Path>,
+    roots: &[(String, String)],
+) -> (Option<StatusCounts>, AssetIdentityMaps) {
+    drain_metrics(cat, workspace_dir);
+    if let Some(emb) = embedder {
+        drain_image_embeddings(cat, emb.as_ref(), workspace_dir);
+    }
+    if let Some(emb) = audio_embedder {
+        drain_audio_embeddings(cat, emb.as_ref(), workspace_dir);
+    }
+    match cat.promote_statuses() {
+        Ok(0) => return (None, Vec::new()), // nothing moved — nothing to re-read
+        Ok(n) => tracing::info!(writes = n, "status lifecycle reconciled"),
+        Err(e) => {
+            tracing::warn!(%e, "status promote failed; statuses stale until next drain");
+            return (None, Vec::new());
+        }
+    }
+    let read = || -> Result<(StatusCounts, AssetIdentityMaps), String> {
+        let mut sources = Vec::with_capacity(roots.len());
+        for (name, root) in roots {
+            let id = cat
+                .upsert_import_source(name, root, "folder")
+                .map_err(|e| e.to_string())?;
+            sources.push((root.clone(), id));
+        }
+        let ids: Vec<i64> = sources.iter().map(|(_, id)| *id).collect();
+        let counts = cat
+            .status_counts_for_sources(&ids)
+            .map_err(|e| e.to_string())?;
+        Ok((counts, read_back_assets(cat, &sources)?))
+    };
+    match read() {
+        Ok((counts, assets)) => (Some(counts), assets),
+        Err(err) => {
+            tracing::warn!(%err, "post-drain read-back failed; UI keeps the pre-drain counts");
+            (None, Vec::new())
+        }
+    }
 }
 
 fn drain_image_embeddings(

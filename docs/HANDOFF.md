@@ -4,7 +4,7 @@ Working notes for whoever (or whatever) continues the build. Unlike the rest of 
 is **not** a design spec — it's the state of play, the decisions already settled, and the traps.
 The design docs still win on any question of what the software *should* do.
 
-Last updated: **2026-07-22**, at `3845d26`.
+Last updated: **2026-07-22**, at `e9827d3` + the P3 status-lifecycle slice.
 
 ---
 
@@ -71,6 +71,14 @@ human-in-the-loop") made literal — keep it that way for every mutating op that
 `image`) + 84 CLAP vectors, from ~2274 assets. The 207 rows still `embedding_dirty` are `.mat`
 materials — there is no material renderer yet, so they legitimately have nothing to encode and will
 drain themselves once one exists.
+
+**The status lifecycle is live** (P3, [`DATA-MODEL.md`](DATA-MODEL.md) §8). `status` is *derived*,
+not hand-set: `Catalog::promote_statuses` reads the ingest state already on the row — facets
+extracted ⇒ `indexed`, an embedding stored ⇒ `identified`, embedding re-dirtied (file changed) ⇒ back
+to `indexed` — and `confirmed` stays human-set. All three writer paths (scan persist, package
+persist, backlog drain) funnel through one `drain_promote_resync`: drain facets, drain vectors,
+promote, then re-read counts + identities and send them, because a drain is no longer count-neutral.
+On this machine the meter reads **2067 / 2274 Identified**.
 
 ---
 
@@ -190,26 +198,22 @@ fixture.
 
 Roughly by value:
 
-1. **P3 status lifecycle** (`discovered → indexed → identified → confirmed`,
-   [`DATA-MODEL.md`](DATA-MODEL.md) §8). Everything currently reads *Unidentified* and the health
-   meter is pinned at 0, which is the UI telling a lie about a library that now has 2067 embeddings.
-   Small state machine, disproportionate effect.
-2. **P5 remainder — the Unity round-trip**: `register_project` → `/v1/import` → import queue →
+1. **P5 remainder — the Unity round-trip**: `register_project` → `/v1/import` → import queue →
    plugin ack → `import_record` ([`ENGINE-API.md`](ENGINE-API.md) §5). The job engine and the
    approval gate already exist to carry it. The UPM C# plugin is the big piece and cannot be
    verified without a Unity install.
-3. **P2 dependency closure.** Until the `.meta` GUID graph is harvested, `export_asset` silently
+2. **P2 dependency closure.** Until the `.meta` GUID graph is harvested, `export_asset` silently
    omits an asset's materials and textures — it reports `dependencies_included: false`, but that is
    the sharpest edge currently shipped.
-4. **P4 tagging.** Unblocks Traits, tag filter chips, `AssetSummary.tags`, pack-stats TAGS, and the
+3. **P4 tagging.** Unblocks Traits, tag filter chips, `AssetSummary.tags`, pack-stats TAGS, and the
    accept/reject flow. Ollama is installed on this machine (`qwen3:8b`, text-only); a vision tagger
    would want `moondream` (~1.7 GB) or `qwen2.5vl:3b` (~3 GB) — the 4–6 GB VRAM tier of
    [`AI-MODELS-BY-GPU.md`](AI-MODELS-BY-GPU.md). Note the machine is AMD (RX 6750 XT): no CUDA, and
    the bundled ORT is the **CPU** build. DirectML would need a different runtime dll — see the
    version warning in §4 before trying.
-5. Optional AI refinements: an LLM query parser (slots in behind `ParsedQuery::validate`),
+4. Optional AI refinements: an LLM query parser (slots in behind `ParsedQuery::validate`),
    cross-encoder rerank, glTF material textures.
-6. **Non-win-x64 ORT auto-fetch** — deliberately skipped. It can't be tested from this machine, and
+5. **Non-win-x64 ORT auto-fetch** — deliberately skipped. It can't be tested from this machine, and
    shipping platform code you can't run is how silent breakage gets in.
 
 Known gaps that are *recorded* rather than hidden — see the interim-status notes in

@@ -410,6 +410,24 @@ backlog. **Recommended user-facing terms: Identified vs Unidentified** (alternat
 - `status` is just another filter ("everything still **Unidentified** in **Sounds**" is one click).
   Re-running AI (e.g. after a model upgrade) cycles an asset back through `identified`.
 
+**How the status actually moves.** `status` is *derived*, not hand-set: `Catalog::promote_statuses`
+reconciles every live row against the ingest work recorded on it, and runs on the writer connection
+right after the drains (facets, then vectors), so a scan, a package extraction and a backlog drain
+all land the same transitions:
+
+| Transition | Earned by |
+|---|---|
+| `discovered → indexed` | `metrics_dirty = 0` — the technical facets (§14) have been extracted |
+| `discovered`/`indexed` → `identified` | a row in `asset_embedding`, with `embedding_dirty = 0` |
+| `identified → indexed` | `embedding_dirty = 1` again — the file's bytes changed, so the vector is stale |
+
+`confirmed` is human-set (the P4 accept/reject flow) and the reconcile never touches it. The pass is
+idempotent, so it is safe to run after every drain.
+
+> **Interim divergence.** This table says `identified` means "AI tagging **+** embeddings"; until the
+> P4 tagging lane exists there is nothing to tag with, so today the embedding alone earns it. When
+> tagging lands, `promote_statuses` gains an `asset_tag` condition and this note goes away.
+
 ---
 
 ## 9. Projects, imports & staging

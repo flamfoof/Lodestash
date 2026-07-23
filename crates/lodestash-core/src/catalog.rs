@@ -684,6 +684,38 @@ impl Catalog {
         }
         Ok(counts)
     }
+
+    /// Reconcile every live asset's `status` with the ingest work actually done
+    /// (DATA-MODEL §8): facets extracted ⇒ `indexed`, an embedding stored ⇒ `identified`,
+    /// and a file whose bytes changed (so `embedding_dirty` is back on) drops from
+    /// `identified` to `indexed` until it re-encodes. `confirmed` is human-set — never
+    /// touched here. Idempotent; run it on the writer connection after the drains. Returns
+    /// the number of status *writes* — a row promoted two steps in one pass counts twice.
+    ///
+    /// ponytail: an undecodable file stores a *zero* vector to guarantee drain progress,
+    /// and that still reads as `identified` here. Filter those out when a zero vector
+    /// starts costing something (a wrong search hit, a wrong count).
+    pub fn promote_statuses(&self) -> Result<usize> {
+        let now = unix_now();
+        let mut changed = 0usize;
+        for sql in [
+            // Demote first: a stale embedding means the asset is no longer identified.
+            "UPDATE asset SET status = 'indexed', updated_at = ?1
+             WHERE deleted_at IS NULL AND status = 'identified' AND embedding_dirty = 1",
+            "UPDATE asset SET status = 'indexed', updated_at = ?1
+             WHERE deleted_at IS NULL AND status = 'discovered' AND metrics_dirty = 0",
+            "UPDATE asset SET status = 'identified', updated_at = ?1
+             WHERE deleted_at IS NULL AND status IN ('discovered', 'indexed')
+               AND embedding_dirty = 0
+               AND EXISTS (SELECT 1 FROM asset_embedding e WHERE e.asset_id = asset.id)",
+        ] {
+            changed += self
+                .conn
+                .execute(sql, params![now])
+                .map_err(|e| CoreError::Catalog(format!("promote_statuses: {e}")))?;
+        }
+        Ok(changed)
+    }
 }
 
 fn unix_now() -> i64 {
@@ -2617,6 +2649,77 @@ mod tests {
         assert_eq!(
             c.status_counts_for_sources(&[]).expect("empty"),
             StatusCounts::default()
+        );
+    }
+
+    #[test]
+    fn promote_statuses_walks_the_lifecycle() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let s = c.upsert_import_source("A", "C:/a", "folder").expect("src");
+        c.record_crawl(
+            s,
+            None,
+            &[rec("x.png", 1, 1), rec("y.png", 2, 2), rec("z.png", 3, 3)],
+        )
+        .expect("crawl");
+        let id_of = |c: &Catalog, name: &str| -> i64 {
+            c.conn
+                .query_row("SELECT id FROM asset WHERE name=?1", params![name], |r| {
+                    r.get(0)
+                })
+                .expect("id")
+        };
+        let status_of = |c: &Catalog, name: &str| -> String {
+            c.conn
+                .query_row(
+                    "SELECT status FROM asset WHERE name=?1",
+                    params![name],
+                    |r| r.get(0),
+                )
+                .expect("status")
+        };
+        let (x, y, z) = (id_of(&c, "x.png"), id_of(&c, "y.png"), id_of(&c, "z.png"));
+
+        // Nothing drained yet: everything stays `discovered`.
+        assert_eq!(c.promote_statuses().expect("noop"), 0);
+        assert_eq!(status_of(&c, "x.png"), "discovered");
+
+        // Facets drained ⇒ indexed; an embedding on top ⇒ identified.
+        c.conn
+            .execute("UPDATE asset SET metrics_dirty = 0", [])
+            .expect("metrics drained");
+        c.upsert_embedding(y, "m", "image", None, None, &[0.5, 0.5])
+            .expect("embed y");
+        // 4 writes, not 3: y is walked discovered → indexed → identified in one pass.
+        assert_eq!(c.promote_statuses().expect("promote"), 4);
+        assert_eq!(status_of(&c, "x.png"), "indexed");
+        assert_eq!(status_of(&c, "y.png"), "identified");
+        assert_eq!(c.promote_statuses().expect("idempotent"), 0);
+
+        // A confirmed row is human-set and never demoted or re-promoted.
+        c.conn
+            .execute(
+                "UPDATE asset SET status='confirmed', embedding_dirty=1 WHERE id=?1",
+                params![z],
+            )
+            .expect("confirm z");
+        // y's bytes changed: dirty embedding drops it back to indexed.
+        c.conn
+            .execute("UPDATE asset SET embedding_dirty=1 WHERE id=?1", params![y])
+            .expect("dirty y");
+        assert_eq!(c.promote_statuses().expect("demote"), 1);
+        assert_eq!(status_of(&c, "y.png"), "indexed");
+        assert_eq!(status_of(&c, "z.png"), "confirmed");
+        let _ = x;
+
+        assert_eq!(
+            c.status_counts_for_sources(&[s]).expect("counts"),
+            StatusCounts {
+                unidentified: 2,
+                identified: 0,
+                confirmed: 1
+            }
         );
     }
 
