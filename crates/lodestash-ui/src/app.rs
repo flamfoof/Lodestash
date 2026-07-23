@@ -7481,6 +7481,9 @@ fn drain_dependencies(cat: &mut Catalog, workspace_dir: Option<&std::path::Path>
             break;
         }
     }
+    if total > 0 {
+        drain_prefab_edges(cat);
+    }
     match cat.resolve_pending_relationships() {
         Ok(late) if late > 0 => tracing::info!(late, "dependency edges late-bound"),
         Ok(_) => {}
@@ -7488,6 +7491,33 @@ fn drain_dependencies(cat: &mut Catalog, workspace_dir: Option<&std::path::Path>
     }
     if total > 0 {
         tracing::info!(scanned = total, edges, "dependency graph harvested");
+    }
+}
+
+/// Walk every source root for `.prefab` files and rebuild the **mesh → material** edges from what
+/// they bind (DATA-MODEL §10). Prefabs are not assets — they aren't a `media_type` — so they can't
+/// ride the `deps_dirty` queue; they are read as pure evidence about assets that *are* catalogued.
+///
+/// Runs only when the dependency drain actually scanned something, so a steady-state library
+/// re-walks nothing. ponytail: on-disk sources only — a prefab extracted into the package
+/// workspace is skipped until someone wants that.
+fn drain_prefab_edges(cat: &mut Catalog) {
+    let roots = match cat.source_roots() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(%e, "prefab pass: source roots unavailable");
+            return;
+        }
+    };
+    let mut pairs: Vec<(String, String)> = roots
+        .iter()
+        .flat_map(|root| lodestash_ingest::deps::prefab_pairs_under(std::path::Path::new(root)))
+        .collect();
+    pairs.sort();
+    pairs.dedup();
+    match cat.replace_prefab_relationships(&pairs) {
+        Ok(written) => tracing::info!(pairs = pairs.len(), written, "prefab edges rebuilt"),
+        Err(e) => tracing::warn!(%e, "rebuilding prefab edges failed"),
     }
 }
 

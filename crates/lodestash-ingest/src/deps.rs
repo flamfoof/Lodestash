@@ -51,6 +51,104 @@ pub fn material_texture_guids(yaml: &str) -> Vec<String> {
     out
 }
 
+/// What a `.prefab` binds together: the meshes it instantiates and the materials it paints them
+/// with. Both are GUID refs into other assets.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PrefabRefs {
+    /// `m_Mesh: {fileID: …, guid: …}` — the model asset (an FBX, usually).
+    pub meshes: Vec<String>,
+    /// The list items under `m_Materials:`.
+    pub materials: Vec<String>,
+}
+
+impl PrefabRefs {
+    /// Every (mesh, material) pair the prefab implies. Whole-file co-occurrence, not per
+    /// GameObject: a prefab that instantiates one model with its materials — the overwhelmingly
+    /// common shape for a store asset — gives exactly the right pairs.
+    ///
+    /// ponytail: a hand-built *scene-like* prefab holding several unrelated models would
+    /// over-connect (n×m instead of the true pairing). Group by the owning `m_GameObject` fileID
+    /// if that ever produces visible junk; it needs a real per-document parse.
+    pub fn pairs(&self) -> Vec<(&str, &str)> {
+        self.meshes
+            .iter()
+            .flat_map(|m| {
+                self.materials
+                    .iter()
+                    .map(move |mat| (m.as_str(), mat.as_str()))
+            })
+            .collect()
+    }
+}
+
+/// Mesh and material GUIDs referenced by a Unity prefab.
+///
+/// This is the only source of **mesh → material** edges: a stock FBX embeds its materials
+/// (`externalObjects` in its `.meta` is empty unless the user remapped them), so the model asset
+/// itself declares nothing. The prefab is where the binding is actually written down.
+pub fn prefab_refs(yaml: &str) -> PrefabRefs {
+    let mut refs = PrefabRefs::default();
+    let mut in_materials = false;
+    for line in yaml.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("- ") {
+            // A list item only belongs to `m_Materials` while we're still inside that block.
+            if in_materials {
+                if let Some(guid) = guid_in(rest) {
+                    push_unique(&mut refs.materials, guid);
+                }
+            }
+            continue;
+        }
+        in_materials = false;
+        let Some((key, rest)) = trimmed.split_once(':') else {
+            continue;
+        };
+        match key {
+            "m_Materials" => in_materials = true,
+            "m_Mesh" => {
+                if let Some(guid) = guid_in(rest) {
+                    push_unique(&mut refs.meshes, guid);
+                }
+            }
+            _ => {}
+        }
+    }
+    refs
+}
+
+/// Every `(mesh GUID, material GUID)` pair declared by the `.prefab` files under `root`, sorted
+/// and deduped. Unreadable files are skipped — a prefab we can't parse is missing evidence, not an
+/// error.
+pub fn prefab_pairs_under(root: &Path) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.path()
+                .extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("prefab"))
+        })
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .flat_map(|text| {
+            prefab_refs(&text)
+                .pairs()
+                .into_iter()
+                .map(|(m, mat)| (m.to_string(), mat.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    pairs.sort();
+    pairs.dedup();
+    pairs
+}
+
+fn push_unique(v: &mut Vec<String>, item: String) {
+    if !v.contains(&item) {
+        v.push(item);
+    }
+}
+
 /// The `guid: <32 hex>` value inside one inline YAML mapping, if present.
 fn guid_in(fragment: &str) -> Option<String> {
     let after = fragment.split_once("guid:")?.1;
@@ -102,6 +200,65 @@ Material:
             "a non-32-char value is not a GUID"
         );
         assert!(material_texture_guids("").is_empty());
+    }
+
+    /// Shaped like a real Synty prefab: SkinnedMeshRenderer material list, MeshFilter mesh ref,
+    /// an unrelated `m_Avatar` GUID that must not be mistaken for either.
+    const PREFAB: &str = "\
+--- !u!137 &137
+SkinnedMeshRenderer:
+  m_Materials:
+  - {fileID: 2100000, guid: 42b64fdb315e3054ea757d8d1c4bcfa7, type: 2}
+  - {fileID: 2100000, guid: 11111111111111111111111111111111, type: 2}
+  m_Mesh: {fileID: 4300000, guid: b6ef2f4d0154b2747860a3332fa05f97, type: 3}
+--- !u!95 &95
+Animator:
+  m_Avatar: {fileID: 9000000, guid: ea24e01b03f54464eadda8d044dc3d2e, type: 3}
+  m_ApplyRootMotion: 0
+--- !u!33 &33
+MeshFilter:
+  m_Mesh: {fileID: 4300000, guid: b6ef2f4d0154b2747860a3332fa05f97, type: 3}
+";
+
+    #[test]
+    fn prefab_refs_separate_meshes_from_materials() {
+        let refs = prefab_refs(PREFAB);
+        assert_eq!(refs.meshes, vec!["b6ef2f4d0154b2747860a3332fa05f97"]);
+        assert_eq!(
+            refs.materials,
+            vec![
+                "42b64fdb315e3054ea757d8d1c4bcfa7",
+                "11111111111111111111111111111111"
+            ]
+        );
+        assert_eq!(
+            refs.pairs().len(),
+            2,
+            "one mesh × two materials, deduped first"
+        );
+        assert!(
+            !refs
+                .meshes
+                .iter()
+                .chain(&refs.materials)
+                .any(|g| g == "ea24e01b03f54464eadda8d044dc3d2e"),
+            "the avatar GUID is neither"
+        );
+    }
+
+    #[test]
+    fn a_list_item_outside_m_materials_is_not_a_material() {
+        let yaml = "\
+m_Materials:
+- {fileID: 1, guid: 42b64fdb315e3054ea757d8d1c4bcfa7, type: 2}
+m_Component:
+- {fileID: 1, guid: 99999999999999999999999999999999, type: 2}
+";
+        assert_eq!(
+            prefab_refs(yaml).materials,
+            vec!["42b64fdb315e3054ea757d8d1c4bcfa7"],
+            "the block ends at the next key"
+        );
     }
 
     #[test]

@@ -1500,6 +1500,49 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("deps commit: {e}")))
     }
 
+    /// Replace the prefab-derived edges with `pairs` of `(mesh GUID, material GUID)` (§10,
+    /// `source='unity_prefab'`). Pairs whose mesh isn't catalogued are dropped — an edge needs a
+    /// real `from_asset_id` — while an unresolved *material* is kept `missing` like any other,
+    /// so a later extraction can late-bind it.
+    ///
+    /// Rebuild-in-full rather than diff: the pass walks every prefab anyway, and at this scale
+    /// (thousands of prefabs, a handful of pairs each) one delete + reinsert inside a transaction
+    /// is both simpler and correct when a prefab is edited or deleted.
+    pub fn replace_prefab_relationships(&mut self, pairs: &[(String, String)]) -> Result<usize> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| CoreError::Catalog(format!("prefab edges begin: {e}")))?;
+        tx.execute(
+            "DELETE FROM asset_relationship WHERE source = 'unity_prefab'",
+            [],
+        )
+        .map_err(|e| CoreError::Catalog(format!("prefab edges clear: {e}")))?;
+        let mut written = 0usize;
+        for (mesh_guid, material_guid) in pairs {
+            written += tx
+                .execute(
+                    "INSERT INTO asset_relationship
+                        (from_asset_id, to_asset_id, kind, source, confidence, declared_path, state)
+                     SELECT a.id,
+                            (SELECT id FROM asset
+                              WHERE unity_guid = ?2 AND deleted_at IS NULL),
+                            'uses_material', 'unity_prefab', 0.9, ?2,
+                            CASE WHEN EXISTS (SELECT 1 FROM asset
+                                               WHERE unity_guid = ?2 AND deleted_at IS NULL)
+                                 THEN 'resolved' ELSE 'missing' END
+                       FROM asset a
+                      WHERE a.unity_guid = ?1 AND a.deleted_at IS NULL
+                     ON CONFLICT(from_asset_id, to_asset_id, kind) DO NOTHING",
+                    params![mesh_guid, material_guid],
+                )
+                .map_err(|e| CoreError::Catalog(format!("prefab edge insert: {e}")))?;
+        }
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("prefab edges commit: {e}")))?;
+        Ok(written)
+    }
+
     /// Every asset reachable from `seeds` over resolved dependency edges, seeds included
     /// (DATA-MODEL §10; ENGINE-API §4 "export with dependencies"). Unresolved (`missing`) edges
     /// point at nothing in the library, so they contribute nothing to a copy.
@@ -2957,6 +3000,75 @@ mod tests {
             })
             .expect("dirty");
         assert_eq!(dirty, 0);
+    }
+
+    #[test]
+    fn prefab_edges_rebuild_and_extend_the_closure() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let s = c.upsert_import_source("A", "C:/a", "folder").expect("src");
+        c.record_crawl(
+            s,
+            None,
+            &[
+                rec("hero.fbx", 1, 1),
+                rec("hero.mat", 2, 2),
+                rec("t.png", 3, 3),
+            ],
+        )
+        .expect("crawl");
+        let id_of = |c: &Catalog, name: &str| -> i64 {
+            c.conn
+                .query_row("SELECT id FROM asset WHERE name=?1", params![name], |r| {
+                    r.get(0)
+                })
+                .expect("id")
+        };
+        let (mesh, mat, tex) = (
+            id_of(&c, "hero.fbx"),
+            id_of(&c, "hero.mat"),
+            id_of(&c, "t.png"),
+        );
+        c.record_dependencies(mesh, Some("meshguid"), "uses_texture", &[])
+            .expect("mesh");
+        c.record_dependencies(tex, Some("texguid"), "uses_texture", &[])
+            .expect("tex");
+        c.record_dependencies(mat, Some("matguid"), "uses_texture", &["texguid".into()])
+            .expect("mat");
+
+        // A prefab binds the mesh to the material; the mesh's closure now reaches the texture
+        // through it — which is the whole point of the pass.
+        let written = c
+            .replace_prefab_relationships(&[
+                ("meshguid".into(), "matguid".into()),
+                ("nosuchmesh".into(), "matguid".into()),
+            ])
+            .expect("prefab edges");
+        assert_eq!(written, 1, "a pair whose mesh isn't catalogued is dropped");
+        assert_eq!(
+            c.dependency_closure(&[mesh]).expect("closure"),
+            vec![mesh, mat, tex],
+            "mesh → material → texture, transitively"
+        );
+
+        // Rebuilding replaces rather than accumulates, and the `unity_meta` edges survive it.
+        c.replace_prefab_relationships(&[("meshguid".into(), "matguid".into())])
+            .expect("rebuild");
+        let by_source: Vec<(String, i64)> = c
+            .conn
+            .prepare("SELECT source, COUNT(*) FROM asset_relationship GROUP BY 1 ORDER BY 1")
+            .and_then(|mut st| {
+                st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .expect("by source");
+        assert_eq!(
+            by_source,
+            vec![
+                ("unity_meta".to_string(), 1),
+                ("unity_prefab".to_string(), 1)
+            ]
+        );
     }
 
     #[test]

@@ -534,9 +534,10 @@ query time, so they survive re-indexing and are queryable ("what materials use t
 -- Directed relationship edge between two assets.
 -- kind values: 'uses_texture' | 'uses_material' | 'uses_mesh' | 'uses_audio'
 --              | 'uses_script' | 'variant_of' | 'derived_from'
--- source:      'unity_meta' (harvested from .meta GUID refs)
---              | 'inferred'  (path-proximity / naming heuristics)
---              | 'manual'    (user-asserted)
+-- source:      'unity_meta'   (harvested from .meta / material GUID refs)
+--              | 'unity_prefab' (the binding a .prefab declares: mesh ↔ material)
+--              | 'inferred'     (path-proximity / naming heuristics)
+--              | 'manual'       (user-asserted)
 CREATE TABLE asset_relationship (
   id            INTEGER PRIMARY KEY,
   from_asset_id INTEGER NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
@@ -570,6 +571,12 @@ CREATE INDEX idx_rel_to   ON asset_relationship(to_asset_id);
    the material YAML itself) lists the GUIDs of all textures it references. After all assets in a
    source are indexed and `unity_guid` is populated, a second pass resolves GUID pairs into
    `asset_relationship` rows (`source = 'unity_meta'`).
+1b. **Unity prefab bindings** — a stock FBX embeds its materials, so the model asset declares
+   nothing and step 1 can never produce a `uses_material` edge. The `.prefab` is where the binding
+   is written down (`m_Mesh` + `m_Materials` GUID refs), so prefabs are read as *evidence about*
+   catalogued assets — they are not assets themselves (`prefab` is not a `media_type`). Pairs land
+   as `source = 'unity_prefab'`, `confidence 0.9`: the GUIDs are exact, the pairing is
+   whole-file co-occurrence.
 2. **Path/naming heuristics** — for assets without `.meta` (raw exports): a texture named
    `Human3_Albedo.png` living beside `Human3.fbx` infers `uses_texture` with `source='inferred'`
    and `confidence ≈ 0.7`. Applies only when no `unity_meta` relationship exists.
@@ -604,11 +611,17 @@ dropped. An edge that never resolves is an honest record of a reference the libr
 reference cycle terminates) and is the single definition of "with dependencies" for both
 `AssetDetail.dependencies` and `export_asset`.
 
-> **Coverage today.** Only Unity's deterministic refs are harvested, and only from files that are
-> themselves catalogued: **material → texture**. A stock FBX embeds its materials (`externalObjects`
-> is empty unless the user remapped them) and prefabs aren't a `media_type`, so **mesh → material has
-> no `unity_meta` source** — it needs step 2's naming heuristic, or a prefab reader. Until then a
-> mesh exports alone, and says so.
+The prefab pass rebuilds its edges wholesale (delete + reinsert `source='unity_prefab'`) rather than
+diffing: it walks every prefab anyway, and a rebuild is what makes an edited or deleted prefab
+correct. It runs only when the dependency drain scanned something, so a steady-state library
+re-walks nothing.
+
+> **Coverage today.** `uses_texture` (material → texture, from the material YAML) and
+> `uses_material` (mesh → material, from prefabs) — so a model's closure reaches its textures
+> through its material. Not yet: step 2's naming heuristic for raw exports outside a Unity project
+> (those have no `.meta`, so they have no GUIDs and no edges at all), `uses_mesh`/`uses_audio`/
+> `uses_script` from prefabs, and prefabs living inside an extracted package workspace rather than
+> a source root.
 
 ---
 

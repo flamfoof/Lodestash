@@ -77,9 +77,13 @@ A third drain flag (`deps_dirty`, M10) walks each asset's `.meta` sidecar for it
 material's `m_Texture` refs; unresolved refs are kept as `missing` edges and late-bound after every
 drain, so index order doesn't matter. `dependency_closure` backs both `AssetDetail.dependencies` and
 `export_asset(with_dependencies)` — the preview is the export. On this library: 1580 GUIDs, 200
-resolved edges, 2 missing. **Coverage caveat**: material → texture only. A stock FBX embeds its
-materials and prefabs aren't a `media_type`, so mesh → material needs the naming heuristic
-(DATA-MODEL §10 step 2) or a prefab reader — until then a mesh exports alone.
+resolved edges, 2 missing. Mesh → material comes from a second pass over `.prefab` files: a stock
+FBX embeds its materials, so the model declares nothing and the prefab is the only place the binding
+is written down. Prefabs are read as *evidence*, never catalogued (`prefab` isn't a `media_type`),
+and the pass rebuilds `source='unity_prefab'` edges wholesale — 1228 resolved on this library, so
+`SM_Gen_Env_Ground_Grass_Large_01` now returns material + 3 textures. **Coverage caveat**: an asset
+outside a Unity project has no `.meta`, so no GUID and no edges at all — step 2's naming heuristic
+(DATA-MODEL §10) is what would reach those.
 
 **The status lifecycle is live** (P3, [`DATA-MODEL.md`](DATA-MODEL.md) §8). `status` is *derived*,
 not hand-set: `Catalog::promote_statuses` reads the ingest state already on the row — facets
