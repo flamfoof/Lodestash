@@ -72,6 +72,14 @@ human-in-the-loop") made literal — keep it that way for every mutating op that
 materials — there is no material renderer yet, so they legitimately have nothing to encode and will
 drain themselves once one exists.
 
+**Local tagging runs** (P4, [`AI-PIPELINE.md`](AI-PIPELINE.md) §2). Settings ▸ AI · IDENTIFY picks
+an Ollama model (and optionally a captioning model) and starts a pass in the job tray: manual,
+cancellable, resumable, because a full library is hours of CPU on this box. Two stages, forced by
+measurement — `moondream` answers facet-JSON requests with arrays of numbers but captions correctly
+in prose, so the VLM captions and a text model writes the facets; the caption becomes
+`asset.description` and is FTS-indexed. Installed here: `qwen3:8b` (facets) + `moondream:latest`
+(captions). Tags are written under `source='ai'`, so a re-run never touches the user's own.
+
 **The dependency graph is harvested and export honours it** (P2, [`DATA-MODEL.md`](DATA-MODEL.md) §10).
 A third drain flag (`deps_dirty`, M10) walks each asset's `.meta` sidecar for its own GUID and a
 material's `m_Texture` refs; unresolved refs are kept as `missing` edges and late-bound after every

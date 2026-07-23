@@ -793,6 +793,11 @@ pub struct LodestashApp {
     jobs: Jobs,
     /// The running scan's tray row, finished/cancelled on ScanDone or generation bump.
     scan_job: Option<u64>,
+    /// Tray row id for a running tagging pass, so it can be finished when the drain reports back.
+    tag_job: Option<u64>,
+    /// Models Ollama reports as installed, fetched once when the Settings AI card first opens
+    /// (the daemon may not be running, and asking every frame would block the UI thread).
+    ollama_models: Option<Vec<String>>,
 }
 
 impl LodestashApp {
@@ -913,6 +918,8 @@ impl LodestashApp {
             onboarding_open: show_onboarding,
             jobs: Jobs::default(),
             scan_job: None,
+            tag_job: None,
+            ollama_models: None,
             engine: None,
             engine_state: None,
             config,
@@ -1405,6 +1412,70 @@ impl LodestashApp {
         self.selected.insert(entry_idx);
         self.page = cache_idx / self.config.view.page_size.max(1);
         true
+    }
+
+    /// Tag the `tags_dirty` backlog with the configured Ollama model (AI-PIPELINE §2), on its own
+    /// thread holding the writer slot.
+    ///
+    /// Manual, not automatic: measured on this box a name-only pass is ~4.7 s/asset and a vision pass
+    /// several times that, so a full library is hours of CPU — something the user asks for, never
+    /// something a scan starts. It is resumable for the same reason: `tags_dirty` is per asset, so a
+    /// cancelled run simply leaves the rest queued.
+    fn spawn_tagging(&mut self) {
+        if self.catalog_persisting {
+            self.jobs
+                .toast("Catalog is busy — try again in a moment", Intent::Info);
+            return;
+        }
+        let (Some(db_path), Some(model)) = (catalog_db_path(), self.config.tagger_model.clone())
+        else {
+            return;
+        };
+        let vision_model = self.config.tagger_vision_model.clone();
+        let workspace_dir = self.workspace_dir.clone();
+        let cache_dir = self.thumb_cache_dir.clone();
+        let generation = self.scan_generation;
+        let tx = self.catalog_tx.clone();
+        let roots = self.scan_root_names();
+        let progress = std::sync::Arc::new(crate::jobs::JobProgress::default());
+        let job_progress = progress.clone();
+        self.tag_job = Some(self.jobs.start(
+            format!("Identifying with {model}"),
+            progress.clone(),
+            true,
+        ));
+        self.catalog_persisting = true;
+
+        std::thread::spawn(move || {
+            let tagger = match vision_model {
+                Some(v) => lodestash_ai::ollama::OllamaTagger::new(model).with_vision(v),
+                None => lodestash_ai::ollama::OllamaTagger::new(model),
+            };
+            let (counts, assets) = match Catalog::open(&db_path) {
+                Ok(mut cat) => {
+                    drain_tags(
+                        &mut cat,
+                        &tagger,
+                        workspace_dir.as_deref(),
+                        cache_dir.as_deref(),
+                        &job_progress,
+                    );
+                    // Tags change what search returns and (with P4's status rule) what "identified"
+                    // means, so report fresh counts + identities like any other drain.
+                    resync_after_drain(&mut cat, &roots)
+                }
+                Err(e) => {
+                    tracing::warn!(%e, "tagging: catalog unavailable");
+                    (None, Vec::new())
+                }
+            };
+            let _ = tx.send(CatalogSynced {
+                generation,
+                drain_only: true,
+                counts,
+                assets,
+            });
+        });
     }
 
     /// `(source name, root path)` per scan root — what `upsert_import_source` wants on the
@@ -1966,6 +2037,11 @@ impl LodestashApp {
             // Unity Assets screen lazily reload its listing next open.
             self.unity_packages = None;
             self.reload_edge_sets();
+            if let Some(id) = self.tag_job.take() {
+                self.jobs.finish(id);
+                self.jobs
+                    .toast("Identification pass finished", Intent::Success);
+            }
             match msg.counts {
                 Some(counts) => self.catalog_counts = Some(counts),
                 None if msg.drain_only => {}
@@ -4342,17 +4418,151 @@ impl LodestashApp {
                                 }
                             }
                         });
-                        settings_card(ui, "AI \u{00B7} IDENTIFY PROFILE", |ui| {
+                        // AI · IDENTIFY — local tagging through an Ollama model already on the
+                        // machine (AI-PIPELINE §2). Manual: a full pass is hours of CPU.
+                        let mut start_tagging = false;
+                        let tagging_running = self.tag_job.is_some();
+                        settings_card(ui, "AI \u{00B7} IDENTIFY", |ui| {
+                            let models = self.ollama_models.get_or_insert_with(|| {
+                                lodestash_ai::ollama::OllamaTagger::installed_models(
+                                    lodestash_ai::ollama::DEFAULT_HOST,
+                                )
+                                .unwrap_or_default()
+                            });
+                            let vision_candidates: Vec<String> = models
+                                .iter()
+                                .filter(|m| is_vision_model(m))
+                                .cloned()
+                                .collect();
+                            if models.is_empty() {
+                                ui.label(
+                                    RichText::new(
+                                        "No local model found. Install Ollama and pull a vision \
+                                         model (moondream ~1.7 GB, or qwen2.5vl:3b ~3 GB), then \
+                                         reopen Settings.",
+                                    )
+                                    .size(11.0)
+                                    .color(theme::TEXT_DIM),
+                                );
+                                return;
+                            }
                             ui.label(
                                 RichText::new(
-                                    "Integrated / Balanced / Dedicated GPU \u{2014} model set + \
-                                     preview quality. Planned (AI-MODELS-BY-GPU.md); no local AI \
-                                     engine yet.",
+                                    "Tags assets with a model already on this machine \u{2014} \
+                                     nothing leaves the box. Vision models describe the preview; \
+                                     text-only models read the asset's name.",
                                 )
                                 .size(11.0)
                                 .color(theme::TEXT_DIM),
                             );
+                            ui.add_space(6.0);
+                            let current = self
+                                .config
+                                .tagger_model
+                                .clone()
+                                .unwrap_or_else(|| "\u{2014} off \u{2014}".into());
+                            egui::ComboBox::from_id_salt("tagger_model")
+                                .selected_text(current)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(
+                                            self.config.tagger_model.is_none(),
+                                            "\u{2014} off \u{2014}",
+                                        )
+                                        .clicked()
+                                    {
+                                        self.config.tagger_model = None;
+                                        save = true;
+                                    }
+                                    for m in models.iter() {
+                                        if ui
+                                            .selectable_label(
+                                                self.config.tagger_model.as_deref() == Some(m),
+                                                m,
+                                            )
+                                            .clicked()
+                                        {
+                                            self.config.tagger_model = Some(m.to_string());
+                                            save = true;
+                                        }
+                                    }
+                                });
+                            if self.config.tagger_model.is_some() {
+                                // Optional captioning stage. Two models, because a small VLM
+                                // captions well but cannot hold a JSON schema (see OllamaTagger).
+                                let vision_label = self
+                                    .config
+                                    .tagger_vision_model
+                                    .clone()
+                                    .unwrap_or_else(|| "\u{2014} name only \u{2014}".into());
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new("Preview captions")
+                                            .size(11.0)
+                                            .color(theme::TEXT_DIM),
+                                    );
+                                    egui::ComboBox::from_id_salt("tagger_vision")
+                                        .selected_text(vision_label)
+                                        .show_ui(ui, |ui| {
+                                            if ui
+                                                .selectable_label(
+                                                    self.config.tagger_vision_model.is_none(),
+                                                    "\u{2014} name only \u{2014}",
+                                                )
+                                                .clicked()
+                                            {
+                                                self.config.tagger_vision_model = None;
+                                                save = true;
+                                            }
+                                            for m in vision_candidates.iter() {
+                                                if ui
+                                                    .selectable_label(
+                                                        self.config.tagger_vision_model.as_deref()
+                                                            == Some(m),
+                                                        m,
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.config.tagger_vision_model =
+                                                        Some(m.to_string());
+                                                    save = true;
+                                                }
+                                            }
+                                        });
+                                });
+                                ui.add_space(6.0);
+                                let label = if tagging_running {
+                                    "Identifying\u{2026} see the job tray".to_string()
+                                } else {
+                                    "\u{2726} Identify unidentified assets".to_string()
+                                };
+                                if ui
+                                    .add_enabled(
+                                        !tagging_running,
+                                        egui::Button::new(
+                                            RichText::new(label).size(12.0).color(theme::ARCANE),
+                                        )
+                                        .stroke(egui::Stroke::new(1.0, theme::ARCANE))
+                                        .rounding(6.0),
+                                    )
+                                    .clicked()
+                                {
+                                    start_tagging = true;
+                                }
+                                ui.label(
+                                    RichText::new(
+                                        "Runs on CPU: seconds per asset, so a large library takes \
+                                         hours. Cancel from the tray \u{2014} it resumes where it \
+                                         stopped.",
+                                    )
+                                    .size(10.0)
+                                    .color(theme::TEXT_DIM),
+                                );
+                            }
                         });
+                        if start_tagging {
+                            self.spawn_tagging();
+                        }
                         settings_card(ui, "MCP", |ui| {
                             ui.label(
                                 RichText::new(
@@ -6435,6 +6645,25 @@ fn reveal_in_file_manager(path: &std::path::Path) {
 // ── Settings screen widgets (design §5) ────────────────────────────────────────
 
 /// A settings section card: `SURFACE` fill, `BORDER`, 10px radius, letter-spaced title.
+/// Whether an Ollama model name looks like a vision model. Ollama's `/api/tags` doesn't report
+/// capability, so the name is the only signal available — and handing pixels to a text-only model
+/// wastes the call, while withholding them from a vision model wastes the model.
+/// ponytail: a name list. Read `/api/show`'s `families` if this ever guesses wrong on a model
+/// someone actually uses.
+fn is_vision_model(name: &str) -> bool {
+    const VISION_MARKERS: &[&str] = &[
+        "moondream",
+        "llava",
+        "bakllava",
+        "vl",
+        "vision",
+        "gemma3",
+        "minicpm-v",
+    ];
+    let lower = name.to_lowercase();
+    VISION_MARKERS.iter().any(|m| lower.contains(m))
+}
+
 fn settings_card(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
     egui::Frame::none()
         .fill(theme::SURFACE)
@@ -7771,6 +8000,15 @@ fn drain_promote_resync(
             return (None, Vec::new());
         }
     }
+    resync_after_drain(cat, roots)
+}
+
+/// Re-read per-status counts + asset identities for `roots` after a drain has changed them.
+/// Shared by every drain path, so what the grid learns never depends on which one ran.
+fn resync_after_drain(
+    cat: &mut Catalog,
+    roots: &[(String, String)],
+) -> (Option<StatusCounts>, AssetIdentityMaps) {
     let read = || -> Result<(StatusCounts, AssetIdentityMaps), String> {
         let mut sources = Vec::with_capacity(roots.len());
         for (name, root) in roots {
@@ -7792,6 +8030,118 @@ fn drain_promote_resync(
             (None, Vec::new())
         }
     }
+}
+
+/// Tag the `tags_dirty` backlog, one asset at a time, on the caller's sole-writer connection.
+///
+/// The preview handed to a vision model is the **thumbnail cache's own PNG** — the same pixels the
+/// grid shows, produced by the same `thumb::generate` (decode for 2D, hero render for 3D), so the
+/// model sees what the user sees and no second rendering path exists to drift.
+///
+/// Forward progress is unconditional: an asset the tagger refuses (audio), one whose preview can't
+/// be made, and one the model answers nothing for all still clear `tags_dirty` via an empty write.
+/// Otherwise the queue would hand back the same rows forever.
+fn drain_tags(
+    cat: &mut Catalog,
+    tagger: &dyn lodestash_ai::tagger::Tagger,
+    workspace_dir: Option<&std::path::Path>,
+    cache_dir: Option<&std::path::Path>,
+    progress: &crate::jobs::JobProgress,
+) {
+    use std::sync::atomic::Ordering;
+    const BATCH: usize = 16;
+    /// Fixed preview size, independent of the user's grid-quality setting: tagging results should
+    /// not change because someone moved a slider.
+    const TAG_PX: u32 = 384;
+
+    if let Ok(total) = cat.count_needing_tags() {
+        progress.total.store(total as u64, Ordering::Relaxed);
+    }
+    let mut tagged = 0usize;
+    let model_id = tagger.model_id().to_string();
+    loop {
+        if progress.is_cancelled() {
+            break;
+        }
+        let jobs = match cat.assets_needing_tags(BATCH) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(%e, "tag queue query failed; retries next run");
+                break;
+            }
+        };
+        if jobs.is_empty() {
+            break;
+        }
+        for job in jobs {
+            if progress.is_cancelled() {
+                return;
+            }
+            let path = match (&job.disk_path, &job.workspace_rel) {
+                (Some(p), _) => Some(std::path::PathBuf::from(p)),
+                (None, Some(rel)) => workspace_dir.map(|w| w.join(rel)),
+                _ => None,
+            };
+            let name = path
+                .as_deref()
+                .and_then(|p| p.file_stem())
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let preview = path
+                .as_deref()
+                .zip(cache_dir)
+                .and_then(|(p, cache)| tag_preview(p, cache, TAG_PX));
+            let result = if tagger.supports(&job.media_code) {
+                tagger.tag(&lodestash_ai::tagger::TagInput {
+                    media_code: &job.media_code,
+                    name: &name,
+                    image: preview.as_ref(),
+                })
+            } else {
+                lodestash_ai::tagger::TagResult::default()
+            };
+            let tags = lodestash_ai::tagger::validate(result.tags);
+            // The caption is the model's own words about the asset; it lands in `description`,
+            // which FTS indexes, so it is searchable rather than decorative.
+            if let Some(caption) = &result.caption {
+                if let Err(e) = cat.set_description(job.asset_id, Some(caption)) {
+                    tracing::warn!(%e, "caption write failed");
+                }
+            }
+            match cat.set_tags(job.asset_id, "ai", Some(&model_id), &tags) {
+                Ok(n) => tagged += n,
+                Err(e) => {
+                    tracing::warn!(%e, "set_tags failed; stopping tag drain");
+                    return;
+                }
+            }
+            progress.done.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    tracing::info!(tags = tagged, model = %model_id, "tagging pass finished");
+}
+
+/// The cached preview PNG for `source`, decoded. `None` when the file can't be previewed at all
+/// (an audio clip, an unreadable model) — the caller then tags from the name alone.
+fn tag_preview(
+    source: &std::path::Path,
+    cache_dir: &std::path::Path,
+    px: u32,
+) -> Option<image::RgbaImage> {
+    let meta = std::fs::metadata(source).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let key = lodestash_ingest::thumb::meta_key(source, meta.len(), mtime);
+    let params = lodestash_ingest::thumb::ThumbParams {
+        width: px,
+        height: px,
+    };
+    let png = lodestash_ingest::thumb::generate(source, cache_dir, &key, params).ok()?;
+    Some(image::open(png).ok()?.to_rgba8())
 }
 
 fn drain_image_embeddings(
@@ -9588,6 +9938,109 @@ mod tests {
             "notes.txt",
         ] {
             assert!(!is_browseable(&f(junk)), "{junk} is not a game asset");
+        }
+    }
+
+    /// End-to-end on **real files with a real model**: crawl two assets whose names say nothing
+    /// useful, run the drain with a vision model, and require that the tags come from the pixels.
+    /// `#[ignore]` + env-gated like the other model-backed tests.
+    ///
+    /// ```bash
+    /// OLLAMA_MODEL=moondream:latest cargo test -p lodestash-ui drain_tags_end_to_end -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs Ollama with a vision model"]
+    fn drain_tags_end_to_end() {
+        let Ok(model) = std::env::var("OLLAMA_MODEL") else {
+            panic!("set OLLAMA_MODEL");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        // Neutral names, so a name-reading tagger can't pass: only the pixels distinguish these.
+        let red = image::RgbaImage::from_pixel(256, 256, image::Rgba([200, 30, 30, 255]));
+        red.save(lib.join("asset_0001.png")).unwrap();
+        let mut checker = image::RgbaImage::new(256, 256);
+        for (x, y, px) in checker.enumerate_pixels_mut() {
+            let on = ((x / 32) + (y / 32)) % 2 == 0;
+            *px = image::Rgba(if on {
+                [20, 20, 20, 255]
+            } else {
+                [235, 235, 235, 255]
+            });
+        }
+        checker.save(lib.join("asset_0002.png")).unwrap();
+
+        let db = dir.path().join("catalog.db");
+        {
+            use lodestash_core::catalog::{Catalog, CrawlRecord};
+            let mut cat = Catalog::open(&db).unwrap();
+            cat.seed_media_types().unwrap();
+            let src = cat
+                .upsert_import_source("Lib", &lib.to_string_lossy(), "folder")
+                .unwrap();
+            let recs: Vec<CrawlRecord> = ["asset_0001.png", "asset_0002.png"]
+                .iter()
+                .map(|rel| CrawlRecord {
+                    workspace_rel: None,
+                    rel_path: (*rel).into(),
+                    name: (*rel).into(),
+                    media_type: "image".into(),
+                    size_bytes: std::fs::metadata(lib.join(rel)).unwrap().len() as i64,
+                    mtime: 1,
+                })
+                .collect();
+            cat.record_crawl(src, None, &recs).unwrap();
+        }
+
+        let mut cat = Catalog::open(&db).unwrap();
+        let vision = std::env::var("OLLAMA_VISION").unwrap_or_else(|_| "moondream:latest".into());
+        let tagger = lodestash_ai::ollama::OllamaTagger::new(model).with_vision(vision);
+        let progress = crate::jobs::JobProgress::default();
+        let cache = dir.path().join("thumbs");
+        drain_tags(&mut cat, &tagger, None, Some(&cache), &progress);
+
+        use std::sync::atomic::Ordering;
+        assert_eq!(progress.done.load(Ordering::Relaxed), 2, "both assets ran");
+        assert_eq!(
+            cat.count_needing_tags().unwrap(),
+            0,
+            "the queue drains even if the model says nothing"
+        );
+        let mut any = false;
+        for id in 1..=2i64 {
+            let tags = cat.tags_for_asset(id).unwrap();
+            println!(
+                "asset {id}: {}",
+                tags.iter()
+                    .map(|t| format!("{}={}", t.namespace, t.value))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            any |= !tags.is_empty();
+        }
+        assert!(any, "a vision model saw two plain images and said nothing");
+        // The point of tagging: a word that appears nowhere in the filename now finds the asset.
+        let hits = cat.search_assets("red", 10).unwrap().unwrap_or_default();
+        println!("search 'red' -> {hits:?}");
+    }
+
+    /// Vision detection is name-based (Ollama reports no capability flag), so it has to catch the
+    /// families people actually pull and not fire on a text model that merely contains a letter
+    /// pair.
+    #[test]
+    fn vision_models_are_recognised_by_name() {
+        for m in [
+            "moondream:latest",
+            "llava:13b",
+            "qwen2.5vl:3b",
+            "gemma3:4b",
+            "minicpm-v",
+        ] {
+            assert!(is_vision_model(m), "{m} is a vision model");
+        }
+        for m in ["qwen3:8b", "llama3.2:3b", "mistral", "phi4", "deepseek-r1"] {
+            assert!(!is_vision_model(m), "{m} is text-only");
         }
     }
 

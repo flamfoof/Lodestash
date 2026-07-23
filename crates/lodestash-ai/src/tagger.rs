@@ -17,6 +17,23 @@ pub struct TagInput<'a> {
     pub image: Option<&'a image::RgbaImage>,
 }
 
+/// What a tagger produced: facet tags plus, when a model can write one, a short caption that
+/// becomes `asset.description` (AI-PIPELINE §6 "caption fills asset.description, FTS-searchable").
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct TagResult {
+    pub tags: Vec<TagAssignment>,
+    pub caption: Option<String>,
+}
+
+impl TagResult {
+    pub fn from_tags(tags: Vec<TagAssignment>) -> Self {
+        Self {
+            tags,
+            caption: None,
+        }
+    }
+}
+
 /// Produces facet tags for one asset (IDENTIFICATION-AND-SEARCH §2).
 ///
 /// The trait deliberately returns *proposals*, not writes: validation (unknown namespaces dropped,
@@ -29,9 +46,10 @@ pub trait Tagger {
     /// Whether this tagger can say anything about a given `media_type.code`. A vision tagger
     /// returns false for audio rather than guessing from the filename.
     fn supports(&self, media_code: &str) -> bool;
-    /// Propose tags. An empty vector is a valid answer — "nothing recognisable" is information,
-    /// and the caller still clears the queue flag so the asset isn't re-run forever.
-    fn tag(&self, input: &TagInput<'_>) -> Vec<TagAssignment>;
+    /// Propose tags (and optionally a caption). An empty result is a valid answer — "nothing
+    /// recognisable" is information, and the caller still clears the queue flag so the asset isn't
+    /// re-run forever.
+    fn tag(&self, input: &TagInput<'_>) -> TagResult;
 }
 
 /// The facet namespaces a *model* is allowed to fill (IDENTIFICATION-AND-SEARCH §2).
@@ -106,7 +124,7 @@ impl Tagger for FilenameTagger {
         true // a filename exists for every asset
     }
 
-    fn tag(&self, input: &TagInput<'_>) -> Vec<TagAssignment> {
+    fn tag(&self, input: &TagInput<'_>) -> TagResult {
         // Split on the separators asset names actually use, so `SM_Chr_Ghost_01` yields tokens
         // rather than one long word.
         let lower = input.name.to_lowercase();
@@ -129,7 +147,7 @@ impl Tagger for FilenameTagger {
                 }
             }
         }
-        out
+        TagResult::from_tags(out)
     }
 }
 
@@ -145,17 +163,19 @@ mod tests {
             name: "SM_Chr_Ghost_01",
             image: None,
         };
-        let tags = t.tag(&input);
+        let tags = t.tag(&input).tags;
         assert_eq!(
             tags.iter().map(|t| t.value.as_str()).collect::<Vec<_>>(),
             vec!["character"]
         );
 
         // Two conventions in one name, and the same value twice collapses.
-        let tags = t.tag(&TagInput {
-            name: "SM_Env_Wall_01_Wall_Alt",
-            ..input
-        });
+        let tags = t
+            .tag(&TagInput {
+                name: "SM_Env_Wall_01_Wall_Alt",
+                ..input
+            })
+            .tags;
         let mut values: Vec<&str> = tags.iter().map(|t| t.value.as_str()).collect();
         values.sort();
         assert_eq!(values, vec!["environment", "wall"]);
@@ -166,6 +186,7 @@ mod tests {
                 name: "chrome_panel",
                 ..input
             })
+            .tags
             .is_empty());
     }
 

@@ -11,8 +11,11 @@ use lodestash_ai::tagger::{validate, TagInput, Tagger};
 
 fn tagger() -> OllamaTagger {
     let model = std::env::var("OLLAMA_MODEL").expect("set OLLAMA_MODEL");
-    let vision = std::env::var("VISION").is_ok();
-    OllamaTagger::new(model, vision)
+    let t = OllamaTagger::new(model);
+    match std::env::var("OLLAMA_VISION") {
+        Ok(v) => t.with_vision(v),
+        Err(_) => t,
+    }
 }
 
 #[test]
@@ -40,11 +43,14 @@ fn names_produce_distinguishing_facets() {
 
     let mut rows = Vec::new();
     for (name, media, _) in cases {
-        let tags = validate(t.tag(&TagInput {
-            media_code: media,
-            name,
-            image: None,
-        }));
+        let tags = validate(
+            t.tag(&TagInput {
+                media_code: media,
+                name,
+                image: None,
+            })
+            .tags,
+        );
         let flat: Vec<String> = tags
             .iter()
             .map(|x| format!("{}={}", x.namespace, x.value))

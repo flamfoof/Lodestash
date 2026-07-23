@@ -346,6 +346,14 @@ pub struct AppConfig {
     /// the rescan only fires while the library is idle, never mid-selection.
     #[serde(default = "default_true")]
     pub watch_sources: bool,
+    /// Ollama model used for local tagging (AI-PIPELINE §2). `None` = tagging off — the drain is
+    /// hours of CPU on a real library, so it never starts unasked.
+    #[serde(default)]
+    pub tagger_model: Option<String>,
+    /// Optional vision model that captions the preview before the text model writes facets
+    /// (AI-PIPELINE section 2). `None` = tag from the asset's name alone.
+    #[serde(default)]
+    pub tagger_vision_model: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -363,6 +371,8 @@ impl Default for AppConfig {
             asset_store_roots: Vec::new(),
             volume: default_volume(),
             watch_sources: true,
+            tagger_model: None,
+            tagger_vision_model: None,
         }
     }
 }

@@ -40,6 +40,15 @@ trait Embedder {
 }
 ```
 
+**Why the local tagger is two models.** Measured, not assumed: asked for facet JSON directly,
+`moondream` degenerates into arrays of numbers (its JSON mode is trained for grounding boxes, not
+objects) — while the *same* model captions the *same* preview accurately in prose. So the vision
+model does what it is good at (one sentence of description), and a text model turns that caption
+plus the filename into the schema. The caption is not thrown away: it becomes `asset.description`,
+which FTS indexes, so a word the model saw but the filename never contained still finds the asset.
+A machine with no vision model installed still tags from names alone, at a lower confidence (0.4 vs
+0.7) because a name is a weaker claim than pixels.
+
 The tagger returns **proposals**, never writes: `lodestash_ai::tagger::validate` drops facets a
 model may not fill (`color`/`technical`/`audio` — §2 of IDENTIFICATION-AND-SEARCH) and caps values
 per facet, then `Catalog::set_tags` normalizes and persists. Same "validate then write" seam the
@@ -50,7 +59,7 @@ that can actually produce one.
 
 | Impl | Backend |
 |---|---|
-| `LocalTagger` | WD v3 (image, ONNX) · YAMNet/PANNs + CLAP (audio) · multiview→WD (3D) · Ollama VLM captions |
+| `LocalTagger` | **Ollama, two stages: VLM captions the preview → text model writes the facet JSON** (shipped) · WD v3 (image, ONNX) · YAMNet/PANNs + CLAP (audio) · multiview→WD (3D) |
 | `ApiTagger` | Cloud vision LLM (default **Claude**) with a JSON-schema response |
 | `LocalEmbedder` | SigLIP 2 (image) · CLAP (audio) · multiview-SigLIP (3D) — via `ort`/candle |
 | `ApiEmbedder` | provider embeddings *(optional — see policy)* |

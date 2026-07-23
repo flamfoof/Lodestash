@@ -1751,6 +1751,32 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("tags read row: {e}")))
     }
 
+    /// Store a model-written caption as the asset's description (AI-PIPELINE section 6). The FTS
+    /// update trigger re-indexes the row, so a caption is searchable the moment it lands.
+    pub fn set_description(&self, asset_id: i64, description: Option<&str>) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE asset SET description = ?2, updated_at = ?3 WHERE id = ?1",
+                params![asset_id, description, unix_now()],
+            )
+            .map(|_| ())
+            .map_err(|e| CoreError::Catalog(format!("set_description: {e}")))
+    }
+
+    /// How many assets still await tagging — the job tray's total, so a run shows a real bar
+    /// instead of a spinner.
+    pub fn count_needing_tags(&self) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset a
+                   JOIN asset_file af ON af.id = a.primary_file_id
+                  WHERE a.tags_dirty = 1 AND a.deleted_at IS NULL AND af.missing = 0",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| CoreError::Catalog(format!("tag queue count: {e}")))
+    }
+
     /// Assets still awaiting identification (`tags_dirty`), for the tagging drain. Same job shape
     /// and path rules as the other queues.
     pub fn assets_needing_tags(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {

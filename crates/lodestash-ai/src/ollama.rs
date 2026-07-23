@@ -11,30 +11,44 @@ use std::time::Duration;
 
 use lodestash_core::catalog::TagAssignment;
 
-use crate::tagger::{TagInput, Tagger, MODEL_FACETS};
+use crate::tagger::{TagInput, TagResult, Tagger, MODEL_FACETS};
 
 /// Default Ollama endpoint. Loopback only — a remote host would put asset previews on the network,
 /// which the local-first invariant forbids without an explicit opt-in path.
 pub const DEFAULT_HOST: &str = "http://127.0.0.1:11434";
 
-/// A tagger backed by an Ollama model.
+/// A tagger backed by Ollama: a **text** model that emits the facet JSON, optionally preceded by a
+/// **vision** model that captions the preview.
+///
+/// The split is not architecture for its own sake, it is what measurement forced. Asked for facet
+/// JSON directly, `moondream` degenerates into arrays of numbers (its JSON mode is trained for
+/// grounding boxes, not objects), while it captions the same preview accurately in prose. A text
+/// model then turns that caption plus the filename into the schema reliably. This is also what
+/// AI-PIPELINE section 2 describes for `LocalTagger`: "Ollama VLM captions".
 pub struct OllamaTagger {
     host: String,
-    model: String,
-    vision: bool,
+    /// Emits the facet JSON. Required.
+    text_model: String,
+    /// Captions the preview first, when the asset has one. `None` = name-only tagging.
+    vision_model: Option<String>,
     timeout: Duration,
 }
 
 impl OllamaTagger {
-    /// Build a tagger for `model` (e.g. `moondream`, `qwen2.5vl:3b`, `qwen3:8b`).
-    /// `vision` says whether to send pixels; a text-only model given an image answers nonsense.
-    pub fn new(model: impl Into<String>, vision: bool) -> Self {
+    /// Text-only: facets are inferred from the asset's name alone.
+    pub fn new(text_model: impl Into<String>) -> Self {
         Self {
             host: DEFAULT_HOST.to_string(),
-            model: model.into(),
-            vision,
-            timeout: Duration::from_secs(120),
+            text_model: text_model.into(),
+            vision_model: None,
+            timeout: Duration::from_secs(180),
         }
+    }
+
+    /// Add the captioning stage (e.g. `moondream`), used whenever an asset has a preview.
+    pub fn with_vision(mut self, vision_model: impl Into<String>) -> Self {
+        self.vision_model = Some(vision_model.into());
+        self
     }
 
     pub fn with_host(mut self, host: impl Into<String>) -> Self {
@@ -63,17 +77,26 @@ impl OllamaTagger {
             .unwrap_or_default())
     }
 
-    /// One blocking generate call, returning the model's raw response text.
-    fn generate(&self, prompt: &str, image_png: Option<&[u8]>) -> Result<String, String> {
+    /// One blocking generate call, returning the model's raw response text. `json` asks Ollama to
+    /// constrain decoding, which is right for the facet stage and wrong for captioning.
+    fn generate(
+        &self,
+        model: &str,
+        prompt: &str,
+        image_png: Option<&[u8]>,
+        json: bool,
+    ) -> Result<String, String> {
         let mut body = serde_json::json!({
-            "model": self.model,
+            "model": model,
             "prompt": prompt,
             "stream": false,
-            // `format: json` makes Ollama constrain decoding to valid JSON, which removes the
-            // single most common failure of small models: prose wrapped around the answer.
-            "format": "json",
             "options": { "temperature": 0.0 },
         });
+        if json {
+            // Constrained decoding removes the commonest failure of small models on the facet
+            // stage: prose wrapped around the answer.
+            body["format"] = serde_json::json!("json");
+        }
         if let Some(png) = image_png {
             body["images"] = serde_json::json!([base64(png)]);
         }
@@ -90,28 +113,57 @@ impl OllamaTagger {
     }
 }
 
-/// The instruction both shapes share. The facet list is injected from [`MODEL_FACETS`] so the
-/// prompt can't drift from what `validate` will accept.
-fn build_prompt(input: &TagInput<'_>, vision: bool) -> String {
+/// The facet instruction. The facet list is injected from [`MODEL_FACETS`] so the prompt cannot
+/// drift from what `validate` will accept.
+fn build_prompt(input: &TagInput<'_>, caption: Option<&str>) -> String {
     let facets = MODEL_FACETS.join(", ");
-    let subject = if vision {
-        "Look at this game asset preview.".to_string()
-    } else {
-        format!(
-            "A game asset file is named \"{}\". Infer only what the name actually supports.",
+    let evidence = match caption {
+        Some(c) => format!(
+            "A {} asset in a game-asset library is named \"{}\".\n\
+             A vision model describes it as: \"{}\".",
+            media_word(input.media_code),
+            input.name,
+            c
+        ),
+        None => format!(
+            "A {} asset in a game-asset library is named \"{}\". \
+             Infer only what the name actually supports.",
+            media_word(input.media_code),
             input.name
-        )
+        ),
     };
     format!(
-        "{subject}\n\
-         It is a {} asset in a game-asset library.\n\
+        "{evidence}\n\
          Reply with JSON only: an object whose keys are facets and whose values are arrays of \
          short lowercase terms.\n\
          Allowed facets: {facets}.\n\
          Use at most 4 terms per facet, and omit a facet entirely rather than guessing. \
-         Do not describe colours, resolution, polygon counts or file formats.",
-        media_word(input.media_code)
+         Do not describe colours, resolution, polygon counts or file formats."
     )
+}
+
+/// The captioning instruction: plain prose, no schema. Small VLMs caption well and follow
+/// structure badly, so this stage asks for the thing they are good at.
+fn caption_prompt(media_code: &str) -> String {
+    format!(
+        "Describe this {} from a game-asset library in one short sentence: what it is, its style, \
+         and what it is made of.",
+        media_word(media_code)
+    )
+}
+
+/// Trim the noise small captioners prepend (`moondream` emits a literal `!!!IMPORTANT!!!`) and cap
+/// the length, since a caption is a description and not an essay.
+fn clean_caption(raw: &str) -> Option<String> {
+    let text = raw
+        .trim()
+        .trim_start_matches(|c: char| c == '!' || c == '*' || c == '#' || c.is_whitespace());
+    let text = text.strip_prefix("IMPORTANT").unwrap_or(text);
+    let text = text.trim_start_matches([':', '!', '-', ' ']).trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.chars().take(300).collect())
 }
 
 fn media_word(code: &str) -> &str {
@@ -163,7 +215,7 @@ fn parse_facets(json: &str, confidence: f64) -> Vec<TagAssignment> {
 
 impl Tagger for OllamaTagger {
     fn model_id(&self) -> &str {
-        &self.model
+        &self.text_model
     }
 
     fn supports(&self, media_code: &str) -> bool {
@@ -171,28 +223,37 @@ impl Tagger for OllamaTagger {
         media_code != "audio"
     }
 
-    fn tag(&self, input: &TagInput<'_>) -> Vec<TagAssignment> {
-        let png = match (self.vision, input.image) {
-            (true, Some(img)) => match encode_png(img) {
-                Ok(bytes) => Some(bytes),
+    fn tag(&self, input: &TagInput<'_>) -> TagResult {
+        // Stage 1 (optional): caption the preview with the vision model.
+        let caption = match (&self.vision_model, input.image) {
+            (Some(model), Some(img)) => match encode_png(img) {
+                Ok(png) => self
+                    .generate(model, &caption_prompt(input.media_code), Some(&png), false)
+                    .map_err(
+                        |e| tracing::warn!(%model, %e, "captioning failed; using the name alone"),
+                    )
+                    .ok()
+                    .and_then(|c| clean_caption(&c)),
                 Err(e) => {
-                    tracing::warn!(%e, "ollama tagger: preview encode failed; falling back to name");
+                    tracing::warn!(%e, "preview encode failed; using the name alone");
                     None
                 }
             },
             _ => None,
         };
-        let prompt = build_prompt(input, png.is_some());
-        match self.generate(&prompt, png.as_deref()) {
-            // A name-only inference is a weaker claim than one made from pixels, and the
-            // confidence has to say so — the UI hides low-confidence tags rather than deleting
-            // them (IDENTIFICATION-AND-SEARCH §2).
-            Ok(text) => parse_facets(&text, if png.is_some() { 0.7 } else { 0.4 }),
+
+        // Stage 2: the text model turns the evidence into the facet schema.
+        let prompt = build_prompt(input, caption.as_deref());
+        let tags = match self.generate(&self.text_model, &prompt, None, true) {
+            // Pixels make a stronger claim than a filename, and the confidence has to say so:
+            // the UI hides low-confidence tags rather than deleting them.
+            Ok(text) => parse_facets(&text, if caption.is_some() { 0.7 } else { 0.4 }),
             Err(e) => {
-                tracing::warn!(model = %self.model, %e, "ollama tagging failed");
+                tracing::warn!(model = %self.text_model, %e, "ollama tagging failed");
                 Vec::new()
             }
-        }
+        };
+        TagResult { tags, caption }
     }
 }
 
@@ -288,13 +349,50 @@ mod tests {
     }
 
     #[test]
+    fn the_caption_becomes_evidence_in_the_facet_prompt() {
+        let input = TagInput {
+            media_code: "model_3d",
+            name: "asset_0192",
+            image: None,
+        };
+        let prompt = build_prompt(&input, Some("A rusty metal barrel with a dented lid."));
+        assert!(
+            prompt.contains("rusty metal barrel"),
+            "caption is passed through"
+        );
+        assert!(
+            prompt.contains("asset_0192"),
+            "the name stays as corroborating evidence"
+        );
+    }
+
+    #[test]
+    fn captions_are_cleaned_of_model_noise() {
+        // moondream really does prefix this.
+        assert_eq!(
+            clean_caption("!!!IMPORTANT!!! A red background with a white border."),
+            Some("A red background with a white border.".to_string())
+        );
+        assert_eq!(
+            clean_caption("  **A stone wall.**  "),
+            Some("A stone wall.**".to_string())
+        );
+        assert_eq!(clean_caption("   !!!  "), None);
+        assert_eq!(
+            clean_caption(&"x".repeat(400)).map(|c| c.len()),
+            Some(300),
+            "a caption is a description, not an essay"
+        );
+    }
+
+    #[test]
     fn the_prompt_offers_only_facets_validate_accepts() {
         let input = TagInput {
             media_code: "model_3d",
             name: "SM_Env_Rock_01",
             image: None,
         };
-        let prompt = build_prompt(&input, false);
+        let prompt = build_prompt(&input, None);
         assert!(
             prompt.contains("SM_Env_Rock_01"),
             "text mode leans on the name"
