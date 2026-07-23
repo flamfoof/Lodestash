@@ -75,6 +75,39 @@ pub fn generate(
     Ok(dest)
 }
 
+/// Render (or serve from cache) a **material sphere** thumbnail: the material's albedo painted on
+/// a ball (UI-SPEC §13.1). `albedo` is resolved by the caller from the dependency graph, so this
+/// module still never touches the catalog.
+///
+/// Rendered on a **transparent** background for the same reason as model thumbnails: the grid card
+/// shows through, and the studio backdrop that suits the encoder would be loud in a dark grid.
+pub fn generate_material(
+    cache_dir: &Path,
+    key: &str,
+    params: ThumbParams,
+    albedo: Option<&Path>,
+) -> std::io::Result<PathBuf> {
+    let dest = cache_path(cache_dir, key, params);
+    if dest.exists() {
+        return Ok(dest);
+    }
+    std::fs::create_dir_all(cache_dir)?;
+    // A texture we can't decode is not a failure: the ball still shows the material's colour.
+    let tex = albedo
+        .and_then(|p| crate::raster::decode(p).ok())
+        .map(|img| {
+            // Downscale first: a 4k atlas costs far more to sample per pixel than the preview is worth.
+            img.thumbnail(512, 512).to_rgba8()
+        });
+    let size = params.width.max(params.height);
+    let img =
+        crate::material::render_sphere(tex.as_ref(), [210, 210, 210, 255], size, [0, 0, 0, 0])
+            .ok_or_else(|| std::io::Error::other("material sphere render failed"))?;
+    img.save_with_format(&dest, ImageFormat::Png)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    Ok(dest)
+}
+
 /// The sound token (`#49C9E0`), so a waveform thumb reads as audio at a glance the same way the
 /// type diamond does (DESIGN-GUIDELINES §7).
 pub const WAVEFORM_RGB: [u8; 3] = [0x49, 0xC9, 0xE0];

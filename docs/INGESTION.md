@@ -208,6 +208,26 @@ placeholder thumbnail.
 - **Skinned meshes, animation, materials/shaders** round-trip least reliably; treat as best-effort and
   center the viewer on static geometry + textures + audio first.
 
+### Material previews (the shader ball)
+
+A `.mat` has no pixels and no geometry, so it is previewed the way every DCC does it: painted onto
+a sphere. `lodestash_ingest::material::render_sphere` builds a UV sphere and hands it to the same
+CPU rasteriser that renders model thumbnails (`render3d`), on a transparent background so the grid
+card shows through.
+
+The texture comes from the **dependency graph** (DATA-MODEL §10): the material's resolved
+`uses_texture` edge names a catalogued texture, and `Catalog::material_albedo_paths` turns that into
+a file path. A material with several textures gets its lowest-id edge — in a Unity `.mat` the albedo
+binding is written before the normal and emissive maps, so insertion order beats any name heuristic.
+A material with no resolved texture still renders, as a neutral ball.
+
+UVs are longitude/latitude, not the material's own mapping: a tiling texture has no single correct
+projection onto a ball, and a shader ball is read as a preview rather than as a claim about how the
+material maps. The cache key includes the texture, so swapping a material's albedo cannot serve the
+old ball.
+
+---
+
 ### Content vs non-content classification
 Asset packs are full of things that aren't browseable *content* — scripts, DLLs, editor extensions,
 shaders, assembly definitions, demo scenes, data objects. Lodestash **classifies every file and flags

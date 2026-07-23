@@ -639,6 +639,9 @@ pub struct LodestashApp {
     asset_tags: std::collections::HashMap<i64, Vec<lodestash_core::catalog::TagAssignment>>,
     /// Tag vocabulary with usage counts, most-used first — the ⚑ Filters TRAIT chips.
     tag_usage: Vec<(String, String, i64)>,
+    /// Material asset id → the absolute path of the texture its preview sphere wears, resolved
+    /// from the dependency graph (DATA-MODEL §10). Refreshed per catalog sync with the tag maps.
+    material_albedo: std::collections::HashMap<i64, String>,
     /// Asset ids with at least one resolved outbound / inbound dependency edge (DATA-MODEL §10).
     /// Reloaded on every catalog sync; drives the grid's link badge and the LINKS filter chips.
     /// Sets rather than a per-entry flag — the grid's entries outlive any single catalog read.
@@ -836,6 +839,7 @@ impl LodestashApp {
             search_catalog: catalog_db_path().and_then(|p| Catalog::open(&p).ok()),
             asset_tags: std::collections::HashMap::new(),
             tag_usage: Vec::new(),
+            material_albedo: std::collections::HashMap::new(),
             edges_out: std::collections::HashSet::new(),
             edges_in: std::collections::HashSet::new(),
             related: Vec::new(),
@@ -1395,6 +1399,24 @@ impl LodestashApp {
         match cat.tag_usage(60) {
             Ok(v) => self.tag_usage = v,
             Err(e) => tracing::warn!(%e, "tag vocabulary unavailable"),
+        }
+        match cat.material_albedo_paths() {
+            Ok(map) => {
+                // A material whose texture only just resolved needs its placeholder thumbnail
+                // thrown away, or it keeps the flat card until the next scan.
+                for entry in &mut self.entries {
+                    if entry.file.media_type == Some(MediaType::Material)
+                        && entry
+                            .asset_id
+                            .is_some_and(|id| map.get(&id) != self.material_albedo.get(&id))
+                    {
+                        entry.texture = None;
+                        entry.thumb_spawned = false;
+                    }
+                }
+                self.material_albedo = map;
+            }
+            Err(e) => tracing::warn!(%e, "material albedo paths unavailable"),
         }
     }
 
@@ -4874,7 +4896,17 @@ impl LodestashApp {
             // On-screen quality drives the grid thumbnail render size (design §5.2). Quick Look is
             // unaffected — it decodes the original at full detail.
             let gen_px = self.config.preview_quality.thumb_px();
-            let is_audio = self.entries[idx].file.media_type == Some(MediaType::Audio);
+            let kind = match self.entries[idx].file.media_type {
+                Some(MediaType::Audio) => ThumbKind::Audio,
+                // A material has no pixels of its own: paint its albedo on a sphere.
+                Some(MediaType::Material) => ThumbKind::Material {
+                    albedo: self.entries[idx]
+                        .asset_id
+                        .and_then(|id| self.material_albedo.get(&id))
+                        .map(PathBuf::from),
+                },
+                _ => ThumbKind::Raster,
+            };
             let tx = self.thumb_tx.clone();
             let ctx2 = ctx.clone();
 
@@ -4890,7 +4922,7 @@ impl LodestashApp {
                     mtime,
                     cache_dir.as_deref(),
                     gen_px,
-                    is_audio,
+                    kind,
                 );
                 let _ = tx.send(ThumbReady {
                     index: idx,
@@ -9940,6 +9972,18 @@ fn type_label_char(mt: Option<MediaType>) -> &'static str {
 
 // ── Background thumbnail helpers ──────────────────────────────────────────────
 
+/// What kind of thumbnail an asset needs. Materials and audio have no pixels of their own, so
+/// each gets a rendered stand-in rather than a decode.
+#[derive(Debug, Clone)]
+enum ThumbKind {
+    Raster,
+    Audio,
+    /// A shader ball wearing the material's albedo, when the dependency graph resolved one.
+    Material {
+        albedo: Option<PathBuf>,
+    },
+}
+
 fn needs_thumbnail(mt: Option<MediaType>) -> bool {
     matches!(
         mt,
@@ -9952,6 +9996,7 @@ fn needs_thumbnail(mt: Option<MediaType>) -> bool {
                 | MediaType::Sprite
                 | MediaType::Model3d
                 | MediaType::Audio
+                | MediaType::Material
         )
     )
 }
@@ -9966,7 +10011,7 @@ fn generate_texture(
     mtime: i64,
     cache_dir: Option<&std::path::Path>,
     gen_px: u32,
-    is_audio: bool,
+    kind: ThumbKind,
 ) -> Option<TextureHandle> {
     // Serve from / populate the on-disk thumbnail cache (INGESTION.md §6): restarts then
     // decode cached PNGs instead of full-size originals. The cache filename embeds WxH
@@ -9979,16 +10024,24 @@ fn generate_texture(
                 width: gen_px,
                 height: gen_px,
             };
-            if is_audio {
+            match &kind {
                 // Audio has no pixels: draw the peak waveform the Quick Look player already
                 // decodes (rodio lives in this crate, so the decode stays here and `thumb` only
                 // owns the cache key + drawing).
-                thumb::generate_waveform(dir, &key, params, |bars| {
+                ThumbKind::Audio => thumb::generate_waveform(dir, &key, params, |bars| {
                     crate::audio::load_waveform(abs_path, bars).map(|m| m.peaks)
                 })
-                .ok()
-            } else {
-                thumb::generate(abs_path, dir, &key, params).ok()
+                .ok(),
+                ThumbKind::Material { albedo } => {
+                    // The texture is part of the picture, so it is part of the cache key: swap the
+                    // material's albedo and the old ball must not be served.
+                    let key = match albedo {
+                        Some(a) => format!("{key}-{}", thumb::meta_key(a, 0, 0)),
+                        None => format!("{key}-flat"),
+                    };
+                    thumb::generate_material(dir, &key, params, albedo.as_deref()).ok()
+                }
+                ThumbKind::Raster => thumb::generate(abs_path, dir, &key, params).ok(),
             }
         })
         .and_then(|cached| image::open(cached).ok())

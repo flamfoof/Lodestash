@@ -6,6 +6,7 @@ pub mod asset_store;
 pub mod crawler;
 pub mod deps;
 pub mod detect;
+pub mod material;
 pub mod melspec;
 pub mod mesh;
 pub mod metrics;

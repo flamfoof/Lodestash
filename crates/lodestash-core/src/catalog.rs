@@ -1788,6 +1788,36 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("tag queue count: {e}")))
     }
 
+    /// For every material that resolves a `uses_texture` edge, the **absolute path** of the
+    /// texture to paint on its preview sphere (DATA-MODEL §10 → UI-SPEC §13.1).
+    ///
+    /// A material with several textures gets its lowest-id one: the albedo is what a shader ball
+    /// should show, and in a Unity `.mat` the albedo binding is written before the normal and
+    /// emissive maps, so insertion order is a better guess than any name heuristic.
+    /// Package-extracted textures are skipped — they live in the workspace, not under a source
+    /// root, and the caller would need the workspace path to resolve them.
+    pub fn material_albedo_paths(&self) -> Result<std::collections::HashMap<i64, String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT r.from_asset_id, MIN(r.id), s.root_path || '/' || af.rel_path
+                   FROM asset_relationship r
+                   JOIN asset m          ON m.id = r.from_asset_id AND m.deleted_at IS NULL
+                   JOIN asset t          ON t.id = r.to_asset_id   AND t.deleted_at IS NULL
+                   JOIN asset_file af    ON af.id = t.primary_file_id AND af.missing = 0
+                                        AND af.workspace_rel IS NULL
+                   JOIN import_source s  ON s.id = t.source_id
+                  WHERE r.kind = 'uses_texture' AND r.to_asset_id IS NOT NULL
+                  GROUP BY r.from_asset_id",
+            )
+            .map_err(|e| CoreError::Catalog(format!("albedo prep: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(2)?)))
+            .map_err(|e| CoreError::Catalog(format!("albedo query: {e}")))?;
+        rows.collect::<std::result::Result<std::collections::HashMap<_, _>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("albedo row: {e}")))
+    }
+
     /// Every live asset's tags in one query, keyed by asset id — what the grid needs to draw
     /// chips and filter on a trait without a query per row.
     ///
