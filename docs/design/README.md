@@ -1,5 +1,20 @@
 # Handoff: Settings screen + Library filtering, grid controls, and MCP
 
+> **Provenance.** This bundle came from the Claude Design project **LodeStash**
+> (`f1fd4bce-f7bc-4b33-b099-d74b78f31998`), path `design_handoff_settings_and_library/`.
+> The repo's copies of `README.md` and `FEATURES.md` have since been **reconciled forward** against
+> the governing `docs/` specs and now supersede the bundle's, which is the original handoff. Re-import
+> the bundle's markdown only after diffing — a straight overwrite would drop, at least:
+> the detected-GPU chip (the bundle hardcodes `RTX 4070`); the MCP section's real tool names
+> (`search_assets`/`find_similar` — the bundle invents `tag_trait`/`search_library`); Unity libraries
+> living in the catalog as `package.pinned` rather than a `UnityLib` config vec; the audio transport's
+> seek timeline and global volume; the Traits screen hosting the Mapping tab; the ten nav
+> destinations; favourites (§1.1, §1.4, §10); the LINKS filter section; and the delete-from-disk
+> exception to the non-destructive rule (§9).
+>
+> Per `CLAUDE.md` the governing `docs/` files win over this bundle wherever they disagree.
+
+
 ## Overview
 
 This package specifies the interaction and visual design for a batch of Lodestash UI work that turns
