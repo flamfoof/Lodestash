@@ -126,9 +126,13 @@ made them a thing you reach *for* (a material is what carries an export's textur
 *(The earlier second-row Library tabs are gone — the sidebar LIBRARIES facet group (§0.2) absorbed
 the per-source filter.)*
 
-**⚑ Filters ▸ FAVOURITES** — a single *Favourites only* chip (DATA-MODEL §12). One-way: nobody
-browses for "things I did not favourite". Cards carry a heart top-left, opposite the size tier;
-`F` toggles the pin on the selection (or the lead card).
+**Favourites** (DATA-MODEL §12) — a **★ Favorites toolbar toggle** left of ⚑ Filters, with a gold
+count pill when any exist; *not* a section inside the Filters popover, because it is a one-click view
+switch rather than a facet to combine. Cards carry a `☆`/`★` tile top-right of the thumbnail (left of
+the ⤢ affordance, on a `BG`-at-75% backdrop); list rows carry an outlined pill. `F` toggles the pin on
+the selection (or the lead card), toasting *"★ Added to Favorites"* / *"Removed from Favorites"*.
+A **Favorites screen** sits second in the nav (§0.2), header `★ Favorites` + starred count, with the
+"Nothing starred yet → Browse Library" empty state.
 
 ### 0.4 Keyboard map (global)
 

@@ -18,11 +18,14 @@ serving in `lodestash-api` (REST) and `lodestash-mcp` (MCP) — **REST and MCP s
 ### 0.1 App frame
 - Full-height column: **top bar (48px)** → **body row** (sidebar 210px + main column + optional
   inspector 300px). Background is `BG` with two faint radial gold/violet glows (decorative only).
-- Screen routing is a single `screen` enum: `onboarding | library | identify | collections |
-  packages | unity | vocabulary | stats | dups | trash | settings`. The main column shows exactly one
-  screen `sc-if`; `library` and `onboarding` share the library body (onboarding is an overlay on top).
-  Ten nav destinations (onboarding is an overlay, not a nav row); `unity` (**Unity Assets**) is its
-  own destination distinct from `packages` (§5 vs §4.1).
+- Screen routing is a single `screen` enum: `onboarding | library | favorites | identify |
+  collections | packages | unity | traits | stats | dups | trash | settings`. The main column shows
+  exactly one screen `sc-if`; `library` and `onboarding` share the library body (onboarding is an
+  overlay on top). Eleven nav destinations (onboarding is an overlay, not a nav row); `unity`
+  (**Unity Assets**) is its own destination distinct from `packages` (§5 vs §4.1).
+  > The prototype bundle this doc ships with is the **settings + library** handoff: it carries the
+  > new `favorites` screen but has **no `unity` screen at all**. That is the bundle's scope, not a
+  > decision to drop Unity Assets — §5 stands.
 
 ### 0.2 Top bar
 - **Brand** (lodestone diamond + “LODESTASH” in Cinzel).
@@ -45,9 +48,10 @@ serving in `lodestash-api` (REST) and `lodestash-mcp` (MCP) — **REST and MCP s
   reads `✦ local · CPU` when no discrete GPU is in use.
 
 ### 0.3 Sidebar (left rail)
-- **Nav list** (`navItems`): Library, Identify (badge = unidentified count), Collections, Packages,
-  Unity Assets, Traits, Stats, Duplicates (badge = dup groups), Trash (badge = trashed count),
-  Settings. Active row = `TEXT` fg, `SURFACE_RAISED` bg, `GOLD` left-border. **Traits** is the nav
+- **Nav list** (`navItems`): Library, **Favorites** (`★`), Identify (badge = unidentified count),
+  Collections, Packages, Unity Assets, Traits, Stats, Duplicates (badge = dup groups), Trash
+  (badge = trashed count), Settings. Favorites sits **second, directly under Library** and carries
+  **no badge** — its count lives on the toolbar chip (§1.3) and the screen header (§4.7). Active row = `TEXT` fg, `SURFACE_RAISED` bg, `GOLD` left-border. **Traits** is the nav
   label (matching the prototype); the screen hosts both Traits and Mapping tabs (§4.6, DATA-MODEL §4).
 - **Facet sections** (only while on Library, `filterOpen`): **STATUS** (All/Unidentified/Identified/
   Confirmed with counts), **LIBRARIES** (All + each source library + pinned Unity libraries + `Add
@@ -68,10 +72,15 @@ The core screen: a responsive grid of asset cards with a filter/sort toolbar and
 - **Thumbnail** (procedurally tinted in the prototype; real app renders a cached preview), a **size
   tier badge** (S/M/L/XL, coloured by tier — see §5.3), a **status gem** (`?` unid / `✓` identified /
   `★` confirmed), **stage** button (adds to the staging tray), and a **⤢ full-size** affordance.
-- **Favourite heart** (top-left, `DANGER` token) on pinned assets — `F` toggles it on the selection
-  (or the lead card), and the card right-click menu carries the same action. A favourite is a **pin,
-  not a rating**: "find this again" and "how good is it" are different questions, so the star rating
-  and the heart never imply each other (DATA-MODEL §12).
+- **Favourite star** — a 20×20 tile pinned **top-right of the thumbnail, immediately left of the
+  ⤢ affordance**, on a `BG`-at-75% backdrop so it stays legible over any preview. Glyph is `☆` when
+  unset and `★` when set, `GOLD` when set and `GOLD_BRIGHT` on hover. In the **list row** it is a
+  small outlined pill (`BORDER_STRONG`, gold border + `GOLD_BRIGHT` text on hover). `F` toggles it on
+  the selection (or the lead card) and the right-click menu carries the same action. Toggling toasts
+  **"★ Added to Favorites"** (`GOLD`) / **"Removed from Favorites"** (`TEXT_MUTED`).
+- A favourite is a **pin, not a rating**: "find this again" and "how good is it" are different
+  questions, so the star *rating* (1–5, bottom-left) and the favourite star never imply each other
+  (DATA-MODEL §12).
 - **Body:** name, `pack · stats` line, and **tag chips** (first 3 + “+N” expander). Confirmed/AI tags
   show a confidence bar; unidentified cards show a `???` placeholder.
 - **Click** selects (opens inspector); **Space** on a selection opens Quick Look; **⟡ stage** stages.
@@ -87,19 +96,22 @@ Left→right: **result label** (`N assets · <library>` or `✦ N ranked matches
 **pack**/**collection** filter pills (each with `✕` clear), the **⇢ Add all N to project** action
 (only when a pinned Unity library is the active filter — §5.5), **sort** select (default / name /
 largest / smallest / tri count), **view mode** (grid / list), **grid-size** selector, and the
-**⚑ Filters** popover trigger (badge = active filter count).
+**★ Favorites** toggle (see below), and the **⚑ Filters** popover trigger (badge = active filter
+count).
+- **★ Favorites toggle** sits immediately left of ⚑ Filters and filters the grid to starred assets
+  only. Active state = gold border/fill like the Filters button; when any favourites exist it carries
+  a **gold count pill** (mono 9px, `GOLD` fill, dark text). This is a **toolbar toggle, not a section
+  inside the Filters popover** — it is a one-click view switch, not a facet to combine.
 
 ### 1.4 Filters popover
 Multi-select sections (an asset passes if it matches **selected traits (any)** AND **selected
-tri buckets (any)** AND **selected size tiers (any)** AND every single-select switch below):
+tri buckets (any)** AND **selected size tiers (any)** AND every single-select switch below).
+Favourites are **not** here — they are a toolbar toggle (§1.3):
 - **TRAIT** — chips of the library’s tags, most-frequent first, with a **search field** to filter the
   chip list. Selected = `ARCANE` outline + `ARCANE_BRIGHT` text.
 - **TRIANGLES** (models only) — `≤1k / 1k–3k / 3k–6k / 6k+`. Selected tinted `TYPE_MODEL`.
 - **FILE SIZE** — S/M/L/XL, ranges driven by the Settings size-tier thresholds (§5.3). Selected
   tinted by tier colour.
-- **FAVOURITES** — one *Favourites only* switch (DATA-MODEL §12). One-way on purpose: nobody
-  browses for "things I did **not** favourite". An asset with no catalog row cannot be a favourite,
-  so it fails this filter rather than slipping through.
 - **LINKS** — *uses others* / *used by others*, from the harvested dependency graph (DATA-MODEL §10).
   Single-select: a material sits in the middle of a chain and satisfies either, so combining them
   would silently mean "intersection".
@@ -187,6 +199,17 @@ Traits tab: user-defined traits that teach the identifier.
   it starts **teaching** by default. Traits list shows colour/icon, scope, usage.
 - Per trait: **teach/pause** toggle (whether the identifier suggests it), **Find** (library search for
   it), **Edit** (colour/usage), **Delete**. Teaching traits are fed into the next identify scan.
+
+### 4.7 Favorites
+
+A first-class destination for starred assets — the go-to loot, one click from anywhere.
+- **Header:** Cinzel `★ Favorites` (star in `GOLD`) with the strap *"Assets you've starred — your
+  go-to loot, one click away. Star anything from the ☆ on its card in any view."*, and a right-aligned
+  mono **count** (24px `GOLD`) followed by a dim ` starred`.
+- **Body:** the same asset cards as the library grid — same sort, Quick Look, staging, and the star
+  itself (un-starring here removes the card from this screen).
+- **Empty state:** a rotated diamond outline holding a `☆`, *"Nothing starred yet"*, the hint
+  *"Hover any asset and tap the ☆ to keep it here."*, and a gold **Browse Library →** action.
 
 ---
 

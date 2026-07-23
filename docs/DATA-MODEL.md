@@ -501,8 +501,10 @@ cannot leave the catalog claiming otherwise.
 a different question from "how good is this", and folding the two together would make every 5-star
 asset a favourite by accident. Catalog-only like ratings and the Trash — the file on disk is never
 touched — and the pin survives a trip through the Trash, so restoring an asset brings its
-favourite back. Surfaced as a heart on the card, `F` on the selection, and a **Favourites only**
-filter chip; a trashed asset stops being listed as a favourite because it has left the grid.
+favourite back. Surfaced per the design bundle's prototype as a **star**: `☆`/`★` top-right of the
+card thumbnail (`GOLD`, `GOLD_BRIGHT` on hover), `F` on the selection, a **★ Favorites** toolbar
+toggle carrying a gold count pill, and a dedicated **Favorites screen** second in the nav. A trashed
+asset stops being listed as a favourite because it has left the grid.
 
 - **License** resolves **asset → package**: an asset's effective license is `asset.license` when set,
   else `package.license`. Surfaced on the detail stat block and on every export/import so credits

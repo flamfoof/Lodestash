@@ -241,6 +241,7 @@ input[type=range]{accent-color:#49C9E0}
                 <option value="sizeAsc">sort · smallest first</option>
                 <option value="tris">sort · tri count</option>
               </select>
+              <div onClick="{{ toggleFavOnly }}" title="Show only favorites" style="cursor:pointer;display:flex;align-items:center;gap:6px;padding:5px 11px;border-radius:6px;font-size:12px;border:1px solid {{ favFilterBd }};color:{{ favFilterFg }};background:{{ favFilterBg }};flex-shrink:0" style-hover="border-color:#E7B765">★ Favorites<sc-if value="{{ hasFavs }}" hint-placeholder-val="{{ false }}"><span style="font-family:JetBrains Mono,ui-monospace,monospace;font-size:9px;background:#E7B765;color:#171207;border-radius:999px;padding:0 6px;font-weight:700">{{ favCount }}</span></sc-if></div>
               <div style="position:relative;flex-shrink:0">
                 <div onClick="{{ toggleFilterPanel }}" title="Filter by tag, triangles, or file size" style="cursor:pointer;display:flex;align-items:center;gap:6px;padding:5px 11px;border-radius:6px;font-size:12px;border:1px solid {{ filterBd }};color:{{ filterFg }};background:{{ filterBg }}" style-hover="border-color:#6E7689">⚑ Filters<sc-if value="{{ hasActiveFilters }}" hint-placeholder-val="{{ false }}"><span style="font-family:JetBrains Mono,ui-monospace,monospace;font-size:9px;background:#E7B765;color:#171207;border-radius:999px;padding:0 6px;font-weight:700">{{ activeFilterCount }}</span></sc-if></div>
                 <sc-if value="{{ filterPanelOpen }}" hint-placeholder-val="{{ false }}">
@@ -326,6 +327,7 @@ input[type=range]{accent-color:#49C9E0}
     </sc-if>
   </div>
 </sc-if>
+                        <div onClick="{{ a.onFav }}" title="Favorite" style="position:absolute;top:8px;right:34px;width:20px;height:20px;border-radius:4px;background:rgba(14,17,23,.75);display:flex;align-items:center;justify-content:center;color:{{ a.favColor }};font-size:12px;z-index:2;cursor:pointer" style-hover="color:#FFD98A">{{ a.favGlyph }}</div>
                         <div style="position:absolute;top:8px;right:8px;width:20px;height:20px;border-radius:4px;background:rgba(14,17,23,.75);display:flex;align-items:center;justify-content:center;color:{{ a.statusColor }};font-size:11px">{{ a.gem }}</div>
                         <div onClick="{{ a.onPick }}" title="Select for bulk actions" style="position:absolute;top:8px;left:8px;width:18px;height:18px;border-radius:4px;background:rgba(14,17,23,.8);border:1px solid {{ a.pickBd }};color:{{ a.pickFg }};display:flex;align-items:center;justify-content:center;font-size:11px;z-index:2;cursor:pointer" style-hover="border-color:#E7B765">{{ a.pickGlyph }}</div>
                         <sc-if value="{{ a.hasMatch }}" hint-placeholder-val="{{ false }}"><div style="position:absolute;top:8px;left:32px;font-family:JetBrains Mono,ui-monospace,monospace;font-size:10px;color:#7BF0E5;background:rgba(14,17,23,.75);border:1px solid rgba(73,214,201,.45);border-radius:999px;padding:1px 7px">✦ {{ a.match }}</div></sc-if>
@@ -367,12 +369,79 @@ input[type=range]{accent-color:#49C9E0}
                       <span style="width:74px;flex-shrink:0;font-family:JetBrains Mono,ui-monospace,monospace;font-size:10px;color:{{ a.sizeFg }};white-space:nowrap">{{ a.sizeTier }} · {{ a.sizeLabel }}</span>
                       <span style="flex:1;min-width:0;color:#6E7689;font-size:11px;font-family:JetBrains Mono,ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ a.statsShort }}</span>
                       <span style="width:96px;flex-shrink:0;color:{{ a.statusColor }};font-size:11px">{{ a.gem }} {{ a.statusLabel }}</span>
+                      <div onClick="{{ a.onFav }}" title="Favorite" style="padding:2px 8px;border-radius:4px;border:1px solid #3A465C;color:{{ a.favColor }};font-size:12px;flex-shrink:0;cursor:pointer" style-hover="border-color:#E7B765;color:#FFD98A">{{ a.favGlyph }}</div>
                       <div onClick="{{ a.onQl }}" title="Full-size preview" style="padding:2px 8px;border-radius:4px;border:1px solid #3A465C;color:#A7B0C0;font-size:11px;flex-shrink:0" style-hover="border-color:#49D6C9;color:#7BF0E5">⤢</div>
                       <div onClick="{{ a.onStage }}" style="padding:2px 8px;border-radius:4px;border:1px solid {{ a.stageBd }};color:{{ a.stageFg }};font-size:11px;flex-shrink:0" style-hover="border-color:#E7B765;color:#FFD98A">{{ a.stageLabel }}</div>
                     </div>
                   </sc-for>
                 </div>
               </sc-if>
+            </div>
+          </div>
+        </sc-if>
+
+        <!-- FAVORITES -->
+        <sc-if value="{{ showFavorites }}" hint-placeholder-val="{{ false }}">
+          <div data-screen-label="Favorites" style="flex:1;min-height:0;display:flex;flex-direction:column">
+            <div style="padding:18px 20px;border-bottom:1px solid #2C3547;flex-shrink:0;display:flex;align-items:flex-end;gap:16px;flex-wrap:wrap">
+              <div style="flex:1;min-width:260px">
+                <div style="font-family:Cinzel,Georgia,serif;font-size:20px;font-weight:700;letter-spacing:.5px;display:flex;align-items:center;gap:9px"><span style="color:#E7B765">★</span>Favorites</div>
+                <div style="color:#A7B0C0;font-size:12px;margin-top:2px">Assets you've starred — your go-to loot, one click away. Star anything from the ☆ on its card in any view.</div>
+              </div>
+              <div style="font-family:JetBrains Mono,ui-monospace,monospace;font-size:24px;color:#E7B765;white-space:nowrap">{{ favCount }}<span style="font-size:12px;color:#6E7689"> starred</span></div>
+            </div>
+            <div style="flex:1;overflow-y:auto;padding:16px">
+              <sc-if value="{{ favEmpty }}" hint-placeholder-val="{{ false }}">
+                <div style="display:flex;flex-direction:column;align-items:center;gap:12px;padding:90px 20px">
+                  <div style="width:38px;height:38px;transform:rotate(45deg);border:2px solid #3A465C;border-radius:9px;display:flex;align-items:center;justify-content:center"><span style="transform:rotate(-45deg);color:#6E7689;font-size:18px">☆</span></div>
+                  <div style="font-family:Cinzel,Georgia,serif;font-size:16px;color:#E6E9F0">Nothing starred yet</div>
+                  <div style="color:#A7B0C0;font-size:12px">Hover any asset and tap the ☆ to keep it here.</div>
+                  <div onClick="{{ goLibrary }}" style="cursor:pointer;background:linear-gradient(180deg,#E7B765,#D9A54E);color:#171207;font-weight:600;padding:8px 16px;border-radius:6px;margin-top:6px" style-hover="box-shadow:0 0 14px rgba(231,183,101,.5)">Browse Library →</div>
+                </div>
+              </sc-if>
+              <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(205px,1fr));gap:12px">
+                <sc-for list="{{ favCards }}" as="a" hint-placeholder-count="0">
+                  <div onClick="{{ a.onClick }}" style="position:relative;background:#161B26;border:1px solid #2C3547;border-left:3px solid {{ a.statusColor }};border-radius:10px;overflow:hidden;cursor:pointer;opacity:{{ a.opacity }};box-shadow:{{ a.ring }};transition:transform .12s ease, background .12s ease" style-hover="transform:translateY(-2px);background:#1E2533">
+                    <div style="height:104px;position:relative;display:flex;align-items:center;justify-content:center;background:#20293A;overflow:hidden">
+                      <sc-if value="{{ a.hasThumb }}" hint-placeholder-val="{{ false }}"><div style="position:absolute;inset:0;background-image:{{ a.thumbCss }};background-size:cover;background-position:center;image-rendering:pixelated;opacity:{{ a.thumbOpacity }};filter:{{ a.thumbFilter }}"></div></sc-if>
+                      <sc-if value="{{ a.isUnid }}" hint-placeholder-val="{{ false }}"><div style="position:relative;font-size:28px;color:#8A93A6;font-family:JetBrains Mono,ui-monospace,monospace;text-shadow:0 0 10px rgba(14,17,23,.95)">?</div></sc-if>
+                      <sc-if value="{{ a.isSound }}" hint-placeholder-val="{{ false }}">
+                        <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;width:100%;padding:0 14px;box-sizing:border-box">
+                          <div style="display:flex;align-items:center;gap:10px">
+                            <div onClick="{{ a.onCardPlay }}" title="Play" style="cursor:pointer;width:30px;height:30px;border-radius:99px;background:rgba(73,214,201,.16);border:1px solid #49D6C9;color:#7BF0E5;display:flex;align-items:center;justify-content:center;font-size:11px;flex-shrink:0" style-hover="box-shadow:0 0 12px rgba(73,214,201,.5)">{{ a.cardPlayGlyph }}</div>
+                            <div style="display:flex;align-items:center;gap:4px;height:30px;position:relative"><div style="width:5px;height:10px;border-radius:99px;background:{{ a.barColor }}"></div><div style="width:5px;height:22px;border-radius:99px;background:{{ a.barColor }}"></div><div style="width:5px;height:30px;border-radius:99px;background:{{ a.barColor }}"></div><div style="width:5px;height:17px;border-radius:99px;background:{{ a.barColor }}"></div><div style="width:5px;height:12px;border-radius:99px;background:{{ a.barColor }}"></div></div>
+                          </div>
+                          <sc-if value="{{ a.cardAudioActive }}" hint-placeholder-val="{{ false }}">
+                            <div onClick="{{ a.eat }}" style="display:flex;align-items:center;gap:7px;background:rgba(14,17,23,.85);border:1px solid #2C3547;border-radius:5px;padding:2px 9px;width:100%;box-sizing:border-box;z-index:2">
+                              <input type="range" min="0" max="{{ a.cardAudioMax }}" step="0.05" value="{{ a.cardAudioPos }}" onChange="{{ a.onCardScrub }}" style="flex:1;min-width:0;height:3px;cursor:pointer">
+                              <span style="font-family:JetBrains Mono,ui-monospace,monospace;font-size:9px;color:#A7B0C0;white-space:nowrap">{{ a.cardAudioTime }}</span>
+                            </div>
+                          </sc-if>
+                        </div>
+                      </sc-if>
+                      <div onClick="{{ a.onFav }}" title="Favorite" style="position:absolute;top:8px;right:34px;width:20px;height:20px;border-radius:4px;background:rgba(14,17,23,.75);display:flex;align-items:center;justify-content:center;color:{{ a.favColor }};font-size:12px;z-index:2;cursor:pointer" style-hover="color:#FFD98A">{{ a.favGlyph }}</div>
+                      <div style="position:absolute;top:8px;right:8px;width:20px;height:20px;border-radius:4px;background:rgba(14,17,23,.75);display:flex;align-items:center;justify-content:center;color:{{ a.statusColor }};font-size:11px">{{ a.gem }}</div>
+                      <div style="position:absolute;bottom:8px;right:8px;display:flex;gap:5px">
+                        <div onClick="{{ a.onQl }}" title="Full-size preview" style="padding:2px 8px;border-radius:4px;background:rgba(14,17,23,.78);border:1px solid #3A465C;color:#A7B0C0;font-size:11px" style-hover="border-color:#49D6C9;color:#7BF0E5">⤢</div>
+                        <div onClick="{{ a.onStage }}" style="padding:2px 8px;border-radius:4px;background:rgba(14,17,23,.78);border:1px solid {{ a.stageBd }};color:{{ a.stageFg }};font-size:11px" style-hover="border-color:#E7B765;color:#FFD98A">{{ a.stageLabel }}</div>
+                      </div>
+                      <div style="position:absolute;bottom:8px;left:8px;display:flex;gap:5px;align-items:center">
+                        <div title="File size on disk" style="font-family:JetBrains Mono,ui-monospace,monospace;font-size:9px;color:{{ a.sizeFg }};background:rgba(14,17,23,.78);border:1px solid {{ a.sizeBd }};border-radius:4px;padding:2px 6px">{{ a.sizeTier }} · {{ a.sizeLabel }}</div>
+                        <sc-if value="{{ a.imported }}" hint-placeholder-val="{{ false }}"><div style="color:#5BD897;font-size:10px;display:flex;gap:4px;align-items:center;background:rgba(14,17,23,.78);border-radius:4px;padding:2px 7px">{{ a.importedLabel }}</div></sc-if>
+                      </div>
+                    </div>
+                    <div style="padding:8px 12px 12px">
+                      <div style="display:flex;align-items:center;gap:6px;font-weight:600;font-size:12px;color:{{ a.nameColor }};font-style:{{ a.nameStyle }}"><span style="width:8px;height:8px;transform:rotate(45deg);border-radius:2px;background:{{ a.typeColor }};flex-shrink:0"></span><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ a.name }}</span></div>
+                      <div style="font-family:JetBrains Mono,ui-monospace,monospace;font-size:11px;color:#6E7689;margin:3px 0 6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><span onClick="{{ a.onPackStats }}" title="Open pack stats" style="cursor:pointer" style-hover="color:#E7B765;text-decoration:underline">{{ a.pack }}</span> · {{ a.statsShort }}</div>
+                      <div style="display:flex;flex-wrap:wrap;gap:5px;min-height:18px">
+                        <sc-for list="{{ a.chips }}" as="c" hint-placeholder-count="1">
+                          <div onClick="{{ c.onClick }}" style="cursor:pointer;display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:1px 8px;border-radius:999px;background:{{ c.bg }};color:{{ c.fg }};border:1px solid {{ c.bd }}">{{ c.label }}<sc-if value="{{ c.hasConf }}" hint-placeholder-val="{{ false }}"><span style="display:inline-block;width:18px;height:3px;border-radius:99px;background:#3A465C;overflow:hidden"><span style="display:block;height:100%;width:{{ c.confW }};background:#49D6C9"></span></span></sc-if></div>
+                        </sc-for>
+                      </div>
+                    </div>
+                  </div>
+                </sc-for>
+              </div>
             </div>
           </div>
         </sc-if>
@@ -1467,7 +1536,7 @@ class Component extends DCLogic {
     assets: this.buildAssets(),
     mode: 'tags', query: '', cat: 'all', lib: 'all', statusF: 'all', packF: 'all',
     view: 'grid', filterOpen: true, gridSize: 'm',
-    fTags: [], fSizes: [], fTris: [], filterPanelOpen: false,
+    fTags: [], fSizes: [], fTris: [], filterPanelOpen: false, favs: [], favOnly: false,
     sortBy: 'default',
     statsTab: 'overview',
     graphZoom: 1,
@@ -2185,6 +2254,7 @@ class Component extends DCLogic {
     if (s.fTags && s.fTags.length) list = list.filter(a => a.tags.some(t => s.fTags.includes(t.t)));
     if (s.fSizes && s.fSizes.length) list = list.filter(a => s.fSizes.includes(this.sizeTierOf(a).tier));
     if (s.fTris && s.fTris.length) list = list.filter(a => { const b = this.trisBucketOf(a); return b && s.fTris.includes(b); });
+    if (s.favOnly) list = list.filter(a => (s.favs || []).includes(a.id));
     if (s.mode === 'ai' && s.aiResults) {
       const scoreById = {};
       s.aiResults.forEach(r => { scoreById[r.id] = r.score; });
@@ -2267,6 +2337,11 @@ class Component extends DCLogic {
   toggleArr(key, val) {
     this.setState(s => { const arr = s[key] || []; return { [key]: arr.includes(val) ? arr.filter(x => x !== val) : [...arr, val] }; });
   }
+  toggleFav(id) {
+    const on = !(this.state.favs || []).includes(id);
+    this.setState(s => { const f = s.favs || []; return { favs: on ? [...f, id] : f.filter(x => x !== id) }; });
+    this.toast(on ? '★ Added to Favorites' : 'Removed from Favorites', on ? '#E7B765' : '#8A93A6');
+  }
   fmtMB(mb) {
     if (mb >= 1024) return (mb / 1024).toFixed(1) + ' GB';
     if (mb >= 1) return mb.toFixed(1) + ' MB';
@@ -2320,7 +2395,7 @@ class Component extends DCLogic {
   mapCard(a, scoreById, idx) {
     const tc = { model: '#A98BFF', sound: '#49C9E0', image: '#6FB1FF' }[a.type];
     const sc = { unid: '#8A93A6', id: '#5BD897', conf: '#E7B765' }[a.status];
-    const gem = { unid: '?', id: '✓', conf: '★' }[a.status];
+    const gem = { unid: '?', id: '✓', conf: '◆' }[a.status];
     const unid = a.status === 'unid';
     const chipsOpen = (this.state.chipsExpanded || []).includes(a.id);
     let chips = unid
@@ -2370,6 +2445,10 @@ class Component extends DCLogic {
         e.stopPropagation();
         this.setState(s2 => ({ multi: s2.multi.includes(a.id) ? s2.multi.filter(x => x !== a.id) : [...s2.multi, a.id] }));
       },
+      isFav: (this.state.favs || []).includes(a.id),
+      favGlyph: (this.state.favs || []).includes(a.id) ? '★' : '☆',
+      favColor: (this.state.favs || []).includes(a.id) ? '#E7B765' : '#8A93A6',
+      onFav: e => { e.stopPropagation(); this.toggleFav(a.id); },
       onPackStats: e => { e.stopPropagation(); this.setState({ psPack: a.pack }); },
       onCardPlay: e => { e.stopPropagation(); this.togglePlay(a.id); },
       onCardScrub: e => this.setState({ audioId: a.id, audioPos: parseFloat(e.target.value), audioStarted: true }),
@@ -2531,8 +2610,8 @@ class Component extends DCLogic {
       onRegenToken: () => this.regenMcpToken(),
       mcpCaps: [
         ['allowIdentify', 'identify_asset', 'Let an agent run appraisal on Unidentified files and write back status.'],
-        ['allowTag', 'add_tag', 'Let an agent apply, promote, and remove traits on your assets.'],
-        ['allowRead', 'search_assets', 'Let an agent read the catalog, tags, and metadata (read-only).']
+        ['allowTag', 'tag_trait', 'Let an agent apply, promote, and remove traits on your assets.'],
+        ['allowRead', 'search_library', 'Let an agent read the catalog, tags, and metadata (read-only).']
       ].map(([k, name, desc]) => ({ name, desc, ...tog(mc[k], () => this.setMcp({ [k]: !mc[k] })) }))
     };
   }
@@ -2567,6 +2646,8 @@ class Component extends DCLogic {
 
     const idList = s.assets.filter(a => a.status === 'unid' || s.session.includes(a.id));
     const identifyCards = idList.map((a, i) => this.mapCard(a, null, i));
+    const favList = s.assets.filter(a => (s.favs || []).includes(a.id));
+    const favCards = favList.map((a, i) => this.mapCard(a, null, i));
 
     const sel = s.assets.find(a => a.id === s.selId) || null;
     const selUnid = sel ? sel.status === 'unid' : false;
@@ -2614,7 +2695,7 @@ class Component extends DCLogic {
     }));
 
     const dupCount = s.dupGroups.length;
-    const navDefs = [['library', 'Library', '⊞'], ['identify', 'Identify', '✦'], ['collections', 'Collections', '⟡'], ['packages', 'Packages', '▤'], ['traits', 'Traits', '❖'], ['stats', 'Stats', '◉'], ['dups', 'Duplicates', '⧉'], ['trash', 'Trash', '⊘'], ['settings', 'Settings', '⚙']];
+    const navDefs = [['library', 'Library', '⊞'], ['favorites', 'Favorites', '★'], ['identify', 'Identify', '✦'], ['collections', 'Collections', '⟡'], ['packages', 'Packages', '▤'], ['traits', 'Traits', '❖'], ['stats', 'Stats', '◉'], ['dups', 'Duplicates', '⧉'], ['trash', 'Trash', '⊘'], ['settings', 'Settings', '⚙']];
     const badgeVals = { identify: unid.length, dups: dupCount, trash: s.trash.length };
     const navItems = navDefs.map(([k, label, glyph]) => ({
       label, glyph,
@@ -3235,6 +3316,16 @@ class Component extends DCLogic {
       gridCols: ({ s: 'repeat(auto-fill,minmax(150px,1fr))', m: 'repeat(auto-fill,minmax(205px,1fr))', l: 'repeat(auto-fill,minmax(288px,1fr))' })[s.gridSize || 'm'],
       gridSizes: [['s', '▪', 'Compact'], ['m', '▦', 'Cozy'], ['l', '▣', 'Large']].map(([k, glyph, title]) => ({ glyph, title, fg: (s.gridSize || 'm') === k ? '#E7B765' : '#A7B0C0', bg: (s.gridSize || 'm') === k ? 'rgba(231,183,101,.15)' : 'transparent', onClick: () => this.setState({ gridSize: k }) })),
       filterOpen: s.filterOpen !== false,
+      favOnly: s.favOnly,
+      toggleFavOnly: () => this.setState(x => ({ favOnly: !x.favOnly, screen: 'library' })),
+      favFilterBd: s.favOnly ? '#E7B765' : '#3A465C',
+      favFilterFg: s.favOnly ? '#FFD98A' : '#A7B0C0',
+      favFilterBg: s.favOnly ? 'rgba(231,183,101,.15)' : 'transparent',
+      favCount: String((s.favs || []).length),
+      hasFavs: (s.favs || []).length > 0,
+      showFavorites: s.screen === 'favorites',
+      favCards,
+      favEmpty: favCards.length === 0,
       ...this.filterVals(),
       cards,
       noResults,
@@ -3263,7 +3354,7 @@ class Component extends DCLogic {
       selTypeLabel: sel ? { model: 'Model', sound: 'Sound', image: 'Image' }[sel.type] : '',
       selStatusColor: sel ? { unid: '#8A93A6', id: '#5BD897', conf: '#E7B765' }[sel.status] : '#8A93A6',
       selStatusLabel: sel ? { unid: 'Unidentified', id: 'Identified', conf: 'Confirmed' }[sel.status] : '',
-      selGem: sel ? { unid: '?', id: '✓', conf: '★' }[sel.status] : '',
+      selGem: sel ? { unid: '?', id: '✓', conf: '◆' }[sel.status] : '',
       selRows: sel ? sel.rows.map(r => ({ k: r[0], v: r[1] })) : [],
       selChips: sel && !selUnid ? sel.tags.map(t => this.chipOf(t)) : [],
       selNoTraits: !!sel && selUnid,
@@ -3319,7 +3410,7 @@ class Component extends DCLogic {
       qlTypeLabel: ql ? { model: 'Model — low-res pre-render', sound: 'Sound', image: 'Image — full preview' }[ql.type] : '',
       qlStatusColor: ql ? { unid: '#8A93A6', id: '#5BD897', conf: '#E7B765' }[ql.status] : '#8A93A6',
       qlStatusLabel: ql ? { unid: 'Unidentified', id: 'Identified', conf: 'Confirmed' }[ql.status] : '',
-      qlGem: ql ? { unid: '?', id: '✓', conf: '★' }[ql.status] : '',
+      qlGem: ql ? { unid: '?', id: '✓', conf: '◆' }[ql.status] : '',
       qlRows: ql ? ql.rows.map(r => ({ k: r[0], v: r[1] })) : [],
       qlChips: ql && !qlUnid ? ql.tags.map(t => this.chipOf(t)) : [],
       qlHasThumb: !!ql && ql.type !== 'sound' && !!qlThumb,
