@@ -153,6 +153,8 @@ async fn asset_detail(State(state): State<Shared>, Path(id): Path<i64>) -> Respo
         "tris": m.tri_count, "width_px": m.width_px,
         "height_px": m.height_px, "duration_ms": m.duration_ms,
     });
+    let deps = state.dependencies(id).unwrap_or_default();
+    body["dependencies"] = json!({ "count": deps.len(), "asset_ids": deps });
     Json(body).into_response()
 }
 

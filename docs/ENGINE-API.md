@@ -117,11 +117,13 @@ in-editor import (§5). Both reuse the **same dependency-closure resolution** de
 > `Package` carries `{id, name, publisher, category, asset_count, unpacked_at}` — `version`,
 > `license` and `attribution` wait on the P2 license harvest. `find_similar` answers `[]` for an
 > asset with no embedding (an un-encoded library is not an error).
-> `export` copies the named assets only — `with_dependencies` is accepted and echoed back as
-> `dependencies_included: false` until the P2 relationship graph can resolve a closure.
-> `AssetDetail` extends the summary with `size_bytes` + `stats` only — `description`, `files`,
-> `collections`, `license`, `dependencies` and `imported_in` arrive with the features that populate
-> them. Clients should treat missing fields as "not known yet", never as "empty".
+> `export` honours `with_dependencies` over the harvested relationship graph (DATA-MODEL §10) and
+> reports `dependencies_included` plus `dependencies_added`; the graph currently carries Unity's
+> deterministic `.meta` GUID refs (material → texture), so a mesh whose materials are embedded in
+> the FBX still exports alone. `AssetDetail` extends the summary with `size_bytes`, `stats` and
+> `dependencies` (the same closure an export would copy) — `description`, `files`, `collections`,
+> `license` and `imported_in` arrive with the features that populate them. Clients should treat
+> missing fields as "not known yet", never as "empty".
 
 ---
 

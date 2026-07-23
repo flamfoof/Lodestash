@@ -171,6 +171,16 @@ impl ServerState {
         Ok(cat.asset_summaries(&[id])?.into_iter().next())
     }
 
+    /// What an asset drags along (ENGINE-API §2 `AssetDetail.dependencies`): the transitive
+    /// closure over resolved dependency edges, the asset itself removed. Deliberately the same
+    /// set `export_asset` copies with `with_dependencies: true` — a client that shows this list
+    /// is showing exactly what an export would write.
+    pub fn dependencies(&self, id: i64) -> lodestash_core::error::Result<Vec<i64>> {
+        let mut ids = self.catalog.lock().unwrap().dependency_closure(&[id])?;
+        ids.retain(|&d| d != id);
+        Ok(ids)
+    }
+
     /// Where an asset's bytes live: an on-disk source file, or a payload extracted into the
     /// workspace.
     pub fn source_path(&self, row: &AssetSummaryRow) -> Option<PathBuf> {
@@ -274,17 +284,31 @@ impl ServerState {
         dest: PathBuf,
     ) {
         job.set_state(jobs::JobState::Running);
-        let rows = match self.catalog.lock().unwrap().asset_summaries(&req.asset_ids) {
+        // With dependencies, the copy set is the transitive closure over the P2 relationship
+        // graph (a material drags its textures). Edges that resolve to nothing in the library
+        // add nothing — the closure only walks `resolved` ones.
+        let ids = if req.with_dependencies {
+            match self
+                .catalog
+                .lock()
+                .unwrap()
+                .dependency_closure(&req.asset_ids)
+            {
+                Ok(ids) => ids,
+                Err(e) => return job.fail(e.to_string()),
+            }
+        } else {
+            req.asset_ids.clone()
+        };
+        let rows = match self.catalog.lock().unwrap().asset_summaries(&ids) {
             Ok(rows) => rows,
             Err(e) => return job.fail(e.to_string()),
         };
-        // ponytail: no dependency closure — the relationship graph is P2. `with_dependencies`
-        // is accepted and reported back so clients can tell it wasn't honoured.
         let files: Vec<(PathBuf, String)> = rows
             .iter()
             .filter_map(|r| self.source_path(r).map(|p| (p, file_name_for(r))))
             .collect();
-        let missing = req.asset_ids.len() - files.len();
+        let missing = ids.len().saturating_sub(files.len());
         match export::copy_files(&files, &dest, &job) {
             Ok(written) if job.is_cancelled() => {
                 job.set_state(jobs::JobState::Cancelled);
@@ -294,8 +318,9 @@ impl ServerState {
                 "written": written,
                 "missing": missing,
                 "dest_path": dest.display().to_string(),
-                "dependencies_included": false,
+                "dependencies_included": req.with_dependencies,
                 "requested_dependencies": req.with_dependencies,
+                "dependencies_added": ids.len().saturating_sub(req.asset_ids.len()),
             })),
             Err(e) => job.fail(e.to_string()),
         }

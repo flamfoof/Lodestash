@@ -7428,6 +7428,69 @@ fn drain_audio_embeddings(
 /// Failures store a zero vector — which cosine-scores 0, so it never matches — solely to clear
 /// `embedding_dirty` and guarantee forward progress (no infinite re-query of a bad file).
 /// Audio still awaits its own encoder (CLAP).
+/// Harvest Unity's own bookkeeping for the rows marked `deps_dirty` (DATA-MODEL §10): each asset's
+/// GUID from its `.meta` sidecar, and — for materials — the texture GUIDs it declares, which become
+/// `asset_relationship` edges. Same sole-writer connection and forward-progress rule as the other
+/// drains: an asset with no `.meta` still clears its flag.
+///
+/// Order matters within a drain but not across them: an edge whose target isn't catalogued yet is
+/// stored `missing` and late-bound by `resolve_pending_relationships`, so a texture indexed after
+/// its material still connects.
+fn drain_dependencies(cat: &mut Catalog, workspace_dir: Option<&std::path::Path>) {
+    const BATCH: usize = 256;
+    let mut total = 0usize;
+    let mut edges = 0usize;
+    loop {
+        let jobs = match cat.assets_needing_dep_scan(BATCH) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(%e, "dependency queue query failed; retries next scan");
+                break;
+            }
+        };
+        if jobs.is_empty() {
+            break;
+        }
+        let n = jobs.len();
+        for job in jobs {
+            let path = match (&job.disk_path, &job.workspace_rel) {
+                (Some(p), _) => Some(std::path::PathBuf::from(p)),
+                (None, Some(rel)) => workspace_dir.map(|w| w.join(rel)),
+                _ => None,
+            };
+            let guid = path.as_deref().and_then(lodestash_ingest::deps::guid_of);
+            // Materials are the only catalogued type that declares GUIDs today: meshes embed
+            // their materials (`externalObjects` is empty on a stock FBX import), and prefabs
+            // aren't a `media_type`.
+            let refs = match (job.media_code.as_str(), path.as_deref()) {
+                ("material", Some(p)) => std::fs::read_to_string(p)
+                    .map(|yaml| lodestash_ingest::deps::material_texture_guids(&yaml))
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            edges += refs.len();
+            if let Err(e) =
+                cat.record_dependencies(job.asset_id, guid.as_deref(), "uses_texture", &refs)
+            {
+                tracing::warn!(%e, "record_dependencies failed; stopping dependency drain");
+                return;
+            }
+            total += 1;
+        }
+        if n < BATCH {
+            break;
+        }
+    }
+    match cat.resolve_pending_relationships() {
+        Ok(late) if late > 0 => tracing::info!(late, "dependency edges late-bound"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(%e, "resolving pending dependency edges failed"),
+    }
+    if total > 0 {
+        tracing::info!(scanned = total, edges, "dependency graph harvested");
+    }
+}
+
 /// Extract technical facets (tri counts, dimensions, duration) for the rows `record_crawl` marked
 /// `metrics_dirty` (DATA-MODEL §14). Runs on the persist thread's own connection like the embedding
 /// drains, but unconditionally — facets are plain measurements and must not depend on the AI stack
@@ -7505,6 +7568,7 @@ fn drain_promote_resync(
     roots: &[(String, String)],
 ) -> (Option<StatusCounts>, AssetIdentityMaps) {
     drain_metrics(cat, workspace_dir);
+    drain_dependencies(cat, workspace_dir);
     if let Some(emb) = embedder {
         drain_image_embeddings(cat, emb.as_ref(), workspace_dir);
     }

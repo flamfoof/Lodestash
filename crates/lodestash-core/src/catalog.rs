@@ -209,6 +209,7 @@ impl Catalog {
             (7, MIGRATION_07_PACKAGE_PINNED),
             (8, MIGRATION_08_EMBEDDINGS),
             (9, MIGRATION_09_ASSET_METRICS),
+            (10, MIGRATION_10_DEPENDENCY_SCAN),
         ];
 
         for (version, sql) in migrations {
@@ -456,9 +457,10 @@ impl Catalog {
                         )
                         .map_err(|e| CoreError::Catalog(format!("asset_file update: {e}")))?;
                         tx.execute(
-                            // The bytes changed, so the extracted facets are stale too.
+                            // The bytes changed, so the extracted facets and the outbound
+                            // dependency refs are stale too.
                             "UPDATE asset SET updated_at = ?2, embedding_dirty = 1,
-                                              metrics_dirty = 1
+                                              metrics_dirty = 1, deps_dirty = 1
                              WHERE id = ?1",
                             params![asset_id, now],
                         )
@@ -1103,6 +1105,15 @@ ALTER TABLE asset ADD COLUMN metrics_dirty INTEGER NOT NULL DEFAULT 1;
 CREATE INDEX IF NOT EXISTS idx_asset_metrics_dirty ON asset(metrics_dirty) WHERE metrics_dirty=1;
 ";
 
+/// M10 — dependency-graph queue (§10). `deps_dirty` is the third drain flag, next to
+/// `embedding_dirty` and `metrics_dirty`: set on insert and whenever a file's bytes change,
+/// cleared once the asset's `.meta` GUID and outbound references have been harvested.
+const MIGRATION_10_DEPENDENCY_SCAN: &str = "
+ALTER TABLE asset ADD COLUMN deps_dirty INTEGER NOT NULL DEFAULT 1;
+CREATE INDEX IF NOT EXISTS idx_asset_deps_dirty ON asset(deps_dirty) WHERE deps_dirty=1;
+CREATE INDEX IF NOT EXISTS idx_asset_unity_guid ON asset(unity_guid) WHERE unity_guid IS NOT NULL;
+";
+
 /// A package-extracted asset rehydrated from the catalog (UI "cache extracted packs" toggle).
 #[derive(Debug, Clone)]
 pub struct HydratedExtracted {
@@ -1391,6 +1402,162 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("metrics queue query: {e}")))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| CoreError::Catalog(format!("metrics queue row: {e}")))
+    }
+
+    /// Assets whose `.meta` GUID and outbound references still need harvesting (§10). Same path
+    /// rules as the other queues; `missing` rows excluded. The scanner needs the on-disk path
+    /// because the `.meta` lives *beside* the asset, not inside the catalog.
+    pub fn assets_needing_dep_scan(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT a.id,
+                        CASE WHEN af.workspace_rel IS NULL
+                             THEN s.root_path || '/' || af.rel_path END,
+                        af.workspace_rel, a.media_type_id, a.source_id, mt.code
+                 FROM asset a
+                 JOIN media_type mt   ON mt.id = a.media_type_id
+                 JOIN import_source s ON s.id = a.source_id
+                 JOIN asset_file af   ON af.id = a.primary_file_id
+                 WHERE a.deps_dirty = 1 AND a.deleted_at IS NULL
+                   AND af.missing = 0
+                 ORDER BY a.id LIMIT ?1",
+            )
+            .map_err(|e| CoreError::Catalog(format!("dep queue prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(VisualEmbedJob {
+                    asset_id: r.get(0)?,
+                    disk_path: r.get(1)?,
+                    workspace_rel: r.get(2)?,
+                    media_type_id: r.get(3)?,
+                    source_id: r.get(4)?,
+                    media_code: r.get(5)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("dep queue query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("dep queue row: {e}")))
+    }
+
+    /// Record one asset's harvested `.meta` GUID plus the GUIDs it declares, and clear
+    /// `deps_dirty` (§10). Edges land with `declared_path` = the referenced GUID and resolve
+    /// against `asset.unity_guid`; a reference whose target isn't catalogued **yet** is kept
+    /// with `to_asset_id NULL` / `state='missing'` and picked up later by
+    /// [`Self::resolve_pending_relationships`] — a package extracted after its consumer is the
+    /// normal case, not an error.
+    ///
+    /// The flag clears even when nothing was found (no `.meta`, no refs), so an asset without
+    /// Unity bookkeeping isn't rescanned on every drain.
+    pub fn record_dependencies(
+        &mut self,
+        asset_id: i64,
+        guid: Option<&str>,
+        kind: &str,
+        ref_guids: &[String],
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| CoreError::Catalog(format!("deps begin: {e}")))?;
+        if let Some(guid) = guid {
+            tx.execute(
+                "UPDATE asset SET unity_guid = ?2 WHERE id = ?1",
+                params![asset_id, guid],
+            )
+            .map_err(|e| CoreError::Catalog(format!("deps guid: {e}")))?;
+        }
+        // Refs are re-derived from the file, so the old harvest is replaced wholesale. This is
+        // also what keeps a rescan from duplicating `missing` edges: SQLite treats NULL
+        // `to_asset_id`s as distinct, so UNIQUE can't dedupe them.
+        tx.execute(
+            "DELETE FROM asset_relationship WHERE from_asset_id = ?1 AND source = 'unity_meta'",
+            params![asset_id],
+        )
+        .map_err(|e| CoreError::Catalog(format!("deps clear edges: {e}")))?;
+        for reference in ref_guids {
+            tx.execute(
+                "INSERT INTO asset_relationship
+                    (from_asset_id, to_asset_id, kind, source, declared_path, state)
+                 VALUES (
+                    ?1,
+                    (SELECT id FROM asset WHERE unity_guid = ?2 AND deleted_at IS NULL),
+                    ?3, 'unity_meta', ?2,
+                    CASE WHEN EXISTS (SELECT 1 FROM asset
+                                       WHERE unity_guid = ?2 AND deleted_at IS NULL)
+                         THEN 'resolved' ELSE 'missing' END)
+                 ON CONFLICT(from_asset_id, to_asset_id, kind) DO NOTHING",
+                params![asset_id, reference, kind],
+            )
+            .map_err(|e| CoreError::Catalog(format!("deps edge: {e}")))?;
+        }
+        tx.execute(
+            "UPDATE asset SET deps_dirty = 0 WHERE id = ?1",
+            params![asset_id],
+        )
+        .map_err(|e| CoreError::Catalog(format!("deps clear: {e}")))?;
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("deps commit: {e}")))
+    }
+
+    /// Every asset reachable from `seeds` over resolved dependency edges, seeds included
+    /// (DATA-MODEL §10; ENGINE-API §4 "export with dependencies"). Unresolved (`missing`) edges
+    /// point at nothing in the library, so they contribute nothing to a copy.
+    ///
+    /// The recursive `UNION` dedupes, which is also what terminates on a reference cycle
+    /// (material ↔ material is legal in Unity).
+    pub fn dependency_closure(&self, seeds: &[i64]) -> Result<Vec<i64>> {
+        if seeds.is_empty() {
+            return Ok(Vec::new());
+        }
+        // seeds are i64s the caller already holds — safe to inline (rusqlite has no array binds).
+        let seed_list = seeds
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("),(");
+        let sql = format!(
+            "WITH RECURSIVE closure(id) AS (
+                 VALUES ({seed_list})
+                 UNION
+                 SELECT r.to_asset_id FROM asset_relationship r
+                   JOIN closure c ON r.from_asset_id = c.id
+                  WHERE r.to_asset_id IS NOT NULL
+             )
+             SELECT c.id FROM closure c
+               JOIN asset a ON a.id = c.id
+              WHERE a.deleted_at IS NULL
+              ORDER BY c.id"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| CoreError::Catalog(format!("closure prep: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))
+            .map_err(|e| CoreError::Catalog(format!("closure query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("closure row: {e}")))
+    }
+
+    /// Late-bind the edges whose target has since been catalogued. One statement, run after every
+    /// dependency drain — cheaper than re-parsing the referencing files, and the reason a
+    /// `missing` edge is recorded rather than dropped. Returns how many edges resolved.
+    pub fn resolve_pending_relationships(&self) -> Result<usize> {
+        self.conn
+            .execute(
+                "UPDATE asset_relationship
+                    SET to_asset_id = (SELECT id FROM asset
+                                        WHERE unity_guid = asset_relationship.declared_path
+                                          AND deleted_at IS NULL),
+                        state = 'resolved'
+                  WHERE to_asset_id IS NULL
+                    AND EXISTS (SELECT 1 FROM asset
+                                 WHERE unity_guid = asset_relationship.declared_path
+                                   AND deleted_at IS NULL)",
+                [],
+            )
+            .map_err(|e| CoreError::Catalog(format!("resolve pending: {e}")))
     }
 
     /// Store extracted facets and clear the dirty flag. The flag clears even when every field is
@@ -1722,7 +1889,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 9, "all 9 migrations should have run");
+        assert_eq!(version, 10, "all 10 migrations should have run");
     }
 
     /// A catalog stopped at schema v4, for exercising M5's data steps.
@@ -2721,6 +2888,75 @@ mod tests {
                 confirmed: 1
             }
         );
+    }
+
+    #[test]
+    fn dependency_edges_resolve_now_or_later() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let s = c.upsert_import_source("A", "C:/a", "folder").expect("src");
+        c.record_crawl(s, None, &[rec("rock.mat", 1, 1), rec("albedo.png", 2, 2)])
+            .expect("crawl");
+        let id_of = |c: &Catalog, name: &str| -> i64 {
+            c.conn
+                .query_row("SELECT id FROM asset WHERE name=?1", params![name], |r| {
+                    r.get(0)
+                })
+                .expect("id")
+        };
+        let (mat, tex) = (id_of(&c, "rock.mat"), id_of(&c, "albedo.png"));
+        let tex_guid = "b24b57e0cfed05643be34b0256df875e".to_string();
+        let gone_guid = "ffffffffffffffffffffffffffffffff".to_string();
+
+        // The material is scanned first — its target has no GUID yet, so the edge is `missing`.
+        c.record_dependencies(
+            mat,
+            Some("1111"),
+            "uses_texture",
+            std::slice::from_ref(&tex_guid),
+        )
+        .expect("mat deps");
+        let edge = |c: &Catalog| -> (Option<i64>, String) {
+            c.conn
+                .query_row(
+                    "SELECT to_asset_id, state FROM asset_relationship WHERE from_asset_id=?1",
+                    params![mat],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .expect("edge")
+        };
+        assert_eq!(edge(&c), (None, "missing".into()));
+        assert_eq!(c.resolve_pending_relationships().expect("early"), 0);
+
+        // The texture lands later; one statement late-binds the edge.
+        c.record_dependencies(tex, Some(&tex_guid), "uses_texture", &[])
+            .expect("tex deps");
+        assert_eq!(c.resolve_pending_relationships().expect("late"), 1);
+        assert_eq!(edge(&c), (Some(tex), "resolved".into()));
+
+        // A rescan replaces the harvest wholesale rather than duplicating it, and a reference to
+        // something that isn't in the library stays honestly unresolved.
+        c.record_dependencies(mat, Some("1111"), "uses_texture", &[tex_guid, gone_guid])
+            .expect("rescan");
+        let counts: (i64, i64) = c
+            .conn
+            .query_row(
+                "SELECT COUNT(*), SUM(to_asset_id IS NULL) FROM asset_relationship
+                 WHERE from_asset_id=?1",
+                params![mat],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("counts");
+        assert_eq!(counts, (2, 1), "two edges, one still unresolved");
+
+        // Every scanned asset is off the queue.
+        let dirty: i64 = c
+            .conn
+            .query_row("SELECT COUNT(*) FROM asset WHERE deps_dirty=1", [], |r| {
+                r.get(0)
+            })
+            .expect("dirty");
+        assert_eq!(dirty, 0);
     }
 
     #[test]

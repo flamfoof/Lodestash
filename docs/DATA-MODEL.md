@@ -589,6 +589,27 @@ CREATE INDEX idx_rel_to   ON asset_relationship(to_asset_id);
   to offer "import with dependencies" — selecting a material auto-selects its textures. Already
   referenced in [`ENGINE-API.md`](ENGINE-API.md) §4; `asset_relationship` is the backing table.
 
+**What harvesting looks like in practice.** Step 1 runs as a drain off `asset.deps_dirty` (M10),
+beside the facet and embedding drains: each dirty asset's own GUID is read from its `.meta` sidecar
+into `asset.unity_guid`, and a material's `m_Texture` bindings become `uses_texture` edges. The flag
+clears either way, so an asset with no Unity bookkeeping isn't rescanned forever.
+
+An edge is recorded even when its target isn't catalogued yet — `to_asset_id NULL`, `state='missing'`,
+`declared_path` holding the GUID — because ordering is not guaranteed (a texture may be indexed after
+the material that uses it, or live in a package extracted later). `Catalog::resolve_pending_relationships`
+late-binds those in one statement after every drain, which is why a `missing` edge is kept rather than
+dropped. An edge that never resolves is an honest record of a reference the library doesn't hold.
+
+`Catalog::dependency_closure` walks the resolved edges transitively (recursive `UNION`, so a
+reference cycle terminates) and is the single definition of "with dependencies" for both
+`AssetDetail.dependencies` and `export_asset`.
+
+> **Coverage today.** Only Unity's deterministic refs are harvested, and only from files that are
+> themselves catalogued: **material → texture**. A stock FBX embeds its materials (`externalObjects`
+> is empty unless the user remapped them) and prefabs aren't a `media_type`, so **mesh → material has
+> no `unity_meta` source** — it needs step 2's naming heuristic, or a prefab reader. Until then a
+> mesh exports alone, and says so.
+
 ---
 
 ## 11. Variants, colors & 2D / material / font assets
@@ -650,6 +671,7 @@ transaction, in order, on open. Shipped so far:
 | **M7** | Unity Assets library pinning: `package.pinned` (`ALTER TABLE package ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`) — backs the Add-to-Library pin (FEATURES.md §5.5, §7 above) so a promoted pack is a durable sidebar LIBRARIES row |
 | **M8** | Semantic embeddings (interim): `asset_embedding` BLOB table (dim × f32 little-endian + `model_id`/`modality`/`media_type_id`/`source_id`) — `Catalog::upsert_embedding` clears `embedding_dirty` in-txn; `embeddings_for_knn` loads the pre-filtered candidate set for `crate::vector::BruteForceIndex`. sqlite-vec `vec_asset` is the drop-in optimisation behind the `VectorIndex` seam (§2). |
 | **M9** | Technical facets: `asset.tri_count/width_px/height_px/duration_ms` + `asset.metrics_dirty` (partial index) — extracted from the file itself by a dirty-flag drain, exactly like embeddings (§14) |
+| **M10** | Dependency scan queue: `asset.deps_dirty` (partial index) + a partial index on `asset.unity_guid` — the third drain flag beside `embedding_dirty`/`metrics_dirty`, cleared once an asset's `.meta` GUID and outbound refs are harvested into `asset_relationship` (§10) |
 | **M5** | UI-SPEC alignment: per-project staging trays, `import_record.batch_id` + backfill, `tag` trait columns, `asset_relationship` (final form), `import_source.blacklist` — DDL + data steps below |
 
 ### M5 — UI-SPEC alignment (shipped 2026-07-16)

@@ -4,7 +4,7 @@ Working notes for whoever (or whatever) continues the build. Unlike the rest of 
 is **not** a design spec — it's the state of play, the decisions already settled, and the traps.
 The design docs still win on any question of what the software *should* do.
 
-Last updated: **2026-07-22**, at `e9827d3` + the P3 status-lifecycle slice.
+Last updated: **2026-07-22**, at `7efcb01` + the P2 dependency-graph slice.
 
 ---
 
@@ -71,6 +71,15 @@ human-in-the-loop") made literal — keep it that way for every mutating op that
 `image`) + 84 CLAP vectors, from ~2274 assets. The 207 rows still `embedding_dirty` are `.mat`
 materials — there is no material renderer yet, so they legitimately have nothing to encode and will
 drain themselves once one exists.
+
+**The dependency graph is harvested and export honours it** (P2, [`DATA-MODEL.md`](DATA-MODEL.md) §10).
+A third drain flag (`deps_dirty`, M10) walks each asset's `.meta` sidecar for its own GUID and a
+material's `m_Texture` refs; unresolved refs are kept as `missing` edges and late-bound after every
+drain, so index order doesn't matter. `dependency_closure` backs both `AssetDetail.dependencies` and
+`export_asset(with_dependencies)` — the preview is the export. On this library: 1580 GUIDs, 200
+resolved edges, 2 missing. **Coverage caveat**: material → texture only. A stock FBX embeds its
+materials and prefabs aren't a `media_type`, so mesh → material needs the naming heuristic
+(DATA-MODEL §10 step 2) or a prefab reader — until then a mesh exports alone.
 
 **The status lifecycle is live** (P3, [`DATA-MODEL.md`](DATA-MODEL.md) §8). `status` is *derived*,
 not hand-set: `Catalog::promote_statuses` reads the ingest state already on the row — facets
@@ -202,9 +211,10 @@ Roughly by value:
    plugin ack → `import_record` ([`ENGINE-API.md`](ENGINE-API.md) §5). The job engine and the
    approval gate already exist to carry it. The UPM C# plugin is the big piece and cannot be
    verified without a Unity install.
-2. **P2 dependency closure.** Until the `.meta` GUID graph is harvested, `export_asset` silently
-   omits an asset's materials and textures — it reports `dependencies_included: false`, but that is
-   the sharpest edge currently shipped.
+2. **P2 relationship graph, remainder.** The GUID pass and export closure are in; what's left is
+   **mesh → material** (naming heuristic or a prefab reader — see the coverage caveat above), the
+   inspector "Related" tab, the grid link-chain badge, and the
+   `has_dependents`/`has_dependencies` filters.
 3. **P4 tagging.** Unblocks Traits, tag filter chips, `AssetSummary.tags`, pack-stats TAGS, and the
    accept/reject flow. Ollama is installed on this machine (`qwen3:8b`, text-only); a vision tagger
    would want `moondream` (~1.7 GB) or `qwen2.5vl:3b` (~3 GB) — the 4–6 GB VRAM tier of

@@ -152,6 +152,8 @@ impl Lodestash {
             "tris": row.metrics.tri_count, "width_px": row.metrics.width_px,
             "height_px": row.metrics.height_px, "duration_ms": row.metrics.duration_ms,
         });
+        let deps = self.state.dependencies(args.id).unwrap_or_default();
+        body["dependencies"] = serde_json::json!({ "count": deps.len(), "asset_ids": deps });
         Ok(CallToolResult::success(vec![ContentBlock::json(body)?]))
     }
 

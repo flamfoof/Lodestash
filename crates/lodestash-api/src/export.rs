@@ -166,6 +166,97 @@ mod flow_tests {
 
     use crate::{jobs::JobState, ServerState};
 
+    /// `with_dependencies` copies the closure, not just the named asset: exporting a material
+    /// brings its textures (DATA-MODEL §10 → ENGINE-API §4).
+    #[test]
+    fn export_with_dependencies_copies_the_closure() {
+        use lodestash_core::catalog::{Catalog, CrawlRecord};
+
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        for f in ["rock.mat", "rock_albedo.png", "unrelated.png"] {
+            std::fs::write(lib.join(f), b"x").unwrap();
+        }
+        let db = dir.path().join("catalog.db");
+        let (mat_id, tex_id) = {
+            let mut cat = Catalog::open(&db).unwrap();
+            cat.seed_media_types().unwrap();
+            let src = cat
+                .upsert_import_source("Lib", &lib.to_string_lossy(), "folder")
+                .unwrap();
+            let rec = |rel: &str, mt: &str| CrawlRecord {
+                workspace_rel: None,
+                rel_path: rel.into(),
+                name: rel.into(),
+                media_type: mt.into(),
+                size_bytes: 1,
+                mtime: 1,
+            };
+            cat.record_crawl(
+                src,
+                None,
+                &[
+                    rec("rock.mat", "material"),
+                    rec("rock_albedo.png", "texture"),
+                    rec("unrelated.png", "texture"),
+                ],
+            )
+            .unwrap();
+            let id = |name: &str| -> i64 {
+                cat.assets_for_source(src)
+                    .unwrap()
+                    .into_iter()
+                    .find(|a| a.rel_path == name)
+                    .unwrap()
+                    .asset_id
+            };
+            let (mat, tex) = (id("rock.mat"), id("rock_albedo.png"));
+            cat.record_dependencies(tex, Some("texguid"), "uses_texture", &[])
+                .unwrap();
+            cat.record_dependencies(mat, Some("matguid"), "uses_texture", &["texguid".into()])
+                .unwrap();
+            (mat, tex)
+        };
+
+        let state =
+            Arc::new(ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap());
+        assert_eq!(
+            state.dependencies(mat_id).unwrap(),
+            vec![tex_id],
+            "the detail view names exactly what an export would add"
+        );
+
+        let dest = dir.path().join("out");
+        let job = state
+            .request_export(super::ExportRequest {
+                asset_ids: vec![mat_id],
+                dest_path: dest.to_string_lossy().into(),
+                with_dependencies: true,
+            })
+            .unwrap();
+        state.approve_job(&job.id);
+        for _ in 0..200 {
+            if job.state().is_terminal() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert_eq!(job.state(), JobState::Done);
+        assert!(dest.join("rock.mat").exists(), "the named asset");
+        assert!(
+            dest.join("rock_albedo.png").exists(),
+            "its texture rode along"
+        );
+        assert!(
+            !dest.join("unrelated.png").exists(),
+            "closure, not the whole library"
+        );
+        let result = job.to_json();
+        assert_eq!(result["result"]["dependencies_included"], true);
+        assert_eq!(result["result"]["dependencies_added"], 1);
+    }
+
     /// The whole gate: an export request writes nothing until it is approved, and denial is
     /// final. This is the invariant the desktop prompt exists to enforce.
     #[test]
