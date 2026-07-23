@@ -361,7 +361,31 @@ struct ContentFilter {
     sizes: std::collections::BTreeSet<SizeTier>,
     /// Minimum star rating (None = no constraint). DATA-MODEL §12.
     min_rating: Option<u8>,
+    /// Dependency-graph constraint (DATA-MODEL §10 "Search"). None = no constraint.
+    link: Option<LinkFilter>,
     trait_search: String,
+}
+
+/// The `has_dependencies` / `has_dependents` chips (DATA-MODEL §10). Single-select: an asset that
+/// is both ends of a chain (a material) satisfies either, so combining them would only ever
+/// narrow to that intersection — not what the chips read as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkFilter {
+    /// Uses something: a material with textures, a mesh with a material.
+    HasDependencies,
+    /// Something uses it: a texture some material paints with.
+    HasDependents,
+}
+
+impl LinkFilter {
+    const ALL: [LinkFilter; 2] = [LinkFilter::HasDependencies, LinkFilter::HasDependents];
+
+    fn label(self) -> &'static str {
+        match self {
+            LinkFilter::HasDependencies => "uses others",
+            LinkFilter::HasDependents => "used by others",
+        }
+    }
 }
 
 impl ContentFilter {
@@ -370,6 +394,7 @@ impl ContentFilter {
             + self.tri_buckets.len()
             + self.sizes.len()
             + usize::from(self.min_rating.is_some())
+            + usize::from(self.link.is_some())
     }
 
     fn any_active(&self) -> bool {
@@ -382,6 +407,7 @@ impl ContentFilter {
         self.tri_buckets.clear();
         self.sizes.clear();
         self.min_rating = None;
+        self.link = None;
         self.trait_search.clear();
     }
 
@@ -396,8 +422,15 @@ impl ContentFilter {
         tri: Option<u32>,
         rating: Option<u8>,
         traits: &[String],
+        links: (bool, bool),
         tiers: &SizeTiers,
     ) -> bool {
+        let (has_dependencies, has_dependents) = links;
+        match self.link {
+            Some(LinkFilter::HasDependencies) if !has_dependencies => return false,
+            Some(LinkFilter::HasDependents) if !has_dependents => return false,
+            _ => {}
+        }
         if let Some(min) = self.min_rating {
             if rating.unwrap_or(0) < min {
                 return false;
@@ -595,6 +628,15 @@ pub struct LodestashApp {
     search_ranks: Option<std::collections::HashMap<i64, usize>>,
     /// The query the current `search_ranks` were computed for — the recompute guard.
     search_ranks_key: Option<String>,
+    /// Asset ids with at least one resolved outbound / inbound dependency edge (DATA-MODEL §10).
+    /// Reloaded on every catalog sync; drives the grid's link badge and the LINKS filter chips.
+    /// Sets rather than a per-entry flag — the grid's entries outlive any single catalog read.
+    edges_out: std::collections::HashSet<i64>,
+    edges_in: std::collections::HashSet<i64>,
+    /// LINKED FILES rows for the selected asset (UI-SPEC §13.6), and the asset they belong to —
+    /// the reload guard, since the panel re-renders every frame but the graph changes rarely.
+    related: Vec<lodestash_core::catalog::RelatedAsset>,
+    related_for: Option<i64>,
     /// The local SigLIP joint image↔text embedder for Search-with-AI (IDENTIFICATION-AND-SEARCH
     /// §5.B), shared by the query side (this thread, text tower) and the persist-thread image
     /// drain (vision tower). `None` when the ONNX Runtime + model artifacts aren't present — AI
@@ -776,6 +818,10 @@ impl LodestashApp {
             project_name: None,
             search: String::new(),
             search_catalog: catalog_db_path().and_then(|p| Catalog::open(&p).ok()),
+            edges_out: std::collections::HashSet::new(),
+            edges_in: std::collections::HashSet::new(),
+            related: Vec::new(),
+            related_for: None,
             search_ranks: None,
             search_ranks_key: None,
             ai_embedder: resolve_embedder(),
@@ -1300,6 +1346,59 @@ impl LodestashApp {
     /// Takes the same writer slot as the persist thread — never both at once (DATA-MODEL §1
     /// single writer), so this no-ops while a persist is in flight and retries on the next
     /// hydrate.
+    /// Reload the two dependency-edge id sets from the catalog (DATA-MODEL §10). Called after
+    /// every catalog sync — a drain can add edges — and cheap enough to do wholesale: two
+    /// `SELECT DISTINCT`s over a table with one row per declared reference.
+    fn reload_edge_sets(&mut self) {
+        if self.search_catalog.is_none() {
+            self.search_catalog = catalog_db_path().and_then(|p| Catalog::open(&p).ok());
+        }
+        let Some(cat) = &self.search_catalog else {
+            return;
+        };
+        match cat.assets_with_edges() {
+            Ok((out, inbound)) => {
+                self.edges_out = out.into_iter().collect();
+                self.edges_in = inbound.into_iter().collect();
+                self.related_for = None; // force the inspector panel to re-read
+            }
+            Err(e) => tracing::warn!(%e, "dependency edge sets unavailable"),
+        }
+    }
+
+    /// LINKED FILES rows for `asset_id`, reloaded only when the selection changes (UI-SPEC §13.6).
+    fn ensure_related_loaded(&mut self, asset_id: i64) {
+        if self.related_for == Some(asset_id) {
+            return;
+        }
+        self.related_for = Some(asset_id);
+        self.related = self
+            .search_catalog
+            .as_ref()
+            .and_then(|cat| cat.related_assets(asset_id).ok())
+            .unwrap_or_default();
+    }
+
+    /// Select the grid entry carrying `asset_id`, if it's in the current view — the LINKED FILES
+    /// rows' click target. Returns false when the asset exists but is filtered out of the grid.
+    fn select_by_asset_id(&mut self, asset_id: i64) -> bool {
+        let Some(entry_idx) = self
+            .entries
+            .iter()
+            .position(|e| e.asset_id == Some(asset_id))
+        else {
+            return false;
+        };
+        let Some(cache_idx) = self.sorted_cache.iter().position(|&i| i == entry_idx) else {
+            return false;
+        };
+        self.selected_cache_idx = Some(cache_idx);
+        self.selected.clear();
+        self.selected.insert(entry_idx);
+        self.page = cache_idx / self.config.view.page_size.max(1);
+        true
+    }
+
     /// `(source name, root path)` per scan root — what `upsert_import_source` wants on the
     /// persist thread.
     fn scan_root_names(&self) -> Vec<(String, String)> {
@@ -1858,6 +1957,7 @@ impl LodestashApp {
             // Package rows may have changed (extraction persisted new ones) — let the
             // Unity Assets screen lazily reload its listing next open.
             self.unity_packages = None;
+            self.reload_edge_sets();
             match msg.counts {
                 Some(counts) => self.catalog_counts = Some(counts),
                 None if msg.drain_only => {}
@@ -2844,12 +2944,19 @@ impl LodestashApp {
             let tiers = &self.config.size_tiers;
             let entries = &self.entries;
             // No trait/tri data pre-catalog → None/&[]; wire real values when P1/P4 land.
+            let (edges_out, edges_in) = (&self.edges_out, &self.edges_in);
             idxs.retain(|&i| {
+                let id = entries[i].asset_id;
+                let links = (
+                    id.is_some_and(|id| edges_out.contains(&id)),
+                    id.is_some_and(|id| edges_in.contains(&id)),
+                );
                 cf.passes(
                     entries[i].file.size_bytes,
                     entries[i].metrics.tri_count.map(|t| t.max(0) as u32),
                     entries[i].rating,
                     &[],
+                    links,
                     tiers,
                 )
             });
@@ -5629,7 +5736,18 @@ impl eframe::App for LodestashApp {
 
         // ── Inspector pane (right side) ───────────────────────────────────────
         let mut inspector_rating: Option<(usize, Option<u8>)> = None;
+        let mut inspector_nav: Option<i64> = None;
         if self.screen == Screen::Library {
+            // Load the LINKED FILES rows before borrowing the entry (the load needs &mut self).
+            if let Some(id) = self
+                .selected_cache_idx
+                .and_then(|c| self.sorted_cache.get(c).copied())
+                .and_then(|i| self.entries.get(i))
+                .and_then(|e| e.asset_id)
+            {
+                self.ensure_related_loaded(id);
+            }
+            let related = &self.related;
             if let Some(cache_idx) = self.selected_cache_idx {
                 if let Some(&entry_idx) = self.sorted_cache.get(cache_idx) {
                     if let Some(entry) = self.entries.get(entry_idx) {
@@ -5656,6 +5774,8 @@ impl eframe::App for LodestashApp {
                                     entry.metrics,
                                     entry.texture.as_ref(),
                                     library.as_deref(),
+                                    related,
+                                    &mut inspector_nav,
                                 ) {
                                     inspector_rating = Some((entry_idx, new_rating));
                                 }
@@ -5666,6 +5786,16 @@ impl eframe::App for LodestashApp {
         }
         if let Some((entry_idx, new_rating)) = inspector_rating {
             self.set_entries_rating(&[entry_idx], new_rating);
+        }
+        // A LINKED FILES row was clicked: jump to that asset, or say why we can't.
+        if let Some(id) = inspector_nav {
+            if !self.select_by_asset_id(id) {
+                self.jobs.toast(
+                    "That linked asset is filtered out of the current view",
+                    Intent::Info,
+                );
+            }
+            self.cache_dirty = true;
         }
 
         // A page flip (or page-size change) must re-check the spawn window even when
@@ -5918,6 +6048,7 @@ impl eframe::App for LodestashApp {
                         self.selected_cache_idx,
                         &self.selected,
                         self.nav_generation.wrapping_add(self.page as u64),
+                        &self.edges_out,
                         &self.config.size_tiers,
                     );
                     if out.cols != self.last_cols
@@ -6903,6 +7034,8 @@ fn thumbnail_grid(
     selected_cache_idx: Option<usize>,
     selected_entries: &std::collections::BTreeSet<usize>,
     nav_salt: u64,
+    // Asset ids with outbound dependency edges — drives the card's link badge (DATA-MODEL §10).
+    linked_ids: &std::collections::HashSet<i64>,
     tiers: &SizeTiers,
 ) -> GridOutput {
     let card_h = thumb_size + CARD_LABEL;
@@ -6959,6 +7092,9 @@ fn thumbnail_grid(
                             thumb_size,
                             is_lead || in_selection,
                             in_selection && selected_entries.len() > 1,
+                            entries[idx]
+                                .asset_id
+                                .is_some_and(|id| linked_ids.contains(&id)),
                             tiers,
                         );
                         if resp.clicked() {
@@ -8208,6 +8344,26 @@ fn filter_popover(ui: &mut Ui, cf: &mut ContentFilter, tiers: &SizeTiers) -> boo
     });
     ui.add_space(6.0);
 
+    // LINKS — the dependency graph (DATA-MODEL §10). Single-select; same chip toggles off.
+    section_label(ui, "LINKS");
+    ui.horizontal_wrapped(|ui| {
+        for lf in LinkFilter::ALL {
+            let sel = cf.link == Some(lf);
+            if filter_chip(ui, lf.label(), sel, theme::TYPE_MATERIAL) {
+                cf.link = if sel { None } else { Some(lf) };
+                changed = true;
+            }
+        }
+    });
+    ui.label(
+        RichText::new(
+            "From Unity's own GUID refs \u{2014} assets outside a Unity project have none.",
+        )
+        .size(10.0)
+        .color(theme::TEXT_DIM),
+    );
+    ui.add_space(6.0);
+
     // RATING — minimum-stars single-select; same chip toggles off (DATA-MODEL §12).
     section_label(ui, "RATING");
     ui.horizontal_wrapped(|ui| {
@@ -8231,6 +8387,8 @@ fn asset_card(
     thumb_size: f32,
     selected: bool,
     check_overlay: bool,
+    // Has at least one resolved outbound dependency edge (DATA-MODEL §10).
+    linked: bool,
     tiers: &SizeTiers,
 ) -> egui::Response {
     let type_color = entry
@@ -8289,6 +8447,18 @@ fn asset_card(
                     theme::BG,
                 );
 
+                // Link-chain badge, bottom-right: this asset pulls others along on export
+                // (DATA-MODEL §10). Outbound edges only — "used by" costs an export nothing.
+                // Drawn, not typed: the bundled text fonts have no chain glyph (U+26AD renders as
+                // tofu — same trap as the dropped ◉ in UI-SPEC §15), so two interlocking rings
+                // are painted instead.
+                if linked {
+                    let c = thumb_rect.right_bottom() + egui::vec2(-11.0, -8.0);
+                    let stroke = egui::Stroke::new(1.4, theme::TYPE_MATERIAL);
+                    painter.circle_stroke(c + egui::vec2(-2.5, 0.0), 3.0, stroke);
+                    painter.circle_stroke(c + egui::vec2(2.5, 0.0), 3.0, stroke);
+                }
+
                 // Star rating, bottom-left of the thumbnail (DATA-MODEL §12).
                 if let Some(r) = entry.rating {
                     painter.text(
@@ -8341,7 +8511,11 @@ fn asset_card(
 
 // ── Inspector pane ────────────────────────────────────────────────────────────
 
-/// Returns Some(new_rating) when the star row was clicked (Some(None) = cleared).
+/// Returns Some(new_rating) when the star row was clicked (Some(None) = cleared); `nav_to` is set
+/// to a linked asset's id when one of its LINKED FILES rows is clicked.
+// ponytail: a wide parameter list beats an args struct used exactly once — the panel reads its
+// inputs straight off the selected entry. Group them if a third caller ever appears.
+#[allow(clippy::too_many_arguments)]
 fn inspector_pane(
     ui: &mut Ui,
     file: &CrawledFile,
@@ -8350,6 +8524,8 @@ fn inspector_pane(
     metrics: lodestash_core::catalog::AssetMetrics,
     texture: Option<&TextureHandle>,
     library: Option<&str>,
+    related: &[lodestash_core::catalog::RelatedAsset],
+    nav_to: &mut Option<i64>,
 ) -> Option<Option<u8>> {
     let mut rating_clicked: Option<Option<u8>> = None;
     let type_color = file
@@ -8455,6 +8631,62 @@ fn inspector_pane(
             }
             stat_row(ui, "Path", &file.abs_path.to_string_lossy());
         });
+
+    // LINKED FILES (UI-SPEC §13.6) — what this asset drags along, and what would drag it.
+    if !related.is_empty() {
+        ui.add_space(10.0);
+        section_label(ui, "LINKED FILES");
+        ui.label(
+            RichText::new("parsed from .meta GUID refs \u{00B7} prefab bindings")
+                .color(theme::TEXT_DIM)
+                .size(9.0),
+        );
+        let mut missing = 0usize;
+        for rel in related {
+            // Only glyphs the bundled fonts actually carry (◆/◇/•) — see the card badge note.
+            let (glyph, color) = match rel.media_code.as_deref() {
+                Some("material") => ("\u{25C7}", theme::TYPE_MATERIAL),
+                Some("model_3d") => ("\u{25C6}", theme::TYPE_MODEL),
+                _ => ("\u{2022}", theme::TYPE_IMAGE),
+            };
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(glyph).color(color).size(11.0));
+                match (&rel.name, rel.asset_id) {
+                    (Some(name), Some(id)) => {
+                        // Inbound rows read "used by", so the arrow direction carries the meaning
+                        // the row's position alone can't.
+                        let arrow = if rel.outbound { "\u{2192}" } else { "\u{2190}" };
+                        ui.label(RichText::new(arrow).color(theme::TEXT_DIM).size(10.0));
+                        let link = ui.add(
+                            egui::Button::new(RichText::new(name).color(theme::TEXT).size(10.0))
+                                .frame(false),
+                        );
+                        if link.clicked() {
+                            *nav_to = Some(id);
+                        }
+                    }
+                    _ => {
+                        missing += 1;
+                        ui.label(
+                            RichText::new(format!(
+                                "\u{2715} missing \u{00B7} {}",
+                                rel.declared_path.as_deref().unwrap_or("unknown")
+                            ))
+                            .color(theme::DANGER)
+                            .size(10.0),
+                        );
+                    }
+                }
+            });
+        }
+        if missing > 0 {
+            ui.label(
+                RichText::new("missing links are skipped on export")
+                    .color(theme::WARNING)
+                    .size(9.0),
+            );
+        }
+    }
 
     ui.add_space(8.0);
     ui.label(
@@ -9292,10 +9524,47 @@ mod tests {
         let cf = ContentFilter::default();
         let tiers = SizeTiers::default();
         assert!(
-            cf.passes(10, None, None, &[], &tiers),
+            cf.passes(10, None, None, &[], (false, false), &tiers),
             "no active facet = no constraint"
         );
-        assert!(cf.passes(9_000_000, Some(5000), None, &["a".into()], &tiers));
+        assert!(cf.passes(
+            9_000_000,
+            Some(5000),
+            None,
+            &["a".into()],
+            (false, false),
+            &tiers
+        ));
+    }
+
+    /// The LINKS chips read the dependency graph, not the file (DATA-MODEL §10): an asset with no
+    /// edges fails either chip, and the two directions select different assets.
+    #[test]
+    fn content_filter_links_select_by_edge_direction() {
+        let tiers = SizeTiers::default();
+        let mut cf = ContentFilter {
+            link: Some(LinkFilter::HasDependencies),
+            ..Default::default()
+        };
+        assert!(
+            cf.passes(10, None, None, &[], (true, false), &tiers),
+            "uses others"
+        );
+        assert!(
+            !cf.passes(10, None, None, &[], (false, true), &tiers),
+            "only used by others"
+        );
+        assert!(
+            !cf.passes(10, None, None, &[], (false, false), &tiers),
+            "no edges at all"
+        );
+
+        cf.link = Some(LinkFilter::HasDependents);
+        assert!(cf.passes(10, None, None, &[], (false, true), &tiers));
+        assert!(!cf.passes(10, None, None, &[], (true, false), &tiers));
+        // A material sits in the middle of a chain and satisfies both.
+        assert!(cf.passes(10, None, None, &[], (true, true), &tiers));
+        assert_eq!(cf.active_count(), 1, "the chip counts as an active facet");
     }
 
     #[test]
@@ -9306,19 +9575,19 @@ mod tests {
         cf.sizes.insert(SizeTier::L);
         let mb = |n: u64| n * 1024 * 1024;
         assert!(
-            cf.passes(mb(0), None, None, &[], &tiers),
+            cf.passes(mb(0), None, None, &[], (false, false), &tiers),
             "500 KB → S, selected"
         );
         assert!(
-            !cf.passes(mb(2), None, None, &[], &tiers),
+            !cf.passes(mb(2), None, None, &[], (false, false), &tiers),
             "2 MB → M, not selected"
         );
         assert!(
-            cf.passes(mb(5), None, None, &[], &tiers),
+            cf.passes(mb(5), None, None, &[], (false, false), &tiers),
             "5 MB → L, selected"
         );
         assert!(
-            !cf.passes(mb(9), None, None, &[], &tiers),
+            !cf.passes(mb(9), None, None, &[], (false, false), &tiers),
             "9 MB → XL, not selected"
         );
     }
@@ -9329,15 +9598,15 @@ mod tests {
         let mut cf = ContentFilter::default();
         cf.tri_buckets.insert(TriBucket::K1to3);
         assert!(
-            cf.passes(10, Some(2000), None, &[], &tiers),
+            cf.passes(10, Some(2000), None, &[], (false, false), &tiers),
             "2000 tris → 1k–3k, selected"
         );
         assert!(
-            !cf.passes(10, Some(500), None, &[], &tiers),
+            !cf.passes(10, Some(500), None, &[], (false, false), &tiers),
             "500 tris → ≤1k, not selected"
         );
         assert!(
-            !cf.passes(10, None, None, &[], &tiers),
+            !cf.passes(10, None, None, &[], (false, false), &tiers),
             "no tri count is excluded when a tri facet is active"
         );
     }
@@ -9347,10 +9616,17 @@ mod tests {
         let tiers = SizeTiers::default();
         let mut cf = ContentFilter::default();
         cf.traits.insert("rusty".into());
-        assert!(cf.passes(10, None, None, &["rusty".into(), "barrel".into()], &tiers));
-        assert!(!cf.passes(10, None, None, &["barrel".into()], &tiers));
+        assert!(cf.passes(
+            10,
+            None,
+            None,
+            &["rusty".into(), "barrel".into()],
+            (false, false),
+            &tiers
+        ));
+        assert!(!cf.passes(10, None, None, &["barrel".into()], (false, false), &tiers));
         assert!(
-            !cf.passes(10, None, None, &[], &tiers),
+            !cf.passes(10, None, None, &[], (false, false), &tiers),
             "an asset with no traits fails a trait filter"
         );
     }

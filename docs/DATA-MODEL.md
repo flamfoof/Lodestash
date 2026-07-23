@@ -588,9 +588,13 @@ CREATE INDEX idx_rel_to   ON asset_relationship(to_asset_id);
 **UI surfaces:**
 - **Inspector → Related** tab: lists all outbound and inbound relationships with their kind and
   Library Source label. Clicking navigates to the related asset.
-- **Grid badge:** a texture that has at least one `uses_texture` inbound edge shows a small
-  link-chain icon; hovering previews the parent material(s).
-- **Search:** `has_dependents` / `has_dependencies` as boolean filter chips. `"textures used by
+- **Grid badge:** a small link-chain mark on cards with **outbound** edges — what an export would
+  drag along (being *used by* something costs an export nothing). Painted as two interlocking rings
+  rather than typed: the bundled text fonts have no chain glyph. Hover preview of the parents is
+  not built.
+- **Search:** `has_dependents` / `has_dependencies` as boolean filter chips — shipped as the
+  ⚑ Filters **LINKS** section (*uses others* / *used by others*, single-select; an asset in the
+  middle of a chain satisfies either). `"textures used by
   assets from source: Synty"` resolves via a two-hop join.
 - **Export/import with deps:** when importing an asset into Unity, the relationship graph is walked
   to offer "import with dependencies" — selecting a material auto-selects its textures. Already

@@ -1105,6 +1105,22 @@ ALTER TABLE asset ADD COLUMN metrics_dirty INTEGER NOT NULL DEFAULT 1;
 CREATE INDEX IF NOT EXISTS idx_asset_metrics_dirty ON asset(metrics_dirty) WHERE metrics_dirty=1;
 ";
 
+/// One row of the inspector's LINKED FILES panel (UI-SPEC §13.6): an edge seen from the selected
+/// asset. `asset_id`/`name`/`media_code` are `None` for an outbound edge whose target isn't in the
+/// library — the `missing` case the panel calls out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelatedAsset {
+    /// True: the selected asset *uses* this one. False: this one uses the selected asset.
+    pub outbound: bool,
+    pub kind: String,
+    pub state: String,
+    /// What the parent declared — a GUID for Unity-harvested edges.
+    pub declared_path: Option<String>,
+    pub asset_id: Option<i64>,
+    pub name: Option<String>,
+    pub media_code: Option<String>,
+}
+
 /// M10 — dependency-graph queue (§10). `deps_dirty` is the third drain flag, next to
 /// `embedding_dirty` and `metrics_dirty`: set on insert and whenever a file's bytes change,
 /// cleared once the asset's `.meta` GUID and outbound references have been harvested.
@@ -1498,6 +1514,68 @@ impl Catalog {
         .map_err(|e| CoreError::Catalog(format!("deps clear: {e}")))?;
         tx.commit()
             .map_err(|e| CoreError::Catalog(format!("deps commit: {e}")))
+    }
+
+    /// Both sides of an asset's dependency graph for the inspector's LINKED FILES panel
+    /// (UI-SPEC §13.6): what it uses (outbound) and what uses it (inbound). Unresolved outbound
+    /// refs are included — a link the library can't satisfy is exactly what the panel must show.
+    pub fn related_assets(&self, asset_id: i64) -> Result<Vec<RelatedAsset>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT 1, r.kind, r.state, r.declared_path, t.id, t.name, mt.code
+                   FROM asset_relationship r
+                   LEFT JOIN asset t      ON t.id = r.to_asset_id AND t.deleted_at IS NULL
+                   LEFT JOIN media_type mt ON mt.id = t.media_type_id
+                  WHERE r.from_asset_id = ?1
+                 UNION ALL
+                 SELECT 0, r.kind, r.state, r.declared_path, f.id, f.name, mt.code
+                   FROM asset_relationship r
+                   JOIN asset f            ON f.id = r.from_asset_id AND f.deleted_at IS NULL
+                   LEFT JOIN media_type mt ON mt.id = f.media_type_id
+                  WHERE r.to_asset_id = ?1
+                  ORDER BY 1 DESC, 6",
+            )
+            .map_err(|e| CoreError::Catalog(format!("related prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![asset_id], |r| {
+                Ok(RelatedAsset {
+                    outbound: r.get::<_, i64>(0)? == 1,
+                    kind: r.get(1)?,
+                    state: r.get(2)?,
+                    declared_path: r.get(3)?,
+                    asset_id: r.get(4)?,
+                    name: r.get(5)?,
+                    media_code: r.get(6)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("related query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("related row: {e}")))
+    }
+
+    /// The two id sets behind the `has_dependencies` / `has_dependents` filter chips
+    /// (DATA-MODEL §10): assets with at least one outbound edge, and assets something points at.
+    /// Read once per catalog sync — cheaper than a per-row `EXISTS` while filtering the grid.
+    pub fn assets_with_edges(&self) -> Result<(Vec<i64>, Vec<i64>)> {
+        let collect = |sql: &str| -> Result<Vec<i64>> {
+            let mut stmt = self
+                .conn
+                .prepare(sql)
+                .map_err(|e| CoreError::Catalog(format!("edge set prep: {e}")))?;
+            let rows = stmt
+                .query_map([], |r| r.get(0))
+                .map_err(|e| CoreError::Catalog(format!("edge set query: {e}")))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| CoreError::Catalog(format!("edge set row: {e}")))
+        };
+        let has_deps = collect(
+            "SELECT DISTINCT from_asset_id FROM asset_relationship WHERE to_asset_id IS NOT NULL",
+        )?;
+        let has_dependents = collect(
+            "SELECT DISTINCT to_asset_id FROM asset_relationship WHERE to_asset_id IS NOT NULL",
+        )?;
+        Ok((has_deps, has_dependents))
     }
 
     /// Replace the prefab-derived edges with `pairs` of `(mesh GUID, material GUID)` (§10,

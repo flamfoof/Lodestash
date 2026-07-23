@@ -528,6 +528,16 @@ Opens when an asset is selected; ✕ / Esc closes. Top→bottom:
    suggestions from the library (`NN% · use →`), **⌕ Browse disk…**, **⊘ Ignore link** (drops the
    edge). Footer warning when any missing: *"✕ missing links are skipped on export — click one to
    relink."* (⚖ requires the unresolved-reference delta, §20.)
+
+   *(Shipped 2026-07-22: the read-only panel — caption `parsed from .meta GUID refs · prefab
+   bindings`, one row per edge with a type glyph, direction arrow (`→` this asset uses it, `←` it
+   uses this asset) and the linked name; clicking a row selects that asset in the grid, and when
+   the current filter hides it, a toast says so rather than silently doing nothing. A `missing`
+   edge renders `✕ missing · <declared GUID>` with the export-skip warning under the list. Not yet:
+   the relink panel (name-match suggestions, ⌕ Browse disk…, ⊘ Ignore link) and the `in pack` vs
+   `in library` distinction — both need the §20 unresolved-reference delta. Glyphs are limited to
+   ◆/◇/• because the bundled text fonts have no chain glyph — see §15's dropped ◉.)*
+
 7. **COLLECTIONS**: toggle chips (`+ name` / `✓ name` gold) — membership per §6.
 8. **SIMILAR IN YOUR HOARD**: top 3 by shared tags + same-type bonus (thumb + name + pack, → that
    asset). Backed by `find_similar` (embeddings) once available.

@@ -85,6 +85,11 @@ and the pass rebuilds `source='unity_prefab'` edges wholesale — 1228 resolved 
 outside a Unity project has no `.meta`, so no GUID and no edges at all — step 2's naming heuristic
 (DATA-MODEL §10) is what would reach those.
 
+Three UI surfaces read the graph: the inspector's **LINKED FILES** panel (UI-SPEC §13.6, both
+directions, click to select, missing refs called out), a **painted** link badge on cards with
+outbound edges (the bundled fonts have no chain glyph — U+26AD is tofu, like the dropped ◉), and
+**⚑ Filters ▸ LINKS**. The relink panel from §13.6 is not built.
+
 **The status lifecycle is live** (P3, [`DATA-MODEL.md`](DATA-MODEL.md) §8). `status` is *derived*,
 not hand-set: `Catalog::promote_statuses` reads the ingest state already on the row — facets
 extracted ⇒ `indexed`, an embedding stored ⇒ `identified`, embedding re-dirtied (file changed) ⇒ back
