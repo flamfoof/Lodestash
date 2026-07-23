@@ -418,15 +418,17 @@ all land the same transitions:
 | Transition | Earned by |
 |---|---|
 | `discovered → indexed` | `metrics_dirty = 0` — the technical facets (§14) have been extracted |
-| `discovered`/`indexed` → `identified` | a row in `asset_embedding`, with `embedding_dirty = 0` |
-| `identified → indexed` | `embedding_dirty = 1` again — the file's bytes changed, so the vector is stale |
+| `discovered`/`indexed` → `identified` | a row in `asset_embedding` (with `embedding_dirty = 0`) **and** at least one `asset_tag` |
+| `identified → indexed` | `embedding_dirty = 1` again (the file's bytes changed, so the vector is stale), **or** the asset has no tags |
 
 `confirmed` is human-set (the P4 accept/reject flow) and the reconcile never touches it. The pass is
 idempotent, so it is safe to run after every drain.
 
-> **Interim divergence.** This table says `identified` means "AI tagging **+** embeddings"; until the
-> P4 tagging lane exists there is nothing to tag with, so today the embedding alone earns it. When
-> tagging lands, `promote_statuses` gains an `asset_tag` condition and this note goes away.
+Both halves are required, and that is not pedantry: an embedding makes an asset *findable*, but
+nothing has been **said** about it until it is tagged. While `identified` was earned by embeddings
+alone (2026-07-22 → 07-23), the health meter reported 2067 of 2274 identified for a library where
+19 assets had tags — the UI asserting work that had not happened. The condition landed the moment
+that was noticed.
 
 ---
 

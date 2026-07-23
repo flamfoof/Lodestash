@@ -106,11 +106,12 @@ The category tabs are now five: Materials split out of Models.
 
 **The status lifecycle is live** (P3, [`DATA-MODEL.md`](DATA-MODEL.md) §8). `status` is *derived*,
 not hand-set: `Catalog::promote_statuses` reads the ingest state already on the row — facets
-extracted ⇒ `indexed`, an embedding stored ⇒ `identified`, embedding re-dirtied (file changed) ⇒ back
-to `indexed` — and `confirmed` stays human-set. All three writer paths (scan persist, package
+extracted ⇒ `indexed`; an embedding **and** at least one tag ⇒ `identified`; embedding re-dirtied
+(file changed) or no tags ⇒ back to `indexed` — and `confirmed` stays human-set. All three writer paths (scan persist, package
 persist, backlog drain) funnel through one `drain_promote_resync`: drain facets, drain vectors,
 promote, then re-read counts + identities and send them, because a drain is no longer count-neutral.
-On this machine the meter reads **2067 / 2274 Identified**.
+Since tags became part of the definition (2026-07-23) the meter reads the *tagged* count — 19
+on this machine until a full Identify pass runs, which is the honest number.
 
 ---
 

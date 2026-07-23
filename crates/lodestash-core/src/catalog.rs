@@ -690,11 +690,16 @@ impl Catalog {
     }
 
     /// Reconcile every live asset's `status` with the ingest work actually done
-    /// (DATA-MODEL §8): facets extracted ⇒ `indexed`, an embedding stored ⇒ `identified`,
-    /// and a file whose bytes changed (so `embedding_dirty` is back on) drops from
-    /// `identified` to `indexed` until it re-encodes. `confirmed` is human-set — never
-    /// touched here. Idempotent; run it on the writer connection after the drains. Returns
-    /// the number of status *writes* — a row promoted two steps in one pass counts twice.
+    /// (DATA-MODEL §8): facets extracted ⇒ `indexed`; an embedding **and** at least one tag ⇒
+    /// `identified`; a file whose bytes changed (so `embedding_dirty` is back on), or one that
+    /// carries no tags, drops back to `indexed`. `confirmed` is human-set — never touched here.
+    /// Idempotent; run it on the writer connection after the drains. Returns the number of
+    /// status *writes* — a row promoted two steps in one pass counts twice.
+    ///
+    /// Requiring both halves is the spec's definition and the honest one: an embedding makes an
+    /// asset *findable*, but nothing has been said about it until it is tagged. A meter counting
+    /// embeddings alone reported a library as identified that no one could describe — which is
+    /// exactly how this was noticed.
     ///
     /// ponytail: an undecodable file stores a *zero* vector to guarantee drain progress,
     /// and that still reads as `identified` here. Filter those out when a zero vector
@@ -708,10 +713,16 @@ impl Catalog {
              WHERE deleted_at IS NULL AND status = 'identified' AND embedding_dirty = 1",
             "UPDATE asset SET status = 'indexed', updated_at = ?1
              WHERE deleted_at IS NULL AND status = 'discovered' AND metrics_dirty = 0",
+            // An untagged asset is not identified, however well it embeds: nothing has been said
+            // about it, so the Identify backlog must still contain it.
+            "UPDATE asset SET status = 'indexed', updated_at = ?1
+             WHERE deleted_at IS NULL AND status = 'identified'
+               AND NOT EXISTS (SELECT 1 FROM asset_tag t WHERE t.asset_id = asset.id)",
             "UPDATE asset SET status = 'identified', updated_at = ?1
              WHERE deleted_at IS NULL AND status IN ('discovered', 'indexed')
                AND embedding_dirty = 0
-               AND EXISTS (SELECT 1 FROM asset_embedding e WHERE e.asset_id = asset.id)",
+               AND EXISTS (SELECT 1 FROM asset_embedding e WHERE e.asset_id = asset.id)
+               AND EXISTS (SELECT 1 FROM asset_tag t WHERE t.asset_id = asset.id)",
         ] {
             changed += self
                 .conn
@@ -3331,15 +3342,30 @@ mod tests {
         assert_eq!(c.promote_statuses().expect("noop"), 0);
         assert_eq!(status_of(&c, "x.png"), "discovered");
 
-        // Facets drained ⇒ indexed; an embedding on top ⇒ identified.
+        // Facets drained ⇒ indexed. An embedding alone is *not* enough: the asset is findable
+        // but nothing has been said about it, so it stays in the Identify backlog.
         c.conn
             .execute("UPDATE asset SET metrics_dirty = 0", [])
             .expect("metrics drained");
         c.upsert_embedding(y, "m", "image", None, None, &[0.5, 0.5])
             .expect("embed y");
-        // 4 writes, not 3: y is walked discovered → indexed → identified in one pass.
-        assert_eq!(c.promote_statuses().expect("promote"), 4);
+        assert_eq!(c.promote_statuses().expect("promote"), 3);
         assert_eq!(status_of(&c, "x.png"), "indexed");
+        assert_eq!(
+            status_of(&c, "y.png"),
+            "indexed",
+            "an embedding without tags is not identification"
+        );
+
+        // Tags on top of the embedding complete it.
+        c.set_tags(
+            y,
+            "ai",
+            Some("m"),
+            &[TagAssignment::exact("subject", "rock")],
+        )
+        .expect("tag y");
+        assert_eq!(c.promote_statuses().expect("promote with tags"), 1);
         assert_eq!(status_of(&c, "y.png"), "identified");
         assert_eq!(c.promote_statuses().expect("idempotent"), 0);
 
