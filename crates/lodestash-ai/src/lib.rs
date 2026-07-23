@@ -5,4 +5,5 @@ pub mod clap;
 pub mod embedder;
 pub mod onnx;
 pub mod siglip;
+pub mod tagger;
 pub mod worker;

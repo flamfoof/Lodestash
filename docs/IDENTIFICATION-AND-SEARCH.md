@@ -53,6 +53,13 @@ facets are what let "Search by Tags" be precise and "Search with AI" turn langua
 
 - Every **AI** facet value carries a **confidence** (`asset_tag.confidence`) and `model_id`; technical
   facets are exact and unscored.
+- **`tag.norm_name` is namespaced**: `'<namespace>:<lowercased value>'`. The column is UNIQUE across
+  the whole table, and `metal` is a legitimate `material` *and* a legitimate `mood` — without the
+  prefix the second facet would silently attach to the first one's row. `tag.name` stays the plain
+  display value.
+- **Tags are written per `source`.** `Catalog::set_tags(asset, source, …)` replaces only what that
+  source wrote, so re-running the tagger never touches the user's own tags — which is what the
+  `source` column in `asset_tag`'s primary key is for.
 - Facets map onto the existing `tag` table via `tag.namespace` and `asset_tag` — **no new tables**. The
   controlled-vocabulary **mapping library** (DATA-MODEL §4) sits on top, normalizing facet values onto
   canonical project categories.

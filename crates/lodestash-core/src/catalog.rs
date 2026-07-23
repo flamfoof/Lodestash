@@ -210,6 +210,7 @@ impl Catalog {
             (8, MIGRATION_08_EMBEDDINGS),
             (9, MIGRATION_09_ASSET_METRICS),
             (10, MIGRATION_10_DEPENDENCY_SCAN),
+            (11, MIGRATION_11_TAGGING),
         ];
 
         for (version, sql) in migrations {
@@ -460,7 +461,8 @@ impl Catalog {
                             // The bytes changed, so the extracted facets and the outbound
                             // dependency refs are stale too.
                             "UPDATE asset SET updated_at = ?2, embedding_dirty = 1,
-                                              metrics_dirty = 1, deps_dirty = 1
+                                              metrics_dirty = 1, deps_dirty = 1,
+                                              tags_dirty = 1
                              WHERE id = ?1",
                             params![asset_id, now],
                         )
@@ -718,6 +720,92 @@ impl Catalog {
         }
         Ok(changed)
     }
+}
+
+/// One facet value on an asset (IDENTIFICATION-AND-SEARCH §2): `namespace` is the facet
+/// (`subject|style|material|color|mood|usage|audio|technical|free`), `value` the term, and
+/// `confidence` the model's self-estimate — `None` for user-set and file-derived tags, which are
+/// exact rather than guessed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TagAssignment {
+    pub namespace: String,
+    pub value: String,
+    pub confidence: Option<f64>,
+}
+
+impl TagAssignment {
+    /// A tag with no confidence — manual or file-derived.
+    pub fn exact(namespace: &str, value: &str) -> Self {
+        Self {
+            namespace: namespace.to_string(),
+            value: value.to_string(),
+            confidence: None,
+        }
+    }
+}
+
+/// Normalize a facet value into `(norm_name, display_name)`, or `None` when nothing survives.
+///
+/// `tag.norm_name` is UNIQUE **across the whole table**, so the namespace has to be part of it:
+/// `metal` is a legitimate `material` *and* a legitimate `mood`, and without the prefix the second
+/// one would silently attach to the first one's row. The display name stays unprefixed.
+///
+/// ponytail: lowercase, trim, collapse inner whitespace, and fold `_`/`.` to spaces. The spec also
+/// asks for singularization and de-Booru'ing (AI-PIPELINE §6) — those belong with the mapping
+/// library's alias table, where a user can see and correct them, not hardcoded here.
+pub fn normalize_tag(namespace: &str, value: &str) -> Option<(String, String)> {
+    let display: String = value
+        .trim()
+        .replace(['_', '.'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if display.is_empty() {
+        return None;
+    }
+    let ns = namespace.trim().to_lowercase();
+    let ns = if ns.is_empty() { "free" } else { ns.as_str() };
+    Some((format!("{ns}:{}", display.to_lowercase()), display))
+}
+
+/// The space-joined tag text FTS indexes for an asset — the same expression the triggers use.
+fn tags_concat_in(conn: &Connection, asset_id: i64) -> Result<String> {
+    conn.query_row(
+        "SELECT COALESCE(group_concat(t.name, ' '), '')
+           FROM asset_tag at JOIN tag t ON t.id = at.tag_id
+          WHERE at.asset_id = ?1",
+        params![asset_id],
+        |r| r.get(0),
+    )
+    .map_err(|e| CoreError::Catalog(format!("tags_concat: {e}")))
+}
+
+/// Re-index one asset in `asset_fts`, removing the entry written under `old_concat` first.
+/// External-content FTS5 stores no copy of the old row, so a `delete` carrying the wrong text
+/// leaves its tokens behind — which is exactly how a renamed or re-tagged asset would start
+/// matching terms it no longer has.
+fn refresh_fts(conn: &Connection, asset_id: i64, old_concat: &str) -> Result<()> {
+    let (name, description): (String, Option<String>) = conn
+        .query_row(
+            "SELECT name, description FROM asset WHERE id = ?1",
+            params![asset_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|e| CoreError::Catalog(format!("fts row: {e}")))?;
+    conn.execute(
+        "INSERT INTO asset_fts(asset_fts, rowid, name, description, tags_concat)
+         VALUES ('delete', ?1, ?2, ?3, ?4)",
+        params![asset_id, name, description, old_concat],
+    )
+    .map_err(|e| CoreError::Catalog(format!("fts delete: {e}")))?;
+    let new_concat = tags_concat_in(conn, asset_id)?;
+    conn.execute(
+        "INSERT INTO asset_fts(rowid, name, description, tags_concat)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![asset_id, name, description, new_concat],
+    )
+    .map_err(|e| CoreError::Catalog(format!("fts insert: {e}")))?;
+    Ok(())
 }
 
 fn unix_now() -> i64 {
@@ -1124,6 +1212,48 @@ pub struct RelatedAsset {
 /// M10 — dependency-graph queue (§10). `deps_dirty` is the third drain flag, next to
 /// `embedding_dirty` and `metrics_dirty`: set on insert and whenever a file's bytes change,
 /// cleared once the asset's `.meta` GUID and outbound references have been harvested.
+/// M11 — tagging queue + working FTS tag column (§2 facets, IDENTIFICATION-AND-SEARCH §2).
+/// `tags_dirty` is the fourth drain flag, beside `metrics_dirty`/`embedding_dirty`/`deps_dirty`.
+///
+/// The three FTS triggers are **replaced**, not added to: they wrote a literal `''` into
+/// `tags_concat`, so a tag could never be searchable and — worse — an asset rename issued a
+/// `delete` carrying `''` instead of the row's real tag text, which would leave stale tokens in the
+/// index the moment tags existed. The subquery makes each trigger self-consistent.
+const MIGRATION_11_TAGGING: &str = "
+ALTER TABLE asset ADD COLUMN tags_dirty INTEGER NOT NULL DEFAULT 1;
+CREATE INDEX IF NOT EXISTS idx_asset_tags_dirty ON asset(tags_dirty) WHERE tags_dirty=1;
+
+DROP TRIGGER IF EXISTS asset_fts_ai;
+DROP TRIGGER IF EXISTS asset_fts_ad;
+DROP TRIGGER IF EXISTS asset_fts_au;
+CREATE TRIGGER asset_fts_ai AFTER INSERT ON asset BEGIN
+    INSERT INTO asset_fts(rowid, name, description, tags_concat)
+    VALUES (new.id, new.name, new.description,
+            (SELECT COALESCE(group_concat(t.name, ' '), '')
+               FROM asset_tag at JOIN tag t ON t.id = at.tag_id
+              WHERE at.asset_id = new.id));
+END;
+CREATE TRIGGER asset_fts_ad AFTER DELETE ON asset BEGIN
+    INSERT INTO asset_fts(asset_fts, rowid, name, description, tags_concat)
+    VALUES ('delete', old.id, old.name, old.description,
+            (SELECT COALESCE(group_concat(t.name, ' '), '')
+               FROM asset_tag at JOIN tag t ON t.id = at.tag_id
+              WHERE at.asset_id = old.id));
+END;
+CREATE TRIGGER asset_fts_au AFTER UPDATE ON asset BEGIN
+    INSERT INTO asset_fts(asset_fts, rowid, name, description, tags_concat)
+    VALUES ('delete', old.id, old.name, old.description,
+            (SELECT COALESCE(group_concat(t.name, ' '), '')
+               FROM asset_tag at JOIN tag t ON t.id = at.tag_id
+              WHERE at.asset_id = old.id));
+    INSERT INTO asset_fts(rowid, name, description, tags_concat)
+    VALUES (new.id, new.name, new.description,
+            (SELECT COALESCE(group_concat(t.name, ' '), '')
+               FROM asset_tag at JOIN tag t ON t.id = at.tag_id
+              WHERE at.asset_id = new.id));
+END;
+";
+
 const MIGRATION_10_DEPENDENCY_SCAN: &str = "
 ALTER TABLE asset ADD COLUMN deps_dirty INTEGER NOT NULL DEFAULT 1;
 CREATE INDEX IF NOT EXISTS idx_asset_deps_dirty ON asset(deps_dirty) WHERE deps_dirty=1;
@@ -1514,6 +1644,146 @@ impl Catalog {
         .map_err(|e| CoreError::Catalog(format!("deps clear: {e}")))?;
         tx.commit()
             .map_err(|e| CoreError::Catalog(format!("deps commit: {e}")))
+    }
+
+    /// Write one asset's tags for a given `source` (`'ai'|'manual'|'imported'`), replacing
+    /// whatever that source wrote before, and clear `tags_dirty` (IDENTIFICATION-AND-SEARCH §2).
+    ///
+    /// Replacing per *source* rather than wholesale is what keeps a re-run of the tagger from
+    /// wiping the user's own tags — the two live side by side on the same asset, which is also why
+    /// `asset_tag`'s primary key carries `source`.
+    ///
+    /// Values are normalized (see [`normalize_tag`]) and confidence is clamped to `[0,1]`; the
+    /// caller is responsible for facet validation (unknown namespaces, per-facet caps) since that
+    /// is model-shaped policy, not storage. The flag clears even when `tags` is empty — a model
+    /// that found nothing must not be re-run forever.
+    pub fn set_tags(
+        &mut self,
+        asset_id: i64,
+        source: &str,
+        model_id: Option<&str>,
+        tags: &[TagAssignment],
+    ) -> Result<usize> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| CoreError::Catalog(format!("tags begin: {e}")))?;
+        // FTS5 external-content tables need the *old* row removed with its old column values,
+        // so capture the pre-write tag text before touching anything.
+        let old_concat = tags_concat_in(&tx, asset_id)?;
+        // Clear the flag *before* the tags change: the FTS update trigger fires on any UPDATE to
+        // `asset`, and while the old tags are still in place its delete+insert cancel out. Doing it
+        // afterwards would have the trigger delete under the new text and leave the old tokens.
+        tx.execute(
+            "UPDATE asset SET tags_dirty = 0 WHERE id = ?1",
+            params![asset_id],
+        )
+        .map_err(|e| CoreError::Catalog(format!("tags clear flag: {e}")))?;
+        tx.execute(
+            "DELETE FROM asset_tag WHERE asset_id = ?1 AND source = ?2",
+            params![asset_id, source],
+        )
+        .map_err(|e| CoreError::Catalog(format!("tags clear: {e}")))?;
+
+        let now = unix_now();
+        let mut written = 0usize;
+        for t in tags {
+            let Some((norm, display)) = normalize_tag(&t.namespace, &t.value) else {
+                continue; // an empty or punctuation-only value is not a tag
+            };
+            tx.execute(
+                "INSERT INTO tag (name, norm_name, namespace) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(norm_name) DO NOTHING",
+                params![display, norm, t.namespace],
+            )
+            .map_err(|e| CoreError::Catalog(format!("tag upsert: {e}")))?;
+            let tag_id: i64 = tx
+                .query_row(
+                    "SELECT id FROM tag WHERE norm_name = ?1",
+                    params![norm],
+                    |r| r.get(0),
+                )
+                .map_err(|e| CoreError::Catalog(format!("tag lookup: {e}")))?;
+            tx.execute(
+                "INSERT INTO asset_tag (asset_id, tag_id, source, confidence, model_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(asset_id, tag_id, source) DO UPDATE SET
+                    confidence = excluded.confidence, model_id = excluded.model_id",
+                params![
+                    asset_id,
+                    tag_id,
+                    source,
+                    t.confidence.map(|c| c.clamp(0.0, 1.0)),
+                    model_id,
+                    now
+                ],
+            )
+            .map_err(|e| CoreError::Catalog(format!("asset_tag insert: {e}")))?;
+            written += 1;
+        }
+        refresh_fts(&tx, asset_id, &old_concat)?;
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("tags commit: {e}")))?;
+        Ok(written)
+    }
+
+    /// One asset's tags, newest source-agnostic view: `(namespace, value, source, confidence)`.
+    pub fn tags_for_asset(&self, asset_id: i64) -> Result<Vec<TagAssignment>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT COALESCE(t.namespace, 'free'), t.name, at.confidence
+                   FROM asset_tag at JOIN tag t ON t.id = at.tag_id
+                  WHERE at.asset_id = ?1
+                  ORDER BY t.namespace, t.name",
+            )
+            .map_err(|e| CoreError::Catalog(format!("tags read prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![asset_id], |r| {
+                Ok(TagAssignment {
+                    namespace: r.get(0)?,
+                    value: r.get(1)?,
+                    confidence: r.get(2)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("tags read query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("tags read row: {e}")))
+    }
+
+    /// Assets still awaiting identification (`tags_dirty`), for the tagging drain. Same job shape
+    /// and path rules as the other queues.
+    pub fn assets_needing_tags(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT a.id,
+                        CASE WHEN af.workspace_rel IS NULL
+                             THEN s.root_path || '/' || af.rel_path END,
+                        af.workspace_rel, a.media_type_id, a.source_id, mt.code
+                 FROM asset a
+                 JOIN media_type mt   ON mt.id = a.media_type_id
+                 JOIN import_source s ON s.id = a.source_id
+                 JOIN asset_file af   ON af.id = a.primary_file_id
+                 WHERE a.tags_dirty = 1 AND a.deleted_at IS NULL
+                   AND af.missing = 0
+                 ORDER BY a.id LIMIT ?1",
+            )
+            .map_err(|e| CoreError::Catalog(format!("tag queue prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(VisualEmbedJob {
+                    asset_id: r.get(0)?,
+                    disk_path: r.get(1)?,
+                    workspace_rel: r.get(2)?,
+                    media_type_id: r.get(3)?,
+                    source_id: r.get(4)?,
+                    media_code: r.get(5)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("tag queue query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("tag queue row: {e}")))
     }
 
     /// Both sides of an asset's dependency graph for the inspector's LINKED FILES panel
@@ -2010,7 +2280,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 10, "all 10 migrations should have run");
+        assert_eq!(version, 11, "all 11 migrations should have run");
     }
 
     /// A catalog stopped at schema v4, for exercising M5's data steps.
@@ -3147,6 +3417,111 @@ mod tests {
                 ("unity_prefab".to_string(), 1)
             ]
         );
+    }
+
+    /// The decisive one: a tag makes an asset findable by a word that appears nowhere in its
+    /// name or path — which is what `tags_concat` was silently failing to do while the trigger
+    /// wrote `''`. Re-tagging must also *remove* the old term, or search starts lying.
+    #[test]
+    fn tags_are_searchable_and_replaced_per_source() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let s = c.upsert_import_source("A", "C:/a", "folder").expect("src");
+        c.record_crawl(s, None, &[rec("asset_0192.fbx", 1, 1)])
+            .expect("crawl");
+        let id = c
+            .conn
+            .query_row("SELECT id FROM asset", [], |r| r.get::<_, i64>(0))
+            .expect("id");
+        let found = |c: &Catalog, q: &str| -> bool {
+            !c.search_assets(q, 10)
+                .expect("search")
+                .unwrap_or_default()
+                .is_empty()
+        };
+
+        assert!(!found(&c, "beaver"), "nothing to match yet");
+        c.set_tags(
+            id,
+            "ai",
+            Some("stub-v1"),
+            &[
+                TagAssignment {
+                    namespace: "subject".into(),
+                    value: "Beaver".into(),
+                    confidence: Some(1.7), // clamped
+                },
+                TagAssignment::exact("style", "low_poly"),
+            ],
+        )
+        .expect("ai tags");
+        assert!(found(&c, "beaver"), "tag term reaches FTS");
+        assert!(found(&c, "low poly"), "underscores fold to spaces");
+        assert_eq!(
+            c.conn
+                .query_row(
+                    "SELECT confidence FROM asset_tag WHERE confidence IS NOT NULL",
+                    [],
+                    |r| r.get::<_, f64>(0)
+                )
+                .expect("confidence"),
+            1.0,
+            "confidence clamped into [0,1]"
+        );
+
+        // A user tag lands beside the model's, not on top of it.
+        c.set_tags(id, "manual", None, &[TagAssignment::exact("mood", "cosy")])
+            .expect("manual tag");
+        assert!(found(&c, "beaver") && found(&c, "cosy"), "sources coexist");
+
+        // Re-running the tagger replaces only its own tags — and the retired term stops matching.
+        c.set_tags(
+            id,
+            "ai",
+            Some("stub-v2"),
+            &[TagAssignment::exact("subject", "otter")],
+        )
+        .expect("retag");
+        assert!(found(&c, "otter"), "new term indexed");
+        assert!(!found(&c, "beaver"), "old term removed from the index");
+        assert!(found(&c, "cosy"), "the manual tag survived the re-run");
+
+        let tags = c.tags_for_asset(id).expect("read back");
+        assert_eq!(
+            tags.iter()
+                .map(|t| (t.namespace.as_str(), t.value.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("mood", "cosy"), ("subject", "otter")]
+        );
+        let dirty: i64 = c
+            .conn
+            .query_row(
+                "SELECT tags_dirty FROM asset WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .expect("flag");
+        assert_eq!(dirty, 0, "tagging clears the queue flag");
+    }
+
+    /// Namespaces share the `tag` table, and `norm_name` is globally UNIQUE — so the same word in
+    /// two facets must not collapse onto one row.
+    #[test]
+    fn the_same_word_in_two_facets_stays_two_tags() {
+        assert_eq!(
+            normalize_tag("material", "Metal"),
+            Some(("material:metal".into(), "Metal".into()))
+        );
+        assert_eq!(
+            normalize_tag("mood", "metal").map(|(n, _)| n),
+            Some("mood:metal".into())
+        );
+        assert_eq!(
+            normalize_tag("", "  spaced   out  "),
+            Some(("free:spaced out".into(), "spaced out".into())),
+            "empty namespace falls back to free; whitespace collapses"
+        );
+        assert_eq!(normalize_tag("subject", "   "), None);
     }
 
     #[test]

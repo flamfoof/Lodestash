@@ -1,0 +1,197 @@
+//! The tagging seam (AI-PIPELINE §2, IDENTIFICATION-AND-SEARCH §2). Real taggers — a local Ollama
+//! VLM, a WD-style ONNX classifier, or the Claude vision API — arrive behind this trait; storage,
+//! normalization and FTS live in `lodestash-core`.
+
+use lodestash_core::catalog::TagAssignment;
+
+/// What a tagger was shown. The pixels are already decoded and the technical facts already
+/// measured, mirroring how [`crate::embedder::Embedder`] takes a decoded image rather than a path:
+/// this crate stays models-only, and no tagger re-implements ingest.
+pub struct TagInput<'a> {
+    /// `media_type.code` — a tagger may refuse a modality it can't see.
+    pub media_code: &'a str,
+    /// The asset's display name. Filenames carry real signal in game libraries
+    /// (`SM_Env_Wall_01`), so a text-only tagger has something to work with.
+    pub name: &'a str,
+    /// A decoded preview: the raster itself for 2D, a rendered view for 3D, `None` for audio.
+    pub image: Option<&'a image::RgbaImage>,
+}
+
+/// Produces facet tags for one asset (IDENTIFICATION-AND-SEARCH §2).
+///
+/// The trait deliberately returns *proposals*, not writes: validation (unknown namespaces dropped,
+/// per-facet caps, confidence clamped) and persistence are the caller's, so a hallucinating model
+/// can never write a facet the grammar doesn't have — the same "validate then write" rule the
+/// query parser follows.
+pub trait Tagger {
+    /// Stable id recorded on every tag it produces (`asset_tag.model_id`).
+    fn model_id(&self) -> &str;
+    /// Whether this tagger can say anything about a given `media_type.code`. A vision tagger
+    /// returns false for audio rather than guessing from the filename.
+    fn supports(&self, media_code: &str) -> bool;
+    /// Propose tags. An empty vector is a valid answer — "nothing recognisable" is information,
+    /// and the caller still clears the queue flag so the asset isn't re-run forever.
+    fn tag(&self, input: &TagInput<'_>) -> Vec<TagAssignment>;
+}
+
+/// The facet namespaces a *model* is allowed to fill (IDENTIFICATION-AND-SEARCH §2).
+///
+/// `color`, `technical` and `audio` are excluded on purpose: colour and technical facts are
+/// derived deterministically from the file, and audio facets come from the audio models — asking
+/// a vision model for them only invites confident nonsense.
+pub const MODEL_FACETS: &[&str] = &["subject", "style", "material", "mood", "usage", "free"];
+
+/// Per-facet value cap (IDENTIFICATION-AND-SEARCH §2 "validate then write").
+pub const MAX_VALUES_PER_FACET: usize = 8;
+
+/// Drop what a model isn't allowed to say and cap what it says too much of, keeping the
+/// highest-confidence values per facet. Runs between [`Tagger::tag`] and the catalog write.
+pub fn validate(tags: Vec<TagAssignment>) -> Vec<TagAssignment> {
+    let mut kept: Vec<TagAssignment> = tags
+        .into_iter()
+        .filter(|t| MODEL_FACETS.contains(&t.namespace.as_str()))
+        .collect();
+    // Highest confidence first so the cap keeps the model's best guesses; `None` sorts last but
+    // a model-produced tag normally carries a score.
+    kept.sort_by(|a, b| {
+        b.confidence
+            .unwrap_or(0.0)
+            .total_cmp(&a.confidence.unwrap_or(0.0))
+    });
+    let mut per_facet: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    kept.retain(|t| {
+        let n = per_facet.entry(t.namespace.clone()).or_default();
+        *n += 1;
+        *n <= MAX_VALUES_PER_FACET
+    });
+    kept
+}
+
+/// Deterministic, model-free stand-in — the `HashEmbedder` of tagging. It reads the *filename*,
+/// which in a game library is genuinely informative (`SM_Env_Wall_01_Alt` → environment, wall),
+/// and emits `usage`/`subject` facets from a small keyword table.
+///
+/// It exists so the tag → validate → `Catalog::set_tags` → FTS path can be exercised end to end
+/// before any model is installed, and so the UI has something to render. It is not identification:
+/// an asset whose name says nothing gets nothing.
+pub struct FilenameTagger;
+
+/// `(keyword, namespace, value)` — deliberately small and boring. A real vocabulary belongs in the
+/// P4 mapping library, where the user can see and edit it.
+const KEYWORDS: &[(&str, &str, &str)] = &[
+    ("wall", "subject", "wall"),
+    ("floor", "subject", "floor"),
+    ("door", "subject", "door"),
+    ("tree", "subject", "tree"),
+    ("rock", "subject", "rock"),
+    ("chr", "usage", "character"),
+    ("char", "usage", "character"),
+    ("wep", "usage", "weapon"),
+    ("weapon", "usage", "weapon"),
+    ("env", "usage", "environment"),
+    ("prop", "usage", "prop"),
+    ("veh", "usage", "vehicle"),
+    ("ui", "usage", "ui"),
+    ("fx", "usage", "vfx"),
+    ("sfx", "audio", "sfx"),
+    ("music", "audio", "music"),
+];
+
+impl Tagger for FilenameTagger {
+    fn model_id(&self) -> &str {
+        "filename-stub-v1"
+    }
+
+    fn supports(&self, _media_code: &str) -> bool {
+        true // a filename exists for every asset
+    }
+
+    fn tag(&self, input: &TagInput<'_>) -> Vec<TagAssignment> {
+        // Split on the separators asset names actually use, so `SM_Chr_Ghost_01` yields tokens
+        // rather than one long word.
+        let lower = input.name.to_lowercase();
+        let tokens: Vec<&str> = lower
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .collect();
+        let mut out: Vec<TagAssignment> = Vec::new();
+        for (keyword, namespace, value) in KEYWORDS {
+            if tokens.iter().any(|t| t == keyword) {
+                let tag = TagAssignment {
+                    namespace: (*namespace).to_string(),
+                    value: (*value).to_string(),
+                    // Not a model score: a filename match is a rule firing, and calling it 1.0
+                    // would let it outrank a real model's considered guess.
+                    confidence: Some(0.5),
+                };
+                if !out.contains(&tag) {
+                    out.push(tag);
+                }
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filename_tagger_reads_the_naming_convention() {
+        let t = FilenameTagger;
+        let input = TagInput {
+            media_code: "model_3d",
+            name: "SM_Chr_Ghost_01",
+            image: None,
+        };
+        let tags = t.tag(&input);
+        assert_eq!(
+            tags.iter().map(|t| t.value.as_str()).collect::<Vec<_>>(),
+            vec!["character"]
+        );
+
+        // Two conventions in one name, and the same value twice collapses.
+        let tags = t.tag(&TagInput {
+            name: "SM_Env_Wall_01_Wall_Alt",
+            ..input
+        });
+        let mut values: Vec<&str> = tags.iter().map(|t| t.value.as_str()).collect();
+        values.sort();
+        assert_eq!(values, vec!["environment", "wall"]);
+
+        // A substring is not a match: "character" must not fire on "chrome".
+        assert!(t
+            .tag(&TagInput {
+                name: "chrome_panel",
+                ..input
+            })
+            .is_empty());
+    }
+
+    #[test]
+    fn validate_drops_forbidden_facets_and_caps_the_rest() {
+        let mut tags = vec![
+            TagAssignment::exact("technical", "2k"),
+            TagAssignment::exact("color", "#ff0000"),
+            TagAssignment::exact("nonsense", "whatever"),
+        ];
+        for i in 0..12 {
+            tags.push(TagAssignment {
+                namespace: "subject".into(),
+                value: format!("thing{i}"),
+                confidence: Some(i as f64 / 12.0),
+            });
+        }
+        let kept = validate(tags);
+        assert!(
+            kept.iter().all(|t| t.namespace == "subject"),
+            "a model may not write technical/color facets, or invent one"
+        );
+        assert_eq!(kept.len(), MAX_VALUES_PER_FACET, "per-facet cap applied");
+        assert!(
+            kept.iter().all(|t| t.confidence.unwrap() >= 4.0 / 12.0),
+            "the cap keeps the highest-confidence values"
+        );
+    }
+}

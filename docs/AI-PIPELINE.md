@@ -30,13 +30,23 @@ come from the **same model**.
 
 ```rust
 trait Tagger {
-    fn tag(&self, asset: &Media) -> TagResult;        // { tags: [{label, score}], caption?: String }
+    fn model_id(&self) -> &str;                       // recorded on every tag (asset_tag.model_id)
+    fn supports(&self, media_code: &str) -> bool;     // a vision tagger refuses audio
+    fn tag(&self, input: &TagInput) -> Vec<TagAssignment>;   // { namespace, value, confidence }
 }
 trait Embedder {
     fn embed_asset(&self, asset: &Media) -> Vec<f32>; // unit-normalized
     fn embed_text(&self, query: &str) -> Vec<f32>;    // SAME space as embed_asset
 }
 ```
+
+The tagger returns **proposals**, never writes: `lodestash_ai::tagger::validate` drops facets a
+model may not fill (`color`/`technical`/`audio` — §2 of IDENTIFICATION-AND-SEARCH) and caps values
+per facet, then `Catalog::set_tags` normalizes and persists. Same "validate then write" seam the
+query parser uses, so a hallucinated facet can never reach the catalog. `TagInput` carries decoded
+pixels and the asset name, not a path — ingest stays in `lodestash-ingest`, this crate stays
+models-only. **Caption** (→ `asset.description`) is not in the trait yet; it arrives with the VLM
+that can actually produce one.
 
 | Impl | Backend |
 |---|---|
