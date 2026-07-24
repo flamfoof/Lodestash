@@ -157,6 +157,21 @@ struct PendingPackage {
 }
 
 impl PendingPackage {
+    /// The pickable entries grouped by their in-archive folder, folder-ordered
+    /// (FEATURES.md §5.4). Indices point back into `entries`; a pack holds hundreds of
+    /// them, and a flat list of hundreds is not a file tree.
+    fn folders(&self) -> Vec<(String, Vec<usize>)> {
+        let mut by_folder: std::collections::BTreeMap<String, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for i in self.extractable() {
+            // `extractable()` already proved the pathname is Some.
+            let path = self.entries[i].pathname.as_deref().unwrap_or_default();
+            let folder = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+            by_folder.entry(folder.to_string()).or_default().push(i);
+        }
+        by_folder.into_iter().collect()
+    }
+
     /// Indices of entries a surgical extraction can pull: a real (non-.meta) pathname
     /// plus the tar offset + size recorded at browse time.
     fn extractable(&self) -> impl Iterator<Item = usize> + '_ {
@@ -6821,7 +6836,14 @@ impl eframe::App for LodestashApp {
         if !self.pending_packages.is_empty() && self.screen == Screen::Unity {
             let mut extract_clicked: Option<usize> = None;
             let mut picked_clicked: Option<usize> = None;
+            // An open contents tree needs room; the bar stays a thin strip otherwise.
+            let browsing_any = self
+                .pending_packages
+                .iter()
+                .any(|p| p.browsing && !p.extracting);
             egui::TopBottomPanel::top("packages_bar")
+                .resizable(browsing_any)
+                .default_height(if browsing_any { 360.0 } else { 0.0 })
                 .frame(
                     egui::Frame::none()
                         .fill(theme::SURFACE)
@@ -6928,41 +6950,102 @@ impl eframe::App for LodestashApp {
                                     picked_clicked = Some(i);
                                 }
                             });
+                            let folders = pkg.folders();
                             egui::ScrollArea::vertical()
                                 .id_salt(("pkg_browse", i))
-                                .max_height(220.0)
+                                .max_height(260.0)
                                 .show(ui, |ui| {
-                                    for ei in all {
-                                        let e = &pkg.entries[ei];
-                                        let (Some(pathname), Some(size)) =
-                                            (e.pathname.as_deref(), e.size_bytes)
-                                        else {
-                                            continue;
+                                    for (folder, members) in &folders {
+                                        let label = if folder.is_empty() {
+                                            "(archive root)"
+                                        } else {
+                                            folder.as_str()
                                         };
-                                        ui.horizontal(|ui| {
-                                            let mut on = pkg.picked.contains(&ei);
-                                            if ui.checkbox(&mut on, "").changed() {
-                                                if on {
-                                                    pkg.picked.insert(ei);
-                                                } else {
-                                                    pkg.picked.remove(&ei);
+                                        let picked_here = members
+                                            .iter()
+                                            .filter(|m| pkg.picked.contains(m))
+                                            .count();
+                                        egui::CollapsingHeader::new(
+                                            RichText::new(format!(
+                                                "{label}  \u{00B7}  {}/{}",
+                                                picked_here,
+                                                members.len()
+                                            ))
+                                            .color(if picked_here > 0 {
+                                                theme::GOLD
+                                            } else {
+                                                theme::TEXT_MUTED
+                                            })
+                                            .size(11.0),
+                                        )
+                                        .id_salt(("pkg_folder", i, folder))
+                                        // A handful of folders reads as a tree; forty reads
+                                        // as the flat list this replaced.
+                                        .default_open(folders.len() <= 8)
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                if ui.small_button("All").clicked() {
+                                                    pkg.picked.extend(members.iter().copied());
                                                 }
-                                            }
-                                            ui.label(
-                                                RichText::new(pathname)
-                                                    .color(theme::TEXT_DIM)
-                                                    .size(11.0),
-                                            );
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
+                                                if ui.small_button("None").clicked() {
+                                                    pkg.picked.retain(|p| !members.contains(p));
+                                                }
+                                            });
+                                            for &ei in members {
+                                                let e = &pkg.entries[ei];
+                                                let (Some(pathname), Some(size)) =
+                                                    (e.pathname.as_deref(), e.size_bytes)
+                                                else {
+                                                    continue;
+                                                };
+                                                let leaf = pathname
+                                                    .rsplit_once('/')
+                                                    .map_or(pathname, |(_, f)| f);
+                                                let mt = detect::by_extension(
+                                                    std::path::Path::new(pathname),
+                                                );
+                                                ui.horizontal(|ui| {
+                                                    let mut on = pkg.picked.contains(&ei);
+                                                    if ui.checkbox(&mut on, "").changed() {
+                                                        if on {
+                                                            pkg.picked.insert(ei);
+                                                        } else {
+                                                            pkg.picked.remove(&ei);
+                                                        }
+                                                    }
+                                                    // Typed dot per §5.4 — the bundled fonts
+                                                    // render most per-type glyphs as tofu, so
+                                                    // the type is carried by colour on a dot.
                                                     ui.label(
-                                                        RichText::new(format_bytes(size as u64))
-                                                            .color(theme::TEXT_MUTED)
-                                                            .size(10.0),
+                                                        RichText::new("\u{25CF}")
+                                                            .color(mt.map_or(
+                                                                theme::TEXT_DIM,
+                                                                theme::media_type_color,
+                                                            ))
+                                                            .size(9.0),
+                                                    )
+                                                    .on_hover_text(media_type_label(mt));
+                                                    ui.label(
+                                                        RichText::new(leaf)
+                                                            .color(theme::TEXT_DIM)
+                                                            .size(11.0),
                                                     );
-                                                },
-                                            );
+                                                    ui.with_layout(
+                                                        egui::Layout::right_to_left(
+                                                            egui::Align::Center,
+                                                        ),
+                                                        |ui| {
+                                                            ui.label(
+                                                                RichText::new(format_bytes(
+                                                                    size as u64,
+                                                                ))
+                                                                .color(theme::TEXT_MUTED)
+                                                                .size(10.0),
+                                                            );
+                                                        },
+                                                    );
+                                                });
+                                            }
                                         });
                                     }
                                 });
@@ -12231,6 +12314,47 @@ mod tests {
 
         builder.into_inner().unwrap().finish().unwrap();
         pkg_path
+    }
+
+    /// §5.4: the browse list is a folder tree, so `.meta` sidecars stay out, entries land
+    /// under their in-archive folder, and a payload at the archive root gets its own group.
+    #[test]
+    fn browse_entries_group_by_in_archive_folder() {
+        let entry = |p: &str| PackageEntryRecord {
+            guid: p.to_string(),
+            pathname: Some(p.to_string()),
+            tar_offset: Some(0),
+            size_bytes: Some(1),
+        };
+        let pkg = PendingPackage {
+            source_idx: 0,
+            abs_path: PathBuf::from("Pack.unitypackage"),
+            display_name: "Pack".into(),
+            nested_candidates: Vec::new(),
+            chosen_variant: 0,
+            extracting: false,
+            progress: Arc::default(),
+            entries: vec![
+                entry("Assets/Props/rock.fbx"),
+                entry("Assets/Props/rock.fbx.meta"),
+                entry("Assets/Textures/rock.png"),
+                entry("Assets/Props/log.fbx"),
+                entry("readme.txt"),
+            ],
+            job: None,
+            browsing: true,
+            picked: std::collections::BTreeSet::new(),
+        };
+        let folders = pkg.folders();
+        let shape: Vec<(&str, usize)> =
+            folders.iter().map(|(f, m)| (f.as_str(), m.len())).collect();
+        assert_eq!(
+            shape,
+            vec![("", 1), ("Assets/Props", 2), ("Assets/Textures", 1)],
+            "folder-ordered groups, root first, .meta excluded"
+        );
+        let props = &folders[1].1;
+        assert_eq!(props, &vec![0, 3], "group members index back into entries");
     }
 
     /// B1+B2 wiring: browse captures locators, `extractable` gates the pickable rows,
