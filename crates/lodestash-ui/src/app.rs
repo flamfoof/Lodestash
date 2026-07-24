@@ -312,6 +312,21 @@ struct PackagePeek {
     path: PathBuf,
 }
 
+/// A finished manifest read for a catalog package (FEATURES.md §5.4 Open →).
+struct ManifestRead {
+    package_id: i64,
+    name: String,
+    abs_path: PathBuf,
+    source_idx: usize,
+    /// Tray row to close when this lands.
+    job: u64,
+    entries: Result<Vec<PackageEntryRecord>, String>,
+}
+
+/// `PendingPackage.source_idx` for a pack opened from the catalog that lies outside every
+/// library source: browse and preview work, extraction has nowhere to persist to.
+const NO_SOURCE: usize = usize::MAX;
+
 /// Sentinel `entry_idx` for the viewer stack while it is showing a peeked pack entry —
 /// no grid entry backs it, and a real index must never collide with it.
 const PEEK_ENTRY_IDX: usize = usize::MAX;
@@ -783,6 +798,11 @@ pub struct LodestashApp {
     peek: Option<PackagePeek>,
     peek_rx: Receiver<Result<PackagePeek, String>>,
     peek_tx: Sender<Result<PackagePeek, String>>,
+    /// Packages whose manifest is being read right now — Open → is one click, and a second
+    /// one must not start a second pass over the same archive.
+    manifest_reading: std::collections::BTreeSet<i64>,
+    manifest_rx: Receiver<ManifestRead>,
+    manifest_tx: Sender<ManifestRead>,
     /// Where extracted package payloads are stored, content-addressed (None if the OS cache dir
     /// is unavailable).
     workspace_dir: Option<PathBuf>,
@@ -899,6 +919,7 @@ impl LodestashApp {
         let (scan_tx, scan_rx) = mpsc::channel();
         let (extract_tx, extract_rx) = mpsc::channel();
         let (peek_tx, peek_rx) = mpsc::channel();
+        let (manifest_tx, manifest_rx) = mpsc::channel();
         let (catalog_tx, catalog_rx) = mpsc::channel();
         let (hydrate_tx, hydrate_rx) = mpsc::channel();
         let (viewer_tx, viewer_rx) = mpsc::channel();
@@ -971,6 +992,9 @@ impl LodestashApp {
             peek: None,
             peek_rx,
             peek_tx,
+            manifest_reading: std::collections::BTreeSet::new(),
+            manifest_rx,
+            manifest_tx,
             workspace_dir: dirs::cache_dir().map(|d| d.join("Lodestash").join("workspace")),
             content_filter: ContentFilter::default(),
             search_mode: SearchMode::Tags,
@@ -2539,6 +2563,13 @@ impl LodestashApp {
         if pkg.extracting {
             return;
         }
+        if pkg.source_idx == NO_SOURCE {
+            self.jobs.toast(
+                "Add the pack's folder as a library source before extracting from it",
+                Intent::Warning,
+            );
+            return;
+        }
         pkg.extracting = true;
         pkg.progress = Arc::default();
         let progress = pkg.progress.clone();
@@ -3083,6 +3114,13 @@ impl LodestashApp {
             return;
         };
         if pkg.extracting || pkg.picked.is_empty() {
+            return;
+        }
+        if pkg.source_idx == NO_SOURCE {
+            self.jobs.toast(
+                "Add the pack's folder as a library source before extracting from it",
+                Intent::Warning,
+            );
             return;
         }
         pkg.extracting = true;
@@ -4822,13 +4860,14 @@ impl LodestashApp {
             );
             return;
         }
-        let Some(source_idx) = self.scan_roots.iter().position(|r| abs_path.starts_with(r)) else {
-            self.jobs.toast(
-                "Add the pack's folder as a library source first",
-                Intent::Warning,
-            );
-            return;
-        };
+        // Browsing and previewing are read-only, so a pack that sits outside every library
+        // source can still be opened; only *extraction* needs a source row to persist into,
+        // and it says so at that point (`NO_SOURCE`).
+        let source_idx = self
+            .scan_roots
+            .iter()
+            .position(|r| abs_path.starts_with(r))
+            .unwrap_or(NO_SOURCE);
         let entries = match catalog_db_path()
             .ok_or_else(|| lodestash_core::error::CoreError::Catalog("no catalog".into()))
             .and_then(|db| Catalog::open(&db).and_then(|c| c.list_package_entries(pkg.id)))
@@ -4840,10 +4879,9 @@ impl LodestashApp {
             }
         };
         if entries.is_empty() {
-            self.jobs.toast(
-                format!("No manifest recorded for {} \u{2014} re-scan it", pkg.name),
-                Intent::Warning,
-            );
+            // A pack the catalog knows only by name (browse-only row, or indexed before the
+            // locators were recorded): read its manifest once, off-thread, and keep it.
+            self.read_manifest_for(pkg, source_idx, abs_path);
             return;
         }
         self.pending_packages.push(PendingPackage {
@@ -4862,6 +4900,91 @@ impl LodestashApp {
             browsing: true,
             picked: std::collections::BTreeSet::new(),
         });
+    }
+
+    /// Read a pack's manifest on a worker thread and record its locators, so the next Open →
+    /// (and every later session) is a catalog read. One pass over the archive, no payload
+    /// bytes buffered — the same browse pass the crawler does.
+    fn read_manifest_for(
+        &mut self,
+        pkg: &lodestash_core::catalog::PackageListing,
+        source_idx: usize,
+        abs_path: PathBuf,
+    ) {
+        if self.manifest_reading.contains(&pkg.id) {
+            return;
+        }
+        self.manifest_reading.insert(pkg.id);
+        let job = self.jobs.start(
+            format!("Reading the contents of {}", pkg.name),
+            Arc::default(),
+            false,
+        );
+        let (package_id, name) = (pkg.id, pkg.name.clone());
+        let tx = self.manifest_tx.clone();
+        std::thread::spawn(move || {
+            let entries = unitypackage::read_manifest(&abs_path).map(|manifest| {
+                manifest
+                    .iter()
+                    .map(|e| PackageEntryRecord {
+                        guid: e.guid.clone(),
+                        pathname: e.pathname.clone(),
+                        tar_offset: e.asset_offset.map(|o| o as i64),
+                        size_bytes: e.asset_size.map(|s| s as i64),
+                    })
+                    .collect::<Vec<_>>()
+            });
+            // Write-behind so the next Open → doesn't re-read the archive.
+            if let (Ok(entries), Some(db)) = (&entries, catalog_db_path()) {
+                if let Err(err) = Catalog::open(&db)
+                    .and_then(|mut c| c.record_package_entries(package_id, entries))
+                {
+                    tracing::warn!(%err, package_id, "recording manifest locators failed");
+                }
+            }
+            let _ = tx.send(ManifestRead {
+                package_id,
+                name,
+                abs_path,
+                source_idx,
+                job,
+                entries: entries.map_err(|e| e.to_string()),
+            });
+        });
+    }
+
+    fn receive_manifests(&mut self) {
+        while let Ok(msg) = self.manifest_rx.try_recv() {
+            self.jobs.finish(msg.job);
+            self.manifest_reading.remove(&msg.package_id);
+            match msg.entries {
+                Ok(entries) if !entries.is_empty() => {
+                    self.pending_packages.push(PendingPackage {
+                        source_idx: msg.source_idx,
+                        abs_path: msg.abs_path,
+                        display_name: msg.name,
+                        nested_candidates: Vec::new(),
+                        chosen_variant: 0,
+                        extracting: false,
+                        progress: Arc::default(),
+                        entries,
+                        job: None,
+                        browsing: true,
+                        picked: std::collections::BTreeSet::new(),
+                    });
+                }
+                Ok(_) => self
+                    .jobs
+                    .toast(format!("{} has no assets in it", msg.name), Intent::Warning),
+                Err(err) => {
+                    tracing::warn!(%err, package = %msg.name, "manifest read failed");
+                    self.jobs.toast(
+                        format!("Couldn't read {} \u{2014} {err}", msg.name),
+                        Intent::Danger,
+                    );
+                }
+            }
+        }
     }
 
     // ── Trash screen (UI-SPEC §7) ───────────────────────────────────────────────
@@ -6197,6 +6320,7 @@ impl eframe::App for LodestashApp {
         self.receive_thumbnails();
         self.receive_extracts();
         self.receive_peek(ctx);
+        self.receive_manifests();
         // A finished extraction frees the slot the batch queue waits on.
         self.pump_extract_queue(ctx);
         self.poll_watch(ctx);
