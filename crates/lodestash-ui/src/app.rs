@@ -302,6 +302,20 @@ struct PersistBatch {
     records: Vec<CrawlRecord>,
 }
 
+/// One pack payload pulled out for preview (FEATURES.md §5.4). The file lives in a scratch
+/// directory, not the workspace: a peek is a look, so it must not leave catalog rows, grid
+/// entries or cached extractions behind.
+struct PackagePeek {
+    name: String,
+    media_type: Option<MediaType>,
+    size_bytes: u64,
+    path: PathBuf,
+}
+
+/// Sentinel `entry_idx` for the viewer stack while it is showing a peeked pack entry —
+/// no grid entry backs it, and a real index must never collide with it.
+const PEEK_ENTRY_IDX: usize = usize::MAX;
+
 /// Result of a background package extraction.
 struct ExtractDone {
     display_name: String,
@@ -764,6 +778,11 @@ pub struct LodestashApp {
     pending_packages: Vec<PendingPackage>,
     extract_rx: Receiver<ExtractDone>,
     extract_tx: Sender<ExtractDone>,
+    /// The pack entry currently peeked (FEATURES.md §5.4 right pane): one payload pulled to
+    /// a scratch file and shown in the viewer stack, with no catalog row and no grid entry.
+    peek: Option<PackagePeek>,
+    peek_rx: Receiver<Result<PackagePeek, String>>,
+    peek_tx: Sender<Result<PackagePeek, String>>,
     /// Where extracted package payloads are stored, content-addressed (None if the OS cache dir
     /// is unavailable).
     workspace_dir: Option<PathBuf>,
@@ -879,6 +898,7 @@ impl LodestashApp {
         let (thumb_tx, thumb_rx) = mpsc::channel();
         let (scan_tx, scan_rx) = mpsc::channel();
         let (extract_tx, extract_rx) = mpsc::channel();
+        let (peek_tx, peek_rx) = mpsc::channel();
         let (catalog_tx, catalog_rx) = mpsc::channel();
         let (hydrate_tx, hydrate_rx) = mpsc::channel();
         let (viewer_tx, viewer_rx) = mpsc::channel();
@@ -948,6 +968,9 @@ impl LodestashApp {
             pending_packages: Vec::new(),
             extract_rx,
             extract_tx,
+            peek: None,
+            peek_rx,
+            peek_tx,
             workspace_dir: dirs::cache_dir().map(|d| d.join("Lodestash").join("workspace")),
             content_filter: ContentFilter::default(),
             search_mode: SearchMode::Tags,
@@ -2251,6 +2274,11 @@ impl LodestashApp {
     /// Keep the viewer in sync with the Quick Look target: (re)load when the overlay
     /// is open on a raster asset it doesn't hold yet. Decode runs off-thread.
     fn ensure_viewer_loaded(&mut self, ctx: &egui::Context) {
+        // A pack peek owns the viewer stack while it is open — otherwise this would free its
+        // texture (and drop its in-flight load as stale) on the very next frame.
+        if self.peek.is_some() {
+            return;
+        }
         if !self.quick_look {
             // Drop the full-detail pixels + texture as soon as the overlay closes —
             // an 8k source holds ~128 MB across CPU+GPU copies.
@@ -3119,6 +3147,105 @@ impl LodestashApp {
             });
         });
         ctx.request_repaint();
+    }
+
+    /// Pull one entry of `pending_packages[idx]` to a scratch file and show it (§5.4).
+    /// Same skip-scan as a surgical extraction, one locator wide.
+    fn peek_entry(&mut self, ctx: &egui::Context, idx: usize, entry_idx: usize) {
+        let Some(pkg) = self.pending_packages.get(idx) else {
+            return;
+        };
+        let Some(e) = pkg.entries.get(entry_idx) else {
+            return;
+        };
+        // `extractable()` gates the rows that can be clicked, so these are Some.
+        let (Some(pathname), Some(offset), Some(size)) =
+            (e.pathname.clone(), e.tar_offset, e.size_bytes)
+        else {
+            return;
+        };
+        let locator = unitypackage::EntryLocator {
+            guid: e.guid.clone(),
+            pathname: Some(pathname.clone()),
+            offset: offset as u64,
+            size: size as u64,
+        };
+        let abs_path = pkg.abs_path.clone();
+        // ponytail: peeked files accumulate in the OS temp dir until the OS clears it —
+        // content-addressed, so a re-peek costs nothing. Sweep on exit if it ever matters.
+        let dest = std::env::temp_dir().join("lodestash-peek");
+        let tx = self.peek_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let msg = match unitypackage::extract_at_offsets(&abs_path, &dest, vec![locator]) {
+                Ok(assets) => match assets.into_iter().next() {
+                    Some(a) => Ok(PackagePeek {
+                        name: pathname
+                            .rsplit_once('/')
+                            .map_or(pathname.as_str(), |(_, f)| f)
+                            .to_string(),
+                        media_type: detect::by_extension(std::path::Path::new(&pathname)),
+                        size_bytes: size as u64,
+                        path: a.workspace_path,
+                    }),
+                    None => Err("the archive had no payload at that offset".into()),
+                },
+                Err(err) => Err(err.to_string()),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Hand a finished peek to whichever viewer owns its media type — the same viewers the
+    /// grid's Quick Look drives, keyed on `PEEK_ENTRY_IDX` instead of a grid row.
+    fn receive_peek(&mut self, ctx: &egui::Context) {
+        while let Ok(msg) = self.peek_rx.try_recv() {
+            let peek = match msg {
+                Ok(p) => p,
+                Err(err) => {
+                    self.jobs.toast(
+                        format!("Couldn't preview that file \u{2014} {err}"),
+                        Intent::Warning,
+                    );
+                    continue;
+                }
+            };
+            match peek.media_type {
+                Some(MediaType::Model3d) if viewport3d::is_viewable_model(&peek.path) => {
+                    if let Some(vp) = &mut self.viewport3d {
+                        vp.load(
+                            PEEK_ENTRY_IDX,
+                            peek.path.clone(),
+                            std::collections::BTreeMap::new(),
+                            ctx,
+                        );
+                    }
+                }
+                Some(MediaType::Audio) => {
+                    if let Some(ap) = &mut self.audio_player {
+                        ap.load(PEEK_ENTRY_IDX, peek.path.clone(), ctx);
+                    }
+                }
+                mt if is_viewer_image(mt) => {
+                    self.image_viewer.reset_for(PEEK_ENTRY_IDX);
+                    let path = peek.path.clone();
+                    let tx = self.viewer_tx.clone();
+                    let ctx = ctx.clone();
+                    std::thread::spawn(move || {
+                        let result = load_viewer_image(&path);
+                        let _ = tx.send(ViewerLoaded {
+                            entry_idx: PEEK_ENTRY_IDX,
+                            result,
+                        });
+                        ctx.request_repaint();
+                    });
+                }
+                // Scripts, prefabs, materials: no viewer yet — the panel states the type.
+                _ => {}
+            }
+            self.peek = Some(peek);
+        }
     }
 
     fn receive_extracts(&mut self) {
@@ -6062,6 +6189,7 @@ impl eframe::App for LodestashApp {
         self.receive_scan();
         self.receive_thumbnails();
         self.receive_extracts();
+        self.receive_peek(ctx);
         // A finished extraction frees the slot the batch queue waits on.
         self.pump_extract_queue(ctx);
         self.poll_watch(ctx);
@@ -6836,6 +6964,7 @@ impl eframe::App for LodestashApp {
         if !self.pending_packages.is_empty() && self.screen == Screen::Unity {
             let mut extract_clicked: Option<usize> = None;
             let mut picked_clicked: Option<usize> = None;
+            let mut peek_clicked: Option<(usize, usize)> = None;
             // An open contents tree needs room; the bar stays a thin strip otherwise.
             let browsing_any = self
                 .pending_packages
@@ -7025,11 +7154,23 @@ impl eframe::App for LodestashApp {
                                                             .size(9.0),
                                                     )
                                                     .on_hover_text(media_type_label(mt));
-                                                    ui.label(
-                                                        RichText::new(leaf)
-                                                            .color(theme::TEXT_DIM)
-                                                            .size(11.0),
-                                                    );
+                                                    if ui
+                                                        .add(
+                                                            egui::Label::new(
+                                                                RichText::new(leaf)
+                                                                    .color(theme::TEXT_DIM)
+                                                                    .size(11.0),
+                                                            )
+                                                            .sense(egui::Sense::click()),
+                                                        )
+                                                        .on_hover_text(
+                                                            "Preview \u{2014} pulls just this \
+                                                             file out of the archive",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        peek_clicked = Some((i, ei));
+                                                    }
                                                     ui.with_layout(
                                                         egui::Layout::right_to_left(
                                                             egui::Align::Center,
@@ -7057,6 +7198,56 @@ impl eframe::App for LodestashApp {
             }
             if let Some(idx) = picked_clicked {
                 self.extract_picked(ctx, idx);
+            }
+            if let Some((idx, entry_idx)) = peek_clicked {
+                self.peek_entry(ctx, idx, entry_idx);
+            }
+        }
+
+        // ── Peek window (FEATURES.md §5.4 right pane) ─────────────────────────
+        if let Some(peek) = &self.peek {
+            let mut open = true;
+            let direct_model = peek.media_type == Some(MediaType::Model3d)
+                && viewport3d::is_viewable_model(&peek.path);
+            let (name, media_type, size_bytes) =
+                (peek.name.clone(), peek.media_type, peek.size_bytes);
+            let viewer = &mut self.image_viewer;
+            let viewport = self.viewport3d.as_mut();
+            let audio = self.audio_player.as_mut();
+            egui::Window::new(format!("Preview \u{2014} {name}"))
+                .id(egui::Id::new("package_peek"))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([640.0, 620.0])
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .frame(
+                    egui::Frame::window(&ctx.style())
+                        .fill(theme::SURFACE_RAISED)
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+                )
+                .show(ctx, |ui| {
+                    quick_look_content(
+                        ui,
+                        &name,
+                        media_type,
+                        size_bytes,
+                        None,
+                        viewer,
+                        direct_model,
+                        viewport,
+                        audio,
+                    );
+                    ui.label(
+                        RichText::new(
+                            "From the archive \u{2014} nothing has been added to your library",
+                        )
+                        .color(theme::TEXT_DIM)
+                        .size(10.0),
+                    );
+                });
+            if !open {
+                self.peek = None;
             }
         }
 
