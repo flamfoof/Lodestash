@@ -312,6 +312,18 @@ struct PackagePeek {
     path: PathBuf,
 }
 
+/// The Import-packages dialog (FEATURES.md §5.2): a folder scanned for `.unitypackage`
+/// files, each of which can be imported as its own Library. Nothing is copied or unpacked —
+/// importing writes a `package` row that points at the archive where it already lives.
+struct ImportScan {
+    root: PathBuf,
+    scanning: bool,
+    /// (in-folder group, archive path, display name, size) — group is the containing folder
+    /// relative to the picked root, which is the publisher/category tree in an Asset Store cache.
+    found: Vec<(String, PathBuf, String, u64)>,
+    selected: std::collections::BTreeSet<usize>,
+}
+
 /// A finished manifest read for a catalog package (FEATURES.md §5.4 Open →).
 struct ManifestRead {
     package_id: i64,
@@ -803,6 +815,10 @@ pub struct LodestashApp {
     manifest_reading: std::collections::BTreeSet<i64>,
     manifest_rx: Receiver<ManifestRead>,
     manifest_tx: Sender<ManifestRead>,
+    /// The open Import-packages dialog (§5.2), if any.
+    import_scan: Option<ImportScan>,
+    import_rx: Receiver<Vec<(String, PathBuf, String, u64)>>,
+    import_tx: Sender<Vec<(String, PathBuf, String, u64)>>,
     /// Where extracted package payloads are stored, content-addressed (None if the OS cache dir
     /// is unavailable).
     workspace_dir: Option<PathBuf>,
@@ -920,6 +936,7 @@ impl LodestashApp {
         let (extract_tx, extract_rx) = mpsc::channel();
         let (peek_tx, peek_rx) = mpsc::channel();
         let (manifest_tx, manifest_rx) = mpsc::channel();
+        let (import_tx, import_rx) = mpsc::channel();
         let (catalog_tx, catalog_rx) = mpsc::channel();
         let (hydrate_tx, hydrate_rx) = mpsc::channel();
         let (viewer_tx, viewer_rx) = mpsc::channel();
@@ -995,6 +1012,9 @@ impl LodestashApp {
             manifest_reading: std::collections::BTreeSet::new(),
             manifest_rx,
             manifest_tx,
+            import_scan: None,
+            import_rx,
+            import_tx,
             workspace_dir: dirs::cache_dir().map(|d| d.join("Lodestash").join("workspace")),
             content_filter: ContentFilter::default(),
             search_mode: SearchMode::Tags,
@@ -4618,10 +4638,12 @@ impl LodestashApp {
     /// the aggregate indexed-asset view). ponytail: this first slice is the listing +
     /// pin/unpin; the in-screen browse tree + per-asset preview (FEATURES §5.4) reuse
     /// the pending-packages bar's extraction for now and land as a follow-on.
-    fn unity_screen(&mut self, ui: &mut Ui, _ctx: &egui::Context) {
+    fn unity_screen(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         if self.unity_packages.is_none() {
             self.reload_unity_packages();
         }
+        let mut import_clicked = false;
+        self.import_dialog(ctx);
 
         ui.horizontal(|ui| {
             ui.label(
@@ -4634,6 +4656,17 @@ impl LodestashApp {
                 .clicked()
             {
                 self.reload_unity_packages();
+            }
+            if ui
+                .button(
+                    RichText::new("+ Import packages\u{2026}")
+                        .color(theme::ARCANE)
+                        .size(11.0),
+                )
+                .on_hover_text("Scan a folder for .unitypackage files and import them as libraries")
+                .clicked()
+            {
+                import_clicked = true;
             }
         });
         ui.label(
@@ -4658,13 +4691,16 @@ impl LodestashApp {
                 );
                 ui.label(
                     RichText::new(
-                        "Extract a .unitypackage (Packages screen, or drop one in a source \
-                         folder) and it shows up here.",
+                        "Import a folder of .unitypackage files, or extract one from the \
+                         Packages screen, and it shows up here.",
                     )
                     .color(theme::TEXT_DIM)
                     .size(11.0),
                 );
             });
+            if import_clicked {
+                self.open_import_dialog();
+            }
             return;
         }
 
@@ -4768,6 +4804,9 @@ impl LodestashApp {
             if let Some(pkg) = packages.get(i) {
                 self.open_package_browse(pkg);
             }
+        }
+        if import_clicked {
+            self.open_import_dialog();
         }
         if let Some(name) = browse_pkg {
             self.browse_package(name);
@@ -4900,6 +4939,272 @@ impl LodestashApp {
             browsing: true,
             picked: std::collections::BTreeSet::new(),
         });
+    }
+
+    /// The §5.2 dialog: the packs found under the picked folder, grouped by the folder that
+    /// holds them (which is the publisher/category tree in an Asset Store cache), each
+    /// tickable, importing as one Library apiece.
+    fn import_dialog(&mut self, ctx: &egui::Context) {
+        let Some(scan) = &mut self.import_scan else {
+            return;
+        };
+        let mut open = true;
+        let mut import_now = false;
+        let mut cancel = false;
+        egui::Window::new("Import packages")
+            .id(egui::Id::new("import_packages"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([620.0, 480.0])
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(theme::SURFACE_RAISED)
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(scan.root.to_string_lossy())
+                        .color(theme::TEXT_MUTED)
+                        .size(11.0),
+                );
+                ui.add_space(6.0);
+                if scan.scanning {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(14.0));
+                        ui.label(
+                            RichText::new("looking for .unitypackage files\u{2026}")
+                                .color(theme::TEXT_DIM)
+                                .size(11.0),
+                        );
+                    });
+                    return;
+                }
+                if scan.found.is_empty() {
+                    ui.label(
+                        RichText::new("No .unitypackage files in that folder.")
+                            .color(theme::TEXT_DIM)
+                            .size(12.0),
+                    );
+                    return;
+                }
+
+                // Contiguous runs of the sorted list — the scan sorted by (group, name).
+                let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+                for (i, (group, _, _, _)) in scan.found.iter().enumerate() {
+                    match groups.last_mut() {
+                        Some((g, members)) if g == group => members.push(i),
+                        _ => groups.push((group.clone(), vec![i])),
+                    }
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(330.0)
+                    .show(ui, |ui| {
+                        for (group, members) in &groups {
+                            let label = if group.is_empty() {
+                                "(this folder)"
+                            } else {
+                                group.as_str()
+                            };
+                            let picked =
+                                members.iter().filter(|m| scan.selected.contains(m)).count();
+                            egui::CollapsingHeader::new(
+                                RichText::new(format!(
+                                    "{label}  \u{00B7}  {picked}/{}",
+                                    members.len()
+                                ))
+                                .color(if picked > 0 {
+                                    theme::GOLD
+                                } else {
+                                    theme::TEXT_MUTED
+                                })
+                                .size(11.0),
+                            )
+                            .id_salt(("import_group", group))
+                            .default_open(groups.len() <= 8)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("All").clicked() {
+                                        scan.selected.extend(members.iter().copied());
+                                    }
+                                    if ui.small_button("None").clicked() {
+                                        scan.selected.retain(|s| !members.contains(s));
+                                    }
+                                });
+                                for &i in members {
+                                    let (_, _, name, size) = &scan.found[i];
+                                    ui.horizontal(|ui| {
+                                        let mut on = scan.selected.contains(&i);
+                                        if ui.checkbox(&mut on, "").changed() {
+                                            if on {
+                                                scan.selected.insert(i);
+                                            } else {
+                                                scan.selected.remove(&i);
+                                            }
+                                        }
+                                        ui.label(RichText::new(name).color(theme::TEXT).size(11.0));
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new(format_bytes(*size))
+                                                        .color(theme::TEXT_MUTED)
+                                                        .size(10.0),
+                                                );
+                                            },
+                                        );
+                                    });
+                                }
+                            });
+                        }
+                    });
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("indexed in place \u{2014} no files are copied")
+                            .color(theme::TEXT_DIM)
+                            .size(10.0),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let n = scan.selected.len();
+                        if ui
+                            .add_enabled(
+                                n > 0,
+                                egui::Button::new(
+                                    RichText::new(format!("Import as libraries ({n})"))
+                                        .color(theme::GOLD)
+                                        .size(11.0),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            import_now = true;
+                        }
+                        if ui.button(RichText::new("Cancel").size(11.0)).clicked() {
+                            cancel = true;
+                        }
+                        ui.label(
+                            RichText::new(format!("{n} selected"))
+                                .color(theme::TEXT_MUTED)
+                                .size(10.0),
+                        );
+                    });
+                });
+            });
+        if import_now {
+            self.import_selected_packages();
+        } else if cancel || !open {
+            self.import_scan = None;
+        }
+    }
+
+    /// §5.2 step 1: pick a folder and scan it for `.unitypackage` files, off-thread (an
+    /// Asset Store cache is thousands of files deep).
+    fn open_import_dialog(&mut self) {
+        let Some(root) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        self.import_scan = Some(ImportScan {
+            root: root.clone(),
+            scanning: true,
+            found: Vec::new(),
+            selected: std::collections::BTreeSet::new(),
+        });
+        let tx = self.import_tx.clone();
+        std::thread::spawn(move || {
+            let mut found: Vec<_> = lodestash_ingest::crawler::crawl(&root, &[])
+                .into_iter()
+                .filter(|f| is_unitypackage(&f.abs_path))
+                .map(|f| {
+                    let group = f
+                        .rel_path
+                        .parent()
+                        .map(|p| p.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_default();
+                    let name = package_display_name(&f.rel_path);
+                    (group, f.abs_path, name, f.size_bytes)
+                })
+                .collect();
+            found.sort_by(|a, b| (&a.0, &a.2).cmp(&(&b.0, &b.2)));
+            let _ = tx.send(found);
+        });
+    }
+
+    fn receive_import_scan(&mut self) {
+        while let Ok(found) = self.import_rx.try_recv() {
+            if let Some(scan) = &mut self.import_scan {
+                scan.found = found;
+                scan.scanning = false;
+            }
+        }
+    }
+
+    /// §5.2 step 2: each selected archive becomes one Library — an `import_source` for the
+    /// picked folder plus a **pinned** `package` row per pack. Nothing is copied or unpacked;
+    /// the row points at the archive where it already lives, and its contents are read on the
+    /// first Open →.
+    fn import_selected_packages(&mut self) {
+        let Some(scan) = &self.import_scan else {
+            return;
+        };
+        let picks: Vec<(PathBuf, String)> = scan
+            .selected
+            .iter()
+            .filter_map(|&i| scan.found.get(i))
+            .map(|(_, path, name, _)| (path.clone(), name.clone()))
+            .collect();
+        if picks.is_empty() {
+            return;
+        }
+        let Some(db_path) = catalog_db_path() else {
+            return;
+        };
+        let root = scan.root.clone();
+        let n = picks.len();
+        self.import_scan = None;
+
+        let result = (|| -> Result<(), String> {
+            let catalog = Catalog::open(&db_path).map_err(|e| e.to_string())?;
+            let sid = catalog
+                .upsert_import_source(&config::stem_name(&root), &root.to_string_lossy(), "folder")
+                .map_err(|e| e.to_string())?;
+            for (path, name) in &picks {
+                // Publisher/category are the Asset Store cache's own two levels above the
+                // pack; a plain folder of packs simply has neither.
+                let (publisher, category) = store_publisher_category(&root, path);
+                let id = catalog
+                    .upsert_package(
+                        sid,
+                        &path.to_string_lossy(),
+                        name,
+                        publisher.as_deref(),
+                        category.as_deref(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                catalog
+                    .set_package_pinned(id, true)
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.jobs.toast(
+                    format!("Imported {n} package(s) as libraries"),
+                    Intent::Success,
+                );
+                self.reload_unity_packages();
+            }
+            Err(err) => {
+                tracing::warn!(%err, "package import failed");
+                self.jobs
+                    .toast(format!("Import failed \u{2014} {err}"), Intent::Danger);
+            }
+        }
     }
 
     /// Read a pack's manifest on a worker thread and record its locators, so the next Open →
@@ -6321,6 +6626,7 @@ impl eframe::App for LodestashApp {
         self.receive_extracts();
         self.receive_peek(ctx);
         self.receive_manifests();
+        self.receive_import_scan();
         // A finished extraction frees the slot the batch queue waits on.
         self.pump_extract_queue(ctx);
         self.poll_watch(ctx);
@@ -8311,6 +8617,27 @@ fn size_tiers_editor(ui: &mut Ui, tiers: &mut SizeTiers) -> bool {
 /// extension is dropped too — wire the magic-byte fallback in if that shows up in practice.
 fn is_browseable(file: &CrawledFile) -> bool {
     file.media_type.is_some()
+}
+
+/// The Asset Store cache lays packs out as `<root>/<publisher>/<category>/<pack>.unitypackage`
+/// (INGESTION §2). Read those two levels off the path when they're there; a plain folder of
+/// packs has neither, and inventing them would be a claim the layout doesn't make.
+fn store_publisher_category(
+    root: &std::path::Path,
+    package_path: &std::path::Path,
+) -> (Option<String>, Option<String>) {
+    let Ok(rel) = package_path.strip_prefix(root) else {
+        return (None, None);
+    };
+    let comps: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    // comps: [publisher, category, …, "Pack.unitypackage"]
+    (
+        (comps.len() >= 2).then(|| comps[0].clone()),
+        (comps.len() >= 3).then(|| comps[1].clone()),
+    )
 }
 
 fn is_unitypackage(path: &std::path::Path) -> bool {
@@ -12671,6 +12998,36 @@ mod tests {
 
         builder.into_inner().unwrap().finish().unwrap();
         pkg_path
+    }
+
+    /// §5.2 import: publisher/category come from the Asset Store's own two levels, and a
+    /// plain folder of packs must not be given invented ones.
+    #[test]
+    fn import_reads_publisher_and_category_only_where_the_layout_has_them() {
+        let root = PathBuf::from("C:/cache");
+        let at = |rel: &str| root.join(rel);
+        assert_eq!(
+            store_publisher_category(&root, &at("SICS Games/3D Models/Isles.unitypackage")),
+            (Some("SICS Games".into()), Some("3D Models".into()))
+        );
+        assert_eq!(
+            store_publisher_category(&root, &at("SomePublisher/Pack.unitypackage")),
+            (Some("SomePublisher".into()), None),
+            "one level deep names a publisher, not a category"
+        );
+        assert_eq!(
+            store_publisher_category(&root, &at("Pack.unitypackage")),
+            (None, None),
+            "a flat folder of packs has neither"
+        );
+        assert_eq!(
+            store_publisher_category(
+                &root,
+                std::path::Path::new("D:/elsewhere/Pack.unitypackage")
+            ),
+            (None, None),
+            "a path outside the picked root tells us nothing"
+        );
     }
 
     /// An extracted payload's workspace location must belong to *its own* record. An
