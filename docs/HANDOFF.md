@@ -4,8 +4,7 @@ Working notes for whoever (or whatever) continues the build. Unlike the rest of 
 is **not** a design spec — it's the state of play, the decisions already settled, and the traps.
 The design docs still win on any question of what the software *should* do.
 
-Last updated: **2026-07-24**, at `fd72eb6`. A paste-ready session-start prompt lives in
-[`HANDOFF-PROMPT.md`](HANDOFF-PROMPT.md).
+Last updated: **2026-07-24**, at `fd72eb6`.
 
 ---
 
