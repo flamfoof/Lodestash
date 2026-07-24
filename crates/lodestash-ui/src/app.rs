@@ -1263,18 +1263,22 @@ impl LodestashApp {
                         // "Cache extracted packs" (UI-SPEC §11.6): rehydrate extracted
                         // entries whose workspace file still exists (retention may have
                         // evicted some — those simply don't come back).
-                        if cache_extracted {
-                            if let Some(ws) = &workspace_dir {
-                                let rows = catalog
-                                    .extracted_entries_for_source(sid)
-                                    .map_err(|e| e.to_string())?;
-                                let live: Vec<_> = rows
-                                    .into_iter()
-                                    .filter(|r| ws.join(&r.workspace_rel).is_file())
-                                    .collect();
-                                if !live.is_empty() {
-                                    extracted.push((idx, live));
-                                }
+                        // A **pinned** pack comes back either way (FEATURES.md §5.5, M7): the
+                        // pin is the user saying this is a library, and a library that
+                        // vanishes on restart isn't one.
+                        if let Some(ws) = &workspace_dir {
+                            let rows = catalog
+                                .extracted_entries_for_source(sid)
+                                .map_err(|e| e.to_string())?;
+                            let live: Vec<_> = rows
+                                .into_iter()
+                                .filter(|r| {
+                                    (cache_extracted || r.pinned)
+                                        && ws.join(&r.workspace_rel).is_file()
+                                })
+                                .collect();
+                            if !live.is_empty() {
+                                extracted.push((idx, live));
                             }
                         }
                     }
@@ -1900,21 +1904,7 @@ impl LodestashApp {
                 .unwrap_or_default(),
             publisher,
             category,
-            records: {
-                let mut records = crawl_records(files.iter());
-                // Locate each extracted file inside the workspace so the catalog can
-                // rehydrate it next session (M6 `asset_file.workspace_rel`).
-                if let Some(ws) = &self.workspace_dir {
-                    for (rec, f) in records.iter_mut().zip(files) {
-                        rec.workspace_rel = f
-                            .abs_path
-                            .strip_prefix(ws)
-                            .ok()
-                            .map(|r| r.to_string_lossy().replace('\\', "/"));
-                    }
-                }
-                records
-            },
+            records: crawl_records_in_workspace(files.iter(), self.workspace_dir.as_deref()),
             entries,
             all_roots: self
                 .scan_roots
@@ -4769,6 +4759,7 @@ impl LodestashApp {
     /// Pin/unpin a package (M7). Optimistic in-memory flip + a detached write (the pin
     /// is a single-row UPDATE; `busy_timeout` covers any overlap with a persist).
     fn set_package_pinned(&mut self, package_id: i64, pinned: bool) {
+        let mut unpinned_name = None;
         if let Some(list) = &mut self.unity_packages {
             if let Some(p) = list.iter_mut().find(|p| p.id == package_id) {
                 p.pinned = pinned;
@@ -4780,7 +4771,23 @@ impl LodestashApp {
                     },
                     Intent::Success,
                 );
+                if !pinned {
+                    unpinned_name = Some(p.name.clone());
+                }
             }
+        }
+        // Removing drops the facet, pulls the pack's assets out of the grid, and resets the
+        // filter to All if that library was the active one (FEATURES.md §5.5). The catalog
+        // rows stay — this is a library membership change, not a delete.
+        if let Some(name) = unpinned_name {
+            self.entries
+                .retain(|e| e.package.as_deref() != Some(name.as_str()));
+            if matches!(&self.source_filter, Some(LibraryFilter::Package(p)) if *p == name) {
+                self.source_filter = None;
+            }
+            self.selected_cache_idx = None;
+            self.selected.clear();
+            self.cache_dirty = true;
         }
         let Some(db_path) = catalog_db_path() else {
             return;
@@ -9830,17 +9837,52 @@ fn load_viewer_image(path: &std::path::Path) -> Result<(egui::ColorImage, [u32; 
 fn crawl_records<'a>(files: impl Iterator<Item = &'a CrawledFile>) -> Vec<CrawlRecord> {
     files
         .filter(|f| f.media_type.is_some())
-        .map(|f| CrawlRecord {
-            rel_path: f.rel_path.to_string_lossy().replace('\\', "/"),
-            name: f
-                .rel_path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            media_type: f.media_type.expect("filtered Some").code().to_string(),
-            size_bytes: f.size_bytes as i64,
-            mtime: f.mtime,
-            workspace_rel: None,
+        .map(crawl_record)
+        .collect()
+}
+
+/// One classified file as a catalog record. Callers that know where the file lives fill in
+/// `workspace_rel` afterwards; an on-disk crawl leaves it None.
+fn crawl_record(f: &CrawledFile) -> CrawlRecord {
+    CrawlRecord {
+        rel_path: f.rel_path.to_string_lossy().replace('\\', "/"),
+        name: f
+            .rel_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        media_type: f
+            .media_type
+            .expect("caller filtered Some")
+            .code()
+            .to_string(),
+        size_bytes: f.size_bytes as i64,
+        mtime: f.mtime,
+        workspace_rel: None,
+    }
+}
+
+/// [`crawl_records`] for package-extracted files, locating each payload inside the extraction
+/// workspace (M6 `asset_file.workspace_rel`) so the catalog can rehydrate it in a later session.
+///
+/// The location has to be resolved in the same pass that builds the record: `crawl_records` drops
+/// unclassified files, so a record list and the file list it came from are different lengths and
+/// pairing them positionally mis-assigns every path after the first dropped file.
+fn crawl_records_in_workspace<'a>(
+    files: impl Iterator<Item = &'a CrawledFile>,
+    workspace_dir: Option<&std::path::Path>,
+) -> Vec<CrawlRecord> {
+    files
+        .filter(|f| f.media_type.is_some())
+        .map(|f| {
+            let mut rec = crawl_record(f);
+            rec.workspace_rel = workspace_dir.and_then(|ws| {
+                f.abs_path
+                    .strip_prefix(ws)
+                    .ok()
+                    .map(|r| r.to_string_lossy().replace('\\', "/"))
+            });
+            rec
         })
         .collect()
 }
@@ -12505,6 +12547,42 @@ mod tests {
 
         builder.into_inner().unwrap().finish().unwrap();
         pkg_path
+    }
+
+    /// An extracted payload's workspace location must belong to *its own* record. An
+    /// unclassified file between two classified ones is dropped from the records, so anything
+    /// pairing the two lists positionally shifts every location after it.
+    #[test]
+    fn workspace_locations_follow_their_own_record() {
+        let ws = PathBuf::from("C:/ws");
+        let file = |rel: &str, mt: Option<MediaType>| CrawledFile {
+            abs_path: ws.join(rel),
+            rel_path: PathBuf::from(rel),
+            size_bytes: 1,
+            mtime: 0,
+            media_type: mt,
+        };
+        let files = [
+            file("aa/rock.fbx", Some(MediaType::Model3d)),
+            file("bb/notes.txt", None), // unclassified — never persisted
+            file("cc/rock.png", Some(MediaType::Texture)),
+        ];
+        let records = crawl_records_in_workspace(files.iter(), Some(&ws));
+        let got: Vec<(&str, Option<&str>)> = records
+            .iter()
+            .map(|r| (r.rel_path.as_str(), r.workspace_rel.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("aa/rock.fbx", Some("aa/rock.fbx")),
+                ("cc/rock.png", Some("cc/rock.png")),
+            ]
+        );
+        // A file outside the workspace (or no workspace at all) simply has no location.
+        assert!(crawl_records_in_workspace(files.iter(), None)
+            .iter()
+            .all(|r| r.workspace_rel.is_none()));
     }
 
     /// §5.4: the browse list is a folder tree, so `.meta` sidecars stay out, entries land
