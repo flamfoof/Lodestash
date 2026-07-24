@@ -1512,6 +1512,31 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("pkg entries commit: {e}")))
     }
 
+    /// The manifest locators recorded for a package, in-archive path order — what the
+    /// Unity Assets browse view lists so a pack indexed in an earlier session can still be
+    /// surgically re-extracted without re-reading its manifest (FEATURES.md §5.4).
+    pub fn list_package_entries(&self, package_id: i64) -> Result<Vec<PackageEntryRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT guid, pathname, tar_offset, size_bytes
+                 FROM package_entry WHERE package_id = ?1 ORDER BY pathname, guid",
+            )
+            .map_err(|e| CoreError::Catalog(format!("pkg entry prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![package_id], |r| {
+                Ok(PackageEntryRecord {
+                    guid: r.get(0)?,
+                    pathname: r.get(1)?,
+                    tar_offset: r.get(2)?,
+                    size_bytes: r.get(3)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("pkg entry query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("pkg entry row: {e}")))
+    }
+
     /// Pin/unpin a package as a sidebar library (M7; FEATURES.md §5.5 Add to Library).
     pub fn set_package_pinned(&self, package_id: i64, pinned: bool) -> Result<()> {
         self.conn
@@ -3182,28 +3207,13 @@ mod tests {
         let mut updated = entries.clone();
         updated[1].tar_offset = Some(9000);
         c.record_package_entries(pid, &updated).expect("upsert");
-        // Read back inline: nothing in the app reads entries per package, so the query lives
-        // here rather than as a pub method with one test caller.
-        let mut stmt = c
-            .conn
-            .prepare(
-                "SELECT guid, pathname, tar_offset, size_bytes
-                 FROM package_entry WHERE package_id = ?1 ORDER BY guid",
-            )
-            .expect("prep");
-        let got: Vec<PackageEntryRecord> = stmt
-            .query_map(params![pid], |r| {
-                Ok(PackageEntryRecord {
-                    guid: r.get(0)?,
-                    pathname: r.get(1)?,
-                    tar_offset: r.get(2)?,
-                    size_bytes: r.get(3)?,
-                })
-            })
-            .expect("query")
-            .map(|r| r.expect("row"))
-            .collect();
-        assert_eq!(got, updated, "guid-keyed upsert, guid-ordered read");
+        // Path-ordered read: NULL pathnames (the .meta-less locators) sort first in SQLite.
+        let got = c.list_package_entries(pid).expect("entries read");
+        assert_eq!(
+            got,
+            vec![updated[1].clone(), updated[0].clone()],
+            "guid-keyed upsert, path-ordered read"
+        );
     }
 
     #[test]

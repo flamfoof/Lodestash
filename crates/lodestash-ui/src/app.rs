@@ -4499,11 +4499,12 @@ impl LodestashApp {
         }
 
         let mut toggle: Option<(i64, bool)> = None;
+        let mut open_pkg: Option<usize> = None;
         let mut browse_pkg: Option<String> = None;
         let mut stats_pkg: Option<String> = None;
         let counts = self.package_asset_counts();
         ScrollArea::vertical().show(ui, |ui| {
-            for pkg in &packages {
+            for (pkg_idx, pkg) in packages.iter().enumerate() {
                 egui::Frame::none()
                     .fill(theme::SURFACE)
                     .stroke(egui::Stroke::new(1.0, theme::BORDER))
@@ -4537,6 +4538,15 @@ impl LodestashApp {
                                         .clicked()
                                     {
                                         toggle = Some((pkg.id, !pinned));
+                                    }
+                                    // §5.3 "Open →": the pick-and-extract contents list,
+                                    // rebuilt from the persisted manifest — works in a
+                                    // session that never crawled this pack.
+                                    if ui
+                                        .button(RichText::new("Open \u{2192}").size(11.0))
+                                        .clicked()
+                                    {
+                                        open_pkg = Some(pkg_idx);
                                     }
                                     if let Some(n) = pkg.asset_count {
                                         // Extracted this session ⇒ its assets are in the grid,
@@ -4583,6 +4593,11 @@ impl LodestashApp {
 
         if let Some((id, pin)) = toggle {
             self.set_package_pinned(id, pin);
+        }
+        if let Some(i) = open_pkg {
+            if let Some(pkg) = packages.get(i) {
+                self.open_package_browse(pkg);
+            }
         }
         if let Some(name) = browse_pkg {
             self.browse_package(name);
@@ -4635,6 +4650,68 @@ impl LodestashApp {
             }) {
                 tracing::warn!(%err, package_id, "package pin write failed");
             }
+        });
+    }
+
+    /// Open a catalog package for browse/pick-and-extract (FEATURES.md §5.4). The manifest
+    /// locators were persisted when the pack was first indexed, so this needs no second scan
+    /// of the archive — which is what makes a pack's contents retrievable in a later session.
+    fn open_package_browse(&mut self, pkg: &lodestash_core::catalog::PackageListing) {
+        let abs_path = PathBuf::from(&pkg.package_path);
+        if let Some(p) = self
+            .pending_packages
+            .iter_mut()
+            .find(|p| p.abs_path == abs_path)
+        {
+            p.browsing = true;
+            return;
+        }
+        if !abs_path.exists() {
+            self.jobs.toast(
+                format!("Archive is gone from {}", pkg.package_path),
+                Intent::Warning,
+            );
+            return;
+        }
+        let Some(source_idx) = self.scan_roots.iter().position(|r| abs_path.starts_with(r)) else {
+            self.jobs.toast(
+                "Add the pack's folder as a library source first",
+                Intent::Warning,
+            );
+            return;
+        };
+        let entries = match catalog_db_path()
+            .ok_or_else(|| lodestash_core::error::CoreError::Catalog("no catalog".into()))
+            .and_then(|db| Catalog::open(&db).and_then(|c| c.list_package_entries(pkg.id)))
+        {
+            Ok(entries) => entries,
+            Err(err) => {
+                tracing::warn!(%err, package = %pkg.name, "package entry read failed");
+                Vec::new()
+            }
+        };
+        if entries.is_empty() {
+            self.jobs.toast(
+                format!("No manifest recorded for {} \u{2014} re-scan it", pkg.name),
+                Intent::Warning,
+            );
+            return;
+        }
+        self.pending_packages.push(PendingPackage {
+            source_idx,
+            abs_path,
+            display_name: pkg.name.clone(),
+            // ponytail: a rehydrated pack offers pick-and-extract only. Re-deriving the
+            // render-pipeline-variant wrapper list needs the ingest-side manifest types;
+            // re-scan the folder if a wrapper needs its variant chosen.
+            nested_candidates: Vec::new(),
+            chosen_variant: 0,
+            extracting: false,
+            progress: Arc::default(),
+            entries,
+            job: None,
+            browsing: true,
+            picked: std::collections::BTreeSet::new(),
         });
     }
 
