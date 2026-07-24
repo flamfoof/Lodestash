@@ -4,7 +4,7 @@ Working notes for whoever (or whatever) continues the build. Unlike the rest of 
 is **not** a design spec — it's the state of play, the decisions already settled, and the traps.
 The design docs still win on any question of what the software *should* do.
 
-Last updated: **2026-07-23**, at `cc79e64`. A paste-ready session-start prompt lives in
+Last updated: **2026-07-24**, at `fd72eb6`. A paste-ready session-start prompt lives in
 [`HANDOFF-PROMPT.md`](HANDOFF-PROMPT.md).
 
 ---
@@ -124,6 +124,38 @@ re-inflated for a 2 KB file. Asset Store discovery now **infers a moved cache** 
 sources already added — this machine's cache is on `G:`, which is why the Unity Assets screen was
 empty (env var + per-OS default only find a cache where Unity put it).
 
+**Unity Assets works end to end** (2026-07-24, FEATURES.md §5). The pieces that existed separately
+are joined, and each step was looked at in the running app:
+
+| Step | State |
+|---|---|
+| **§5.2 Import** | **+ Import packages…** picks a folder, scans it off-thread (`crawler::crawl` + the extension test — no second walk), lists packs **grouped by the folder holding them** (the publisher/category tree in a store cache), and imports the ticked ones as one **pinned** `package` row apiece. Nothing copied, nothing unpacked. |
+| **§5.3 Landing** | Every catalog pack, with **Open →** and the Add-to-Library pin. |
+| **§5.4 Browse** | Contents as a **folder tree** (`PendingPackage::folders`) with per-folder counts + All/None, a type-coloured dot per row, leaf filenames. Groups default open at ≤8 folders; the bar grows to 360 px and is drag-resizable. |
+| **§5.4 Preview** | Clicking a filename pulls **that one payload** to an OS-temp scratch file and opens it in the grid's own `quick_look_content` — image zoom/pan, 3D viewport, audio transport. No catalog row, no grid entry, no workspace write. |
+| **§5.5 Pin** | A pinned pack rehydrates on startup **regardless** of the `cache_extracted` toggle; unpinning pulls its assets out of the grid and resets the filter. |
+
+Two things make that work in a session that never crawled the pack. `Catalog::list_package_entries`
+reads the persisted locators back, and a pack the catalog knows only by *name* (87 of the 88 rows
+here) **reads its manifest on demand**, off-thread with a job row, writing the locators back so every
+later open is a catalog read. Browsing and previewing are read-only, so a pack outside every library
+source opens fine — only *extraction* needs a source row to persist into, and both extract paths say
+so at that point (`NO_SOURCE`).
+
+Two real defects surfaced under that work, both fixed:
+
+- **`asset_file.workspace_rel` was mis-assigned.** The package persist zipped the record list against
+  the *file* list, but `crawl_records` drops unclassified files — one stray `.txt` shifted every
+  location after it onto the wrong asset. `crawl_records_in_workspace` resolves the location in the
+  same pass that builds the record. Rows written before this fix are NULL, so a pinned rehydrate on
+  this machine still needs one fresh extraction to demonstrate.
+- **A pack could be two packs** (M13). `package` was keyed `UNIQUE(source_id, package_path)`, so an
+  archive reachable from both a folder source and the cache source got two rows — the pin, the asset
+  count and the locators landing on different ones. A pack *is* the archive: M13 merges duplicates
+  onto the row carrying data, repoints assets and locators, and puts a UNIQUE index on
+  `package_path`. Verified on the real catalog: 88 rows → 87, 546 assets still linked, both locator
+  sets intact.
+
 **Favourites exist** (`asset.favorite`, M12): a pin, not a rating, catalog-side, surviving the Trash.
 The **shipped UI diverges from the design bundle** on four presentation points (star not heart, gold
 not danger, top-right not top-left, a toolbar toggle + dedicated screen rather than a Filters-popover
@@ -181,6 +213,12 @@ Each is recorded with rationale in [`TECH-STACK.md`](TECH-STACK.md) §7 and the 
   re-admit everything.
 - **Favourites are a pin, not a rating.** Separate column, separate affordance — folding them into
   the star rating would make every 5-star asset a favourite by accident.
+- **A pack is the archive on disk, not the source that found it** (M13). Identity is
+  `package_path`; a second sighting through another source fills blanks rather than minting a row.
+  Anything that mints packages must go through `upsert_package`.
+- **Browse and preview are read-only; only extraction needs a library source.** A pack can be
+  opened, walked and previewed from anywhere on disk. Extraction is what writes catalog rows, so it
+  is the only step that requires an `import_source` to persist into.
 - **Separate, non-comparable vector spaces.** SigLIP (768-d visual) and CLAP (512-d audio) are searched
   independently and fused on *rank* by RRF — comparing raw scores across models is meaningless.
   `hybrid_search` therefore takes `spaces: &[(model_id, query_vec)]`.
@@ -264,6 +302,14 @@ fixture.
   captures the **whole window** while `GetClientRect` reports the **client area**, so image
   coordinates are offset by the title bar (~31 px) before you convert them. When a click won't
   land, verify the mechanism headlessly instead of burning the session on input synthesis.
+- **Screenshot to a fresh filename every time.** Re-reading the same path served a *stale* image
+  twice in a row, once hiding a fix that had actually worked and once hiding that the capture script
+  was pointed at a dead PID (PrintWindow on an invalid handle leaves the old file in place). Write
+  `shot-1.png`, `shot-2.png`, … and pass the PID as a parameter rather than editing the script.
+- **Reaching a screen the app doesn't open on needs temporary instrumentation**, since clicks don't
+  land: flip the default `Screen::` and, if the state is behind a dialog, set that state directly for
+  one run. Grep for a marker (`// TEMP-SHOT`) and revert every one before committing — verify with
+  `grep -c TEMP` and re-check the default screen line by number.
 - **`cargo build` fails with "Access is denied. (os error 5)"** when the app is running — it holds
   `lodestash.exe`. `Stop-Process -Name lodestash -Force` first. `cargo check` works regardless.
 - **You may not be the only writer in this tree.** A second agent lane edits `crates/lodestash-ui`
@@ -284,13 +330,16 @@ fixture.
 
 The user's stated order, then value:
 
-1. **Unity Assets, end to end** — the next task they asked for. The pieces exist and are not joined:
-   `.unitypackage` manifest + surgical extraction (`unitypackage.rs`), pack rows with icons and
-   licence (`read_package_meta`), cache-root inference, and a `Screen::Unity` that renders little.
-   Wanted: packs listed as **Libraries**, surgical extract → identify → index so a pack's contents
-   are retrievable after it has been opened once, and the **Unity Assets menu** built from
-   `docs/design/` (§5 of FEATURES.md; note that bundle's prototype has **no** Unity screen — §5 is
-   the contract, not the prototype).
+1. **Unity Assets §5 leftovers** — the spine is built (§2 above); what remains is presentation and
+   one flow. In rough value order: the pack **rows** don't yet carry §5.3's path, `N assets · size`
+   or **↻ Sync**; the import list has no **category badge + override dropdown** and no category
+   filter tabs; §5.6's `⧉` duplicate flag is unbuilt (its only real instance turned out to be the
+   M13 defect, so build it only if a genuine content-overlap case shows up); the sidebar facet's
+   `✕` remove is missing (the browse-header **✓ In Libraries · remove** is the shipped path); and
+   the "N older versions · newest shown" disclosure has no data behind it on this machine — no pack
+   filename here carries a version, so treat it as YAGNI until one does. Also: **script, prefab and
+   material previews** show only their type, and one **fresh extraction** is needed to demonstrate
+   the pinned rehydrate (§2's `workspace_rel` note).
 2. **Favourites design conformance** — four presentation deltas listed on the KANBAN card. Contained:
    glyph/colour/position, chip moves to the toolbar, plus a Favorites screen reusing the grid.
 3. **P5 — the Unity round-trip**: `register_project` → `/v1/import` → import queue → `import_record`
