@@ -365,7 +365,7 @@ CREATE TABLE package (
   license       TEXT,                   -- e.g. 'Unity Asset Store EULA', 'CC-BY-4.0' (harvested at ingest)
   attribution   TEXT,                   -- required credit string, when applicable
   license_url   TEXT,                   -- link to the license/EULA
-  UNIQUE(source_id, package_path)
+  UNIQUE(source_id, package_path)       -- superseded by M13's UNIQUE(package_path)
 );
 ALTER TABLE asset ADD COLUMN package_id INTEGER REFERENCES package(id);
 CREATE INDEX idx_asset_package ON asset(package_id);
@@ -706,6 +706,7 @@ transaction, in order, on open. Shipped so far:
 | **M7** | Unity Assets library pinning: `package.pinned` (`ALTER TABLE package ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`) — backs the Add-to-Library pin (FEATURES.md §5.5, §7 above) so a promoted pack is a durable sidebar LIBRARIES row |
 | **M8** | Semantic embeddings (interim): `asset_embedding` BLOB table (dim × f32 little-endian + `model_id`/`modality`/`media_type_id`/`source_id`) — `Catalog::upsert_embedding` clears `embedding_dirty` in-txn; `embeddings_for_knn` loads the pre-filtered candidate set for `crate::vector::BruteForceIndex`. sqlite-vec `vec_asset` is the drop-in optimisation behind the `VectorIndex` seam (§2). |
 | **M9** | Technical facets: `asset.tri_count/width_px/height_px/duration_ms` + `asset.metrics_dirty` (partial index) — extracted from the file itself by a dirty-flag drain, exactly like embeddings (§14) |
+| **M13** | One `package` row per archive: `UNIQUE INDEX idx_package_path ON package(package_path)`, replacing M3's `UNIQUE(source_id, package_path)`. A pack is identified by the file on disk, not by whichever source found it — the same `.unitypackage` reachable from both a folder source and the Asset Store cache source used to get two rows, so the Unity Assets screen listed it twice and the pin, the asset count and the recorded locators landed on different ones. The migration merges duplicates onto the row that carries data (extracted, then pinned, then lowest id), repointing `asset.package_id` and `package_entry` (`INSERT OR IGNORE` — the same GUID recorded twice is one fact, not a conflict). `upsert_package` now keys on the path and fills a blank publisher/category from a later sighting |
 | **M12** | Favourites: `asset.favorite` + partial index — a pin, independent of `rating` (§12) |
 | **M11** | Tagging: `asset.tags_dirty` (partial index) — the fourth drain flag — and the three `asset_fts` triggers **replaced** so `tags_concat` is a real denormalisation of `asset_tag` instead of the literal `''` they wrote before (a rename would otherwise `delete` under the wrong text and strand tokens in the index) |
 | **M10** | Dependency scan queue: `asset.deps_dirty` (partial index) + a partial index on `asset.unity_guid` — the third drain flag beside `embedding_dirty`/`metrics_dirty`, cleared once an asset's `.meta` GUID and outbound refs are harvested into `asset_relationship` (§10) |

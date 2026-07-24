@@ -229,6 +229,7 @@ impl Catalog {
             (10, MIGRATION_10_DEPENDENCY_SCAN),
             (11, MIGRATION_11_TAGGING),
             (12, MIGRATION_12_FAVORITES),
+            (13, MIGRATION_13_ONE_PACKAGE_PER_PATH),
         ];
 
         for (version, sql) in migrations {
@@ -387,8 +388,10 @@ impl Catalog {
         Ok(())
     }
 
-    /// Find-or-create a `package` row by `(source_id, package_path)` — the browse-only
-    /// population of DATA-MODEL §7 (`asset_count`/`unpacked_at` stay NULL until ingest).
+    /// Find-or-create a `package` row by `package_path` — the archive on disk *is* the pack
+    /// (M13), so the same file found again through a different source is the same row. The
+    /// browse-only population of DATA-MODEL §7 (`asset_count`/`unpacked_at` stay NULL until
+    /// ingest); a later sighting fills in a publisher/category the first one didn't know.
     pub fn upsert_package(
         &self,
         source_id: i64,
@@ -400,13 +403,21 @@ impl Catalog {
         let existing: Option<i64> = self
             .conn
             .query_row(
-                "SELECT id FROM package WHERE source_id = ?1 AND package_path = ?2",
-                params![source_id, package_path],
+                "SELECT id FROM package WHERE package_path = ?1",
+                params![package_path],
                 |r| r.get(0),
             )
             .optional()
             .map_err(|e| CoreError::Catalog(format!("package lookup: {e}")))?;
         if let Some(id) = existing {
+            self.conn
+                .execute(
+                    "UPDATE package SET publisher = COALESCE(publisher, ?2),
+                                        category  = COALESCE(category, ?3)
+                      WHERE id = ?1",
+                    params![id, publisher, category],
+                )
+                .map_err(|e| CoreError::Catalog(format!("package fill: {e}")))?;
             return Ok(id);
         }
         self.conn
@@ -1351,6 +1362,42 @@ pub struct RelatedAsset {
 /// M12 — favourites (§12). A pin, not a rating: "I want to find this again" is a different
 /// question from "how good is it", and collapsing the two would make a 5-star asset a favourite by
 /// accident. Partial index because the interesting set is always the small one.
+/// M13 — one `package` row per archive (DATA-MODEL §7). A pack is identified by the file on
+/// disk, not by whichever source happened to find it: the same `.unitypackage` reachable from
+/// both a folder source and the Asset Store cache source used to get two rows, so the Unity
+/// Assets screen listed it twice and the pin, the asset count and the recorded locators landed
+/// on different rows.
+///
+/// The merge keeps the row that carries data — extracted (`asset_count`), then pinned, then the
+/// lowest id — and repoints the losers' assets and locators onto it. `package_entry` is
+/// `INSERT OR IGNORE`d because both rows may have recorded the same GUID; a duplicate locator is
+/// the same fact twice, not a conflict.
+const MIGRATION_13_ONE_PACKAGE_PER_PATH: &str = "
+CREATE TEMP TABLE pkg_survivor AS
+SELECT package_path,
+       (SELECT id FROM package p2 WHERE p2.package_path = p.package_path
+         ORDER BY (p2.asset_count IS NOT NULL) DESC, p2.pinned DESC, p2.id ASC
+         LIMIT 1) AS keep_id
+  FROM package p GROUP BY package_path;
+
+UPDATE asset SET package_id = (
+    SELECT s.keep_id FROM pkg_survivor s JOIN package p ON p.package_path = s.package_path
+     WHERE p.id = asset.package_id)
+ WHERE package_id IS NOT NULL;
+
+INSERT OR IGNORE INTO package_entry (package_id, guid, pathname, tar_offset, size_bytes)
+SELECT s.keep_id, e.guid, e.pathname, e.tar_offset, e.size_bytes
+  FROM package_entry e
+  JOIN package p ON p.id = e.package_id
+  JOIN pkg_survivor s ON s.package_path = p.package_path
+ WHERE e.package_id <> s.keep_id;
+
+DELETE FROM package WHERE id NOT IN (SELECT keep_id FROM pkg_survivor);
+DROP TABLE pkg_survivor;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_package_path ON package(package_path);
+";
+
 const MIGRATION_12_FAVORITES: &str = "
 ALTER TABLE asset ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_asset_favorite ON asset(favorite) WHERE favorite=1;
@@ -2600,7 +2647,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 12, "all 12 migrations should have run");
+        assert_eq!(version, 13, "all 13 migrations should have run");
     }
 
     /// A catalog stopped at schema v4, for exercising M5's data steps.
@@ -3480,6 +3527,57 @@ mod tests {
             .expect("joined");
         assert_eq!(pkg_of_asset, p1);
         assert_eq!(count, 1);
+
+        // M13: the same archive found through a *second* source is the same pack, and the
+        // second sighting fills in what the first didn't know rather than making a new row.
+        let folder = c
+            .upsert_import_source("Synty", "C:/cache/Synty", "folder")
+            .expect("second source");
+        let bare = c
+            .upsert_package(
+                folder,
+                "C:/cache/Synty/3D/Bare.unitypackage",
+                "Bare",
+                None,
+                None,
+            )
+            .expect("bare insert");
+        let again = c
+            .upsert_package(
+                src,
+                "C:/cache/Synty/3D/POLYGON City.unitypackage",
+                "POLYGON City",
+                Some("Synty"),
+                Some("3D"),
+            )
+            .expect("same archive, other source");
+        assert_eq!(again, p1, "one row per archive, whichever source found it");
+        c.upsert_package(
+            src,
+            "C:/cache/Synty/3D/Bare.unitypackage",
+            "Bare",
+            Some("Synty"),
+            Some("3D"),
+        )
+        .expect("fill");
+        let filled: (Option<String>, Option<String>) = c
+            .conn
+            .query_row(
+                "SELECT publisher, category FROM package WHERE id=?1",
+                [bare],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(
+            filled,
+            (Some("Synty".into()), Some("3D".into())),
+            "a later sighting fills blanks"
+        );
+        assert_eq!(
+            c.list_packages().expect("list").len(),
+            2,
+            "two archives, two rows"
+        );
     }
 
     #[test]
