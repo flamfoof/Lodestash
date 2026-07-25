@@ -31,6 +31,19 @@ pub struct CrawlRecord {
     pub workspace_rel: Option<String>,
 }
 
+/// A caller's classification of one in-pack manifest entry (DATA-MODEL §7 "In-pack assets", M14),
+/// keyed by the entry's GUID. Core stays classification-free, exactly like [`CrawlRecord`]: the UI
+/// runs `detect::by_extension` over each pathname and passes only the entries it could classify —
+/// an unclassified entry is simply absent, so it never becomes a grid asset (the same invariant the
+/// crawl enforces).
+#[derive(Debug, Clone)]
+pub struct InPackClass {
+    /// Display name (file stem).
+    pub name: String,
+    /// `media_type.code`.
+    pub media_type: String,
+}
+
 /// What `record_crawl` did with a batch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CrawlStats {
@@ -230,6 +243,7 @@ impl Catalog {
             (11, MIGRATION_11_TAGGING),
             (12, MIGRATION_12_FAVORITES),
             (13, MIGRATION_13_ONE_PACKAGE_PER_PATH),
+            (14, MIGRATION_14_IN_PACK_ASSETS),
         ];
 
         for (version, sql) in migrations {
@@ -579,6 +593,125 @@ impl Catalog {
         .map_err(|e| CoreError::Catalog(format!("last_scanned_at: {e}")))?;
         tx.commit()
             .map_err(|e| CoreError::Catalog(format!("record_crawl commit: {e}")))?;
+        Ok(stats)
+    }
+
+    /// Mint an `asset` + `asset_file` for each classified in-pack entry (DATA-MODEL §7
+    /// "In-pack assets", M14). Reads the package's persisted `package_entry` locators and, for every
+    /// entry whose GUID the caller classified, inserts an asset whose bytes stay **inside** the
+    /// `.unitypackage`: `workspace_rel` is NULL and `package_entry_id` links the locator holding its
+    /// `tar_offset`/`size_bytes`, so the embedding/tag/deps drains identify it in place by a surgical
+    /// single-payload pull. Unclassified GUIDs (absent from `classified`) are skipped — that is the
+    /// "unclassified files never reach the grid" invariant.
+    ///
+    /// Idempotent by `package_entry_id` (re-importing mints nothing twice). Freshly inserted rows
+    /// carry the default dirty flags (`embedding_dirty`/`metrics_dirty`/`tags_dirty`/`deps_dirty` all
+    /// DEFAULT 1), so identify picks them up with no extra flagging.
+    pub fn mint_in_pack_assets(
+        &mut self,
+        source_id: i64,
+        package_id: i64,
+        classified: &HashMap<String, InPackClass>,
+    ) -> Result<CrawlStats> {
+        let now = unix_now();
+        let mut stats = CrawlStats::default();
+
+        // The persisted locators to mint from (id + guid + pathname + size), read before the
+        // write borrow so the transaction can hold the only mutable borrow of the connection.
+        let locators: Vec<(i64, String, Option<String>, Option<i64>)> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, guid, pathname, size_bytes FROM package_entry
+                     WHERE package_id = ?1 ORDER BY id",
+                )
+                .map_err(|e| CoreError::Catalog(format!("mint locators prep: {e}")))?;
+            let rows = stmt
+                .query_map(params![package_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .map_err(|e| CoreError::Catalog(format!("mint locators query: {e}")))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| CoreError::Catalog(format!("mint locators row: {e}")))?
+        };
+
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| CoreError::Catalog(format!("mint_in_pack begin: {e}")))?;
+        {
+            let mut type_ids: HashMap<String, i64> = HashMap::new();
+            {
+                let mut stmt = tx
+                    .prepare("SELECT code, id FROM media_type")
+                    .map_err(|e| CoreError::Catalog(format!("media_type prep: {e}")))?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                    .map_err(|e| CoreError::Catalog(format!("media_type query: {e}")))?;
+                for row in rows {
+                    let (code, id) =
+                        row.map_err(|e| CoreError::Catalog(format!("media_type row: {e}")))?;
+                    type_ids.insert(code, id);
+                }
+            }
+
+            let mut seen = tx
+                .prepare("SELECT 1 FROM asset_file WHERE package_entry_id = ?1")
+                .map_err(|e| CoreError::Catalog(format!("mint probe prep: {e}")))?;
+
+            for (entry_id, guid, pathname, size_bytes) in &locators {
+                let Some(class) = classified.get(guid) else {
+                    continue; // unclassified — never becomes a grid asset
+                };
+                let Some(&media_type_id) = type_ids.get(&class.media_type) else {
+                    return Err(CoreError::Catalog(format!(
+                        "unknown media_type code '{}' (seed_media_types not run?)",
+                        class.media_type
+                    )));
+                };
+                if seen
+                    .exists(params![entry_id])
+                    .map_err(|e| CoreError::Catalog(format!("mint probe: {e}")))?
+                {
+                    stats.unchanged += 1;
+                    continue;
+                }
+                // In-pack files have no source-root path; the in-archive pathname is the rel_path.
+                let rel_path = pathname.clone().unwrap_or_else(|| guid.clone());
+
+                tx.execute(
+                    "INSERT INTO asset (uuid, source_id, media_type_id, name,
+                                        package_id, status, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'discovered', ?6, ?6)",
+                    params![
+                        uuid::Uuid::new_v4().to_string(),
+                        source_id,
+                        media_type_id,
+                        class.name,
+                        package_id,
+                        now
+                    ],
+                )
+                .map_err(|e| CoreError::Catalog(format!("in-pack asset insert: {e}")))?;
+                let asset_id = tx.last_insert_rowid();
+                let ext = rel_path.rsplit('.').next().map(str::to_lowercase);
+                tx.execute(
+                    "INSERT INTO asset_file (asset_id, rel_path, ext, size_bytes,
+                                             package_entry_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![asset_id, rel_path, ext, size_bytes, entry_id],
+                )
+                .map_err(|e| CoreError::Catalog(format!("in-pack asset_file insert: {e}")))?;
+                tx.execute(
+                    "UPDATE asset SET primary_file_id = ?2 WHERE id = ?1",
+                    params![asset_id, tx.last_insert_rowid()],
+                )
+                .map_err(|e| CoreError::Catalog(format!("in-pack primary_file: {e}")))?;
+                stats.inserted += 1;
+            }
+        }
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("mint_in_pack commit: {e}")))?;
         Ok(stats)
     }
 
@@ -1401,6 +1534,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_package_path ON package(package_path);
 const MIGRATION_12_FAVORITES: &str = "
 ALTER TABLE asset ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_asset_favorite ON asset(favorite) WHERE favorite=1;
+";
+
+/// M14 — in-pack assets (DATA-MODEL §7 \"In-pack assets\"). Links an `asset_file` to the
+/// `package_entry` locator holding its `tar_offset`/`size_bytes`, so a file's bytes resolve
+/// *extracted* (`workspace_rel`) → *in-pack* (`package_entry_id`) → *on-disk* (`rel_path`).
+/// Importing a pack mints an in-pack asset per manifest entry; the embedding/tag/deps drains
+/// identify it in place by surgically pulling one payload at a time, so a pack is a searchable
+/// library without ever being unpacked. `materialized` is derived from the ladder, never stored.
+const MIGRATION_14_IN_PACK_ASSETS: &str = "
+ALTER TABLE asset_file ADD COLUMN package_entry_id INTEGER REFERENCES package_entry(id);
+CREATE INDEX IF NOT EXISTS idx_file_pkgentry
+  ON asset_file(package_entry_id) WHERE package_entry_id IS NOT NULL;
 ";
 
 /// M11 — tagging queue + working FTS tag column (§2 facets, IDENTIFICATION-AND-SEARCH §2).
@@ -2647,7 +2792,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 13, "all 13 migrations should have run");
+        assert_eq!(version, 14, "all 14 migrations should have run");
     }
 
     /// A catalog stopped at schema v4, for exercising M5's data steps.
@@ -3261,6 +3406,115 @@ mod tests {
             vec![updated[1].clone(), updated[0].clone()],
             "guid-keyed upsert, path-ordered read"
         );
+    }
+
+    #[test]
+    fn mint_in_pack_assets_links_locators_and_skips_unclassified() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let sid = c
+            .upsert_import_source("src", "G:/src", "asset_store_library")
+            .expect("sid");
+        let pid = c
+            .upsert_package(sid, "G:/src/Pack.unitypackage", "Pack", None, None)
+            .expect("pid");
+
+        // Three manifest locators; the caller classifies only two (the third is a .cs script
+        // with no media_type — it must never become a grid asset).
+        c.record_package_entries(
+            pid,
+            &[
+                PackageEntryRecord {
+                    guid: "g_rock".into(),
+                    pathname: Some("Assets/Models/Rock.fbx".into()),
+                    tar_offset: Some(1536),
+                    size_bytes: Some(4096),
+                },
+                PackageEntryRecord {
+                    guid: "g_tex".into(),
+                    pathname: Some("Assets/Textures/Rock_Albedo.png".into()),
+                    tar_offset: Some(8192),
+                    size_bytes: Some(2048),
+                },
+                PackageEntryRecord {
+                    guid: "g_script".into(),
+                    pathname: Some("Assets/Scripts/Spin.cs".into()),
+                    tar_offset: Some(16384),
+                    size_bytes: Some(512),
+                },
+            ],
+        )
+        .expect("entries");
+
+        let classified = HashMap::from([
+            (
+                "g_rock".to_string(),
+                InPackClass {
+                    name: "Rock".into(),
+                    media_type: "model_3d".into(),
+                },
+            ),
+            (
+                "g_tex".to_string(),
+                InPackClass {
+                    name: "Rock_Albedo".into(),
+                    media_type: "texture".into(),
+                },
+            ),
+        ]);
+
+        let stats = c.mint_in_pack_assets(sid, pid, &classified).expect("mint");
+        assert_eq!(stats.inserted, 2, "two classified entries minted");
+
+        // Every minted file links its locator and has NO workspace_rel (bytes stay in-pack).
+        let linked: i64 = c
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset_file af JOIN package_entry pe
+                   ON pe.id = af.package_entry_id
+                 WHERE pe.package_id = ?1 AND af.workspace_rel IS NULL",
+                params![pid],
+                |r| r.get(0),
+            )
+            .expect("linked count");
+        assert_eq!(
+            linked, 2,
+            "both in-pack files carry a locator, none extracted"
+        );
+
+        // The unclassified script produced no asset.
+        let script_assets: i64 = c
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset_file WHERE package_entry_id =
+                   (SELECT id FROM package_entry WHERE guid = 'g_script')",
+                [],
+                |r| r.get(0),
+            )
+            .expect("script count");
+        assert_eq!(
+            script_assets, 0,
+            "unclassified entry never becomes an asset"
+        );
+
+        // A minted asset is queued for every drain (default dirty flags).
+        let dirty: i64 = c
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset WHERE package_id = ?1
+                   AND embedding_dirty = 1 AND tags_dirty = 1 AND deps_dirty = 1",
+                params![pid],
+                |r| r.get(0),
+            )
+            .expect("dirty count");
+        assert_eq!(dirty, 2, "minted in-pack assets await identify");
+
+        // Idempotent: re-minting the same classification inserts nothing new.
+        let again = c
+            .mint_in_pack_assets(sid, pid, &classified)
+            .expect("re-mint");
+        assert_eq!(again.inserted, 0, "re-import mints nothing twice");
+        assert_eq!(again.unchanged, 2);
     }
 
     #[test]
