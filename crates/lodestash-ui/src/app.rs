@@ -122,6 +122,8 @@ struct LargePackPrompt {
     name: String,
     abs_path: PathBuf,
     size_bytes: u64,
+    /// Carried from the triggering action: Open → jumps into the folders after indexing.
+    then_browse: bool,
 }
 
 /// A child-folder tile in Folders view: its name, the count of assets **directly** inside it, and
@@ -5194,28 +5196,6 @@ impl LodestashApp {
             );
             return;
         }
-        let size_bytes = self
-            .package_sizes
-            .get(&pkg.id)
-            .copied()
-            .or_else(|| std::fs::metadata(&abs_path).ok().map(|m| m.len()))
-            .unwrap_or(0);
-        let threshold = (self.config.rapid_index_max_gb as f64 * (1u64 << 30) as f64) as u64;
-        // Only prompt when it would actually inflate: a pack whose locators are already recorded
-        // (indexed in an earlier session) mints from the catalog with no archive read.
-        let needs_index = catalog_db_path()
-            .and_then(|db| Catalog::open(&db).ok())
-            .and_then(|c| c.list_package_entries(pkg.id).ok())
-            .map_or(true, |e| e.is_empty());
-        if size_bytes > threshold && needs_index {
-            self.large_pack_prompt = Some(LargePackPrompt {
-                package_id: pkg.id,
-                name: pkg.name.clone(),
-                abs_path,
-                size_bytes,
-            });
-            return;
-        }
         self.pin_and_mint(ctx, pkg.id, pkg.name.clone(), abs_path, false);
     }
 
@@ -5246,10 +5226,47 @@ impl LodestashApp {
         self.pin_and_mint(ctx, pkg.id, name, abs_path, true);
     }
 
+    /// Pin + index a pack, prompting first if it is oversized and not yet indexed (indexing in
+    /// place inflates the whole archive). Both **Add to Library** and **Open →** route through here,
+    /// so the prompt guards every path that would inflate a large pack.
+    fn pin_and_mint(
+        &mut self,
+        ctx: &egui::Context,
+        package_id: i64,
+        name: String,
+        abs_path: PathBuf,
+        then_browse: bool,
+    ) {
+        let size_bytes = self
+            .package_sizes
+            .get(&package_id)
+            .copied()
+            .or_else(|| std::fs::metadata(&abs_path).ok().map(|m| m.len()))
+            .unwrap_or(0);
+        let threshold = (self.config.rapid_index_max_gb as f64 * (1u64 << 30) as f64) as u64;
+        // Only prompt when it would actually inflate: a pack whose locators are already recorded
+        // (indexed in an earlier session) mints from the catalog with no archive read.
+        let needs_index = catalog_db_path()
+            .and_then(|db| Catalog::open(&db).ok())
+            .and_then(|c| c.list_package_entries(package_id).ok())
+            .map_or(true, |e| e.is_empty());
+        if size_bytes > threshold && needs_index {
+            self.large_pack_prompt = Some(LargePackPrompt {
+                package_id,
+                name,
+                abs_path,
+                size_bytes,
+                then_browse,
+            });
+            return;
+        }
+        self.pin_and_mint_now(ctx, package_id, name, abs_path, then_browse);
+    }
+
     /// Pin a pack, track its source folder as a pack-only library, and mint its in-pack assets in
     /// the background (streaming + cancellable), then re-hydrate so it surfaces. `then_browse` also
     /// jumps into the folder explorer once the assets land (Open →); Add to Library does not.
-    fn pin_and_mint(
+    fn pin_and_mint_now(
         &mut self,
         ctx: &egui::Context,
         package_id: i64,
@@ -5447,9 +5464,13 @@ impl LodestashApp {
 
         match choice {
             Some(1) => self.extract_whole_pack(ctx, prompt),
-            Some(2) => {
-                self.pin_and_mint(ctx, prompt.package_id, prompt.name, prompt.abs_path, false)
-            }
+            Some(2) => self.pin_and_mint_now(
+                ctx,
+                prompt.package_id,
+                prompt.name,
+                prompt.abs_path,
+                prompt.then_browse,
+            ),
             // No button this frame: keep the prompt open unless the ✕ closed it.
             None if open => self.large_pack_prompt = Some(prompt),
             _ => {} // cancelled / closed — dropped
