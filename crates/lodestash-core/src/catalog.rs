@@ -4,7 +4,7 @@
 //! Migration strategy: `PRAGMA user_version` tracks the schema version;
 //! `apply_migrations` runs numbered SQL steps in order on first open.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -655,11 +655,12 @@ impl Catalog {
             )
             .map_err(|e| CoreError::Catalog(format!("mint source_id: {e}")))?;
 
-        // A pack that has already been fully extracted carries its assets as workspace_rel rows
-        // (via record_crawl), which don't link a package_entry — so the per-locator idempotency
-        // probe below can't see them and would mint in-pack duplicates. Until extraction is unified
-        // to materialize the in-pack rows in place (M14 step 8), a pack is either analyzed (in-pack)
-        // or extracted, never both: skip minting once any extracted row exists.
+        // A pack extracted *without ever being analyzed* carries its assets as workspace_rel rows
+        // (via record_crawl) that don't link a package_entry — the per-locator idempotency probe
+        // below can't see them and would mint in-pack duplicates. Skip minting once such a row
+        // exists. (When a pack is analyzed *then* extracted, `materialize_in_pack_assets` fills
+        // workspace_rel on the minted rows in place — no parallel set, so this guard never trips on
+        // that ordering.)
         let extracted: bool = self
             .conn
             .query_row(
@@ -776,6 +777,50 @@ impl Catalog {
                 .map_err(|e| CoreError::Catalog(format!("mint_in_pack commit: {e}")))?;
         }
         Ok(stats)
+    }
+
+    /// Extraction demoted to *materialize* (DATA-MODEL §7 "In-pack assets", M14 step 8). When a pack
+    /// whose entries were already minted in-pack (`mint_in_pack_assets`) is extracted to disk, this
+    /// fills `workspace_rel` on those **existing** rows instead of inserting a parallel set — so a
+    /// materialized file resolves *extracted* (fast on-disk path) and stops shadowing itself.
+    ///
+    /// Each pair is `(pathname, workspace_rel)`, where `pathname` is the manifest path recorded on the
+    /// `package_entry` (the mint's key) and `workspace_rel` locates the extracted file in the content-
+    /// addressed workspace. Matches by `package_entry.pathname` within the pack. Returns the set of
+    /// pathnames it actually materialized, so the caller can fall back to `record_crawl` for any file
+    /// with no in-pack row (a pack extracted without ever being analyzed). Idempotent.
+    pub fn materialize_in_pack_assets(
+        &mut self,
+        package_id: i64,
+        pairs: &[(String, String)],
+    ) -> Result<HashSet<String>> {
+        let mut matched = HashSet::new();
+        for batch in pairs.chunks(PKG_WRITE_CHUNK) {
+            let tx = self
+                .conn
+                .transaction()
+                .map_err(|e| CoreError::Catalog(format!("materialize begin: {e}")))?;
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "UPDATE asset_file SET workspace_rel = ?3
+                         WHERE package_entry_id = (SELECT id FROM package_entry
+                             WHERE package_id = ?1 AND pathname = ?2)",
+                    )
+                    .map_err(|e| CoreError::Catalog(format!("materialize prep: {e}")))?;
+                for (pathname, workspace_rel) in batch {
+                    let changed = stmt
+                        .execute(params![package_id, pathname, workspace_rel])
+                        .map_err(|e| CoreError::Catalog(format!("materialize update: {e}")))?;
+                    if changed > 0 {
+                        matched.insert(pathname.clone());
+                    }
+                }
+            }
+            tx.commit()
+                .map_err(|e| CoreError::Catalog(format!("materialize commit: {e}")))?;
+        }
+        Ok(matched)
     }
 
     /// The read path for the grid: every asset under a source as
@@ -3728,6 +3773,108 @@ mod tests {
             skipped.inserted, 0,
             "an extracted pack does not grow in-pack duplicates"
         );
+    }
+
+    #[test]
+    fn materialize_fills_workspace_rel_on_minted_rows_no_shadow() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let sid = c
+            .upsert_import_source("src", "G:/src", "asset_store_library")
+            .expect("sid");
+        let pid = c
+            .upsert_package(sid, "G:/src/Pack.unitypackage", "Pack", None, None)
+            .expect("pid");
+        c.set_package_pinned(pid, true).expect("pin");
+
+        c.record_package_entries(
+            pid,
+            &[
+                PackageEntryRecord {
+                    guid: "g_rock".into(),
+                    pathname: Some("Assets/Models/Rock.fbx".into()),
+                    tar_offset: Some(1536),
+                    size_bytes: Some(4096),
+                },
+                PackageEntryRecord {
+                    guid: "g_tex".into(),
+                    pathname: Some("Assets/Textures/Rock_Albedo.png".into()),
+                    tar_offset: Some(8192),
+                    size_bytes: Some(2048),
+                },
+            ],
+        )
+        .expect("entries");
+        let classified = HashMap::from([
+            (
+                "g_rock".to_string(),
+                InPackClass {
+                    name: "Rock".into(),
+                    media_type: "model_3d".into(),
+                },
+            ),
+            (
+                "g_tex".to_string(),
+                InPackClass {
+                    name: "Rock_Albedo".into(),
+                    media_type: "texture".into(),
+                },
+            ),
+        ]);
+        c.mint_in_pack_assets(pid, &classified).expect("mint");
+
+        // Both start in-pack (workspace_rel NULL), neither extracted.
+        assert_eq!(c.in_pack_entries_for_source(sid).unwrap().len(), 2);
+        assert_eq!(c.extracted_entries_for_source(sid).unwrap().len(), 0);
+
+        // Extract only Rock: materialize fills its workspace_rel in place. The pathname with no
+        // minted row (a stray extracted file) is reported unmatched so the caller can record_crawl it.
+        let matched = c
+            .materialize_in_pack_assets(
+                pid,
+                &[
+                    ("Assets/Models/Rock.fbx".into(), "h0/Rock.fbx".into()),
+                    ("Assets/Nope.txt".into(), "h0/Nope.txt".into()),
+                ],
+            )
+            .expect("materialize");
+        assert_eq!(
+            matched,
+            HashSet::from(["Assets/Models/Rock.fbx".to_string()]),
+            "only the minted pathname is materialized"
+        );
+
+        // Rock flipped in-pack → extracted (no parallel row); the texture stays in-pack.
+        let in_pack = c.in_pack_entries_for_source(sid).unwrap();
+        let extracted = c.extracted_entries_for_source(sid).unwrap();
+        assert_eq!(in_pack.len(), 1, "texture still in-pack");
+        assert_eq!(in_pack[0].asset.rel_path, "Assets/Textures/Rock_Albedo.png");
+        assert_eq!(extracted.len(), 1, "rock now resolves on disk");
+        assert_eq!(extracted[0].workspace_rel, "h0/Rock.fbx");
+        assert_eq!(extracted[0].asset.rel_path, "Assets/Models/Rock.fbx");
+
+        // The materialized row keeps its package_entry link (still an in-pack asset, just on disk).
+        let still_linked: i64 = c
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset_file
+                 WHERE package_entry_id IS NOT NULL AND workspace_rel = 'h0/Rock.fbx'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("link count");
+        assert_eq!(still_linked, 1, "materialize does not sever the locator");
+
+        // Total rows unchanged: 2 minted, 0 added — the whole point of step 8.
+        let total: i64 = c
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset WHERE package_id = ?1",
+                params![pid],
+                |r| r.get(0),
+            )
+            .expect("total");
+        assert_eq!(total, 2, "no parallel set — one row per file");
     }
 
     #[test]

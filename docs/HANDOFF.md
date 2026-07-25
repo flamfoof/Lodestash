@@ -396,12 +396,15 @@ fixture.
   for prose and let a text model do the schema.
 - Git Bash maps `/tmp` to the Windows temp dir, and job-scoped env vars aren't guaranteed to persist
   between shell invocations — prefer absolute paths in long-running work.
-- **In-pack and extracted rows can coexist for one pack (M14 step 8 is not done).** If a pack is
-  indexed in place (in-pack rows) and then extracted (workspace_rel rows), both sets exist and the
-  in-pack ones shadow the extracted ones in the grid — so a viewer opens the slow in-pack path even
-  though a fast extracted copy is on disk. `mint_in_pack_assets` guards *forward* (won't mint if
-  extracted rows exist) but nothing reconciles the *other* order. **Step 8**: extraction should
-  materialize the existing in-pack rows (set `workspace_rel` on them), not mint a parallel set.
+- **In-pack ↔ extracted rows are unified (M14 step 8 shipped 2026-07-25).** Extraction no longer
+  mints a parallel set: `persist_package_to_catalog` records the pack's `package_entry` locators and
+  then `Catalog::materialize_in_pack_assets` fills `workspace_rel` on the pack's **already-minted**
+  in-pack rows (matched by `package_entry.pathname`); `record_crawl` runs only for leftover files with
+  no in-pack row (a pack extracted without ever being analyzed — the empty-`entries` large-pack path).
+  So a materialized file resolves *extracted* (fast on-disk) and stops shadowing itself. **Residue:**
+  packs extracted under the *old* code still carry their pre-existing parallel rows (no migration
+  reconciles them); the new path is only exercised by a *fresh* extract of an analyzed pack, which was
+  not driven in the running app this session (headless can't click Extract).
 - **`pin_and_mint` fires `load_paths` (a crawl+persist) while the background mint writes** — two
   writers. The chunked package writes + 15 s `busy_timeout` keep it from erroring, but if you touch
   this path, prefer serializing (mint, *then* hydrate) over widening the timeout.
@@ -412,11 +415,9 @@ fixture.
 
 Top of the list is finishing the in-pack feature (M14) the last session built, in the user's order:
 
-0. **M14 step 8 — unify extraction with in-pack rows** (the biggest correctness gap; see the trap in
-   §6). Extraction should **materialize** a pack's existing in-pack rows (fill `workspace_rel`,
-   pointing at the extracted files), not mint a parallel set. Then the grid shows one row per file,
-   viewing prefers the fast on-disk copy, and there is no shadowing. The KANBAN "In-pack assets" card
-   lists the full 8 steps; steps 1–7 shipped.
+0. ~~M14 step 8 — unify extraction with in-pack rows~~ **DONE 2026-07-25** (`materialize_in_pack_assets`;
+   see §6 trap). Extraction now materializes a pack's existing in-pack rows instead of minting a
+   parallel set — one row per file, no shadowing. Not yet driven end-to-end in the running app.
 1. **In-pack identify parity.** Only **images** embed in place today. Wire the **metrics** drain
    (dimensions from bytes are cheap; tris need mesh-from-bytes), **audio** embedding, and **tags**
    for in-pack assets — otherwise a purely in-pack asset never reaches `indexed`/`identified`. The

@@ -11306,11 +11306,40 @@ fn persist_package_to_catalog(
         )
         .map_err(|e| e.to_string())?;
     harvest_package_metadata(&catalog, package_id, job);
-    let stats = catalog
-        .record_crawl(source_id, Some(package_id), &job.records)
-        .map_err(|e| e.to_string())?;
+    // Entries first, so `materialize_in_pack_assets` can match already-minted in-pack rows by
+    // `package_entry.pathname`.
     catalog
         .record_package_entries(package_id, &job.entries)
+        .map_err(|e| e.to_string())?;
+    // M14 step 8: extraction is demoted to *materialize*. Fill `workspace_rel` on the pack's
+    // existing in-pack rows rather than inserting a parallel set (which would shadow them and force
+    // the slow in-pack pull on view). The extracted record's `rel_path` is `display_name/<pathname>`
+    // — drop the first component to recover the manifest pathname the mint keyed on.
+    let pairs: Vec<(String, String)> = job
+        .records
+        .iter()
+        .filter_map(|r| {
+            let ws = r.workspace_rel.clone()?;
+            let (_, pathname) = r.rel_path.split_once('/')?;
+            Some((pathname.to_string(), ws))
+        })
+        .collect();
+    let materialized = catalog
+        .materialize_in_pack_assets(package_id, &pairs)
+        .map_err(|e| e.to_string())?;
+    // Any file with no in-pack row (a pack extracted without ever being analyzed) still needs a row:
+    // insert just those, so a never-analyzed pack behaves exactly as before.
+    let leftover: Vec<CrawlRecord> = job
+        .records
+        .iter()
+        .filter(|r| match r.rel_path.split_once('/') {
+            Some((_, pathname)) => !materialized.contains(pathname),
+            None => true,
+        })
+        .cloned()
+        .collect();
+    let stats = catalog
+        .record_crawl(source_id, Some(package_id), &leftover)
         .map_err(|e| e.to_string())?;
     catalog
         .mark_package_unpacked(package_id, job.records.len())
