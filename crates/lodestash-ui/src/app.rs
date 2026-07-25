@@ -10185,6 +10185,40 @@ fn tag_preview(
     Some(image::open(png).ok()?.to_rgba8())
 }
 
+/// Decode a visual drain job's image from whichever of the three §7 byte-sources applies:
+/// an on-disk file, a package-extracted workspace file, or — for an **in-pack** asset — one
+/// payload pulled into memory and decoded from bytes (DATA-MODEL §7 / M14). The in-pack path
+/// never writes to disk: identify surgically reads a single payload, one asset at a time.
+/// `None` = no source resolved / undecodable (the caller stores a zero vector to advance).
+fn resolve_job_image(
+    job: &lodestash_core::catalog::VisualEmbedJob,
+    workspace_dir: Option<&std::path::Path>,
+) -> Option<image::DynamicImage> {
+    if let Some(p) = &job.disk_path {
+        return lodestash_ingest::raster::decode(std::path::Path::new(p))
+            .map_err(|e| tracing::warn!(%e, "image decode failed"))
+            .ok();
+    }
+    if let (Some(rel), Some(ws)) = (&job.workspace_rel, workspace_dir) {
+        return lodestash_ingest::raster::decode(&ws.join(rel))
+            .map_err(|e| tracing::warn!(%e, "extracted image decode failed"))
+            .ok();
+    }
+    if let (Some(pack), Some(off), Some(sz)) = (&job.pack_path, job.pack_offset, job.pack_size) {
+        let bytes = lodestash_ingest::unitypackage::read_payload_at(
+            std::path::Path::new(pack),
+            off as u64,
+            sz as u64,
+        )
+        .map_err(|e| tracing::warn!(%e, "in-pack payload pull failed"))
+        .ok()?;
+        return lodestash_ingest::raster::decode_bytes(&bytes, job.ext.as_deref())
+            .map_err(|e| tracing::warn!(%e, "in-pack image decode failed"))
+            .ok();
+    }
+    None
+}
+
 fn drain_image_embeddings(
     cat: &mut Catalog,
     emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync),
@@ -10205,24 +10239,23 @@ fn drain_image_embeddings(
         }
         let n = jobs.len();
         for job in jobs {
-            // On-disk source file, or a package-extracted file resolved against the workspace.
-            let path = match (&job.disk_path, &job.workspace_rel) {
-                (Some(p), _) => Some(std::path::PathBuf::from(p)),
-                (None, Some(rel)) => workspace_dir.map(|w| w.join(rel)),
-                _ => None,
-            };
             let modality = if job.media_code == "model_3d" {
                 "model_3d"
             } else {
                 "image"
             };
-            let vector = match path.as_deref() {
-                Some(p) if job.media_code == "model_3d" => embed_model_multiview(p, emb),
-                Some(p) => lodestash_ingest::raster::decode(p)
-                    .map_err(|e| tracing::warn!(%e, "image decode failed"))
-                    .ok()
-                    .map(|img| emb.embed_image(&img.to_rgba8())),
-                None => None,
+            let vector = if job.media_code == "model_3d" {
+                // On-disk source file, or a package-extracted file resolved against the workspace.
+                // ponytail: an in-pack model needs mesh-from-bytes render (no path to give the
+                // renderer) — not yet; in-pack models fall to the zero vec below until it lands.
+                let path = match (&job.disk_path, &job.workspace_rel) {
+                    (Some(p), _) => Some(std::path::PathBuf::from(p)),
+                    (None, Some(rel)) => workspace_dir.map(|w| w.join(rel)),
+                    _ => None,
+                };
+                path.as_deref().and_then(|p| embed_model_multiview(p, emb))
+            } else {
+                resolve_job_image(&job, workspace_dir).map(|img| emb.embed_image(&img.to_rgba8()))
             }
             // ponytail: unusable (undecodable / unrenderable / evicted from the workspace) →
             // zero vec clears the flag so the drain always advances and never re-queries the
