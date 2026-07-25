@@ -193,7 +193,17 @@ built.
   breadcrumb, ← / → history, up-one, and a thumbnails ⇄ list toggle (`folders_as_list`). `Add to
   Library` is what indexes (mints); Open just navigates. `folder_children` is pack-aware (several
   packs share a source and all use `Assets/…` paths, so it filters by the active pack); folder tiles
-  render as a **vertical list** with `direct (recursive)` counts (e.g. `3 (50)`).
+  render as a **vertical list** with `direct (recursive)` counts (e.g. `3 (50)`). A **persistent left
+  directory-tree pane** (2026-07-25, nested `SidePanel`) shows the pack's whole hierarchy — see §7.2.
+- **In-pack grid thumbnails** (M14 step 4, 2026-07-25). An in-pack card used to show only a typed
+  placeholder; the worker now pulls the one payload to a **stable scratch file** in the thumb cache
+  (`inpack/<key>.<ext>`, `ensure_in_pack_scratch`, keyed by pack+offset+size so it is reused across
+  runs) and thumbnails that path — images, models (hero render) and audio (waveform) all work.
+  **Gated on archive size** (`IN_PACK_THUMB_MAX_BYTES`, 256 MB): a per-file pull inflates the gzip up
+  to the payload's offset, so on a big pack (the real 21.9 GB "Total Music Collection") every visible
+  thumbnail re-inflated gigabytes and pegged the CPU — above the cap the card keeps its placeholder
+  until the pack is extracted (the fast random-access path). **ponytail:** batch the visible page into
+  one sorted `extract_at_offsets` skip-scan to lift the cap.
 - **Oversized packs prompt.** `config.rapid_index_max_gb` (default 4 GB, Settings ▸ Storage). A pack
   over it that isn't indexed prompts **Extract to temp & index / Index in place / Cancel** — indexing
   in place inflates the whole archive (a 21 GB pack is minutes of CPU). The gate lives in

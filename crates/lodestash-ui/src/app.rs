@@ -7452,14 +7452,41 @@ impl LodestashApp {
             if entry.thumb_spawned || !needs_thumbnail(entry.file.media_type) {
                 continue;
             }
-            // In-pack assets have no file on disk (abs_path is the .unitypackage) — their
-            // thumbnail needs a surgical payload pull, which lands in the step-4 slice. Mark as
-            // handled so the grid stops retrying and shows the typed placeholder (M14).
+            // In-pack asset (M14 step 4): its bytes live inside the `.unitypackage`, so the worker
+            // pulls the one payload to a stable scratch file and thumbnails that. Needs the payload's
+            // extension for decode dispatch; without one there's nothing to decode, so leave the
+            // typed placeholder. `abs_path` is the archive and must not be decoded directly.
+            let in_pack: Option<(String, i64, i64, String)> = entry
+                .asset_id
+                .and_then(|id| self.in_pack_locators.get(&id).cloned())
+                .and_then(|(pack, off, size)| {
+                    // A per-file pull inflates the gzip from the start up to the payload's offset (no
+                    // random access), so on a large pack every visible thumbnail re-inflates gigabytes
+                    // — which pegs the CPU (reported on a multi-GB music pack). Gate on archive size:
+                    // a big pack keeps its typed placeholder until it is extracted, which is the fast
+                    // random-access path anyway (INGESTION §2).
+                    // ponytail: O(page) independent pulls; batch the visible page into one skip-scan
+                    // (`extract_at_offsets`, sorted offsets) to lift this cap.
+                    let archive_ok = std::fs::metadata(&pack)
+                        .map(|m| m.len() <= IN_PACK_THUMB_MAX_BYTES)
+                        .unwrap_or(false);
+                    if !archive_ok {
+                        return None;
+                    }
+                    let ext = entry
+                        .file
+                        .rel_path
+                        .extension()?
+                        .to_string_lossy()
+                        .to_lowercase();
+                    Some((pack, off, size, ext))
+                });
             if entry
                 .asset_id
                 .is_some_and(|id| self.in_pack_locators.contains_key(&id))
+                && in_pack.is_none()
             {
-                self.entries[idx].thumb_spawned = true;
+                self.entries[idx].thumb_spawned = true; // no extension → typed placeholder
                 continue;
             }
             self.entries[idx].thumb_spawned = true;
@@ -7495,12 +7522,29 @@ impl LodestashApp {
                 // Always send (even on failure) so pending_thumbs is always decremented.
                 // Do NOT call request_repaint() here — stray repaints from rayon during resize
                 // cause DWM jitter. The main thread polls via request_repaint_after() instead.
+                // In-pack: pull the payload to a stable scratch file first, then thumbnail that path
+                // (its stable size keys the cache); on-disk decodes `abs_path` directly.
+                let (source, src_size, src_mtime) = match &in_pack {
+                    Some((pack, off, size, ext)) => {
+                        match ensure_in_pack_scratch(cache_dir.as_deref(), pack, *off, *size, ext) {
+                            Some((path, sz)) => (path, sz, 0),
+                            None => {
+                                let _ = tx.send(ThumbReady {
+                                    index: idx,
+                                    texture: None,
+                                });
+                                return;
+                            }
+                        }
+                    }
+                    None => (abs_path, size_bytes, mtime),
+                };
                 let texture = generate_texture(
                     &ctx2,
-                    &abs_path,
+                    &source,
                     &rel_path,
-                    size_bytes,
-                    mtime,
+                    src_size,
+                    src_mtime,
                     cache_dir.as_deref(),
                     gen_px,
                     kind,
@@ -13426,6 +13470,12 @@ fn under_known_root(
     roots.iter().any(|r| path.starts_with(r)) || workspace.is_some_and(|w| path.starts_with(w))
 }
 
+/// Archive-size ceiling above which in-pack assets keep their typed placeholder instead of pulling a
+/// per-file thumbnail: past this, the gzip re-inflation cost per payload (§7 / INGESTION §2) is not
+/// worth it and a big pack should be extracted for thumbnails. ponytail: a per-page batch pull lifts
+/// this; the cap is the cheap guard until then.
+const IN_PACK_THUMB_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
 fn needs_thumbnail(mt: Option<MediaType>) -> bool {
     matches!(
         mt,
@@ -13441,6 +13491,42 @@ fn needs_thumbnail(mt: Option<MediaType>) -> bool {
                 | MediaType::Material
         )
     )
+}
+
+/// Materialize an in-pack payload to a **stable** per-payload scratch file in the thumb cache
+/// (`inpack/<key>.<ext>`), pulling it once and reusing it across runs (DATA-MODEL §7 / M14 step 4).
+/// The path-based thumbnail generator then decodes it exactly like an on-disk file — images, models
+/// (hero render) and audio (waveform) all work. Keyed by pack path + offset + size so it is stable
+/// (unlike an OS-temp name), which also keeps the thumbnail cache entry itself stable. Runs on the
+/// worker thread since the gzip skip-scan can be slow. Returns the scratch path + payload size (the
+/// cache-key inputs); `None` if there is no cache dir or the pull fails.
+fn ensure_in_pack_scratch(
+    cache_dir: Option<&std::path::Path>,
+    pack_path: &str,
+    offset: i64,
+    size: i64,
+    ext: &str,
+) -> Option<(PathBuf, u64)> {
+    let cache = cache_dir?;
+    let key = thumb::meta_key(std::path::Path::new(pack_path), size as u64, offset);
+    let dir = cache.join("inpack");
+    let scratch = dir.join(format!("{key}.{ext}"));
+    if scratch.exists() {
+        return Some((scratch, size as u64));
+    }
+    let bytes = lodestash_ingest::unitypackage::read_payload_at(
+        std::path::Path::new(pack_path),
+        offset as u64,
+        size as u64,
+    )
+    .map_err(|e| tracing::warn!(%e, "in-pack thumbnail pull failed"))
+    .ok()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    // Write to a `.part` then rename, so a sibling payload's thumbnail can't read a half-written file.
+    let tmp = dir.join(format!("{key}.{ext}.part"));
+    std::fs::write(&tmp, &bytes).ok()?;
+    std::fs::rename(&tmp, &scratch).ok()?;
+    Some((scratch, size as u64))
 }
 
 // ponytail: 8 flat args instead of a params struct — one call site, all of them primitives.
@@ -14475,6 +14561,45 @@ mod tests {
         let mut nowhere = job.clone();
         nowhere.pack_path = None;
         assert!(resolve_job_path(&nowhere, None).is_none());
+    }
+
+    /// In-pack grid thumbnails (M14 step 4): the payload materializes once to a stable scratch file
+    /// keyed by pack + offset + size, and a second call reuses it without touching the archive again.
+    #[test]
+    fn in_pack_scratch_pulls_once_and_is_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"THUMBME".repeat(40);
+        let pkg = build_test_package(dir.path(), "P.unitypackage", "Assets/Rock.png", &payload);
+        let entry =
+            &lodestash_ingest::unitypackage::read_manifest_with_progress(&pkg, &|_, _| true)
+                .unwrap()[0];
+        let (off, size) = (
+            entry.asset_offset.unwrap() as i64,
+            entry.asset_size.unwrap() as i64,
+        );
+        let cache = dir.path().join("cache");
+        let pk = pkg.to_string_lossy().into_owned();
+
+        let (p1, sz) = ensure_in_pack_scratch(Some(&cache), &pk, off, size, "png").unwrap();
+        assert_eq!(sz, payload.len() as u64);
+        assert_eq!(
+            std::fs::read(&p1).unwrap(),
+            payload,
+            "scratch holds the payload"
+        );
+        assert_eq!(
+            p1.extension().and_then(|e| e.to_str()),
+            Some("png"),
+            "extension preserved for decode dispatch"
+        );
+
+        // Delete the pack: a second call must reuse the stable scratch, not re-pull (which would fail).
+        std::fs::remove_file(&pkg).unwrap();
+        let (p2, _) = ensure_in_pack_scratch(Some(&cache), &pk, off, size, "png").unwrap();
+        assert_eq!(
+            p1, p2,
+            "same locator resolves to the same stable path, no re-pull"
+        );
     }
 
     /// §5.2 import: publisher/category come from the Asset Store's own two levels, and a
