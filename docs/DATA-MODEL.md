@@ -387,6 +387,44 @@ CREATE INDEX idx_package_source ON package(source_id);
   reconcile that package's `asset` rows (non-destructive — preserves manual tags/mappings on unchanged
   assets via per-file `content_hash`).
 
+### In-pack assets — analyze without extracting (M14)
+
+A pack the user imports is **analyzed, not unpacked**: `read_manifest` ([`INGESTION.md`](INGESTION.md)
+§2) is the whole cost, and it mints one **`asset` + `asset_file` per entry** whose bytes live *inside*
+the archive. There is no "virtual asset" type — an asset is an asset; where its bytes come from is a
+property of its file, resolved in this precedence:
+
+1. `workspace_rel` set **and** that file exists → **extracted** (materialized on disk)
+2. `asset_file.package_entry_id` set → **in-pack**: the bytes are `size_bytes` at `tar_offset` inside
+   `package.package_path` (one gzip skip-scan, [`INGESTION.md`](INGESTION.md) §2)
+3. else → **on-disk**: `import_source.root_path / rel_path`
+
+*Materialized* is derived from that ladder, never a stored flag or a status — so nothing in the
+schema forks on it. **M14** adds the single link:
+
+```sql
+ALTER TABLE asset_file ADD COLUMN package_entry_id INTEGER REFERENCES package_entry(id);
+CREATE INDEX idx_file_pkgentry ON asset_file(package_entry_id) WHERE package_entry_id IS NOT NULL;
+```
+
+- **Import mints the rows.** Importing a pack (was: browse-only `package` row, `asset_count` NULL)
+  now also writes an `asset`/`asset_file` per `package_entry`, `package_entry_id` set, `workspace_rel`
+  NULL, `embedding_dirty`/`tags_dirty`/`deps_dirty` all queued. `asset.package_id` therefore joins
+  immediately, so a pinned pack is a real sidebar **LIBRARIES** row *before* any extraction (§8, §5.5).
+- **Dependency edges harvest with zero pulls.** `read_manifest` already parses each entry's `.meta`
+  (GUID/labels), so the §10 GUID pass runs off the manifest — an in-pack asset has its graph before a
+  byte is read.
+- **Identify runs in place, one file at a time.** The embedding and tag drains resolve bytes through
+  the ladder above; for an in-pack asset they surgically pull that one payload into memory, decode,
+  embed **and** tag, then drop the bytes — no workspace copy, no identify cache (see §8 and
+  [`INGESTION.md`](INGESTION.md) §2/§3). Serial by design (the persist thread is the sole writer), and
+  identify does not need to be fast.
+- **Extraction is demoted to *materialize*.** `extract_at_offsets` fills `workspace_rel` on rows that
+  already exist; it is only needed to leave a **persistent file on disk** (Add to project, or the
+  "keep extracted" cache). Un-materializing (unpin/evict) clears `workspace_rel` and deletes the cached
+  file — the `asset` row, its embedding and its tags **stay in `catalog.db`**, so re-opening the
+  library is a pure DB read.
+
 ---
 
 ## 8. Asset lifecycle & "Identify" mode
@@ -429,6 +467,15 @@ nothing has been **said** about it until it is tagged. While `identified` was ea
 alone (2026-07-22 → 07-23), the health meter reported 2067 of 2274 identified for a library where
 19 assets had tags — the UI asserting work that had not happened. The condition landed the moment
 that was noticed.
+
+**The lifecycle is source-agnostic — an in-pack asset moves through it without ever being
+extracted.** The drains that clear `metrics_dirty`, write `asset_embedding` and write `asset_tag`
+resolve an asset's bytes through §7's precedence ladder, so an asset whose bytes are still inside a
+`.unitypackage` earns `indexed` (facets + thumbnail from the one surgical pull) and then `identified`
+(embedding **and** tag from that same pull) exactly like an on-disk file. Extraction is not a step in
+this table — materializing a file on disk changes *where the bytes are*, not *how far it has been
+processed*. A pack the user imports is therefore fully searchable from `catalog.db` after its identify
+pass, with the archive touched only to preview full-res or to extract.
 
 ---
 
@@ -706,6 +753,7 @@ transaction, in order, on open. Shipped so far:
 | **M7** | Unity Assets library pinning: `package.pinned` (`ALTER TABLE package ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`) — backs the Add-to-Library pin (FEATURES.md §5.5, §7 above) so a promoted pack is a durable sidebar LIBRARIES row |
 | **M8** | Semantic embeddings (interim): `asset_embedding` BLOB table (dim × f32 little-endian + `model_id`/`modality`/`media_type_id`/`source_id`) — `Catalog::upsert_embedding` clears `embedding_dirty` in-txn; `embeddings_for_knn` loads the pre-filtered candidate set for `crate::vector::BruteForceIndex`. sqlite-vec `vec_asset` is the drop-in optimisation behind the `VectorIndex` seam (§2). |
 | **M9** | Technical facets: `asset.tri_count/width_px/height_px/duration_ms` + `asset.metrics_dirty` (partial index) — extracted from the file itself by a dirty-flag drain, exactly like embeddings (§14) |
+| **M14** | In-pack assets — analyze without extracting (§7 "In-pack assets"): `asset_file.package_entry_id` (+ partial index) links a file to the `package_entry` locator holding its `tar_offset`/`size_bytes`, so a file's bytes resolve to *extracted* (`workspace_rel`) → *in-pack* (`package_entry_id`) → *on-disk* (`rel_path`). Importing a pack mints an `asset`/`asset_file` per entry (locator set, `workspace_rel` NULL); the embedding/tag/deps drains identify it in place by surgically pulling one payload at a time, and extraction is demoted to filling `workspace_rel` when a persistent on-disk copy is actually wanted. No `media_type` change; no lifecycle fork (materialized is derived, not stored) |
 | **M13** | One `package` row per archive: `UNIQUE INDEX idx_package_path ON package(package_path)`, replacing M3's `UNIQUE(source_id, package_path)`. A pack is identified by the file on disk, not by whichever source found it — the same `.unitypackage` reachable from both a folder source and the Asset Store cache source used to get two rows, so the Unity Assets screen listed it twice and the pin, the asset count and the recorded locators landed on different ones. The migration merges duplicates onto the row that carries data (extracted, then pinned, then lowest id), repointing `asset.package_id` and `package_entry` (`INSERT OR IGNORE` — the same GUID recorded twice is one fact, not a conflict). `upsert_package` now keys on the path and fills a blank publisher/category from a later sighting |
 | **M12** | Favourites: `asset.favorite` + partial index — a pin, independent of `rating` (§12) |
 | **M11** | Tagging: `asset.tags_dirty` (partial index) — the fourth drain flag — and the three `asset_fts` triggers **replaced** so `tags_concat` is a real denormalisation of `asset_tag` instead of the literal `''` they wrote before (a rename would otherwise `delete` under the wrong text and strand tokens in the index) |

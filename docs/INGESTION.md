@@ -115,17 +115,31 @@ Selecting one or multiple packages enqueues a **batch unpack+ingest** job (via t
 A `.unitypackage` is **gzip+tar** — a *sequential* stream with **no central index**, so you can't seek
 to a single entry; reaching any entry means decompressing from the start. Lodestash therefore
 **streams, never loads the whole archive into memory**:
-- **Browse** = one light streaming pass reading only the small entries (`pathname`, `asset.meta`,
-  `preview.png`), skipping the big `asset` payloads, to build a **manifest** cached in the catalog — so
-  listing a pack's contents is instant thereafter, at O(1) memory.
-- **Open/ingest** = a single streaming pass (gzip-decode → tar-walk) that extracts the package **once**
-  into a content-addressed, LRU/size-capped **workspace** on disk (evict + re-extract on demand,
-  idempotent by hash). One full pass beats N partial re-opens, since late entries require streaming the
+- **Browse / analyze** = one light streaming pass reading only the small entries (`pathname`,
+  `asset.meta`, `preview.png`), skipping the big `asset` payloads, to build a **manifest** cached in
+  the catalog — so listing a pack's contents is instant thereafter, at O(1) memory. The manifest
+  records each payload's **`tar_offset`/`size_bytes`**, which is what makes the surgical pull below
+  possible, and importing the pack mints an **in-pack `asset` per entry** from it
+  ([`DATA-MODEL.md`](DATA-MODEL.md) §7 / M14) — no payload is read.
+- **Surgical pull** = one gzip skip-scan (decompress-and-discard to a payload's offset, copy just that
+  payload, ignore the rest — `extract_at_offsets`). This is the workhorse for **preview**, **identify**
+  and single-file **Add to project**: the pack is never fully unpacked. **Identify pulls into memory**
+  and decodes there (embed **and** tag off the one decoded buffer, then drop it) — no file is written,
+  so there is no identify cache; only **preview** and **explicit extraction** write the disposable
+  cache dir (Settings → Storage, §6). Serial, one file at a time — identify does not need to be fast.
+- **Full extraction (materialize)** = a single streaming pass (gzip-decode → tar-walk) that extracts
+  every payload **once** into a content-addressed, LRU/size-capped **workspace** on disk (evict +
+  re-extract on demand, idempotent by hash). This is now **optional** — only when a persistent on-disk
+  copy of the whole pack is wanted (e.g. "keep extracted" cache); a pack is fully searchable *without*
+  it. When wanted, one full pass beats N partial re-opens, since late entries require streaming the
   whole gzip anyway.
-- **After ingest the `.unitypackage` is never reopened**: previews come from the normalized/derived
-  caches (thumbnails, mesh→`.glb`, texture→PNG, audio→WAV), and viewing **lazy-loads just the one
-  file** (mmap/stream) then releases it — so even multi-GB packs stay light, and *every sibling asset
-  in the same pack is random-access on disk* (no re-streaming, no whole-pack-in-RAM).
+- **Once a pack is fully extracted the `.unitypackage` is not reopened for it**: previews come from
+  the normalized/derived caches (thumbnails, mesh→`.glb`, texture→PNG, audio→WAV), and viewing
+  **lazy-loads just the one file** (mmap/stream) then releases it — so even multi-GB packs stay light,
+  and *every sibling asset in the same pack is random-access on disk* (no re-streaming, no
+  whole-pack-in-RAM). An **in-pack** asset that was never materialized instead reopens the archive for
+  a single surgical pull on preview/identify/extract (the grid card and search still come from the
+  catalog + derived caches, so browsing stays light either way).
 - **Workspace retention (warm reopens)** — extracted payloads **persist across sessions**, so a pack
   opened today is still random-access on disk tomorrow with zero re-extraction. Eviction is
   **size-cap first, then age**: within the cap nothing is evicted; under cap pressure, LRU order —

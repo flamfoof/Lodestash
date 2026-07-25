@@ -217,8 +217,13 @@ A first-class destination for starred assets — the go-to loot, one click from 
 
 Dedicated flow for Unity Asset Store packages (e.g. `%AppData%/Roaming/Unity/Asset Store-5.x`).
 **Indexed in place — nothing is copied; files are surgically extracted on demand** (the archive is
-never fully unpacked). Nav glyph = the SVG `ls-unitypackage` cube. Two entry points: the sidebar nav
-item **and** the Add-a-source chooser (§7.4).
+never fully unpacked). Importing a pack **mints a catalog `asset` per entry whose bytes stay inside
+the archive** (in-pack assets, [`DATA-MODEL.md`](../DATA-MODEL.md) §7 / M14), so the pack is a real
+library — searchable, tagged, embedded — **without being unpacked**. Identify runs in place: the
+embedding and tag drains pull one payload at a time into memory, encode it, and drop the bytes.
+Extraction to disk is only for keeping a persistent file (Add to project, or the extracted-cache
+toggle). Nav glyph = the SVG `ls-unitypackage` cube. Two entry points: the sidebar nav item **and**
+the Add-a-source chooser (§7.4).
 
 ### 5.1 Sources & per-source blacklist (Settings → Sources)
 Watched sources each have: status dot, name, mono path, meta, an **exclusions/blacklist** disclosure,
@@ -238,7 +243,9 @@ indexing skips them. `+ Add source` opens the chooser (§7.4). Persist blacklist
 - **Category filter tabs** (All / 3D / Audio / Code / UI / Materials) filter the list.
 - **Footer:** “indexed in place — no files are copied”, a running **N selected** count, and **Import
   as libraries**. Each selected `.unitypackage` becomes **one Library** (named by the package,
-  publisher as subtitle).
+  publisher as subtitle). Import reads each pack's manifest and **mints an in-pack `asset` per entry**
+  (DATA-MODEL §7 / M14) — the Library and its cards exist immediately; identify runs in the background
+  off the drains, never blocking import.
 
 ### 5.3 Unity Assets landing
 Cards for each imported package: `ls-unitypackage` mark, name, publisher · version, category badge,
@@ -249,7 +256,13 @@ mono path, `N assets · size`, **↻ Sync** (re-scan archive index), **Open →*
   Sync**, and **＋ Add to Library / ✓ In Libraries · remove** (§5.5).
 - **Left rail:** the **surgically-extracted** file tree, grouped by in-archive folder (Prefabs /
   Models / Textures / Materials / Audio / Scripts), each entry typed with a glyph+colour.
-- **Right pane — per-asset preview**, extracted without unpacking the whole archive:
+- **Right pane — per-asset preview**, extracted without unpacking the whole archive: clicking a file
+  pulls **that one payload** (one gzip skip-scan) into the preview/extraction **cache dir** (its
+  location is a Settings option, §6) and shows it. Nothing else is unpacked; no grid row is created by
+  a preview.
+  - **Provenance block:** the **source `.unitypackage` absolute path**, the in-archive path + GUID +
+    size, and the **cache path** the payload was pulled to. This is the right panel's record of *where
+    the file really lives* vs *where it was temporarily materialized*.
   - **3D model** → orbit/zoom viewport with tri/vert/material readout.
   - **Texture / material** → checker-backed swatch + dimensions/format.
   - **Audio** → peak waveform + transport: circular play/pause, a **seek timeline** (drag/click
@@ -267,7 +280,9 @@ mono path, `N assets · size`, **↻ Sync** (re-scan archive index), **Open →*
   The *Unity Assets* screen keeps the preview/browse view; pinning is what makes it a first-class
   library. A pinned library **persists until removed** — the pin is a **`package.pinned` flag on the
   catalog `package` row** (DATA-MODEL §7, M7), not a separate config list; its assets surface in the
-  grid through the existing `asset.package_id` join.
+  grid through the existing `asset.package_id` join. Because import mints the in-pack `asset` rows
+  (§5.2, M14), pinning surfaces a full grid **before any extraction** — the cards are in-pack assets,
+  materialized to disk only when the user previews or adds them to a project.
 - **Remove** two ways: the sidebar facet `✕`, or the browse-header toggle (**✓ In Libraries ·
   remove**). Removing drops the facet, pulls its assets out of the grid, and resets the filter to All
   if that library was active.
@@ -300,7 +315,11 @@ Scrollable, max content width ~760px, section cards on `SURFACE`. Sections:
   `suggest_tags`, `add_tag`/`retag`, …); keep **MCP↔REST 1:1** (`MCP-AND-ENGINES.md §2`,
   `ENGINE-API.md §2`). (Names must match the canonical inventory — §1.6 already uses `search_assets`.)
 - **6.6 Storage caps** — preview-cache limit slider + live usage bar (scales with on-screen quality;
-  `WARNING` near / `DANGER` over cap) + **auto-purge over cap** toggle.
+  `WARNING` near / `DANGER` over cap) + **auto-purge over cap** toggle. Also holds the **cache
+  directory location** — where surgically-pulled previews and on-demand extractions are written
+  (defaults to the OS temp dir; **Change…** picks another, **Reveal** opens it). This cache is
+  disposable and LRU-evicted to the cap; identify never writes it (in-pack identify decodes in memory,
+  DATA-MODEL §7 / M14).
 - **6.7 Engine bridge** — live bridge to the connected engine/project.
 - **6.8 First-run setup toggle** — the Settings-side control for `skip_onboarding`; bound to the
   onboarding’s “Don’t show this next time” checkbox (they are one persisted boolean, inverse of each
