@@ -461,6 +461,21 @@ impl Catalog {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// The root path of the `import_source` a package belongs to — what the UI must track as a
+    /// (pack-only) scan root for the package's in-pack assets to hydrate into the grid (M14).
+    pub fn package_source_root(&self, package_id: i64) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT s.root_path FROM package p
+                   JOIN import_source s ON s.id = p.source_id
+                  WHERE p.id = ?1",
+                params![package_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| CoreError::Catalog(format!("package source root: {e}")))
+    }
+
     /// Stamp a package as unpacked with its ingested asset count (DATA-MODEL §7).
     pub fn mark_package_unpacked(&self, package_id: i64, asset_count: usize) -> Result<()> {
         self.conn

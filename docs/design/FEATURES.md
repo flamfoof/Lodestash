@@ -249,30 +249,33 @@ indexing skips them. `+ Add source` opens the chooser (§7.4). Persist blacklist
 
 ### 5.3 Unity Assets landing
 Cards for each imported package: `ls-unitypackage` mark, name, publisher · version, category badge,
-mono path, `N assets · size`, **↻ Sync** (re-scan archive index), **Open →** (browse/preview §5.4).
+mono path, `N assets · size`, **↻ Sync** (re-scan archive index), **Open →** (open as a library and
+browse it in the folder explorer, §5.4).
 
-### 5.4 Browse / preview one package
-- **Header:** back, mark, name + category badge, path, `N assets · size · indexed in place`, **↻
-  Sync**, and **＋ Add to Library / ✓ In Libraries · remove** (§5.5).
-- **Left rail:** the **surgically-extracted** file tree, grouped by in-archive folder (Prefabs /
-  Models / Textures / Materials / Audio / Scripts), each entry typed with a glyph+colour.
-- **Right pane — per-asset preview**, extracted without unpacking the whole archive: clicking a file
-  pulls **that one payload** (one gzip skip-scan) into the preview/extraction **cache dir** (its
-  location is a Settings option, §6) and shows it. Nothing else is unpacked; no grid row is created by
-  a preview.
-  - **Provenance block:** the **source `.unitypackage` absolute path**, the in-archive path + GUID +
-    size, and the **cache path** the payload was pulled to. This is the right panel's record of *where
-    the file really lives* vs *where it was temporarily materialized*.
-  - **3D model** → orbit/zoom viewport with tri/vert/material readout.
-  - **Texture / material** → checker-backed swatch + dimensions/format.
-  - **Audio** → peak waveform + transport: circular play/pause, a **seek timeline** (drag/click
-    to scrub), elapsed/total time, sample-rate/channels, and a **global volume** control
-    (persisted, applies to all playback). *(App-added beyond the prototype's static waveform +
-    play/pause; the prototype has no volume control.)*
-  - **Prefab** → resolved object hierarchy tree.
-  - **Script** → line-numbered code peek.
-- **⇢ Add to project** (per asset) copies that file **plus its resolved dependencies** into the open
-  Unity project — resolved from the package’s own dependency graph, not the whole archive.
+### 5.4 Browse one package — the folder explorer
+**Open → makes the pack a library and navigates it in the ordinary library browser**, not a separate
+extraction panel. Opening **pins** the pack (§5.5) and **mints an in-pack `asset` per entry** (M14,
+DATA-MODEL §7) in the background — no extraction — then jumps into the library grid **filtered to that
+pack**, in **Folders view** rooted at the pack's top folder. This reuses one browser (grid/list,
+Quick Look, breadcrumb) for on-disk libraries and packs alike; there is no bespoke pack-browse tree.
+
+- **Folder navigation:** the in-archive directory tree (each asset's `Assets/…` path), navigated by
+  folder tiles + breadcrumb, with **← / → back-forward** history and Backspace = up. Re-opening an
+  already-surfaced pack is instant.
+- **Two view modes** (the grid's own toggle): **thumbnails** (grid cards) or a **file list** with
+  **folders first**, then assets. Thumbnails and previews are pulled from the archive on demand — a
+  card's thumbnail and a Quick Look both surgically pull **that one payload** (one gzip skip-scan) into
+  the preview/extraction **cache dir** (its location is a Settings option, §6). Nothing else is
+  unpacked; browsing writes no files.
+- **Preview a file** = Quick Look on its card (Space / ⤢), the same viewers the grid uses — image
+  zoom/pan, 3D orbit viewport, audio transport. The **inspector** carries the provenance block: the
+  **source `.unitypackage` absolute path**, the in-archive path + GUID + size, and the **cache path**
+  a pulled payload was materialized to — *where the file really lives* vs *where it was temporarily
+  materialized*. (Script/prefab/material viewers are the remaining per-type work.)
+- **⇢ Add to project** (per asset or selection) copies that file **plus its resolved dependencies**
+  into the open Unity project — resolved from the package's own dependency graph, not the whole
+  archive. This is the one action that **materializes** payloads to disk (fills `workspace_rel`);
+  browse and preview never do.
 
 ### 5.5 Add to Library (grid promotion) + remove
 - **Add to Library** pins the package into the sidebar **LIBRARIES** list and surfaces its assets in

@@ -327,17 +327,6 @@ struct ImportScan {
     selected: std::collections::BTreeSet<usize>,
 }
 
-/// A finished manifest read for a catalog package (FEATURES.md §5.4 Open →).
-struct ManifestRead {
-    package_id: i64,
-    name: String,
-    abs_path: PathBuf,
-    source_idx: usize,
-    /// Tray row to close when this lands.
-    job: u64,
-    entries: Result<Vec<PackageEntryRecord>, String>,
-}
-
 /// `PendingPackage.source_idx` for a pack opened from the catalog that lies outside every
 /// library source: browse and preview work, extraction has nowhere to persist to.
 const NO_SOURCE: usize = usize::MAX;
@@ -760,6 +749,11 @@ pub struct LodestashApp {
     source_filter: Option<LibraryFilter>,
     /// Folders mode location: None = top level (source tiles); Some = (source, dir rel to root).
     current_dir: Option<(usize, PathBuf)>,
+    /// Folder-navigation history for the ← / → buttons: each visited `current_dir`, newest at the
+    /// back, with `nav_cursor` pointing at the current position. Navigating forward from the middle
+    /// truncates the tail (standard browser history). Reset when the library reloads.
+    nav_history: Vec<Option<(usize, PathBuf)>>,
+    nav_cursor: usize,
     /// Child folders at `current_dir`: (name, contained-asset count). Rebuilt with the cache.
     folder_tiles: Vec<(String, usize)>,
     /// Bumped on every folder navigation so the grid ScrollArea gets fresh scroll state.
@@ -813,16 +807,14 @@ pub struct LodestashApp {
     peek: Option<PackagePeek>,
     peek_rx: Receiver<Result<PackagePeek, String>>,
     peek_tx: Sender<Result<PackagePeek, String>>,
-    /// Packages whose manifest is being read right now — Open → is one click, and a second
-    /// one must not start a second pass over the same archive.
-    manifest_reading: std::collections::BTreeSet<i64>,
     /// In-pack asset locators (DATA-MODEL §7 / M14): `asset_id → (pack path, tar offset, size)`.
     /// Lives beside the grid entries (refreshed per hydrate) rather than on `AssetEntry`, so the
     /// grid plumbing stays unchanged; the thumbnail and preview paths look a payload up here to
     /// pull it from the archive on demand.
     in_pack_locators: std::collections::HashMap<i64, (String, i64, i64)>,
-    manifest_rx: Receiver<ManifestRead>,
-    manifest_tx: Sender<ManifestRead>,
+    /// A pack the user pressed **Open →** on: once its in-pack assets land in the grid (via the
+    /// background mint + hydrate), the browser jumps into it in Folders view (FEATURES.md §5.4).
+    pending_pack_browse: Option<String>,
     /// Signalled by a background in-pack mint (import / Add-to-Library) once its assets exist,
     /// so the grid re-hydrates and the new pack library appears (M14).
     rehydrate_rx: Receiver<()>,
@@ -947,7 +939,6 @@ impl LodestashApp {
         let (scan_tx, scan_rx) = mpsc::channel();
         let (extract_tx, extract_rx) = mpsc::channel();
         let (peek_tx, peek_rx) = mpsc::channel();
-        let (manifest_tx, manifest_rx) = mpsc::channel();
         let (rehydrate_tx, rehydrate_rx) = mpsc::channel::<()>();
         let (import_tx, import_rx) = mpsc::channel();
         let (catalog_tx, catalog_rx) = mpsc::channel();
@@ -991,6 +982,8 @@ impl LodestashApp {
             view_mode,
             source_filter: None,
             current_dir: None,
+            nav_history: vec![None],
+            nav_cursor: 0,
             folder_tiles: Vec::new(),
             nav_generation: 0,
             page: 0,
@@ -1022,10 +1015,8 @@ impl LodestashApp {
             peek: None,
             peek_rx,
             peek_tx,
-            manifest_reading: std::collections::BTreeSet::new(),
             in_pack_locators: std::collections::HashMap::new(),
-            manifest_rx,
-            manifest_tx,
+            pending_pack_browse: None,
             rehydrate_rx,
             rehydrate_tx,
             import_scan: None,
@@ -1233,6 +1224,7 @@ impl LodestashApp {
         self.quick_look = false;
         self.source_filter = None;
         self.current_dir = None;
+        self.reset_nav_history();
         self.folder_tiles = Vec::new();
         self.nav_generation += 1;
         self.page = 0;
@@ -1582,11 +1574,23 @@ impl LodestashApp {
                 }
             }
             self.current_dir = self.default_dir();
+            self.reset_nav_history();
             self.recompute_tab_counts();
             self.cache_dirty = true;
             self.last_cols = 0;
             self.last_row_start = usize::MAX;
             self.last_row_end = 0;
+            // A pending Open → jumps into the pack's folder explorer once its assets have landed.
+            if let Some(name) = self.pending_pack_browse.clone() {
+                if self
+                    .entries
+                    .iter()
+                    .any(|e| e.package.as_deref() == Some(name.as_str()))
+                {
+                    self.pending_pack_browse = None;
+                    self.browse_package_folders(name);
+                }
+            }
             tracing::info!(entries = self.entries.len(), "hydrated grid from catalog");
             // A hydrate skips the persist thread, and the embed/metric drains live inside it —
             // so a library that was catalogued before the AI models arrived would never encode.
@@ -1689,6 +1693,7 @@ impl LodestashApp {
             self.selected.clear();
             self.select_anchor = None;
             self.current_dir = self.default_dir();
+            self.reset_nav_history();
             self.recompute_tab_counts();
             self.cache_dirty = true;
             self.last_cols = 0;
@@ -3151,6 +3156,24 @@ impl LodestashApp {
         self.nav_to(None);
     }
 
+    /// Open a pack in the **folder-explorer** (FEATURES.md §5.4): the library grid filtered to the
+    /// pack, in Folders view rooted at the pack's top folder, with a fresh back/forward history.
+    fn browse_package_folders(&mut self, name: String) {
+        self.source_filter = Some(LibraryFilter::Package(name));
+        self.screen = Screen::Library;
+        // Switch to Folders for this browse without clobbering the saved default view mode.
+        self.view_mode = ViewMode::Folders;
+        // Root the explorer at the pack's own source; folder tiles below are its in-archive dirs.
+        let src = self
+            .entries
+            .iter()
+            .find(|e| matches!(&self.source_filter, Some(LibraryFilter::Package(p)) if e.package.as_deref() == Some(p.as_str())))
+            .map(|e| e.source_idx)
+            .unwrap_or(0);
+        self.apply_dir(Some((src, PathBuf::new())));
+        self.reset_nav_history();
+    }
+
     /// Queue every selected pack that can actually be unpacked, then start the first one.
     /// Selections whose cache root isn't a library source yet are left ticked and reported —
     /// silently dropping them would look like the button did nothing.
@@ -4092,6 +4115,7 @@ impl LodestashApp {
         self.search.clear();
         self.content_filter.clear();
         self.current_dir = self.default_dir();
+        self.reset_nav_history();
         self.selected_cache_idx = None;
         self.nav_generation += 1;
         self.cache_dirty = true;
@@ -4882,7 +4906,7 @@ impl LodestashApp {
         }
         if let Some(i) = open_pkg {
             if let Some(pkg) = packages.get(i) {
-                self.open_package_browse(pkg);
+                self.open_package_browse(ctx, pkg);
             }
         }
         if import_clicked {
@@ -4962,16 +4986,26 @@ impl LodestashApp {
     /// Open a catalog package for browse/pick-and-extract (FEATURES.md §5.4). The manifest
     /// locators were persisted when the pack was first indexed, so this needs no second scan
     /// of the archive — which is what makes a pack's contents retrievable in a later session.
-    fn open_package_browse(&mut self, pkg: &lodestash_core::catalog::PackageListing) {
-        let abs_path = PathBuf::from(&pkg.package_path);
-        if let Some(p) = self
-            .pending_packages
-            .iter_mut()
-            .find(|p| p.abs_path == abs_path)
+    /// **Open →** a pack (FEATURES.md §5.4): add it as a library and browse it in the folder
+    /// explorer. Opening pins the pack, tracks its source folder as a pack-only scan root, mints
+    /// its in-pack assets in the background (no extraction — bytes are pulled on demand), and jumps
+    /// into its folders once they land. Re-opening an already-surfaced pack is instant.
+    fn open_package_browse(
+        &mut self,
+        ctx: &egui::Context,
+        pkg: &lodestash_core::catalog::PackageListing,
+    ) {
+        let name = pkg.name.clone();
+        // Already surfaced in the grid → straight into its folders.
+        if self
+            .entries
+            .iter()
+            .any(|e| e.package.as_deref() == Some(name.as_str()))
         {
-            p.browsing = true;
+            self.browse_package_folders(name);
             return;
         }
+        let abs_path = PathBuf::from(&pkg.package_path);
         if !abs_path.exists() {
             self.jobs.toast(
                 format!("Archive is gone from {}", pkg.package_path),
@@ -4979,46 +5013,56 @@ impl LodestashApp {
             );
             return;
         }
-        // Browsing and previewing are read-only, so a pack that sits outside every library
-        // source can still be opened; only *extraction* needs a source row to persist into,
-        // and it says so at that point (`NO_SOURCE`).
-        let source_idx = self
-            .scan_roots
-            .iter()
-            .position(|r| abs_path.starts_with(r))
-            .unwrap_or(NO_SOURCE);
-        let entries = match catalog_db_path()
-            .ok_or_else(|| lodestash_core::error::CoreError::Catalog("no catalog".into()))
-            .and_then(|db| Catalog::open(&db).and_then(|c| c.list_package_entries(pkg.id)))
-        {
-            Ok(entries) => entries,
-            Err(err) => {
-                tracing::warn!(%err, package = %pkg.name, "package entry read failed");
-                Vec::new()
-            }
-        };
-        if entries.is_empty() {
-            // A pack the catalog knows only by name (browse-only row, or indexed before the
-            // locators were recorded): read its manifest once, off-thread, and keep it.
-            self.read_manifest_for(pkg, source_idx, abs_path);
+        let Some(db_path) = catalog_db_path() else {
             return;
-        }
-        self.pending_packages.push(PendingPackage {
-            source_idx,
-            abs_path,
-            display_name: pkg.name.clone(),
-            // ponytail: a rehydrated pack offers pick-and-extract only. Re-deriving the
-            // render-pipeline-variant wrapper list needs the ingest-side manifest types;
-            // re-scan the folder if a wrapper needs its variant chosen.
-            nested_candidates: Vec::new(),
-            chosen_variant: 0,
-            extracting: false,
-            progress: Arc::default(),
-            entries,
-            job: None,
-            browsing: true,
-            picked: std::collections::BTreeSet::new(),
+        };
+        let package_id = pkg.id;
+
+        // Track the pack's source folder as a pack-only library so the hydrate surfaces its
+        // in-pack assets (they carry that source's id). Then load that project view.
+        let proj = self.project_name.clone().unwrap_or_else(|| {
+            let root = abs_path
+                .parent()
+                .map(PathBuf::from)
+                .unwrap_or(abs_path.clone());
+            self.config.record_open(root)
         });
+        if let Ok(Some(root)) =
+            Catalog::open(&db_path).and_then(|c| c.package_source_root(package_id))
+        {
+            self.config.add_pack_only_source(&proj, PathBuf::from(root));
+        }
+
+        // Browse into the pack once its assets land (set before the background mint kicks off).
+        self.pending_pack_browse = Some(name.clone());
+
+        // Background: pin + ensure minted, then signal a re-hydrate.
+        let tx = self.rehydrate_tx.clone();
+        let ctx2 = ctx.clone();
+        let path = abs_path.clone();
+        std::thread::spawn(move || {
+            if let Ok(c) = Catalog::open(&db_path) {
+                if let Err(err) = c.set_package_pinned(package_id, true) {
+                    tracing::warn!(%err, package_id, "open: pin failed");
+                }
+            }
+            if let Err(err) = ensure_in_pack_minted(&db_path, package_id, &path) {
+                tracing::warn!(%err, package_id, "open: in-pack mint failed");
+            }
+            let _ = tx.send(());
+            ctx2.request_repaint();
+        });
+
+        self.jobs
+            .toast(format!("Opening {name}\u{2026}"), Intent::Success);
+        // Bring the pack's source folder into the active project view; the crawl skips it
+        // (pack-only) and the hydrate surfaces its packs once the background mint signals.
+        let live: Vec<PathBuf> = self
+            .config
+            .project_by_name(&proj)
+            .map(|p| p.live_paths().iter().map(|p| p.to_path_buf()).collect())
+            .unwrap_or_default();
+        self.load_paths(ctx, live, Some(proj));
     }
 
     /// The §5.2 dialog: the packs found under the picked folder, grouped by the folder that
@@ -5337,107 +5381,6 @@ impl LodestashApp {
                 tracing::warn!(%err, "package import failed");
                 self.jobs
                     .toast(format!("Import failed \u{2014} {err}"), Intent::Danger);
-            }
-        }
-    }
-
-    /// Read a pack's manifest on a worker thread and record its locators, so the next Open →
-    /// (and every later session) is a catalog read. One pass over the archive, no payload
-    /// bytes buffered — the same browse pass the crawler does.
-    fn read_manifest_for(
-        &mut self,
-        pkg: &lodestash_core::catalog::PackageListing,
-        source_idx: usize,
-        abs_path: PathBuf,
-    ) {
-        if self.manifest_reading.contains(&pkg.id) {
-            return;
-        }
-        self.manifest_reading.insert(pkg.id);
-        let job = self.jobs.start(
-            format!("Reading the contents of {}", pkg.name),
-            Arc::default(),
-            false,
-        );
-        let (package_id, name) = (pkg.id, pkg.name.clone());
-        let tx = self.manifest_tx.clone();
-        std::thread::spawn(move || {
-            let entries = unitypackage::read_manifest(&abs_path).map(|manifest| {
-                manifest
-                    .iter()
-                    .map(|e| PackageEntryRecord {
-                        guid: e.guid.clone(),
-                        pathname: e.pathname.clone(),
-                        tar_offset: e.asset_offset.map(|o| o as i64),
-                        size_bytes: e.asset_size.map(|s| s as i64),
-                    })
-                    .collect::<Vec<_>>()
-            });
-            // Write-behind so the next Open → doesn't re-read the archive, and mint an in-pack
-            // asset per classified entry (M14) so the pack is a searchable library without being
-            // unpacked (DATA-MODEL §7). Both writes ride one connection, sequentially.
-            if let (Ok(entries), Some(db)) = (&entries, catalog_db_path()) {
-                match Catalog::open(&db) {
-                    Ok(mut c) => {
-                        if let Err(err) = c.record_package_entries(package_id, entries) {
-                            tracing::warn!(%err, package_id, "recording manifest locators failed");
-                        }
-                        let classified = classify_in_pack_entries(entries);
-                        match c.mint_in_pack_assets(package_id, &classified) {
-                            Ok(stats) => tracing::info!(
-                                package_id,
-                                minted = stats.inserted,
-                                "in-pack assets minted"
-                            ),
-                            Err(err) => {
-                                tracing::warn!(%err, package_id, "minting in-pack assets failed")
-                            }
-                        }
-                    }
-                    Err(err) => tracing::warn!(%err, package_id, "catalog open for mint failed"),
-                }
-            }
-            let _ = tx.send(ManifestRead {
-                package_id,
-                name,
-                abs_path,
-                source_idx,
-                job,
-                entries: entries.map_err(|e| e.to_string()),
-            });
-        });
-    }
-
-    fn receive_manifests(&mut self) {
-        while let Ok(msg) = self.manifest_rx.try_recv() {
-            self.jobs.finish(msg.job);
-            self.manifest_reading.remove(&msg.package_id);
-            match msg.entries {
-                Ok(entries) if !entries.is_empty() => {
-                    self.pending_packages.push(PendingPackage {
-                        source_idx: msg.source_idx,
-                        abs_path: msg.abs_path,
-                        display_name: msg.name,
-                        nested_candidates: Vec::new(),
-                        chosen_variant: 0,
-                        extracting: false,
-                        progress: Arc::default(),
-                        entries,
-                        job: None,
-                        browsing: true,
-                        picked: std::collections::BTreeSet::new(),
-                    });
-                }
-                Ok(_) => self
-                    .jobs
-                    .toast(format!("{} has no assets in it", msg.name), Intent::Warning),
-                Err(err) => {
-                    tracing::warn!(%err, package = %msg.name, "manifest read failed");
-                    self.jobs.toast(
-                        format!("Couldn't read {} \u{2014} {err}", msg.name),
-                        Intent::Danger,
-                    );
-                }
             }
         }
     }
@@ -6440,12 +6383,53 @@ impl LodestashApp {
         (self.scan_roots.len() == 1).then(|| (0, PathBuf::new()))
     }
 
-    fn nav_to(&mut self, dir: Option<(usize, PathBuf)>) {
+    /// Apply a folder location (shared by nav_to / back / forward) without touching history.
+    fn apply_dir(&mut self, dir: Option<(usize, PathBuf)>) {
         self.current_dir = dir;
         self.cache_dirty = true;
         self.nav_generation += 1;
         self.selected_cache_idx = None;
         self.quick_look = false;
+    }
+
+    fn nav_to(&mut self, dir: Option<(usize, PathBuf)>) {
+        if self.nav_history.get(self.nav_cursor) == Some(&dir) {
+            return; // already at this location — don't stack a duplicate
+        }
+        self.apply_dir(dir.clone());
+        self.nav_history.truncate(self.nav_cursor + 1);
+        self.nav_history.push(dir);
+        self.nav_cursor = self.nav_history.len() - 1;
+    }
+
+    /// Reset navigation history to the current location (on library reload / package open).
+    fn reset_nav_history(&mut self) {
+        self.nav_history = vec![self.current_dir.clone()];
+        self.nav_cursor = 0;
+    }
+
+    fn can_go_back(&self) -> bool {
+        self.nav_cursor > 0
+    }
+
+    fn can_go_forward(&self) -> bool {
+        self.nav_cursor + 1 < self.nav_history.len()
+    }
+
+    fn nav_back(&mut self) {
+        if self.can_go_back() {
+            self.nav_cursor -= 1;
+            let dir = self.nav_history[self.nav_cursor].clone();
+            self.apply_dir(dir);
+        }
+    }
+
+    fn nav_forward(&mut self) {
+        if self.can_go_forward() {
+            self.nav_cursor += 1;
+            let dir = self.nav_history[self.nav_cursor].clone();
+            self.apply_dir(dir);
+        }
     }
 
     /// Up one folder level; from a source root to the top level (multi-source only).
@@ -6481,8 +6465,26 @@ impl LodestashApp {
             ui.label(RichText::new("/").color(theme::TEXT_DIM).size(12.0));
         };
 
+        let (can_back, can_fwd) = (self.can_go_back(), self.can_go_forward());
+        let mut go_back = false;
+        let mut go_fwd = false;
+
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
+            let arrow = |ui: &mut Ui, glyph: &str, enabled: bool| -> bool {
+                ui.add_enabled(
+                    enabled,
+                    egui::Button::new(RichText::new(glyph).size(14.0)).frame(false),
+                )
+                .on_hover_text(if glyph == "\u{2190}" {
+                    "Back"
+                } else {
+                    "Forward"
+                })
+                .clicked()
+            };
+            go_back |= arrow(ui, "\u{2190}", can_back);
+            go_fwd |= arrow(ui, "\u{2192}", can_fwd);
             if multi && crumb(ui, "All libraries", self.current_dir.is_none()) {
                 nav = Some(None);
             }
@@ -6509,6 +6511,11 @@ impl LodestashApp {
                 }
             }
         });
+        if go_back {
+            self.nav_back();
+        } else if go_fwd {
+            self.nav_forward();
+        }
         ui.add_space(6.0);
 
         // Folder tiles (hidden while searching — search shows subtree results flat).
@@ -6785,7 +6792,6 @@ impl eframe::App for LodestashApp {
         self.receive_thumbnails();
         self.receive_extracts();
         self.receive_peek(ctx);
-        self.receive_manifests();
         self.receive_import_scan();
         self.receive_rehydrate(ctx);
         // A finished extraction frees the slot the batch queue waits on.
