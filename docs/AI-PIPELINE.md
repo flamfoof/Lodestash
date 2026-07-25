@@ -28,6 +28,15 @@ come from the **same model**.
 
 ## 2. The local-vs-API abstraction
 
+**Identification is manual by default.** Both embeddings (SigLIP/CLAP) and local-LLM tagging run on
+the CPU here, so a hydrate never auto-identifies unless the user opts in (`config.auto_identify`,
+Settings ▸ AI · IDENTIFY, default off). With it off, a scan/hydrate runs only the cheap drains
+(technical facets, dependency graph, status promotion); embeddings and tags run when the user presses
+**Identify** — which does embeddings *then* tags in one pass. With it on, new unidentified assets are
+drained in the background as they appear. This matters most for in-pack libraries (DATA-MODEL §7 /
+M14): importing/opening a pack mints thousands of dirty assets at once, and auto-embedding them all
+would peg a core for minutes.
+
 ```rust
 trait Tagger {
     fn model_id(&self) -> &str;                       // recorded on every tag (asset_tag.model_id)
