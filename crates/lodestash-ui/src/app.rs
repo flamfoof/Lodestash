@@ -7054,41 +7054,45 @@ impl LodestashApp {
         if !self.folder_tiles.is_empty() && self.search.is_empty() {
             let tiles = self.folder_tiles.clone();
             let mut clicked: Option<usize> = None;
+            // A vertical list (one folder per row) reads far better than wrapped chips when
+            // perusing a package's directories.
             ScrollArea::vertical()
                 .id_salt("folder_tiles")
-                .max_height(150.0)
+                .max_height(320.0)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
-                        for (i, tile) in tiles.iter().enumerate() {
-                            // `direct (recursive)` — e.g. `3 (50)`; drop the parenthetical when the
-                            // folder has no deeper assets (direct == recursive).
-                            let count = if tile.recursive > tile.direct {
-                                format!("{} ({})", tile.direct, tile.recursive)
-                            } else {
-                                tile.direct.to_string()
-                            };
-                            let btn = egui::Button::new(
-                                RichText::new(format!("\u{1F4C1} {}   {count}", tile.name))
-                                    .color(theme::TEXT)
-                                    .size(13.5),
-                            )
-                            .fill(theme::SURFACE)
-                            .stroke(egui::Stroke::new(1.0, theme::BORDER))
-                            .min_size(Vec2::new(0.0, 34.0));
-                            if ui
-                                .add(btn)
-                                .on_hover_text(format!(
-                                    "{} \u{2014} {} here, {} in total",
-                                    tile.name, tile.direct, tile.recursive
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for (i, tile) in tiles.iter().enumerate() {
+                        // `direct (recursive)` — e.g. `3 (50)`; drop the parenthetical when the
+                        // folder has no deeper assets (direct == recursive).
+                        let count = if tile.recursive > tile.direct {
+                            format!("{} ({})", tile.direct, tile.recursive)
+                        } else {
+                            tile.direct.to_string()
+                        };
+                        let full = ui.available_width();
+                        let resp = ui.add_sized(
+                            [full, 26.0],
+                            egui::SelectableLabel::new(
+                                false,
+                                RichText::new(format!(
+                                    "\u{1F4C1}  {}\u{2003}\u{00B7} {count}",
+                                    tile.name
                                 ))
-                                .clicked()
-                            {
-                                clicked = Some(i);
-                            }
+                                .color(theme::TEXT)
+                                .size(13.0),
+                            ),
+                        );
+                        if resp
+                            .on_hover_text(format!(
+                                "{} \u{2014} {} here, {} in total",
+                                tile.name, tile.direct, tile.recursive
+                            ))
+                            .clicked()
+                        {
+                            clicked = Some(i);
                         }
-                    });
+                    }
                 });
             ui.add_space(8.0);
             if let Some(i) = clicked {
