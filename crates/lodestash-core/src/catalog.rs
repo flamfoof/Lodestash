@@ -86,9 +86,12 @@ pub struct EmbedJob {
 
 /// A dirty asset the **vision** embedder can encode (SigLIP): a 2D image, or a 3D model that
 /// gets multiview-rendered first. `media_code` tells the caller which path to take.
-/// Exactly one location is set: `disk_path` for on-disk source files, or `workspace_rel` for
-/// package-extracted files (the caller joins it onto the extraction workspace dir, which the
-/// catalog doesn't know).
+/// Where the job's bytes are, in the §7 precedence order — exactly one location applies:
+/// `disk_path` for a true on-disk source file, `workspace_rel` for a package-extracted file (the
+/// caller joins it onto the extraction workspace dir), or the in-pack locator
+/// (`pack_path`+`pack_offset`+`pack_size`) for an asset whose bytes are still inside a
+/// `.unitypackage` (DATA-MODEL §7 / M14) — the drain pulls that one payload into memory to identify
+/// it without extracting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VisualEmbedJob {
     pub asset_id: i64,
@@ -98,6 +101,13 @@ pub struct VisualEmbedJob {
     pub source_id: i64,
     /// `media_type.code` — `image`/`texture`/`sprite` decode directly, `model_3d` renders first.
     pub media_code: String,
+    /// In-pack locator: absolute `.unitypackage` path holding this asset's payload.
+    pub pack_path: Option<String>,
+    pub pack_offset: Option<i64>,
+    pub pack_size: Option<i64>,
+    /// The file's extension (lowercased, no dot) — the decode-dispatch hint for an in-pack
+    /// payload pulled into memory, where there is no path to read it from.
+    pub ext: Option<String>,
 }
 
 impl StatusCounts {
@@ -1815,13 +1825,16 @@ impl Catalog {
             .conn
             .prepare(
                 "SELECT a.id,
-                        CASE WHEN af.workspace_rel IS NULL
+                        CASE WHEN af.workspace_rel IS NULL AND af.package_entry_id IS NULL
                              THEN s.root_path || '/' || af.rel_path END,
-                        af.workspace_rel, a.media_type_id, a.source_id, mt.code
+                        af.workspace_rel, a.media_type_id, a.source_id, mt.code,
+                        pk.package_path, pe.tar_offset, pe.size_bytes, af.ext
                  FROM asset a
                  JOIN media_type mt   ON mt.id = a.media_type_id
                  JOIN import_source s ON s.id = a.source_id
                  JOIN asset_file af   ON af.asset_id = a.id
+                 LEFT JOIN package_entry pe ON pe.id = af.package_entry_id
+                 LEFT JOIN package pk       ON pk.id = pe.package_id
                  WHERE a.embedding_dirty = 1 AND a.deleted_at IS NULL
                    AND af.missing = 0
                    AND mt.code IN ('image', 'texture', 'sprite', 'model_3d')
@@ -1837,6 +1850,10 @@ impl Catalog {
                     media_type_id: r.get(3)?,
                     source_id: r.get(4)?,
                     media_code: r.get(5)?,
+                    pack_path: r.get(6)?,
+                    pack_offset: r.get(7)?,
+                    pack_size: r.get(8)?,
+                    ext: r.get(9)?,
                 })
             })
             .map_err(|e| CoreError::Catalog(format!("visual embed queue query: {e}")))?;
@@ -1852,13 +1869,16 @@ impl Catalog {
             .conn
             .prepare(
                 "SELECT a.id,
-                        CASE WHEN af.workspace_rel IS NULL
+                        CASE WHEN af.workspace_rel IS NULL AND af.package_entry_id IS NULL
                              THEN s.root_path || '/' || af.rel_path END,
-                        af.workspace_rel, a.media_type_id, a.source_id, mt.code
+                        af.workspace_rel, a.media_type_id, a.source_id, mt.code,
+                        pk.package_path, pe.tar_offset, pe.size_bytes, af.ext
                  FROM asset a
                  JOIN media_type mt   ON mt.id = a.media_type_id
                  JOIN import_source s ON s.id = a.source_id
                  JOIN asset_file af   ON af.asset_id = a.id
+                 LEFT JOIN package_entry pe ON pe.id = af.package_entry_id
+                 LEFT JOIN package pk       ON pk.id = pe.package_id
                  WHERE a.embedding_dirty = 1 AND a.deleted_at IS NULL
                    AND af.missing = 0
                    AND mt.code = 'audio'
@@ -1874,6 +1894,10 @@ impl Catalog {
                     media_type_id: r.get(3)?,
                     source_id: r.get(4)?,
                     media_code: r.get(5)?,
+                    pack_path: r.get(6)?,
+                    pack_offset: r.get(7)?,
+                    pack_size: r.get(8)?,
+                    ext: r.get(9)?,
                 })
             })
             .map_err(|e| CoreError::Catalog(format!("audio embed queue query: {e}")))?;
@@ -1889,13 +1913,16 @@ impl Catalog {
             .conn
             .prepare(
                 "SELECT a.id,
-                        CASE WHEN af.workspace_rel IS NULL
+                        CASE WHEN af.workspace_rel IS NULL AND af.package_entry_id IS NULL
                              THEN s.root_path || '/' || af.rel_path END,
-                        af.workspace_rel, a.media_type_id, a.source_id, mt.code
+                        af.workspace_rel, a.media_type_id, a.source_id, mt.code,
+                        pk.package_path, pe.tar_offset, pe.size_bytes, af.ext
                  FROM asset a
                  JOIN media_type mt   ON mt.id = a.media_type_id
                  JOIN import_source s ON s.id = a.source_id
                  JOIN asset_file af   ON af.id = a.primary_file_id
+                 LEFT JOIN package_entry pe ON pe.id = af.package_entry_id
+                 LEFT JOIN package pk       ON pk.id = pe.package_id
                  WHERE a.metrics_dirty = 1 AND a.deleted_at IS NULL
                    AND af.missing = 0
                  ORDER BY a.id LIMIT ?1",
@@ -1910,6 +1937,10 @@ impl Catalog {
                     media_type_id: r.get(3)?,
                     source_id: r.get(4)?,
                     media_code: r.get(5)?,
+                    pack_path: r.get(6)?,
+                    pack_offset: r.get(7)?,
+                    pack_size: r.get(8)?,
+                    ext: r.get(9)?,
                 })
             })
             .map_err(|e| CoreError::Catalog(format!("metrics queue query: {e}")))?;
@@ -1925,13 +1956,16 @@ impl Catalog {
             .conn
             .prepare(
                 "SELECT a.id,
-                        CASE WHEN af.workspace_rel IS NULL
+                        CASE WHEN af.workspace_rel IS NULL AND af.package_entry_id IS NULL
                              THEN s.root_path || '/' || af.rel_path END,
-                        af.workspace_rel, a.media_type_id, a.source_id, mt.code
+                        af.workspace_rel, a.media_type_id, a.source_id, mt.code,
+                        pk.package_path, pe.tar_offset, pe.size_bytes, af.ext
                  FROM asset a
                  JOIN media_type mt   ON mt.id = a.media_type_id
                  JOIN import_source s ON s.id = a.source_id
                  JOIN asset_file af   ON af.id = a.primary_file_id
+                 LEFT JOIN package_entry pe ON pe.id = af.package_entry_id
+                 LEFT JOIN package pk       ON pk.id = pe.package_id
                  WHERE a.deps_dirty = 1 AND a.deleted_at IS NULL
                    AND af.missing = 0
                  ORDER BY a.id LIMIT ?1",
@@ -1946,6 +1980,10 @@ impl Catalog {
                     media_type_id: r.get(3)?,
                     source_id: r.get(4)?,
                     media_code: r.get(5)?,
+                    pack_path: r.get(6)?,
+                    pack_offset: r.get(7)?,
+                    pack_size: r.get(8)?,
+                    ext: r.get(9)?,
                 })
             })
             .map_err(|e| CoreError::Catalog(format!("dep queue query: {e}")))?;
@@ -2270,13 +2308,16 @@ impl Catalog {
             .conn
             .prepare(
                 "SELECT a.id,
-                        CASE WHEN af.workspace_rel IS NULL
+                        CASE WHEN af.workspace_rel IS NULL AND af.package_entry_id IS NULL
                              THEN s.root_path || '/' || af.rel_path END,
-                        af.workspace_rel, a.media_type_id, a.source_id, mt.code
+                        af.workspace_rel, a.media_type_id, a.source_id, mt.code,
+                        pk.package_path, pe.tar_offset, pe.size_bytes, af.ext
                  FROM asset a
                  JOIN media_type mt   ON mt.id = a.media_type_id
                  JOIN import_source s ON s.id = a.source_id
                  JOIN asset_file af   ON af.id = a.primary_file_id
+                 LEFT JOIN package_entry pe ON pe.id = af.package_entry_id
+                 LEFT JOIN package pk       ON pk.id = pe.package_id
                  WHERE a.tags_dirty = 1 AND a.deleted_at IS NULL
                    AND af.missing = 0
                  ORDER BY a.id LIMIT ?1",
@@ -2291,6 +2332,10 @@ impl Catalog {
                     media_type_id: r.get(3)?,
                     source_id: r.get(4)?,
                     media_code: r.get(5)?,
+                    pack_path: r.get(6)?,
+                    pack_offset: r.get(7)?,
+                    pack_size: r.get(8)?,
+                    ext: r.get(9)?,
                 })
             })
             .map_err(|e| CoreError::Catalog(format!("tag queue query: {e}")))?;
