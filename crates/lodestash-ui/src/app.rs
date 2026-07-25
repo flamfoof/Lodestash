@@ -104,6 +104,15 @@ struct AssetEntry {
     thumb_spawned: bool,
 }
 
+/// A child-folder tile in Folders view: its name, the count of assets **directly** inside it, and
+/// the **recursive** total including everything in its subfolders (shown as `direct (recursive)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FolderTile {
+    name: String,
+    direct: usize,
+    recursive: usize,
+}
+
 struct ThumbReady {
     index: usize,
     /// None when generate_texture fails; sent so pending_thumbs is always decremented.
@@ -754,8 +763,8 @@ pub struct LodestashApp {
     /// truncates the tail (standard browser history). Reset when the library reloads.
     nav_history: Vec<Option<(usize, PathBuf)>>,
     nav_cursor: usize,
-    /// Child folders at `current_dir`: (name, contained-asset count). Rebuilt with the cache.
-    folder_tiles: Vec<(String, usize)>,
+    /// Child folders at `current_dir` (name + direct/recursive counts). Rebuilt with the cache.
+    folder_tiles: Vec<FolderTile>,
     /// In Folders view, render the current directory's assets as a **file list** (folders still
     /// first, as tiles) instead of a thumbnail grid — the pack browser's list/thumbnails toggle
     /// (FEATURES.md §5.4). Session state.
@@ -3179,6 +3188,14 @@ impl LodestashApp {
         self.reset_nav_history();
     }
 
+    /// Leave the pack folder explorer and return to the Unity Assets landing (FEATURES.md §5.3).
+    fn return_to_unity(&mut self) {
+        self.source_filter = None;
+        self.screen = Screen::Unity;
+        self.apply_dir(None);
+        self.reset_nav_history();
+    }
+
     /// Queue every selected pack that can actually be unpacked, then start the first one.
     /// Selections whose cache root isn't a library source yet are left ticked and reported —
     /// silently dropping them would look like the button did nothing.
@@ -3812,7 +3829,12 @@ impl LodestashApp {
                 .contains(&q)
         };
 
-        let (mut idxs, tiles): (Vec<usize>, Vec<(String, usize)>) =
+        // When a pack is the active filter, the folder explorer is scoped to it (its own tree).
+        let pack: Option<String> = match &self.source_filter {
+            Some(LibraryFilter::Package(p)) => Some(p.clone()),
+            _ => None,
+        };
+        let (mut idxs, tiles): (Vec<usize>, Vec<FolderTile>) =
             match (self.view_mode, self.current_dir.clone()) {
                 (ViewMode::Flat, _) | (ViewMode::List, _) => {
                     let filter = self.source_filter.clone();
@@ -3848,7 +3870,11 @@ impl LodestashApp {
                                             && tab.matches(e.file.media_type)
                                     })
                                     .count();
-                                (config::stem_name(root), count)
+                                FolderTile {
+                                    name: config::stem_name(root),
+                                    direct: count,
+                                    recursive: count,
+                                }
                             })
                             .collect();
                         (Vec::new(), tiles)
@@ -3867,7 +3893,7 @@ impl LodestashApp {
                 // searching searches the current subtree.
                 (ViewMode::Folders, Some((src, dir))) => {
                     if q.is_empty() && !ai_active {
-                        folder_children(&self.entries, src, &dir, tab)
+                        folder_children(&self.entries, src, &dir, tab, pack.as_deref())
                     } else {
                         let idxs = self
                             .entries
@@ -3877,6 +3903,9 @@ impl LodestashApp {
                                 e.source_idx == src
                                     && e.file.rel_path.starts_with(&dir)
                                     && tab.matches(e.file.media_type)
+                                    && pack
+                                        .as_deref()
+                                        .map_or(true, |p| e.package.as_deref() == Some(p))
                                     && name_matches(e)
                             })
                             .map(|(i, _)| i)
@@ -6471,8 +6500,13 @@ impl LodestashApp {
         };
 
         let (can_back, can_fwd) = (self.can_go_back(), self.can_go_forward());
+        let active_pack: Option<String> = match &self.source_filter {
+            Some(LibraryFilter::Package(p)) => Some(p.clone()),
+            _ => None,
+        };
         let mut go_back = false;
         let mut go_fwd = false;
+        let mut go_unity = false;
 
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
@@ -6490,17 +6524,51 @@ impl LodestashApp {
             };
             go_back |= arrow(ui, "\u{2190}", can_back);
             go_fwd |= arrow(ui, "\u{2192}", can_fwd);
-            if multi && crumb(ui, "All libraries", self.current_dir.is_none()) {
-                nav = Some(None);
+
+            let (root_src, at_root) = match self.current_dir.clone() {
+                Some((src, dir)) => (Some(src), dir.as_os_str().is_empty()),
+                None => (None, true),
+            };
+
+            if let Some(pack) = &active_pack {
+                // Pack browse: a return-to-Unity button, then the pack name as the explorer root
+                // (not "All libraries / <source>") — the tree is that pack's own contents.
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("\u{27F5} Unity Assets")
+                                .size(11.0)
+                                .color(theme::ARCANE),
+                        )
+                        .frame(false),
+                    )
+                    .on_hover_text("Back to Unity Assets")
+                    .clicked()
+                {
+                    go_unity = true;
+                }
+                sep(ui);
+                if crumb(ui, pack, at_root) && !at_root {
+                    if let Some(src) = root_src {
+                        nav = Some(Some((src, PathBuf::new())));
+                    }
+                }
+            } else {
+                if multi && crumb(ui, "All libraries", self.current_dir.is_none()) {
+                    nav = Some(None);
+                }
+                if let Some(src) = root_src {
+                    if multi {
+                        sep(ui);
+                    }
+                    if crumb(ui, &config::stem_name(&self.scan_roots[src]), at_root) && !at_root {
+                        nav = Some(Some((src, PathBuf::new())));
+                    }
+                }
             }
+
+            // Shared: the current directory's path components.
             if let Some((src, dir)) = self.current_dir.clone() {
-                if multi {
-                    sep(ui);
-                }
-                let at_root = dir.as_os_str().is_empty();
-                if crumb(ui, &config::stem_name(&self.scan_roots[src]), at_root) && !at_root {
-                    nav = Some(Some((src, PathBuf::new())));
-                }
                 let comps: Vec<String> = dir
                     .components()
                     .map(|c| c.as_os_str().to_string_lossy().into_owned())
@@ -6516,6 +6584,9 @@ impl LodestashApp {
                 }
             }
         });
+        if go_unity {
+            self.return_to_unity();
+        }
         if go_back {
             self.nav_back();
         } else if go_fwd {
@@ -6558,16 +6629,31 @@ impl LodestashApp {
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-                        for (i, (name, count)) in tiles.iter().enumerate() {
+                        ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                        for (i, tile) in tiles.iter().enumerate() {
+                            // `direct (recursive)` — e.g. `3 (50)`; drop the parenthetical when the
+                            // folder has no deeper assets (direct == recursive).
+                            let count = if tile.recursive > tile.direct {
+                                format!("{} ({})", tile.direct, tile.recursive)
+                            } else {
+                                tile.direct.to_string()
+                            };
                             let btn = egui::Button::new(
-                                RichText::new(format!("\u{1F4C1} {name}   {count}"))
+                                RichText::new(format!("\u{1F4C1} {}   {count}", tile.name))
                                     .color(theme::TEXT)
-                                    .size(12.0),
+                                    .size(13.5),
                             )
                             .fill(theme::SURFACE)
-                            .stroke(egui::Stroke::new(1.0, theme::BORDER));
-                            if ui.add(btn).clicked() {
+                            .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                            .min_size(Vec2::new(0.0, 34.0));
+                            if ui
+                                .add(btn)
+                                .on_hover_text(format!(
+                                    "{} \u{2014} {} here, {} in total",
+                                    tile.name, tile.direct, tile.recursive
+                                ))
+                                .clicked()
+                            {
                                 clicked = Some(i);
                             }
                         }
@@ -6578,7 +6664,7 @@ impl LodestashApp {
                 // Top level: tile index == source index (built parallel to scan_roots).
                 match self.current_dir.clone() {
                     None => self.nav_to(Some((i, PathBuf::new()))),
-                    Some((src, dir)) => self.nav_to(Some((src, dir.join(&tiles[i].0)))),
+                    Some((src, dir)) => self.nav_to(Some((src, dir.join(&tiles[i].name)))),
                 }
             }
         }
@@ -6754,28 +6840,51 @@ fn folder_children(
     src: usize,
     dir: &std::path::Path,
     tab: Category,
-) -> (Vec<usize>, Vec<(String, usize)>) {
-    let mut tiles: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    pack: Option<&str>,
+) -> (Vec<usize>, Vec<FolderTile>) {
+    // name → (direct children in that folder, total recursive under it)
+    let mut tiles: std::collections::BTreeMap<String, (usize, usize)> =
+        std::collections::BTreeMap::new();
     let mut idxs = Vec::new();
     for (i, e) in entries.iter().enumerate() {
         if e.source_idx != src || e.trashed || !tab.matches(e.file.media_type) {
             continue;
         }
+        // When browsing one pack, its folder tree is only that pack's assets — several packs can
+        // share a source (and all use `Assets/…` paths), so without this they would merge.
+        if let Some(p) = pack {
+            if e.package.as_deref() != Some(p) {
+                continue;
+            }
+        }
         let Ok(rest) = e.file.rel_path.strip_prefix(dir) else {
             continue;
         };
-        let mut comps = rest.components();
-        let Some(first) = comps.next() else { continue };
-        if comps.next().is_some() {
-            // Deeper than one level: counts toward its top-level child folder.
-            *tiles
-                .entry(first.as_os_str().to_string_lossy().into_owned())
-                .or_insert(0) += 1;
-        } else {
-            idxs.push(i);
+        let comps: Vec<_> = rest.components().collect();
+        match comps.len() {
+            0 => continue,
+            1 => idxs.push(i), // a file directly in the current folder
+            _ => {
+                // Under subfolder comps[0]: always recursive; direct only when it's exactly
+                // one level below (comps == [subfolder, file]).
+                let name = comps[0].as_os_str().to_string_lossy().into_owned();
+                let e = tiles.entry(name).or_insert((0, 0));
+                e.1 += 1;
+                if comps.len() == 2 {
+                    e.0 += 1;
+                }
+            }
         }
     }
-    (idxs, tiles.into_iter().collect())
+    let tiles = tiles
+        .into_iter()
+        .map(|(name, (direct, recursive))| FolderTile {
+            name,
+            direct,
+            recursive,
+        })
+        .collect();
+    (idxs, tiles)
 }
 
 /// How many card columns fit in `available` width. Always ≥ 1 so the grid never divides by zero.
@@ -13088,12 +13197,17 @@ mod tests {
             entry(0, "PolygonCity/Models/m.fbx", Some(MediaType::Model3d)),
             entry(1, "other.png", Some(MediaType::Image)), // different source — excluded
         ];
-        let (idxs, tiles) = folder_children(&entries, 0, std::path::Path::new(""), Category::All);
+        let (idxs, tiles) =
+            folder_children(&entries, 0, std::path::Path::new(""), Category::All, None);
         assert_eq!(idxs, vec![0], "only the direct-child file at the root");
+        // PolygonCity has 1 file directly in it (tex.png) and 2 total (incl. Models/m.fbx).
         assert_eq!(
             tiles,
-            vec![("PolygonCity".to_owned(), 2)],
-            "subtree count is recursive"
+            vec![FolderTile {
+                name: "PolygonCity".to_owned(),
+                direct: 1,
+                recursive: 2,
+            }]
         );
 
         let (idxs, tiles) = folder_children(
@@ -13101,9 +13215,17 @@ mod tests {
             0,
             std::path::Path::new("PolygonCity"),
             Category::All,
+            None,
         );
         assert_eq!(idxs, vec![1]);
-        assert_eq!(tiles, vec![("Models".to_owned(), 1)]);
+        assert_eq!(
+            tiles,
+            vec![FolderTile {
+                name: "Models".to_owned(),
+                direct: 1,
+                recursive: 1,
+            }]
+        );
     }
 
     #[test]
@@ -13112,12 +13234,21 @@ mod tests {
             entry(0, "PolygonCity/tex.png", Some(MediaType::Image)),
             entry(0, "PolygonCity/m.fbx", Some(MediaType::Model3d)),
         ];
-        let (idxs, tiles) =
-            folder_children(&entries, 0, std::path::Path::new(""), Category::Models);
+        let (idxs, tiles) = folder_children(
+            &entries,
+            0,
+            std::path::Path::new(""),
+            Category::Models,
+            None,
+        );
         assert!(idxs.is_empty());
         assert_eq!(
             tiles,
-            vec![("PolygonCity".to_owned(), 1)],
+            vec![FolderTile {
+                name: "PolygonCity".to_owned(),
+                direct: 1,
+                recursive: 1,
+            }],
             "tile counts are tab-filtered"
         );
     }
