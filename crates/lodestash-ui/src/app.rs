@@ -831,6 +831,9 @@ pub struct LodestashApp {
     /// Job-tray row for an in-progress **Open →** (reading a pack's manifest can take a while on a
     /// large pack); finished when the mint signals a re-hydrate.
     open_pack_job: Option<u64>,
+    /// `.unitypackage` archive size on disk per `package.id`, read once when the Unity Assets list
+    /// loads (not per-frame) so the cards can show KB/MB/GB.
+    package_sizes: std::collections::HashMap<i64, u64>,
     /// Signalled by a background in-pack mint (import / Add-to-Library) once its assets exist,
     /// so the grid re-hydrates and the new pack library appears (M14).
     rehydrate_rx: Receiver<()>,
@@ -1035,6 +1038,7 @@ impl LodestashApp {
             in_pack_locators: std::collections::HashMap::new(),
             pending_pack_browse: None,
             open_pack_job: None,
+            package_sizes: std::collections::HashMap::new(),
             rehydrate_rx,
             rehydrate_tx,
             import_scan: None,
@@ -4879,6 +4883,7 @@ impl LodestashApp {
         let mut browse_pkg: Option<String> = None;
         let mut stats_pkg: Option<String> = None;
         let counts = self.package_asset_counts();
+        let sizes = self.package_sizes.clone();
         ScrollArea::vertical().show(ui, |ui| {
             for (pkg_idx, pkg) in packages.iter().enumerate() {
                 egui::Frame::none()
@@ -4959,6 +4964,17 @@ impl LodestashApp {
                                                 .size(10.0),
                                         );
                                     }
+                                    // Archive size on disk (KB / MB / GB).
+                                    if let Some(&bytes) = sizes.get(&pkg.id) {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{} \u{00B7}",
+                                                format_bytes(bytes)
+                                            ))
+                                            .color(theme::TEXT_DIM)
+                                            .size(10.0),
+                                        );
+                                    }
                                 },
                             );
                         });
@@ -5003,6 +5019,15 @@ impl LodestashApp {
                         .cmp(&a_active)
                         .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
                 });
+                // Archive size on disk, read once here (not per-frame) so cards can show it.
+                self.package_sizes = list
+                    .iter()
+                    .filter_map(|p| {
+                        std::fs::metadata(&p.package_path)
+                            .ok()
+                            .map(|m| (p.id, m.len()))
+                    })
+                    .collect();
                 self.unity_packages = Some(list);
             }
             Err(err) => {
