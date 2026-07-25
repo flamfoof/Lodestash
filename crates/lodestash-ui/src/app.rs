@@ -828,6 +828,9 @@ pub struct LodestashApp {
     /// A pack the user pressed **Open →** on: once its in-pack assets land in the grid (via the
     /// background mint + hydrate), the browser jumps into it in Folders view (FEATURES.md §5.4).
     pending_pack_browse: Option<String>,
+    /// Job-tray row for an in-progress **Open →** (reading a pack's manifest can take a while on a
+    /// large pack); finished when the mint signals a re-hydrate.
+    open_pack_job: Option<u64>,
     /// Signalled by a background in-pack mint (import / Add-to-Library) once its assets exist,
     /// so the grid re-hydrates and the new pack library appears (M14).
     rehydrate_rx: Receiver<()>,
@@ -1031,6 +1034,7 @@ impl LodestashApp {
             peek_tx,
             in_pack_locators: std::collections::HashMap::new(),
             pending_pack_browse: None,
+            open_pack_job: None,
             rehydrate_rx,
             rehydrate_tx,
             import_scan: None,
@@ -1603,6 +1607,14 @@ impl LodestashApp {
                 {
                     self.pending_pack_browse = None;
                     self.browse_package_folders(name);
+                } else if self.open_pack_job.is_none() {
+                    // The mint finished (its job row is gone) but nothing surfaced — a pack with no
+                    // classifiable assets, or one whose source isn't tracked. Don't hang on it.
+                    self.pending_pack_browse = None;
+                    self.jobs.toast(
+                        format!("Couldn't open {name} \u{2014} no viewable assets found"),
+                        Intent::Warning,
+                    );
                 }
             }
             tracing::info!(entries = self.entries.len(), "hydrated grid from catalog");
@@ -4981,7 +4993,18 @@ impl LodestashApp {
             return;
         };
         match Catalog::open(&db_path).and_then(|c| c.list_packages()) {
-            Ok(list) => self.unity_packages = Some(list),
+            Ok(mut list) => {
+                // Indexed / extracted (or pinned-as-library) packs float to the top of the list;
+                // everything else follows alphabetically.
+                list.sort_by(|a, b| {
+                    let a_active = a.pinned || a.asset_count.is_some();
+                    let b_active = b.pinned || b.asset_count.is_some();
+                    b_active
+                        .cmp(&a_active)
+                        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                });
+                self.unity_packages = Some(list);
+            }
             Err(err) => {
                 tracing::warn!(%err, "unity package listing failed");
                 self.unity_packages = Some(Vec::new());
@@ -5089,6 +5112,16 @@ impl LodestashApp {
 
         // Browse into the pack once its assets land (set before the background mint kicks off).
         self.pending_pack_browse = Some(name.clone());
+        // A job-tray row so a large pack (whose manifest takes a while to read) shows activity
+        // instead of looking frozen.
+        if let Some(id) = self.open_pack_job.take() {
+            self.jobs.finish(id);
+        }
+        self.open_pack_job = Some(self.jobs.start(
+            format!("Opening {name}"),
+            Arc::default(),
+            false,
+        ));
 
         // Background: pin + ensure minted, then signal a re-hydrate.
         let tx = self.rehydrate_tx.clone();
@@ -5329,8 +5362,13 @@ impl LodestashApp {
         while self.rehydrate_rx.try_recv().is_ok() {
             got = true;
         }
-        if got && !self.scan_roots.is_empty() {
-            self.load_paths(ctx, self.scan_roots.clone(), self.project_name.clone());
+        if got {
+            if let Some(id) = self.open_pack_job.take() {
+                self.jobs.finish(id);
+            }
+            if !self.scan_roots.is_empty() {
+                self.load_paths(ctx, self.scan_roots.clone(), self.project_name.clone());
+            }
         }
     }
 
