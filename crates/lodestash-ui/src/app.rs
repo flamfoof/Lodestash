@@ -3587,11 +3587,17 @@ impl LodestashApp {
                         if total == 0 {
                             ui.add(egui::Spinner::new().size(12.0));
                         } else {
+                            let frac = job.progress.fraction();
                             ui.add(
-                                egui::ProgressBar::new(job.progress.fraction())
+                                egui::ProgressBar::new(frac)
                                     .desired_width(120.0)
-                                    .desired_height(10.0)
-                                    .fill(theme::GOLD),
+                                    .desired_height(14.0)
+                                    .fill(theme::GOLD)
+                                    .text(
+                                        RichText::new(format!("{:.0}%", frac * 100.0))
+                                            .size(9.0)
+                                            .color(theme::BG),
+                                    ),
                             );
                         }
                         ui.label(
