@@ -1644,6 +1644,20 @@ pub struct HydratedExtracted {
     pub asset: HydratedAsset,
 }
 
+/// An in-pack asset rehydrated from the catalog (DATA-MODEL §7 / M14): its bytes are still inside
+/// the `.unitypackage`, located by `pack_path` + `tar_offset` + `size` for on-demand pull.
+#[derive(Debug, Clone)]
+pub struct HydratedInPack {
+    pub package_name: String,
+    /// The owning package's Add-to-Library pin (M7) — a pinned pack rehydrates into the grid.
+    pub pinned: bool,
+    /// Absolute path to the `.unitypackage` holding this asset's payload.
+    pub pack_path: String,
+    pub tar_offset: i64,
+    pub size: i64,
+    pub asset: HydratedAsset,
+}
+
 /// One `package` row for the Unity Assets screen (DATA-MODEL §7).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PackageListing {
@@ -1712,6 +1726,55 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("extracted query: {e}")))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| CoreError::Catalog(format!("extracted row: {e}")))
+    }
+
+    /// In-pack assets for a source's grid (DATA-MODEL §7 / M14): assets minted from a pack's
+    /// manifest whose bytes are still **inside** the `.unitypackage` — `workspace_rel IS NULL` and
+    /// a `package_entry_id` present. Carries the pack name + pin (for the sidebar library) and the
+    /// locator (`pack_path`/`tar_offset`/`size`) the grid needs to pull a thumbnail or preview on
+    /// demand. Complement of [`Self::extracted_entries_for_source`]; the caller gates on `pinned`.
+    pub fn in_pack_entries_for_source(&self, source_id: i64) -> Result<Vec<HydratedInPack>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT af.rel_path, a.id, mt.code, af.size_bytes, af.mtime,
+                        a.status, a.deleted_at IS NOT NULL, a.rating,
+                        p.name, p.pinned, p.package_path, pe.tar_offset, pe.size_bytes,
+                        a.tri_count, a.width_px, a.height_px, a.duration_ms, a.content_hash
+                 FROM asset a
+                 JOIN asset_file af   ON af.id = a.primary_file_id
+                 JOIN media_type mt   ON mt.id = a.media_type_id
+                 JOIN package p       ON p.id = a.package_id
+                 JOIN package_entry pe ON pe.id = af.package_entry_id
+                 WHERE a.source_id = ?1 AND af.missing = 0
+                   AND af.workspace_rel IS NULL AND af.package_entry_id IS NOT NULL",
+            )
+            .map_err(|e| CoreError::Catalog(format!("in-pack hydrate prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![source_id], |r| {
+                Ok(HydratedInPack {
+                    package_name: r.get(8)?,
+                    pinned: r.get(9)?,
+                    pack_path: r.get(10)?,
+                    tar_offset: r.get::<_, Option<i64>>(11)?.unwrap_or(0),
+                    size: r.get::<_, Option<i64>>(12)?.unwrap_or(0),
+                    asset: HydratedAsset {
+                        rel_path: r.get(0)?,
+                        asset_id: r.get(1)?,
+                        media_type: r.get(2)?,
+                        size_bytes: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                        mtime: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                        status: r.get(5)?,
+                        trashed: r.get(6)?,
+                        rating: r.get(7)?,
+                        metrics: AssetMetrics::from_row(r, 13)?,
+                        content_hash: r.get(17)?,
+                    },
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("in-pack hydrate query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("in-pack hydrate row: {e}")))
     }
 
     /// Upsert the payload locations of a package's manifest (browse pass) so selected
@@ -3633,6 +3696,66 @@ mod tests {
         assert_eq!(
             skipped.inserted, 0,
             "an extracted pack does not grow in-pack duplicates"
+        );
+    }
+
+    #[test]
+    fn in_pack_entries_surface_with_pack_and_locator() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let sid = c
+            .upsert_import_source("src", "G:/src", "asset_store_library")
+            .expect("sid");
+        let pid = c
+            .upsert_package(sid, "G:/src/Pack.unitypackage", "Pack", None, None)
+            .expect("pid");
+        c.record_package_entries(
+            pid,
+            &[PackageEntryRecord {
+                guid: "g_rock".into(),
+                pathname: Some("Assets/Models/Rock.fbx".into()),
+                tar_offset: Some(1536),
+                size_bytes: Some(4096),
+            }],
+        )
+        .expect("entries");
+        c.set_package_pinned(pid, true).expect("pin");
+        c.mint_in_pack_assets(
+            pid,
+            &HashMap::from([(
+                "g_rock".to_string(),
+                InPackClass {
+                    name: "Rock".into(),
+                    media_type: "model_3d".into(),
+                },
+            )]),
+        )
+        .expect("mint");
+
+        let rows = c.in_pack_entries_for_source(sid).expect("in-pack hydrate");
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.package_name, "Pack");
+        assert!(
+            r.pinned,
+            "the pack's pin rides through so the grid can gate on it"
+        );
+        assert_eq!(r.pack_path, "G:/src/Pack.unitypackage");
+        assert_eq!(
+            (r.tar_offset, r.size),
+            (1536, 4096),
+            "locator for on-demand pull"
+        );
+        assert_eq!(r.asset.rel_path, "Assets/Models/Rock.fbx");
+        assert_eq!(r.asset.media_type, "model_3d");
+
+        // An in-pack asset is NOT returned by the plain folder hydrate (package_id excludes it),
+        // so it can't become a broken on-disk card.
+        assert!(
+            c.entries_for_source(sid)
+                .expect("folder hydrate")
+                .is_empty(),
+            "in-pack assets stay out of the folder hydrate"
         );
     }
 

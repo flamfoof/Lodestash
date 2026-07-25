@@ -245,6 +245,9 @@ struct HydrateDone {
     /// Package-extracted rows (only when "cache extracted packs" is on), with the
     /// workspace-existence check already done on the hydrate thread.
     extracted: Vec<(usize, Vec<lodestash_core::catalog::HydratedExtracted>)>,
+    /// In-pack rows for pinned packs (DATA-MODEL §7 / M14) — bytes still inside the archive,
+    /// carried with their locator for on-demand thumbnail/preview pulls.
+    in_pack: Vec<(usize, Vec<lodestash_core::catalog::HydratedInPack>)>,
 }
 
 /// Per-root asset identity maps: root → (rel_path → (asset id, status, content_hash)).
@@ -813,6 +816,11 @@ pub struct LodestashApp {
     /// Packages whose manifest is being read right now — Open → is one click, and a second
     /// one must not start a second pass over the same archive.
     manifest_reading: std::collections::BTreeSet<i64>,
+    /// In-pack asset locators (DATA-MODEL §7 / M14): `asset_id → (pack path, tar offset, size)`.
+    /// Lives beside the grid entries (refreshed per hydrate) rather than on `AssetEntry`, so the
+    /// grid plumbing stays unchanged; the thumbnail and preview paths look a payload up here to
+    /// pull it from the archive on demand.
+    in_pack_locators: std::collections::HashMap<i64, (String, i64, i64)>,
     manifest_rx: Receiver<ManifestRead>,
     manifest_tx: Sender<ManifestRead>,
     /// The open Import-packages dialog (§5.2), if any.
@@ -1010,6 +1018,7 @@ impl LodestashApp {
             peek_rx,
             peek_tx,
             manifest_reading: std::collections::BTreeSet::new(),
+            in_pack_locators: std::collections::HashMap::new(),
             manifest_rx,
             manifest_tx,
             import_scan: None,
@@ -1287,11 +1296,13 @@ impl LodestashApp {
                 type Hydrated = (
                     Vec<(usize, Vec<HydratedAsset>)>,
                     Vec<(usize, Vec<lodestash_core::catalog::HydratedExtracted>)>,
+                    Vec<(usize, Vec<lodestash_core::catalog::HydratedInPack>)>,
                 );
                 let run = || -> Result<Hydrated, String> {
                     let catalog = Catalog::open(&db_path).map_err(|e| e.to_string())?;
                     let mut sources = Vec::new();
                     let mut extracted = Vec::new();
+                    let mut in_pack = Vec::new();
                     for (idx, root) in roots.iter().enumerate() {
                         let sid = catalog
                             .upsert_import_source(
@@ -1325,15 +1336,29 @@ impl LodestashApp {
                                 extracted.push((idx, live));
                             }
                         }
+                        // In-pack assets (M14): a pinned pack's contents surface as grid cards
+                        // whose bytes are pulled from the archive on demand — no workspace copy.
+                        let pack_rows: Vec<_> = catalog
+                            .in_pack_entries_for_source(sid)
+                            .map_err(|e| e.to_string())?
+                            .into_iter()
+                            .filter(|r| r.pinned)
+                            .collect();
+                        if !pack_rows.is_empty() {
+                            in_pack.push((idx, pack_rows));
+                        }
                     }
-                    Ok((sources, extracted))
+                    Ok((sources, extracted, in_pack))
                 };
                 match run() {
-                    Ok((sources, extracted)) if !sources.is_empty() || !extracted.is_empty() => {
+                    Ok((sources, extracted, in_pack))
+                        if !sources.is_empty() || !extracted.is_empty() || !in_pack.is_empty() =>
+                    {
                         let _ = tx.send(HydrateDone {
                             generation,
                             sources,
                             extracted,
+                            in_pack,
                         });
                     }
                     Ok(_) => {} // nothing catalogued yet — first open of these sources
@@ -1499,6 +1524,42 @@ impl LodestashApp {
                             thumb_spawned: false,
                         });
                     }
+                }
+            }
+            // In-pack assets (M14): grid cards whose bytes stay inside the archive. `abs_path`
+            // points at the `.unitypackage` itself (provenance + Reveal), and the locator lands
+            // in `in_pack_locators` so the thumbnail/preview paths pull the payload on demand.
+            self.in_pack_locators
+                .retain(|id, _| self.entries.iter().any(|e| e.asset_id == Some(*id)));
+            for (source_idx, rows) in msg.in_pack {
+                for row in rows {
+                    let Some(status) = AssetStatus::from_code(&row.asset.status) else {
+                        continue;
+                    };
+                    let pack_path = PathBuf::from(&row.pack_path);
+                    self.in_pack_locators.insert(
+                        row.asset.asset_id,
+                        (row.pack_path, row.tar_offset, row.size),
+                    );
+                    self.entries.push(AssetEntry {
+                        package: Some(row.package_name),
+                        file: CrawledFile {
+                            abs_path: pack_path,
+                            rel_path: PathBuf::from(&row.asset.rel_path),
+                            size_bytes: row.asset.size_bytes.max(0) as u64,
+                            mtime: row.asset.mtime,
+                            media_type: MediaType::from_code(&row.asset.media_type),
+                        },
+                        source_idx,
+                        asset_id: Some(row.asset.asset_id),
+                        status,
+                        trashed: row.asset.trashed,
+                        rating: row.asset.rating,
+                        metrics: row.asset.metrics,
+                        content_hash: row.asset.content_hash.clone(),
+                        texture: None,
+                        thumb_spawned: false,
+                    });
                 }
             }
             self.current_dir = self.default_dir();
@@ -6421,6 +6482,16 @@ impl LodestashApp {
         for &idx in to_spawn {
             let entry = &self.entries[idx];
             if entry.thumb_spawned || !needs_thumbnail(entry.file.media_type) {
+                continue;
+            }
+            // In-pack assets have no file on disk (abs_path is the .unitypackage) — their
+            // thumbnail needs a surgical payload pull, which lands in the step-4 slice. Mark as
+            // handled so the grid stops retrying and shows the typed placeholder (M14).
+            if entry
+                .asset_id
+                .is_some_and(|id| self.in_pack_locators.contains_key(&id))
+            {
+                self.entries[idx].thumb_spawned = true;
                 continue;
             }
             self.entries[idx].thumb_spawned = true;
