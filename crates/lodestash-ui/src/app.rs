@@ -12064,7 +12064,18 @@ fn inspector_pane(
             if let Some(lib) = library {
                 stat_row(ui, "Library", lib);
             }
-            stat_row(ui, "Path", &file.abs_path.to_string_lossy());
+            // In-pack assets point `abs_path` at the `.unitypackage`; the file's real location is its
+            // in-archive path. Show that as the (copyable) Path and the archive as a Package row.
+            let in_pack = file
+                .abs_path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("unitypackage"));
+            if in_pack {
+                copy_path_row(ui, "Path", &file.rel_path.to_string_lossy());
+                copy_path_row(ui, "Package", &file.abs_path.to_string_lossy());
+            } else {
+                copy_path_row(ui, "Path", &file.abs_path.to_string_lossy());
+            }
         });
 
     // TRAITS (UI-SPEC §13.5) — the facet tags identification produced. AI tags carry a confidence
@@ -12296,6 +12307,22 @@ fn stat_tile(ui: &mut Ui, label: &str, value: &str, color: egui::Color32) {
 fn stat_row(ui: &mut Ui, label: &str, value: &str) {
     ui.label(RichText::new(label).color(theme::TEXT_DIM).size(11.0));
     ui.add(egui::Label::new(RichText::new(value).color(theme::TEXT).size(11.0)).truncate());
+    ui.end_row();
+}
+
+/// A path row whose value copies to the clipboard on click (the inspector Path / Package rows).
+fn copy_path_row(ui: &mut Ui, label: &str, value: &str) {
+    ui.label(RichText::new(label).color(theme::TEXT_DIM).size(11.0));
+    let resp = ui
+        .add(
+            egui::Label::new(RichText::new(value).color(theme::TEXT).size(11.0))
+                .truncate()
+                .sense(egui::Sense::click()),
+        )
+        .on_hover_text("Click to copy");
+    if resp.clicked() {
+        ui.output_mut(|o| o.copied_text = value.to_string());
+    }
     ui.end_row();
 }
 

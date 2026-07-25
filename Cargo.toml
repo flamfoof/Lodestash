@@ -76,8 +76,10 @@ three-d       = { version = "0.18.2", default-features = false }
 # data-url: self-contained .gltf files embed their buffers as base64 data URIs — without this
 # feature they fail to load (in the viewer as well as the embedding renderer).
 three-d-asset = { version = "0.9", features = ["gltf", "obj", "png", "jpeg", "tga", "data-url"] }
-# Audio playback + decode (rodio bundles symphonia): wav/flac/vorbis/mp3.
-rodio = "0.20"
+# Audio playback + decode (rodio bundles symphonia). `symphonia-all` widens codec coverage beyond
+# the default wav/flac/vorbis/mp3 to aiff/m4a/aac/alac/… — game-music packs ship these too, and
+# `detect` already classifies them as audio, so playback must keep up (TECH-STACK §1).
+rodio = { version = "0.20", features = ["symphonia-all"] }
 # SVG nav-icon rendering (resvg via the svg feature); tinted per row state.
 egui_extras = { version = "0.29", default-features = false, features = ["svg"] }
 
