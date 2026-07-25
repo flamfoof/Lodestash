@@ -4,7 +4,7 @@ Working notes for whoever (or whatever) continues the build. Unlike the rest of 
 is **not** a design spec — it's the state of play, the decisions already settled, and the traps.
 The design docs still win on any question of what the software *should* do.
 
-Last updated: **2026-07-24**, at `fd72eb6`.
+Last updated: **2026-07-25**, at `803ceb9`.
 
 ---
 
@@ -155,6 +155,70 @@ Two real defects surfaced under that work, both fixed:
   `package_path`. Verified on the real catalog: 88 rows → 87, 546 assets still linked, both locator
   sets intact.
 
+**In-pack assets — analyze & identify a pack without extracting it** (2026-07-25, M14,
+[`DATA-MODEL.md`](DATA-MODEL.md) §7 "In-pack assets", FEATURES.md §5). This is the session's spine.
+The old model gated everything on a full workspace extraction; now a pack is a first-class,
+identifiable library **before any unpack**. Design was written first (spec commits `256c66c`), then
+built.
+
+- **One asset type, three byte-sources.** `asset_file.package_entry_id` (M14) links a file to its
+  `package_entry` locator (`tar_offset`/`size`). A file's bytes resolve *extracted* (`workspace_rel`
+  + the file exists) → *in-pack* (`package_entry_id`) → *on-disk* (`rel_path`). "Materialized" is
+  derived from that ladder, never stored — no lifecycle fork. `media_type` enum untouched.
+- **Mint on analyze.** `Catalog::mint_in_pack_assets(package_id, classified)` reads the pack's
+  persisted locators and inserts one `asset` + `asset_file` per classifiable entry (UI supplies the
+  guid→`InPackClass` map; core stays classification-free). Idempotent by `package_entry_id`; **skips
+  a pack that already has extracted rows** (guard against duplicate rows until step 8 unifies them).
+  Dep edges harvest from the manifest `.meta` with zero pulls.
+- **Identify in place, from bytes.** `unitypackage::read_payload_at` pulls one payload into memory,
+  `raster::decode_bytes` decodes it — no file written. The embedding/tag/deps drain queues carry the
+  in-pack locator (`pack_path`+`offset`+`size`+`ext`), and `resolve_job_image` (in `app.rs`) picks
+  on-disk → workspace → in-pack pull. **Only images are wired for in-pack embedding so far**; in-pack
+  3D falls to the zero vector (mesh-from-bytes render not built), and in-pack **metrics/audio/tags**
+  drains still resolve only a real path (so no facets/audio-vec/tags for a purely in-pack asset yet).
+- **Import mints; the folder is a pack-only source.** §5.2 import marks the folder `pack_only` in
+  config (a tracked library that is **not crawled** for loose files), pins each pack, and mints in a
+  background pass (`ensure_in_pack_minted`), then a `rehydrate` channel reloads the grid. In-pack rows
+  carry `package_id`, so `entries_for_source`/`reconcile_missing` exclude them from the folder hydrate
+  (no broken cards); they surface via `in_pack_entries_for_source` (pinned packs only), with their
+  locator kept in the `in_pack_locators` map beside the grid.
+- **The pack browser is the library grid.** **Open →** (only shown once a pack is pinned) routes to
+  the library folder-explorer filtered to that pack (`browse_package_folders`): pack-rooted
+  breadcrumb, ← / → history, up-one, and a thumbnails ⇄ list toggle (`folders_as_list`). `Add to
+  Library` is what indexes (mints); Open just navigates. `folder_children` is pack-aware (several
+  packs share a source and all use `Assets/…` paths, so it filters by the active pack); folder tiles
+  render as a **vertical list** with `direct (recursive)` counts (e.g. `3 (50)`).
+- **Oversized packs prompt.** `config.rapid_index_max_gb` (default 4 GB, Settings ▸ Storage). A pack
+  over it that isn't indexed prompts **Extract to temp & index / Index in place / Cancel** — indexing
+  in place inflates the whole archive (a 21 GB pack is minutes of CPU). The gate lives in
+  `pin_and_mint`, so both Add and Open hit it. Manifest read streams with a **% job bar + cancel**
+  (`read_manifest_with_progress`); extraction is now **incremental + resumable** (each payload placed
+  as its bytes+pathname are seen, so a cancel/crash leaves valid files and a re-run resumes by hash).
+- **Viewing an in-pack asset pulls its payload** (`spawn_scratch_pull` → `extract_at_offsets` to an
+  OS-temp scratch, cached per asset), because `abs_path` for an in-pack asset **is the
+  `.unitypackage`** — decoding that as audio/image is the "Unrecognized format" bug that bit the mp3.
+  The inspector shows the **in-archive path** (copyable) + a **Package** row.
+
+**Identification is manual by default** (`config.auto_identify`, off; Settings ▸ AI · IDENTIFY toggle,
+[`AI-PIPELINE.md`](AI-PIPELINE.md) §2). The SigLIP/CLAP embedding drain auto-ran on every hydrate, and
+in-pack minting flags thousands of new assets `embedding_dirty` — so it churned models on the CPU for
+minutes, holding `catalog_persisting=true` (30fps repaint). That was the app-wide high-CPU. Now a
+hydrate runs only the cheap drains (metrics/deps/promote); the manual Identify pass does embeddings
+**and** tags. The Ollama tagger was already manual.
+
+**Package writes are chunked** (`PKG_WRITE_CHUNK = 500`, `busy_timeout` 15 s). `record_package_entries`
+and `mint_in_pack_assets` committed each in one transaction; a huge pack held the single WAL write
+lock long enough to starve a concurrent scan-persist ("database is locked"). They now commit in
+500-row batches so writers interleave.
+
+**Also this session:** window size + position persist across restarts (eframe `persistence` feature);
+audio decodes more codecs (rodio `symphonia-all` — aiff/m4a/aac/alac, not opus/wma/fsb); Unity Assets
+list has a **sort** (Indexed first / Name / Size / Date), pack cards show archive **size** (KB/MB/GB);
+`docs/AI-PIPELINE.md` §2, `DATA-MODEL.md` §7/§8, `FEATURES.md` §5.3/§5.4/§6.6, `INGESTION.md` §2 all
+reconciled. A **design mockup for a better pack directory navigation** (persistent tree pane,
+pack-rooted breadcrumb, folders-first contents) is published as an Artifact:
+`https://claude.ai/code/artifact/357c39f4-0809-4f06-adc2-53c1d3be95b0`.
+
 **Favourites exist** (`asset.favorite`, M12): a pin, not a rating, catalog-side, surviving the Trash.
 The **shipped UI diverges from the design bundle** on four presentation points (star not heart, gold
 not danger, top-right not top-left, a toolbar toggle + dedicated screen rather than a Filters-popover
@@ -218,6 +282,16 @@ Each is recorded with rationale in [`TECH-STACK.md`](TECH-STACK.md) §7 and the 
 - **Browse and preview are read-only; only extraction needs a library source.** A pack can be
   opened, walked and previewed from anywhere on disk. Extraction is what writes catalog rows, so it
   is the only step that requires an `import_source` to persist into.
+- **An in-pack asset is an asset, not a virtual type** (M14). Where its bytes are is a property of
+  its file, resolved through the §7 ladder — not a boolean threaded through counts/filters/status.
+  Extraction is demoted to "materialize" (fill `workspace_rel`), never a gate on identification.
+- **Identification is CPU-heavy, so it is manual** (`auto_identify`, default off). A hydrate never
+  auto-embeds/tags; the user asks for it, or opts into auto. Don't relax it back — auto-embedding an
+  imported multi-GB pack's thousands of new dirty rows pegs a core for minutes.
+- **In-pack pull cost is inherent to gzip.** `.unitypackage` is tar.gz with no random access, so
+  reading a manifest or pulling any one payload inflates from the start up to that offset. Cache the
+  manifest (locators) and the pulled scratch file; for a big pack the fast path is **extract once**,
+  then everything is on-disk random-access. Don't chase a "seekable" in-pack preview.
 - **Separate, non-comparable vector spaces.** SigLIP (768-d visual) and CLAP (512-d audio) are searched
   independently and fused on *rank* by RRF — comparing raw scores across models is meaningless.
   `hybrid_search` therefore takes `spaces: &[(model_id, query_vec)]`.
@@ -322,23 +396,41 @@ fixture.
   for prose and let a text model do the schema.
 - Git Bash maps `/tmp` to the Windows temp dir, and job-scoped env vars aren't guaranteed to persist
   between shell invocations — prefer absolute paths in long-running work.
+- **In-pack and extracted rows can coexist for one pack (M14 step 8 is not done).** If a pack is
+  indexed in place (in-pack rows) and then extracted (workspace_rel rows), both sets exist and the
+  in-pack ones shadow the extracted ones in the grid — so a viewer opens the slow in-pack path even
+  though a fast extracted copy is on disk. `mint_in_pack_assets` guards *forward* (won't mint if
+  extracted rows exist) but nothing reconciles the *other* order. **Step 8**: extraction should
+  materialize the existing in-pack rows (set `workspace_rel` on them), not mint a parallel set.
+- **`pin_and_mint` fires `load_paths` (a crawl+persist) while the background mint writes** — two
+  writers. The chunked package writes + 15 s `busy_timeout` keep it from erroring, but if you touch
+  this path, prefer serializing (mint, *then* hydrate) over widening the timeout.
 
 ---
 
 ## 7. Suggested next work
 
-The user's stated order, then value:
+Top of the list is finishing the in-pack feature (M14) the last session built, in the user's order:
 
-1. **Unity Assets §5 leftovers** — the spine is built (§2 above); what remains is presentation and
-   one flow. In rough value order: the pack **rows** don't yet carry §5.3's path, `N assets · size`
-   or **↻ Sync**; the import list has no **category badge + override dropdown** and no category
-   filter tabs; §5.6's `⧉` duplicate flag is unbuilt (its only real instance turned out to be the
-   M13 defect, so build it only if a genuine content-overlap case shows up); the sidebar facet's
-   `✕` remove is missing (the browse-header **✓ In Libraries · remove** is the shipped path); and
-   the "N older versions · newest shown" disclosure has no data behind it on this machine — no pack
-   filename here carries a version, so treat it as YAGNI until one does. Also: **script, prefab and
-   material previews** show only their type, and one **fresh extraction** is needed to demonstrate
-   the pinned rehydrate (§2's `workspace_rel` note).
+0. **M14 step 8 — unify extraction with in-pack rows** (the biggest correctness gap; see the trap in
+   §6). Extraction should **materialize** a pack's existing in-pack rows (fill `workspace_rel`,
+   pointing at the extracted files), not mint a parallel set. Then the grid shows one row per file,
+   viewing prefers the fast on-disk copy, and there is no shadowing. The KANBAN "In-pack assets" card
+   lists the full 8 steps; steps 1–7 shipped.
+1. **In-pack identify parity.** Only **images** embed in place today. Wire the **metrics** drain
+   (dimensions from bytes are cheap; tris need mesh-from-bytes), **audio** embedding, and **tags**
+   for in-pack assets — otherwise a purely in-pack asset never reaches `indexed`/`identified`. The
+   seams exist (`decode_bytes`, `read_payload_at`, the locator columns on the queue rows); it is
+   filling the `None`-path in `drain_metrics`/`drain_audio_embeddings`/`drain_tags`.
+2. **Pack directory navigation redesign** — a design mockup is published (§2, the Artifact URL):
+   persistent left tree pane, pack-rooted breadcrumb, folders-first contents, inspector. The current
+   impl is functional (folder tiles as a vertical list) but is the library grid bolted to a folder
+   filter; the mockup is the target.
+3. **Unity Assets §5 leftovers** — the pack **rows** don't yet carry **↻ Sync**; the import list has
+   no **category badge + override dropdown** and no category filter tabs; §5.6's `⧉` duplicate flag
+   is unbuilt (its only real instance was the M13 defect); the sidebar facet's `✕` remove is missing
+   (the browse-header **✓ In Libraries · remove** is the shipped path); **script/prefab/material
+   previews** show only their type. (Pack **size** now shows on cards; **sort** shipped.)
 2. **Favourites design conformance** — four presentation deltas listed on the KANBAN card. Contained:
    glyph/colour/position, chip moves to the toolbar, plus a Favorites screen reusing the grid.
 3. **P5 — the Unity round-trip**: `register_project` → `/v1/import` → import queue → `import_record`
