@@ -373,12 +373,21 @@ struct ProgressReader<'a, R> {
     on_progress: &'a (dyn Fn(u64, u64) -> bool + Sync),
 }
 
+/// Sentinel message a [`ProgressReader`] raises when its callback cancels, so callers can tell a
+/// user-requested stop apart from a genuine I/O failure.
+const CANCEL_MSG: &str = "extraction cancelled";
+
+/// Was this error a cooperative cancel (vs. a real I/O failure)?
+fn is_cancel(e: &io::Error) -> bool {
+    e.get_ref().map(|inner| inner.to_string()) == Some(CANCEL_MSG.to_string())
+}
+
 impl<R: Read> Read for ProgressReader<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
         self.read += n as u64;
         if !(self.on_progress)(self.read, self.total) {
-            return Err(io::Error::other("extraction cancelled"));
+            return Err(io::Error::other(CANCEL_MSG));
         }
         Ok(n)
     }
@@ -393,9 +402,10 @@ pub fn extract_to_workspace(path: &Path, dest: &Path) -> io::Result<Vec<Extracte
 
 /// [`extract_to_workspace`] with byte-level progress: `on_progress(read, total)` is called with
 /// **compressed** bytes consumed vs. the archive's file size — accurate activity even when the
-/// entry count isn't known upfront (streamed tar). Return `false` to cancel: extraction
-/// stops at the next read and errors out (already-placed payloads stay — idempotent re-runs
-/// skip them by content hash).
+/// entry count isn't known upfront (streamed tar). Return `false` to cancel: extraction stops and
+/// returns **what it placed so far** (a cancel is not an error). Payloads are placed incrementally
+/// and content-addressed, so a cancelled or crashed run leaves valid files and a re-run **resumes**,
+/// skipping them by hash.
 pub fn extract_to_workspace_with_progress(
     path: &Path,
     dest: &Path,
@@ -415,58 +425,63 @@ pub fn extract_to_workspace_with_progress(
     let gz = GzDecoder::new(file);
     let mut archive = tar::Archive::new(gz);
 
+    // Place each payload **as soon as both its `asset` bytes and its `pathname` are seen** (they are
+    // adjacent entries within a GUID folder), so an interrupted run leaves valid, content-addressed
+    // files on disk. A re-run skips those by hash and continues — this is what makes a 21 GB
+    // extraction resumable (gzip can't seek, so a resume still inflates, but never re-writes what
+    // is already placed).
     let mut pathnames: BTreeMap<String, String> = BTreeMap::new();
-    let mut payloads: BTreeMap<String, (PathBuf, String, u64)> = BTreeMap::new();
+    let mut pending: BTreeMap<String, (PathBuf, String, u64)> = BTreeMap::new();
+    let mut extracted = Vec::new();
 
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let entry_path = entry.path()?.to_path_buf();
-        let Some((guid, member)) = guid_and_member(&entry_path) else {
-            continue;
-        };
-
-        match member.as_str() {
-            "pathname" => {
-                let mut s = String::new();
-                entry.read_to_string(&mut s)?;
-                pathnames.insert(guid, parse_pathname(&s));
+    let walk: io::Result<()> = (|| {
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            let entry_path = entry.path()?.to_path_buf();
+            let Some((guid, member)) = guid_and_member(&entry_path) else {
+                continue;
+            };
+            match member.as_str() {
+                "pathname" => {
+                    let mut s = String::new();
+                    entry.read_to_string(&mut s)?;
+                    let pn = parse_pathname(&s);
+                    if let Some((tmp, hash, size)) = pending.remove(&guid) {
+                        extracted.push(place_payload(dest, guid, Some(pn), tmp, hash, size)?);
+                    } else {
+                        pathnames.insert(guid, pn);
+                    }
+                }
+                "asset" => {
+                    let tmp_path = tmp_dir.join(&guid);
+                    let (hash, size) = stream_hash_to_file(&mut entry, &tmp_path)?;
+                    if let Some(pn) = pathnames.remove(&guid) {
+                        extracted.push(place_payload(dest, guid, Some(pn), tmp_path, hash, size)?);
+                    } else {
+                        pending.insert(guid, (tmp_path, hash, size));
+                    }
+                }
+                _ => {}
             }
-            "asset" => {
-                let tmp_path = tmp_dir.join(&guid);
-                let (hash, size) = stream_hash_to_file(&mut entry, &tmp_path)?;
-                payloads.insert(guid, (tmp_path, hash, size));
-            }
-            _ => {}
         }
-    }
+        Ok(())
+    })();
 
-    let mut extracted = Vec::with_capacity(payloads.len());
-    for (guid, (tmp_path, hash, size)) in payloads {
-        let pathname = pathnames.get(&guid).cloned();
-        let basename = pathname
-            .as_deref()
-            .and_then(|p| Path::new(p).file_name())
-            .map(|n| sanitize_basename(&n.to_string_lossy()))
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| guid.clone());
-
-        let out_dir = dest.join(&hash);
-        std::fs::create_dir_all(&out_dir)?;
-        let out_path = out_dir.join(&basename);
-        if out_path.exists() {
-            std::fs::remove_file(&tmp_path)?;
-        } else {
-            std::fs::rename(&tmp_path, &out_path)?;
-        }
-        extracted.push(ExtractedAsset {
-            guid,
-            pathname,
-            content_hash: hash,
-            workspace_path: out_path,
-            size_bytes: size,
-        });
+    // Assets fully read before the walk stopped but still awaiting a pathname are complete — place
+    // them (guid basename if the pathname never came) so they count toward a resume.
+    for (guid, (tmp, hash, size)) in std::mem::take(&mut pending) {
+        let pn = pathnames.remove(&guid);
+        extracted.push(place_payload(dest, guid, pn, tmp, hash, size)?);
     }
     let _ = std::fs::remove_dir(&tmp_dir); // best-effort; empty once every payload is moved out
+
+    // Cancel is not a failure: the placed files are valid and a re-run resumes from them. Any other
+    // I/O error still propagates, but what was already placed likewise survives for a manual retry.
+    if let Err(e) = walk {
+        if !is_cancel(&e) {
+            return Err(e);
+        }
+    }
     Ok(extracted)
 }
 
@@ -699,6 +714,54 @@ mod tests {
             }],
         );
         assert!(bad.is_err());
+    }
+
+    #[test]
+    fn extraction_is_idempotent_and_survives_cancel() {
+        // A package with two GUID folders (two payloads).
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_path = dir.path().join("two.unitypackage");
+        {
+            let gz = flate2::write::GzEncoder::new(
+                File::create(&pkg_path).unwrap(),
+                flate2::Compression::default(),
+            );
+            let mut b = tar::Builder::new(gz);
+            let mut add = |name: String, bytes: &[u8]| {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(bytes.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                b.append_data(&mut h, name, bytes).unwrap();
+            };
+            for (guid, file) in [("g1", "One.png"), ("g2", "Two.png")] {
+                add(format!("{guid}/asset"), &b"payload".repeat(200));
+                add(
+                    format!("{guid}/pathname"),
+                    format!("Assets/{file}").as_bytes(),
+                );
+            }
+            b.into_inner().unwrap().finish().unwrap();
+        }
+
+        // Immediate cancel: returns Ok (a cancel is not a failure), not an Err.
+        let ws = dir.path().join("ws");
+        let cancelled = extract_to_workspace_with_progress(&pkg_path, &ws, &|_, _| false).unwrap();
+        assert!(
+            cancelled.len() < 2,
+            "an immediate cancel doesn't place everything"
+        );
+
+        // A re-run completes the extraction (resumes), skipping anything already placed.
+        let full = extract_to_workspace_with_progress(&pkg_path, &ws, &|_, _| true).unwrap();
+        assert_eq!(full.len(), 2, "re-run completes all payloads");
+
+        // Idempotent: extracting again places nothing new and points at the same files.
+        let again = extract_to_workspace_with_progress(&pkg_path, &ws, &|_, _| true).unwrap();
+        assert_eq!(again.len(), 2);
+        for a in &again {
+            assert!(a.workspace_path.exists());
+        }
     }
 
     #[test]
