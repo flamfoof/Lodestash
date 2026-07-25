@@ -847,6 +847,13 @@ pub struct LodestashApp {
     /// grid plumbing stays unchanged; the thumbnail and preview paths look a payload up here to
     /// pull it from the archive on demand.
     in_pack_locators: std::collections::HashMap<i64, (String, i64, i64)>,
+    /// Scratch files pulled out of the archive for viewing an in-pack asset (asset_id → local
+    /// file). An in-pack asset's bytes live inside the `.unitypackage`, so a viewer can't open
+    /// `abs_path` (that's the archive) — the payload is surgically pulled to a scratch file first.
+    in_pack_scratch: std::collections::HashMap<i64, PathBuf>,
+    scratch_pulling: std::collections::HashSet<i64>,
+    scratch_rx: Receiver<(i64, Result<PathBuf, String>)>,
+    scratch_tx: Sender<(i64, Result<PathBuf, String>)>,
     /// A pack the user pressed **Open →** on: once its in-pack assets land in the grid (via the
     /// background mint + hydrate), the browser jumps into it in Folders view (FEATURES.md §5.4).
     pending_pack_browse: Option<String>,
@@ -990,6 +997,7 @@ impl LodestashApp {
         let (extract_tx, extract_rx) = mpsc::channel();
         let (peek_tx, peek_rx) = mpsc::channel();
         let (rehydrate_tx, rehydrate_rx) = mpsc::channel::<()>();
+        let (scratch_tx, scratch_rx) = mpsc::channel::<(i64, Result<PathBuf, String>)>();
         let (import_tx, import_rx) = mpsc::channel();
         let (catalog_tx, catalog_rx) = mpsc::channel();
         let (hydrate_tx, hydrate_rx) = mpsc::channel();
@@ -1067,6 +1075,10 @@ impl LodestashApp {
             peek_rx,
             peek_tx,
             in_pack_locators: std::collections::HashMap::new(),
+            in_pack_scratch: std::collections::HashMap::new(),
+            scratch_pulling: std::collections::HashSet::new(),
+            scratch_rx,
+            scratch_tx,
             pending_pack_browse: None,
             open_pack_job: None,
             package_sizes: std::collections::HashMap::new(),
@@ -2515,69 +2527,151 @@ impl LodestashApp {
         let Some(entry) = self.entries.get(entry_idx) else {
             return;
         };
+        let media_type = entry.file.media_type;
+        let rel_path = entry.file.rel_path.clone();
+        let asset_id = entry.asset_id;
+        let package = entry.package.clone();
+        let abs_path = entry.file.abs_path.clone();
+
+        // In-pack assets keep their bytes inside the `.unitypackage`, so a viewer must not open
+        // `abs_path` (that is the archive) — pull the one payload to a scratch file first and open
+        // that (M14). On-disk / extracted assets use their real path directly.
+        let local_path = match asset_id.and_then(|id| self.in_pack_locators.get(&id).cloned()) {
+            Some((pack, off, size)) => {
+                let id = asset_id.expect("locator implies asset_id");
+                match self.in_pack_scratch.get(&id) {
+                    Some(p) => p.clone(),
+                    None => {
+                        self.spawn_scratch_pull(id, pack, off, size, &rel_path, ctx);
+                        return; // load once the payload lands
+                    }
+                }
+            }
+            None => abs_path,
+        };
+
         // 3D branch mirrors the raster branch below.
-        if entry.file.media_type == Some(MediaType::Model3d)
-            && viewport3d::is_viewable_model(&entry.file.abs_path)
-        {
-            let path = entry.file.abs_path.clone();
+        if media_type == Some(MediaType::Model3d) && viewport3d::is_viewable_model(&local_path) {
             // Extracted packages place payloads in content-addressed dirs, so an FBX's
             // relative texture paths dangle — hand the loader a basename→file map built
             // from the same package's image entries. Loose files resolve on disk.
-            let tex_files = match &entry.package {
-                Some(pkg) => {
-                    let pkg = pkg.clone();
-                    self.entries
-                        .iter()
-                        .filter(|e| {
-                            e.package.as_deref() == Some(pkg.as_str())
-                                && matches!(
-                                    e.file.media_type,
-                                    Some(MediaType::Texture | MediaType::Image | MediaType::Sprite)
-                                )
-                        })
-                        .filter_map(|e| {
-                            let base = e
-                                .file
-                                .rel_path
-                                .file_name()?
-                                .to_string_lossy()
-                                .to_lowercase();
-                            Some((base, e.file.abs_path.clone()))
-                        })
-                        .collect()
-                }
+            let tex_files = match &package {
+                Some(pkg) => self
+                    .entries
+                    .iter()
+                    .filter(|e| {
+                        e.package.as_deref() == Some(pkg.as_str())
+                            && matches!(
+                                e.file.media_type,
+                                Some(MediaType::Texture | MediaType::Image | MediaType::Sprite)
+                            )
+                    })
+                    .filter_map(|e| {
+                        let base = e
+                            .file
+                            .rel_path
+                            .file_name()?
+                            .to_string_lossy()
+                            .to_lowercase();
+                        Some((base, e.file.abs_path.clone()))
+                    })
+                    .collect(),
                 None => std::collections::BTreeMap::new(),
             };
             if let Some(vp) = &mut self.viewport3d {
                 if vp.entry_idx != Some(entry_idx) {
-                    vp.load(entry_idx, path, tex_files, ctx);
+                    vp.load(entry_idx, local_path, tex_files, ctx);
                 }
             }
             return;
         }
         // Audio branch — decode the waveform on a worker thread, like the image branch.
-        if entry.file.media_type == Some(MediaType::Audio) {
-            let path = entry.file.abs_path.clone();
+        if media_type == Some(MediaType::Audio) {
             if let Some(ap) = &mut self.audio_player {
                 if ap.entry_idx != Some(entry_idx) {
-                    ap.load(entry_idx, path, ctx);
+                    ap.load(entry_idx, local_path, ctx);
                 }
             }
             return;
         }
-        if !is_viewer_image(entry.file.media_type) || self.image_viewer.entry_idx == Some(entry_idx)
-        {
+        if !is_viewer_image(media_type) || self.image_viewer.entry_idx == Some(entry_idx) {
             return;
         }
         self.image_viewer.reset_for(entry_idx);
-        let path = entry.file.abs_path.clone();
         let tx = self.viewer_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = load_viewer_image(&path);
+            let result = load_viewer_image(&local_path);
             let _ = tx.send(ViewerLoaded { entry_idx, result });
             ctx.request_repaint();
         });
+    }
+
+    /// Pull an in-pack asset's payload out of its archive to a scratch file so the viewers can open
+    /// it (M14). One surgical skip-scan; on a large pack this inflates up to the payload's offset,
+    /// so it runs off-thread with a toast and the result is cached for re-opens.
+    fn spawn_scratch_pull(
+        &mut self,
+        asset_id: i64,
+        pack_path: String,
+        offset: i64,
+        size: i64,
+        rel_path: &std::path::Path,
+        ctx: &egui::Context,
+    ) {
+        if !self.scratch_pulling.insert(asset_id) {
+            return; // already pulling this one
+        }
+        let name = rel_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.jobs.toast(
+            format!("Loading {name} from the pack\u{2026}"),
+            Intent::Info,
+        );
+        let pathname = rel_path.to_string_lossy().replace('\\', "/");
+        let tx = self.scratch_tx.clone();
+        let ctx = ctx.clone();
+        let dest = std::env::temp_dir().join("lodestash-peek");
+        std::thread::spawn(move || {
+            let loc = unitypackage::EntryLocator {
+                guid: asset_id.to_string(),
+                pathname: Some(pathname),
+                offset: offset as u64,
+                size: size as u64,
+            };
+            let res = match unitypackage::extract_at_offsets(
+                std::path::Path::new(&pack_path),
+                &dest,
+                vec![loc],
+            ) {
+                Ok(mut v) => match v.pop() {
+                    Some(a) => Ok(a.workspace_path),
+                    None => Err("the archive had no payload at that offset".to_string()),
+                },
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send((asset_id, res));
+            ctx.request_repaint();
+        });
+    }
+
+    fn receive_scratch(&mut self, ctx: &egui::Context) {
+        while let Ok((id, res)) = self.scratch_rx.try_recv() {
+            self.scratch_pulling.remove(&id);
+            match res {
+                Ok(path) => {
+                    self.in_pack_scratch.insert(id, path);
+                    ctx.request_repaint(); // re-run ensure_viewer_loaded now the file exists
+                }
+                Err(e) => {
+                    tracing::warn!(%e, asset_id = id, "in-pack payload pull for viewing failed");
+                    self.jobs
+                        .toast("Couldn't load that file from the pack", Intent::Warning);
+                }
+            }
+        }
     }
 
     fn receive_viewer(&mut self, ctx: &egui::Context) {
@@ -7368,6 +7462,7 @@ impl eframe::App for LodestashApp {
         self.receive_peek(ctx);
         self.receive_import_scan();
         self.receive_rehydrate(ctx);
+        self.receive_scratch(ctx);
         // A finished extraction frees the slot the batch queue waits on.
         self.pump_extract_queue(ctx);
         self.poll_watch(ctx);
