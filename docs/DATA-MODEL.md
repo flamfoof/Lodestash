@@ -414,11 +414,16 @@ CREATE INDEX idx_file_pkgentry ON asset_file(package_entry_id) WHERE package_ent
 - **Dependency edges harvest with zero pulls.** `read_manifest` already parses each entry's `.meta`
   (GUID/labels), so the §10 GUID pass runs off the manifest — an in-pack asset has its graph before a
   byte is read.
-- **Identify runs in place, one file at a time.** The embedding and tag drains resolve bytes through
-  the ladder above; for an in-pack asset they surgically pull that one payload into memory, decode,
-  embed **and** tag, then drop the bytes — no workspace copy, no identify cache (see §8 and
-  [`INGESTION.md`](INGESTION.md) §2/§3). Serial by design (the persist thread is the sole writer), and
-  identify does not need to be fast.
+- **Identify runs in place, one file at a time.** The embedding, metrics and tag drains resolve bytes
+  through the ladder above; for an in-pack asset they surgically pull that one payload, identify it,
+  then drop it — no workspace copy, no persistent identify cache (see §8 and
+  [`INGESTION.md`](INGESTION.md) §2/§3). **Images** decode straight from the in-memory bytes
+  (`raster::decode_bytes`). **Metrics, audio and tags (and 3D multiview embedding)** run through
+  path-based extractors, so the pulled payload is spilled to an **ephemeral OS-temp scratch file**
+  (`resolve_job_path`) that is deleted the instant the drain finishes with it — still not a workspace
+  copy and not the persistent extract cache, just a decode buffer that happens to live on disk because
+  those decoders take a path. Serial by design (the persist thread is the sole writer), and identify
+  does not need to be fast.
 - **Extraction is demoted to *materialize*.** `extract_at_offsets` fills `workspace_rel` on rows that
   already exist; it is only needed to leave a **persistent file on disk** (Add to project, or the
   "keep extracted" cache). Un-materializing (unpin/evict) clears `workspace_rel` and deletes the cached

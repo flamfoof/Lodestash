@@ -170,12 +170,18 @@ built.
   guid→`InPackClass` map; core stays classification-free). Idempotent by `package_entry_id`; **skips
   a pack that already has extracted rows** (guard against duplicate rows until step 8 unifies them).
   Dep edges harvest from the manifest `.meta` with zero pulls.
-- **Identify in place, from bytes.** `unitypackage::read_payload_at` pulls one payload into memory,
-  `raster::decode_bytes` decodes it — no file written. The embedding/tag/deps drain queues carry the
-  in-pack locator (`pack_path`+`offset`+`size`+`ext`), and `resolve_job_image` (in `app.rs`) picks
-  on-disk → workspace → in-pack pull. **Only images are wired for in-pack embedding so far**; in-pack
-  3D falls to the zero vector (mesh-from-bytes render not built), and in-pack **metrics/audio/tags**
-  drains still resolve only a real path (so no facets/audio-vec/tags for a purely in-pack asset yet).
+- **Identify in place, from bytes (full parity, 2026-07-25).** The drain queues carry the in-pack
+  locator (`pack_path`+`offset`+`size`+`ext`). **Images** decode straight from bytes
+  (`read_payload_at` → `raster::decode_bytes`, `resolve_job_image`, no file written). **Metrics,
+  audio embedding, tags and 3D embedding** now go through `resolve_job_path` (in `app.rs`): on-disk →
+  workspace → **in-pack payload surgically pulled to an OS-temp scratch file** (a `tempfile::TempPath`
+  guard deletes it on drop), so the path-based extractors (`metrics::extract`, `decode_audio_48k_mono`,
+  `tag_preview`/`thumb::generate`, and the multiview renderer — geometry-only, so an untextured temp
+  `.fbx`/`.glb` embeds by shape) identify a purely in-pack asset without a workspace extraction. So a
+  pack the user only *analyzed* now reaches `indexed`/`identified` end to end. **Remaining gaps:** an
+  in-pack asset's tag `name` is passed empty (the scratch file has a random stem — the caption carries
+  the signal; the real name needs the job to carry it); in-pack **deps** still resolve only a real path
+  (a `.meta` sidecar isn't the payload — dep edges are harvested from the manifest at mint anyway).
 - **Import mints; the folder is a pack-only source.** §5.2 import marks the folder `pack_only` in
   config (a tracked library that is **not crawled** for loose files), pins each pack, and mints in a
   background pass (`ensure_in_pack_minted`), then a `rehydrate` channel reloads the grid. In-pack rows
@@ -418,11 +424,10 @@ Top of the list is finishing the in-pack feature (M14) the last session built, i
 0. ~~M14 step 8 — unify extraction with in-pack rows~~ **DONE 2026-07-25** (`materialize_in_pack_assets`;
    see §6 trap). Extraction now materializes a pack's existing in-pack rows instead of minting a
    parallel set — one row per file, no shadowing. Not yet driven end-to-end in the running app.
-1. **In-pack identify parity.** Only **images** embed in place today. Wire the **metrics** drain
-   (dimensions from bytes are cheap; tris need mesh-from-bytes), **audio** embedding, and **tags**
-   for in-pack assets — otherwise a purely in-pack asset never reaches `indexed`/`identified`. The
-   seams exist (`decode_bytes`, `read_payload_at`, the locator columns on the queue rows); it is
-   filling the `None`-path in `drain_metrics`/`drain_audio_embeddings`/`drain_tags`.
+1. ~~In-pack identify parity~~ **DONE 2026-07-25.** `resolve_job_path` pulls an in-pack payload to an
+   OS-temp scratch file, so `drain_metrics`/`drain_audio_embeddings`/`drain_tags` and 3D embedding now
+   identify a purely in-pack asset (see §2). Leftover polish: real tag `name` for in-pack (currently
+   empty); not driven end-to-end in the running app.
 2. **Pack directory navigation redesign** — a design mockup is published (§2, the Artifact URL):
    persistent left tree pane, pack-rooted breadcrumb, folders-first contents, inspector. The current
    impl is functional (folder tiles as a vertical list) but is the library grid bolted to a folder

@@ -78,8 +78,9 @@ flagged.
 | **Errors/logging** | `thiserror` (libs) + `anyhow` (boundaries) + `tracing` (structured logs) |
 
 **Test dev-dependencies** (workspace `[dev-dependencies]`, not shipped): `insta` (snapshot
-assertions), `proptest` (property-based), `criterion` (benchmarks), `tempfile` (fixture dirs,
-already used). Real-model AI inference is **not** run in CI (non-deterministic, weight-dependent,
+assertions), `proptest` (property-based), `criterion` (benchmarks). `tempfile` is a **runtime**
+dependency (test fixture dirs, plus the OS-temp scratch file the in-pack identify drains pull a
+payload into — DATA-MODEL §7 / M14). Real-model AI inference is **not** run in CI (non-deterministic, weight-dependent,
 slow) — gate those behind `--features model-tests` for local/nightly runs; CI uses mock
 `Tagger`/`Embedder` impls.
 

@@ -123,10 +123,13 @@ to a single entry; reaching any entry means decompressing from the start. Lodest
   ([`DATA-MODEL.md`](DATA-MODEL.md) §7 / M14) — no payload is read.
 - **Surgical pull** = one gzip skip-scan (decompress-and-discard to a payload's offset, copy just that
   payload, ignore the rest — `extract_at_offsets`). This is the workhorse for **preview**, **identify**
-  and single-file **Add to project**: the pack is never fully unpacked. **Identify pulls into memory**
-  and decodes there (embed **and** tag off the one decoded buffer, then drop it) — no file is written,
-  so there is no identify cache; only **preview** and **explicit extraction** write the disposable
-  cache dir (Settings → Storage, §6). Serial, one file at a time — identify does not need to be fast.
+  and single-file **Add to project**: the pack is never fully unpacked. **Identify pulls one payload**
+  and identifies off it, then drops it — no workspace copy, no *persistent* identify cache. Images
+  decode straight from the in-memory bytes; metrics/audio/tags/3D use path-based extractors, so the
+  payload is spilled to an **ephemeral OS-temp scratch file** (`resolve_job_path`, deleted the instant
+  the drain is done with it) — a decode buffer that lives on disk only because those decoders take a
+  path, not the disposable extract cache. Only **preview** and **explicit extraction** write the
+  retained cache dir (Settings → Storage, §6). Serial, one file at a time — identify need not be fast.
 - **Full extraction (materialize)** = a single streaming pass (gzip-decode → tar-walk) that extracts
   every payload **once** into a content-addressed, LRU/size-capped **workspace** on disk (evict +
   re-extract on demand, idempotent by hash). This is now **optional** — only when a persistent on-disk

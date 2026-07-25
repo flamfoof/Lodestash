@@ -10623,11 +10623,9 @@ fn drain_audio_embeddings(
         }
         let n = jobs.len();
         for job in jobs {
-            let path = match (&job.disk_path, &job.workspace_rel) {
-                (Some(p), _) => Some(std::path::PathBuf::from(p)),
-                (None, Some(rel)) => workspace_dir.map(|w| w.join(rel)),
-                _ => None,
-            };
+            // In-pack payloads pull to a scratch file; keep the guard alive while `path` is read.
+            let resolved = resolve_job_path(&job, workspace_dir);
+            let path = resolved.as_ref().map(|(p, _)| p.clone());
             let vector = path
                 .as_deref()
                 .and_then(|p| {
@@ -10780,11 +10778,9 @@ fn drain_metrics(cat: &mut Catalog, workspace_dir: Option<&std::path::Path>) {
         }
         let n = jobs.len();
         for job in jobs {
-            let path = match (&job.disk_path, &job.workspace_rel) {
-                (Some(p), _) => Some(std::path::PathBuf::from(p)),
-                (None, Some(rel)) => workspace_dir.map(|w| w.join(rel)),
-                _ => None,
-            };
+            // In-pack payloads pull to a scratch file; keep the guard alive while `path` is read.
+            let resolved = resolve_job_path(&job, workspace_dir);
+            let path = resolved.as_ref().map(|(p, _)| p.clone());
             let metrics = path
                 .as_deref()
                 .map(|p| {
@@ -10937,16 +10933,21 @@ fn drain_tags(
             if progress.is_cancelled() {
                 return;
             }
-            let path = match (&job.disk_path, &job.workspace_rel) {
-                (Some(p), _) => Some(std::path::PathBuf::from(p)),
-                (None, Some(rel)) => workspace_dir.map(|w| w.join(rel)),
-                _ => None,
+            // In-pack payloads pull to a scratch file; keep the guard alive while `path` is read
+            // (only this first pass touches the file — the caption image is decoded into memory here).
+            let resolved = resolve_job_path(&job, workspace_dir);
+            let path = resolved.as_ref().map(|(p, _)| p.clone());
+            // A scratch pull (in-pack) has a random temp stem — don't feed it as the asset name; the
+            // caption carries the signal. ponytail: real in-pack name needs the job to carry it.
+            let is_scratch = resolved.as_ref().is_some_and(|(_, g)| g.is_some());
+            let name = if is_scratch {
+                String::new()
+            } else {
+                path.as_deref()
+                    .and_then(|p| p.file_stem())
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default()
             };
-            let name = path
-                .as_deref()
-                .and_then(|p| p.file_stem())
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
             let caption = if tagger.supports(&job.media_code) {
                 path.as_deref()
                     .zip(cache_dir)
@@ -11058,6 +11059,52 @@ fn resolve_job_image(
     None
 }
 
+/// Resolve a drain job to a readable on-disk path from whichever §7 byte-source applies. On-disk and
+/// workspace-extracted files resolve to their real path with no guard; an **in-pack** asset has its
+/// one payload surgically pulled to an OS-temp scratch file (DATA-MODEL §7 / M14), returned with a
+/// `TempPath` guard that deletes it on drop — so the path-based metrics/audio/tag extractors can
+/// identify an in-pack asset without a workspace extraction. Serial + manual by design (INGESTION
+/// §2), so the pull-per-file cost is fine. `None` when nothing resolves (evicted workspace file, no
+/// locator). Keep the returned guard alive for as long as the path is used.
+fn resolve_job_path(
+    job: &lodestash_core::catalog::VisualEmbedJob,
+    workspace_dir: Option<&std::path::Path>,
+) -> Option<(std::path::PathBuf, Option<tempfile::TempPath>)> {
+    if let Some(p) = &job.disk_path {
+        return Some((std::path::PathBuf::from(p), None));
+    }
+    if let (Some(rel), Some(ws)) = (&job.workspace_rel, workspace_dir) {
+        return Some((ws.join(rel), None));
+    }
+    if let (Some(pack), Some(off), Some(sz)) = (&job.pack_path, job.pack_offset, job.pack_size) {
+        let bytes = lodestash_ingest::unitypackage::read_payload_at(
+            std::path::Path::new(pack),
+            off as u64,
+            sz as u64,
+        )
+        .map_err(|e| tracing::warn!(%e, "in-pack payload pull failed"))
+        .ok()?;
+        // Keep the extension so the path-based decoders dispatch on it exactly as for a real file.
+        let suffix = job
+            .ext
+            .as_deref()
+            .map(|e| format!(".{e}"))
+            .unwrap_or_default();
+        let mut tmp = tempfile::Builder::new()
+            .suffix(&suffix)
+            .tempfile()
+            .map_err(|e| tracing::warn!(%e, "scratch temp create failed"))
+            .ok()?;
+        std::io::Write::write_all(&mut tmp, &bytes)
+            .map_err(|e| tracing::warn!(%e, "scratch temp write failed"))
+            .ok()?;
+        let temp_path = tmp.into_temp_path();
+        let pathbuf = temp_path.to_path_buf();
+        return Some((pathbuf, Some(temp_path)));
+    }
+    None
+}
+
 fn drain_image_embeddings(
     cat: &mut Catalog,
     emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync),
@@ -11084,15 +11131,13 @@ fn drain_image_embeddings(
                 "image"
             };
             let vector = if job.media_code == "model_3d" {
-                // On-disk source file, or a package-extracted file resolved against the workspace.
-                // ponytail: an in-pack model needs mesh-from-bytes render (no path to give the
-                // renderer) — not yet; in-pack models fall to the zero vec below until it lands.
-                let path = match (&job.disk_path, &job.workspace_rel) {
-                    (Some(p), _) => Some(std::path::PathBuf::from(p)),
-                    (None, Some(rel)) => workspace_dir.map(|w| w.join(rel)),
-                    _ => None,
-                };
-                path.as_deref().and_then(|p| embed_model_multiview(p, emb))
+                // On-disk, workspace-extracted, or an in-pack model pulled to a scratch file — the
+                // multiview renderer is geometry-only, so an isolated (untextured) temp .fbx/.glb
+                // embeds by shape exactly as an on-disk one would. Guard held while the path is read.
+                let resolved = resolve_job_path(&job, workspace_dir);
+                resolved
+                    .as_ref()
+                    .and_then(|(p, _)| embed_model_multiview(p, emb))
             } else {
                 resolve_job_image(&job, workspace_dir).map(|img| emb.embed_image(&img.to_rgba8()))
             }
@@ -14037,6 +14082,66 @@ mod tests {
 
         builder.into_inner().unwrap().finish().unwrap();
         pkg_path
+    }
+
+    /// In-pack identify parity (M14 / DATA-MODEL §7): a job whose bytes are still inside the
+    /// `.unitypackage` resolves by pulling that one payload to a scratch file the path-based
+    /// metrics/audio/tag extractors can read — extension preserved, deleted when the guard drops.
+    #[test]
+    fn resolve_job_path_pulls_in_pack_payload_to_scratch() {
+        use lodestash_core::catalog::VisualEmbedJob;
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"PNGDATA".repeat(64); // stand-in bytes, spans tar blocks
+        let pkg = build_test_package(dir.path(), "Pack.unitypackage", "Assets/Rock.png", &payload);
+        let entry =
+            &lodestash_ingest::unitypackage::read_manifest_with_progress(&pkg, &|_, _| true)
+                .unwrap()[0];
+        let job = VisualEmbedJob {
+            asset_id: 1,
+            disk_path: None,
+            workspace_rel: None,
+            media_type_id: 1,
+            source_id: 1,
+            media_code: "texture".into(),
+            pack_path: Some(pkg.to_string_lossy().into_owned()),
+            pack_offset: Some(entry.asset_offset.unwrap() as i64),
+            pack_size: Some(entry.asset_size.unwrap() as i64),
+            ext: Some("png".into()),
+        };
+
+        let scratch_path = {
+            let (path, guard) = resolve_job_path(&job, None).expect("in-pack resolves");
+            assert!(
+                guard.is_some(),
+                "in-pack pull returns a delete-on-drop guard"
+            );
+            assert_eq!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("png"),
+                "extension preserved so the path decoders dispatch"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                payload,
+                "scratch is byte-identical to the in-pack payload"
+            );
+            path
+        };
+        assert!(
+            !scratch_path.exists(),
+            "guard dropped → scratch deleted (the pull cache is disposable)"
+        );
+
+        // Ladder precedence: a real disk_path wins and is used in place (no guard); nothing
+        // resolvable → None (so the drain clears the flag and advances instead of looping).
+        let mut on_disk = job.clone();
+        on_disk.disk_path = Some("C:/lib/Rock.png".into());
+        let (p, g) = resolve_job_path(&on_disk, None).unwrap();
+        assert_eq!(p, PathBuf::from("C:/lib/Rock.png"));
+        assert!(g.is_none(), "an on-disk file is read in place, not copied");
+        let mut nowhere = job.clone();
+        nowhere.pack_path = None;
+        assert!(resolve_job_path(&nowhere, None).is_none());
     }
 
     /// §5.2 import: publisher/category come from the Asset Store's own two levels, and a
