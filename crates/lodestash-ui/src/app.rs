@@ -5137,18 +5137,19 @@ impl LodestashApp {
 
         // Browse into the pack once its assets land (set before the background mint kicks off).
         self.pending_pack_browse = Some(name.clone());
-        // A job-tray row so a large pack (whose manifest takes a while to read) shows activity
-        // instead of looking frozen.
+        // A cancellable, progress-reporting job-tray row: reading a big pack's manifest inflates the
+        // whole archive (a 21 GB pack is minutes of CPU), so it shows a real bar and a ✕ to abort.
         if let Some(id) = self.open_pack_job.take() {
             self.jobs.finish(id);
         }
+        let progress = Arc::new(crate::jobs::JobProgress::default());
         self.open_pack_job = Some(self.jobs.start(
             format!("Opening {name}"),
-            Arc::default(),
-            false,
+            progress.clone(),
+            true,
         ));
 
-        // Background: pin + ensure minted, then signal a re-hydrate.
+        // Background: pin + ensure minted (streaming, cancellable), then signal a re-hydrate.
         let tx = self.rehydrate_tx.clone();
         let ctx2 = ctx.clone();
         let path = abs_path.clone();
@@ -5158,8 +5159,8 @@ impl LodestashApp {
                     tracing::warn!(%err, package_id, "open: pin failed");
                 }
             }
-            if let Err(err) = ensure_in_pack_minted(&db_path, package_id, &path) {
-                tracing::warn!(%err, package_id, "open: in-pack mint failed");
+            if let Err(err) = ensure_in_pack_minted(&db_path, package_id, &path, &progress) {
+                tracing::warn!(%err, package_id, "open: in-pack mint failed or cancelled");
             }
             let _ = tx.send(());
             ctx2.request_repaint();
@@ -5467,8 +5468,12 @@ impl LodestashApp {
                 let ctx2 = ctx.clone();
                 std::thread::spawn(move || {
                     let mut minted = 0usize;
+                    // ponytail: import minting is not individually cancellable yet (bulk action) —
+                    // a throwaway progress carries the read; the per-pack Open flow is where cancel
+                    // matters (the 21 GB case).
+                    let progress = crate::jobs::JobProgress::default();
                     for (id, path) in ids {
-                        match ensure_in_pack_minted(&db2, id, &path) {
+                        match ensure_in_pack_minted(&db2, id, &path, &progress) {
                             Ok(k) => minted += k,
                             Err(err) => {
                                 tracing::warn!(%err, package_id = id, "in-pack mint failed")
@@ -10763,13 +10768,24 @@ fn ensure_in_pack_minted(
     db: &std::path::Path,
     package_id: i64,
     pack_path: &std::path::Path,
+    progress: &crate::jobs::JobProgress,
 ) -> Result<usize, String> {
+    use std::sync::atomic::Ordering;
     let mut catalog = Catalog::open(db).map_err(|e| e.to_string())?;
     let mut entries = catalog
         .list_package_entries(package_id)
         .map_err(|e| e.to_string())?;
     if entries.is_empty() {
-        let manifest = unitypackage::read_manifest(pack_path).map_err(|e| e.to_string())?;
+        // Streaming manifest read: a big pack (a 21 GB music collection) must inflate its whole
+        // tar.gz to list its files, so drive a progress bar off compressed bytes and let the tray's
+        // ✕ cancel it. Cancel surfaces as an Err, leaving nothing half-written (locators are
+        // recorded only after a complete read).
+        let manifest = unitypackage::read_manifest_with_progress(pack_path, &|read, total| {
+            progress.total.store(total, Ordering::Relaxed);
+            progress.done.store(read, Ordering::Relaxed);
+            !progress.is_cancelled()
+        })
+        .map_err(|e| e.to_string())?;
         entries = manifest
             .iter()
             .map(|e| PackageEntryRecord {

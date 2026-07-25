@@ -265,7 +265,26 @@ fn guid_and_member(entry_path: &Path) -> Option<(String, String)> {
 /// Browse pass: enumerate every GUID folder's `pathname`/`asset.meta`/`asset` size/`preview.png`
 /// presence without ever buffering an `asset` payload's bytes. Returned in GUID order.
 pub fn read_manifest(path: &Path) -> io::Result<Vec<PackageEntry>> {
+    read_manifest_with_progress(path, &|_, _| true)
+}
+
+/// [`read_manifest`] with progress + cancel. `.unitypackage` is tar.gz with no random access, so
+/// even reading only the small manifest entries means **decompressing the whole archive** (the tiny
+/// `pathname`/`asset.meta` entries sit behind the huge `asset` payloads, and gzip can't seek). On a
+/// 20 GB pack that is real CPU, so the read reports **compressed bytes consumed vs. the file size**
+/// for a progress bar, and `on_progress` returning `false` cancels it (errors out).
+pub fn read_manifest_with_progress(
+    path: &Path,
+    on_progress: &(dyn Fn(u64, u64) -> bool + Sync),
+) -> io::Result<Vec<PackageEntry>> {
     let file = File::open(path)?;
+    let total = file.metadata()?.len();
+    let file = ProgressReader {
+        inner: file,
+        read: 0,
+        total,
+        on_progress,
+    };
     let gz = GzDecoder::new(file);
     let mut archive = tar::Archive::new(gz);
 
@@ -680,6 +699,31 @@ mod tests {
             }],
         );
         assert!(bad.is_err());
+    }
+
+    #[test]
+    fn read_manifest_with_progress_reports_and_cancels() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = build_test_package(
+            dir.path(),
+            "abc123",
+            "Assets/Props/Barrel.png",
+            "guid: abc123\n",
+            &b"payload".repeat(500),
+        );
+        // Progress fires with a non-zero total (the compressed file size).
+        let seen_total = std::sync::atomic::AtomicU64::new(0);
+        let out = read_manifest_with_progress(&pkg, &|_read, total| {
+            seen_total.store(total, std::sync::atomic::Ordering::Relaxed);
+            true
+        })
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(seen_total.load(std::sync::atomic::Ordering::Relaxed) > 0);
+
+        // Returning false cancels — the read errors rather than completing.
+        let cancelled = read_manifest_with_progress(&pkg, &|_, _| false);
+        assert!(cancelled.is_err(), "cancel surfaces as an error");
     }
 
     #[test]
