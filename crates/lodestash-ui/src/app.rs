@@ -3591,13 +3591,15 @@ impl LodestashApp {
                             ui.add(
                                 egui::ProgressBar::new(frac)
                                     .desired_width(120.0)
-                                    .desired_height(14.0)
-                                    .fill(theme::GOLD)
-                                    .text(
-                                        RichText::new(format!("{:.0}%", frac * 100.0))
-                                            .size(9.0)
-                                            .color(theme::BG),
-                                    ),
+                                    .desired_height(10.0)
+                                    .fill(theme::GOLD),
+                            );
+                            // Percentage as a separate label beside the bar — drawing text *inside*
+                            // a 10px bar forced it taller and overflowed the tray frame's top edge.
+                            ui.label(
+                                RichText::new(format!("{:.0}%", frac * 100.0))
+                                    .size(10.0)
+                                    .color(theme::TEXT_DIM),
                             );
                         }
                         ui.label(
