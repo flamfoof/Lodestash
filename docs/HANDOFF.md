@@ -213,7 +213,14 @@ built.
 - **Viewing an in-pack asset pulls its payload** (`spawn_scratch_pull` → `extract_at_offsets` to an
   OS-temp scratch, cached per asset), because `abs_path` for an in-pack asset **is the
   `.unitypackage`** — decoding that as audio/image is the "Unrecognized format" bug that bit the mp3.
-  The inspector shows the **in-archive path** (copyable) + a **Package** row.
+  The inspector shows the **in-archive path** (copyable) + a **Package** row. **The pull now shows a
+  job-tray % bar + ✕** (`extract_at_offsets_with_progress`, `scratch_jobs`): on the real 21.9 GB music
+  pack a single track sits near the end of the archive, so the gzip skip-scan inflates ~20 GB (minutes)
+  — with only the old static toast it read as "can't play any audio" (user-reported). It is **inherent
+  to gzip** (no random access): the honest fixes are the visible/cancellable bar, and *extract the pack
+  once* for instant repeat playback. **ponytail:** for heavy browsing of one big pack, prompt to
+  extract rather than pull per track. **Center folder tiles are hidden when the directory-tree pane is
+  present** (§7.2) — the tree owns folder nav, so the old center strip would be redundant buttons.
 
 **Identification is manual by default** (`config.auto_identify`, off; Settings ▸ AI · IDENTIFY toggle,
 [`AI-PIPELINE.md`](AI-PIPELINE.md) §2). The SigLIP/CLAP embedding drain auto-ran on every hydrate, and

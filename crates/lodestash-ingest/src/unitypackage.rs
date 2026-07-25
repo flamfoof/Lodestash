@@ -503,13 +503,47 @@ pub struct EntryLocator {
 pub fn extract_at_offsets(
     path: &Path,
     dest: &Path,
+    wanted: Vec<EntryLocator>,
+) -> io::Result<Vec<ExtractedAsset>> {
+    let gz = GzDecoder::new(File::open(path)?);
+    extract_at_offsets_from(gz, dest, wanted)
+}
+
+/// Like [`extract_at_offsets`] but drives `on_progress(compressed_read, compressed_total)` as it
+/// skip-scans and stops (clean cancel) when the callback returns false. Progress is in **compressed**
+/// bytes — the honest denominator, since the cost is inflating the gzip up to the payload's offset (a
+/// big pack has no random access, INGESTION §2). A cancel surfaces as the sentinel error
+/// [`is_cancel`] recognizes; on a huge pack this is what lets a single-file preview pull show a real
+/// bar and be aborted instead of appearing frozen.
+pub fn extract_at_offsets_with_progress(
+    path: &Path,
+    dest: &Path,
+    wanted: Vec<EntryLocator>,
+    on_progress: &(dyn Fn(u64, u64) -> bool + Sync),
+) -> io::Result<Vec<ExtractedAsset>> {
+    let file = File::open(path)?;
+    let total = file.metadata()?.len();
+    let reader = ProgressReader {
+        inner: file,
+        read: 0,
+        total,
+        on_progress,
+    };
+    let gz = GzDecoder::new(reader);
+    extract_at_offsets_from(gz, dest, wanted)
+}
+
+/// Shared skip-scan loop for both surgical-extract entry points — generic over the reader so the
+/// plain and progress-reporting variants differ only in how the gzip stream is wrapped.
+fn extract_at_offsets_from<R: Read>(
+    mut gz: GzDecoder<R>,
+    dest: &Path,
     mut wanted: Vec<EntryLocator>,
 ) -> io::Result<Vec<ExtractedAsset>> {
     wanted.sort_by_key(|w| w.offset);
     let tmp_dir = dest.join(".tmp");
     std::fs::create_dir_all(&tmp_dir)?;
 
-    let mut gz = GzDecoder::new(File::open(path)?);
     let mut pos: u64 = 0;
     let mut extracted = Vec::with_capacity(wanted.len());
     for w in wanted {

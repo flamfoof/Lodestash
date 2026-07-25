@@ -966,6 +966,9 @@ pub struct LodestashApp {
     /// `abs_path` (that's the archive) — the payload is surgically pulled to a scratch file first.
     in_pack_scratch: std::collections::HashMap<i64, PathBuf>,
     scratch_pulling: std::collections::HashSet<i64>,
+    /// Job-tray row per in-flight scratch pull, so a slow pull from a huge pack shows a % bar + ✕
+    /// (the pull inflates the gzip up to the payload's offset — minutes on a 20 GB pack).
+    scratch_jobs: std::collections::HashMap<i64, u64>,
     scratch_rx: Receiver<(i64, Result<PathBuf, String>)>,
     scratch_tx: Sender<(i64, Result<PathBuf, String>)>,
     /// A pack the user pressed **Open →** on: once its in-pack assets land in the grid (via the
@@ -1193,6 +1196,7 @@ impl LodestashApp {
             in_pack_locators: std::collections::HashMap::new(),
             in_pack_scratch: std::collections::HashMap::new(),
             scratch_pulling: std::collections::HashSet::new(),
+            scratch_jobs: std::collections::HashMap::new(),
             scratch_rx,
             scratch_tx,
             pending_pack_browse: None,
@@ -2742,10 +2746,17 @@ impl LodestashApp {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        self.jobs.toast(
-            format!("Loading {name} from the pack\u{2026}"),
-            Intent::Info,
+        // A real progress bar + ✕ rather than a fire-and-forget toast: the pull inflates the gzip up
+        // to the payload's offset, so on a 20 GB pack it is minutes of work and a static toast reads
+        // as "frozen / can't play". The job row shows compressed-bytes progress and can be cancelled.
+        use std::sync::atomic::Ordering;
+        let progress = Arc::new(crate::jobs::JobProgress::default());
+        let job = self.jobs.start(
+            format!("Loading {name} from the pack"),
+            progress.clone(),
+            true,
         );
+        self.scratch_jobs.insert(asset_id, job);
         let pathname = rel_path.to_string_lossy().replace('\\', "/");
         let tx = self.scratch_tx.clone();
         let ctx = ctx.clone();
@@ -2757,10 +2768,15 @@ impl LodestashApp {
                 offset: offset as u64,
                 size: size as u64,
             };
-            let res = match unitypackage::extract_at_offsets(
+            let res = match unitypackage::extract_at_offsets_with_progress(
                 std::path::Path::new(&pack_path),
                 &dest,
                 vec![loc],
+                &|read, total| {
+                    progress.total.store(total, Ordering::Relaxed);
+                    progress.done.store(read, Ordering::Relaxed);
+                    !progress.is_cancelled()
+                },
             ) {
                 Ok(mut v) => match v.pop() {
                     Some(a) => Ok(a.workspace_path),
@@ -2776,10 +2792,17 @@ impl LodestashApp {
     fn receive_scratch(&mut self, ctx: &egui::Context) {
         while let Ok((id, res)) = self.scratch_rx.try_recv() {
             self.scratch_pulling.remove(&id);
+            if let Some(job) = self.scratch_jobs.remove(&id) {
+                self.jobs.finish(job);
+            }
             match res {
                 Ok(path) => {
                     self.in_pack_scratch.insert(id, path);
                     ctx.request_repaint(); // re-run ensure_viewer_loaded now the file exists
+                }
+                // A cancel (the tray's ✕) is not a failure — the user aborted a slow pull.
+                Err(e) if e.contains("cancelled") => {
+                    tracing::info!(asset_id = id, "in-pack payload pull cancelled");
                 }
                 Err(e) => {
                     tracing::warn!(%e, asset_id = id, "in-pack payload pull for viewing failed");
@@ -7387,8 +7410,12 @@ impl LodestashApp {
         }
         ui.add_space(6.0);
 
-        // Folder tiles (hidden while searching — search shows subtree results flat).
-        if !self.folder_tiles.is_empty() && self.search.is_empty() {
+        // Folder tiles (hidden while searching — search shows subtree results flat). Suppressed when
+        // the pack directory-tree pane is present: the left tree owns folder navigation there, so the
+        // center strip would be a redundant second set of folder buttons.
+        let tree_owns_nav = matches!(self.source_filter, Some(LibraryFilter::Package(_)))
+            && !self.pack_dir_tree.is_empty();
+        if !tree_owns_nav && !self.folder_tiles.is_empty() && self.search.is_empty() {
             let tiles = self.folder_tiles.clone();
             let mut clicked: Option<usize> = None;
             // A vertical list (one folder per row) reads far better than wrapped chips when
