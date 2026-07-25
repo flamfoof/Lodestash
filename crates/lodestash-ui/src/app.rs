@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use egui::{Key, RichText, ScrollArea, TextureHandle, Ui, Vec2};
 use lodestash_core::catalog::{
-    Catalog, CrawlRecord, HydratedAsset, PackageEntryRecord, StatusCounts,
+    Catalog, CrawlRecord, HydratedAsset, InPackClass, PackageEntryRecord, StatusCounts,
 };
 use lodestash_core::types::{AssetStatus, MediaType};
 use lodestash_ingest::asset_store::{self, AssetStorePackage};
@@ -5239,12 +5239,28 @@ impl LodestashApp {
                     })
                     .collect::<Vec<_>>()
             });
-            // Write-behind so the next Open → doesn't re-read the archive.
+            // Write-behind so the next Open → doesn't re-read the archive, and mint an in-pack
+            // asset per classified entry (M14) so the pack is a searchable library without being
+            // unpacked (DATA-MODEL §7). Both writes ride one connection, sequentially.
             if let (Ok(entries), Some(db)) = (&entries, catalog_db_path()) {
-                if let Err(err) = Catalog::open(&db)
-                    .and_then(|mut c| c.record_package_entries(package_id, entries))
-                {
-                    tracing::warn!(%err, package_id, "recording manifest locators failed");
+                match Catalog::open(&db) {
+                    Ok(mut c) => {
+                        if let Err(err) = c.record_package_entries(package_id, entries) {
+                            tracing::warn!(%err, package_id, "recording manifest locators failed");
+                        }
+                        let classified = classify_in_pack_entries(entries);
+                        match c.mint_in_pack_assets(package_id, &classified) {
+                            Ok(stats) => tracing::info!(
+                                package_id,
+                                minted = stats.inserted,
+                                "in-pack assets minted"
+                            ),
+                            Err(err) => {
+                                tracing::warn!(%err, package_id, "minting in-pack assets failed")
+                            }
+                        }
+                    }
+                    Err(err) => tracing::warn!(%err, package_id, "catalog open for mint failed"),
                 }
             }
             let _ = tx.send(ManifestRead {
@@ -10344,6 +10360,34 @@ fn crawl_record(f: &CrawledFile) -> CrawlRecord {
         mtime: f.mtime,
         workspace_rel: None,
     }
+}
+
+/// Classify a package's manifest entries for minting (M14): map each entry's GUID to the media
+/// type + display name the in-pack asset should carry. Entries whose extension classifies to no
+/// `media_type` (scripts, prefabs, manifests) are dropped — the same "unclassified never reaches
+/// the grid" rule the crawl applies, enforced here by their absence from the returned map.
+fn classify_in_pack_entries(
+    entries: &[PackageEntryRecord],
+) -> std::collections::HashMap<String, InPackClass> {
+    entries
+        .iter()
+        .filter_map(|e| {
+            let pathname = e.pathname.as_deref()?;
+            let path = std::path::Path::new(pathname);
+            let media_type = detect::by_extension(path)?;
+            let name = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| e.guid.clone());
+            Some((
+                e.guid.clone(),
+                InPackClass {
+                    name,
+                    media_type: media_type.code().to_string(),
+                },
+            ))
+        })
+        .collect()
 }
 
 /// [`crawl_records`] for package-extracted files, locating each payload inside the extraction

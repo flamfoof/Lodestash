@@ -616,15 +616,42 @@ impl Catalog {
     ///
     /// Idempotent by `package_entry_id` (re-importing mints nothing twice). Freshly inserted rows
     /// carry the default dirty flags (`embedding_dirty`/`metrics_dirty`/`tags_dirty`/`deps_dirty` all
-    /// DEFAULT 1), so identify picks them up with no extra flagging.
+    /// DEFAULT 1), so identify picks them up with no extra flagging. The owning `source_id` is read
+    /// from the `package` row — the pack already knows which library it belongs to.
     pub fn mint_in_pack_assets(
         &mut self,
-        source_id: i64,
         package_id: i64,
         classified: &HashMap<String, InPackClass>,
     ) -> Result<CrawlStats> {
         let now = unix_now();
         let mut stats = CrawlStats::default();
+
+        let source_id: i64 = self
+            .conn
+            .query_row(
+                "SELECT source_id FROM package WHERE id = ?1",
+                params![package_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| CoreError::Catalog(format!("mint source_id: {e}")))?;
+
+        // A pack that has already been fully extracted carries its assets as workspace_rel rows
+        // (via record_crawl), which don't link a package_entry — so the per-locator idempotency
+        // probe below can't see them and would mint in-pack duplicates. Until extraction is unified
+        // to materialize the in-pack rows in place (M14 step 8), a pack is either analyzed (in-pack)
+        // or extracted, never both: skip minting once any extracted row exists.
+        let extracted: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM asset a JOIN asset_file af ON af.asset_id = a.id
+                    WHERE a.package_id = ?1 AND af.workspace_rel IS NOT NULL)",
+                params![package_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| CoreError::Catalog(format!("mint extracted probe: {e}")))?;
+        if extracted {
+            return Ok(stats);
+        }
 
         // The persisted locators to mint from (id + guid + pathname + size), read before the
         // write borrow so the transaction can hold the only mutable borrow of the connection.
@@ -3508,8 +3535,21 @@ mod tests {
             ),
         ]);
 
-        let stats = c.mint_in_pack_assets(sid, pid, &classified).expect("mint");
+        let stats = c.mint_in_pack_assets(pid, &classified).expect("mint");
         assert_eq!(stats.inserted, 2, "two classified entries minted");
+        // The owning source_id is derived from the package row, not passed in.
+        let minted_source: i64 = c
+            .conn
+            .query_row(
+                "SELECT DISTINCT source_id FROM asset WHERE package_id = ?1",
+                params![pid],
+                |r| r.get(0),
+            )
+            .expect("minted source");
+        assert_eq!(
+            minted_source, sid,
+            "minted assets belong to the pack's source"
+        );
 
         // Every minted file links its locator and has NO workspace_rel (bytes stay in-pack).
         let linked: i64 = c
@@ -3555,11 +3595,45 @@ mod tests {
         assert_eq!(dirty, 2, "minted in-pack assets await identify");
 
         // Idempotent: re-minting the same classification inserts nothing new.
-        let again = c
-            .mint_in_pack_assets(sid, pid, &classified)
-            .expect("re-mint");
+        let again = c.mint_in_pack_assets(pid, &classified).expect("re-mint");
         assert_eq!(again.inserted, 0, "re-import mints nothing twice");
         assert_eq!(again.unchanged, 2);
+
+        // Guard: once the pack has any extracted (workspace_rel) row, minting is skipped wholesale
+        // so an extracted pack can't grow duplicate in-pack rows. Add a new classified locator and
+        // an extracted row, then confirm the new locator is NOT minted.
+        c.record_package_entries(
+            pid,
+            &[PackageEntryRecord {
+                guid: "g_new".into(),
+                pathname: Some("Assets/Audio/Hit.wav".into()),
+                tar_offset: Some(32768),
+                size_bytes: Some(1024),
+            }],
+        )
+        .expect("new entry");
+        c.conn
+            .execute(
+                "INSERT INTO asset_file (asset_id, rel_path, workspace_rel)
+                 VALUES ((SELECT id FROM asset WHERE package_id = ?1 LIMIT 1),
+                         'Pack/extracted.fbx', 'hash/extracted.fbx')",
+                params![pid],
+            )
+            .expect("extracted row");
+        let with_extracted = HashMap::from([(
+            "g_new".to_string(),
+            InPackClass {
+                name: "Hit".into(),
+                media_type: "audio".into(),
+            },
+        )]);
+        let skipped = c
+            .mint_in_pack_assets(pid, &with_extracted)
+            .expect("guarded mint");
+        assert_eq!(
+            skipped.inserted, 0,
+            "an extracted pack does not grow in-pack duplicates"
+        );
     }
 
     #[test]
