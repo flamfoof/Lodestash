@@ -221,6 +221,21 @@ built.
   once* for instant repeat playback. **ponytail:** for heavy browsing of one big pack, prompt to
   extract rather than pull per track. **Center folder tiles are hidden when the directory-tree pane is
   present** (§7.2) — the tree owns folder nav, so the old center strip would be redundant buttons.
+- **In-pack 3D models rendered blank — fixed 2026-07-25.** The Quick Look computed `direct_model` from
+  `e.file.abs_path`, which for an in-pack asset **is the `.unitypackage` archive**, so
+  `is_viewable_model` read false and the display's `is_model` branch never ran — the viewport
+  `ensure_viewer_loaded` had actually loaded (from the scratch pull) was never shown (the "blank 3D
+  default" the user saw). Now it tests `e.file.rel_path` (the asset's own extension, correct for
+  in-pack **and** on-disk). Audio was never a display bug — `is_audio` keys off `media_type`; its "can't
+  play" was purely the slow pull.
+- **"Extract for instant previews" button** (`extract_active_pack` → `extract_whole_pack`,
+  `pack_extract_banner`) in the pack browser when the browsed pack still has in-pack assets and is
+  bigger than `IN_PACK_THUMB_MAX_BYTES`. One full streaming extraction materializes every row (M14
+  step 8) so all assets then preview from disk — the fast answer to a big pack's per-track pull cost.
+  Preview pulls now land in the **managed workspace** (content-addressed, LRU-capped, dedups with a
+  later full extract) rather than unbounded OS-temp. **ponytail:** cross-session reuse of a single
+  previewed track still needs its row materialized on the persist thread (single-writer) — deferred;
+  the extract button is the full fast path.
 
 **Identification is manual by default** (`config.auto_identify`, off; Settings ▸ AI · IDENTIFY toggle,
 [`AI-PIPELINE.md`](AI-PIPELINE.md) §2). The SigLIP/CLAP embedding drain auto-ran on every hydrate, and

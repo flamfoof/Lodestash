@@ -2760,7 +2760,16 @@ impl LodestashApp {
         let pathname = rel_path.to_string_lossy().replace('\\', "/");
         let tx = self.scratch_tx.clone();
         let ctx = ctx.clone();
-        let dest = std::env::temp_dir().join("lodestash-peek");
+        // Pull into the managed workspace (content-addressed, LRU-capped) rather than an unbounded
+        // OS-temp dir: a previewed payload is then reused if the pack is later fully extracted (same
+        // hash placement dedups), and it is cleaned up with the workspace instead of piling up in temp.
+        // ponytail: cross-session reuse still needs the row materialized (workspace_rel) on the persist
+        // thread (single-writer rule) — deferred; the "Extract for instant previews" button is the
+        // full fast path.
+        let dest = self
+            .workspace_dir
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("lodestash-peek"));
         std::thread::spawn(move || {
             let loc = unitypackage::EntryLocator {
                 guid: asset_id.to_string(),
@@ -5643,6 +5652,119 @@ impl LodestashApp {
         });
         let idx = self.pending_packages.len() - 1;
         self.extract_package(ctx, idx);
+    }
+
+    /// Full-extract the pack the user is **browsing** (the fast path for a big in-pack pack). A pack
+    /// analyzed in place previews every asset by a per-file gzip pull that inflates the archive up to
+    /// the payload's offset — minutes each on a 20 GB pack. One streaming extraction writes every
+    /// payload to the workspace and (via M14 step 8) materializes the in-pack rows, so afterward every
+    /// asset resolves to its on-disk file and previews instantly. Reuses `extract_whole_pack`.
+    fn extract_active_pack(&mut self, ctx: &egui::Context) {
+        let Some(LibraryFilter::Package(name)) = self.source_filter.clone() else {
+            return;
+        };
+        // The archive path from any of this pack's in-pack locators (they all share it).
+        let pack_path = self
+            .entries
+            .iter()
+            .filter(|e| e.package.as_deref() == Some(name.as_str()))
+            .find_map(|e| e.asset_id.and_then(|id| self.in_pack_locators.get(&id)))
+            .map(|(p, _, _)| p.clone());
+        let Some(pack_path) = pack_path else {
+            self.jobs
+                .toast("This pack's assets are already on disk", Intent::Info);
+            return;
+        };
+        let Some(db_path) = catalog_db_path() else {
+            return;
+        };
+        let listing = Catalog::open(&db_path)
+            .ok()
+            .and_then(|c| c.list_packages().ok())
+            .and_then(|v| v.into_iter().find(|p| p.name == name));
+        let Some(listing) = listing else {
+            self.jobs
+                .toast("Couldn't locate the pack in the catalog", Intent::Warning);
+            return;
+        };
+        let size = std::fs::metadata(&pack_path).map(|m| m.len()).unwrap_or(0);
+        self.extract_whole_pack(
+            ctx,
+            LargePackPrompt {
+                package_id: listing.id,
+                name,
+                abs_path: PathBuf::from(pack_path),
+                size_bytes: size,
+                then_browse: false,
+            },
+        );
+    }
+
+    /// A banner in the pack browser offering the one-time full extraction (above), shown only while
+    /// the browsed pack still has in-pack assets and is big enough that per-file pulls hurt.
+    fn pack_extract_banner(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        let Some(LibraryFilter::Package(name)) = self.source_filter.clone() else {
+            return;
+        };
+        let pack_path = self
+            .entries
+            .iter()
+            .filter(|e| e.package.as_deref() == Some(name.as_str()))
+            .find_map(|e| e.asset_id.and_then(|id| self.in_pack_locators.get(&id)))
+            .map(|(p, _, _)| p.clone());
+        let Some(pack_path) = pack_path else {
+            return; // no in-pack assets left (already extracted) → nothing to offer
+        };
+        let size = std::fs::metadata(&pack_path).map(|m| m.len()).unwrap_or(0);
+        if size < IN_PACK_THUMB_MAX_BYTES {
+            return; // a small pack previews fine in place; no need to nudge extraction
+        }
+        let busy = self.pending_packages.iter().any(|p| p.extracting);
+        let mut go = false;
+        egui::Frame::none()
+            .fill(theme::ARCANE.linear_multiply(0.08))
+            .stroke(egui::Stroke::new(1.0, theme::ARCANE.linear_multiply(0.35)))
+            .rounding(4.0)
+            .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "\u{26A1} This {} pack is browsed in place \u{2014} each preview pulls its \
+                             track from the archive (slow).",
+                            format_bytes(size)
+                        ))
+                        .color(theme::TEXT_MUTED)
+                        .size(12.0),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let label = if busy {
+                            "Extracting\u{2026}"
+                        } else {
+                            "Extract for instant previews"
+                        };
+                        if ui
+                            .add_enabled(
+                                !busy,
+                                egui::Button::new(
+                                    RichText::new(label).color(theme::ARCANE).size(12.0),
+                                ),
+                            )
+                            .on_hover_text(
+                                "Unpack the whole pack once to disk; every track then previews \
+                                 instantly",
+                            )
+                            .clicked()
+                        {
+                            go = true;
+                        }
+                    });
+                });
+            });
+        ui.add_space(6.0);
+        if go {
+            self.extract_active_pack(ctx);
+        }
     }
 
     /// The oversized-pack confirm (FEATURES.md §5.4): opening a pack bigger than the rapid-index cap
@@ -9154,6 +9276,10 @@ impl eframe::App for LodestashApp {
                 if self.view_mode == ViewMode::Folders {
                     self.folders_nav_ui(ui);
                 }
+                // Offer the one-time full extraction when browsing a big in-pack pack (fast path).
+                if browsing_pack {
+                    self.pack_extract_banner(ui, ctx);
+                }
                 let tiles_shown = self.view_mode == ViewMode::Folders
                     && !self.folder_tiles.is_empty()
                     && self.search.is_empty();
@@ -9349,8 +9475,13 @@ impl eframe::App for LodestashApp {
                             e.file.media_type,
                             e.file.size_bytes,
                             e.texture.clone(),
+                            // Test the asset's own extension via `rel_path`, not `abs_path`: for an
+                            // in-pack asset `abs_path` is the `.unitypackage` archive, so it would
+                            // read as "not a model" and the loaded viewport would never display
+                            // (blank 3D). `ensure_viewer_loaded` already loads it from the scratch
+                            // pull; this just lets the display agree.
                             e.file.media_type == Some(MediaType::Model3d)
-                                && viewport3d::is_viewable_model(&e.file.abs_path),
+                                && viewport3d::is_viewable_model(&e.file.rel_path),
                         )
                     });
                     if let Some((name, media_type, size_bytes, thumb, direct_model)) = peek {
