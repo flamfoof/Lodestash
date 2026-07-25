@@ -395,6 +395,11 @@ pub struct AppConfig {
     /// (AI-PIPELINE section 2). `None` = tag from the asset's name alone.
     #[serde(default)]
     pub tagger_vision_model: Option<String>,
+    /// Run identification (SigLIP/CLAP embeddings + local-LLM tagging) automatically when new
+    /// unidentified assets appear. **Default off** — identification is CPU-heavy (models run on
+    /// CPU here), so it is a manual action unless the user opts into auto (AI-PIPELINE §2).
+    #[serde(default)]
+    pub auto_identify: bool,
 }
 
 impl Default for AppConfig {
@@ -419,6 +424,7 @@ impl Default for AppConfig {
             confirm_before_trash: true,
             tagger_model: None,
             tagger_vision_model: None,
+            auto_identify: false,
         }
     }
 }

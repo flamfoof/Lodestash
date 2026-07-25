@@ -1832,6 +1832,9 @@ impl LodestashApp {
         let generation = self.scan_generation;
         let tx = self.catalog_tx.clone();
         let roots = self.scan_root_names();
+        // A manual Identify pass does the full job: embeddings first (so search works), then tags.
+        let embedder = self.ai_embedder.clone();
+        let audio_embedder = self.audio_embedder.clone();
         let progress = std::sync::Arc::new(crate::jobs::JobProgress::default());
         let job_progress = progress.clone();
         self.tag_job = Some(self.jobs.start(
@@ -1848,6 +1851,12 @@ impl LodestashApp {
             };
             let (counts, assets) = match Catalog::open(&db_path) {
                 Ok(mut cat) => {
+                    if let Some(emb) = &embedder {
+                        drain_image_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
+                    }
+                    if let Some(emb) = &audio_embedder {
+                        drain_audio_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
+                    }
                     drain_tags(
                         &mut cat,
                         &tagger,
@@ -1889,8 +1898,19 @@ impl LodestashApp {
         let Some(db_path) = catalog_db_path() else {
             return;
         };
-        let embedder = self.ai_embedder.clone();
-        let audio_embedder = self.audio_embedder.clone();
+        // Identification (embeddings) is CPU-heavy and manual by default (AI-PIPELINE §2): a hydrate
+        // only auto-embeds when the user opted into auto-identify. Metrics/deps/promote still run —
+        // they are cheap and drive the grid's facets and status.
+        let embedder = self
+            .config
+            .auto_identify
+            .then(|| self.ai_embedder.clone())
+            .flatten();
+        let audio_embedder = self
+            .config
+            .auto_identify
+            .then(|| self.audio_embedder.clone())
+            .flatten();
         let workspace_dir = self.workspace_dir.clone();
         let generation = self.scan_generation;
         let tx = self.catalog_tx.clone();
@@ -5982,6 +6002,24 @@ impl LodestashApp {
                                 .size(11.0)
                                 .color(theme::TEXT_DIM),
                             );
+                            ui.add_space(6.0);
+                            // Manual by default (AI-PIPELINE §2): identification is CPU-heavy, so it
+                            // runs only when the user asks — unless auto is enabled, which drains new
+                            // unidentified assets in the background as they appear.
+                            if ui
+                                .checkbox(
+                                    &mut self.config.auto_identify,
+                                    "Auto-identify new assets as they appear",
+                                )
+                                .on_hover_text(
+                                    "Off (default): identify runs only when you press the button \
+                                     below. On: embeddings + tags run automatically in the \
+                                     background — heavier on CPU.",
+                                )
+                                .changed()
+                            {
+                                save = true;
+                            }
                             ui.add_space(6.0);
                             let current = self
                                 .config
