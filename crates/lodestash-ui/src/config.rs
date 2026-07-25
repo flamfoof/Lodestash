@@ -323,6 +323,10 @@ fn default_workspace_cache_cap_gb() -> u32 {
     10
 }
 
+fn default_rapid_index_max_gb() -> f32 {
+    4.0
+}
+
 fn default_workspace_cache_retention_days() -> u32 {
     7
 }
@@ -369,6 +373,11 @@ pub struct AppConfig {
     /// Extracted-archive workspace cap in gigabytes (UI-SPEC §5.5).
     #[serde(default = "default_workspace_cache_cap_gb")]
     pub workspace_cache_cap_gb: u32,
+    /// Max `.unitypackage` size (GB) that is indexed **in place** without asking. A bigger pack
+    /// takes over a minute to inflate its manifest (DATA-MODEL §7 / M14), so opening it prompts to
+    /// extract it to the temp cache instead. Default 4 GB.
+    #[serde(default = "default_rapid_index_max_gb")]
+    pub rapid_index_max_gb: f32,
     /// Age (days) after which extracted workspace files are eligible for purge.
     #[serde(default = "default_workspace_cache_retention_days")]
     pub workspace_cache_retention_days: u32,
@@ -417,6 +426,7 @@ impl Default for AppConfig {
             preview_cache_cap_gb: default_preview_cache_cap_gb(),
             auto_purge_preview_cache: true,
             workspace_cache_cap_gb: default_workspace_cache_cap_gb(),
+            rapid_index_max_gb: default_rapid_index_max_gb(),
             workspace_cache_retention_days: default_workspace_cache_retention_days(),
             asset_store_roots: Vec::new(),
             volume: default_volume(),

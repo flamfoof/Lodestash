@@ -104,6 +104,15 @@ struct AssetEntry {
     thumb_spawned: bool,
 }
 
+/// A pending confirm for opening an oversized pack (FEATURES.md §5.4): indexing it in place would
+/// inflate the whole archive, so the user is asked whether to extract it to the temp cache instead.
+struct LargePackPrompt {
+    package_id: i64,
+    name: String,
+    abs_path: PathBuf,
+    size_bytes: u64,
+}
+
 /// A child-folder tile in Folders view: its name, the count of assets **directly** inside it, and
 /// the **recursive** total including everything in its subfolders (shown as `direct (recursive)`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -834,6 +843,10 @@ pub struct LodestashApp {
     /// `.unitypackage` archive size on disk per `package.id`, read once when the Unity Assets list
     /// loads (not per-frame) so the cards can show KB/MB/GB.
     package_sizes: std::collections::HashMap<i64, u64>,
+    /// A confirm modal for opening an oversized pack (over `config.rapid_index_max_gb`): indexing
+    /// it in place means inflating the whole archive, so the user chooses extract-to-temp,
+    /// index-in-place anyway, or cancel.
+    large_pack_prompt: Option<LargePackPrompt>,
     /// Signalled by a background in-pack mint (import / Add-to-Library) once its assets exist,
     /// so the grid re-hydrates and the new pack library appears (M14).
     rehydrate_rx: Receiver<()>,
@@ -1039,6 +1052,7 @@ impl LodestashApp {
             pending_pack_browse: None,
             open_pack_job: None,
             package_sizes: std::collections::HashMap::new(),
+            large_pack_prompt: None,
             rehydrate_rx,
             rehydrate_tx,
             import_scan: None,
@@ -4920,12 +4934,12 @@ impl LodestashApp {
                                     {
                                         toggle = Some((pkg.id, !pinned));
                                     }
-                                    // §5.3 "Open →": the pick-and-extract contents list,
-                                    // rebuilt from the persisted manifest — works in a
-                                    // session that never crawled this pack.
-                                    if ui
-                                        .button(RichText::new("Open \u{2192}").size(11.0))
-                                        .clicked()
+                                    // Open → only once the pack is a library (§5.4): before that
+                                    // there is nothing indexed to browse — Add to Library first.
+                                    if pinned
+                                        && ui
+                                            .button(RichText::new("Open \u{2192}").size(11.0))
+                                            .clicked()
                                     {
                                         open_pkg = Some(pkg_idx);
                                     }
@@ -4984,7 +4998,14 @@ impl LodestashApp {
         });
 
         if let Some((id, pin)) = toggle {
-            self.set_package_pinned(id, pin);
+            if pin {
+                // Add to Library indexes the pack (mint), with the oversized-pack prompt.
+                if let Some(pkg) = packages.iter().find(|p| p.id == id) {
+                    self.add_package_to_library(ctx, pkg);
+                }
+            } else {
+                self.set_package_pinned(id, false);
+            }
         }
         if let Some(i) = open_pkg {
             if let Some(pkg) = packages.get(i) {
@@ -5088,17 +5109,56 @@ impl LodestashApp {
     /// Open a catalog package for browse/pick-and-extract (FEATURES.md §5.4). The manifest
     /// locators were persisted when the pack was first indexed, so this needs no second scan
     /// of the archive — which is what makes a pack's contents retrievable in a later session.
-    /// **Open →** a pack (FEATURES.md §5.4): add it as a library and browse it in the folder
-    /// explorer. Opening pins the pack, tracks its source folder as a pack-only scan root, mints
-    /// its in-pack assets in the background (no extraction — bytes are pulled on demand), and jumps
-    /// into its folders once they land. Re-opening an already-surfaced pack is instant.
+    /// **Add to Library** (FEATURES.md §5.4/§5.5): pin the pack and index it (mint its in-pack
+    /// assets) so it becomes a first-class library — no auto-browse; **Open →** does that. An
+    /// oversized pack (over `config.rapid_index_max_gb`) that isn't indexed yet prompts to
+    /// extract-to-temp first, since indexing in place means inflating the whole archive.
+    fn add_package_to_library(
+        &mut self,
+        ctx: &egui::Context,
+        pkg: &lodestash_core::catalog::PackageListing,
+    ) {
+        let abs_path = PathBuf::from(&pkg.package_path);
+        if !abs_path.exists() {
+            self.jobs.toast(
+                format!("Archive is gone from {}", pkg.package_path),
+                Intent::Warning,
+            );
+            return;
+        }
+        let size_bytes = self
+            .package_sizes
+            .get(&pkg.id)
+            .copied()
+            .or_else(|| std::fs::metadata(&abs_path).ok().map(|m| m.len()))
+            .unwrap_or(0);
+        let threshold = (self.config.rapid_index_max_gb as f64 * (1u64 << 30) as f64) as u64;
+        // Only prompt when it would actually inflate: a pack whose locators are already recorded
+        // (indexed in an earlier session) mints from the catalog with no archive read.
+        let needs_index = catalog_db_path()
+            .and_then(|db| Catalog::open(&db).ok())
+            .and_then(|c| c.list_package_entries(pkg.id).ok())
+            .map_or(true, |e| e.is_empty());
+        if size_bytes > threshold && needs_index {
+            self.large_pack_prompt = Some(LargePackPrompt {
+                package_id: pkg.id,
+                name: pkg.name.clone(),
+                abs_path,
+                size_bytes,
+            });
+            return;
+        }
+        self.pin_and_mint(ctx, pkg.id, pkg.name.clone(), abs_path, false);
+    }
+
+    /// **Open →** a pinned pack: browse it in the folder explorer. Its assets were minted when it
+    /// was added, so this just navigates; if they somehow aren't present yet it mints then jumps.
     fn open_package_browse(
         &mut self,
         ctx: &egui::Context,
         pkg: &lodestash_core::catalog::PackageListing,
     ) {
         let name = pkg.name.clone();
-        // Already surfaced in the grid → straight into its folders.
         if self
             .entries
             .iter()
@@ -5115,11 +5175,23 @@ impl LodestashApp {
             );
             return;
         }
+        self.pin_and_mint(ctx, pkg.id, name, abs_path, true);
+    }
+
+    /// Pin a pack, track its source folder as a pack-only library, and mint its in-pack assets in
+    /// the background (streaming + cancellable), then re-hydrate so it surfaces. `then_browse` also
+    /// jumps into the folder explorer once the assets land (Open →); Add to Library does not.
+    fn pin_and_mint(
+        &mut self,
+        ctx: &egui::Context,
+        package_id: i64,
+        name: String,
+        abs_path: PathBuf,
+        then_browse: bool,
+    ) {
         let Some(db_path) = catalog_db_path() else {
             return;
         };
-        let package_id = pkg.id;
-
         // Track the pack's source folder as a pack-only library so the hydrate surfaces its
         // in-pack assets (they carry that source's id). Then load that project view.
         let proj = self.project_name.clone().unwrap_or_else(|| {
@@ -5135,8 +5207,9 @@ impl LodestashApp {
             self.config.add_pack_only_source(&proj, PathBuf::from(root));
         }
 
-        // Browse into the pack once its assets land (set before the background mint kicks off).
-        self.pending_pack_browse = Some(name.clone());
+        if then_browse {
+            self.pending_pack_browse = Some(name.clone());
+        }
         // A cancellable, progress-reporting job-tray row: reading a big pack's manifest inflates the
         // whole archive (a 21 GB pack is minutes of CPU), so it shows a real bar and a ✕ to abort.
         if let Some(id) = self.open_pack_job.take() {
@@ -5144,38 +5217,175 @@ impl LodestashApp {
         }
         let progress = Arc::new(crate::jobs::JobProgress::default());
         self.open_pack_job = Some(self.jobs.start(
-            format!("Opening {name}"),
+            format!("Indexing {name}"),
             progress.clone(),
             true,
         ));
 
-        // Background: pin + ensure minted (streaming, cancellable), then signal a re-hydrate.
         let tx = self.rehydrate_tx.clone();
         let ctx2 = ctx.clone();
         let path = abs_path.clone();
         std::thread::spawn(move || {
             if let Ok(c) = Catalog::open(&db_path) {
                 if let Err(err) = c.set_package_pinned(package_id, true) {
-                    tracing::warn!(%err, package_id, "open: pin failed");
+                    tracing::warn!(%err, package_id, "pin failed");
                 }
             }
             if let Err(err) = ensure_in_pack_minted(&db_path, package_id, &path, &progress) {
-                tracing::warn!(%err, package_id, "open: in-pack mint failed or cancelled");
+                tracing::warn!(%err, package_id, "in-pack mint failed or cancelled");
             }
             let _ = tx.send(());
             ctx2.request_repaint();
         });
 
-        self.jobs
-            .toast(format!("Opening {name}\u{2026}"), Intent::Success);
-        // Bring the pack's source folder into the active project view; the crawl skips it
-        // (pack-only) and the hydrate surfaces its packs once the background mint signals.
+        self.jobs.toast(
+            format!("Added {name} \u{2014} indexing\u{2026}"),
+            Intent::Success,
+        );
         let live: Vec<PathBuf> = self
             .config
             .project_by_name(&proj)
             .map(|p| p.live_paths().iter().map(|p| p.to_path_buf()).collect())
             .unwrap_or_default();
         self.load_paths(ctx, live, Some(proj));
+    }
+
+    /// "Extract to temp & index" for an oversized pack (FEATURES.md §5.4): pin it, track its source,
+    /// and fully extract it into the workspace cache in one pass — which indexes it and leaves the
+    /// files on disk for fast browsing. Reuses the pending-package extraction machinery.
+    fn extract_whole_pack(&mut self, ctx: &egui::Context, prompt: LargePackPrompt) {
+        let Some(db_path) = catalog_db_path() else {
+            return;
+        };
+        // Pin + track the source folder, then load the project so `scan_roots` includes it (that
+        // assignment is synchronous inside `load_paths`, so the source index resolves right after).
+        let proj = self.project_name.clone().unwrap_or_else(|| {
+            let root = prompt
+                .abs_path
+                .parent()
+                .map(PathBuf::from)
+                .unwrap_or(prompt.abs_path.clone());
+            self.config.record_open(root)
+        });
+        let source_root = Catalog::open(&db_path)
+            .ok()
+            .and_then(|c| c.package_source_root(prompt.package_id).ok().flatten());
+        if let Some(root) = source_root {
+            self.config.add_pack_only_source(&proj, PathBuf::from(root));
+        }
+        if let Ok(c) = Catalog::open(&db_path) {
+            let _ = c.set_package_pinned(prompt.package_id, true);
+        }
+        let live: Vec<PathBuf> = self
+            .config
+            .project_by_name(&proj)
+            .map(|p| p.live_paths().iter().map(|p| p.to_path_buf()).collect())
+            .unwrap_or_default();
+        self.load_paths(ctx, live, Some(proj));
+
+        let source_idx = self
+            .scan_roots
+            .iter()
+            .position(|r| prompt.abs_path.starts_with(r))
+            .unwrap_or(NO_SOURCE);
+        if source_idx == NO_SOURCE {
+            self.jobs.toast(
+                format!("Couldn't locate a library source for {}", prompt.name),
+                Intent::Warning,
+            );
+            return;
+        }
+        // A full-extract pending package: empty `entries` means extract everything (one pass over
+        // the archive), which the extractor reads for itself.
+        self.pending_packages.push(PendingPackage {
+            source_idx,
+            abs_path: prompt.abs_path,
+            display_name: prompt.name,
+            nested_candidates: Vec::new(),
+            chosen_variant: 0,
+            extracting: false,
+            progress: Arc::default(),
+            entries: Vec::new(),
+            job: None,
+            browsing: false,
+            picked: std::collections::BTreeSet::new(),
+        });
+        let idx = self.pending_packages.len() - 1;
+        self.extract_package(ctx, idx);
+    }
+
+    /// The oversized-pack confirm (FEATURES.md §5.4): opening a pack bigger than the rapid-index cap
+    /// would inflate the whole archive, so offer to extract it to the temp cache instead.
+    fn large_pack_modal(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = self.large_pack_prompt.take() else {
+            return;
+        };
+        let est_secs = estimate_index_secs(prompt.size_bytes);
+        let mut choice: Option<u8> = None; // 1 = extract, 2 = in place, 0 = cancel
+        let mut open = true;
+        egui::Window::new("Large package")
+            .id(egui::Id::new("large_pack_prompt"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(theme::SURFACE_RAISED)
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+            )
+            .show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(
+                    RichText::new(&prompt.name)
+                        .color(theme::TEXT)
+                        .size(14.0),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!(
+                        "This pack is {} \u{2014} indexing it in place inflates the whole archive \
+                         (about {}). You can extract it to the temp cache instead: one pass over \
+                         the archive that indexes it and leaves the files on disk for fast browsing.",
+                        format_bytes(prompt.size_bytes),
+                        fmt_duration_approx(est_secs),
+                    ))
+                    .color(theme::TEXT_MUTED)
+                    .size(11.5),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(
+                            RichText::new("Extract to temp \u{0026} index")
+                                .color(theme::ARCANE)
+                                .size(12.0),
+                        )
+                        .clicked()
+                    {
+                        choice = Some(1);
+                    }
+                    if ui
+                        .button(RichText::new("Index in place").size(12.0))
+                        .clicked()
+                    {
+                        choice = Some(2);
+                    }
+                    if ui.button(RichText::new("Cancel").size(12.0)).clicked() {
+                        choice = Some(0);
+                    }
+                });
+            });
+
+        match choice {
+            Some(1) => self.extract_whole_pack(ctx, prompt),
+            Some(2) => {
+                self.pin_and_mint(ctx, prompt.package_id, prompt.name, prompt.abs_path, false)
+            }
+            // No button this frame: keep the prompt open unless the ✕ closed it.
+            None if open => self.large_pack_prompt = Some(prompt),
+            _ => {} // cancelled / closed — dropped
+        }
     }
 
     /// The §5.2 dialog: the packs found under the picked folder, grouped by the folder that
@@ -6405,6 +6615,32 @@ impl LodestashApp {
                                     save = true;
                                 }
                             });
+                            // Rapid-index cap: a pack at/below this size indexes in place instantly;
+                            // a bigger one prompts to extract-to-temp instead (indexing in place
+                            // inflates the whole archive — a 21 GB pack is minutes of CPU).
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new("Rapid-index Unity packages up to")
+                                    .size(11.0)
+                                    .color(theme::TEXT_MUTED),
+                            );
+                            let mut rapid = self.config.rapid_index_max_gb;
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut rapid, 0.5..=64.0)
+                                        .suffix(" GB")
+                                        .step_by(0.5),
+                                )
+                                .on_hover_text(
+                                    "A .unitypackage at or below this size is indexed in place \
+                                     instantly on open. A larger one prompts you to extract it to \
+                                     the temp cache instead.",
+                                )
+                                .changed()
+                            {
+                                self.config.rapid_index_max_gb = rapid;
+                                save = true;
+                            }
                         });
                         let engine = self.engine.clone();
                         settings_card(ui, "ENGINE BRIDGE", |ui| {
@@ -7043,6 +7279,7 @@ impl eframe::App for LodestashApp {
         self.pump_extract_queue(ctx);
         self.poll_watch(ctx);
         self.pack_stats_modal(ctx);
+        self.large_pack_modal(ctx);
         self.agent_approval_modal(ctx);
         self.render_modals(ctx);
         self.receive_catalog();
@@ -11984,6 +12221,21 @@ fn format_thousands(n: i64) -> String {
         return format!("-{out}");
     }
     out
+}
+
+/// Rough estimate of how long indexing a pack takes: it inflates the whole `.unitypackage`, and
+/// gzip on this box runs on the order of ~150 MB/s. Only used to warn the user (order-of-magnitude).
+fn estimate_index_secs(bytes: u64) -> u64 {
+    const INFLATE_BYTES_PER_SEC: u64 = 150 * 1024 * 1024;
+    bytes / INFLATE_BYTES_PER_SEC.max(1)
+}
+
+fn fmt_duration_approx(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{} min", secs.div_ceil(60))
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {
