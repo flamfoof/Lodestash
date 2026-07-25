@@ -510,6 +510,30 @@ pub fn extract_at_offsets(
     Ok(extracted)
 }
 
+/// Upper bound on the capacity hint when pulling a payload into memory — guards against a
+/// corrupt manifest size triggering a huge speculative allocation. `take(size)` still limits
+/// the actual read, so a legitimately larger payload simply grows past the hint.
+const PULL_CAP_HINT: usize = 64 * 1024 * 1024;
+
+/// Pull **one** payload out of a `.unitypackage` **into memory** — the in-pack identify path
+/// (DATA-MODEL §7 / M14). One gzip skip-scan to `offset`, read `size` bytes, return them; no file
+/// is written (unlike [`extract_at_offsets`]), so identifying an in-pack asset leaves nothing on
+/// disk. A short read means a stale locator (the archive changed) and errors rather than handing
+/// back a truncated buffer. The caller decides whether a payload is small enough to pull into RAM.
+pub fn read_payload_at(path: &Path, offset: u64, size: u64) -> io::Result<Vec<u8>> {
+    let mut gz = GzDecoder::new(File::open(path)?);
+    io::copy(&mut (&mut gz).take(offset), &mut io::sink())?;
+    let mut buf = Vec::with_capacity((size as usize).min(PULL_CAP_HINT));
+    let n = (&mut gz).take(size).read_to_end(&mut buf)?;
+    if n as u64 != size {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("payload truncated: wanted {size} got {n} bytes"),
+        ));
+    }
+    Ok(buf)
+}
+
 /// Content-addressed placement shared by full and surgical extraction: move the hashed
 /// temp payload to `dest/<hash>/<basename>`, discarding it if already present.
 fn place_payload(
@@ -656,6 +680,30 @@ mod tests {
             }],
         );
         assert!(bad.is_err());
+    }
+
+    #[test]
+    fn read_payload_at_pulls_one_payload_into_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"in-memory identify payload".repeat(50); // spans tar blocks
+        let pkg = build_test_package(
+            dir.path(),
+            "aaaa1111bbbb2222cccc3333dddd4444",
+            "Assets/Textures/Rock.png",
+            "guid: aaaa1111bbbb2222cccc3333dddd4444\n",
+            &payload,
+        );
+        let entry = &read_manifest(&pkg).unwrap()[0];
+        let (offset, size) = (entry.asset_offset.unwrap(), entry.asset_size.unwrap());
+
+        let got = read_payload_at(&pkg, offset, size).unwrap();
+        assert_eq!(
+            got, payload,
+            "in-memory pull is byte-identical, no file written"
+        );
+
+        // A stale locator (size past EOF) errors rather than returning a short buffer.
+        assert!(read_payload_at(&pkg, offset, size + 4096).is_err());
     }
 
     #[test]

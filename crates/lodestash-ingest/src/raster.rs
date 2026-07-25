@@ -17,8 +17,21 @@ pub fn decode(path: &Path) -> io::Result<DynamicImage> {
         .unwrap_or_default();
     match ext.to_str() {
         Some("dds") => decode_dds(path),
-        Some("psd") => decode_psd(path),
+        Some("psd") => decode_psd_bytes(&std::fs::read(path)?),
         _ => image::open(path).map_err(invalid),
+    }
+}
+
+/// Decode a raster from **bytes already in memory** — the in-pack identify path
+/// (DATA-MODEL §7 / M14): a payload surgically pulled from a `.unitypackage` never
+/// touches disk, so it can't go through [`decode`]. `ext` is the classifying extension
+/// (lowercased, no dot) from the in-archive pathname; `None` falls through to content
+/// sniffing. Shares the DDS/PSD decoders with [`decode`] so format support can't diverge.
+pub fn decode_bytes(bytes: &[u8], ext: Option<&str>) -> io::Result<DynamicImage> {
+    match ext {
+        Some("dds") => decode_dds_bytes(bytes),
+        Some("psd") => decode_psd_bytes(bytes),
+        _ => image::load_from_memory(bytes).map_err(invalid),
     }
 }
 
@@ -30,10 +43,15 @@ fn decode_dds(path: &Path) -> io::Result<DynamicImage> {
     Ok(DynamicImage::ImageRgba8(rgba))
 }
 
+fn decode_dds_bytes(bytes: &[u8]) -> io::Result<DynamicImage> {
+    let dds = image_dds::ddsfile::Dds::read(&mut io::Cursor::new(bytes)).map_err(invalid)?;
+    let rgba = image_dds::image_from_dds(&dds, 0).map_err(invalid)?;
+    Ok(DynamicImage::ImageRgba8(rgba))
+}
+
 /// Flattened PSD composite → RGBA (per-layer access is a later viewer feature).
-fn decode_psd(path: &Path) -> io::Result<DynamicImage> {
-    let bytes = std::fs::read(path)?;
-    let psd = psd::Psd::from_bytes(&bytes).map_err(invalid)?;
+fn decode_psd_bytes(bytes: &[u8]) -> io::Result<DynamicImage> {
+    let psd = psd::Psd::from_bytes(bytes).map_err(invalid)?;
     let buffer = image::RgbaImage::from_raw(psd.width(), psd.height(), psd.rgba())
         .ok_or_else(|| invalid("psd composite has wrong buffer size"))?;
     Ok(DynamicImage::ImageRgba8(buffer))
@@ -78,6 +96,23 @@ mod tests {
         let img = decode(&path).expect("dds decodes");
         assert_eq!((img.width(), img.height()), (8, 8));
         assert_eq!(img.to_rgba8().get_pixel(4, 4).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn decode_bytes_decodes_in_memory_and_matches_disk() {
+        // The in-pack identify path: a PNG that only ever exists as bytes decodes the same
+        // as it would from disk, so identify never needs to touch the filesystem.
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(3, 3, image::Rgba([10, 20, 30, 255]))
+            .write_to(&mut io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let img = decode_bytes(&png, Some("png")).expect("png bytes decode");
+        assert_eq!((img.width(), img.height()), (3, 3));
+        assert_eq!(img.to_rgba8().get_pixel(1, 1).0, [10, 20, 30, 255]);
+
+        // Content sniffing when the extension is unknown/absent still finds PNG.
+        assert!(decode_bytes(&png, None).is_ok());
+        assert!(decode_bytes(b"garbage", Some("png")).is_err());
     }
 
     #[test]
