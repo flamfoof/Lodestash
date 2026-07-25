@@ -135,6 +135,114 @@ struct FolderTile {
     recursive: usize,
 }
 
+/// One folder in the pack directory tree — the persistent left pane of the pack browser (FEATURES.md
+/// §5.4, the published nav redesign). `path` is source-root-relative (the browse `current_dir` key);
+/// `depth` (component count) drives indentation; `direct`/`recursive` mirror [`FolderTile`]; and
+/// `has_children` gates the expand chevron. The tree is path-sorted, so parents precede their children.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirNode {
+    path: PathBuf,
+    name: String,
+    depth: usize,
+    direct: usize,
+    recursive: usize,
+    has_children: bool,
+}
+
+/// Build the whole folder hierarchy for one pack's assets, path-sorted, each node carrying its
+/// direct and recursive asset counts (DATA-MODEL §7 pack browse). Pure over the entry list so it is
+/// unit-testable; the UI caches it and rebuilds it with the grid cache. Complement of
+/// [`folder_children`], which resolves a single level — this is the full tree the left pane draws.
+fn build_pack_dir_tree(entries: &[AssetEntry], src: usize, pack: &str) -> Vec<DirNode> {
+    use std::collections::BTreeMap;
+    // dir path → (direct assets in it, recursive assets under it). BTreeMap keeps path order.
+    let mut counts: BTreeMap<PathBuf, (usize, usize)> = BTreeMap::new();
+    for e in entries {
+        if e.source_idx != src || e.trashed || e.package.as_deref() != Some(pack) {
+            continue;
+        }
+        let Some(parent) = e.file.rel_path.parent() else {
+            continue;
+        };
+        // Every ancestor dir counts the file recursively; only its immediate parent counts it direct.
+        let mut dir = PathBuf::new();
+        for comp in parent.components() {
+            dir.push(comp);
+            let slot = counts.entry(dir.clone()).or_insert((0, 0));
+            slot.1 += 1;
+            if dir == parent {
+                slot.0 += 1;
+            }
+        }
+    }
+    let paths: Vec<PathBuf> = counts.keys().cloned().collect();
+    paths
+        .iter()
+        .map(|p| DirNode {
+            name: p
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            depth: p.components().count(),
+            direct: counts[p].0,
+            recursive: counts[p].1,
+            // Component-wise prefix: `Assets/AB` is not a child of `Assets/A`.
+            has_children: paths.iter().any(|q| q != p && q.starts_with(p)),
+            path: p.clone(),
+        })
+        .collect()
+}
+
+/// A tree row is visible only when every one of its ancestor folders is expanded. Root-level nodes
+/// (whose only ancestor is the empty source root) are always visible.
+fn ancestors_expanded(
+    path: &std::path::Path,
+    expanded: &std::collections::HashSet<PathBuf>,
+) -> bool {
+    let mut anc = path.parent();
+    while let Some(a) = anc {
+        if a.as_os_str().is_empty() {
+            break;
+        }
+        if !expanded.contains(a) {
+            return false;
+        }
+        anc = a.parent();
+    }
+    true
+}
+
+/// Seed the expanded set by auto-opening down the **linear spine** to where the content first fans
+/// out: a folder opens iff every one of its ancestors is a single-child link. That opens the spine
+/// **and** the first branching folder (so its children show), exactly like the mockup — deeper
+/// branches stay closed until the user opens them.
+fn seed_expanded(nodes: &[DirNode]) -> std::collections::HashSet<PathBuf> {
+    let mut child_dirs: std::collections::HashMap<PathBuf, usize> =
+        std::collections::HashMap::new();
+    for n in nodes {
+        if let Some(par) = n.path.parent() {
+            *child_dirs.entry(par.to_path_buf()).or_default() += 1;
+        }
+    }
+    nodes
+        .iter()
+        .filter(|n| {
+            let mut anc = n.path.parent();
+            while let Some(a) = anc {
+                if a.as_os_str().is_empty() {
+                    break;
+                }
+                if child_dirs.get(a).copied().unwrap_or(0) != 1 {
+                    return false;
+                }
+                anc = a.parent();
+            }
+            true
+        })
+        .map(|n| n.path.clone())
+        .collect()
+}
+
 struct ThumbReady {
     index: usize,
     /// None when generate_texture fails; sent so pending_thumbs is always decremented.
@@ -791,6 +899,12 @@ pub struct LodestashApp {
     /// first, as tiles) instead of a thumbnail grid — the pack browser's list/thumbnails toggle
     /// (FEATURES.md §5.4). Session state.
     folders_as_list: bool,
+    /// The pack's full directory tree for the persistent left pane (browse mode); rebuilt with the
+    /// grid cache, empty when not browsing a pack.
+    pack_dir_tree: Vec<DirNode>,
+    /// Which tree folders are expanded (source-root-relative paths). Ancestors of the navigated
+    /// folder are force-expanded so the selection stays visible; cleared when a new pack is opened.
+    dir_tree_expanded: std::collections::HashSet<PathBuf>,
     /// Bumped on every folder navigation so the grid ScrollArea gets fresh scroll state.
     nav_generation: u64,
     /// Current thumbnail-grid page (0-based; page size lives in `config.view.page_size`).
@@ -1044,6 +1158,8 @@ impl LodestashApp {
             nav_cursor: 0,
             folder_tiles: Vec::new(),
             folders_as_list: false,
+            pack_dir_tree: Vec::new(),
+            dir_tree_expanded: std::collections::HashSet::new(),
             nav_generation: 0,
             page: 0,
             last_page_key: (0, 0),
@@ -3350,6 +3466,8 @@ impl LodestashApp {
             .unwrap_or(0);
         self.apply_dir(Some((src, PathBuf::new())));
         self.reset_nav_history();
+        // A fresh pack reseeds its tree along the spine (rebuild_cache seeds an empty set).
+        self.dir_tree_expanded.clear();
     }
 
     /// Leave the pack folder explorer and return to the Unity Assets landing (FEATURES.md §5.3).
@@ -4087,6 +4205,17 @@ impl LodestashApp {
                 }
             };
         self.folder_tiles = tiles;
+
+        // Pack browse: the persistent left pane draws the pack's whole directory tree (not just the
+        // current folder's children). Rebuilt here with the grid cache; seeded open along its linear
+        // spine the first time a pack is opened (the set is cleared in `browse_package_folders`).
+        self.pack_dir_tree = match (pack.as_deref(), self.current_dir.as_ref()) {
+            (Some(p), Some((src, _))) => build_pack_dir_tree(&self.entries, *src, p),
+            _ => Vec::new(),
+        };
+        if !self.pack_dir_tree.is_empty() && self.dir_tree_expanded.is_empty() {
+            self.dir_tree_expanded = seed_expanded(&self.pack_dir_tree);
+        }
 
         // Content filter (⚑ Filters) composes on top of facet + search (design §3). Applied once
         // over the resolved asset indices; folder-tile counts are intentionally left unfiltered.
@@ -7006,6 +7135,120 @@ impl LodestashApp {
         }
     }
 
+    /// The persistent left directory-tree pane of the pack browser (the published nav redesign):
+    /// the pack's whole folder hierarchy, indented, with an expand chevron, `direct (recursive)`
+    /// counts, a gold selection rail, and click-to-navigate. Drives and is driven by `current_dir`.
+    fn pack_dir_tree_ui(&mut self, ui: &mut Ui) {
+        let Some(src) = self.current_dir.as_ref().map(|(s, _)| *s) else {
+            return;
+        };
+        let cur: Option<PathBuf> = self.current_dir.as_ref().map(|(_, d)| d.clone());
+        ui.add_space(2.0);
+        ui.label(RichText::new("DIRECTORY").size(10.0).color(theme::TEXT_DIM));
+        ui.add_space(4.0);
+
+        let nodes = self.pack_dir_tree.clone();
+        let mut nav: Option<PathBuf> = None;
+        let mut toggle: Option<PathBuf> = None;
+        ScrollArea::vertical()
+            .id_salt("pack_dir_tree")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                for node in &nodes {
+                    // A row shows only when every ancestor folder is expanded.
+                    if !ancestors_expanded(&node.path, &self.dir_tree_expanded) {
+                        continue;
+                    }
+                    let selected = cur.as_deref() == Some(node.path.as_path());
+                    let expanded = self.dir_tree_expanded.contains(&node.path);
+                    let inner = ui.horizontal(|ui| {
+                        ui.add_space(4.0 + node.depth as f32 * 12.0);
+                        if node.has_children {
+                            let g = if expanded { "\u{25BE}" } else { "\u{25B8}" };
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(g).size(9.0).color(theme::TEXT_DIM),
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                            {
+                                toggle = Some(node.path.clone());
+                            }
+                        } else {
+                            ui.add_space(14.0); // align leaves with chevroned siblings
+                        }
+                        if ui
+                            .add(egui::SelectableLabel::new(
+                                selected,
+                                RichText::new(format!("\u{1F4C2} {}", node.name))
+                                    .size(12.5)
+                                    .color(if selected {
+                                        theme::TEXT
+                                    } else {
+                                        theme::TEXT_MUTED
+                                    }),
+                            ))
+                            .clicked()
+                        {
+                            nav = Some(node.path.clone());
+                        }
+                        // `direct (recursive)`; drop the parenthetical when they're equal (a leaf).
+                        let count = if node.recursive > node.direct {
+                            format!("{} ({})", node.direct, node.recursive)
+                        } else {
+                            node.recursive.to_string()
+                        };
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(count).size(10.5).monospace().color(
+                                if selected {
+                                    theme::GOLD
+                                } else {
+                                    theme::TEXT_DIM
+                                },
+                            ));
+                        });
+                    });
+                    if selected {
+                        // Gold selection rail down the left edge of the row.
+                        let r = inner.response.rect;
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_max(
+                                r.left_top(),
+                                egui::pos2(r.left() + 2.0, r.bottom()),
+                            ),
+                            0.0,
+                            theme::GOLD,
+                        );
+                    }
+                }
+            });
+
+        if let Some(p) = toggle {
+            if !self.dir_tree_expanded.remove(&p) {
+                self.dir_tree_expanded.insert(p);
+            }
+        }
+        if let Some(p) = nav {
+            self.expand_to(&p); // opening a folder reveals its children
+            self.nav_to(Some((src, p)));
+        }
+    }
+
+    /// Force-expand every ancestor of `path` (and `path` itself) so a navigated folder is visible.
+    fn expand_to(&mut self, path: &std::path::Path) {
+        let mut anc = Some(path);
+        while let Some(a) = anc {
+            if a.as_os_str().is_empty() {
+                break;
+            }
+            self.dir_tree_expanded.insert(a.to_path_buf());
+            anc = a.parent();
+        }
+    }
+
     /// Breadcrumb + folder tiles for Folders view; handles navigation clicks.
     fn folders_nav_ui(&mut self, ui: &mut Ui) {
         let multi = self.scan_roots.len() > 1;
@@ -8818,6 +9061,25 @@ impl eframe::App for LodestashApp {
                     ui.add_space(6.0);
                 }
 
+                // Pack browser: the persistent left directory tree (published nav redesign). Only in
+                // Folders mode over a pack — a nested SidePanel, so the breadcrumb + contents flow in
+                // the remaining width and the global inspector stays the right pane.
+                let browsing_pack = matches!(self.source_filter, Some(LibraryFilter::Package(_)));
+                if browsing_pack
+                    && self.view_mode == ViewMode::Folders
+                    && !self.pack_dir_tree.is_empty()
+                {
+                    egui::SidePanel::left("pack_dir_tree_pane")
+                        .resizable(true)
+                        .default_width(230.0)
+                        .width_range(160.0..=360.0)
+                        .frame(
+                            egui::Frame::none()
+                                .fill(theme::RECESS)
+                                .inner_margin(egui::Margin::same(6.0)),
+                        )
+                        .show_inside(ui, |ui| self.pack_dir_tree_ui(ui));
+                }
                 if self.view_mode == ViewMode::Folders {
                     self.folders_nav_ui(ui);
                 }
@@ -13759,6 +14021,77 @@ mod tests {
             texture: None,
             thumb_spawned: false,
         }
+    }
+
+    /// The pack directory tree: path-sorted, per-folder direct + recursive counts, `has_children`,
+    /// and a sibling pack under the same source must not merge in.
+    #[test]
+    fn build_pack_dir_tree_counts_and_nesting() {
+        let mk = |rel: &str, pkg: &str, mt| {
+            let mut e = entry(0, rel, Some(mt));
+            e.package = Some(pkg.into());
+            e
+        };
+        let entries = vec![
+            mk("Assets/Music/Full/a.mp3", "Pack", MediaType::Audio),
+            mk("Assets/Music/Full/b.mp3", "Pack", MediaType::Audio),
+            mk("Assets/Music/Loop/c.mp3", "Pack", MediaType::Audio),
+            mk("Assets/cover.png", "Pack", MediaType::Image),
+            mk("Assets/Other/x.mp3", "Elsewhere", MediaType::Audio), // different pack, same source
+        ];
+        let got: Vec<(PathBuf, usize, usize, usize, bool)> =
+            build_pack_dir_tree(&entries, 0, "Pack")
+                .iter()
+                .map(|n| {
+                    (
+                        n.path.clone(),
+                        n.depth,
+                        n.direct,
+                        n.recursive,
+                        n.has_children,
+                    )
+                })
+                .collect();
+        assert_eq!(
+            got,
+            vec![
+                (PathBuf::from("Assets"), 1, 1, 4, true), // cover.png direct; 4 assets recursive
+                (PathBuf::from("Assets/Music"), 2, 0, 3, true),
+                (PathBuf::from("Assets/Music/Full"), 3, 2, 2, false),
+                (PathBuf::from("Assets/Music/Loop"), 3, 1, 1, false),
+            ],
+            "Elsewhere/x.mp3 is excluded; counts and nesting are per-pack"
+        );
+    }
+
+    /// Seeding opens the single-child spine and the first branch node, but not deeper; a row is
+    /// visible only when every ancestor is expanded.
+    #[test]
+    fn tree_seed_opens_spine_to_first_branch() {
+        use std::path::Path;
+        let mk = |rel: &str| {
+            let mut e = entry(0, rel, Some(MediaType::Audio));
+            e.package = Some("P".into());
+            e
+        };
+        // Assets -> Pack (single-child links) -> {Full, Loop} (branch).
+        let entries = vec![mk("Assets/Pack/Full/a.mp3"), mk("Assets/Pack/Loop/b.mp3")];
+        let seeded = seed_expanded(&build_pack_dir_tree(&entries, 0, "P"));
+        assert!(seeded.contains(Path::new("Assets")), "root spine open");
+        assert!(
+            seeded.contains(Path::new("Assets/Pack")),
+            "branch node open so its children show"
+        );
+        assert!(
+            !seeded.contains(Path::new("Assets/Pack/Full")),
+            "deeper branch stays closed"
+        );
+        // Visibility follows the expanded ancestors.
+        assert!(ancestors_expanded(Path::new("Assets/Pack/Full"), &seeded));
+        assert!(!ancestors_expanded(
+            Path::new("Assets/Pack/Full/x"),
+            &seeded
+        ));
     }
 
     #[test]

@@ -428,10 +428,19 @@ Top of the list is finishing the in-pack feature (M14) the last session built, i
    OS-temp scratch file, so `drain_metrics`/`drain_audio_embeddings`/`drain_tags` and 3D embedding now
    identify a purely in-pack asset (see §2). Leftover polish: real tag `name` for in-pack (currently
    empty); not driven end-to-end in the running app.
-2. **Pack directory navigation redesign** — a design mockup is published (§2, the Artifact URL):
-   persistent left tree pane, pack-rooted breadcrumb, folders-first contents, inspector. The current
-   impl is functional (folder tiles as a vertical list) but is the library grid bolted to a folder
-   filter; the mockup is the target.
+2. **Pack directory navigation redesign** — *left tree pane shipped 2026-07-25.* The published mockup
+   (§2, the Artifact URL) asked for a persistent left directory tree; it now renders as a nested
+   `SidePanel::left("pack_dir_tree_pane")` in the pack browser (Folders mode over a pack): the pack's
+   whole hierarchy, indented, expand chevrons, `direct (recursive)` counts, a gold selection rail, and
+   click-to-navigate (drives/driven by `current_dir`). Data = `build_pack_dir_tree` (pure, cached in
+   `rebuild_cache`), expansion in `dir_tree_expanded`, seeded open down the single-child spine to the
+   first branch (`seed_expanded`). Ran clean against the real 1737-asset "Total Music Collection" (no
+   panic) but **the pixels weren't captured** — both PrintWindow (blank; glow's GL surface isn't in the
+   GDI DC) and CopyFromScreen (black; foreground-lock) hit the §6 traps, so **layout/rail geometry
+   needs a human eyeball**. *Remaining vs mockup:* breadcrumb is still atop the contents (right of the
+   tree) rather than a full-width bar above all three panes; the center contents keep the existing
+   folder-tiles-then-grid rather than the mockup's single Name/Size/Items list; the right inspector is
+   the existing global one (already shows preview + in-archive path + Package + stats).
 3. **Unity Assets §5 leftovers** — the pack **rows** don't yet carry **↻ Sync**; the import list has
    no **category badge + override dropdown** and no category filter tabs; §5.6's `⧉` duplicate flag
    is unbuilt (its only real instance was the M13 defect); the sidebar facet's `✕` remove is missing
