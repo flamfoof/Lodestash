@@ -65,7 +65,8 @@ tower      = { version = "0.5", features = ["util"] }
 
 # UI
 # eframe runs the Glow renderer (TECH-STACK §7) — the wgpu backend is not compiled.
-eframe = "0.29"
+# `persistence` lets eframe remember the window size + position across restarts (persist_window).
+eframe = { version = "0.29", features = ["persistence"] }
 egui   = "0.29"
 rfd    = "0.15"
 dirs   = "5"
