@@ -44,6 +44,11 @@ pub struct InPackClass {
     pub media_type: String,
 }
 
+/// How many rows a package write (locators, in-pack asset mint) commits per transaction. Chunking
+/// keeps a huge pack from holding the single write lock long enough to starve a concurrent
+/// scan-persist ("database is locked").
+const PKG_WRITE_CHUNK: usize = 500;
+
 /// What `record_crawl` did with a batch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CrawlStats {
@@ -687,83 +692,89 @@ impl Catalog {
                 .map_err(|e| CoreError::Catalog(format!("mint locators row: {e}")))?
         };
 
-        let tx = self
-            .conn
-            .transaction()
-            .map_err(|e| CoreError::Catalog(format!("mint_in_pack begin: {e}")))?;
+        // media_type code → id — a read, resolved once before the write chunks below.
+        let mut type_ids: HashMap<String, i64> = HashMap::new();
         {
-            let mut type_ids: HashMap<String, i64> = HashMap::new();
-            {
-                let mut stmt = tx
-                    .prepare("SELECT code, id FROM media_type")
-                    .map_err(|e| CoreError::Catalog(format!("media_type prep: {e}")))?;
-                let rows = stmt
-                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
-                    .map_err(|e| CoreError::Catalog(format!("media_type query: {e}")))?;
-                for row in rows {
-                    let (code, id) =
-                        row.map_err(|e| CoreError::Catalog(format!("media_type row: {e}")))?;
-                    type_ids.insert(code, id);
-                }
-            }
-
-            let mut seen = tx
-                .prepare("SELECT 1 FROM asset_file WHERE package_entry_id = ?1")
-                .map_err(|e| CoreError::Catalog(format!("mint probe prep: {e}")))?;
-
-            for (entry_id, guid, pathname, size_bytes) in &locators {
-                let Some(class) = classified.get(guid) else {
-                    continue; // unclassified — never becomes a grid asset
-                };
-                let Some(&media_type_id) = type_ids.get(&class.media_type) else {
-                    return Err(CoreError::Catalog(format!(
-                        "unknown media_type code '{}' (seed_media_types not run?)",
-                        class.media_type
-                    )));
-                };
-                if seen
-                    .exists(params![entry_id])
-                    .map_err(|e| CoreError::Catalog(format!("mint probe: {e}")))?
-                {
-                    stats.unchanged += 1;
-                    continue;
-                }
-                // In-pack files have no source-root path; the in-archive pathname is the rel_path.
-                let rel_path = pathname.clone().unwrap_or_else(|| guid.clone());
-
-                tx.execute(
-                    "INSERT INTO asset (uuid, source_id, media_type_id, name,
-                                        package_id, status, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 'discovered', ?6, ?6)",
-                    params![
-                        uuid::Uuid::new_v4().to_string(),
-                        source_id,
-                        media_type_id,
-                        class.name,
-                        package_id,
-                        now
-                    ],
-                )
-                .map_err(|e| CoreError::Catalog(format!("in-pack asset insert: {e}")))?;
-                let asset_id = tx.last_insert_rowid();
-                let ext = rel_path.rsplit('.').next().map(str::to_lowercase);
-                tx.execute(
-                    "INSERT INTO asset_file (asset_id, rel_path, ext, size_bytes,
-                                             package_entry_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![asset_id, rel_path, ext, size_bytes, entry_id],
-                )
-                .map_err(|e| CoreError::Catalog(format!("in-pack asset_file insert: {e}")))?;
-                tx.execute(
-                    "UPDATE asset SET primary_file_id = ?2 WHERE id = ?1",
-                    params![asset_id, tx.last_insert_rowid()],
-                )
-                .map_err(|e| CoreError::Catalog(format!("in-pack primary_file: {e}")))?;
-                stats.inserted += 1;
+            let mut stmt = self
+                .conn
+                .prepare("SELECT code, id FROM media_type")
+                .map_err(|e| CoreError::Catalog(format!("media_type prep: {e}")))?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .map_err(|e| CoreError::Catalog(format!("media_type query: {e}")))?;
+            for row in rows {
+                let (code, id) =
+                    row.map_err(|e| CoreError::Catalog(format!("media_type row: {e}")))?;
+                type_ids.insert(code, id);
             }
         }
-        tx.commit()
-            .map_err(|e| CoreError::Catalog(format!("mint_in_pack commit: {e}")))?;
+
+        // Mint in chunks: a huge pack (tens of thousands of entries) must not hold the single write
+        // lock long enough to starve a concurrent scan-persist ("database is locked").
+        for batch in locators.chunks(PKG_WRITE_CHUNK) {
+            let tx = self
+                .conn
+                .transaction()
+                .map_err(|e| CoreError::Catalog(format!("mint_in_pack begin: {e}")))?;
+            {
+                let mut seen = tx
+                    .prepare("SELECT 1 FROM asset_file WHERE package_entry_id = ?1")
+                    .map_err(|e| CoreError::Catalog(format!("mint probe prep: {e}")))?;
+
+                for (entry_id, guid, pathname, size_bytes) in batch {
+                    let Some(class) = classified.get(guid) else {
+                        continue; // unclassified — never becomes a grid asset
+                    };
+                    let Some(&media_type_id) = type_ids.get(&class.media_type) else {
+                        return Err(CoreError::Catalog(format!(
+                            "unknown media_type code '{}' (seed_media_types not run?)",
+                            class.media_type
+                        )));
+                    };
+                    if seen
+                        .exists(params![entry_id])
+                        .map_err(|e| CoreError::Catalog(format!("mint probe: {e}")))?
+                    {
+                        stats.unchanged += 1;
+                        continue;
+                    }
+                    // In-pack files have no source-root path; the in-archive pathname is rel_path.
+                    let rel_path = pathname.clone().unwrap_or_else(|| guid.clone());
+
+                    tx.execute(
+                        "INSERT INTO asset (uuid, source_id, media_type_id, name,
+                                            package_id, status, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, 'discovered', ?6, ?6)",
+                        params![
+                            uuid::Uuid::new_v4().to_string(),
+                            source_id,
+                            media_type_id,
+                            class.name,
+                            package_id,
+                            now
+                        ],
+                    )
+                    .map_err(|e| CoreError::Catalog(format!("in-pack asset insert: {e}")))?;
+                    let asset_id = tx.last_insert_rowid();
+                    let ext = rel_path.rsplit('.').next().map(str::to_lowercase);
+                    tx.execute(
+                        "INSERT INTO asset_file (asset_id, rel_path, ext, size_bytes,
+                                                 package_entry_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![asset_id, rel_path, ext, size_bytes, entry_id],
+                    )
+                    .map_err(|e| CoreError::Catalog(format!("in-pack asset_file insert: {e}")))?;
+                    tx.execute(
+                        "UPDATE asset SET primary_file_id = ?2 WHERE id = ?1",
+                        params![asset_id, tx.last_insert_rowid()],
+                    )
+                    .map_err(|e| CoreError::Catalog(format!("in-pack primary_file: {e}")))?;
+                    stats.inserted += 1;
+                }
+            }
+            tx.commit()
+                .map_err(|e| CoreError::Catalog(format!("mint_in_pack commit: {e}")))?;
+        }
         Ok(stats)
     }
 
@@ -1154,7 +1165,7 @@ fn configure_connection(conn: &Connection) -> Result<()> {
          PRAGMA foreign_keys=ON;
          PRAGMA cache_size=-32768;  -- 32 MiB page cache
          PRAGMA temp_store=MEMORY;
-         PRAGMA busy_timeout=5000;  -- writers queue briefly instead of erroring (single-writer rule)",
+         PRAGMA busy_timeout=15000;  -- writers queue instead of erroring; chunked pack writes keep the wait short",
     )
     .map_err(|e| CoreError::Catalog(format!("configure pragmas: {e}")))?;
     Ok(())
@@ -1799,24 +1810,29 @@ impl Catalog {
         package_id: i64,
         entries: &[PackageEntryRecord],
     ) -> Result<()> {
-        let tx = self
-            .conn
-            .transaction()
-            .map_err(|e| CoreError::Catalog(format!("pkg entries begin: {e}")))?;
-        for e in entries {
-            tx.execute(
-                "INSERT INTO package_entry (package_id, guid, pathname, tar_offset, size_bytes)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(package_id, guid) DO UPDATE SET
-                    pathname = excluded.pathname,
-                    tar_offset = excluded.tar_offset,
-                    size_bytes = excluded.size_bytes",
-                params![package_id, e.guid, e.pathname, e.tar_offset, e.size_bytes],
-            )
-            .map_err(|e2| CoreError::Catalog(format!("pkg entry upsert: {e2}")))?;
+        // Commit in chunks so a huge pack (tens of thousands of entries) never holds the single
+        // write lock long enough to starve a concurrent scan-persist ("database is locked").
+        for batch in entries.chunks(PKG_WRITE_CHUNK) {
+            let tx = self
+                .conn
+                .transaction()
+                .map_err(|e| CoreError::Catalog(format!("pkg entries begin: {e}")))?;
+            for e in batch {
+                tx.execute(
+                    "INSERT INTO package_entry (package_id, guid, pathname, tar_offset, size_bytes)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(package_id, guid) DO UPDATE SET
+                        pathname = excluded.pathname,
+                        tar_offset = excluded.tar_offset,
+                        size_bytes = excluded.size_bytes",
+                    params![package_id, e.guid, e.pathname, e.tar_offset, e.size_bytes],
+                )
+                .map_err(|e2| CoreError::Catalog(format!("pkg entry upsert: {e2}")))?;
+            }
+            tx.commit()
+                .map_err(|e| CoreError::Catalog(format!("pkg entries commit: {e}")))?;
         }
-        tx.commit()
-            .map_err(|e| CoreError::Catalog(format!("pkg entries commit: {e}")))
+        Ok(())
     }
 
     /// The manifest locators recorded for a package, in-archive path order — what the
