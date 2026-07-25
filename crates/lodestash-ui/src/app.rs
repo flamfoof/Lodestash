@@ -756,6 +756,10 @@ pub struct LodestashApp {
     nav_cursor: usize,
     /// Child folders at `current_dir`: (name, contained-asset count). Rebuilt with the cache.
     folder_tiles: Vec<(String, usize)>,
+    /// In Folders view, render the current directory's assets as a **file list** (folders still
+    /// first, as tiles) instead of a thumbnail grid — the pack browser's list/thumbnails toggle
+    /// (FEATURES.md §5.4). Session state.
+    folders_as_list: bool,
     /// Bumped on every folder navigation so the grid ScrollArea gets fresh scroll state.
     nav_generation: u64,
     /// Current thumbnail-grid page (0-based; page size lives in `config.view.page_size`).
@@ -985,6 +989,7 @@ impl LodestashApp {
             nav_history: vec![None],
             nav_cursor: 0,
             folder_tiles: Vec::new(),
+            folders_as_list: false,
             nav_generation: 0,
             page: 0,
             last_page_key: (0, 0),
@@ -6516,6 +6521,31 @@ impl LodestashApp {
         } else if go_fwd {
             self.nav_forward();
         }
+
+        // Thumbnails / file-list content toggle for the folder explorer (FEATURES.md §5.4).
+        let list_now = self.folders_as_list;
+        let mut flip = false;
+        ui.horizontal(|ui| {
+            let (glyph, hint) = if list_now {
+                ("\u{25A6} Thumbnails", "Show this folder as thumbnails")
+            } else {
+                ("\u{2630} List", "Show this folder as a file list")
+            };
+            if ui
+                .add(
+                    egui::Button::new(RichText::new(glyph).size(11.0).color(theme::TEXT_MUTED))
+                        .frame(false),
+                )
+                .on_hover_text(hint)
+                .clicked()
+            {
+                flip = true;
+            }
+        });
+        if flip {
+            self.folders_as_list = !self.folders_as_list;
+            self.cache_dirty = true;
+        }
         ui.add_space(6.0);
 
         // Folder tiles (hidden while searching — search shows subtree results flat).
@@ -8163,7 +8193,9 @@ impl eframe::App for LodestashApp {
                     // grid, so decode work and textures stay bounded per page.
                     let page_range = self.page_range();
                     let page_start = page_range.start;
-                    let out = if self.view_mode == ViewMode::List {
+                    let as_list = self.view_mode == ViewMode::List
+                        || (self.view_mode == ViewMode::Folders && self.folders_as_list);
+                    let out = if as_list {
                         asset_list(
                             ui,
                             &self.entries,
