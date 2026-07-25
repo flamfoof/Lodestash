@@ -823,6 +823,10 @@ pub struct LodestashApp {
     in_pack_locators: std::collections::HashMap<i64, (String, i64, i64)>,
     manifest_rx: Receiver<ManifestRead>,
     manifest_tx: Sender<ManifestRead>,
+    /// Signalled by a background in-pack mint (import / Add-to-Library) once its assets exist,
+    /// so the grid re-hydrates and the new pack library appears (M14).
+    rehydrate_rx: Receiver<()>,
+    rehydrate_tx: Sender<()>,
     /// The open Import-packages dialog (§5.2), if any.
     import_scan: Option<ImportScan>,
     import_rx: Receiver<Vec<(String, PathBuf, String, u64)>>,
@@ -944,6 +948,7 @@ impl LodestashApp {
         let (extract_tx, extract_rx) = mpsc::channel();
         let (peek_tx, peek_rx) = mpsc::channel();
         let (manifest_tx, manifest_rx) = mpsc::channel();
+        let (rehydrate_tx, rehydrate_rx) = mpsc::channel::<()>();
         let (import_tx, import_rx) = mpsc::channel();
         let (catalog_tx, catalog_rx) = mpsc::channel();
         let (hydrate_tx, hydrate_rx) = mpsc::channel();
@@ -1021,6 +1026,8 @@ impl LodestashApp {
             in_pack_locators: std::collections::HashMap::new(),
             manifest_rx,
             manifest_tx,
+            rehydrate_rx,
+            rehydrate_tx,
             import_scan: None,
             import_rx,
             import_tx,
@@ -1241,6 +1248,15 @@ impl LodestashApp {
                 .collect(),
             None => roots.iter().map(|_| Vec::new()).collect(),
         };
+        // Pack-only sources (FEATURES.md §5.2) are tracked but not crawled for loose files — their
+        // packs surface as in-pack libraries via the hydrate instead (M14).
+        let pack_only: Vec<bool> = match self.project_name.as_deref() {
+            Some(proj) => roots
+                .iter()
+                .map(|r| self.config.is_pack_only(proj, r))
+                .collect(),
+            None => roots.iter().map(|_| false).collect(),
+        };
 
         self.start_watching();
         self.scan_generation += 1;
@@ -1261,6 +1277,9 @@ impl LodestashApp {
             let mut entries: Vec<(usize, CrawledFile)> = Vec::new();
             let mut pending_packages = Vec::new();
             for (source_idx, root) in roots.iter().enumerate() {
+                if pack_only[source_idx] {
+                    continue; // tracked container; its packs hydrate as in-pack libraries
+                }
                 for file in crawler::crawl(root, &excludes[source_idx]) {
                     if is_unitypackage(&file.abs_path) {
                         // Don't surface the raw archive; offer an Extract action instead (PR #8).
@@ -5156,7 +5175,7 @@ impl LodestashApp {
                 });
             });
         if import_now {
-            self.import_selected_packages();
+            self.import_selected_packages(ctx);
         } else if cancel || !open {
             self.import_scan = None;
         }
@@ -5203,11 +5222,25 @@ impl LodestashApp {
         }
     }
 
+    /// A background in-pack mint (import / Add-to-Library) finished — rebuild the grid so the new
+    /// pack libraries appear (M14). ponytail: reuses `load_paths` (the crawl skips the pack-only
+    /// folder, the hydrate inside surfaces the minted assets); a hydrate-only path is the
+    /// optimisation if a re-crawl per import ever shows.
+    fn receive_rehydrate(&mut self, ctx: &egui::Context) {
+        let mut got = false;
+        while self.rehydrate_rx.try_recv().is_ok() {
+            got = true;
+        }
+        if got && !self.scan_roots.is_empty() {
+            self.load_paths(ctx, self.scan_roots.clone(), self.project_name.clone());
+        }
+    }
+
     /// §5.2 step 2: each selected archive becomes one Library — an `import_source` for the
     /// picked folder plus a **pinned** `package` row per pack. Nothing is copied or unpacked;
     /// the row points at the archive where it already lives, and its contents are read on the
     /// first Open →.
-    fn import_selected_packages(&mut self) {
+    fn import_selected_packages(&mut self, ctx: &egui::Context) {
         let Some(scan) = &self.import_scan else {
             return;
         };
@@ -5227,11 +5260,14 @@ impl LodestashApp {
         let n = picks.len();
         self.import_scan = None;
 
-        let result = (|| -> Result<(), String> {
+        // Sync: pin each pack (fast — no archive read) and collect (id, path) for the background
+        // mint. The manifest read + mint is deferred because it streams the whole gzip per pack.
+        let result = (|| -> Result<Vec<(i64, PathBuf)>, String> {
             let catalog = Catalog::open(&db_path).map_err(|e| e.to_string())?;
             let sid = catalog
                 .upsert_import_source(&config::stem_name(&root), &root.to_string_lossy(), "folder")
                 .map_err(|e| e.to_string())?;
+            let mut ids = Vec::with_capacity(picks.len());
             for (path, name) in &picks {
                 // Publisher/category are the Asset Store cache's own two levels above the
                 // pack; a plain folder of packs simply has neither.
@@ -5248,16 +5284,53 @@ impl LodestashApp {
                 catalog
                     .set_package_pinned(id, true)
                     .map_err(|e| e.to_string())?;
+                ids.push((id, path.clone()));
             }
-            Ok(())
+            Ok(ids)
         })();
 
         match result {
-            Ok(()) => {
+            Ok(ids) => {
+                // The folder is a **pack-only** container (FEATURES.md §5.2): tracked as a library
+                // source but not crawled for loose files — its packs surface as in-pack libraries.
+                let proj = self
+                    .project_name
+                    .clone()
+                    .unwrap_or_else(|| self.config.record_open(root.clone()));
+                self.config.add_pack_only_source(&proj, root.clone());
+
+                // Background: read each pack's manifest (if needed) + mint its in-pack assets,
+                // then signal a re-hydrate so the new libraries appear without a restart (M14).
+                let db2 = db_path.clone();
+                let tx = self.rehydrate_tx.clone();
+                let ctx2 = ctx.clone();
+                std::thread::spawn(move || {
+                    let mut minted = 0usize;
+                    for (id, path) in ids {
+                        match ensure_in_pack_minted(&db2, id, &path) {
+                            Ok(k) => minted += k,
+                            Err(err) => {
+                                tracing::warn!(%err, package_id = id, "in-pack mint failed")
+                            }
+                        }
+                    }
+                    tracing::info!(minted, "import minted in-pack assets");
+                    let _ = tx.send(());
+                    ctx2.request_repaint();
+                });
+
                 self.jobs.toast(
                     format!("Imported {n} package(s) as libraries"),
                     Intent::Success,
                 );
+                // Bring the folder into the active project view; the crawl skips it (pack-only)
+                // and the hydrate surfaces its packs once the background mint signals.
+                let live: Vec<PathBuf> = self
+                    .config
+                    .project_by_name(&proj)
+                    .map(|p| p.live_paths().iter().map(|p| p.to_path_buf()).collect())
+                    .unwrap_or_default();
+                self.load_paths(ctx, live, Some(proj));
                 self.reload_unity_packages();
             }
             Err(err) => {
@@ -6714,6 +6787,7 @@ impl eframe::App for LodestashApp {
         self.receive_peek(ctx);
         self.receive_manifests();
         self.receive_import_scan();
+        self.receive_rehydrate(ctx);
         // A finished extraction frees the slot the batch queue waits on.
         self.pump_extract_queue(ctx);
         self.poll_watch(ctx);
@@ -10431,6 +10505,41 @@ fn crawl_record(f: &CrawledFile) -> CrawlRecord {
         mtime: f.mtime,
         workspace_rel: None,
     }
+}
+
+/// Ensure a pack's in-pack assets exist (M14): record its manifest locators if the catalog
+/// doesn't have them yet (reading the archive once), then mint an in-pack asset per classified
+/// entry. Idempotent — mint skips duplicates and extracted packs. Background-only: a manifest
+/// read streams the whole gzip. Returns how many assets were newly minted.
+fn ensure_in_pack_minted(
+    db: &std::path::Path,
+    package_id: i64,
+    pack_path: &std::path::Path,
+) -> Result<usize, String> {
+    let mut catalog = Catalog::open(db).map_err(|e| e.to_string())?;
+    let mut entries = catalog
+        .list_package_entries(package_id)
+        .map_err(|e| e.to_string())?;
+    if entries.is_empty() {
+        let manifest = unitypackage::read_manifest(pack_path).map_err(|e| e.to_string())?;
+        entries = manifest
+            .iter()
+            .map(|e| PackageEntryRecord {
+                guid: e.guid.clone(),
+                pathname: e.pathname.clone(),
+                tar_offset: e.asset_offset.map(|o| o as i64),
+                size_bytes: e.asset_size.map(|s| s as i64),
+            })
+            .collect();
+        catalog
+            .record_package_entries(package_id, &entries)
+            .map_err(|e| e.to_string())?;
+    }
+    let classified = classify_in_pack_entries(&entries);
+    let stats = catalog
+        .mint_in_pack_assets(package_id, &classified)
+        .map_err(|e| e.to_string())?;
+    Ok(stats.inserted)
 }
 
 /// Classify a package's manifest entries for minting (M14): map each entry's GUID to the media

@@ -56,6 +56,11 @@ pub struct LibraryProject {
     /// source with no entry (or an empty vec) indexes everything under it.
     #[serde(default)]
     pub blacklist: BTreeMap<PathBuf, Vec<Exclude>>,
+    /// Sources imported as a **pack-only** container (FEATURES.md §5.2): the folder holds
+    /// `.unitypackage` libraries, so it is tracked (a sidebar `⊞` row) but **not crawled** for
+    /// loose files — its packs surface as in-pack libraries (DATA-MODEL §7 / M14) instead.
+    #[serde(default)]
+    pub pack_only: std::collections::BTreeSet<PathBuf>,
 }
 
 impl LibraryProject {
@@ -81,7 +86,13 @@ impl LibraryProject {
         let before = self.paths.len();
         self.paths.retain(|p| p != path);
         self.blacklist.remove(path);
+        self.pack_only.remove(path);
         self.paths.len() != before
+    }
+
+    /// Is this source a pack-only container (imported packs, not crawled for loose files)?
+    pub fn is_pack_only(&self, path: &Path) -> bool {
+        self.pack_only.contains(path)
     }
 
     /// The exclusion list for a source (empty slice when none).
@@ -479,6 +490,26 @@ impl AppConfig {
         }
     }
 
+    /// Add a **pack-only** source to a project (FEATURES.md §5.2): tracked as a library folder
+    /// but not crawled for loose files — its packs surface as in-pack libraries (M14). Persists.
+    pub fn add_pack_only_source(&mut self, project_name: &str, path: PathBuf) -> bool {
+        self.touch_recent(path.clone());
+        if let Some(proj) = self.projects.iter_mut().find(|p| p.name == project_name) {
+            proj.add_path(path.clone());
+            proj.pack_only.insert(path);
+            self.save();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Is `source` a pack-only container in `project_name`?
+    pub fn is_pack_only(&self, project_name: &str, source: &Path) -> bool {
+        self.project_by_name(project_name)
+            .is_some_and(|p| p.is_pack_only(source))
+    }
+
     /// The blacklist for a source in a project (cloned; empty when none). Design §5.1.
     pub fn source_excludes(&self, project_name: &str, source: &Path) -> Vec<Exclude> {
         self.project_by_name(project_name)
@@ -551,6 +582,7 @@ impl AppConfig {
             name: unique_name.clone(),
             paths: vec![path],
             blacklist: BTreeMap::new(),
+            pack_only: Default::default(),
         });
         unique_name
     }
@@ -635,6 +667,7 @@ mod tests {
             name: "Synty".into(),
             paths: vec![p("/a")],
             blacklist: BTreeMap::new(),
+            pack_only: Default::default(),
         };
         assert!(proj.add_path(p("/b")), "new path is added");
         assert!(!proj.add_path(p("/a")), "existing path is not re-added");
@@ -647,6 +680,7 @@ mod tests {
             name: "Synty".into(),
             paths: vec![p("/a"), p("/b")],
             blacklist: BTreeMap::new(),
+            pack_only: Default::default(),
         };
         assert!(proj.remove_path(&p("/a")));
         assert_eq!(proj.paths, vec![p("/b")]);
@@ -654,6 +688,24 @@ mod tests {
             !proj.remove_path(&p("/a")),
             "already removed, nothing to do"
         );
+    }
+
+    #[test]
+    fn pack_only_source_is_tracked_but_flagged_and_cleared_on_remove() {
+        let mut proj = LibraryProject {
+            name: "Cache".into(),
+            paths: vec![],
+            blacklist: BTreeMap::new(),
+            pack_only: Default::default(),
+        };
+        proj.add_path(p("/packs"));
+        proj.pack_only.insert(p("/packs"));
+        assert!(proj.is_pack_only(&p("/packs")), "flagged pack-only");
+        assert!(!proj.is_pack_only(&p("/other")), "plain source is crawled");
+        // Removing the source clears its pack-only flag too (no dangling marker).
+        assert!(proj.remove_path(&p("/packs")));
+        assert!(!proj.is_pack_only(&p("/packs")));
+        assert!(proj.pack_only.is_empty());
     }
 
     #[test]
@@ -768,6 +820,7 @@ mod tests {
             name: "Synty".into(),
             paths: vec![p("/a"), p("/b")],
             blacklist: BTreeMap::new(),
+            pack_only: Default::default(),
         };
         let ex = |v: &str| Exclude {
             kind: ExcludeKind::Folder,
