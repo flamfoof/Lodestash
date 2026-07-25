@@ -104,6 +104,17 @@ struct AssetEntry {
     thumb_spawned: bool,
 }
 
+/// Sort order for the Unity Assets package list (FEATURES.md §5.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum UnitySort {
+    /// Indexed / added packs first, then alphabetical (the default landing order).
+    #[default]
+    IndexedFirst,
+    Name,
+    Size,
+    Date,
+}
+
 /// A pending confirm for opening an oversized pack (FEATURES.md §5.4): indexing it in place would
 /// inflate the whole archive, so the user is asked whether to extract it to the temp cache instead.
 struct LargePackPrompt {
@@ -843,6 +854,11 @@ pub struct LodestashApp {
     /// `.unitypackage` archive size on disk per `package.id`, read once when the Unity Assets list
     /// loads (not per-frame) so the cards can show KB/MB/GB.
     package_sizes: std::collections::HashMap<i64, u64>,
+    /// `.unitypackage` file mtime (epoch secs) per `package.id` — the "release/downloaded" date the
+    /// Unity Assets list can sort by. Read alongside the size.
+    package_mtimes: std::collections::HashMap<i64, i64>,
+    /// Sort order for the Unity Assets list.
+    unity_sort: UnitySort,
     /// A confirm modal for opening an oversized pack (over `config.rapid_index_max_gb`): indexing
     /// it in place means inflating the whole archive, so the user chooses extract-to-temp,
     /// index-in-place anyway, or cancel.
@@ -1052,6 +1068,8 @@ impl LodestashApp {
             pending_pack_browse: None,
             open_pack_job: None,
             package_sizes: std::collections::HashMap::new(),
+            package_mtimes: std::collections::HashMap::new(),
+            unity_sort: UnitySort::default(),
             large_pack_prompt: None,
             rehydrate_rx,
             rehydrate_tx,
@@ -4856,6 +4874,27 @@ impl LodestashApp {
             {
                 import_clicked = true;
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let label = match self.unity_sort {
+                    UnitySort::IndexedFirst => "Indexed first",
+                    UnitySort::Name => "Name",
+                    UnitySort::Size => "Size",
+                    UnitySort::Date => "Date",
+                };
+                egui::ComboBox::from_id_salt("unity_sort")
+                    .selected_text(RichText::new(label).size(11.0))
+                    .show_ui(ui, |ui| {
+                        for (opt, name) in [
+                            (UnitySort::IndexedFirst, "Indexed first"),
+                            (UnitySort::Name, "Name"),
+                            (UnitySort::Size, "Size"),
+                            (UnitySort::Date, "Date"),
+                        ] {
+                            ui.selectable_value(&mut self.unity_sort, opt, name);
+                        }
+                    });
+                ui.label(RichText::new("Sort").size(11.0).color(theme::TEXT_MUTED));
+            });
         });
         ui.label(
             RichText::new(
@@ -4867,7 +4906,21 @@ impl LodestashApp {
         );
         ui.add_space(8.0);
 
-        let packages = self.unity_packages.clone().unwrap_or_default();
+        let mut packages = self.unity_packages.clone().unwrap_or_default();
+        match self.unity_sort {
+            UnitySort::IndexedFirst => {} // reload_unity_packages already lands them in this order
+            UnitySort::Name => packages.sort_by_key(|p| p.name.to_lowercase()),
+            UnitySort::Size => packages.sort_by(|a, b| {
+                // Largest first, unknown sizes last.
+                let sz = |id| self.package_sizes.get(id).copied().unwrap_or(0);
+                sz(&b.id).cmp(&sz(&a.id))
+            }),
+            UnitySort::Date => packages.sort_by(|a, b| {
+                // Newest first, unknown dates last.
+                let dt = |id| self.package_mtimes.get(id).copied().unwrap_or(0);
+                dt(&b.id).cmp(&dt(&a.id))
+            }),
+        }
         if packages.is_empty() {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
@@ -5040,15 +5093,22 @@ impl LodestashApp {
                         .cmp(&a_active)
                         .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
                 });
-                // Archive size on disk, read once here (not per-frame) so cards can show it.
-                self.package_sizes = list
-                    .iter()
-                    .filter_map(|p| {
-                        std::fs::metadata(&p.package_path)
+                // Archive size + mtime on disk, read once here (not per-frame) so the cards can show
+                // the size and the list can sort by size / date.
+                self.package_sizes.clear();
+                self.package_mtimes.clear();
+                for p in &list {
+                    if let Ok(m) = std::fs::metadata(&p.package_path) {
+                        self.package_sizes.insert(p.id, m.len());
+                        if let Some(secs) = m
+                            .modified()
                             .ok()
-                            .map(|m| (p.id, m.len()))
-                    })
-                    .collect();
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        {
+                            self.package_mtimes.insert(p.id, secs.as_secs() as i64);
+                        }
+                    }
+                }
                 self.unity_packages = Some(list);
             }
             Err(err) => {
