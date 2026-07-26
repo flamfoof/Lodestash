@@ -1159,6 +1159,9 @@ pub struct TagAssignment {
     pub confidence: Option<f64>,
 }
 
+/// A teaching-vocabulary row (AI-PIPELINE §6): `(namespace, value, scope, usage_note)`.
+pub type TeachRow = (String, String, Option<String>, Option<String>);
+
 /// One row of the tagging **vocabulary** for the Traits screen (UI-SPEC §9, DATA-MODEL §20): a
 /// `tag` with its usage count and its Trait-Library promotion fields. `manual_count`/`ai_count`
 /// let the UI decide promote-eligibility (a manual tag, or an AI tag used ≥2×, that isn't a trait).
@@ -2675,7 +2678,7 @@ impl Catalog {
     /// Teaching vocabulary fed to the identifier (AI-PIPELINE §6): the traits a user has marked
     /// `teach=1`, as `(namespace, value, scope, usage_note)`. `scope` is a `media_type` code or
     /// `None` for any modality; a paused trait (`teach=0`) is excluded but keeps its tags.
-    pub fn teaching_traits(&self) -> Result<Vec<(String, String, Option<String>, Option<String>)>> {
+    pub fn teaching_traits(&self) -> Result<Vec<TeachRow>> {
         let mut stmt = self
             .conn
             .prepare(

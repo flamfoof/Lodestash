@@ -592,6 +592,29 @@ struct ContentFilter {
     trait_search: String,
 }
 
+/// Traits screen state (UI-SPEC §9). The Mapping tab is card 170 — stubbed here.
+#[derive(Default)]
+struct VocabState {
+    tab: VocabTab,
+    /// The vocabulary, reloaded from the catalog when `dirty`. Traits first (see `list_vocabulary`).
+    rows: Vec<lodestash_core::catalog::VocabTrait>,
+    dirty: bool,
+    search: String,
+    /// NEW TRAIT form.
+    nt_name: String,
+    nt_namespace: String,
+    /// media_type code the trait applies to; empty = any.
+    nt_scope: String,
+    nt_usage: String,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum VocabTab {
+    #[default]
+    Traits,
+    Mapping,
+}
+
 /// The `has_dependencies` / `has_dependents` chips (DATA-MODEL §10). Single-select: an asset that
 /// is both ends of a chain (a material) satisfies either, so combining them would only ever
 /// narrow to that intersection — not what the chips read as.
@@ -1033,6 +1056,8 @@ pub struct LodestashApp {
     engine_state: Option<std::sync::Arc<lodestash_api::ServerState>>,
     /// The ⚑ Filters content filter (trait / triangles / file-size). Transient. Design §3.
     content_filter: ContentFilter,
+    /// Traits screen (UI-SPEC §9) — vocabulary + NEW TRAIT form.
+    vocab: VocabState,
     /// Top-bar search mode (UI-SPEC §0.1). AI is a stub until P3/P4.
     search_mode: SearchMode,
     /// Session dismissal for the Unidentified nudge banner (UI-SPEC §2.1).
@@ -1238,6 +1263,7 @@ impl LodestashApp {
             import_tx,
             workspace_dir: dirs::cache_dir().map(|d| d.join("Lodestash").join("workspace")),
             content_filter: ContentFilter::default(),
+            vocab: VocabState::default(),
             search_mode: SearchMode::Tags,
             nudge_dismissed: false,
             store_roots: Vec::new(),
@@ -1960,6 +1986,7 @@ impl LodestashApp {
             Ok(v) => self.tag_usage = v,
             Err(e) => tracing::warn!(%e, "tag vocabulary unavailable"),
         }
+        self.vocab.dirty = true; // the Traits screen reloads its list next open
         match cat.favorite_ids() {
             Ok(ids) => self.favorites = ids.into_iter().collect(),
             Err(e) => tracing::warn!(%e, "favorites unavailable"),
@@ -6384,6 +6411,267 @@ impl LodestashApp {
         }
     }
 
+    // ── Traits screen (UI-SPEC §9) ──────────────────────────────────────────────
+
+    /// The tagging vocabulary and the Trait Library (UI-SPEC §9.1). Mapping (§9.2) is card 170 and
+    /// renders a stub tab. Trait writes are tiny single-row updates on a short-lived catalog
+    /// connection, applied after the frame so the borrow of `vocab.rows` is released first.
+    fn vocabulary_screen(&mut self, ui: &mut Ui) {
+        // Reload the vocabulary when a sync (or an edit here) marked it stale.
+        if self.vocab.dirty {
+            if self.search_catalog.is_none() {
+                self.search_catalog = catalog_db_path().and_then(|p| Catalog::open(&p).ok());
+            }
+            if let Some(cat) = &self.search_catalog {
+                match cat.list_vocabulary() {
+                    Ok(rows) => self.vocab.rows = rows,
+                    Err(e) => tracing::warn!(%e, "vocabulary unavailable"),
+                }
+            }
+            self.vocab.dirty = false;
+        }
+        if self.vocab.nt_namespace.is_empty() {
+            self.vocab.nt_namespace = "subject".to_string();
+        }
+
+        ui.label(
+            RichText::new("Traits")
+                .color(theme::TEXT)
+                .font(crate::fonts::display(24.0)),
+        );
+        // Tab segmented control (same pattern as Stats §8).
+        ui.horizontal(|ui| {
+            for (tab, label) in [
+                (VocabTab::Traits, "\u{2756} Traits"),
+                (VocabTab::Mapping, "\u{21E2} Mapping"),
+            ] {
+                if ui
+                    .selectable_label(self.vocab.tab == tab, RichText::new(label).size(13.0))
+                    .clicked()
+                {
+                    self.vocab.tab = tab;
+                }
+            }
+        });
+        ui.add(egui::Separator::default().spacing(10.0));
+
+        if self.vocab.tab == VocabTab::Mapping {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("\u{21E2}").size(48.0).color(theme::TEXT_DIM));
+                ui.label(
+                    RichText::new("Mapping rules land with the mapping library.")
+                        .color(theme::TEXT_MUTED)
+                        .size(13.0),
+                );
+            });
+            return;
+        }
+
+        ui.label(
+            RichText::new(
+                "Your own tagging vocabulary. Traits marked \u{2726} teaching are fed to the \
+                 identifier \u{2014} future scans tag with your words, not just its own.",
+            )
+            .color(theme::TEXT_MUTED)
+            .size(12.0),
+        );
+        ui.add_space(8.0);
+
+        let mut action: Option<VocabAction> = None;
+
+        // NEW TRAIT card.
+        egui::Frame::none()
+            .fill(theme::SURFACE)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER))
+            .rounding(6.0)
+            .inner_margin(egui::Margin::same(10.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("NEW TRAIT").size(10.0).color(theme::TEXT_DIM));
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.vocab.nt_name)
+                            .hint_text("trait name")
+                            .desired_width(160.0),
+                    );
+                    egui::ComboBox::from_id_salt("nt_facet")
+                        .selected_text(self.vocab.nt_namespace.clone())
+                        .width(110.0)
+                        .show_ui(ui, |ui| {
+                            for f in ["subject", "style", "material", "mood", "usage", "free"] {
+                                ui.selectable_value(
+                                    &mut self.vocab.nt_namespace,
+                                    f.to_string(),
+                                    f,
+                                );
+                            }
+                        });
+                    ui.label(RichText::new("applies to").size(11.0).color(theme::TEXT_DIM));
+                    for (code, label) in [
+                        ("", "any"),
+                        ("model_3d", "model"),
+                        ("audio", "sound"),
+                        ("image", "image"),
+                    ] {
+                        let on = self.vocab.nt_scope == code;
+                        if ui.selectable_label(on, label).clicked() {
+                            self.vocab.nt_scope = code.to_string();
+                        }
+                    }
+                });
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.vocab.nt_usage)
+                        .hint_text("when should this trait apply? (the identifier reads this)")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(4.0);
+                let can_add = !self.vocab.nt_name.trim().is_empty();
+                if ui
+                    .add_enabled(
+                        can_add,
+                        egui::Button::new(
+                            RichText::new("+ Add trait").size(12.0).color(theme::BG),
+                        )
+                        .fill(theme::GOLD),
+                    )
+                    .clicked()
+                {
+                    action = Some(VocabAction::Create);
+                }
+            });
+
+        // PROMOTE EXISTING TAGS: in-use tags that aren't traits yet.
+        let promote: Vec<(String, String, i64)> = self
+            .vocab
+            .rows
+            .iter()
+            .filter(|r| !r.is_trait && (r.manual_count > 0 || r.ai_count >= 2))
+            .map(|r| (r.namespace.clone(), r.value.clone(), r.usage_count))
+            .collect();
+        if !promote.is_empty() {
+            ui.add_space(10.0);
+            section_label(ui, "\u{2726} PROMOTE EXISTING TAGS");
+            ui.horizontal_wrapped(|ui| {
+                for (ns, val, n) in &promote {
+                    let color = facet_color(ns);
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(format!("+ {val} \u{00b7} {n}"))
+                                    .size(10.0)
+                                    .color(color),
+                            )
+                            .fill(color.linear_multiply(0.10))
+                            .stroke(egui::Stroke::new(1.0, color.linear_multiply(0.5)))
+                            .rounding(8.0),
+                        )
+                        .on_hover_text("Promote to a first-class trait")
+                        .clicked()
+                    {
+                        action = Some(VocabAction::Promote(ns.clone(), val.clone()));
+                    }
+                }
+            });
+        }
+
+        // Trait cards.
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            section_label(ui, "TRAITS");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.vocab.search)
+                    .hint_text("filter")
+                    .desired_width(120.0),
+            );
+        });
+        let search = self.vocab.search.trim().to_lowercase();
+        let traits: Vec<lodestash_core::catalog::VocabTrait> = self
+            .vocab
+            .rows
+            .iter()
+            .filter(|r| r.is_trait)
+            .filter(|r| search.is_empty() || r.value.to_lowercase().contains(&search))
+            .cloned()
+            .collect();
+        if traits.is_empty() {
+            ui.label(
+                RichText::new("No traits yet \u{2014} add one above, or promote a tag in use.")
+                    .size(11.0)
+                    .color(theme::TEXT_DIM),
+            );
+        }
+        ScrollArea::vertical().show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for t in &traits {
+                    if let Some(a) = trait_card(ui, t) {
+                        action = Some(a);
+                    }
+                }
+            });
+        });
+
+        if let Some(a) = action {
+            self.apply_vocab_action(a);
+        }
+    }
+
+    /// Apply one Traits-screen edit. Writes are single tiny rows on a short-lived connection —
+    /// fast enough to run inline, which sidesteps the async-reload race a worker thread would add.
+    fn apply_vocab_action(&mut self, action: VocabAction) {
+        if let VocabAction::FindTagged(val) = &action {
+            self.content_filter.traits.clear();
+            self.content_filter.traits.insert(val.clone());
+            self.screen = Screen::Library;
+            self.cache_dirty = true;
+            return;
+        }
+        let Some(db) = catalog_db_path() else {
+            return;
+        };
+        let Ok(cat) = Catalog::open(&db) else {
+            return;
+        };
+        match action {
+            VocabAction::Create => {
+                let name = self.vocab.nt_name.trim().to_string();
+                if name.is_empty() {
+                    return;
+                }
+                let ns = self.vocab.nt_namespace.clone();
+                let scope = (!self.vocab.nt_scope.is_empty()).then(|| self.vocab.nt_scope.clone());
+                let usage = {
+                    let u = self.vocab.nt_usage.trim();
+                    (!u.is_empty()).then(|| u.to_string())
+                };
+                match cat.upsert_trait(&ns, &name, scope.as_deref(), usage.as_deref(), true) {
+                    Ok(_) => {
+                        self.vocab.nt_name.clear();
+                        self.vocab.nt_usage.clear();
+                        self.jobs
+                            .toast(format!("Trait \u{201c}{name}\u{201d} added"), Intent::Success);
+                    }
+                    Err(e) => self.jobs.toast(format!("Couldn't add trait: {e}"), Intent::Danger),
+                }
+            }
+            VocabAction::Promote(ns, val) => {
+                let _ = cat.upsert_trait(&ns, &val, None, None, true);
+            }
+            VocabAction::ToggleTeach(id, on) => {
+                let _ = cat.set_trait_teach(id, on);
+            }
+            VocabAction::Unpromote(id) => {
+                let _ = cat.unpromote_trait(id);
+            }
+            VocabAction::SetStyle(id, color, icon) => {
+                let _ = cat.set_trait_style(id, color.as_deref(), icon.as_deref());
+            }
+            VocabAction::FindTagged(_) => unreachable!("handled above"),
+        }
+        self.vocab.dirty = true;
+    }
+
     // ── Trash screen (UI-SPEC §7) ───────────────────────────────────────────────
 
     /// Catalog-only soft delete: zebra table rows with Restore. Files stay on disk;
@@ -9272,6 +9560,10 @@ impl eframe::App for LodestashApp {
                         self.trash_screen(ui);
                         return;
                     }
+                    Screen::Vocabulary => {
+                        self.vocabulary_screen(ui);
+                        return;
+                    }
                     Screen::Library => {}
                     // Unbuilt destinations render the §12 stub — never a dead click.
                     other => {
@@ -9843,6 +10135,156 @@ fn reveal_in_file_manager(path: &std::path::Path) {
 /// A settings section card: `SURFACE` fill, `BORDER`, 10px radius, letter-spaced title.
 /// Chip colour per facet (IDENTIFICATION-AND-SEARCH §2). Facets are the vocabulary's structure,
 /// so they get the type palette rather than one flat "tag" colour.
+/// One Traits-screen edit, collected while the vocabulary list is borrowed and applied after.
+enum VocabAction {
+    Create,
+    Promote(String, String),
+    ToggleTeach(i64, bool),
+    Unpromote(i64),
+    SetStyle(i64, Option<String>, Option<String>),
+    FindTagged(String),
+}
+
+/// The 6-colour trait palette (UI-SPEC §9 ✎ style). Facet-agnostic — a trait's colour is the
+/// user's, not its namespace's.
+const TRAIT_PALETTE: [egui::Color32; 6] = [
+    theme::GOLD,
+    theme::ARCANE,
+    theme::TYPE_MODEL,
+    theme::TYPE_MATERIAL,
+    theme::TYPE_IMAGE,
+    theme::TYPE_SOUND,
+];
+
+fn color_to_hex(c: egui::Color32) -> String {
+    format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())
+}
+
+fn hex_to_color(s: &str) -> Option<egui::Color32> {
+    let h = s.trim_start_matches('#');
+    if h.len() != 6 {
+        return None;
+    }
+    let n = u32::from_str_radix(h, 16).ok()?;
+    Some(egui::Color32::from_rgb(
+        (n >> 16) as u8,
+        (n >> 8) as u8,
+        n as u8,
+    ))
+}
+
+/// One trait card (UI-SPEC §9.1): coloured chip, scope + count, usage quote, and the actions
+/// (teaching toggle, find-tagged, ✎ colour, ✕ un-promote). Returns the action taken, if any.
+fn trait_card(
+    ui: &mut Ui,
+    t: &lodestash_core::catalog::VocabTrait,
+) -> Option<VocabAction> {
+    let mut action = None;
+    let color = t
+        .color
+        .as_deref()
+        .and_then(hex_to_color)
+        .unwrap_or_else(|| facet_color(&t.namespace));
+    let scope_label = match t.scope.as_deref() {
+        None => "any",
+        Some("model_3d") => "model",
+        Some("audio") => "sound",
+        Some("image") => "image",
+        Some(other) => other,
+    };
+    ui.allocate_ui(Vec2::new(300.0, 0.0), |ui| {
+        egui::Frame::none()
+            .fill(theme::SURFACE)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER))
+            .rounding(6.0)
+            .inner_margin(egui::Margin::same(9.0))
+            .show(ui, |ui| {
+                ui.set_width(282.0);
+                ui.horizontal(|ui| {
+                    let chip = match &t.icon {
+                        Some(g) if !g.is_empty() => format!("{g} {}", t.value),
+                        _ => t.value.clone(),
+                    };
+                    ui.label(RichText::new(chip).size(13.0).strong().color(color));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!("{} tagged", t.usage_count))
+                                .size(10.0)
+                                .color(theme::TEXT_DIM),
+                        );
+                    });
+                });
+                ui.label(
+                    RichText::new(format!("{} \u{00b7} {scope_label}", t.namespace))
+                        .size(10.0)
+                        .color(theme::TEXT_DIM),
+                );
+                if let Some(note) = &t.usage_note {
+                    if !note.is_empty() {
+                        ui.label(
+                            RichText::new(format!("\u{201c}{note}\u{201d}"))
+                                .size(10.0)
+                                .italics()
+                                .color(theme::TEXT_MUTED),
+                        );
+                    }
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    // Teaching toggle.
+                    let (glyph, tint) = if t.teach {
+                        ("\u{2726} teaching", theme::GOLD)
+                    } else {
+                        ("\u{23F8} paused", theme::TEXT_DIM)
+                    };
+                    if ui
+                        .add(egui::Button::new(RichText::new(glyph).size(10.0).color(tint)).frame(false))
+                        .on_hover_text("Feed this trait to future scans, or pause it")
+                        .clicked()
+                    {
+                        action = Some(VocabAction::ToggleTeach(t.id, !t.teach));
+                    }
+                    if ui
+                        .add(egui::Button::new(RichText::new("\u{2315} find").size(10.0).color(theme::TEXT_DIM)).frame(false))
+                        .on_hover_text("Show assets with this trait")
+                        .clicked()
+                    {
+                        action = Some(VocabAction::FindTagged(t.value.clone()));
+                    }
+                    // ✎ style — colour swatches.
+                    ui.menu_button(RichText::new("\u{270E}").size(10.0).color(theme::TEXT_DIM), |ui| {
+                        ui.horizontal(|ui| {
+                            for c in TRAIT_PALETTE {
+                                let (r, _p) = ui.allocate_painter(Vec2::splat(16.0), egui::Sense::click());
+                                _p.rect_filled(r.rect, 3.0, c);
+                                if r.clicked() {
+                                    action = Some(VocabAction::SetStyle(
+                                        t.id,
+                                        Some(color_to_hex(c)),
+                                        t.icon.clone(),
+                                    ));
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                        if ui.button("clear colour").clicked() {
+                            action = Some(VocabAction::SetStyle(t.id, None, t.icon.clone()));
+                            ui.close_menu();
+                        }
+                    });
+                    if ui
+                        .add(egui::Button::new(RichText::new("\u{2715}").size(10.0).color(theme::TEXT_DIM)).frame(false))
+                        .on_hover_text("Remove trait (existing tags on assets are kept)")
+                        .clicked()
+                    {
+                        action = Some(VocabAction::Unpromote(t.id));
+                    }
+                });
+            });
+    });
+    action
+}
+
 fn facet_color(namespace: &str) -> egui::Color32 {
     match namespace {
         "subject" => theme::TYPE_MODEL,
