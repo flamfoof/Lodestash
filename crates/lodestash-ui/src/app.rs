@@ -7712,7 +7712,17 @@ impl LodestashApp {
 
     /// Spawn thumbnail tasks for entry indices that haven't been started yet.
     fn spawn_thumbnails(&mut self, ctx: &egui::Context, to_spawn: &[usize]) {
+        // Cap concurrent generation. A 3D thumbnail parses a mesh and a material renders a sphere —
+        // both CPU-bound (INGESTION §6) — so a folder full of them would otherwise fire one heavy job
+        // per visible card onto the whole rayon pool and peg every core, starving the UI thread (the
+        // "spike" browsing a models/materials folder). Holding in-flight below the core count keeps
+        // the machine responsive; the rest are retried next frame (`to_spawn` is the visible window,
+        // recomputed each frame, so nothing is dropped).
+        let cap = thumb_inflight_cap();
         for &idx in to_spawn {
+            if self.pending_thumbs >= cap {
+                break;
+            }
             let entry = &self.entries[idx];
             if entry.thumb_spawned || !needs_thumbnail(entry.file.media_type) {
                 continue;
@@ -7966,6 +7976,15 @@ fn folder_children(
         })
         .collect();
     (idxs, tiles)
+}
+
+/// Max thumbnails generating at once — half the cores (min 2). A 3D/material thumbnail is a
+/// CPU-bound parse+render, so leaving cores free keeps the UI responsive while a folder of them
+/// generates (INGESTION §6). rayon already caps at core count; this caps below it.
+fn thumb_inflight_cap() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).max(2))
+        .unwrap_or(2)
 }
 
 /// How many card columns fit in `available` width. Always ≥ 1 so the grid never divides by zero.
