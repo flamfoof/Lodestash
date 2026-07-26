@@ -2068,7 +2068,12 @@ impl LodestashApp {
                         tracing::warn!(%e, "identify scope flagging failed");
                     }
                     if let Some(emb) = &embedder {
-                        drain_image_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
+                        drain_image_embeddings(
+                            &mut cat,
+                            emb.as_ref(),
+                            workspace_dir.as_deref(),
+                            cache_dir.as_deref(),
+                        );
                     }
                     if let Some(emb) = &audio_embedder {
                         drain_audio_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
@@ -11122,11 +11127,16 @@ fn resolve_embedder() -> Option<Arc<dyn lodestash_ai::embedder::Embedder + Send 
 fn embed_model_multiview(
     path: &std::path::Path,
     emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync),
+    cache_dir: Option<&std::path::Path>,
 ) -> Option<Vec<f32>> {
-    // FBX/OBJ via ufbx, glTF/GLB via three-d-asset — one entry point, world-space MeshData.
-    let meshes = lodestash_ingest::mesh::load_any(path, &std::collections::BTreeMap::new())
-        .map_err(|e| tracing::warn!(%e, "mesh load failed"))
-        .ok()?;
+    // Untextured multiview, so it shares the parse-once mesh cache with thumbnails/metrics
+    // (TECH-STACK §7): the FBX parses once across all three consumers.
+    let meshes = match cache_dir {
+        Some(dir) => lodestash_ingest::mesh::load_cached(path, dir),
+        None => lodestash_ingest::mesh::load_any(path, &std::collections::BTreeMap::new()),
+    }
+    .map_err(|e| tracing::warn!(%e, "mesh load failed"))
+    .ok()?;
     let views = lodestash_ingest::render3d::render_views(
         &meshes,
         RENDER_SIZE,
@@ -11469,7 +11479,7 @@ fn drain_promote_resync(
     drain_metrics(cat, workspace_dir, cache_dir);
     drain_dependencies(cat, workspace_dir);
     if let Some(emb) = embedder {
-        drain_image_embeddings(cat, emb.as_ref(), workspace_dir);
+        drain_image_embeddings(cat, emb.as_ref(), workspace_dir, cache_dir);
     }
     if let Some(emb) = audio_embedder {
         drain_audio_embeddings(cat, emb.as_ref(), workspace_dir);
@@ -11743,6 +11753,7 @@ fn drain_image_embeddings(
     cat: &mut Catalog,
     emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync),
     workspace_dir: Option<&std::path::Path>,
+    cache_dir: Option<&std::path::Path>,
 ) {
     const BATCH: usize = 64;
     let mut total = 0usize;
@@ -11771,7 +11782,7 @@ fn drain_image_embeddings(
                 let resolved = resolve_job_path(&job, workspace_dir);
                 resolved
                     .as_ref()
-                    .and_then(|(p, _)| embed_model_multiview(p, emb))
+                    .and_then(|(p, _)| embed_model_multiview(p, emb, cache_dir))
             } else {
                 resolve_job_image(&job, workspace_dir).map(|img| emb.embed_image(&img.to_rgba8()))
             }
