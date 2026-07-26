@@ -2386,6 +2386,53 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("tag queue count: {e}")))
     }
 
+    /// Re-flag assets for a scoped **Identify** pass (embedding + tags, AI-PIPELINE §2). Setting the
+    /// dirty flags is all that is needed — the drains then re-embed and re-tag, and `drain_tags` only
+    /// touches `source='ai'` rows, so a re-run never clobbers the user's own tags. `Full` re-does the
+    /// whole live library; `Unidentified` re-does only assets that have **no tag at all** (never
+    /// tagged, or the tagger produced nothing); `New` needs no flag — a never-processed asset is still
+    /// dirty from its mint. Returns the number of rows flagged.
+    pub fn flag_identify_all(&self) -> Result<usize> {
+        self.conn
+            .execute(
+                "UPDATE asset SET embedding_dirty = 1, tags_dirty = 1 WHERE deleted_at IS NULL",
+                [],
+            )
+            .map_err(|e| CoreError::Catalog(format!("flag identify all: {e}")))
+    }
+
+    pub fn flag_identify_untagged(&self) -> Result<usize> {
+        self.conn
+            .execute(
+                "UPDATE asset SET embedding_dirty = 1, tags_dirty = 1
+                 WHERE deleted_at IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM asset_tag t WHERE t.asset_id = asset.id)",
+                [],
+            )
+            .map_err(|e| CoreError::Catalog(format!("flag identify untagged: {e}")))
+    }
+
+    /// Flag a specific set of assets (right-click "Identify selected").
+    pub fn flag_identify_assets(&self, ids: &[i64]) -> Result<usize> {
+        let mut n = 0;
+        let tx_ids: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        // Chunked IN-lists keep the statement bounded for a huge multi-select.
+        for chunk in tx_ids.chunks(500) {
+            let placeholders = chunk.join(",");
+            n += self
+                .conn
+                .execute(
+                    &format!(
+                        "UPDATE asset SET embedding_dirty = 1, tags_dirty = 1
+                         WHERE deleted_at IS NULL AND id IN ({placeholders})"
+                    ),
+                    [],
+                )
+                .map_err(|e| CoreError::Catalog(format!("flag identify assets: {e}")))?;
+        }
+        Ok(n)
+    }
+
     /// Store what a pack says about itself (DATA-MODEL §7): version, licence, attribution and a
     /// licence URL, harvested from its embedded manifest/licence files or defaulted by origin.
     ///
@@ -3811,6 +3858,75 @@ mod tests {
             skipped.inserted, 0,
             "an extracted pack does not grow in-pack duplicates"
         );
+    }
+
+    #[test]
+    fn flag_identify_scopes_untagged_and_selected() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let sid = c.upsert_import_source("s", "G:/s", "folder").expect("sid");
+        let rec = |p: &str| CrawlRecord {
+            rel_path: p.into(),
+            name: p.into(),
+            media_type: "image".into(),
+            size_bytes: 1,
+            mtime: 0,
+            workspace_rel: None,
+        };
+        c.record_crawl(sid, None, &[rec("a.png"), rec("b.png"), rec("c.png")])
+            .unwrap();
+        // Simulate an already-identified library, then tag only 'a'.
+        c.conn
+            .execute("UPDATE asset SET embedding_dirty = 0, tags_dirty = 0", [])
+            .unwrap();
+        let a_id: i64 = c
+            .conn
+            .query_row(
+                "SELECT a.id FROM asset a JOIN asset_file af ON af.id = a.primary_file_id
+                 WHERE af.rel_path = 'a.png'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        c.set_tags(
+            a_id,
+            "ai",
+            None,
+            &[TagAssignment {
+                namespace: "style".into(),
+                value: "foo".into(),
+                confidence: None,
+            }],
+        )
+        .unwrap();
+
+        // Unidentified scope: b + c (no tags) re-flagged; a (tagged) left clean.
+        assert_eq!(c.flag_identify_untagged().unwrap(), 2);
+        let a_dirty: i64 = c
+            .conn
+            .query_row(
+                "SELECT tags_dirty FROM asset WHERE id = ?1",
+                params![a_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            a_dirty, 0,
+            "a tagged asset is not re-flagged by Unidentified"
+        );
+
+        // Selected scope: exactly the given ids.
+        c.conn
+            .execute("UPDATE asset SET embedding_dirty = 0, tags_dirty = 0", [])
+            .unwrap();
+        assert_eq!(c.flag_identify_assets(&[a_id]).unwrap(), 1);
+        let total_dirty: i64 = c
+            .conn
+            .query_row("SELECT COUNT(*) FROM asset WHERE tags_dirty = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(total_dirty, 1, "only the selected asset is flagged");
     }
 
     #[test]

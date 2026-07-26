@@ -37,6 +37,20 @@ drained in the background as they appear. This matters most for in-pack librarie
 M14): importing/opening a pack mints thousands of dirty assets at once, and auto-embedding them all
 would peg a core for minutes.
 
+**The manual pass has three scopes** (the drains always run over whatever is `embedding_dirty`/
+`tags_dirty`, so a scope simply re-flags the subset it wants redone before draining):
+
+- **Run on New** — the default; no re-flag. A freshly minted asset is dirty until first processed, so
+  this drains only assets that have never been through identification.
+- **Run on Unidentified** — re-flags every live asset with **no tag** (`flag_identify_untagged`):
+  ones that failed to tag or were never tagged. Superset of New.
+- **Full Run** — re-flags the whole live library (`flag_identify_all`): redo everything (e.g. after a
+  model upgrade).
+
+Right-clicking assets in the grid offers **Identify selected** (`flag_identify_assets`), scoping the
+pass to that selection. AI tags are written `source='ai'`, so any re-run replaces only AI tags and
+never the user's own.
+
 ```rust
 trait Tagger {
     fn model_id(&self) -> &str;                       // recorded on every tag (asset_tag.model_id)

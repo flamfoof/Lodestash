@@ -262,6 +262,20 @@ struct ScanDone {
 }
 
 /// Sidebar LIBRARIES facet selection: a source root, or one extracted package.
+/// Scope of a manual Identify pass (embeddings + tags, AI-PIPELINE §2). The user picks how much work
+/// to (re)do; core just re-flags the matching rows dirty and the drains run over the dirty set.
+#[derive(Clone, PartialEq)]
+enum IdentifyScope {
+    /// Only never-processed assets — the default; a mint leaves them dirty until first drained.
+    New,
+    /// Re-identify the whole live library (redo everything).
+    Full,
+    /// Re-identify only assets with no tags (failed / never tagged).
+    Unidentified,
+    /// A specific selection (right-click "Identify selected").
+    Selected(Vec<i64>),
+}
+
 #[derive(Clone, PartialEq)]
 enum LibraryFilter {
     Source(usize),
@@ -2002,7 +2016,7 @@ impl LodestashApp {
     /// several times that, so a full library is hours of CPU — something the user asks for, never
     /// something a scan starts. It is resumable for the same reason: `tags_dirty` is per asset, so a
     /// cancelled run simply leaves the rest queued.
-    fn spawn_tagging(&mut self) {
+    fn spawn_tagging(&mut self, scope: IdentifyScope) {
         if self.catalog_persisting {
             self.jobs
                 .toast("Catalog is busy — try again in a moment", Intent::Info);
@@ -2010,6 +2024,10 @@ impl LodestashApp {
         }
         let (Some(db_path), Some(model)) = (catalog_db_path(), self.config.tagger_model.clone())
         else {
+            self.jobs.toast(
+                "Pick an Identify model in Settings ▸ AI · IDENTIFY first",
+                Intent::Warning,
+            );
             return;
         };
         let vision_model = self.config.tagger_vision_model.clone();
@@ -2037,6 +2055,18 @@ impl LodestashApp {
             };
             let (counts, assets) = match Catalog::open(&db_path) {
                 Ok(mut cat) => {
+                    // Scope the pass by re-flagging the target subset dirty (New needs nothing — a
+                    // mint leaves assets dirty until first processed). The drains then run over the
+                    // dirty set as usual.
+                    let flagged = match &scope {
+                        IdentifyScope::New => Ok(0),
+                        IdentifyScope::Full => cat.flag_identify_all(),
+                        IdentifyScope::Unidentified => cat.flag_identify_untagged(),
+                        IdentifyScope::Selected(ids) => cat.flag_identify_assets(ids),
+                    };
+                    if let Err(e) = flagged {
+                        tracing::warn!(%e, "identify scope flagging failed");
+                    }
                     if let Some(emb) = &embedder {
                         drain_image_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
                     }
@@ -6771,7 +6801,7 @@ impl LodestashApp {
                         });
                         // AI · IDENTIFY — local tagging through an Ollama model already on the
                         // machine (AI-PIPELINE §2). Manual: a full pass is hours of CPU.
-                        let mut start_tagging = false;
+                        let mut identify_scope: Option<IdentifyScope> = None;
                         let tagging_running = self.tag_job.is_some();
                         settings_card(ui, "AI \u{00B7} IDENTIFY", |ui| {
                             let models = self.ollama_models.get_or_insert_with(|| {
@@ -6900,37 +6930,54 @@ impl LodestashApp {
                                         });
                                 });
                                 ui.add_space(6.0);
-                                let label = if tagging_running {
-                                    "Identifying\u{2026} see the job tray".to_string()
+                                if tagging_running {
+                                    ui.label(
+                                        RichText::new("\u{2726} Identifying\u{2026} see the job tray")
+                                            .size(12.0)
+                                            .color(theme::ARCANE),
+                                    );
                                 } else {
-                                    "\u{2726} Identify unidentified assets".to_string()
-                                };
-                                if ui
-                                    .add_enabled(
-                                        !tagging_running,
-                                        egui::Button::new(
-                                            RichText::new(label).size(12.0).color(theme::ARCANE),
-                                        )
-                                        .stroke(egui::Stroke::new(1.0, theme::ARCANE))
-                                        .rounding(6.0),
-                                    )
-                                    .clicked()
-                                {
-                                    start_tagging = true;
+                                    // Three scopes (§AI-PIPELINE): New = never-processed only (fast),
+                                    // Unidentified = anything with no tags (retry failures), Full =
+                                    // redo the whole library.
+                                    ui.horizontal(|ui| {
+                                        let btn = |ui: &mut Ui, text: &str, hint: &str| {
+                                            ui.add(
+                                                egui::Button::new(
+                                                    RichText::new(text)
+                                                        .size(12.0)
+                                                        .color(theme::ARCANE),
+                                                )
+                                                .stroke(egui::Stroke::new(1.0, theme::ARCANE))
+                                                .rounding(6.0),
+                                            )
+                                            .on_hover_text(hint)
+                                            .clicked()
+                                        };
+                                        if btn(ui, "\u{2726} Run on New", "Assets not yet through identification") {
+                                            identify_scope = Some(IdentifyScope::New);
+                                        }
+                                        if btn(ui, "Run on Unidentified", "Any asset with no tags (retry failures)") {
+                                            identify_scope = Some(IdentifyScope::Unidentified);
+                                        }
+                                        if btn(ui, "Full Run", "Re-identify the entire library") {
+                                            identify_scope = Some(IdentifyScope::Full);
+                                        }
+                                    });
                                 }
                                 ui.label(
                                     RichText::new(
                                         "Runs on CPU: seconds per asset, so a large library takes \
                                          hours. Cancel from the tray \u{2014} it resumes where it \
-                                         stopped.",
+                                         stopped. Right-click assets to identify just those.",
                                     )
                                     .size(10.0)
                                     .color(theme::TEXT_DIM),
                                 );
                             }
                         });
-                        if start_tagging {
-                            self.spawn_tagging();
+                        if let Some(scope) = identify_scope {
+                            self.spawn_tagging(scope);
                         }
                         settings_card(ui, "MCP", |ui| {
                             ui.label(
@@ -9502,6 +9549,27 @@ impl eframe::App for LodestashApp {
                         };
                         self.set_entries_trashed(&targets, true);
                     }
+                    ContextAction::Identify => {
+                        let targets: Vec<usize> = if self.selected.contains(&entry_idx) {
+                            self.selected.iter().copied().collect()
+                        } else {
+                            vec![entry_idx]
+                        };
+                        let ids: Vec<i64> = targets
+                            .iter()
+                            .filter_map(|&i| self.entries[i].asset_id)
+                            .collect();
+                        if ids.is_empty() {
+                            self.jobs
+                                .toast("Those assets aren't catalogued yet", Intent::Info);
+                        } else {
+                            self.jobs.toast(
+                                format!("Identifying {} selected\u{2026}", ids.len()),
+                                Intent::Info,
+                            );
+                            self.spawn_tagging(IdentifyScope::Selected(ids));
+                        }
+                    }
                     ContextAction::CopyPath => {
                         let set = if self.selected.contains(&entry_idx) {
                             self.selected.iter().copied().collect::<Vec<_>>()
@@ -10448,6 +10516,7 @@ fn no_results_state(ui: &mut Ui, query: &str) {
 enum ContextAction {
     QuickLook,
     ToggleFavorite,
+    Identify,
     Reveal,
     OpenWithDefault,
     CopyPath,
@@ -10776,6 +10845,7 @@ fn card_context_menu(ui: &mut Ui, can_trash: bool) -> Option<ContextAction> {
         ContextAction::ToggleFavorite,
         "\u{2665} Favourite          F",
     );
+    act(ui, ContextAction::Identify, "\u{2726} Identify selected");
     ui.separator();
     act(ui, ContextAction::Reveal, "Reveal in Explorer");
     act(ui, ContextAction::OpenWithDefault, "Open with default app");
@@ -10786,7 +10856,6 @@ fn card_context_menu(ui: &mut Ui, can_trash: bool) -> Option<ContextAction> {
         "Import\u{2026}",
         "Add to collection",
         "Edit tags",
-        "Re-identify",
         "Find similar",
     ] {
         ui.add_enabled(false, egui::Button::new(label))
