@@ -199,6 +199,85 @@ pub(super) fn drain_audio_embeddings(
     }
 }
 
+/// Tag dirty **visual** assets through an OpenAI-compatible cloud VLM (AI-PIPELINE §5). One call per
+/// asset — a capable cloud model holds the schema, so no local caption pre-step. Single pass (no
+/// weight-residency concern), keyed on `tags_dirty`, audio excluded (`tagger.supports`). Forward
+/// progress preserved: a request that fails or a preview that won't render still clears the flag.
+pub(super) fn drain_api_tags(
+    cat: &mut Catalog,
+    tagger: &dyn lodestash_ai::tagger::Tagger,
+    workspace_dir: Option<&std::path::Path>,
+    cache_dir: Option<&std::path::Path>,
+    progress: &crate::jobs::JobProgress,
+) {
+    use std::sync::atomic::Ordering;
+    const BATCH: usize = 16;
+    const TAG_PX: u32 = 384;
+    let model_id = tagger.model_id().to_string();
+    loop {
+        if progress.is_cancelled() {
+            return;
+        }
+        let jobs = match cat.assets_needing_tags(BATCH) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(%e, "tag queue query failed; retries next run");
+                break;
+            }
+        };
+        if jobs.is_empty() {
+            break;
+        }
+        for job in jobs {
+            if progress.is_cancelled() {
+                return;
+            }
+            // Audio has no cloud path. If the CLAP pass already tagged it, it isn't in this queue;
+            // if it couldn't run, clear the flag with an empty set (as the local drain does) rather
+            // than skipping — skipping would return the same audio-only batch forever.
+            if !tagger.supports(&job.media_code) {
+                if let Err(e) = cat.set_tags(job.asset_id, "ai", Some(&model_id), &[]) {
+                    tracing::warn!(%e, "api audio clear failed; stopping api tag drain");
+                    return;
+                }
+                progress.done.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let resolved = resolve_job_path(&job, workspace_dir);
+            let path = resolved.as_ref().map(|(p, _)| p.clone());
+            let name = path
+                .as_deref()
+                .filter(|_| resolved.as_ref().is_some_and(|(_, g)| g.is_none()))
+                .and_then(|p| p.file_stem())
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let tags = path
+                .as_deref()
+                .zip(cache_dir)
+                .and_then(|(p, cache)| tag_preview(p, cache, TAG_PX))
+                .map(|img| {
+                    tagger
+                        .tag(
+                            &lodestash_ai::tagger::TagInput {
+                                media_code: &job.media_code,
+                                name: &name,
+                                image: Some(&img),
+                            },
+                            None,
+                        )
+                        .tags
+                })
+                .unwrap_or_default();
+            let tags = lodestash_ai::tagger::validate(tags);
+            if let Err(e) = cat.set_tags(job.asset_id, "ai", Some(&model_id), &tags) {
+                tracing::warn!(%e, "api set_tags failed; stopping api tag drain");
+                return;
+            }
+            progress.done.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Tag dirty **audio** assets by CLAP zero-shot (AI-PIPELINE §6/§110): decode → log-mel → score
 /// against the label vocabulary in the same joint space the embeddings use. Its own `tags_dirty`
 /// queue, run before the VLM tag drain (which can't see audio anyway), so an audio re-tag pass works

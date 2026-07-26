@@ -129,7 +129,7 @@ impl OllamaTagger {
 
 /// The facet instruction. The facet list is injected from [`MODEL_FACETS`] so the prompt cannot
 /// drift from what `validate` will accept.
-fn build_prompt(input: &TagInput<'_>, caption: Option<&str>, teach: &[TeachTrait]) -> String {
+pub(crate) fn build_prompt(input: &TagInput<'_>, caption: Option<&str>, teach: &[TeachTrait]) -> String {
     let facets = MODEL_FACETS.join(", ");
     let evidence = match caption {
         Some(c) => format!(
@@ -216,7 +216,7 @@ fn media_word(code: &str) -> &str {
 /// Parse `{"subject": ["rock"], "style": ["low-poly"]}` into assignments. Unknown facets and
 /// non-string values are dropped here; [`crate::tagger::validate`] still runs afterwards, since
 /// this is the model's output and the rule is validate-then-write.
-fn parse_facets(json: &str, confidence: f64) -> Vec<TagAssignment> {
+pub(crate) fn parse_facets(json: &str, confidence: f64) -> Vec<TagAssignment> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
         return Vec::new();
     };
@@ -290,7 +290,7 @@ impl Tagger for OllamaTagger {
     }
 }
 
-fn encode_png(img: &image::RgbaImage) -> Result<Vec<u8>, String> {
+pub(crate) fn encode_png(img: &image::RgbaImage) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     image::DynamicImage::ImageRgba8(img.clone())
         .write_to(
@@ -302,7 +302,7 @@ fn encode_png(img: &image::RgbaImage) -> Result<Vec<u8>, String> {
 }
 
 /// Standard base64. ponytail: ~15 lines against a new dependency for one call site.
-fn base64(bytes: &[u8]) -> String {
+pub(crate) fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {

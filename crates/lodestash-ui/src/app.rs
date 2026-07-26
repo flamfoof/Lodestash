@@ -2057,15 +2057,27 @@ impl LodestashApp {
                 .toast("Catalog is busy — try again in a moment", Intent::Info);
             return;
         }
-        let (Some(db_path), Some(model)) = (catalog_db_path(), self.config.tagger_model.clone())
-        else {
+        // The visual tag pass runs on either the local Ollama model or the cloud API — one is enough.
+        let api_ok = self.config.api_tagging_enabled
+            && !self.config.api_key.trim().is_empty()
+            && self.config.api_model.is_some();
+        let model = self.config.tagger_model.clone();
+        let Some(db_path) = catalog_db_path() else {
+            return;
+        };
+        if model.is_none() && !api_ok {
             self.jobs.toast(
-                "Pick an Identify model in Settings ▸ AI · IDENTIFY first",
+                "Pick a local Identify model, or enable API tagging, in Settings ▸ AI first",
                 Intent::Warning,
             );
             return;
-        };
+        }
         let vision_model = self.config.tagger_vision_model.clone();
+        let (api_base, api_key, api_model) = (
+            self.config.api_base_url.clone(),
+            self.config.api_key.clone(),
+            self.config.api_model.clone().unwrap_or_default(),
+        );
         let workspace_dir = self.workspace_dir.clone();
         let cache_dir = self.thumb_cache_dir.clone();
         let generation = self.scan_generation;
@@ -2076,11 +2088,12 @@ impl LodestashApp {
         let audio_embedder = self.audio_embedder.clone();
         let progress = std::sync::Arc::new(crate::jobs::JobProgress::default());
         let job_progress = progress.clone();
-        self.tag_job = Some(self.jobs.start(
-            format!("Identifying with {model}"),
-            progress.clone(),
-            true,
-        ));
+        let job_label = if api_ok {
+            format!("Identifying with {api_model} (API)")
+        } else {
+            format!("Identifying with {}", model.clone().unwrap_or_default())
+        };
+        self.tag_job = Some(self.jobs.start(job_label, progress.clone(), true));
         self.catalog_persisting = true;
 
         std::thread::spawn(move || {
@@ -2100,11 +2113,6 @@ impl LodestashApp {
                             }
                         })
                         .collect();
-                    let tagger = match vision_model {
-                        Some(v) => lodestash_ai::ollama::OllamaTagger::new(model).with_vision(v),
-                        None => lodestash_ai::ollama::OllamaTagger::new(model),
-                    }
-                    .with_teaching(teach);
                     // Scope the pass by re-flagging the target subset dirty (New needs nothing — a
                     // mint leaves assets dirty until first processed). The drains then run over the
                     // dirty set as usual.
@@ -2138,13 +2146,36 @@ impl LodestashApp {
                             );
                         }
                     }
-                    drain_tags(
-                        &mut cat,
-                        &tagger,
-                        workspace_dir.as_deref(),
-                        cache_dir.as_deref(),
-                        &job_progress,
-                    );
+                    // Visual tag pass: cloud API when enabled, else the local Ollama VLM.
+                    if api_ok {
+                        let tagger = lodestash_ai::openai::OpenAiTagger::new(
+                            &api_base, &api_key, &api_model,
+                        )
+                        .with_teaching(teach);
+                        drain_api_tags(
+                            &mut cat,
+                            &tagger,
+                            workspace_dir.as_deref(),
+                            cache_dir.as_deref(),
+                            &job_progress,
+                        );
+                    } else {
+                        let model = model.clone().unwrap_or_default();
+                        let tagger = match vision_model {
+                            Some(v) => {
+                                lodestash_ai::ollama::OllamaTagger::new(model).with_vision(v)
+                            }
+                            None => lodestash_ai::ollama::OllamaTagger::new(model),
+                        }
+                        .with_teaching(teach);
+                        drain_tags(
+                            &mut cat,
+                            &tagger,
+                            workspace_dir.as_deref(),
+                            cache_dir.as_deref(),
+                            &job_progress,
+                        );
+                    }
                     // Tags change what search returns and (with P4's status rule) what "identified"
                     // means, so report fresh counts + identities like any other drain.
                     resync_after_drain(&mut cat, &roots)
@@ -7383,6 +7414,146 @@ impl LodestashApp {
                                     .size(10.0)
                                     .color(theme::TEXT_DIM),
                                 );
+                            }
+                        });
+                        // AI · IDENTIFY (CLOUD) — opt-in API tagging over the OpenAI-compatible
+                        // vision shape (AI-PIPELINE §5). Always shown, since it needs no local model.
+                        settings_card(ui, "AI \u{00B7} IDENTIFY (CLOUD)", |ui| {
+                            ui.label(
+                                RichText::new(
+                                    "Optional. Tag images / 3D / materials / fonts through a cloud \
+                                     or self-hosted vision model instead of the local one. Works \
+                                     with any OpenAI-compatible endpoint \u{2014} Gemini (free tier), \
+                                     Groq, OpenRouter, OpenAI, or a local server (LM Studio / vLLM). \
+                                     Audio always stays local. See the Model Guide in docs.",
+                                )
+                                .size(11.0)
+                                .color(theme::TEXT_DIM),
+                            );
+                            ui.add_space(6.0);
+                            if ui
+                                .checkbox(
+                                    &mut self.config.api_tagging_enabled,
+                                    "Use cloud/API tagging for visual assets",
+                                )
+                                .on_hover_text(
+                                    "When on and a model + key are set, the visual tag pass calls \
+                                     the API instead of the local Ollama model.",
+                                )
+                                .changed()
+                            {
+                                save = true;
+                            }
+                            if self.config.api_tagging_enabled {
+                                egui::Grid::new("api_cfg")
+                                    .num_columns(2)
+                                    .spacing([8.0, 6.0])
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            RichText::new("Endpoint").size(11.0).color(theme::TEXT_DIM),
+                                        );
+                                        if ui
+                                            .add(
+                                                egui::TextEdit::singleline(
+                                                    &mut self.config.api_base_url,
+                                                )
+                                                .desired_width(320.0),
+                                            )
+                                            .on_hover_text(
+                                                "OpenAI-compatible base URL (…/v1 or provider \
+                                                 equivalent). Default: Gemini.",
+                                            )
+                                            .lost_focus()
+                                        {
+                                            save = true;
+                                        }
+                                        ui.end_row();
+
+                                        ui.label(
+                                            RichText::new("Model").size(11.0).color(theme::TEXT_DIM),
+                                        );
+                                        let mut model =
+                                            self.config.api_model.clone().unwrap_or_default();
+                                        if ui
+                                            .add(
+                                                egui::TextEdit::singleline(&mut model)
+                                                    .hint_text("e.g. a Gemini flash vision model")
+                                                    .desired_width(320.0),
+                                            )
+                                            .lost_focus()
+                                        {
+                                            self.config.api_model =
+                                                (!model.trim().is_empty()).then(|| model.clone());
+                                            save = true;
+                                        }
+                                        ui.end_row();
+
+                                        ui.label(
+                                            RichText::new("API key").size(11.0).color(theme::TEXT_DIM),
+                                        );
+                                        if ui
+                                            .add(
+                                                egui::TextEdit::singleline(&mut self.config.api_key)
+                                                    .password(true)
+                                                    .hint_text("stored locally; never logged")
+                                                    .desired_width(320.0),
+                                            )
+                                            .lost_focus()
+                                        {
+                                            save = true;
+                                        }
+                                        ui.end_row();
+                                    });
+
+                                let api_ready = !self.config.api_key.trim().is_empty()
+                                    && self.config.api_model.is_some();
+                                ui.add_space(6.0);
+                                if !api_ready {
+                                    ui.label(
+                                        RichText::new("Set a model and key to enable the run buttons.")
+                                            .size(10.0)
+                                            .color(theme::TEXT_DIM),
+                                    );
+                                } else if tagging_running {
+                                    ui.label(
+                                        RichText::new("\u{2726} Identifying\u{2026} see the job tray")
+                                            .size(12.0)
+                                            .color(theme::ARCANE),
+                                    );
+                                } else {
+                                    ui.horizontal(|ui| {
+                                        let btn = |ui: &mut Ui, text: &str, hint: &str| {
+                                            ui.add(
+                                                egui::Button::new(
+                                                    RichText::new(text)
+                                                        .size(12.0)
+                                                        .color(theme::ARCANE),
+                                                )
+                                                .stroke(egui::Stroke::new(1.0, theme::ARCANE))
+                                                .rounding(6.0),
+                                            )
+                                            .on_hover_text(hint)
+                                            .clicked()
+                                        };
+                                        if btn(ui, "\u{2726} Run on New", "Assets not yet identified") {
+                                            identify_scope = Some(IdentifyScope::New);
+                                        }
+                                        if btn(ui, "Run on Unidentified", "Any asset with no tags") {
+                                            identify_scope = Some(IdentifyScope::Unidentified);
+                                        }
+                                        if btn(ui, "Full Run", "Re-identify everything") {
+                                            identify_scope = Some(IdentifyScope::Full);
+                                        }
+                                    });
+                                    ui.label(
+                                        RichText::new(
+                                            "Cloud calls cost per asset \u{2014} scope to New or \
+                                             Unidentified, or right-click just the assets you want.",
+                                        )
+                                        .size(10.0)
+                                        .color(theme::WARNING),
+                                    );
+                                }
                             }
                         });
                         if let Some(scope) = identify_scope {

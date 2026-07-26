@@ -90,7 +90,7 @@ that can actually produce one.
 | Impl | Backend |
 |---|---|
 | `LocalTagger` | **Ollama, two stages: VLM captions the preview → text model writes the facet JSON** (shipped) · WD v3 (image, ONNX) · YAMNet/PANNs + CLAP (audio) · multiview→WD (3D) |
-| `ApiTagger` | Cloud vision LLM (default **Claude**) with a JSON-schema response |
+| `ApiTagger` | Cloud/remote vision LLM over the **OpenAI-compatible** chat+vision shape (first concrete provider — reaches OpenAI, **Gemini**, Groq, OpenRouter, and any local OpenAI-API server); Claude-native is a later drop-in. JSON facet response. |
 | `LocalEmbedder` | SigLIP 2 (image) · CLAP (audio) · multiview-SigLIP (3D) — via `ort`/candle |
 | `ApiEmbedder` | provider embeddings *(optional — see policy)* |
 
@@ -141,20 +141,32 @@ that can actually produce one.
 
 ---
 
-## 5. Online API option (default: Claude vision)
+## 5. Online API option (opt-in; first provider: OpenAI-compatible)
 
-When the user opts into API tagging, the natural default for this Anthropic-aligned tool is **Claude
-vision** for images and rendered 3D views.
+API tagging is **opt-in enrichment, never required** — the local Ollama VLM path already tags
+images/3D/material/font offline for free, so the cloud path exists only to buy better tags when a
+user wants to spend for them.
 
-> Verify model IDs / pricing / vision request shape against the bundled **`claude-api`** skill or
-> current official docs before implementing — do not hard-code from memory. As referenced during
-> research: tiered models (Opus / Sonnet / Haiku) with Sonnet or Haiku the cost-sensible default for
-> bulk tagging; images sent as base64/URL content blocks; **structured outputs** (JSON-schema) for
-> reliable `{tags, category, confidence}` (no assistant prefills on current models); **Message
-> Batches API at ~50% cost** + **prompt caching** of the shared instruction prefix for bulk jobs.
+**The first concrete provider is the OpenAI chat-completions + vision shape**, not Claude-native, and
+the reason is reach-per-line: one impl (`base_url` + `api_key` + `model`) talks to **OpenAI, Google
+Gemini** (its OpenAI-compatible endpoint), **Groq, OpenRouter, and any local OpenAI-API server**
+(LM Studio / llama.cpp / vLLM) — including the generous **free tiers** (Gemini Flash, Groq,
+OpenRouter free models) that make cloud tagging affordable at all. Claude's native Messages API is a
+different request shape and lands later as a second impl behind the same `ApiTagger` trait for users
+who specifically want Anthropic. The default `base_url` points at Gemini's OpenAI-compatible endpoint;
+a local server URL is a first-class alternative (zero cost, fully private).
 
-The provider is abstracted (`ApiTagger`), so Gemini/GPT (or others) are drop-in alternatives. Audio
-goes through the local transcription/description pre-step regardless of provider.
+> Verify model IDs / pricing / free-tier limits / vision request shape against each provider's
+> current docs before relying on them — do not hard-code from memory. The request is a standard
+> `POST {base_url}/chat/completions` with the image as a base64 `image_url` content block and the
+> shared instruction prefix reused across the batch (prompt-cacheable where the provider supports it).
+> For Anthropic specifically, the bundled **`claude-api`** skill is the reference. Cost-sensible
+> defaults: a small/flash model for bulk; **scoped runs** (Unidentified/Selected only) and a per-run
+> asset cap keep spend bounded; a Batches path (~50% cost) is a later add.
+
+The provider is abstracted (`ApiTagger`), so Claude-native / others are drop-in alternatives. Audio
+has **no cloud path** in any provider (§5, above): it goes through the local CLAP/Whisper
+description pre-step regardless, and the API only ever enriches text.
 
 ---
 

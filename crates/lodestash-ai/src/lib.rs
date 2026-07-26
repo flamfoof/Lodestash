@@ -6,6 +6,7 @@ pub mod clap_tags;
 pub mod embedder;
 pub mod ollama;
 pub mod onnx;
+pub mod openai;
 pub mod siglip;
 pub mod tagger;
 pub mod worker;

@@ -409,6 +409,24 @@ pub struct AppConfig {
     /// CPU here), so it is a manual action unless the user opts into auto (AI-PIPELINE §2).
     #[serde(default)]
     pub auto_identify: bool,
+    /// Opt-in cloud/remote tagging over the OpenAI-compatible vision shape (AI-PIPELINE §5). When
+    /// on **and** a key + model are set, the visual tag pass uses the API instead of the local
+    /// Ollama VLM. Off by default — the local path is free and private.
+    #[serde(default)]
+    pub api_tagging_enabled: bool,
+    /// OpenAI-compatible base URL (default: Gemini's endpoint). Any provider or local server works.
+    #[serde(default = "default_api_base_url")]
+    pub api_base_url: String,
+    /// The vision model id at that endpoint (e.g. a Gemini flash model). `None` = not configured.
+    #[serde(default)]
+    pub api_model: Option<String>,
+    /// API key for the endpoint. A secret — never logged. Empty = not configured.
+    #[serde(default)]
+    pub api_key: String,
+}
+
+fn default_api_base_url() -> String {
+    lodestash_ai::openai::DEFAULT_BASE_URL.to_string()
 }
 
 impl Default for AppConfig {
@@ -435,6 +453,10 @@ impl Default for AppConfig {
             tagger_model: None,
             tagger_vision_model: None,
             auto_identify: false,
+            api_tagging_enabled: false,
+            api_base_url: default_api_base_url(),
+            api_model: None,
+            api_key: String::new(),
         }
     }
 }
