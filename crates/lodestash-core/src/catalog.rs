@@ -2336,6 +2336,66 @@ impl Catalog {
         Ok(written)
     }
 
+    /// Reject a single facet value on an asset (P4 accept/reject, DATA-MODEL §8): delete every
+    /// `asset_tag` row for this (asset, tag) pair regardless of source — the user is saying the term
+    /// is wrong, not that one model guessed it. Re-indexes FTS with the pre-write text so the
+    /// rejected term stops matching. The `tag` vocabulary row is left in place (other assets use it).
+    /// Returns the number of rows removed.
+    pub fn remove_asset_tag(
+        &mut self,
+        asset_id: i64,
+        namespace: &str,
+        value: &str,
+    ) -> Result<usize> {
+        let Some((norm, _)) = normalize_tag(namespace, value) else {
+            return Ok(0); // an empty or punctuation-only value never became a tag
+        };
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| CoreError::Catalog(format!("reject begin: {e}")))?;
+        let old_concat = tags_concat_in(&tx, asset_id)?;
+        let n = tx
+            .execute(
+                "DELETE FROM asset_tag
+                  WHERE asset_id = ?1
+                    AND tag_id = (SELECT id FROM tag WHERE norm_name = ?2)",
+                params![asset_id, norm],
+            )
+            .map_err(|e| CoreError::Catalog(format!("reject delete: {e}")))?;
+        refresh_fts(&tx, asset_id, &old_concat)?;
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("reject commit: {e}")))?;
+        Ok(n)
+    }
+
+    /// Mark an asset **confirmed** (human-reviewed tags → trusted, DATA-MODEL §8), or clear that
+    /// back to the status the ingest work actually earns. `confirmed` is the one status a human
+    /// sets; `promote_statuses` never touches it, so un-confirming recomputes the earned status
+    /// inline with the same predicate the reconcile uses (embedding **and** a tag ⇒ `identified`;
+    /// facets ⇒ `indexed`) — otherwise the row would sit stale until the next drain.
+    pub fn set_confirmed(&self, asset_id: i64, confirmed: bool) -> Result<()> {
+        let now = unix_now();
+        let sql = if confirmed {
+            "UPDATE asset SET status = 'confirmed', updated_at = ?2
+               WHERE id = ?1 AND deleted_at IS NULL"
+        } else {
+            "UPDATE asset SET status = CASE
+                 WHEN embedding_dirty = 0
+                      AND EXISTS (SELECT 1 FROM asset_embedding e WHERE e.asset_id = asset.id)
+                      AND EXISTS (SELECT 1 FROM asset_tag t WHERE t.asset_id = asset.id)
+                      THEN 'identified'
+                 WHEN metrics_dirty = 0 THEN 'indexed'
+                 ELSE 'discovered' END,
+                 updated_at = ?2
+               WHERE id = ?1 AND deleted_at IS NULL"
+        };
+        self.conn
+            .execute(sql, params![asset_id, now])
+            .map(|_| ())
+            .map_err(|e| CoreError::Catalog(format!("set_confirmed: {e}")))
+    }
+
     /// One asset's tags, newest source-agnostic view: `(namespace, value, source, confidence)`.
     pub fn tags_for_asset(&self, asset_id: i64) -> Result<Vec<TagAssignment>> {
         let mut stmt = self
@@ -3927,6 +3987,98 @@ mod tests {
             })
             .unwrap();
         assert_eq!(total_dirty, 1, "only the selected asset is flagged");
+    }
+
+    #[test]
+    fn confirm_flow_sets_and_reverts_status_and_reject_stops_matching() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let sid = c.upsert_import_source("s", "G:/s", "folder").expect("sid");
+        c.record_crawl(
+            sid,
+            None,
+            &[CrawlRecord {
+                rel_path: "a.png".into(),
+                name: "a.png".into(),
+                media_type: "image".into(),
+                size_bytes: 1,
+                mtime: 0,
+                workspace_rel: None,
+            }],
+        )
+        .unwrap();
+        let id: i64 = c
+            .conn
+            .query_row(
+                "SELECT a.id FROM asset a JOIN asset_file af ON af.id = a.primary_file_id
+                 WHERE af.rel_path = 'a.png'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // An identified asset: embedding present + clean, one tag, facets extracted.
+        c.conn
+            .execute(
+                "UPDATE asset SET embedding_dirty = 0, metrics_dirty = 0, status = 'identified'
+                 WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        c.conn
+            .execute(
+                "INSERT INTO asset_embedding
+                    (asset_id, model_id, modality, dim, embedding, created_at)
+                 VALUES (?1, 'm', 'image', 1, X'00000000', 0)",
+                params![id],
+            )
+            .unwrap();
+        c.set_tags(
+            id,
+            "ai",
+            None,
+            &[
+                TagAssignment {
+                    namespace: "subject".into(),
+                    value: "dragon".into(),
+                    confidence: Some(0.8),
+                },
+                TagAssignment {
+                    namespace: "material".into(),
+                    value: "scales".into(),
+                    confidence: Some(0.6),
+                },
+            ],
+        )
+        .unwrap();
+
+        let status = |c: &Catalog| -> String {
+            c.conn
+                .query_row("SELECT status FROM asset WHERE id = ?1", params![id], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+
+        // Confirm → confirmed; un-confirm recomputes the earned status (embedding + tag ⇒ identified).
+        c.set_confirmed(id, true).unwrap();
+        assert_eq!(status(&c), "confirmed");
+        c.set_confirmed(id, false).unwrap();
+        assert_eq!(status(&c), "identified");
+
+        // Reject a tag: it is gone from the asset and no longer matches FTS.
+        assert_eq!(c.remove_asset_tag(id, "subject", "dragon").unwrap(), 1);
+        let left = c.tags_for_asset(id).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].value, "scales");
+        let hits: i64 = c
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset_fts WHERE asset_fts MATCH 'dragon'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 0, "rejected term stops matching FTS");
     }
 
     #[test]

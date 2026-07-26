@@ -2659,6 +2659,83 @@ impl LodestashApp {
         });
     }
 
+    /// Reject one AI/manual trait on an asset (P4 accept/reject, DATA-MODEL §8). Drops it from the
+    /// local map so the chip vanishes this frame, then persists off-thread and re-syncs.
+    fn reject_asset_tag(&mut self, asset_id: i64, namespace: String, value: String) {
+        if let Some(tags) = self.asset_tags.get_mut(&asset_id) {
+            tags.retain(|t| !(t.namespace == namespace && t.value == value));
+        }
+        let Some(db_path) = catalog_db_path() else {
+            return;
+        };
+        let generation = self.scan_generation;
+        let tx = self.catalog_tx.clone();
+        let roots = self.scan_root_names();
+        self.catalog_persisting = true;
+        std::thread::spawn(move || {
+            let (counts, assets) = match Catalog::open(&db_path) {
+                Ok(mut cat) => {
+                    if let Err(err) = cat.remove_asset_tag(asset_id, &namespace, &value) {
+                        tracing::warn!(%err, "tag reject failed; local view may diverge");
+                    }
+                    resync_after_drain(&mut cat, &roots)
+                }
+                Err(e) => {
+                    tracing::warn!(%e, "tag reject: catalog unavailable");
+                    (None, Vec::new())
+                }
+            };
+            let _ = tx.send(CatalogSynced {
+                generation,
+                drain_only: true,
+                counts,
+                assets,
+            });
+        });
+    }
+
+    /// Mark an asset `confirmed` or return it to its earned status (P4 accept/reject, DATA-MODEL §8).
+    /// Updates the local entry optimistically; the re-sync carries the authoritative status.
+    fn set_asset_confirmed(&mut self, entry_idx: usize, asset_id: i64, confirmed: bool) {
+        if let Some(e) = self.entries.get_mut(entry_idx) {
+            // Un-confirm is recomputed authoritatively by the write; `Identified` is the optimistic
+            // guess (confirm is only offered on a tagged asset), corrected on the next sync.
+            e.status = if confirmed {
+                AssetStatus::Confirmed
+            } else {
+                AssetStatus::Identified
+            };
+        }
+        self.cache_dirty = true; // status filter may drop the row from the view
+        let Some(db_path) = catalog_db_path() else {
+            return;
+        };
+        let generation = self.scan_generation;
+        let tx = self.catalog_tx.clone();
+        let roots = self.scan_root_names();
+        self.catalog_persisting = true;
+        std::thread::spawn(move || {
+            let (counts, assets) = match Catalog::open(&db_path) {
+                Ok(mut cat) => {
+                    if let Err(err) = cat.set_confirmed(asset_id, confirmed) {
+                        tracing::warn!(%err, "confirm update failed; local value may diverge");
+                    }
+                    resync_after_drain(&mut cat, &roots)
+                }
+                Err(e) => {
+                    tracing::warn!(%e, "confirm: catalog unavailable");
+                    (None, Vec::new())
+                }
+            };
+            let _ = tx.send(CatalogSynced {
+                generation,
+                drain_only: true,
+                counts,
+                assets,
+            });
+        });
+    }
+
     /// Keep the viewer in sync with the Quick Look target: (re)load when the overlay
     /// is open on a raster asset it doesn't hold yet. Decode runs off-thread.
     fn ensure_viewer_loaded(&mut self, ctx: &egui::Context) {
@@ -8937,6 +9014,8 @@ impl eframe::App for LodestashApp {
         // ── Inspector pane (right side) ───────────────────────────────────────
         let mut inspector_rating: Option<(usize, Option<u8>)> = None;
         let mut inspector_nav: Option<i64> = None;
+        let mut inspector_reject: Option<(i64, String, String)> = None;
+        let mut inspector_confirm: Option<(usize, i64, bool)> = None;
         if self.screen == Screen::Library {
             // Load the LINKED FILES rows before borrowing the entry (the load needs &mut self).
             if let Some(id) = self
@@ -8967,6 +9046,8 @@ impl eframe::App for LodestashApp {
                                     .inner_margin(egui::Margin::same(12.0)),
                             )
                             .show(ctx, |ui| {
+                                let mut reject: Option<(String, String)> = None;
+                                let mut confirm: Option<bool> = None;
                                 if let Some(new_rating) = inspector_pane(
                                     ui,
                                     file,
@@ -8982,8 +9063,18 @@ impl eframe::App for LodestashApp {
                                         .map(Vec::as_slice)
                                         .unwrap_or(&[]),
                                     &mut inspector_nav,
+                                    &mut reject,
+                                    &mut confirm,
                                 ) {
                                     inspector_rating = Some((entry_idx, new_rating));
+                                }
+                                if let Some(id) = entry.asset_id {
+                                    if let Some((ns, val)) = reject {
+                                        inspector_reject = Some((id, ns, val));
+                                    }
+                                    if let Some(c) = confirm {
+                                        inspector_confirm = Some((entry_idx, id, c));
+                                    }
                                 }
                             });
                     }
@@ -8992,6 +9083,12 @@ impl eframe::App for LodestashApp {
         }
         if let Some((entry_idx, new_rating)) = inspector_rating {
             self.set_entries_rating(&[entry_idx], new_rating);
+        }
+        if let Some((asset_id, ns, val)) = inspector_reject {
+            self.reject_asset_tag(asset_id, ns, val);
+        }
+        if let Some((entry_idx, asset_id, confirmed)) = inspector_confirm {
+            self.set_asset_confirmed(entry_idx, asset_id, confirmed);
         }
         // A LINKED FILES row was clicked: jump to that asset, or say why we can't.
         if let Some(id) = inspector_nav {
@@ -11533,6 +11630,8 @@ fn inspector_pane(
     related: &[lodestash_core::catalog::RelatedAsset],
     tags: &[lodestash_core::catalog::TagAssignment],
     nav_to: &mut Option<i64>,
+    reject_tag: &mut Option<(String, String)>,
+    confirm_set: &mut Option<bool>,
 ) -> Option<Option<u8>> {
     let mut rating_clicked: Option<Option<u8>> = None;
     let type_color = file
@@ -11695,8 +11794,51 @@ fn inspector_pane(
                         egui::Stroke::new(1.5, color),
                     );
                 }
+                // Reject (accept/reject, DATA-MODEL §8): a wrong term is removed from the asset.
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("\u{00d7}").size(10.0).color(theme::TEXT_DIM),
+                        )
+                        .frame(false),
+                    )
+                    .on_hover_text("Reject this trait")
+                    .clicked()
+                {
+                    *reject_tag = Some((tag.namespace.clone(), tag.value.clone()));
+                }
             }
         });
+    }
+
+    // Confirm / un-confirm (P4 accept/reject → `confirmed`, DATA-MODEL §8). Confirming asserts a
+    // human reviewed the traits, so it only makes sense once there are traits to review.
+    if !tags.is_empty() {
+        ui.add_space(6.0);
+        if status == AssetStatus::Confirmed {
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("\u{25C6} Confirmed \u{2014} revise")
+                            .size(10.0)
+                            .color(theme::STATUS_CONFIRMED),
+                    )
+                    .frame(false),
+                )
+                .on_hover_text("Return this asset to the Identify backlog")
+                .clicked()
+            {
+                *confirm_set = Some(false);
+            }
+        } else if ui
+            .add(egui::Button::new(
+                RichText::new("\u{2713} Confirm traits").size(10.0).color(theme::TEXT),
+            ))
+            .on_hover_text("Mark the traits reviewed and trusted")
+            .clicked()
+        {
+            *confirm_set = Some(true);
+        }
     }
 
     // LINKED FILES (UI-SPEC §13.6) — what this asset drags along, and what would drag it.
