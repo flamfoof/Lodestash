@@ -4,7 +4,7 @@ Working notes for whoever (or whatever) continues the build. Unlike the rest of 
 is **not** a design spec — it's the state of play, the decisions already settled, and the traps.
 The design docs still win on any question of what the software *should* do.
 
-Last updated: **2026-07-25**, at `803ceb9`.
+Last updated: **2026-07-26**, at `12a2c2e`.
 
 ---
 
@@ -79,6 +79,32 @@ measurement — `moondream` answers facet-JSON requests with arrays of numbers b
 in prose, so the VLM captions and a text model writes the facets; the caption becomes
 `asset.description` and is FTS-indexed. Installed here: `qwen3:8b` (facets) + `moondream:latest`
 (captions). Tags are written under `source='ai'`, so a re-run never touches the user's own.
+
+**P4 is now most of the way in (2026-07-26).** Four slices landed this session:
+- **Accept/reject → `confirmed`** — the last lifecycle state is reachable. `Catalog::remove_asset_tag`
+  (reject one trait, re-indexes FTS) + `set_confirmed` (human-set status; un-confirm recomputes the
+  earned status inline). Inspector TRAITS chips get a `×` reject and a Confirm toggle (tagged assets only).
+- **Traits screen** (`Screen::Vocabulary`, UI-SPEC §9.1) — NEW TRAIT card, ✦ PROMOTE EXISTING TAGS,
+  trait cards (6-colour palette, ✦ teaching / ⏸ paused, ⌕ find, ✕ un-promote). The **teaching**
+  contract is wired end to end: `spawn_tagging` loads `teaching_traits` and injects them into the
+  facet prompt, scoped per modality (`OllamaTagger`/`OpenAiTagger::with_teaching`). Schema needed no
+  migration — the trait columns were already in MIGRATION_05. Mapping tab stubbed (that's card 170).
+- **Audio tagging** — **CLAP zero-shot** (`lodestash_ai::clap_tags`), no new model: scores a clip
+  against a game-audio label vocabulary in the shipped CLAP joint space, per-facet temperature-scaled
+  softmax over `MIN_PROB`. Own `tags_dirty` queue + `drain_audio_tags`, runs before the VLM drain
+  (which refuses audio). YAMNet/PANNs + Whisper remain the heavier future path.
+- **API tagger** — `lodestash_ai::openai::OpenAiTagger`, the **OpenAI-compatible** vision shape, so
+  one impl reaches OpenAI/**Gemini (free tier)**/Groq/OpenRouter/local servers. Chosen over
+  Claude-native after a cost review (Claude API is dear; a chat membership can't be used
+  programmatically). `drain_api_tags` single pass; `spawn_tagging` routes API-vs-Ollama on config.
+  Settings ▸ **AI · IDENTIFY (CLOUD)** card (endpoint/model/key, scoped Run buttons, cost warning);
+  key never logged. Audio never uploaded. AI-PIPELINE §5 rewritten accordingly. New user docs:
+  [`MODEL-GUIDE.md`](MODEL-GUIDE.md) (which model by modality) and
+  [`SELF-HOSTED-PROVIDER.md`](SELF-HOSTED-PROVIDER.md) (a **separate/future** spec — a hosted
+  Lodestash endpoint is just another OpenAI-compatible URL the cloud card already accepts).
+
+*P4 still open*: YAMNet/PANNs + Whisper; the Mapping tab (card 170); Claude-native API impl + Batches;
+`+ trait` quick-add from the inspector; trait colour on inspector chips.
 
 **The dependency graph is harvested and export honours it** (P2, [`DATA-MODEL.md`](DATA-MODEL.md) §10).
 A third drain flag (`deps_dirty`, M10) walks each asset's `.meta` sidecar for its own GUID and a
@@ -492,9 +518,12 @@ Top of the list is finishing the in-pack feature (M14) the last session built, i
 3. **P5 — the Unity round-trip**: `register_project` → `/v1/import` → import queue → `import_record`
    → dup-guard, then the UPM C# plugin (the big piece; unverifiable without a Unity install). Land
    the MCP per-tool allow-list *before* the import ops, since those mutate a project.
-4. **P4 remainder** — audio taggers (CLAP/PANNs, not a language model guessing from a filename),
-   accept/reject → `confirmed`, the Traits screen, `+ trait` quick-add. A full Identify pass over
-   this library is ~5 h of CPU; it is manual and resumable for that reason.
+4. **P4 remainder** — *most of P4 shipped 2026-07-26* (accept/reject → `confirmed`, Traits screen +
+   teaching, CLAP zero-shot **audio** tagging, OpenAI-compatible **API** tagger — see §2). Still open:
+   YAMNet/PANNs discrete audio events + Whisper speech; the **Mapping tab** (card 170, the mapping
+   library); a **Claude-native** API impl + **Batches** (~50% cost); `+ trait` quick-add from the
+   inspector; trait colour on inspector chips. A full local Identify pass over this library is ~5 h of
+   CPU; it is manual and resumable for that reason (the API path is faster but costs per asset).
 5. **P2 remainder** — the naming heuristic for assets with no `.meta` (no GUID ⇒ no edges at all),
    prefabs inside an extracted workspace, the §13.6 relink panel, and `has_dependents`/
    `has_dependencies` as search filters rather than only chips.

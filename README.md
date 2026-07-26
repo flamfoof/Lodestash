@@ -112,7 +112,9 @@ alternatives (Tauri+three.js, pure-Python/PySide6).
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | System architecture, components, data flow, the language decision & alternatives |
 | [`docs/INGESTION.md`](docs/INGESTION.md) | Import pipeline, Unity formats (primary), Unreal formats (planned), viewers/players, thumbnailing |
 | [`docs/AI-PIPELINE.md`](docs/AI-PIPELINE.md) | Tagging & embeddings per modality; local-vs-API abstraction |
+| [`docs/MODEL-GUIDE.md`](docs/MODEL-GUIDE.md) | **User guide:** friendly "which model should I pick?" by asset type (image / 3D / audio) and local-vs-cloud |
 | [`docs/AI-MODELS-BY-GPU.md`](docs/AI-MODELS-BY-GPU.md) | **User guide:** which local AI models to run per GPU VRAM tier (CPU / 4 / 6 / 8 / 12 / 16 / 24 GB / cloud) |
+| [`docs/SELF-HOSTED-PROVIDER.md`](docs/SELF-HOSTED-PROVIDER.md) | **Separate/future spec stub:** a hosted Lodestash inference subscription (the cloud card already works with any OpenAI-compatible host) |
 | [`docs/DESIGN-GUIDELINES.md`](docs/DESIGN-GUIDELINES.md) | **Design system** for devs & designers — dark-mode JRPG theme, tokens, components, icons (+ live [`design/Lodestash Prototype.dc.html`](docs/design/Lodestash%20Prototype.dc.html), [`design/icons/`](docs/design/icons/)) |
 | [`docs/UI-SPEC.md`](docs/UI-SPEC.md) | **UI functional spec** — every screen/overlay (shell, onboarding, Library, Identify, Packages, Unity Assets, Duplicates, Collections, Trash, Stats, Vocabulary (Traits + Mapping), Settings, inspector, Quick Look, staging/import), normalized from the design prototype with resolved inconsistencies |
 | [`docs/design/FEATURES.md`](docs/design/FEATURES.md) | **Complete feature handoff** — exhaustive, feature-by-feature behavioural contract for the prototype (companion to UI-SPEC; the prototype is source of truth for interaction) |

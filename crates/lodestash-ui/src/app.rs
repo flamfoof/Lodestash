@@ -6542,14 +6542,14 @@ impl LodestashApp {
                         .width(110.0)
                         .show_ui(ui, |ui| {
                             for f in ["subject", "style", "material", "mood", "usage", "free"] {
-                                ui.selectable_value(
-                                    &mut self.vocab.nt_namespace,
-                                    f.to_string(),
-                                    f,
-                                );
+                                ui.selectable_value(&mut self.vocab.nt_namespace, f.to_string(), f);
                             }
                         });
-                    ui.label(RichText::new("applies to").size(11.0).color(theme::TEXT_DIM));
+                    ui.label(
+                        RichText::new("applies to")
+                            .size(11.0)
+                            .color(theme::TEXT_DIM),
+                    );
                     for (code, label) in [
                         ("", "any"),
                         ("model_3d", "model"),
@@ -6572,10 +6572,8 @@ impl LodestashApp {
                 if ui
                     .add_enabled(
                         can_add,
-                        egui::Button::new(
-                            RichText::new("+ Add trait").size(12.0).color(theme::BG),
-                        )
-                        .fill(theme::GOLD),
+                        egui::Button::new(RichText::new("+ Add trait").size(12.0).color(theme::BG))
+                            .fill(theme::GOLD),
                     )
                     .clicked()
                 {
@@ -6690,10 +6688,14 @@ impl LodestashApp {
                     Ok(_) => {
                         self.vocab.nt_name.clear();
                         self.vocab.nt_usage.clear();
-                        self.jobs
-                            .toast(format!("Trait \u{201c}{name}\u{201d} added"), Intent::Success);
+                        self.jobs.toast(
+                            format!("Trait \u{201c}{name}\u{201d} added"),
+                            Intent::Success,
+                        );
                     }
-                    Err(e) => self.jobs.toast(format!("Couldn't add trait: {e}"), Intent::Danger),
+                    Err(e) => self
+                        .jobs
+                        .toast(format!("Couldn't add trait: {e}"), Intent::Danger),
                 }
             }
             VocabAction::Promote(ns, val) => {
@@ -10356,10 +10358,7 @@ fn hex_to_color(s: &str) -> Option<egui::Color32> {
 
 /// One trait card (UI-SPEC §9.1): coloured chip, scope + count, usage quote, and the actions
 /// (teaching toggle, find-tagged, ✎ colour, ✕ un-promote). Returns the action taken, if any.
-fn trait_card(
-    ui: &mut Ui,
-    t: &lodestash_core::catalog::VocabTrait,
-) -> Option<VocabAction> {
+fn trait_card(ui: &mut Ui, t: &lodestash_core::catalog::VocabTrait) -> Option<VocabAction> {
     let mut action = None;
     let color = t
         .color
@@ -10419,42 +10418,61 @@ fn trait_card(
                         ("\u{23F8} paused", theme::TEXT_DIM)
                     };
                     if ui
-                        .add(egui::Button::new(RichText::new(glyph).size(10.0).color(tint)).frame(false))
+                        .add(
+                            egui::Button::new(RichText::new(glyph).size(10.0).color(tint))
+                                .frame(false),
+                        )
                         .on_hover_text("Feed this trait to future scans, or pause it")
                         .clicked()
                     {
                         action = Some(VocabAction::ToggleTeach(t.id, !t.teach));
                     }
                     if ui
-                        .add(egui::Button::new(RichText::new("\u{2315} find").size(10.0).color(theme::TEXT_DIM)).frame(false))
+                        .add(
+                            egui::Button::new(
+                                RichText::new("\u{2315} find")
+                                    .size(10.0)
+                                    .color(theme::TEXT_DIM),
+                            )
+                            .frame(false),
+                        )
                         .on_hover_text("Show assets with this trait")
                         .clicked()
                     {
                         action = Some(VocabAction::FindTagged(t.value.clone()));
                     }
                     // ✎ style — colour swatches.
-                    ui.menu_button(RichText::new("\u{270E}").size(10.0).color(theme::TEXT_DIM), |ui| {
-                        ui.horizontal(|ui| {
-                            for c in TRAIT_PALETTE {
-                                let (r, _p) = ui.allocate_painter(Vec2::splat(16.0), egui::Sense::click());
-                                _p.rect_filled(r.rect, 3.0, c);
-                                if r.clicked() {
-                                    action = Some(VocabAction::SetStyle(
-                                        t.id,
-                                        Some(color_to_hex(c)),
-                                        t.icon.clone(),
-                                    ));
-                                    ui.close_menu();
+                    ui.menu_button(
+                        RichText::new("\u{270E}").size(10.0).color(theme::TEXT_DIM),
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                for c in TRAIT_PALETTE {
+                                    let (r, _p) = ui
+                                        .allocate_painter(Vec2::splat(16.0), egui::Sense::click());
+                                    _p.rect_filled(r.rect, 3.0, c);
+                                    if r.clicked() {
+                                        action = Some(VocabAction::SetStyle(
+                                            t.id,
+                                            Some(color_to_hex(c)),
+                                            t.icon.clone(),
+                                        ));
+                                        ui.close_menu();
+                                    }
                                 }
+                            });
+                            if ui.button("clear colour").clicked() {
+                                action = Some(VocabAction::SetStyle(t.id, None, t.icon.clone()));
+                                ui.close_menu();
                             }
-                        });
-                        if ui.button("clear colour").clicked() {
-                            action = Some(VocabAction::SetStyle(t.id, None, t.icon.clone()));
-                            ui.close_menu();
-                        }
-                    });
+                        },
+                    );
                     if ui
-                        .add(egui::Button::new(RichText::new("\u{2715}").size(10.0).color(theme::TEXT_DIM)).frame(false))
+                        .add(
+                            egui::Button::new(
+                                RichText::new("\u{2715}").size(10.0).color(theme::TEXT_DIM),
+                            )
+                            .frame(false),
+                        )
                         .on_hover_text("Remove trait (existing tags on assets are kept)")
                         .clicked()
                     {
@@ -12470,7 +12488,9 @@ fn inspector_pane(
             }
         } else if ui
             .add(egui::Button::new(
-                RichText::new("\u{2713} Confirm traits").size(10.0).color(theme::TEXT),
+                RichText::new("\u{2713} Confirm traits")
+                    .size(10.0)
+                    .color(theme::TEXT),
             ))
             .on_hover_text("Mark the traits reviewed and trusted")
             .clicked()

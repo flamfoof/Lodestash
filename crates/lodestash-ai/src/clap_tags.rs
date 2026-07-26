@@ -131,8 +131,14 @@ fn score_facets(
         // Softmax over the facet's candidates, scaled so the contrastive model's narrow cosine
         // band separates (see LOGIT_SCALE).
         let logit = |s: f32| s * LOGIT_SCALE;
-        let max = scores.iter().map(|(_, s)| logit(*s)).fold(f32::MIN, f32::max);
-        let exps: Vec<f32> = scores.iter().map(|(_, s)| (logit(*s) - max).exp()).collect();
+        let max = scores
+            .iter()
+            .map(|(_, s)| logit(*s))
+            .fold(f32::MIN, f32::max);
+        let exps: Vec<f32> = scores
+            .iter()
+            .map(|(_, s)| (logit(*s) - max).exp())
+            .collect();
         let sum: f32 = exps.iter().sum();
         if sum <= 0.0 {
             continue;

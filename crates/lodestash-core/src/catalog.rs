@@ -2763,9 +2763,11 @@ impl Catalog {
             )
             .map_err(|e| CoreError::Catalog(format!("upsert_trait: {e}")))?;
         self.conn
-            .query_row("SELECT id FROM tag WHERE norm_name = ?1", params![norm], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT id FROM tag WHERE norm_name = ?1",
+                params![norm],
+                |r| r.get(0),
+            )
             .map_err(|e| CoreError::Catalog(format!("upsert_trait id: {e}")))
     }
 
@@ -4321,12 +4323,21 @@ mod tests {
 
         // Promote the in-use tag to a teaching trait scoped to models.
         let tid = c
-            .upsert_trait("material", "metal", Some("model_3d"), Some("shiny hard surface"), true)
+            .upsert_trait(
+                "material",
+                "metal",
+                Some("model_3d"),
+                Some("shiny hard surface"),
+                true,
+            )
             .unwrap();
         let vocab = c.list_vocabulary().unwrap();
         let row = vocab.iter().find(|v| v.id == tid).unwrap();
         assert!(row.is_trait && row.teach);
-        assert_eq!(row.usage_count, 1, "promotion keeps the existing assignment");
+        assert_eq!(
+            row.usage_count, 1,
+            "promotion keeps the existing assignment"
+        );
         assert_eq!(row.ai_count, 1);
 
         // Teaching vocabulary now carries it, scope + usage note intact.

@@ -129,7 +129,11 @@ impl OllamaTagger {
 
 /// The facet instruction. The facet list is injected from [`MODEL_FACETS`] so the prompt cannot
 /// drift from what `validate` will accept.
-pub(crate) fn build_prompt(input: &TagInput<'_>, caption: Option<&str>, teach: &[TeachTrait]) -> String {
+pub(crate) fn build_prompt(
+    input: &TagInput<'_>,
+    caption: Option<&str>,
+    teach: &[TeachTrait],
+) -> String {
     let facets = MODEL_FACETS.join(", ");
     let evidence = match caption {
         Some(c) => format!(
