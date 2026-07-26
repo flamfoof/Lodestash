@@ -969,6 +969,9 @@ pub struct LodestashApp {
     /// Job-tray row per in-flight scratch pull, so a slow pull from a huge pack shows a % bar + ✕
     /// (the pull inflates the gzip up to the payload's offset — minutes on a 20 GB pack).
     scratch_jobs: std::collections::HashMap<i64, u64>,
+    /// Pack names auto-extraction was already kicked off for this session (over the size limit →
+    /// fully extract for fast access, once — the banner would otherwise re-queue every frame).
+    auto_extracted: std::collections::HashSet<String>,
     scratch_rx: Receiver<(i64, Result<PathBuf, String>)>,
     scratch_tx: Sender<(i64, Result<PathBuf, String>)>,
     /// A pack the user pressed **Open →** on: once its in-pack assets land in the grid (via the
@@ -1197,6 +1200,7 @@ impl LodestashApp {
             in_pack_scratch: std::collections::HashMap::new(),
             scratch_pulling: std::collections::HashSet::new(),
             scratch_jobs: std::collections::HashMap::new(),
+            auto_extracted: std::collections::HashSet::new(),
             scratch_rx,
             scratch_tx,
             pending_pack_browse: None,
@@ -5417,25 +5421,60 @@ impl LodestashApp {
         // Removing drops the facet, pulls the pack's assets out of the grid, and resets the
         // filter to All if that library was the active one (FEATURES.md §5.5). The catalog
         // rows stay — this is a library membership change, not a delete.
-        if let Some(name) = unpinned_name {
+        if let Some(name) = &unpinned_name {
             self.entries
                 .retain(|e| e.package.as_deref() != Some(name.as_str()));
-            if matches!(&self.source_filter, Some(LibraryFilter::Package(p)) if *p == name) {
+            if matches!(&self.source_filter, Some(LibraryFilter::Package(p)) if p == name) {
                 self.source_filter = None;
             }
             self.selected_cache_idx = None;
             self.selected.clear();
             self.cache_dirty = true;
+            // Drop any in-memory preview scratch for this pack and let its auto-extract re-arm.
+            self.auto_extracted.remove(name);
         }
         let Some(db_path) = catalog_db_path() else {
             return;
         };
+        // On removal, reclaim the pack's extracted bytes: un-materialize its rows and delete the
+        // workspace files no other live asset shares (M14 §7). Same detached single-writer connection
+        // the pin flip already uses (busy_timeout covers any overlap with the persist thread).
+        let reclaim = !pinned;
+        let workspace_dir = self.workspace_dir.clone();
         std::thread::spawn(move || {
-            if let Err(err) = Catalog::open(&db_path).and_then(|c| {
+            let res = Catalog::open(&db_path).and_then(|mut c| {
                 c.set_package_pinned(package_id, pinned)?;
-                Ok(())
-            }) {
-                tracing::warn!(%err, package_id, "package pin write failed");
+                let files = if reclaim {
+                    c.unmaterialize_package(package_id)?
+                } else {
+                    Vec::new()
+                };
+                Ok(files)
+            });
+            match res {
+                Ok(files) => {
+                    if let Some(ws) = workspace_dir {
+                        let mut freed = 0u64;
+                        for rel in &files {
+                            let path = ws.join(rel);
+                            freed += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                            let _ = std::fs::remove_file(&path);
+                            // The content-addressed <hash>/ dir is now likely empty; tidy it.
+                            if let Some(parent) = path.parent() {
+                                let _ = std::fs::remove_dir(parent);
+                            }
+                        }
+                        if freed > 0 {
+                            tracing::info!(
+                                package_id,
+                                files = files.len(),
+                                freed,
+                                "reclaimed workspace on unpin"
+                            );
+                        }
+                    }
+                }
+                Err(err) => tracing::warn!(%err, package_id, "package pin write / reclaim failed"),
             }
         });
     }
@@ -5709,8 +5748,12 @@ impl LodestashApp {
         );
     }
 
-    /// A banner in the pack browser offering the one-time full extraction (above), shown only while
-    /// the browsed pack still has in-pack assets and is big enough that per-file pulls hurt.
+    /// A banner in the pack browser for a big in-pack pack. A pack **over the size limit**
+    /// (`rapid_index_max_gb`) is fully extracted **automatically** for fast access — the user's
+    /// preference: per-file gzip pulls on a 20 GB archive are minutes each, so one streaming
+    /// extraction is the right call. A merely-big pack (over `IN_PACK_THUMB_MAX_BYTES`, under the
+    /// limit) gets a manual **Extract** button instead. Extraction is cancellable (job-tray ✕) and
+    /// idempotent.
     fn pack_extract_banner(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let Some(LibraryFilter::Package(name)) = self.source_filter.clone() else {
             return;
@@ -5729,6 +5772,21 @@ impl LodestashApp {
             return; // a small pack previews fine in place; no need to nudge extraction
         }
         let busy = self.pending_packages.iter().any(|p| p.extracting);
+        let over_limit = size as f64 > self.config.rapid_index_max_gb as f64 * (1u64 << 30) as f64;
+
+        // Over the limit → auto-extract once for fast access (guard set prevents re-queuing each
+        // frame; extraction is cancellable + idempotent, so a rare double-fire is harmless).
+        if over_limit && !busy && self.auto_extracted.insert(name.clone()) {
+            self.jobs.toast(
+                format!(
+                    "{name} is {} \u{2014} extracting for fast access\u{2026}",
+                    format_bytes(size)
+                ),
+                Intent::Info,
+            );
+            self.extract_active_pack(ctx);
+        }
+
         let mut go = false;
         egui::Frame::none()
             .fill(theme::ARCANE.linear_multiply(0.08))
@@ -5737,37 +5795,39 @@ impl LodestashApp {
             .inner_margin(egui::Margin::symmetric(10.0, 6.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "\u{26A1} This {} pack is browsed in place \u{2014} each preview pulls its \
-                             track from the archive (slow).",
+                    let msg = if busy {
+                        format!(
+                            "\u{26A1} Extracting {} to disk for fast access\u{2026}",
                             format_bytes(size)
-                        ))
-                        .color(theme::TEXT_MUTED)
-                        .size(12.0),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let label = if busy {
-                            "Extracting\u{2026}"
-                        } else {
-                            "Extract for instant previews"
-                        };
-                        if ui
-                            .add_enabled(
-                                !busy,
-                                egui::Button::new(
-                                    RichText::new(label).color(theme::ARCANE).size(12.0),
-                                ),
-                            )
-                            .on_hover_text(
-                                "Unpack the whole pack once to disk; every track then previews \
-                                 instantly",
-                            )
-                            .clicked()
-                        {
-                            go = true;
-                        }
-                    });
+                        )
+                    } else {
+                        format!(
+                            "\u{26A1} This {} pack is browsed in place \u{2014} each preview pulls \
+                             its file from the archive (slow).",
+                            format_bytes(size)
+                        )
+                    };
+                    ui.label(RichText::new(msg).color(theme::TEXT_MUTED).size(12.0));
+                    // Manual button only for the merely-big band (an over-limit pack auto-extracts);
+                    // it also serves as a retry if an auto-extraction was cancelled.
+                    if !busy {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(egui::Button::new(
+                                    RichText::new("Extract for instant previews")
+                                        .color(theme::ARCANE)
+                                        .size(12.0),
+                                ))
+                                .on_hover_text(
+                                    "Unpack the whole pack once to disk; every file then previews \
+                                     instantly",
+                                )
+                                .clicked()
+                            {
+                                go = true;
+                            }
+                        });
+                    }
                 });
             });
         ui.add_space(6.0);

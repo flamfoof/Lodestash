@@ -235,7 +235,16 @@ built.
   Preview pulls now land in the **managed workspace** (content-addressed, LRU-capped, dedups with a
   later full extract) rather than unbounded OS-temp. **ponytail:** cross-session reuse of a single
   previewed track still needs its row materialized on the persist thread (single-writer) — deferred;
-  the extract button is the full fast path.
+  the extract button is the full fast path. **A pack over `rapid_index_max_gb` auto-extracts** once on
+  browse (guarded by `auto_extracted`, cancellable) — the user's call that a 20 GB archive should just
+  be unpacked for fast access rather than pulled per file; the band between `IN_PACK_THUMB_MAX_BYTES`
+  and the limit keeps the manual button.
+- **Removing a pack from Library reclaims its extracted bytes** (`unmaterialize_package`, M14 §7).
+  Unpin reverts the pack's materialized rows to in-pack (clears `workspace_rel`, keeps the
+  `package_entry_id` locator so bytes stay resolvable from the archive) and deletes the workspace files
+  **no other live asset shares** (content-addressed dedup — a payload two packs both extracted
+  survives). Runs on the same detached connection the pin flip already uses. A 21.9 GB auto-extract is
+  therefore not a permanent commit — removing the pack frees it.
 
 **Identification is manual by default** (`config.auto_identify`, off; Settings ▸ AI · IDENTIFY toggle,
 [`AI-PIPELINE.md`](AI-PIPELINE.md) §2). The SigLIP/CLAP embedding drain auto-ran on every hydrate, and

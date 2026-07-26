@@ -823,6 +823,44 @@ impl Catalog {
         Ok(matched)
     }
 
+    /// Un-materialize a package (M14 §7, "unpin/evict clears `workspace_rel`"): revert its
+    /// materialized in-pack rows to in-pack (clear `workspace_rel`; the `package_entry_id` locator
+    /// stays, so bytes are still resolvable from the archive) and **return the workspace files that
+    /// are safe to delete** — those no *other* live asset shares (the workspace is content-addressed,
+    /// so a file two packs both extracted must survive). Called when a pack leaves the Library so its
+    /// extracted bytes (potentially tens of GB) are reclaimed without stranding a shared payload.
+    pub fn unmaterialize_package(&mut self, package_id: i64) -> Result<Vec<String>> {
+        let files: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT DISTINCT af.workspace_rel
+                     FROM asset a JOIN asset_file af ON af.asset_id = a.id
+                     WHERE a.package_id = ?1 AND af.package_entry_id IS NOT NULL
+                       AND af.workspace_rel IS NOT NULL
+                       AND NOT EXISTS (
+                         SELECT 1 FROM asset_file af2 JOIN asset a2 ON a2.id = af2.asset_id
+                         WHERE af2.workspace_rel = af.workspace_rel
+                           AND af2.id != af.id AND a2.deleted_at IS NULL)",
+                )
+                .map_err(|e| CoreError::Catalog(format!("unmaterialize query prep: {e}")))?;
+            let rows = stmt
+                .query_map(params![package_id], |r| r.get::<_, String>(0))
+                .map_err(|e| CoreError::Catalog(format!("unmaterialize query: {e}")))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| CoreError::Catalog(format!("unmaterialize row: {e}")))?
+        };
+        self.conn
+            .execute(
+                "UPDATE asset_file SET workspace_rel = NULL
+                 WHERE package_entry_id IS NOT NULL
+                   AND asset_id IN (SELECT id FROM asset WHERE package_id = ?1)",
+                params![package_id],
+            )
+            .map_err(|e| CoreError::Catalog(format!("unmaterialize update: {e}")))?;
+        Ok(files)
+    }
+
     /// The read path for the grid: every asset under a source as
     /// `(rel_path of its primary file, asset id, status code, trashed)`. Trashed
     /// (soft-deleted) rows are included with the flag set so the UI can both hide
@@ -3773,6 +3811,85 @@ mod tests {
             skipped.inserted, 0,
             "an extracted pack does not grow in-pack duplicates"
         );
+    }
+
+    #[test]
+    fn unmaterialize_returns_only_unshared_files_and_reverts_rows() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let sid = c
+            .upsert_import_source("s", "G:/s", "asset_store_library")
+            .expect("sid");
+        let p1 = c
+            .upsert_package(sid, "G:/s/P1.unitypackage", "P1", None, None)
+            .expect("p1");
+        let p2 = c
+            .upsert_package(sid, "G:/s/P2.unitypackage", "P2", None, None)
+            .expect("p2");
+        let entry = |guid: &str, path: &str| PackageEntryRecord {
+            guid: guid.into(),
+            pathname: Some(path.into()),
+            tar_offset: Some(0),
+            size_bytes: Some(1),
+        };
+        let tex = |n: &str| InPackClass {
+            name: n.into(),
+            media_type: "texture".into(),
+        };
+        // P1 has A + B; P2 has A too (same content → same workspace_rel).
+        c.record_package_entries(
+            p1,
+            &[entry("g_a", "Assets/A.png"), entry("g_b", "Assets/B.png")],
+        )
+        .unwrap();
+        c.record_package_entries(p2, &[entry("g_c", "Assets/A.png")])
+            .unwrap();
+        c.mint_in_pack_assets(
+            p1,
+            &HashMap::from([("g_a".into(), tex("A")), ("g_b".into(), tex("B"))]),
+        )
+        .unwrap();
+        c.mint_in_pack_assets(p2, &HashMap::from([("g_c".into(), tex("A"))]))
+            .unwrap();
+        // Materialize: A.png in both packs points at the *same* content-addressed file.
+        c.materialize_in_pack_assets(
+            p1,
+            &[
+                ("Assets/A.png".into(), "hashA/A.png".into()),
+                ("Assets/B.png".into(), "hashB/B.png".into()),
+            ],
+        )
+        .unwrap();
+        c.materialize_in_pack_assets(p2, &[("Assets/A.png".into(), "hashA/A.png".into())])
+            .unwrap();
+
+        let freed = c.unmaterialize_package(p1).expect("unmaterialize");
+        assert_eq!(
+            freed,
+            vec!["hashB/B.png".to_string()],
+            "only B is deletable — A is shared with P2 and must survive"
+        );
+        // P1's rows reverted to in-pack (workspace_rel NULL, locator kept); P2 untouched.
+        let p1_extracted: i64 = c
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset a JOIN asset_file af ON af.asset_id=a.id
+                 WHERE a.package_id=?1 AND af.workspace_rel IS NOT NULL",
+                params![p1],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(p1_extracted, 0, "P1 fully un-materialized");
+        let p2_extracted: i64 = c
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset a JOIN asset_file af ON af.asset_id=a.id
+                 WHERE a.package_id=?1 AND af.workspace_rel IS NOT NULL",
+                params![p2],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(p2_extracted, 1, "P2's materialized row is untouched");
     }
 
     #[test]
