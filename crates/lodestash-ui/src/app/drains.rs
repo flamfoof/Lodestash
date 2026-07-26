@@ -199,6 +199,65 @@ pub(super) fn drain_audio_embeddings(
     }
 }
 
+/// Tag dirty **audio** assets by CLAP zero-shot (AI-PIPELINE §6/§110): decode → log-mel → score
+/// against the label vocabulary in the same joint space the embeddings use. Its own `tags_dirty`
+/// queue, run before the VLM tag drain (which can't see audio anyway), so an audio re-tag pass works
+/// without a re-embed. Same forward-progress rule: a clip that yields nothing still clears its flag
+/// (`set_tags` with an empty set), so it is never re-queued forever.
+pub(super) fn drain_audio_tags(
+    cat: &mut Catalog,
+    zero_shot: &lodestash_ai::clap_tags::AudioZeroShot,
+    workspace_dir: Option<&std::path::Path>,
+    progress: &crate::jobs::JobProgress,
+) {
+    use std::sync::atomic::Ordering;
+    const BATCH: usize = 32;
+    let model_id = zero_shot.model_id().to_string();
+    loop {
+        if progress.is_cancelled() {
+            return;
+        }
+        let jobs = match cat.audio_assets_needing_tags(BATCH) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(%e, "audio tag queue query failed; retries next run");
+                break;
+            }
+        };
+        if jobs.is_empty() {
+            break;
+        }
+        let n = jobs.len();
+        for job in jobs {
+            if progress.is_cancelled() {
+                return;
+            }
+            let resolved = resolve_job_path(&job, workspace_dir);
+            let path = resolved.as_ref().map(|(p, _)| p.clone());
+            let tags = path
+                .as_deref()
+                .and_then(|p| {
+                    decode_audio_48k_mono(p)
+                        .map_err(|e| tracing::warn!(%e, "audio decode failed"))
+                        .ok()
+                })
+                .map(|samples| {
+                    let (frames, mel) = lodestash_ingest::melspec::log_mel_spectrogram(&samples);
+                    zero_shot.tag(&mel, frames)
+                })
+                .unwrap_or_default();
+            if let Err(e) = cat.set_tags(job.asset_id, "ai", Some(&model_id), &tags) {
+                tracing::warn!(%e, "audio set_tags failed; stopping audio tag drain");
+                return;
+            }
+            progress.done.fetch_add(1, Ordering::Relaxed);
+        }
+        if n < BATCH {
+            break;
+        }
+    }
+}
+
 /// Embed the dirty **visual** assets (SigLIP vision tower) in batches over the persist thread's
 /// own sole-writer connection: 2D files decode directly, 3D models are multiview-rendered first.
 /// Failures store a zero vector — which cosine-scores 0, so it never matches — solely to clear

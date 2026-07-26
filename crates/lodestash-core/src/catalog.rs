@@ -2090,6 +2090,50 @@ impl Catalog {
     /// Dirty **audio** assets for the CLAP drain. Same shape and path rules as
     /// [`Self::visual_assets_needing_embedding`]; separate because audio is encoded by a
     /// different model into a different vector space.
+    /// Audio assets awaiting **tags** (`tags_dirty`), for the CLAP zero-shot tagger (AI-PIPELINE §6,
+    /// §110). Its own queue rather than a filter over `assets_needing_tags`, so the audio pass loops
+    /// to completion instead of spinning on a batch of non-audio rows it can't clear.
+    pub fn audio_assets_needing_tags(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT a.id,
+                        CASE WHEN af.workspace_rel IS NULL AND af.package_entry_id IS NULL
+                             THEN s.root_path || '/' || af.rel_path END,
+                        af.workspace_rel, a.media_type_id, a.source_id, mt.code,
+                        pk.package_path, pe.tar_offset, pe.size_bytes, af.ext
+                 FROM asset a
+                 JOIN media_type mt   ON mt.id = a.media_type_id
+                 JOIN import_source s ON s.id = a.source_id
+                 JOIN asset_file af   ON af.id = a.primary_file_id
+                 LEFT JOIN package_entry pe ON pe.id = af.package_entry_id
+                 LEFT JOIN package pk       ON pk.id = pe.package_id
+                 WHERE a.tags_dirty = 1 AND a.deleted_at IS NULL
+                   AND af.missing = 0
+                   AND mt.code = 'audio'
+                 ORDER BY a.id LIMIT ?1",
+            )
+            .map_err(|e| CoreError::Catalog(format!("audio tag queue prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(VisualEmbedJob {
+                    asset_id: r.get(0)?,
+                    disk_path: r.get(1)?,
+                    workspace_rel: r.get(2)?,
+                    media_type_id: r.get(3)?,
+                    source_id: r.get(4)?,
+                    media_code: r.get(5)?,
+                    pack_path: r.get(6)?,
+                    pack_offset: r.get(7)?,
+                    pack_size: r.get(8)?,
+                    ext: r.get(9)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("audio tag queue query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("audio tag queue row: {e}")))
+    }
+
     pub fn audio_assets_needing_embedding(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
         let mut stmt = self
             .conn

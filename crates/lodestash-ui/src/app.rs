@@ -2127,6 +2127,16 @@ impl LodestashApp {
                     }
                     if let Some(emb) = &audio_embedder {
                         drain_audio_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
+                        // Audio zero-shot tags run before the VLM drain (which can't tag audio),
+                        // so the audio queue is cleared with real tags, not empty.
+                        if let Some(zs) = lodestash_ai::clap_tags::AudioZeroShot::new(emb.clone()) {
+                            drain_audio_tags(
+                                &mut cat,
+                                &zs,
+                                workspace_dir.as_deref(),
+                                &job_progress,
+                            );
+                        }
                     }
                     drain_tags(
                         &mut cat,
