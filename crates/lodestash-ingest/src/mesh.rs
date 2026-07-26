@@ -318,6 +318,239 @@ pub fn load_any(
     }
 }
 
+/// Load `path` through a **normalized-geometry cache** (TECH-STACK §7, parse-once): parse it once
+/// (ufbx/three-d-asset), write the flattened world-space geometry to `cache_dir/mesh/<key>.msh`, and
+/// on every later call read that back instead of re-parsing. Parsing is the expensive part of a 3D
+/// thumbnail/metric/embedding, and metrics (every scan), thumbnails (on browse) and embeddings each
+/// parse the **same** file — so the metrics drain warms the cache and browse-time thumbnails hit it,
+/// which is what removes the browse spike. **Textures are not cached** (thumbnails/embeddings render
+/// untextured base-colour anyway); the textured Quick Look viewport keeps its own uncached path.
+///
+/// The cache is disposable: any read error or format mismatch silently falls back to a fresh parse,
+/// so a stale/corrupt entry can never wedge a load. Keyed by `(path, size, mtime)` so an edited file
+/// re-parses.
+pub fn load_cached(path: &Path, cache_dir: &Path) -> Result<Vec<MeshData>, String> {
+    let cache_path = cache_dir
+        .join("mesh")
+        .join(format!("{}.msh", mesh_cache_key(path)));
+    if let Ok(bytes) = std::fs::read(&cache_path) {
+        if let Some(meshes) = decode_meshes(&bytes) {
+            return Ok(meshes);
+        }
+    }
+    let meshes = load_any(path, &BTreeMap::new())?;
+    if let Some(dir) = cache_path.parent() {
+        if std::fs::create_dir_all(dir).is_ok() {
+            let bytes = encode_meshes(&meshes);
+            // Write to a temp then rename so a concurrent reader can't see a half-written file.
+            let tmp = cache_path.with_extension("msh.part");
+            if std::fs::write(&tmp, &bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, &cache_path);
+            }
+        }
+    }
+    Ok(meshes)
+}
+
+fn mesh_cache_key(path: &Path) -> String {
+    let (size, mtime) = std::fs::metadata(path)
+        .map(|m| {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            (m.len(), mtime)
+        })
+        .unwrap_or((0, 0));
+    let mut h = blake3::Hasher::new();
+    h.update(path.to_string_lossy().as_bytes());
+    h.update(&size.to_le_bytes());
+    h.update(&mtime.to_le_bytes());
+    h.finalize().to_hex()[..32].to_string()
+}
+
+const MESH_CACHE_MAGIC: &[u8; 4] = b"LSM1";
+
+/// Serialize the flattened geometry (no albedo — see [`load_cached`]). Flat `f32`/`u32` arrays, so
+/// read-back is a bounded parse rather than a full mesh re-parse.
+fn encode_meshes(meshes: &[MeshData]) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(MESH_CACHE_MAGIC);
+    b.extend_from_slice(&(meshes.len() as u32).to_le_bytes());
+    let put_vec3 = |b: &mut Vec<u8>, v: &[[f32; 3]]| {
+        b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        for p in v {
+            for f in p {
+                b.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+    };
+    for m in meshes {
+        b.extend_from_slice(&(m.name.len() as u32).to_le_bytes());
+        b.extend_from_slice(m.name.as_bytes());
+        put_vec3(&mut b, &m.positions);
+        match &m.normals {
+            Some(n) => {
+                b.push(1);
+                put_vec3(&mut b, n);
+            }
+            None => b.push(0),
+        }
+        match &m.uvs {
+            Some(u) => {
+                b.push(1);
+                b.extend_from_slice(&(u.len() as u32).to_le_bytes());
+                for uv in u {
+                    for f in uv {
+                        b.extend_from_slice(&f.to_le_bytes());
+                    }
+                }
+            }
+            None => b.push(0),
+        }
+        b.extend_from_slice(&(m.indices.len() as u32).to_le_bytes());
+        for i in &m.indices {
+            b.extend_from_slice(&i.to_le_bytes());
+        }
+        b.extend_from_slice(&m.base_color);
+    }
+    b
+}
+
+/// Bounds-checked reader: returns `None` on any short/corrupt read, so the caller re-parses.
+struct Cur<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+impl<'a> Cur<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let s = self.b.get(self.i..self.i + n)?;
+        self.i += n;
+        Some(s)
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn f32(&mut self) -> Option<f32> {
+        Some(f32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn vec3(&mut self) -> Option<Vec<[f32; 3]>> {
+        let n = self.u32()? as usize;
+        // Guard a corrupt length from a huge speculative allocation.
+        let mut v = Vec::with_capacity(n.min(1 << 20));
+        for _ in 0..n {
+            v.push([self.f32()?, self.f32()?, self.f32()?]);
+        }
+        Some(v)
+    }
+}
+
+fn decode_meshes(bytes: &[u8]) -> Option<Vec<MeshData>> {
+    let mut c = Cur { b: bytes, i: 0 };
+    if c.take(4)? != MESH_CACHE_MAGIC {
+        return None;
+    }
+    let mesh_count = c.u32()? as usize;
+    let mut out = Vec::with_capacity(mesh_count.min(1 << 16));
+    for _ in 0..mesh_count {
+        let name_len = c.u32()? as usize;
+        let name = std::str::from_utf8(c.take(name_len)?).ok()?.to_string();
+        let positions = c.vec3()?;
+        let normals = if c.take(1)?[0] == 1 {
+            Some(c.vec3()?)
+        } else {
+            None
+        };
+        let uvs = if c.take(1)?[0] == 1 {
+            let n = c.u32()? as usize;
+            let mut v = Vec::with_capacity(n.min(1 << 20));
+            for _ in 0..n {
+                v.push([c.f32()?, c.f32()?]);
+            }
+            Some(v)
+        } else {
+            None
+        };
+        let idx_count = c.u32()? as usize;
+        let mut indices = Vec::with_capacity(idx_count.min(1 << 22));
+        for _ in 0..idx_count {
+            indices.push(c.u32()?);
+        }
+        let base_color: [u8; 4] = c.take(4)?.try_into().ok()?;
+        out.push(MeshData {
+            name,
+            positions,
+            normals,
+            uvs,
+            indices,
+            base_color,
+            albedo: None,
+        });
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod mesh_cache_tests {
+    use super::*;
+
+    fn mesh(name: &str, tris: usize) -> MeshData {
+        MeshData {
+            name: name.into(),
+            positions: vec![[1.0, 2.0, 3.0]; tris],
+            normals: Some(vec![[0.0, 1.0, 0.0]; tris]),
+            uvs: Some(vec![[0.25, 0.75]; tris]),
+            indices: (0..tris as u32 * 3).collect(),
+            base_color: [10, 20, 30, 40],
+            albedo: None,
+        }
+    }
+
+    #[test]
+    fn encode_decode_round_trips_geometry() {
+        let m = mesh("cube", 2);
+        let bytes = encode_meshes(std::slice::from_ref(&m));
+        let back = decode_meshes(&bytes).expect("decode");
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].name, "cube");
+        assert_eq!(back[0].positions, m.positions);
+        assert_eq!(back[0].normals, m.normals);
+        assert_eq!(back[0].uvs, m.uvs);
+        assert_eq!(back[0].indices, m.indices);
+        assert_eq!(back[0].base_color, m.base_color);
+        assert!(back[0].albedo.is_none());
+        // A truncated / bad buffer decodes to None (caller re-parses) rather than panicking.
+        assert!(decode_meshes(&bytes[..bytes.len() - 3]).is_none());
+        assert!(decode_meshes(b"nope").is_none());
+    }
+
+    #[test]
+    fn load_cached_serves_the_cache_over_reparsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let obj = dir.path().join("tri.obj");
+        std::fs::write(&obj, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").unwrap();
+        let cache = dir.path().join("cache");
+
+        let first = load_cached(&obj, &cache).expect("parse + cache");
+        assert!(!first.is_empty(), "OBJ parsed to geometry");
+        let key = mesh_cache_key(&obj);
+        let cache_file = cache.join("mesh").join(format!("{key}.msh"));
+        assert!(cache_file.exists(), "cache written on first load");
+
+        // Overwrite the cache with a distinct 2-triangle mesh (source untouched, so the key is
+        // stable). A second load must return *that* — proving it read the cache, not re-parsed.
+        std::fs::write(&cache_file, encode_meshes(&[mesh("fake", 2)])).unwrap();
+        let second = load_cached(&obj, &cache).expect("cache hit");
+        assert_eq!(
+            second.iter().map(|m| m.indices.len()).sum::<usize>(),
+            6,
+            "served the cached mesh, not a fresh parse of the 1-triangle OBJ"
+        );
+    }
+}
+
 #[cfg(test)]
 mod gltf_tests {
     use super::*;

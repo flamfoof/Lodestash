@@ -11,10 +11,10 @@ use lodestash_core::catalog::AssetMetrics;
 
 /// Extract whatever facets `media_code` implies. Unknown/unsupported types yield an empty set,
 /// which the caller still stores — clearing the dirty flag is the forward-progress rule (§14).
-pub fn extract(path: &Path, media_code: &str) -> AssetMetrics {
+pub fn extract(path: &Path, media_code: &str, cache_dir: Option<&Path>) -> AssetMetrics {
     match media_code {
         "model_3d" => AssetMetrics {
-            tri_count: triangle_count(path),
+            tri_count: triangle_count(path, cache_dir),
             ..Default::default()
         },
         "image" | "texture" | "sprite" => {
@@ -33,9 +33,15 @@ pub fn extract(path: &Path, media_code: &str) -> AssetMetrics {
 }
 
 /// Triangles across every mesh in the file. Needs a full parse — the same one the thumbnail and
-/// multiview renders do, and there is no cheaper header answer for FBX/OBJ/glTF.
-pub fn triangle_count(path: &Path) -> Option<i64> {
-    let meshes = crate::mesh::load_any(path, &std::collections::BTreeMap::new()).ok()?;
+/// multiview renders do, and there is no cheaper header answer for FBX/OBJ/glTF. Given a `cache_dir`
+/// it parses through the shared parse-once mesh cache (`mesh::load_cached`), so this scan-time count
+/// **warms** the cache that browse-time thumbnails then read — the parse happens once, not per
+/// consumer (TECH-STACK §7).
+pub fn triangle_count(path: &Path, cache_dir: Option<&Path>) -> Option<i64> {
+    let meshes = match cache_dir {
+        Some(dir) => crate::mesh::load_cached(path, dir).ok()?,
+        None => crate::mesh::load_any(path, &std::collections::BTreeMap::new()).ok()?,
+    };
     let tris: usize = meshes.iter().map(|m| m.indices.len() / 3).sum();
     (tris > 0).then_some(tris as i64)
 }
@@ -66,7 +72,7 @@ mod tests {
         .save(&p)
         .unwrap();
 
-        let m = extract(&p, "texture");
+        let m = extract(&p, "texture", None);
         assert_eq!((m.width_px, m.height_px), (Some(40), Some(10)));
         assert_eq!(m.tri_count, None, "a texture has no triangles");
     }
@@ -77,7 +83,7 @@ mod tests {
         let p = dir.path().join("tri.obj");
         // Two triangles sharing an edge (a quad, triangulated by hand).
         std::fs::write(&p, "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3\nf 1 3 4\n").unwrap();
-        assert_eq!(extract(&p, "model_3d").tri_count, Some(2));
+        assert_eq!(extract(&p, "model_3d", None).tri_count, Some(2));
     }
 
     #[test]
@@ -85,7 +91,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("broken.png");
         std::fs::write(&p, b"not a png").unwrap();
-        assert_eq!(extract(&p, "image"), AssetMetrics::default());
-        assert_eq!(extract(&p, "audio"), AssetMetrics::default());
+        assert_eq!(extract(&p, "image", None), AssetMetrics::default());
+        assert_eq!(extract(&p, "audio", None), AssetMetrics::default());
     }
 }

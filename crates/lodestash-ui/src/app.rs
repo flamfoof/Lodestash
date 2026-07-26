@@ -2128,6 +2128,7 @@ impl LodestashApp {
             .then(|| self.audio_embedder.clone())
             .flatten();
         let workspace_dir = self.workspace_dir.clone();
+        let cache_dir = self.thumb_cache_dir.clone();
         let generation = self.scan_generation;
         let tx = self.catalog_tx.clone();
         let roots = self.scan_root_names();
@@ -2140,6 +2141,7 @@ impl LodestashApp {
                     embedder,
                     audio_embedder,
                     workspace_dir.as_deref(),
+                    cache_dir.as_deref(),
                     &roots,
                 ),
                 Err(e) => {
@@ -2196,6 +2198,7 @@ impl LodestashApp {
         let embedder = self.ai_embedder.clone();
         let audio_embedder = self.audio_embedder.clone();
         let workspace_dir = self.workspace_dir.clone();
+        let cache_dir = self.thumb_cache_dir.clone();
         let roots = self.scan_root_names();
         self.catalog_persisting = true;
         std::thread::spawn(move || {
@@ -2222,6 +2225,7 @@ impl LodestashApp {
                     embedder,
                     audio_embedder,
                     workspace_dir.as_deref(),
+                    cache_dir.as_deref(),
                     &roots,
                 );
                 // Second message: the drain promoted rows, so the meter and STATUS facet
@@ -2297,6 +2301,7 @@ impl LodestashApp {
         let embedder = self.ai_embedder.clone();
         let audio_embedder = self.audio_embedder.clone();
         let workspace_dir = self.workspace_dir.clone();
+        let cache_dir = self.thumb_cache_dir.clone();
         let roots = job.all_roots.clone();
         self.catalog_persisting = true;
         std::thread::spawn(move || {
@@ -2321,6 +2326,7 @@ impl LodestashApp {
                     embedder,
                     audio_embedder,
                     workspace_dir.as_deref(),
+                    cache_dir.as_deref(),
                     &roots,
                 );
                 if counts.is_some() {
@@ -11383,7 +11389,11 @@ fn drain_prefab_edges(cat: &mut Catalog) {
 /// `metrics_dirty` (DATA-MODEL §14). Runs on the persist thread's own connection like the embedding
 /// drains, but unconditionally — facets are plain measurements and must not depend on the AI stack
 /// being installed. A file we can't measure still gets its flag cleared (forward progress).
-fn drain_metrics(cat: &mut Catalog, workspace_dir: Option<&std::path::Path>) {
+fn drain_metrics(
+    cat: &mut Catalog,
+    workspace_dir: Option<&std::path::Path>,
+    cache_dir: Option<&std::path::Path>,
+) {
     const BATCH: usize = 64;
     let mut total = 0usize;
     loop {
@@ -11411,7 +11421,9 @@ fn drain_metrics(cat: &mut Catalog, workspace_dir: Option<&std::path::Path>) {
                             ..Default::default()
                         }
                     } else {
-                        lodestash_ingest::metrics::extract(p, &job.media_code)
+                        // Passing cache_dir warms the parse-once mesh cache (TECH-STACK §7): a 3D
+                        // asset's FBX parses here on scan, so its browse-time thumbnail skips it.
+                        lodestash_ingest::metrics::extract(p, &job.media_code, cache_dir)
                     }
                 })
                 .unwrap_or_default();
@@ -11451,9 +11463,10 @@ fn drain_promote_resync(
     embedder: Option<Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
     audio_embedder: Option<Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
     workspace_dir: Option<&std::path::Path>,
+    cache_dir: Option<&std::path::Path>,
     roots: &[(String, String)],
 ) -> (Option<StatusCounts>, AssetIdentityMaps) {
-    drain_metrics(cat, workspace_dir);
+    drain_metrics(cat, workspace_dir, cache_dir);
     drain_dependencies(cat, workspace_dir);
     if let Some(emb) = embedder {
         drain_image_embeddings(cat, emb.as_ref(), workspace_dir);

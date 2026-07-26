@@ -61,7 +61,7 @@ pub fn generate(
     // 3D models have no pixels to decode — render one hero view instead. Same cache key and
     // same output contract, so callers don't care which branch produced the PNG.
     let img = if is_model(source) {
-        render_model_thumb(source, params.width.max(params.height))?
+        render_model_thumb(source, params.width.max(params.height), cache_dir)?
     } else {
         crate::raster::decode(source)?
     };
@@ -201,9 +201,10 @@ fn is_model(path: &Path) -> bool {
 /// Render a 3D model to a single 3/4 hero view on a **transparent** background, so the grid card
 /// shows through. Reuses the same CPU rasteriser the embedding pipeline uses — no GPU context,
 /// so this runs happily on the thumbnail worker threads.
-fn render_model_thumb(source: &Path, size: u32) -> std::io::Result<DynamicImage> {
-    let meshes = crate::mesh::load_any(source, &std::collections::BTreeMap::new())
-        .map_err(std::io::Error::other)?;
+fn render_model_thumb(source: &Path, size: u32, cache_dir: &Path) -> std::io::Result<DynamicImage> {
+    // Parse-once cache: the metrics drain warms it on scan, so this browse-time render skips the
+    // FBX parse (the spike). Untextured, which is exactly what the thumbnail renders.
+    let meshes = crate::mesh::load_cached(source, cache_dir).map_err(std::io::Error::other)?;
     let views = crate::render3d::render_views_on(
         &meshes,
         size.max(1),
