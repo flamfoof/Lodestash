@@ -17,6 +17,26 @@ pub struct TagInput<'a> {
     pub image: Option<&'a image::RgbaImage>,
 }
 
+/// A user trait fed back into the identifier (AI-PIPELINE §6, UI-SPEC §9). A trait the user marked
+/// `teach=1` becomes a preferred candidate term in the tagger's prompt, scoped per modality so a
+/// model-only trait never steers an audio scan.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TeachTrait {
+    pub namespace: String,
+    pub value: String,
+    /// `media_type.code` the trait applies to; `None` = any modality.
+    pub scope: Option<String>,
+    /// When-to-apply guidance shown to the model (the trait's `usage_note`).
+    pub usage_note: Option<String>,
+}
+
+impl TeachTrait {
+    /// Whether this trait should be offered to a scan of `media_code` (matches its scope or is any).
+    pub fn applies_to(&self, media_code: &str) -> bool {
+        self.scope.as_deref().map_or(true, |s| s == media_code)
+    }
+}
+
 /// What a tagger produced: facet tags plus, when a model can write one, a short caption that
 /// becomes `asset.description` (AI-PIPELINE §6 "caption fills asset.description, FTS-searchable").
 #[derive(Debug, Default, Clone, PartialEq)]

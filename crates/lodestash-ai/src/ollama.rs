@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use lodestash_core::catalog::TagAssignment;
 
-use crate::tagger::{TagInput, TagResult, Tagger, MODEL_FACETS};
+use crate::tagger::{TagInput, TagResult, Tagger, TeachTrait, MODEL_FACETS};
 
 /// Default Ollama endpoint. Loopback only — a remote host would put asset previews on the network,
 /// which the local-first invariant forbids without an explicit opt-in path.
@@ -31,6 +31,8 @@ pub struct OllamaTagger {
     text_model: String,
     /// Captions the preview first, when the asset has one. `None` = name-only tagging.
     vision_model: Option<String>,
+    /// User traits (`teach=1`) offered to the model as preferred terms (AI-PIPELINE §6).
+    teach: Vec<TeachTrait>,
     timeout: Duration,
 }
 
@@ -41,6 +43,7 @@ impl OllamaTagger {
             host: DEFAULT_HOST.to_string(),
             text_model: text_model.into(),
             vision_model: None,
+            teach: Vec::new(),
             timeout: Duration::from_secs(180),
         }
     }
@@ -48,6 +51,13 @@ impl OllamaTagger {
     /// Add the captioning stage (e.g. `moondream`), used whenever an asset has a preview.
     pub fn with_vision(mut self, vision_model: impl Into<String>) -> Self {
         self.vision_model = Some(vision_model.into());
+        self
+    }
+
+    /// Feed the user's teaching traits into the facet prompt (AI-PIPELINE §6): future scans prefer
+    /// the user's own vocabulary. Scoped per modality at prompt-build time.
+    pub fn with_teaching(mut self, teach: Vec<TeachTrait>) -> Self {
+        self.teach = teach;
         self
     }
 
@@ -119,7 +129,7 @@ impl OllamaTagger {
 
 /// The facet instruction. The facet list is injected from [`MODEL_FACETS`] so the prompt cannot
 /// drift from what `validate` will accept.
-fn build_prompt(input: &TagInput<'_>, caption: Option<&str>) -> String {
+fn build_prompt(input: &TagInput<'_>, caption: Option<&str>, teach: &[TeachTrait]) -> String {
     let facets = MODEL_FACETS.join(", ");
     let evidence = match caption {
         Some(c) => format!(
@@ -136,8 +146,31 @@ fn build_prompt(input: &TagInput<'_>, caption: Option<&str>) -> String {
             input.name
         ),
     };
+    // Teaching block (AI-PIPELINE §6): the user's own vocabulary, scoped to this modality. Only the
+    // traits that apply, so a model-only trait never nudges an audio scan. Never a fabricated line:
+    // omitted entirely when the user has taught nothing relevant.
+    let teaching = {
+        let relevant: Vec<String> = teach
+            .iter()
+            .filter(|t| t.applies_to(input.media_code))
+            .map(|t| match &t.usage_note {
+                Some(note) if !note.trim().is_empty() => {
+                    format!("{}:{} (use when {})", t.namespace, t.value, note.trim())
+                }
+                _ => format!("{}:{}", t.namespace, t.value),
+            })
+            .collect();
+        if relevant.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nPrefer these of the user's own terms whenever they genuinely apply: {}.",
+                relevant.join("; ")
+            )
+        }
+    };
     format!(
-        "{evidence}\n\
+        "{evidence}{teaching}\n\
          Reply with JSON only: an object whose keys are facets and whose values are arrays of \
          short lowercase terms.\n\
          Allowed facets: {facets}.\n\
@@ -240,7 +273,7 @@ impl Tagger for OllamaTagger {
     }
 
     fn tag(&self, input: &TagInput<'_>, caption: Option<&str>) -> TagResult {
-        let prompt = build_prompt(input, caption);
+        let prompt = build_prompt(input, caption, &self.teach);
         let tags = match self.generate(&self.text_model, &prompt, None, true) {
             // Pixels make a stronger claim than a filename, and the confidence has to say so:
             // the UI hides low-confidence tags rather than deleting them.
@@ -355,7 +388,7 @@ mod tests {
             name: "asset_0192",
             image: None,
         };
-        let prompt = build_prompt(&input, Some("A rusty metal barrel with a dented lid."));
+        let prompt = build_prompt(&input, Some("A rusty metal barrel with a dented lid."), &[]);
         assert!(
             prompt.contains("rusty metal barrel"),
             "caption is passed through"
@@ -364,6 +397,45 @@ mod tests {
             prompt.contains("asset_0192"),
             "the name stays as corroborating evidence"
         );
+    }
+
+    #[test]
+    fn teaching_traits_enter_the_prompt_only_when_in_scope() {
+        let teach = vec![
+            TeachTrait {
+                namespace: "material".into(),
+                value: "bronze".into(),
+                scope: Some("model_3d".into()),
+                usage_note: Some("the greenish metal".into()),
+            },
+            TeachTrait {
+                namespace: "mood".into(),
+                value: "ominous".into(),
+                scope: None, // any modality
+                usage_note: None,
+            },
+            TeachTrait {
+                namespace: "audio".into(),
+                value: "sfx".into(),
+                scope: Some("audio".into()),
+                usage_note: None,
+            },
+        ];
+        let input = TagInput {
+            media_code: "model_3d",
+            name: "SM_Statue",
+            image: None,
+        };
+        let prompt = build_prompt(&input, None, &teach);
+        assert!(prompt.contains("material:bronze"), "in-scope trait offered");
+        assert!(prompt.contains("the greenish metal"), "usage note included");
+        assert!(prompt.contains("mood:ominous"), "any-scope trait offered");
+        assert!(
+            !prompt.contains("audio:sfx"),
+            "an audio-scoped trait never steers a 3D scan"
+        );
+        // No teaching at all ⇒ no teaching sentence.
+        assert!(!build_prompt(&input, None, &[]).contains("user's own terms"));
     }
 
     #[test]
@@ -392,7 +464,7 @@ mod tests {
             name: "SM_Env_Rock_01",
             image: None,
         };
-        let prompt = build_prompt(&input, None);
+        let prompt = build_prompt(&input, None, &[]);
         assert!(
             prompt.contains("SM_Env_Rock_01"),
             "text mode leans on the name"

@@ -1159,6 +1159,25 @@ pub struct TagAssignment {
     pub confidence: Option<f64>,
 }
 
+/// One row of the tagging **vocabulary** for the Traits screen (UI-SPEC §9, DATA-MODEL §20): a
+/// `tag` with its usage count and its Trait-Library promotion fields. `manual_count`/`ai_count`
+/// let the UI decide promote-eligibility (a manual tag, or an AI tag used ≥2×, that isn't a trait).
+#[derive(Debug, Clone)]
+pub struct VocabTrait {
+    pub id: i64,
+    pub namespace: String,
+    pub value: String,
+    pub usage_count: i64,
+    pub manual_count: i64,
+    pub ai_count: i64,
+    pub is_trait: bool,
+    pub scope: Option<String>,
+    pub usage_note: Option<String>,
+    pub teach: bool,
+    pub color: Option<String>,
+    pub icon: Option<String>,
+}
+
 impl TagAssignment {
     /// A tag with no confidence — manual or file-derived.
     pub fn exact(namespace: &str, value: &str) -> Self {
@@ -2610,6 +2629,139 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("tag usage query: {e}")))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| CoreError::Catalog(format!("tag usage row: {e}")))
+    }
+
+    /// The whole tagging vocabulary for the Traits screen (UI-SPEC §9). Every `tag` with its live
+    /// usage count and Trait-Library fields, traits first. A trait with no assignments yet (freshly
+    /// created) still lists, so the LEFT JOINs keep it; deleted assets never count.
+    pub fn list_vocabulary(&self) -> Result<Vec<VocabTrait>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT t.id, COALESCE(t.namespace, 'free'), t.name,
+                        COUNT(DISTINCT CASE WHEN a.id IS NOT NULL THEN at.asset_id END) AS n,
+                        COALESCE(SUM(CASE WHEN at.source='manual' AND a.id IS NOT NULL THEN 1 END), 0),
+                        COALESCE(SUM(CASE WHEN at.source='ai'     AND a.id IS NOT NULL THEN 1 END), 0),
+                        t.is_trait, t.scope, t.usage_note, t.teach, t.color, t.icon
+                   FROM tag t
+                   LEFT JOIN asset_tag at ON at.tag_id = t.id
+                   LEFT JOIN asset a      ON a.id = at.asset_id AND a.deleted_at IS NULL
+                  GROUP BY t.id
+                  ORDER BY t.is_trait DESC, n DESC, t.name",
+            )
+            .map_err(|e| CoreError::Catalog(format!("vocab prep: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(VocabTrait {
+                    id: r.get(0)?,
+                    namespace: r.get(1)?,
+                    value: r.get(2)?,
+                    usage_count: r.get(3)?,
+                    manual_count: r.get(4)?,
+                    ai_count: r.get(5)?,
+                    is_trait: r.get::<_, i64>(6)? != 0,
+                    scope: r.get(7)?,
+                    usage_note: r.get(8)?,
+                    teach: r.get::<_, i64>(9)? != 0,
+                    color: r.get(10)?,
+                    icon: r.get(11)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("vocab query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("vocab row: {e}")))
+    }
+
+    /// Teaching vocabulary fed to the identifier (AI-PIPELINE §6): the traits a user has marked
+    /// `teach=1`, as `(namespace, value, scope, usage_note)`. `scope` is a `media_type` code or
+    /// `None` for any modality; a paused trait (`teach=0`) is excluded but keeps its tags.
+    pub fn teaching_traits(&self) -> Result<Vec<(String, String, Option<String>, Option<String>)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT COALESCE(t.namespace, 'free'), t.name, t.scope, t.usage_note
+                   FROM tag t
+                  WHERE t.is_trait = 1 AND t.teach = 1
+                  ORDER BY t.namespace, t.name",
+            )
+            .map_err(|e| CoreError::Catalog(format!("teach prep: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .map_err(|e| CoreError::Catalog(format!("teach query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("teach row: {e}")))
+    }
+
+    /// Create or promote a trait (UI-SPEC §9 NEW TRAIT + PROMOTE). Upserts the `tag` row by its
+    /// namespaced `norm_name` and flags it a first-class trait; an existing tag (already in use on
+    /// assets) keeps its assignments and simply gains trait status. Returns the tag id.
+    pub fn upsert_trait(
+        &self,
+        namespace: &str,
+        value: &str,
+        scope: Option<&str>,
+        usage_note: Option<&str>,
+        teach: bool,
+    ) -> Result<i64> {
+        let Some((norm, display)) = normalize_tag(namespace, value) else {
+            return Err(CoreError::Catalog("empty trait name".into()));
+        };
+        self.conn
+            .execute(
+                "INSERT INTO tag (name, norm_name, namespace, is_trait, scope, usage_note, teach)
+                 VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6)
+                 ON CONFLICT(norm_name) DO UPDATE SET
+                    is_trait = 1, scope = ?4, usage_note = ?5, teach = ?6",
+                params![display, norm, namespace, scope, usage_note, teach as i64],
+            )
+            .map_err(|e| CoreError::Catalog(format!("upsert_trait: {e}")))?;
+        self.conn
+            .query_row("SELECT id FROM tag WHERE norm_name = ?1", params![norm], |r| {
+                r.get(0)
+            })
+            .map_err(|e| CoreError::Catalog(format!("upsert_trait id: {e}")))
+    }
+
+    /// Demote a trait back to a plain tag (UI-SPEC §9 delete: *"existing tags on assets are kept"*).
+    /// Clears every Trait-Library field but never touches `asset_tag`, so the vocabulary term and
+    /// its assignments survive — only its first-class status and teaching are removed.
+    pub fn unpromote_trait(&self, tag_id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE tag SET is_trait = 0, teach = 0, scope = NULL, usage_note = NULL,
+                                color = NULL, icon = NULL
+                 WHERE id = ?1",
+                params![tag_id],
+            )
+            .map(|_| ())
+            .map_err(|e| CoreError::Catalog(format!("unpromote_trait: {e}")))
+    }
+
+    /// Toggle a trait's teaching flag (UI-SPEC §9 ✦ teaching / ⏸ paused).
+    pub fn set_trait_teach(&self, tag_id: i64, teach: bool) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE tag SET teach = ?2 WHERE id = ?1 AND is_trait = 1",
+                params![tag_id, teach as i64],
+            )
+            .map(|_| ())
+            .map_err(|e| CoreError::Catalog(format!("set_trait_teach: {e}")))
+    }
+
+    /// Set a trait's chip style (UI-SPEC §9 ✎ style — 6-colour palette + glyph). `None` clears.
+    pub fn set_trait_style(
+        &self,
+        tag_id: i64,
+        color: Option<&str>,
+        icon: Option<&str>,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE tag SET color = ?2, icon = ?3 WHERE id = ?1 AND is_trait = 1",
+                params![tag_id, color, icon],
+            )
+            .map(|_| ())
+            .map_err(|e| CoreError::Catalog(format!("set_trait_style: {e}")))
     }
 
     /// Assets still awaiting identification (`tags_dirty`), for the tagging drain. Same job shape
@@ -4079,6 +4231,78 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hits, 0, "rejected term stops matching FTS");
+    }
+
+    #[test]
+    fn trait_promote_teach_and_unpromote_keeps_assignments() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let sid = c.upsert_import_source("s", "G:/s", "folder").expect("sid");
+        c.record_crawl(
+            sid,
+            None,
+            &[CrawlRecord {
+                rel_path: "a.png".into(),
+                name: "a.png".into(),
+                media_type: "image".into(),
+                size_bytes: 1,
+                mtime: 0,
+                workspace_rel: None,
+            }],
+        )
+        .unwrap();
+        let id: i64 = c
+            .conn
+            .query_row(
+                "SELECT a.id FROM asset a JOIN asset_file af ON af.id = a.primary_file_id
+                 WHERE af.rel_path = 'a.png'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        c.set_tags(
+            id,
+            "ai",
+            None,
+            &[TagAssignment {
+                namespace: "material".into(),
+                value: "metal".into(),
+                confidence: Some(0.7),
+            }],
+        )
+        .unwrap();
+
+        // Promote the in-use tag to a teaching trait scoped to models.
+        let tid = c
+            .upsert_trait("material", "metal", Some("model_3d"), Some("shiny hard surface"), true)
+            .unwrap();
+        let vocab = c.list_vocabulary().unwrap();
+        let row = vocab.iter().find(|v| v.id == tid).unwrap();
+        assert!(row.is_trait && row.teach);
+        assert_eq!(row.usage_count, 1, "promotion keeps the existing assignment");
+        assert_eq!(row.ai_count, 1);
+
+        // Teaching vocabulary now carries it, scope + usage note intact.
+        let teach = c.teaching_traits().unwrap();
+        assert_eq!(
+            teach,
+            vec![(
+                "material".to_string(),
+                "metal".to_string(),
+                Some("model_3d".to_string()),
+                Some("shiny hard surface".to_string())
+            )]
+        );
+        // Pause it: excluded from teaching, still a trait.
+        c.set_trait_teach(tid, false).unwrap();
+        assert!(c.teaching_traits().unwrap().is_empty());
+
+        // Un-promote: trait status gone, but the tag and its assignment survive.
+        c.unpromote_trait(tid).unwrap();
+        let vocab = c.list_vocabulary().unwrap();
+        let row = vocab.iter().find(|v| v.id == tid).unwrap();
+        assert!(!row.is_trait);
+        assert_eq!(row.usage_count, 1, "un-promote never drops assignments");
     }
 
     #[test]

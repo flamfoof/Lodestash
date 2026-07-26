@@ -2057,12 +2057,27 @@ impl LodestashApp {
         self.catalog_persisting = true;
 
         std::thread::spawn(move || {
-            let tagger = match vision_model {
-                Some(v) => lodestash_ai::ollama::OllamaTagger::new(model).with_vision(v),
-                None => lodestash_ai::ollama::OllamaTagger::new(model),
-            };
             let (counts, assets) = match Catalog::open(&db_path) {
                 Ok(mut cat) => {
+                    // Teaching vocabulary (AI-PIPELINE §6): the user's traits steer this pass.
+                    let teach: Vec<lodestash_ai::tagger::TeachTrait> = cat
+                        .teaching_traits()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(namespace, value, scope, usage_note)| {
+                            lodestash_ai::tagger::TeachTrait {
+                                namespace,
+                                value,
+                                scope,
+                                usage_note,
+                            }
+                        })
+                        .collect();
+                    let tagger = match vision_model {
+                        Some(v) => lodestash_ai::ollama::OllamaTagger::new(model).with_vision(v),
+                        None => lodestash_ai::ollama::OllamaTagger::new(model),
+                    }
+                    .with_teaching(teach);
                     // Scope the pass by re-flagging the target subset dirty (New needs nothing — a
                     // mint leaves assets dirty until first processed). The drains then run over the
                     // dirty set as usual.
