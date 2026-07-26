@@ -4391,6 +4391,15 @@ impl LodestashApp {
     /// the marquee. Returns `true` if a marquee selection was just finalised, so the caller
     /// can suppress the ordinary click for this frame.
     fn update_drag_select(&mut self, ui: &egui::Ui, rects: &[(usize, usize, egui::Rect)]) -> bool {
+        // A preview window (Quick Look / pack peek) is modal over the grid. Dragging inside its 3D
+        // viewport must not start a marquee on the grid behind it — otherwise leaving the window
+        // mid-drag selects the cards under the marquee. Bail and clear any in-progress marquee.
+        if self.quick_look || self.peek.is_some() {
+            self.drag_select_start = None;
+            self.drag_select_current = None;
+            self.drag_select_active = false;
+            return false;
+        }
         let (pos, down, released, mods) = ui.input(|i| {
             (
                 i.pointer.interact_pos(),
@@ -13160,8 +13169,11 @@ fn quick_look_content(
         ui.add_space(4.0);
     }
 
-    let avail = ui.available_size();
-    let canvas = Vec2::new(avail.x, (avail.y - 64.0).max(96.0));
+    // Fixed canvas, NOT `ui.available_size()`: the Quick Look window auto-fits to its content, so
+    // sizing the viewport from available space feeds that size straight back and the window creeps
+    // larger every frame (the same trap the audio branch's fixed waveform/scrub widths avoid). A
+    // constant size renders identically frame to frame.
+    let canvas = Vec2::new(600.0, 440.0);
 
     if is_image && (viewer.texture.is_some() || viewer.loading || viewer.error.is_some()) {
         let (resp, mut painter) = ui.allocate_painter(canvas, egui::Sense::click_and_drag());
