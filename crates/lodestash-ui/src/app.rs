@@ -2151,10 +2151,23 @@ impl LodestashApp {
                         let tagger = lodestash_ai::openai::OpenAiTagger::new(
                             &api_base, &api_key, &api_model,
                         )
-                        .with_teaching(teach);
+                        .with_teaching(teach.clone());
+                        // Local fallback for a hard API failure (AI-PIPELINE §5.1) — only when the
+                        // user also has a local Identify model set; otherwise a failed asset just
+                        // stays queued for the next run.
+                        let fallback = model.clone().map(|m| {
+                            match vision_model.clone() {
+                                Some(v) => lodestash_ai::ollama::OllamaTagger::new(m).with_vision(v),
+                                None => lodestash_ai::ollama::OllamaTagger::new(m),
+                            }
+                            .with_teaching(teach.clone())
+                        });
                         drain_api_tags(
                             &mut cat,
                             &tagger,
+                            fallback
+                                .as_ref()
+                                .map(|t| t as &dyn lodestash_ai::tagger::Tagger),
                             workspace_dir.as_deref(),
                             cache_dir.as_deref(),
                             &job_progress,
@@ -4066,6 +4079,18 @@ impl LodestashApp {
                                 .color(theme::TEXT_MUTED)
                                 .size(11.0),
                         );
+                        let failed = job.progress.failed.load(Ordering::Relaxed);
+                        if failed > 0 {
+                            ui.label(
+                                RichText::new(format!("\u{26A0} {failed} failed"))
+                                    .color(theme::WARNING)
+                                    .size(10.0),
+                            )
+                            .on_hover_text(
+                                "Assets the cloud tagger couldn't reach (rate limit or API error). \
+                                 They stay queued for the next run; a local model, if set, tagged them.",
+                            );
+                        }
                         if job.progress.is_cancelled() {
                             ui.label(
                                 RichText::new("cancelling\u{2026}")

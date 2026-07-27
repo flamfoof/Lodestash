@@ -205,15 +205,22 @@ pub(super) fn drain_audio_embeddings(
 /// progress preserved: a request that fails or a preview that won't render still clears the flag.
 pub(super) fn drain_api_tags(
     cat: &mut Catalog,
-    tagger: &dyn lodestash_ai::tagger::Tagger,
+    tagger: &lodestash_ai::openai::OpenAiTagger,
+    fallback: Option<&dyn lodestash_ai::tagger::Tagger>,
     workspace_dir: Option<&std::path::Path>,
     cache_dir: Option<&std::path::Path>,
     progress: &crate::jobs::JobProgress,
 ) {
+    use lodestash_ai::openai::ApiError;
+    use lodestash_ai::tagger::{TagInput, Tagger};
     use std::sync::atomic::Ordering;
     const BATCH: usize = 16;
     const TAG_PX: u32 = 384;
     let model_id = tagger.model_id().to_string();
+    // Once a *hard* error proves the endpoint is unusable (bad key/quota/non-vision model), stop
+    // hammering it for the rest of the pass — every remaining asset would fail the same way. If a
+    // local fallback exists we use it for the remainder; if not, we've already stopped (see below).
+    let mut api_dead = false;
     loop {
         if progress.is_cancelled() {
             return;
@@ -251,23 +258,64 @@ pub(super) fn drain_api_tags(
                 .and_then(|p| p.file_stem())
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let tags = path
+            let Some(img) = path
                 .as_deref()
                 .zip(cache_dir)
                 .and_then(|(p, cache)| tag_preview(p, cache, TAG_PX))
-                .map(|img| {
-                    tagger
-                        .tag(
-                            &lodestash_ai::tagger::TagInput {
-                                media_code: &job.media_code,
-                                name: &name,
-                                image: Some(&img),
-                            },
-                            None,
-                        )
-                        .tags
-                })
-                .unwrap_or_default();
+            else {
+                // No preview to send. Nothing to look at ⇒ clear (as the local drain does), don't
+                // leave it dirty to re-loop forever.
+                if let Err(e) = cat.set_tags(job.asset_id, "ai", Some(&model_id), &[]) {
+                    tracing::warn!(%e, "api set_tags(empty) failed; stopping api tag drain");
+                    return;
+                }
+                progress.done.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            let input = TagInput {
+                media_code: &job.media_code,
+                name: &name,
+                image: Some(&img),
+            };
+
+            // The endpoint already proved dead this pass: skip it and use the local model directly.
+            // (`api_dead` is only ever set when a fallback exists — see the error arm.)
+            if api_dead {
+                let tags = fallback.map(|fb| fb.tag(&input, None).tags).unwrap_or_default();
+                let tags = lodestash_ai::tagger::validate(tags);
+                if let Err(e) = cat.set_tags(job.asset_id, "ai", Some(&model_id), &tags) {
+                    tracing::warn!(%e, "api(fallback) set_tags failed; stopping api tag drain");
+                    return;
+                }
+                progress.done.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
+            let tags = match attempt_api_tag(tagger, &input, progress) {
+                AttemptOutcome::Ok(tags) => tags,
+                AttemptOutcome::Cancelled => return,
+                AttemptOutcome::Failed(err) => {
+                    progress.failed.fetch_add(1, Ordering::Relaxed);
+                    match fallback {
+                        // Substitute the local model for this asset (AI-PIPELINE §5.1). A hard error
+                        // also flips `api_dead` so we stop retrying a dead endpoint; a throttle does
+                        // not — it may clear by the next asset.
+                        Some(fb) if fb.supports(&job.media_code) => {
+                            if matches!(err, ApiError::Hard(_)) {
+                                tracing::warn!(%err, "api tagger failed hard; using local model for the rest of this run");
+                                api_dead = true;
+                            }
+                            fb.tag(&input, None).tags
+                        }
+                        // No local model to fall back to: leave this asset **dirty** (never mark it
+                        // done-with-no-tags) and stop the pass. The next run resumes here.
+                        _ => {
+                            tracing::warn!(%err, "api tagger failed and no local fallback; asset stays queued, stopping run");
+                            return;
+                        }
+                    }
+                }
+            };
             let tags = lodestash_ai::tagger::validate(tags);
             if let Err(e) = cat.set_tags(job.asset_id, "ai", Some(&model_id), &tags) {
                 tracing::warn!(%e, "api set_tags failed; stopping api tag drain");
@@ -276,6 +324,73 @@ pub(super) fn drain_api_tags(
             progress.done.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// Outcome of one asset's API tagging after backoff/retry.
+enum AttemptOutcome {
+    Ok(Vec<lodestash_core::catalog::TagAssignment>),
+    /// The user cancelled during a backoff sleep — the caller must stop the drain.
+    Cancelled,
+    /// Exhausted retries (throttle) or a hard error — the caller decides fallback vs. leave-dirty.
+    Failed(lodestash_ai::openai::ApiError),
+}
+
+/// One asset, with rate-limit backoff + resume (AI-PIPELINE §5.1). Retries only a `Throttled` call
+/// (honouring `Retry-After`, else exponential backoff + jitter); a `Hard` error returns immediately.
+/// Cancellation is polled during the sleep so a paused run stops promptly.
+fn attempt_api_tag(
+    tagger: &lodestash_ai::openai::OpenAiTagger,
+    input: &lodestash_ai::tagger::TagInput<'_>,
+    progress: &crate::jobs::JobProgress,
+) -> AttemptOutcome {
+    use lodestash_ai::openai::ApiError;
+    const MAX_RETRIES: u32 = 4;
+    let mut attempt: u32 = 0;
+    loop {
+        match tagger.try_tag(input) {
+            Ok(res) => return AttemptOutcome::Ok(res.tags),
+            Err(ApiError::Throttled { retry_after }) => {
+                if attempt >= MAX_RETRIES {
+                    return AttemptOutcome::Failed(ApiError::Throttled { retry_after });
+                }
+                // Server's Retry-After wins; otherwise 2s, 4s, 8s, 16s (capped 30s) + up-to-1s jitter.
+                let base = retry_after.unwrap_or_else(|| {
+                    let secs = (2u64 << attempt).min(30);
+                    std::time::Duration::from_secs(secs)
+                });
+                let wait = base + std::time::Duration::from_millis(jitter_ms());
+                if sleep_cancellable(wait, progress) {
+                    return AttemptOutcome::Cancelled;
+                }
+                attempt += 1;
+            }
+            Err(hard) => return AttemptOutcome::Failed(hard),
+        }
+    }
+}
+
+/// Cheap jitter (0–999 ms) from the wall clock — avoids a `rand` dependency for backoff spread,
+/// which only needs to be uncorrelated between callers, not cryptographic.
+fn jitter_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64 % 1000)
+        .unwrap_or(0)
+}
+
+/// Sleep `dur`, waking every 250 ms to check for cancel. Returns `true` if cancelled mid-sleep.
+fn sleep_cancellable(dur: std::time::Duration, progress: &crate::jobs::JobProgress) -> bool {
+    let step = std::time::Duration::from_millis(250);
+    let mut left = dur;
+    while left > std::time::Duration::ZERO {
+        if progress.is_cancelled() {
+            return true;
+        }
+        let nap = left.min(step);
+        std::thread::sleep(nap);
+        left = left.saturating_sub(nap);
+    }
+    progress.is_cancelled()
 }
 
 /// Tag dirty **audio** assets by CLAP zero-shot (AI-PIPELINE §6/§110): decode → log-mel → score

@@ -8,8 +8,10 @@ often better and needs no GPU)**.
 > If you read nothing else:
 > - **Just want it to work, free, offline?** Install [Ollama](https://ollama.com), pull
 >   **`moondream`**, pick it in *Settings ▸ AI · IDENTIFY*. Done.
-> - **Have an API key and want the best tags with no GPU?** Turn on *Settings ▸ AI · IDENTIFY
->   (CLOUD)*, paste a **Gemini** key (free tier), set a flash-tier vision model. Done.
+> - **Want better tags with no GPU?** Turn on *Settings ▸ AI · IDENTIFY (CLOUD)*, pick the
+>   **Gemini (free)** preset, paste a free-tier key, set a flash-tier vision model. Done.
+>   **No OpenAI account is needed** — "OpenAI-compatible" is just the request format; the free
+>   tiers (Gemini/Groq/OpenRouter) and your own local server all speak it.
 > - **Audio always stays local** (Ollama/CLAP) — there is no cloud-audio path, by design.
 > - Model names and prices change. **Verify the current model IDs / free-tier limits** on the
 >   provider's own page before relying on them; the names below are guidance, not gospel.
@@ -19,7 +21,7 @@ The two settings cards mirror this guide:
 | Card | What it drives |
 |---|---|
 | **AI · IDENTIFY** | Local tagging via **Ollama** (a model already on your machine) |
-| **AI · IDENTIFY (CLOUD)** | Optional **OpenAI-compatible** API tagging (Gemini / Groq / OpenRouter / OpenAI / your own server) |
+| **AI · IDENTIFY (CLOUD)** | Optional cloud tagging over the **OpenAI-compatible** format — *no OpenAI account needed* (Gemini free / Groq free / OpenRouter / your own local server) |
 
 There is also a per-VRAM deep-dive in [`AI-MODELS-BY-GPU.md`](AI-MODELS-BY-GPU.md) if you want to push
 local quality as far as your GPU allows. This page is the friendly "just tell me what to pick" version.
@@ -33,6 +35,7 @@ The most common asset, and the easiest to tag well.
 | Goal | Local pick | Cloud pick |
 |---|---|---|
 | **Best default** | **`moondream`** (~1.7 GB) in Ollama — captions the preview, a text model turns it into traits | **Gemini Flash** (free tier) via the CLOUD card |
+| **Most tags, no LLM, no GPU** | **WD-EVA02-Large (v3)** — a small ONNX tagger that emits hundreds of labels with scores; great for stylized/anime art. Or **SigLIP zero-shot** to tag against *your own* trait vocabulary (reuses the search model — nothing to install) | — (local already covers this well) |
 | **Higher quality, have VRAM/patience** | **`qwen2.5vl:3b`** or **`llava`** (7B, needs ~6–8 GB) | **GPT-4o-mini** class / **Claude Haiku** class — cheap, strong |
 | **Fastest cloud, free** | — | **Groq** vision model, or **OpenRouter** free model |
 
@@ -64,7 +67,7 @@ the machine. Three complementary pieces, in order of what ships today:
 | Piece | What it does | Status |
 |---|---|---|
 | **CLAP zero-shot** (shipped) | Matches a clip against a sound vocabulary (explosion, footsteps, music, ambient, voice…) in a joint audio↔text space | **On now** — comes free with the audio embedder; no extra model to install |
-| **YAMNet / PANNs** | Discrete sound-event tags (hundreds of AudioSet classes) | Planned |
+| **PANNs / YAMNet** | Discrete sound-event tags (hundreds of AudioSet classes) — PANNs (CNN14) is the quality pick, YAMNet the tiny/fast one; both ONNX, free, CPU | **Next audio slice** (specced) |
 | **Whisper** | Transcribes **spoken** audio → searchable text + a `voice` tag | Planned (only for voice/dialogue clips) |
 
 **What to do today:** nothing extra. If the audio embedder is set up (part of *Search with AI*),
@@ -88,17 +91,25 @@ model plus scoped runs keeps a big library to pennies — but **check the provid
 
 ---
 
-## Setting up the cloud card (any OpenAI-compatible provider)
+## Setting up the cloud card (no OpenAI account required)
+
+"OpenAI-compatible" is only the *request format* — every option below speaks it, and none of them is
+OpenAI unless you deliberately pick it. Pick the **Endpoint preset** and the base URL is filled for you:
 
 1. *Settings ▸ AI · IDENTIFY (CLOUD)* ▸ tick **Use cloud/API tagging**.
-2. **Endpoint** — the provider's OpenAI-compatible base URL:
-   - **Gemini** (default): its OpenAI-compatible endpoint.
-   - **Groq / OpenRouter / OpenAI**: their `/v1` base URL.
-   - **Local server**: e.g. `http://localhost:1234/v1` (LM Studio) or your vLLM URL.
+2. **Endpoint** — choose a preset:
+   - **Local server** — your own LM Studio / llama.cpp / vLLM (zero cost, fully private).
+   - **Gemini (free)** — Google's free tier; the default.
+   - **Groq (free)** / **OpenRouter** — free model tiers.
+   - **Custom…** — type any OpenAI-compatible base URL (for anything not preset).
 3. **Model** — a **vision-capable** model id at that endpoint (verify the current name on the provider).
-4. **API key** — paste it. Stored locally, never logged. (A local server usually needs any non-empty
-   string.)
-5. Press **Run on New**. Watch the job tray; cancel anytime — it resumes where it stopped.
+4. **API key** — paste it. Kept in your OS credential store (Windows Credential Manager) where
+   available, never logged. (A local server usually accepts any non-empty string; the free tiers hand
+   you a key with no card.)
+5. Press **Test** — it tags one sample image and shows the result or the exact error, so a wrong
+   endpoint / non-vision model / dead key is caught *before* a bulk run.
+6. Press **Run on New**. Watch the job tray; cancel anytime — it resumes where it stopped, and
+   rate-limited or failed assets stay queued for the next run rather than being marked done.
 
 ---
 

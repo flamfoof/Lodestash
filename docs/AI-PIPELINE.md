@@ -90,7 +90,7 @@ that can actually produce one.
 | Impl | Backend |
 |---|---|
 | `LocalTagger` | **Ollama, two stages: VLM captions the preview → text model writes the facet JSON** (shipped) · WD v3 (image, ONNX) · YAMNet/PANNs + CLAP (audio) · multiview→WD (3D) |
-| `ApiTagger` | Cloud/remote vision LLM over the **OpenAI-compatible** chat+vision shape (first concrete provider — reaches OpenAI, **Gemini**, Groq, OpenRouter, and any local OpenAI-API server); Claude-native is a later drop-in. JSON facet response. |
+| `ApiTagger` | Cloud/remote vision LLM over the **OpenAI-compatible wire format** (vendor-neutral — **no OpenAI account required**; reaches Gemini/Groq/OpenRouter free tiers and any local OpenAI-API server, paid vendors only if opted in); Claude-native is a later drop-in. JSON facet response. |
 | `LocalEmbedder` | SigLIP 2 (image) · CLAP (audio) · multiview-SigLIP (3D) — via `ort`/candle |
 | `ApiEmbedder` | provider embeddings *(optional — see policy)* |
 
@@ -100,15 +100,40 @@ that can actually produce one.
 - The embedder is chosen **per modality as a unit** (text+asset towers must match); you cannot mix a
   local image embedder with an API text embedder.
 
+### 2.1 Local tagging strategies (why more than one)
+
+The local tagger is not a single model but a small set of **complementary strategies**, because each
+covers a different weakness — and the two highest-leverage ones reuse infrastructure already in the
+box, so they cost a label list, not a new dependency:
+
+- **Discrete multi-label (WD / RAM).** `WD-EVA02-Large-v3` (ONNX, via `ort`) emits hundreds of
+  Booru-style tags with native probabilities — dense recall, no LLM, no two-model caption dance.
+  Strong on stylized/anime game art; RAM++ is the broader open-set option for realistic props. This
+  is a **primary local image/3D tagger**, not a fallback: for many libraries it out-tags the VLM
+  caption path and is faster.
+- **Zero-shot vs a controlled vocabulary (CLIP/SigLIP for image/3D, CLAP for audio).** Score the
+  asset embedding against label-prompt embeddings and keep the closest per facet — the exact
+  temperature-scaled-softmax method already **shipped for audio** (`clap_tags`, §6). The image/3D
+  version reuses the **SigLIP embedder already loaded for search** — zero new model, zero download —
+  and is the natural home for **teaching vocabulary** (§6): a user's own trait becomes a candidate
+  label, so their words win without prompt-engineering a VLM.
+- **VLM caption → text-facet (Ollama two-stage, shipped).** The rich free-form path (§2 above): one
+  sentence of description (→ `asset.description`, FTS-indexed) plus a text model mapping it to the
+  schema. Best when you want prose/novel concepts the fixed vocabularies above can't name.
+
+These are **union, not exclusive** — WD gives recall, zero-shot enforces the controlled/teaching
+vocabulary, the VLM adds description; `validate` + `set_tags` dedupe and cap across all of them. The
+API path (§5) is a fourth strategy the user can switch *in* per modality, never a prerequisite.
+
 ---
 
 ## 3. Per-modality defaults
 
 | Modality | Embedding (local, always) | Tags (local default / API option) |
 |---|---|---|
-| **Image / texture** | **SigLIP 2 So400m** (768-d; ViT-B fallback on weak CPUs) | **WD-EVA02-Large-v3** (ONNX) / Claude vision JSON. Textures: embed the **albedo** channel; detect other maps by filename and merge as one material. |
+| **Image / texture** | **SigLIP 2 So400m** (768-d; ViT-B fallback on weak CPUs) | **WD-EVA02-Large-v3** (ONNX, dense multi-label) **+ SigLIP zero-shot** over the controlled/teaching vocab (§2.1) / Ollama VLM caption / OpenAI-compatible vision JSON (opt-in). Textures: embed the **albedo** channel; detect other maps by filename and merge as one material. |
 | **Audio** | **LAION-CLAP** (512-d) | **YAMNet/PANNs** event tags + CLAP zero-shot description; **Whisper** only when VAD detects speech / API enriches text tags |
-| **3D model** | **multiview render (4–8 views) → SigLIP 2**, mean-pooled & renormalized | **WD tagger** on the rendered views (vote/union) + **file-derived structured tags** (poly count, material slots, bone count) / Claude vision on the views |
+| **3D model** | **multiview render (4–8 views) → SigLIP 2**, mean-pooled & renormalized | **WD tagger + SigLIP zero-shot** on the rendered views (vote/union) + **file-derived structured tags** (poly count, material slots, bone count) / OpenAI-compatible vision on the views (opt-in) |
 | **Sprite (animated 2D)** | SigLIP 2 on the composited hero frame (image path) | WD v3 on sampled frames (union) + file-derived technical tags (frame count, fps, dimensions) |
 | **Material** | SigLIP 2 on the **albedo** map (upgrade: the lit sphere render once available) | filename/hue map-role heuristics + WD/Claude vision on albedo — same PBR-map caveat as textures |
 | **Font** | SigLIP 2 on the rendered **glyph specimen sheet** ([`INGESTION.md`](INGESTION.md) §5) | file-derived metrics (style, weight, glyph coverage) + VLM/Claude on the specimen (e.g. "handwritten", "pixel", "serif") |
@@ -141,20 +166,30 @@ that can actually produce one.
 
 ---
 
-## 5. Online API option (opt-in; first provider: OpenAI-compatible)
+## 5. Online API option (opt-in; OpenAI-compatible wire format)
 
 API tagging is **opt-in enrichment, never required** — the local Ollama VLM path already tags
 images/3D/material/font offline for free, so the cloud path exists only to buy better tags when a
 user wants to spend for them.
 
-**The first concrete provider is the OpenAI chat-completions + vision shape**, not Claude-native, and
-the reason is reach-per-line: one impl (`base_url` + `api_key` + `model`) talks to **OpenAI, Google
-Gemini** (its OpenAI-compatible endpoint), **Groq, OpenRouter, and any local OpenAI-API server**
-(LM Studio / llama.cpp / vLLM) — including the generous **free tiers** (Gemini Flash, Groq,
-OpenRouter free models) that make cloud tagging affordable at all. Claude's native Messages API is a
+**"OpenAI-compatible" names a wire format, not a vendor account.** The `ApiTagger` speaks the
+`POST /chat/completions` + base64 `image_url` shape, so it is provider-agnostic by construction: an
+OpenAI account is **never** required, and none of the reachable endpoints are OpenAI's own. One impl
+(`base_url` + `api_key` + `model`) talks to whatever server answers that shape — the practical set is
+**free tiers** (Google **Gemini Flash**, **Groq**, **OpenRouter** free models), a **local
+OpenAI-API server** (LM Studio / llama.cpp / vLLM — zero cost, fully private), and paid vendors only
+if the user opts in. The default `base_url` points at Gemini's OpenAI-compatible endpoint (free tier,
+no card); a local server URL is a first-class alternative. Claude's native Messages API is a
 different request shape and lands later as a second impl behind the same `ApiTagger` trait for users
-who specifically want Anthropic. The default `base_url` points at Gemini's OpenAI-compatible endpoint;
-a local server URL is a first-class alternative (zero cost, fully private).
+who specifically want Anthropic.
+
+**Endpoint presets (UI spec).** Because the raw base_url reads as "insert OpenAI key" to a new user —
+the exact opposite of the truth — the CLOUD settings card presents a **preset picker**, not a bare
+URL field: `Local server · Gemini (free) · Groq (free) · OpenRouter · Custom…`. Selecting a preset
+fills `base_url` and hints a sensible vision-model id; **Custom** exposes the raw field for power
+users. This is pure client wiring over the same `base_url` the tagger already accepts — no backend or
+trait change — and it is the primary lever that makes the free/local paths discoverable. See
+[`MODEL-GUIDE.md`](MODEL-GUIDE.md).
 
 > Verify model IDs / pricing / free-tier limits / vision request shape against each provider's
 > current docs before relying on them — do not hard-code from memory. The request is a standard
@@ -167,6 +202,36 @@ a local server URL is a first-class alternative (zero cost, fully private).
 The provider is abstracted (`ApiTagger`), so Claude-native / others are drop-in alternatives. Audio
 has **no cloud path** in any provider (§5, above): it goes through the local CLAP/Whisper
 description pre-step regardless, and the API only ever enriches text.
+
+### 5.1 Reliability & cost controls
+
+The cloud path is designed for the **free tiers first** (Gemini/Groq/OpenRouter), and free tiers
+throttle hard — Gemini free is on the order of ~15 requests/minute. A naive tight-loop drain sprays
+429s and silently loses those assets, so the design mandates:
+
+- **Rate-limit backoff + resume.** On `429`/`503` (honour `Retry-After` when present), back off
+  exponentially with jitter and retry a bounded number of times; a call that still fails leaves the
+  asset **`tags_dirty` = 1** so the next run picks it up. An asset is only cleared once it is actually
+  tagged — a drain must never mark a rate-limited asset "done, no tags." (Contrast the *unsupported*
+  case, e.g. audio through a vision API, which is cleared deliberately to avoid a spin loop.)
+- **Local fallback on failure.** A hard API error (bad key, exhausted quota, network) falls back to
+  the **local Ollama VLM** for that asset when a local model is available; if none is, the asset stays
+  dirty and a per-run **failure count** surfaces in the job tray. Either way the asset is never left
+  looking complete-with-no-tags — the whole point of `confirmed` vs `identified` (DATA-MODEL §8)
+  depends on "untagged" meaning "not yet done," not "silently failed."
+- **Connection test + vision preflight.** The CLOUD card exposes a **Test** action that runs the
+  tagger against one bundled sample image and shows the raw result or the raw error. This is the
+  single cheapest fix for the #1 failure mode — a wrong base_url, a non-vision model id, or a dead key
+  produces *nothing* from a bulk run with no signal. Test surfaces it in one click before any spend or
+  any large pass.
+- **Budget guard.** Scoped runs (New/Unidentified/Selected) already bound *what* is tagged; on top of
+  that a **hard per-run asset cap** and, for any **non-free preset**, a pre-run confirm showing
+  *N assets ≈ M API calls* (and an est. cost line when the provider's pricing is known) prevent a
+  mis-clicked **Full Run** on a paid endpoint from becoming a surprise bill. Free/local presets skip
+  the confirm.
+- **Key at rest.** `api_key` is the one secret this local-first app holds; store it in the **OS
+  credential store** (Windows Credential Manager) when available, with a plaintext-config fallback so
+  the app still works headless. Never logged, never sent anywhere but the chosen endpoint.
 
 ---
 

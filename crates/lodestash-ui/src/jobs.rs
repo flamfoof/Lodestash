@@ -17,6 +17,9 @@ pub struct JobProgress {
     pub done: AtomicU64,
     /// 0 = total unknown → the tray shows a spinner instead of a bar.
     pub total: AtomicU64,
+    /// Assets the cloud tagger could not tag (rate-limit exhausted or hard API error). Surfaced in
+    /// the tray so a silently-degraded run (e.g. bad key → local fallback) is visible, not invisible.
+    pub failed: AtomicU64,
     /// Set by the tray's ✕. Cooperative: workers poll it where they can stop safely.
     pub cancelled: AtomicBool,
 }
