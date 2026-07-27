@@ -142,12 +142,26 @@ impl ImageZeroShot {
         &self.model_id
     }
 
+    /// The underlying embedder's id — the `asset_embedding.model_id` a stored vector must carry to be
+    /// scoreable here (same joint space as the label vectors). Lets a caller reuse a precomputed
+    /// embedding via [`Self::tag_vector`] instead of re-embedding.
+    pub fn base_model_id(&self) -> &str {
+        self.embedder.model_id()
+    }
+
     /// Tag one decoded image. Returns validated facet tags — at most one label per facet, only the
     /// clear ones. A zero image vector (unsupported/blank) yields nothing (see [`score_facets`]).
     pub fn tag(&self, img: &image::RgbaImage) -> Vec<TagAssignment> {
-        let v = self.embedder.embed_image(img);
+        self.tag_vector(&self.embedder.embed_image(img))
+    }
+
+    /// Tag from a precomputed joint-space vector — e.g. a 3D asset's stored **multiview** embedding
+    /// (four orbit views pooled), which is a better basis than any single rendered thumbnail
+    /// (AI-PIPELINE §3 "3D runs on the multiview renders"). The vector must come from this tagger's
+    /// [`Self::base_model_id`] embedder, or it isn't in the label vectors' space.
+    pub fn tag_vector(&self, v: &[f32]) -> Vec<TagAssignment> {
         let tags = score_facets(
-            &v,
+            v,
             self.labels.iter().map(|(f, l, vec)| (f.as_str(), l.as_str(), vec.as_slice())),
         );
         validate(tags)

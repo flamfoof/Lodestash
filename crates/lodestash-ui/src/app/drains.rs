@@ -203,6 +203,27 @@ pub(super) fn drain_audio_embeddings(
 /// asset — a capable cloud model holds the schema, so no local caption pre-step. Single pass (no
 /// weight-residency concern), keyed on `tags_dirty`, audio excluded (`tagger.supports`). Forward
 /// progress preserved: a request that fails or a preview that won't render still clears the flag.
+/// Zero-shot tags for one asset (AI-PIPELINE §2.1/§3). For a `model_3d` asset it scores the stored
+/// **multiview** embedding (four orbit views pooled by the embedding drain) rather than the single
+/// rendered thumbnail — a better basis, at no extra render cost — when that vector exists and came
+/// from this tagger's own embedder. Every other case scores the decoded preview.
+fn zeroshot_tags(
+    zs: &lodestash_ai::image_tags::ImageZeroShot,
+    cat: &Catalog,
+    asset_id: i64,
+    media_code: &str,
+    img: Option<&image::RgbaImage>,
+) -> Vec<lodestash_core::catalog::TagAssignment> {
+    if media_code == "model_3d" {
+        if let Ok(Some((mid, v))) = cat.embedding_of(asset_id) {
+            if mid == zs.base_model_id() {
+                return zs.tag_vector(&v);
+            }
+        }
+    }
+    img.map(|i| zs.tag(i)).unwrap_or_default()
+}
+
 pub(super) fn drain_api_tags(
     cat: &mut Catalog,
     tagger: &lodestash_ai::openai::OpenAiTagger,
@@ -293,7 +314,7 @@ pub(super) fn drain_api_tags(
             if api_dead {
                 let mut tags = fallback.map(|fb| fb.tag(&input, None).tags).unwrap_or_default();
                 if let Some(z) = zero_shot {
-                    tags.extend(z.tag(&img));
+                    tags.extend(zeroshot_tags(z, cat, job.asset_id, &job.media_code, Some(&img)));
                 }
                 let tags = lodestash_ai::tagger::validate(tags);
                 if let Err(e) = cat.set_tags(job.asset_id, "ai", Some(&model_id), &tags) {
@@ -333,7 +354,7 @@ pub(super) fn drain_api_tags(
             // Union the API tags with the SigLIP zero-shot proposals over the same preview.
             let mut tags = tags;
             if let Some(z) = zero_shot {
-                tags.extend(z.tag(&img));
+                tags.extend(zeroshot_tags(z, cat, job.asset_id, &job.media_code, Some(&img)));
             }
             let tags = lodestash_ai::tagger::validate(tags);
             if let Err(e) = cat.set_tags(job.asset_id, "ai", Some(&model_id), &tags) {
@@ -785,10 +806,9 @@ pub(super) fn drain_tags(
                     image: Some(img),
                 })
             });
-            let zs_tags = match (zero_shot, &img) {
-                (Some(z), Some(img)) => z.tag(img),
-                _ => Vec::new(),
-            };
+            let zs_tags = zero_shot
+                .map(|z| zeroshot_tags(z, cat, job.asset_id, &job.media_code, img.as_ref()))
+                .unwrap_or_default();
             prepared.push((job, name, caption, zs_tags));
         }
 
