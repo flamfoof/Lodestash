@@ -7476,35 +7476,92 @@ impl LodestashApp {
                                     .num_columns(2)
                                     .spacing([8.0, 6.0])
                                     .show(ui, |ui| {
+                                        // Endpoint preset picker (AI-PIPELINE §5.1): the base URL is
+                                        // just wiring — presenting Local/Gemini/Groq/OpenRouter makes
+                                        // the free/local paths discoverable so "OpenAI-compatible"
+                                        // stops reading as "needs an OpenAI account".
                                         ui.label(
                                             RichText::new("Endpoint").size(11.0).color(theme::TEXT_DIM),
                                         );
-                                        if ui
-                                            .add(
-                                                egui::TextEdit::singleline(
-                                                    &mut self.config.api_base_url,
-                                                )
-                                                .desired_width(320.0),
-                                            )
-                                            .on_hover_text(
-                                                "OpenAI-compatible base URL (…/v1 or provider \
-                                                 equivalent). Default: Gemini.",
-                                            )
-                                            .lost_focus()
-                                        {
-                                            save = true;
-                                        }
+                                        let current = lodestash_ai::openai::preset_for(
+                                            &self.config.api_base_url,
+                                        );
+                                        let selected_label =
+                                            current.map(|p| p.label).unwrap_or("Custom\u{2026}");
+                                        egui::ComboBox::from_id_salt("api_preset")
+                                            .selected_text(selected_label)
+                                            .width(320.0)
+                                            .show_ui(ui, |ui| {
+                                                for p in lodestash_ai::openai::PRESETS {
+                                                    if ui
+                                                        .selectable_label(
+                                                            selected_label == p.label,
+                                                            p.label,
+                                                        )
+                                                        .on_hover_text(p.base_url)
+                                                        .clicked()
+                                                    {
+                                                        self.config.api_base_url =
+                                                            p.base_url.to_string();
+                                                        save = true;
+                                                    }
+                                                }
+                                                if ui
+                                                    .selectable_label(current.is_none(), "Custom\u{2026}")
+                                                    .clicked()
+                                                {
+                                                    // Clear a known URL so no preset matches → the
+                                                    // raw field appears for a hand-typed endpoint.
+                                                    if current.is_some() {
+                                                        self.config.api_base_url.clear();
+                                                    }
+                                                    save = true;
+                                                }
+                                            });
                                         ui.end_row();
+
+                                        // Raw base URL field only in Custom mode (no preset match).
+                                        if lodestash_ai::openai::preset_for(&self.config.api_base_url)
+                                            .is_none()
+                                        {
+                                            ui.label(
+                                                RichText::new("Base URL")
+                                                    .size(11.0)
+                                                    .color(theme::TEXT_DIM),
+                                            );
+                                            if ui
+                                                .add(
+                                                    egui::TextEdit::singleline(
+                                                        &mut self.config.api_base_url,
+                                                    )
+                                                    .hint_text("https://host/v1")
+                                                    .desired_width(320.0),
+                                                )
+                                                .on_hover_text(
+                                                    "OpenAI-compatible base URL (…/v1 or provider \
+                                                     equivalent).",
+                                                )
+                                                .lost_focus()
+                                            {
+                                                save = true;
+                                            }
+                                            ui.end_row();
+                                        }
 
                                         ui.label(
                                             RichText::new("Model").size(11.0).color(theme::TEXT_DIM),
                                         );
+                                        let model_hint = lodestash_ai::openai::preset_for(
+                                            &self.config.api_base_url,
+                                        )
+                                        .map(|p| p.model_hint)
+                                        .unwrap_or("a vision-capable model id");
                                         let mut model =
                                             self.config.api_model.clone().unwrap_or_default();
                                         if ui
                                             .add(
                                                 egui::TextEdit::singleline(&mut model)
-                                                    .hint_text("e.g. a Gemini flash vision model")
+                                                    .hint_text(model_hint)
                                                     .desired_width(320.0),
                                             )
                                             .lost_focus()

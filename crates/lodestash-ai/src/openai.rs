@@ -19,6 +19,70 @@ use std::time::Duration;
 /// affordable at all. Any OpenAI-API host (a paid provider or a local server) is a drop-in.
 pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
 
+/// An endpoint preset for the CLOUD settings card (AI-PIPELINE §5.1 "Endpoint presets"). Selecting
+/// one fills `base_url` so a new user never has to know that "OpenAI-compatible" is a wire format,
+/// not an OpenAI account. `Custom…` (handled in the UI) exposes the raw field.
+pub struct Preset {
+    pub label: &'static str,
+    pub base_url: &'static str,
+    /// A hint shown in the Model field — guidance, not a committed value (verify the live id).
+    pub model_hint: &'static str,
+    /// Free/local tiers skip the budget-guard confirm; a paid endpoint gets one.
+    pub free: bool,
+}
+
+/// The presets, in menu order. Local first (fully private, zero cost), then the free hosted tiers,
+/// then a paid aggregator. `Custom…` is a UI-only entry that reveals the raw base_url field.
+///
+/// Model ids are intentionally *hints*, not values — providers rename models often, so the UI
+/// prefills only `base_url` (stable) and shows the hint as placeholder text (AI-PIPELINE §5 note:
+/// verify ids against the provider). URLs are the well-known OpenAI-compatible bases.
+pub const PRESETS: &[Preset] = &[
+    Preset {
+        label: "Local server",
+        base_url: "http://localhost:1234/v1",
+        model_hint: "your local model id (LM Studio / vLLM)",
+        free: true,
+    },
+    Preset {
+        label: "Gemini (free)",
+        base_url: DEFAULT_BASE_URL,
+        model_hint: "a Gemini flash vision model",
+        free: true,
+    },
+    Preset {
+        label: "Groq (free)",
+        base_url: "https://api.groq.com/openai/v1",
+        model_hint: "a Groq vision model",
+        free: true,
+    },
+    Preset {
+        label: "OpenRouter",
+        base_url: "https://openrouter.ai/api/v1",
+        model_hint: "provider/model (e.g. a free vision model)",
+        free: false,
+    },
+];
+
+/// The preset whose base_url matches (trailing slash ignored), if any — else `None` = Custom.
+pub fn preset_for(base_url: &str) -> Option<&'static Preset> {
+    let want = base_url.trim().trim_end_matches('/');
+    PRESETS
+        .iter()
+        .find(|p| p.base_url.trim_end_matches('/') == want)
+}
+
+/// Whether an endpoint is free/local, so the budget-guard confirm can be skipped. A loopback host is
+/// always treated as free (a self-hosted server costs nothing); an unknown/custom remote is treated
+/// as **paid** (confirm) — the safe default when we can't prove otherwise.
+pub fn is_free_endpoint(base_url: &str) -> bool {
+    let u = base_url.to_ascii_lowercase();
+    if u.contains("localhost") || u.contains("127.0.0.1") || u.contains("[::1]") {
+        return true;
+    }
+    preset_for(base_url).is_some_and(|p| p.free)
+}
+
 /// A classified failure of one API call (AI-PIPELINE §5.1). The distinction drives the drain: a
 /// **`Throttled`** call is worth waiting and retrying (free tiers cap ~15 req/min), a **`Hard`**
 /// call (bad key, quota, non-vision model, network) is not — it falls back to the local model or
@@ -185,6 +249,21 @@ mod tests {
         assert!(!t.supports("audio"));
         assert!(t.supports("model_3d"));
         assert!(t.supports("image"));
+    }
+
+    #[test]
+    fn presets_round_trip_and_free_detection() {
+        // Default base URL resolves to the Gemini preset; a trailing slash doesn't break the match.
+        assert_eq!(preset_for(DEFAULT_BASE_URL).map(|p| p.label), Some("Gemini (free)"));
+        let with_slash = format!("{DEFAULT_BASE_URL}/");
+        assert_eq!(preset_for(&with_slash).map(|p| p.label), Some("Gemini (free)"));
+        // An unknown remote is Custom (None) and, crucially, treated as *paid* so the budget guard
+        // asks before spending; a loopback URL is always free even when it's not a listed preset.
+        assert!(preset_for("https://api.example.com/v1").is_none());
+        assert!(!is_free_endpoint("https://api.example.com/v1"));
+        assert!(is_free_endpoint("http://127.0.0.1:8000/v1"));
+        assert!(is_free_endpoint("http://localhost:1234/v1"));
+        assert!(is_free_endpoint(DEFAULT_BASE_URL));
     }
 
     #[test]
