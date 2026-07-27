@@ -207,6 +207,7 @@ pub(super) fn drain_api_tags(
     cat: &mut Catalog,
     tagger: &lodestash_ai::openai::OpenAiTagger,
     fallback: Option<&dyn lodestash_ai::tagger::Tagger>,
+    zero_shot: Option<&lodestash_ai::image_tags::ImageZeroShot>,
     max_assets: u32,
     workspace_dir: Option<&std::path::Path>,
     cache_dir: Option<&std::path::Path>,
@@ -290,7 +291,10 @@ pub(super) fn drain_api_tags(
             // The endpoint already proved dead this pass: skip it and use the local model directly.
             // (`api_dead` is only ever set when a fallback exists — see the error arm.)
             if api_dead {
-                let tags = fallback.map(|fb| fb.tag(&input, None).tags).unwrap_or_default();
+                let mut tags = fallback.map(|fb| fb.tag(&input, None).tags).unwrap_or_default();
+                if let Some(z) = zero_shot {
+                    tags.extend(z.tag(&img));
+                }
                 let tags = lodestash_ai::tagger::validate(tags);
                 if let Err(e) = cat.set_tags(job.asset_id, "ai", Some(&model_id), &tags) {
                     tracing::warn!(%e, "api(fallback) set_tags failed; stopping api tag drain");
@@ -326,6 +330,11 @@ pub(super) fn drain_api_tags(
                     }
                 }
             };
+            // Union the API tags with the SigLIP zero-shot proposals over the same preview.
+            let mut tags = tags;
+            if let Some(z) = zero_shot {
+                tags.extend(z.tag(&img));
+            }
             let tags = lodestash_ai::tagger::validate(tags);
             if let Err(e) = cat.set_tags(job.asset_id, "ai", Some(&model_id), &tags) {
                 tracing::warn!(%e, "api set_tags failed; stopping api tag drain");
@@ -701,6 +710,7 @@ pub(super) fn resync_after_drain(
 pub(super) fn drain_tags(
     cat: &mut Catalog,
     tagger: &dyn lodestash_ai::tagger::Tagger,
+    zero_shot: Option<&lodestash_ai::image_tags::ImageZeroShot>,
     workspace_dir: Option<&std::path::Path>,
     cache_dir: Option<&std::path::Path>,
     progress: &crate::jobs::JobProgress,
@@ -737,6 +747,7 @@ pub(super) fn drain_tags(
             lodestash_core::catalog::VisualEmbedJob,
             String,
             Option<String>,
+            Vec<lodestash_core::catalog::TagAssignment>,
         )> = Vec::with_capacity(jobs.len());
         for job in jobs {
             if progress.is_cancelled() {
@@ -757,24 +768,31 @@ pub(super) fn drain_tags(
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default()
             };
-            let caption = if tagger.supports(&job.media_code) {
+            // Decode the preview once, then use it for both the VLM caption and the SigLIP zero-shot
+            // pass (AI-PIPELINE §2.1: the two are a union, run over the same pixels). Only visual
+            // assets get here; audio has no preview and no zero-shot path.
+            let img = if tagger.supports(&job.media_code) {
                 path.as_deref()
                     .zip(cache_dir)
                     .and_then(|(p, cache)| tag_preview(p, cache, TAG_PX))
-                    .and_then(|img| {
-                        tagger.caption(&lodestash_ai::tagger::TagInput {
-                            media_code: &job.media_code,
-                            name: &name,
-                            image: Some(&img),
-                        })
-                    })
             } else {
                 None
             };
-            prepared.push((job, name, caption));
+            let caption = img.as_ref().and_then(|img| {
+                tagger.caption(&lodestash_ai::tagger::TagInput {
+                    media_code: &job.media_code,
+                    name: &name,
+                    image: Some(img),
+                })
+            });
+            let zs_tags = match (zero_shot, &img) {
+                (Some(z), Some(img)) => z.tag(img),
+                _ => Vec::new(),
+            };
+            prepared.push((job, name, caption, zs_tags));
         }
 
-        for (job, name, caption) in prepared {
+        for (job, name, caption, zs_tags) in prepared {
             if progress.is_cancelled() {
                 return;
             }
@@ -790,7 +808,10 @@ pub(super) fn drain_tags(
             } else {
                 lodestash_ai::tagger::TagResult::default()
             };
-            let tags = lodestash_ai::tagger::validate(result.tags);
+            // Union the VLM/name tags with the zero-shot proposals; validate dedupes + caps per facet.
+            let mut merged = result.tags;
+            merged.extend(zs_tags);
+            let tags = lodestash_ai::tagger::validate(merged);
             // The caption is the model's own words about the asset; it lands in `description`,
             // which FTS indexes, so it is searchable rather than decorative.
             if let Some(caption) = &result.caption {

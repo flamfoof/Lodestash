@@ -2157,6 +2157,12 @@ impl LodestashApp {
                             );
                         }
                     }
+                    // SigLIP zero-shot image tagger (AI-PIPELINE §2.1): a union pass over the same
+                    // preview, using the loaded search embedder + the teaching vocabulary. `None`
+                    // when no image-capable model is loaded — then only the VLM/API path runs.
+                    let image_zs = embedder.clone().and_then(|e| {
+                        lodestash_ai::image_tags::ImageZeroShot::new(e, &teach)
+                    });
                     // Visual tag pass: cloud API when enabled, else the local Ollama VLM.
                     if api_ok {
                         let tagger = lodestash_ai::openai::OpenAiTagger::new(
@@ -2179,6 +2185,7 @@ impl LodestashApp {
                             fallback
                                 .as_ref()
                                 .map(|t| t as &dyn lodestash_ai::tagger::Tagger),
+                            image_zs.as_ref(),
                             api_max_per_run,
                             workspace_dir.as_deref(),
                             cache_dir.as_deref(),
@@ -2196,6 +2203,7 @@ impl LodestashApp {
                         drain_tags(
                             &mut cat,
                             &tagger,
+                            image_zs.as_ref(),
                             workspace_dir.as_deref(),
                             cache_dir.as_deref(),
                             &job_progress,
@@ -13792,7 +13800,7 @@ mod tests {
         let tagger = lodestash_ai::ollama::OllamaTagger::new(model).with_vision(vision);
         let progress = crate::jobs::JobProgress::default();
         let cache = dir.path().join("thumbs");
-        drain_tags(&mut cat, &tagger, None, Some(&cache), &progress);
+        drain_tags(&mut cat, &tagger, None, None, Some(&cache), &progress);
 
         use std::sync::atomic::Ordering;
         assert_eq!(progress.done.load(Ordering::Relaxed), 2, "both assets ran");
@@ -13851,7 +13859,7 @@ mod tests {
         let cache = dirs::cache_dir()
             .map(|d| d.join("Lodestash").join("thumbs"))
             .expect("cache dir");
-        drain_tags(&mut cat, &tagger, None, Some(&cache), &progress);
+        drain_tags(&mut cat, &tagger, None, None, Some(&cache), &progress);
 
         let after = cat.count_needing_tags().expect("count after");
         let done = progress.done.load(std::sync::atomic::Ordering::Relaxed);
