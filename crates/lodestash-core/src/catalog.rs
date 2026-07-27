@@ -1216,6 +1216,11 @@ pub fn normalize_tag(namespace: &str, value: &str) -> Option<(String, String)> {
     Some((format!("{ns}:{}", display.to_lowercase()), display))
 }
 
+/// The mapping-rule `match_type` values (DATA-MODEL §4). `regex` and `embedding_knn` are defined in
+/// the schema but not yet evaluated by [`Catalog::apply_mapping`] — it skips them with a warning.
+pub const MAPPING_MATCH_TYPES: &[&str] =
+    &["exact_tag", "alias", "media_type", "glob_path", "regex", "embedding_knn"];
+
 /// The space-joined tag text FTS indexes for an asset — the same expression the triggers use.
 fn tags_concat_in(conn: &Connection, asset_id: i64) -> Result<String> {
     conn.query_row(
@@ -2486,6 +2491,238 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("tags read row: {e}")))
     }
 
+    // ── Mapping library (DATA-MODEL §4) ─────────────────────────────────────────────────────────
+    //
+    // Raw `asset_tag`s are observations; `asset_category` is the canonical interpretation, produced
+    // by applying a taxonomy's rules. The two are separate so a re-map is non-destructive — it never
+    // touches the tags. `apply_mapping` is the engine; the rest is minimal authoring + read.
+
+    /// Create a taxonomy (mapping library). `activate` makes it the single active one.
+    pub fn create_taxonomy(&self, name: &str, activate: bool) -> Result<i64> {
+        if activate {
+            self.conn
+                .execute("UPDATE taxonomy SET is_active = 0", [])
+                .map_err(|e| CoreError::Catalog(format!("taxonomy deactivate: {e}")))?;
+        }
+        self.conn
+            .execute(
+                "INSERT INTO taxonomy (uuid, name, version, is_active) VALUES (?1, ?2, 1, ?3)",
+                params![uuid::Uuid::new_v4().to_string(), name, activate as i64],
+            )
+            .map_err(|e| CoreError::Catalog(format!("taxonomy insert: {e}")))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// The active taxonomy's id, if one is set — the taxonomy the apply pass and search pre-filter use.
+    pub fn active_taxonomy(&self) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM taxonomy WHERE is_active = 1 LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| CoreError::Catalog(format!("active taxonomy: {e}")))
+    }
+
+    /// Add a category. `path` is the materialized "Environment/Foliage/Trees" (UNIQUE per taxonomy).
+    pub fn add_category(
+        &self,
+        taxonomy_id: i64,
+        parent_id: Option<i64>,
+        pref_label: &str,
+        path: &str,
+    ) -> Result<i64> {
+        self.conn
+            .execute(
+                "INSERT INTO category (taxonomy_id, parent_id, pref_label, path)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![taxonomy_id, parent_id, pref_label, path],
+            )
+            .map_err(|e| CoreError::Catalog(format!("category insert: {e}")))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Add a mapping rule. `match_type` is one of [`MAPPING_MATCH_TYPES`]; `priority` lower wins.
+    pub fn add_rule(
+        &self,
+        taxonomy_id: i64,
+        category_id: i64,
+        match_type: &str,
+        pattern: &str,
+        priority: i64,
+    ) -> Result<i64> {
+        self.conn
+            .execute(
+                "INSERT INTO mapping_rule (taxonomy_id, category_id, match_type, pattern, priority)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![taxonomy_id, category_id, match_type, pattern, priority],
+            )
+            .map_err(|e| CoreError::Catalog(format!("rule insert: {e}")))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// A manual category assignment — pinned, so `apply_mapping` never clobbers it (DATA-MODEL §4
+    /// step 3). Idempotent: re-pinning the same category is a no-op update.
+    pub fn assign_category_manual(
+        &self,
+        asset_id: i64,
+        category_id: i64,
+        taxonomy_id: i64,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO asset_category
+                    (asset_id, category_id, taxonomy_id, assigned_by, rule_id, confidence, is_pinned)
+                 VALUES (?1, ?2, ?3, 'manual', NULL, NULL, 1)
+                 ON CONFLICT(asset_id, category_id, taxonomy_id)
+                 DO UPDATE SET assigned_by = 'manual', is_pinned = 1, rule_id = NULL",
+                params![asset_id, category_id, taxonomy_id],
+            )
+            .map_err(|e| CoreError::Catalog(format!("manual assign: {e}")))?;
+        Ok(())
+    }
+
+    /// Remove one asset↔category assignment (pinned or not).
+    pub fn remove_category_assignment(
+        &self,
+        asset_id: i64,
+        category_id: i64,
+        taxonomy_id: i64,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM asset_category
+                 WHERE asset_id = ?1 AND category_id = ?2 AND taxonomy_id = ?3",
+                params![asset_id, category_id, taxonomy_id],
+            )
+            .map_err(|e| CoreError::Catalog(format!("remove assignment: {e}")))?;
+        Ok(())
+    }
+
+    /// Bump the taxonomy version — the marker a re-map records (DATA-MODEL §4 step 4). `apply_mapping`
+    /// regenerates the non-pinned rows regardless; this is the durable "the library changed" signal.
+    pub fn bump_taxonomy_version(&self, taxonomy_id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE taxonomy SET version = version + 1 WHERE id = ?1",
+                params![taxonomy_id],
+            )
+            .map_err(|e| CoreError::Catalog(format!("version bump: {e}")))?;
+        Ok(())
+    }
+
+    /// Categories an asset belongs to in a taxonomy: `(category_id, path, assigned_by, is_pinned)`.
+    pub fn categories_of(
+        &self,
+        asset_id: i64,
+        taxonomy_id: i64,
+    ) -> Result<Vec<(i64, String, String, bool)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT c.id, c.path, ac.assigned_by, ac.is_pinned
+                   FROM asset_category ac JOIN category c ON c.id = ac.category_id
+                  WHERE ac.asset_id = ?1 AND ac.taxonomy_id = ?2
+                  ORDER BY c.path",
+            )
+            .map_err(|e| CoreError::Catalog(format!("categories_of prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![asset_id, taxonomy_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0))
+            })
+            .map_err(|e| CoreError::Catalog(format!("categories_of query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("categories_of row: {e}")))
+    }
+
+    /// Apply a taxonomy's rules to the whole library (DATA-MODEL §4 step 2). Deterministic and
+    /// non-destructive:
+    /// - Non-pinned rule rows for the taxonomy are dropped and regenerated; **pinned rows survive**.
+    /// - Rules run in `priority` order (lower first) then id; the **first** rule to match an asset
+    ///   claims it (a `NOT EXISTS` guard on any existing assignment for the taxonomy), so priority is
+    ///   the tie-break and the result never depends on rule insertion order or row iteration order.
+    /// - Raw `asset_tag`s are untouched.
+    ///
+    /// ponytail: one winning category per (asset, taxonomy) — the deterministic core the P3 tests
+    /// pin. Multi-category assignment and the `regex`/`embedding_knn` match types are deferred (the
+    /// latter needs the embedder + seed vectors); unsupported types are skipped with a warning.
+    pub fn apply_mapping(&mut self, taxonomy_id: i64) -> Result<usize> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| CoreError::Catalog(format!("apply begin: {e}")))?;
+        tx.execute(
+            "DELETE FROM asset_category WHERE taxonomy_id = ?1 AND is_pinned = 0",
+            params![taxonomy_id],
+        )
+        .map_err(|e| CoreError::Catalog(format!("apply clear: {e}")))?;
+
+        let rules: Vec<(i64, i64, String, String)> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id, category_id, match_type, pattern FROM mapping_rule
+                     WHERE taxonomy_id = ?1 AND enabled = 1
+                     ORDER BY priority ASC, id ASC",
+                )
+                .map_err(|e| CoreError::Catalog(format!("apply rules prep: {e}")))?;
+            let rows = stmt
+                .query_map(params![taxonomy_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .map_err(|e| CoreError::Catalog(format!("apply rules query: {e}")))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| CoreError::Catalog(format!("apply rules row: {e}")))?;
+            rows
+        };
+
+        // Each rule: insert (asset, its category) for matching, not-yet-assigned, live assets. The
+        // NOT EXISTS guard + priority ordering makes the lowest-priority matching rule the winner.
+        const HEAD: &str = "INSERT OR IGNORE INTO asset_category
+                (asset_id, category_id, taxonomy_id, assigned_by, rule_id, confidence, is_pinned)
+             SELECT a.id, ?1, ?2, 'rule', ?3, NULL, 0 FROM asset a
+             WHERE a.deleted_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM asset_category ac
+                               WHERE ac.asset_id = a.id AND ac.taxonomy_id = ?2)
+               AND ";
+        let mut assigned = 0usize;
+        for (rule_id, category_id, match_type, pattern) in rules {
+            let cond = match match_type.as_str() {
+                "media_type" => "a.media_type_id = (SELECT id FROM media_type WHERE code = ?4)",
+                "exact_tag" => {
+                    "EXISTS (SELECT 1 FROM asset_tag at JOIN tag t ON t.id = at.tag_id
+                             WHERE at.asset_id = a.id AND t.norm_name = ?4)"
+                }
+                "alias" => {
+                    "EXISTS (SELECT 1 FROM asset_tag at JOIN tag t ON t.id = at.tag_id
+                             WHERE at.asset_id = a.id
+                               AND (t.norm_name = ?4 OR t.norm_name LIKE '%:' || ?4))"
+                }
+                "glob_path" => {
+                    "EXISTS (SELECT 1 FROM asset_file af
+                             WHERE af.asset_id = a.id AND af.rel_path GLOB ?4)"
+                }
+                other => {
+                    tracing::warn!(match_type = %other, "mapping: unsupported match_type skipped");
+                    continue;
+                }
+            };
+            // exact_tag/alias compare against the lowercased norm text; media_type/glob bind as-is.
+            let bind = match match_type.as_str() {
+                "exact_tag" | "alias" => pattern.to_lowercase(),
+                _ => pattern.clone(),
+            };
+            let sql = format!("{HEAD}{cond}");
+            let n = tx
+                .execute(&sql, params![category_id, taxonomy_id, rule_id, bind])
+                .map_err(|e| CoreError::Catalog(format!("apply rule {rule_id}: {e}")))?;
+            assigned += n;
+        }
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("apply commit: {e}")))?;
+        Ok(assigned)
+    }
+
     /// Store a model-written caption as the asset's description (AI-PIPELINE section 6). The FTS
     /// update trigger re-indexes the row, so a caption is searchable the moment it lands.
     pub fn set_description(&self, asset_id: i64, description: Option<&str>) -> Result<()> {
@@ -3507,6 +3744,95 @@ mod tests {
             size_bytes: size,
             mtime,
         }
+    }
+
+    /// `apply_mapping` is deterministic: rules run in priority order, the lowest-priority match wins,
+    /// and the result never depends on rule *insertion* order.
+    #[test]
+    fn mapping_rule_priority_lower_wins_and_is_order_independent() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let src = c.upsert_import_source("Lib", "C:/lib", "folder").expect("src");
+        c.record_crawl(src, None, &[rec("barrel.png", 1, 1)]).expect("crawl");
+        let asset: i64 = c
+            .conn
+            .query_row("SELECT id FROM asset LIMIT 1", [], |r| r.get(0))
+            .expect("asset");
+        c.set_tags(asset, "manual", None, &[TagAssignment::exact("subject", "barrel")])
+            .expect("tag");
+
+        let tax = c.create_taxonomy("Default", true).expect("tax");
+        let props = c.add_category(tax, None, "Props", "Props").expect("props");
+        let junk = c.add_category(tax, None, "Junk", "Junk").expect("junk");
+        // Insert the HIGH-priority-number (loses) rule FIRST, so a correct engine must sort by
+        // priority, not insertion/id order.
+        c.add_rule(tax, junk, "exact_tag", "subject:barrel", 200).expect("r1");
+        c.add_rule(tax, props, "exact_tag", "subject:barrel", 50).expect("r2");
+
+        let n = c.apply_mapping(tax).expect("apply");
+        assert_eq!(n, 1, "exactly one winning assignment");
+        let cats = c.categories_of(asset, tax).expect("cats");
+        assert_eq!(cats.len(), 1, "one category per asset");
+        assert_eq!(cats[0].1, "Props", "priority 50 beats 200 regardless of insert order");
+        assert_eq!(cats[0].2, "rule");
+    }
+
+    /// A pinned manual assignment survives a re-apply; non-pinned rule rows regenerate. Also proves
+    /// `alias`, `media_type`, and `glob_path` match, and that a pinned asset is not re-claimed by a rule.
+    #[test]
+    fn mapping_pinned_survives_reapply_and_match_types_work() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let src = c.upsert_import_source("Lib", "C:/lib", "folder").expect("src");
+        let sfx = CrawlRecord {
+            workspace_rel: None,
+            rel_path: "Audio/step.wav".into(),
+            name: "step.wav".into(),
+            media_type: "audio".into(),
+            size_bytes: 1,
+            mtime: 1,
+        };
+        c.record_crawl(src, None, &[rec("props/barrel.png", 1, 1), sfx]).expect("crawl");
+        let by_name = |c: &Catalog, like: &str| -> i64 {
+            c.conn
+                .query_row(
+                    "SELECT a.id FROM asset a JOIN asset_file af ON af.asset_id=a.id
+                     WHERE af.rel_path GLOB ?1 LIMIT 1",
+                    params![like],
+                    |r| r.get(0),
+                )
+                .expect("asset by path")
+        };
+        let barrel = by_name(&c, "*barrel*");
+        let step = by_name(&c, "*step*");
+        c.set_tags(barrel, "manual", None, &[TagAssignment::exact("subject", "barrel")])
+            .expect("tag");
+
+        let tax = c.create_taxonomy("Default", true).expect("tax");
+        let props = c.add_category(tax, None, "Props", "Props").expect("props");
+        let sfx_cat = c.add_category(tax, None, "SFX", "SFX").expect("sfx");
+        let manual_cat = c.add_category(tax, None, "Hero", "Hero").expect("hero");
+        // alias (bare value) matches the namespaced tag; media_type matches the wav.
+        c.add_rule(tax, props, "alias", "barrel", 100).expect("r-alias");
+        c.add_rule(tax, sfx_cat, "media_type", "audio", 100).expect("r-media");
+
+        // Pin the barrel to a manual category *before* applying — the rule must not override it.
+        c.assign_category_manual(barrel, manual_cat, tax).expect("pin");
+
+        c.apply_mapping(tax).expect("apply 1");
+        let barrel_cats = c.categories_of(barrel, tax).expect("cats");
+        assert_eq!(barrel_cats.len(), 1, "pinned asset keeps only its manual row");
+        assert_eq!(barrel_cats[0].1, "Hero");
+        assert!(barrel_cats[0].3, "row is pinned");
+        assert_eq!(c.categories_of(step, tax).expect("cats")[0].1, "SFX", "media_type rule matched");
+
+        // Re-map: bump version, re-apply. Pinned row survives; the SFX rule row regenerates.
+        c.bump_taxonomy_version(tax).expect("bump");
+        c.apply_mapping(tax).expect("apply 2");
+        let barrel_cats = c.categories_of(barrel, tax).expect("cats");
+        assert_eq!(barrel_cats.len(), 1);
+        assert_eq!(barrel_cats[0].1, "Hero", "pinned override survived the re-apply");
+        assert_eq!(c.categories_of(step, tax).expect("cats").len(), 1, "non-pinned regenerated once");
     }
 
     /// New assets queue for extraction; storing facets clears the flag and the values reach the
