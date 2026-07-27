@@ -4,7 +4,7 @@ Working notes for whoever (or whatever) continues the build. Unlike the rest of 
 is **not** a design spec — it's the state of play, the decisions already settled, and the traps.
 The design docs still win on any question of what the software *should* do.
 
-Last updated: **2026-07-26**, at `12a2c2e`.
+Last updated: **2026-07-27**, at `75fa5e9`.
 
 ---
 
@@ -88,7 +88,8 @@ in prose, so the VLM captions and a text model writes the facets; the caption be
   trait cards (6-colour palette, ✦ teaching / ⏸ paused, ⌕ find, ✕ un-promote). The **teaching**
   contract is wired end to end: `spawn_tagging` loads `teaching_traits` and injects them into the
   facet prompt, scoped per modality (`OllamaTagger`/`OpenAiTagger::with_teaching`). Schema needed no
-  migration — the trait columns were already in MIGRATION_05. Mapping tab stubbed (that's card 170).
+  migration — the trait columns were already in MIGRATION_05. (The Mapping tab beside it was stubbed
+  then; **shipped 2026-07-27**, see the P4-tail block below.)
 - **Audio tagging** — **CLAP zero-shot** (`lodestash_ai::clap_tags`), no new model: scores a clip
   against a game-audio label vocabulary in the shipped CLAP joint space, per-facet temperature-scaled
   softmax over `MIN_PROB`. Own `tags_dirty` queue + `drain_audio_tags`, runs before the VLM drain
@@ -103,7 +104,40 @@ in prose, so the VLM captions and a text model writes the facets; the caption be
   [`SELF-HOSTED-PROVIDER.md`](SELF-HOSTED-PROVIDER.md) (a **separate/future** spec — a hosted
   Lodestash endpoint is just another OpenAI-compatible URL the cloud card already accepts).
 
-*P4 still open*: YAMNet/PANNs + Whisper; the Mapping tab (card 170); Claude-native API impl + Batches;
+**P4's tail landed almost whole (2026-07-27).** Six slices this session:
+- **Cloud tagging reliability & cost controls (card 170, DONE)** — the free-tier path is now usable.
+  `OpenAiTagger::try_tag` classifies each call (`ApiError::Throttled{retry_after}` vs `Hard`); the
+  drain owns backoff+resume (honour `Retry-After`, else exp 2/4/8/16 s + jitter, cancel-polled). **The
+  core bug is fixed**: a failed call no longer wrote an empty tag set that cleared the asset "done, no
+  tags" — a throttled/failed asset stays `tags_dirty` for the next run. Hard error → local-Ollama
+  fallback per asset (latches `api_dead`); no fallback → leave dirty + stop. Plus an **endpoint-preset
+  picker** (`openai::PRESETS` Local/Gemini/Groq/OpenRouter + `is_free_endpoint`), a **Test connection**
+  preflight, a **budget guard** (`api_max_per_run` cap + a paid-endpoint confirm), and **key-at-rest**
+  in **Windows Credential Manager** (`config::secret` via the new `keyring` dep; blanked on disk,
+  plaintext fallback off-Windows). AI-PIPELINE §5.1 governs it.
+- **SigLIP zero-shot image/3D tagger (card 171)** — `zeroshot::score_facets` extracted as the shared
+  per-facet softmax core (CLAP + SigLIP both use it now); `image_tags::ImageZeroShot` mirrors
+  `clap_tags`, scoring a preview (or a **3D asset's stored multiview embedding** via `tag_vector`) against
+  a base vocabulary **plus the user's teaching traits**. Wired as a **union** pass into both drains
+  (`drain_tags` + `drain_api_tags`) over the preview each already decodes — merged before
+  `validate`+`set_tags` (source `ai`, one write). No new dep. Card 171 remainder = **WD-EVA02 only**
+  (blocked on the model-registry work in card 173).
+- **Mapping library (card 172, DONE end-to-end)** — the schema tables already existed; this session
+  added the engine + UI + facet + starter pack. `Catalog::apply_mapping` is deterministic + non-destructive
+  (drops non-pinned rule rows and regenerates; **pinned survives**; rules run `priority ASC, id`, first
+  match claims an asset via `NOT EXISTS`, so order-independent; raw tags untouched). Match types
+  `exact_tag`/`alias`/`media_type`/`glob_path` each in one SQL statement (SQLite `GLOB` for paths);
+  `regex`/`embedding_knn` skipped with a warning. The Traits screen's **⇢ Mapping** tab is real
+  (create library, add categories/rules, ▶ Apply); a **CATEGORY** facet in ⚑ Filters filters the grid
+  (`all_asset_categories` → per-sync map, hard structural pre-filter kept out of `passes` so its 20
+  tests stayed put); and a **✦ Load starter library** button seeds a curated game-asset taxonomy. This
+  also closes the P3 mapping-determinism test card. DATA-MODEL §4 governs it.
+- **Model-download hardening (card 173)** — `fetch_all`/`download_ort` verify bytes-written against
+  `Content-Length` and reject a **truncated** file (the silent "looks installed, panics at ort load"
+  bug); a **Remove models** button (`models::remove_models`) deletes SigLIP+CLAP for a re-fetch.
+
+*P4 still open*: WD-EVA02 dense tagger (needs the GPU-tier model registry — card 173) + YAMNet/PANNs +
+Whisper; Claude-native API impl + Batches; the optional `regex`/`embedding_knn` mapping match types;
 `+ trait` quick-add from the inspector; trait colour on inspector chips.
 
 **The dependency graph is harvested and export honours it** (P2, [`DATA-MODEL.md`](DATA-MODEL.md) §10).
@@ -515,15 +549,16 @@ Top of the list is finishing the in-pack feature (M14) the last session built, i
    previews** show only their type. (Pack **size** now shows on cards; **sort** shipped.)
 2. **Favourites design conformance** — four presentation deltas listed on the KANBAN card. Contained:
    glyph/colour/position, chip moves to the toolbar, plus a Favorites screen reusing the grid.
-3. **P5 — the Unity round-trip**: `register_project` → `/v1/import` → import queue → `import_record`
-   → dup-guard, then the UPM C# plugin (the big piece; unverifiable without a Unity install). Land
-   the MCP per-tool allow-list *before* the import ops, since those mutate a project.
-4. **P4 remainder** — *most of P4 shipped 2026-07-26* (accept/reject → `confirmed`, Traits screen +
-   teaching, CLAP zero-shot **audio** tagging, OpenAI-compatible **API** tagger — see §2). Still open:
-   YAMNet/PANNs discrete audio events + Whisper speech; the **Mapping tab** (card 170, the mapping
-   library); a **Claude-native** API impl + **Batches** (~50% cost); `+ trait` quick-add from the
-   inspector; trait colour on inspector chips. A full local Identify pass over this library is ~5 h of
-   CPU; it is manual and resumable for that reason (the API path is faster but costs per asset).
+3. **P5 — the Unity round-trip** *(now the biggest open frontier)*: land the **MCP per-tool allow-list**
+   (card 178, UI-SPEC §16) FIRST — it's self-contained and must gate the mutating ops on **both** planes
+   before they exist. Then `register_project` → `/v1/import` → import queue → `import_record` →
+   dup-guard, then the UPM C# plugin (the big piece; unverifiable without a Unity install).
+4. **P4 remainder** — *the P4 tail shipped almost whole 2026-07-27* (cloud reliability/cost card 170,
+   SigLIP zero-shot + 3D multiview card 171, the whole Mapping library card 172, download hardening
+   card 173 — see the P4-tail block in §2). Still open: **WD-EVA02** dense tagger (needs the GPU-tier
+   model registry — card 173) + YAMNet/PANNs + Whisper; **Claude-native** API impl + **Batches**; the
+   optional `regex`/`embedding_knn` mapping match types; `+ trait` quick-add + trait colour on inspector
+   chips. A full local Identify pass over this library is ~5 h of CPU; manual + resumable for that reason.
 5. **P2 remainder** — the naming heuristic for assets with no `.meta` (no GUID ⇒ no edges at all),
    prefabs inside an extracted workspace, the §13.6 relink panel, and `has_dependents`/
    `has_dependencies` as search filters rather than only chips.

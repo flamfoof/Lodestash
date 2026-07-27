@@ -1218,8 +1218,18 @@ pub fn normalize_tag(namespace: &str, value: &str) -> Option<(String, String)> {
 
 /// The mapping-rule `match_type` values (DATA-MODEL §4). `regex` and `embedding_knn` are defined in
 /// the schema but not yet evaluated by [`Catalog::apply_mapping`] — it skips them with a warning.
-pub const MAPPING_MATCH_TYPES: &[&str] =
-    &["exact_tag", "alias", "media_type", "glob_path", "regex", "embedding_knn"];
+pub const MAPPING_MATCH_TYPES: &[&str] = &[
+    "exact_tag",
+    "alias",
+    "media_type",
+    "glob_path",
+    "regex",
+    "embedding_knn",
+];
+
+/// One row of [`Catalog::list_rules`]: `(id, category_id, category_path, match_type, pattern,
+/// priority, enabled)`.
+pub type MappingRuleRow = (i64, i64, String, String, String, i64, bool);
 
 /// The space-joined tag text FTS indexes for an asset — the same expression the triggers use.
 fn tags_concat_in(conn: &Connection, asset_id: i64) -> Result<String> {
@@ -2523,16 +2533,63 @@ impl Catalog {
     /// (alias) rather than the coarse Audio (media_type).
     pub fn create_starter_taxonomy(&mut self) -> Result<i64> {
         // (path, [rules as (match_type, pattern, priority)]). Categories are flat/prefixed paths.
+        #[allow(clippy::type_complexity)]
         const PACK: &[(&str, &[(&str, &str, i64)])] = &[
-            ("Characters", &[("alias", "character", 100), ("alias", "creature", 100), ("alias", "monster", 100)]),
-            ("Environment", &[("alias", "environment", 100), ("alias", "tree", 120), ("alias", "terrain", 120), ("alias", "building", 120)]),
-            ("Props", &[("alias", "prop", 150), ("alias", "barrel", 150), ("alias", "crate", 150), ("alias", "chest", 150)]),
-            ("Weapons", &[("alias", "weapon", 100), ("alias", "sword", 100), ("alias", "gun", 100)]),
-            ("Vehicles", &[("alias", "vehicle", 100), ("alias", "ship", 100)]),
-            ("UI", &[("alias", "ui", 100), ("alias", "icon", 100), ("alias", "button", 100)]),
+            (
+                "Characters",
+                &[
+                    ("alias", "character", 100),
+                    ("alias", "creature", 100),
+                    ("alias", "monster", 100),
+                ],
+            ),
+            (
+                "Environment",
+                &[
+                    ("alias", "environment", 100),
+                    ("alias", "tree", 120),
+                    ("alias", "terrain", 120),
+                    ("alias", "building", 120),
+                ],
+            ),
+            (
+                "Props",
+                &[
+                    ("alias", "prop", 150),
+                    ("alias", "barrel", 150),
+                    ("alias", "crate", 150),
+                    ("alias", "chest", 150),
+                ],
+            ),
+            (
+                "Weapons",
+                &[
+                    ("alias", "weapon", 100),
+                    ("alias", "sword", 100),
+                    ("alias", "gun", 100),
+                ],
+            ),
+            (
+                "Vehicles",
+                &[("alias", "vehicle", 100), ("alias", "ship", 100)],
+            ),
+            (
+                "UI",
+                &[
+                    ("alias", "ui", 100),
+                    ("alias", "icon", 100),
+                    ("alias", "button", 100),
+                ],
+            ),
             ("Audio/Music", &[("alias", "music", 100)]),
-            ("Audio/SFX", &[("alias", "sfx", 100), ("alias", "sound effect", 100)]),
-            ("Audio/Ambience", &[("alias", "ambient", 100), ("alias", "ambience", 100)]),
+            (
+                "Audio/SFX",
+                &[("alias", "sfx", 100), ("alias", "sound effect", 100)],
+            ),
+            (
+                "Audio/Ambience",
+                &[("alias", "ambient", 100), ("alias", "ambience", 100)],
+            ),
             ("Audio", &[("media_type", "audio", 200)]),
             ("Materials/Textures", &[("media_type", "texture", 200)]),
             ("Materials", &[("media_type", "material", 200)]),
@@ -2724,7 +2781,9 @@ impl Catalog {
             )
             .map_err(|e| CoreError::Catalog(format!("list_categories prep: {e}")))?;
         let rows = stmt
-            .query_map(params![taxonomy_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .query_map(params![taxonomy_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
             .map_err(|e| CoreError::Catalog(format!("list_categories query: {e}")))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| CoreError::Catalog(format!("list_categories row: {e}")))
@@ -2732,10 +2791,7 @@ impl Catalog {
 
     /// Every rule in a taxonomy with its category's path, ordered as the apply engine runs them
     /// (`priority ASC, id`): `(id, category_id, category_path, match_type, pattern, priority, enabled)`.
-    pub fn list_rules(
-        &self,
-        taxonomy_id: i64,
-    ) -> Result<Vec<(i64, i64, String, String, String, i64, bool)>> {
+    pub fn list_rules(&self, taxonomy_id: i64) -> Result<Vec<MappingRuleRow>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -3886,28 +3942,41 @@ mod tests {
     fn mapping_rule_priority_lower_wins_and_is_order_independent() {
         let mut c = Catalog::open_in_memory().expect("open");
         c.seed_media_types().expect("seed");
-        let src = c.upsert_import_source("Lib", "C:/lib", "folder").expect("src");
-        c.record_crawl(src, None, &[rec("barrel.png", 1, 1)]).expect("crawl");
+        let src = c
+            .upsert_import_source("Lib", "C:/lib", "folder")
+            .expect("src");
+        c.record_crawl(src, None, &[rec("barrel.png", 1, 1)])
+            .expect("crawl");
         let asset: i64 = c
             .conn
             .query_row("SELECT id FROM asset LIMIT 1", [], |r| r.get(0))
             .expect("asset");
-        c.set_tags(asset, "manual", None, &[TagAssignment::exact("subject", "barrel")])
-            .expect("tag");
+        c.set_tags(
+            asset,
+            "manual",
+            None,
+            &[TagAssignment::exact("subject", "barrel")],
+        )
+        .expect("tag");
 
         let tax = c.create_taxonomy("Default", true).expect("tax");
         let props = c.add_category(tax, None, "Props", "Props").expect("props");
         let junk = c.add_category(tax, None, "Junk", "Junk").expect("junk");
         // Insert the HIGH-priority-number (loses) rule FIRST, so a correct engine must sort by
         // priority, not insertion/id order.
-        c.add_rule(tax, junk, "exact_tag", "subject:barrel", 200).expect("r1");
-        c.add_rule(tax, props, "exact_tag", "subject:barrel", 50).expect("r2");
+        c.add_rule(tax, junk, "exact_tag", "subject:barrel", 200)
+            .expect("r1");
+        c.add_rule(tax, props, "exact_tag", "subject:barrel", 50)
+            .expect("r2");
 
         let n = c.apply_mapping(tax).expect("apply");
         assert_eq!(n, 1, "exactly one winning assignment");
         let cats = c.categories_of(asset, tax).expect("cats");
         assert_eq!(cats.len(), 1, "one category per asset");
-        assert_eq!(cats[0].1, "Props", "priority 50 beats 200 regardless of insert order");
+        assert_eq!(
+            cats[0].1, "Props",
+            "priority 50 beats 200 regardless of insert order"
+        );
         assert_eq!(cats[0].2, "rule");
     }
 
@@ -3916,7 +3985,9 @@ mod tests {
     fn starter_taxonomy_applies_to_real_assets() {
         let mut c = Catalog::open_in_memory().expect("open");
         c.seed_media_types().expect("seed");
-        let src = c.upsert_import_source("Lib", "C:/lib", "folder").expect("src");
+        let src = c
+            .upsert_import_source("Lib", "C:/lib", "folder")
+            .expect("src");
         let music = CrawlRecord {
             workspace_rel: None,
             rel_path: "Audio/theme.wav".into(),
@@ -3925,7 +3996,8 @@ mod tests {
             size_bytes: 1,
             mtime: 1,
         };
-        c.record_crawl(src, None, &[rec("hero.png", 1, 1), music]).expect("crawl");
+        c.record_crawl(src, None, &[rec("hero.png", 1, 1), music])
+            .expect("crawl");
         let hero: i64 = c
             .conn
             .query_row("SELECT a.id FROM asset a JOIN asset_file af ON af.asset_id=a.id WHERE af.rel_path GLOB '*hero*'", [], |r| r.get(0))
@@ -3934,20 +4006,36 @@ mod tests {
             .conn
             .query_row("SELECT a.id FROM asset a JOIN asset_file af ON af.asset_id=a.id WHERE af.rel_path GLOB '*theme*'", [], |r| r.get(0))
             .expect("theme");
-        c.set_tags(hero, "ai", Some("m"), &[TagAssignment::exact("usage", "character")])
-            .expect("tag hero");
-        c.set_tags(theme, "ai", Some("m"), &[TagAssignment::exact("usage", "music")])
-            .expect("tag theme");
+        c.set_tags(
+            hero,
+            "ai",
+            Some("m"),
+            &[TagAssignment::exact("usage", "character")],
+        )
+        .expect("tag hero");
+        c.set_tags(
+            theme,
+            "ai",
+            Some("m"),
+            &[TagAssignment::exact("usage", "music")],
+        )
+        .expect("tag theme");
 
         let tax = c.create_starter_taxonomy().expect("starter");
         assert_eq!(c.active_taxonomy().expect("active"), Some(tax));
-        assert!(c.list_categories(tax).expect("cats").len() >= 10, "a real category tree");
+        assert!(
+            c.list_categories(tax).expect("cats").len() >= 10,
+            "a real category tree"
+        );
 
         let n = c.apply_mapping(tax).expect("apply");
         assert!(n >= 2, "both assets categorized");
         assert_eq!(c.categories_of(hero, tax).expect("cats")[0].1, "Characters");
         // The music clip lands in Audio/Music (alias, prio 100), not the coarse Audio (media_type 200).
-        assert_eq!(c.categories_of(theme, tax).expect("cats")[0].1, "Audio/Music");
+        assert_eq!(
+            c.categories_of(theme, tax).expect("cats")[0].1,
+            "Audio/Music"
+        );
     }
 
     /// A pinned manual assignment survives a re-apply; non-pinned rule rows regenerate. Also proves
@@ -3956,7 +4044,9 @@ mod tests {
     fn mapping_pinned_survives_reapply_and_match_types_work() {
         let mut c = Catalog::open_in_memory().expect("open");
         c.seed_media_types().expect("seed");
-        let src = c.upsert_import_source("Lib", "C:/lib", "folder").expect("src");
+        let src = c
+            .upsert_import_source("Lib", "C:/lib", "folder")
+            .expect("src");
         let sfx = CrawlRecord {
             workspace_rel: None,
             rel_path: "Audio/step.wav".into(),
@@ -3965,7 +4055,8 @@ mod tests {
             size_bytes: 1,
             mtime: 1,
         };
-        c.record_crawl(src, None, &[rec("props/barrel.png", 1, 1), sfx]).expect("crawl");
+        c.record_crawl(src, None, &[rec("props/barrel.png", 1, 1), sfx])
+            .expect("crawl");
         let by_name = |c: &Catalog, like: &str| -> i64 {
             c.conn
                 .query_row(
@@ -3978,39 +4069,68 @@ mod tests {
         };
         let barrel = by_name(&c, "*barrel*");
         let step = by_name(&c, "*step*");
-        c.set_tags(barrel, "manual", None, &[TagAssignment::exact("subject", "barrel")])
-            .expect("tag");
+        c.set_tags(
+            barrel,
+            "manual",
+            None,
+            &[TagAssignment::exact("subject", "barrel")],
+        )
+        .expect("tag");
 
         let tax = c.create_taxonomy("Default", true).expect("tax");
         let props = c.add_category(tax, None, "Props", "Props").expect("props");
         let sfx_cat = c.add_category(tax, None, "SFX", "SFX").expect("sfx");
         let manual_cat = c.add_category(tax, None, "Hero", "Hero").expect("hero");
         // alias (bare value) matches the namespaced tag; media_type matches the wav.
-        c.add_rule(tax, props, "alias", "barrel", 100).expect("r-alias");
-        c.add_rule(tax, sfx_cat, "media_type", "audio", 100).expect("r-media");
+        c.add_rule(tax, props, "alias", "barrel", 100)
+            .expect("r-alias");
+        c.add_rule(tax, sfx_cat, "media_type", "audio", 100)
+            .expect("r-media");
 
         // Pin the barrel to a manual category *before* applying — the rule must not override it.
-        c.assign_category_manual(barrel, manual_cat, tax).expect("pin");
+        c.assign_category_manual(barrel, manual_cat, tax)
+            .expect("pin");
 
         c.apply_mapping(tax).expect("apply 1");
         let barrel_cats = c.categories_of(barrel, tax).expect("cats");
-        assert_eq!(barrel_cats.len(), 1, "pinned asset keeps only its manual row");
+        assert_eq!(
+            barrel_cats.len(),
+            1,
+            "pinned asset keeps only its manual row"
+        );
         assert_eq!(barrel_cats[0].1, "Hero");
         assert!(barrel_cats[0].3, "row is pinned");
-        assert_eq!(c.categories_of(step, tax).expect("cats")[0].1, "SFX", "media_type rule matched");
+        assert_eq!(
+            c.categories_of(step, tax).expect("cats")[0].1,
+            "SFX",
+            "media_type rule matched"
+        );
 
         // Re-map: bump version, re-apply. Pinned row survives; the SFX rule row regenerates.
         c.bump_taxonomy_version(tax).expect("bump");
         c.apply_mapping(tax).expect("apply 2");
         let barrel_cats = c.categories_of(barrel, tax).expect("cats");
         assert_eq!(barrel_cats.len(), 1);
-        assert_eq!(barrel_cats[0].1, "Hero", "pinned override survived the re-apply");
-        assert_eq!(c.categories_of(step, tax).expect("cats").len(), 1, "non-pinned regenerated once");
+        assert_eq!(
+            barrel_cats[0].1, "Hero",
+            "pinned override survived the re-apply"
+        );
+        assert_eq!(
+            c.categories_of(step, tax).expect("cats").len(),
+            1,
+            "non-pinned regenerated once"
+        );
 
         // The Library facet map reflects the assignments: barrel→Hero, step→SFX.
         let by_asset = c.all_asset_categories(tax).expect("facet map");
-        assert_eq!(by_asset.get(&barrel).map(|v| v.as_slice()), Some(["Hero".to_string()].as_slice()));
-        assert_eq!(by_asset.get(&step).map(|v| v.as_slice()), Some(["SFX".to_string()].as_slice()));
+        assert_eq!(
+            by_asset.get(&barrel).map(|v| v.as_slice()),
+            Some(["Hero".to_string()].as_slice())
+        );
+        assert_eq!(
+            by_asset.get(&step).map(|v| v.as_slice()),
+            Some(["SFX".to_string()].as_slice())
+        );
     }
 
     /// New assets queue for extraction; storing facets clears the flag and the values reach the

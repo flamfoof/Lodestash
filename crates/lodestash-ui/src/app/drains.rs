@@ -267,7 +267,10 @@ pub(super) fn drain_api_tags(
             }
             // Budget cap reached — stop and leave the remaining assets queued for the next run.
             if max_assets != 0 && tagged >= max_assets {
-                tracing::info!(max_assets, "api tag budget cap reached; remaining assets stay queued");
+                tracing::info!(
+                    max_assets,
+                    "api tag budget cap reached; remaining assets stay queued"
+                );
                 return;
             }
             // Audio has no cloud path. If the CLAP pass already tagged it, it isn't in this queue;
@@ -312,9 +315,17 @@ pub(super) fn drain_api_tags(
             // The endpoint already proved dead this pass: skip it and use the local model directly.
             // (`api_dead` is only ever set when a fallback exists — see the error arm.)
             if api_dead {
-                let mut tags = fallback.map(|fb| fb.tag(&input, None).tags).unwrap_or_default();
+                let mut tags = fallback
+                    .map(|fb| fb.tag(&input, None).tags)
+                    .unwrap_or_default();
                 if let Some(z) = zero_shot {
-                    tags.extend(zeroshot_tags(z, cat, job.asset_id, &job.media_code, Some(&img)));
+                    tags.extend(zeroshot_tags(
+                        z,
+                        cat,
+                        job.asset_id,
+                        &job.media_code,
+                        Some(&img),
+                    ));
                 }
                 let tags = lodestash_ai::tagger::validate(tags);
                 if let Err(e) = cat.set_tags(job.asset_id, "ai", Some(&model_id), &tags) {
@@ -354,7 +365,13 @@ pub(super) fn drain_api_tags(
             // Union the API tags with the SigLIP zero-shot proposals over the same preview.
             let mut tags = tags;
             if let Some(z) = zero_shot {
-                tags.extend(zeroshot_tags(z, cat, job.asset_id, &job.media_code, Some(&img)));
+                tags.extend(zeroshot_tags(
+                    z,
+                    cat,
+                    job.asset_id,
+                    &job.media_code,
+                    Some(&img),
+                ));
             }
             let tags = lodestash_ai::tagger::validate(tags);
             if let Err(e) = cat.set_tags(job.asset_id, "ai", Some(&model_id), &tags) {

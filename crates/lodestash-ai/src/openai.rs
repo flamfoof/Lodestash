@@ -161,7 +161,9 @@ impl OpenAiTagger {
             .set("Authorization", &format!("Bearer {}", self.api_key))
             .send_json(body)
             .map_err(classify_ureq)?;
-        let resp: serde_json::Value = resp.into_json().map_err(|e| ApiError::Hard(e.to_string()))?;
+        let resp: serde_json::Value = resp
+            .into_json()
+            .map_err(|e| ApiError::Hard(e.to_string()))?;
         resp["choices"][0]["message"]["content"]
             .as_str()
             .map(str::to_string)
@@ -254,9 +256,15 @@ mod tests {
     #[test]
     fn presets_round_trip_and_free_detection() {
         // Default base URL resolves to the Gemini preset; a trailing slash doesn't break the match.
-        assert_eq!(preset_for(DEFAULT_BASE_URL).map(|p| p.label), Some("Gemini (free)"));
+        assert_eq!(
+            preset_for(DEFAULT_BASE_URL).map(|p| p.label),
+            Some("Gemini (free)")
+        );
         let with_slash = format!("{DEFAULT_BASE_URL}/");
-        assert_eq!(preset_for(&with_slash).map(|p| p.label), Some("Gemini (free)"));
+        assert_eq!(
+            preset_for(&with_slash).map(|p| p.label),
+            Some("Gemini (free)")
+        );
         // An unknown remote is Custom (None) and, crucially, treated as *paid* so the budget guard
         // asks before spending; a loopback URL is always free even when it's not a listed preset.
         assert!(preset_for("https://api.example.com/v1").is_none());
@@ -269,15 +277,27 @@ mod tests {
     #[test]
     fn classify_splits_retry_worthy_from_hard() {
         // 429/503 are throttles the drain should back off and resume; 401/400 are hard.
-        let throttle =
-            classify_ureq(ureq::Error::Status(429, ureq::Response::new(429, "x", "").unwrap()));
-        assert!(matches!(throttle, ApiError::Throttled { .. }), "429 must be a throttle");
-        let unavailable =
-            classify_ureq(ureq::Error::Status(503, ureq::Response::new(503, "x", "").unwrap()));
-        assert!(matches!(unavailable, ApiError::Throttled { .. }), "503 must be a throttle");
+        let throttle = classify_ureq(ureq::Error::Status(
+            429,
+            ureq::Response::new(429, "x", "").unwrap(),
+        ));
+        assert!(
+            matches!(throttle, ApiError::Throttled { .. }),
+            "429 must be a throttle"
+        );
+        let unavailable = classify_ureq(ureq::Error::Status(
+            503,
+            ureq::Response::new(503, "x", "").unwrap(),
+        ));
+        assert!(
+            matches!(unavailable, ApiError::Throttled { .. }),
+            "503 must be a throttle"
+        );
 
-        let bad_key =
-            classify_ureq(ureq::Error::Status(401, ureq::Response::new(401, "x", "nope").unwrap()));
+        let bad_key = classify_ureq(ureq::Error::Status(
+            401,
+            ureq::Response::new(401, "x", "nope").unwrap(),
+        ));
         match bad_key {
             ApiError::Hard(m) => assert!(m.contains("401"), "hard error keeps the status code"),
             _ => panic!("401 must be a hard error, not retried forever"),

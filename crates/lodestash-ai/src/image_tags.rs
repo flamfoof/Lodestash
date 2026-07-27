@@ -112,8 +112,10 @@ impl ImageZeroShot {
         // Base vocabulary as owned tuples, then add each visual teaching trait (skip audio-scoped —
         // this pass only ever sees visual assets). Dedup so a taught word that duplicates a base
         // label doesn't get two candidate rows.
-        let mut pairs: Vec<(String, String)> =
-            LABELS.iter().map(|(f, l)| (f.to_string(), l.to_string())).collect();
+        let mut pairs: Vec<(String, String)> = LABELS
+            .iter()
+            .map(|(f, l)| (f.to_string(), l.to_string()))
+            .collect();
         for t in teach {
             if t.scope.as_deref() == Some("audio") {
                 continue;
@@ -162,7 +164,9 @@ impl ImageZeroShot {
     pub fn tag_vector(&self, v: &[f32]) -> Vec<TagAssignment> {
         let tags = score_facets(
             v,
-            self.labels.iter().map(|(f, l, vec)| (f.as_str(), l.as_str(), vec.as_slice())),
+            self.labels
+                .iter()
+                .map(|(f, l, vec)| (f.as_str(), l.as_str(), vec.as_slice())),
         );
         validate(tags)
     }
@@ -216,7 +220,8 @@ mod tests {
         let img = image::RgbaImage::new(4, 4);
         let tags = zs.tag(&img);
         assert!(
-            tags.iter().any(|t| t.namespace == "mood" && t.value == "grimdark"),
+            tags.iter()
+                .any(|t| t.namespace == "mood" && t.value == "grimdark"),
             "the taught trait should be assignable via zero-shot: {tags:?}"
         );
     }

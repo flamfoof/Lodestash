@@ -265,8 +265,7 @@ fn fetch_all(
 pub fn remove_models() -> Result<(), String> {
     for dir in [siglip_dir(), clap_dir()].into_iter().flatten() {
         if dir.exists() {
-            std::fs::remove_dir_all(&dir)
-                .map_err(|e| format!("remove {}: {e}", dir.display()))?;
+            std::fs::remove_dir_all(&dir).map_err(|e| format!("remove {}: {e}", dir.display()))?;
         }
     }
     Ok(())

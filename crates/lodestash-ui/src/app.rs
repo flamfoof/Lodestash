@@ -2206,9 +2206,9 @@ impl LodestashApp {
                     // SigLIP zero-shot image tagger (AI-PIPELINE §2.1): a union pass over the same
                     // preview, using the loaded search embedder + the teaching vocabulary. `None`
                     // when no image-capable model is loaded — then only the VLM/API path runs.
-                    let image_zs = embedder.clone().and_then(|e| {
-                        lodestash_ai::image_tags::ImageZeroShot::new(e, &teach)
-                    });
+                    let image_zs = embedder
+                        .clone()
+                        .and_then(|e| lodestash_ai::image_tags::ImageZeroShot::new(e, &teach));
                     // Visual tag pass: cloud API when enabled, else the local Ollama VLM.
                     if api_ok {
                         let tagger = lodestash_ai::openai::OpenAiTagger::new(
@@ -2220,7 +2220,9 @@ impl LodestashApp {
                         // stays queued for the next run.
                         let fallback = model.clone().map(|m| {
                             match vision_model.clone() {
-                                Some(v) => lodestash_ai::ollama::OllamaTagger::new(m).with_vision(v),
+                                Some(v) => {
+                                    lodestash_ai::ollama::OllamaTagger::new(m).with_vision(v)
+                                }
                                 None => lodestash_ai::ollama::OllamaTagger::new(m),
                             }
                             .with_teaching(teach.clone())
@@ -3276,7 +3278,7 @@ impl LodestashApp {
     }
 
     /// Run one cloud tagging call against a bundled sample image (AI-PIPELINE §5.1 "connection test
-    /// + vision preflight") off-thread, so a wrong endpoint / non-vision model / dead key is caught
+    /// and vision preflight") off-thread, so a wrong endpoint / non-vision model / dead key is caught
     /// in one click before any bulk run — the #1 cloud failure mode.
     fn spawn_api_test(&mut self, ctx: &egui::Context) {
         if self.api_test_rx.is_some() {
@@ -6926,7 +6928,9 @@ impl LodestashApp {
                 .inner_margin(egui::Margin::same(10.0))
                 .show(ui, |ui| {
                     ui.label(
-                        RichText::new("No mapping library yet.").size(12.0).color(theme::TEXT),
+                        RichText::new("No mapping library yet.")
+                            .size(12.0)
+                            .color(theme::TEXT),
                     );
                     ui.horizontal(|ui| {
                         ui.add(
@@ -6982,10 +6986,13 @@ impl LodestashApp {
                     .color(theme::TEXT),
             );
             ui.label(
-                RichText::new(format!("v{tax_ver} \u{00b7} {} categories \u{00b7} {} rules",
-                    self.vocab.categories.len(), self.vocab.rules.len()))
-                    .size(10.0)
-                    .color(theme::TEXT_DIM),
+                RichText::new(format!(
+                    "v{tax_ver} \u{00b7} {} categories \u{00b7} {} rules",
+                    self.vocab.categories.len(),
+                    self.vocab.rules.len()
+                ))
+                .size(10.0)
+                .color(theme::TEXT_DIM),
             );
             if ui
                 .add(
@@ -7136,7 +7143,11 @@ impl LodestashApp {
                     ui.label(
                         RichText::new(format!("{mtype} \u{201c}{pattern}\u{201d}"))
                             .size(11.0)
-                            .color(if enabled { theme::TEXT } else { theme::TEXT_DIM }),
+                            .color(if enabled {
+                                theme::TEXT
+                            } else {
+                                theme::TEXT_DIM
+                            }),
                     );
                     ui.label(RichText::new("\u{2192}").size(11.0).color(theme::TEXT_DIM));
                     ui.label(RichText::new(&path).size(11.0).color(theme::ARCANE_BRIGHT));
@@ -7175,14 +7186,19 @@ impl LodestashApp {
                         self.vocab.nc_label.clear();
                         self.jobs.toast("Mapping library created", Intent::Success);
                     }
-                    Err(e) => self.jobs.toast(format!("Create failed: {e}"), Intent::Danger),
+                    Err(e) => self
+                        .jobs
+                        .toast(format!("Create failed: {e}"), Intent::Danger),
                 }
             }
             MappingAction::CreateStarter => match cat.create_starter_taxonomy() {
-                Ok(_) => self
+                Ok(_) => self.jobs.toast(
+                    "Starter library loaded \u{2014} press Apply",
+                    Intent::Success,
+                ),
+                Err(e) => self
                     .jobs
-                    .toast("Starter library loaded \u{2014} press Apply", Intent::Success),
-                Err(e) => self.jobs.toast(format!("Starter failed: {e}"), Intent::Danger),
+                    .toast(format!("Starter failed: {e}"), Intent::Danger),
             },
             MappingAction::AddCategory(tax) => {
                 let path = self.vocab.nc_label.trim().to_string();
@@ -7194,9 +7210,14 @@ impl LodestashApp {
                 match cat.add_category(tax, None, &label, &path) {
                     Ok(_) => {
                         self.vocab.nc_label.clear();
-                        self.jobs.toast(format!("Category \u{201c}{path}\u{201d} added"), Intent::Success);
+                        self.jobs.toast(
+                            format!("Category \u{201c}{path}\u{201d} added"),
+                            Intent::Success,
+                        );
                     }
-                    Err(e) => self.jobs.toast(format!("Add category failed: {e}"), Intent::Danger),
+                    Err(e) => self
+                        .jobs
+                        .toast(format!("Add category failed: {e}"), Intent::Danger),
                 }
             }
             MappingAction::AddRule(tax) => {
@@ -7213,17 +7234,22 @@ impl LodestashApp {
                         self.vocab.nr_pattern.clear();
                         self.jobs.toast("Rule added", Intent::Success);
                     }
-                    Err(e) => self.jobs.toast(format!("Add rule failed: {e}"), Intent::Danger),
+                    Err(e) => self
+                        .jobs
+                        .toast(format!("Add rule failed: {e}"), Intent::Danger),
                 }
             }
             MappingAction::DeleteRule(id) => {
                 let _ = cat.delete_rule(id);
             }
             MappingAction::Apply(tax) => match cat.apply_mapping(tax) {
-                Ok(n) => self
+                Ok(n) => self.jobs.toast(
+                    format!("Applied \u{2014} {n} assets categorized"),
+                    Intent::Success,
+                ),
+                Err(e) => self
                     .jobs
-                    .toast(format!("Applied \u{2014} {n} assets categorized"), Intent::Success),
-                Err(e) => self.jobs.toast(format!("Apply failed: {e}"), Intent::Danger),
+                    .toast(format!("Apply failed: {e}"), Intent::Danger),
             },
         }
         // The write went through the ephemeral connection; force the read connection to refresh.
@@ -8608,7 +8634,9 @@ impl LodestashApp {
                     self.jobs
                         .toast("Models removed — click Download to re-fetch", Intent::Info);
                 }
-                Err(e) => self.jobs.toast(format!("Remove failed: {e}"), Intent::Danger),
+                Err(e) => self
+                    .jobs
+                    .toast(format!("Remove failed: {e}"), Intent::Danger),
             }
         }
 

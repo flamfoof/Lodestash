@@ -91,7 +91,9 @@ impl AudioZeroShot {
         let v = self.embedder.embed_audio(mel, frames);
         let tags = score_facets(
             &v,
-            self.labels.iter().map(|(f, l, vec)| (*f, *l, vec.as_slice())),
+            self.labels
+                .iter()
+                .map(|(f, l, vec)| (*f, *l, vec.as_slice())),
         );
         validate(tags)
     }
