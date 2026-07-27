@@ -2513,6 +2513,41 @@ impl Catalog {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Create a curated starter mapping library (DATA-MODEL §4 "import a starter pack") and make it
+    /// active. Categories + rules are shaped to the vocabulary the shipped taggers actually emit
+    /// (usage/subject facet values, `media_type` codes), so a fresh library gets useful categories
+    /// from one **Apply** with no authoring. Returns the new taxonomy id.
+    ///
+    /// Rules use `alias` (bare value, matches a tag in any namespace) for specifics at priority 100
+    /// and `media_type` fallbacks at 200 — first-match-wins means a music clip lands in Audio/Music
+    /// (alias) rather than the coarse Audio (media_type).
+    pub fn create_starter_taxonomy(&mut self) -> Result<i64> {
+        // (path, [rules as (match_type, pattern, priority)]). Categories are flat/prefixed paths.
+        const PACK: &[(&str, &[(&str, &str, i64)])] = &[
+            ("Characters", &[("alias", "character", 100), ("alias", "creature", 100), ("alias", "monster", 100)]),
+            ("Environment", &[("alias", "environment", 100), ("alias", "tree", 120), ("alias", "terrain", 120), ("alias", "building", 120)]),
+            ("Props", &[("alias", "prop", 150), ("alias", "barrel", 150), ("alias", "crate", 150), ("alias", "chest", 150)]),
+            ("Weapons", &[("alias", "weapon", 100), ("alias", "sword", 100), ("alias", "gun", 100)]),
+            ("Vehicles", &[("alias", "vehicle", 100), ("alias", "ship", 100)]),
+            ("UI", &[("alias", "ui", 100), ("alias", "icon", 100), ("alias", "button", 100)]),
+            ("Audio/Music", &[("alias", "music", 100)]),
+            ("Audio/SFX", &[("alias", "sfx", 100), ("alias", "sound effect", 100)]),
+            ("Audio/Ambience", &[("alias", "ambient", 100), ("alias", "ambience", 100)]),
+            ("Audio", &[("media_type", "audio", 200)]),
+            ("Materials/Textures", &[("media_type", "texture", 200)]),
+            ("Materials", &[("media_type", "material", 200)]),
+        ];
+        let tax = self.create_taxonomy("Starter", true)?;
+        for (path, rules) in PACK {
+            let label = path.rsplit('/').next().unwrap_or(path);
+            let cat = self.add_category(tax, None, label, path)?;
+            for (mt, pat, prio) in *rules {
+                self.add_rule(tax, cat, mt, pat, *prio)?;
+            }
+        }
+        Ok(tax)
+    }
+
     /// The active taxonomy's id, if one is set — the taxonomy the apply pass and search pre-filter use.
     pub fn active_taxonomy(&self) -> Result<Option<i64>> {
         self.conn
@@ -3874,6 +3909,45 @@ mod tests {
         assert_eq!(cats.len(), 1, "one category per asset");
         assert_eq!(cats[0].1, "Props", "priority 50 beats 200 regardless of insert order");
         assert_eq!(cats[0].2, "rule");
+    }
+
+    /// The starter pack creates a usable library and its rules categorize real assets end to end.
+    #[test]
+    fn starter_taxonomy_applies_to_real_assets() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let src = c.upsert_import_source("Lib", "C:/lib", "folder").expect("src");
+        let music = CrawlRecord {
+            workspace_rel: None,
+            rel_path: "Audio/theme.wav".into(),
+            name: "theme.wav".into(),
+            media_type: "audio".into(),
+            size_bytes: 1,
+            mtime: 1,
+        };
+        c.record_crawl(src, None, &[rec("hero.png", 1, 1), music]).expect("crawl");
+        let hero: i64 = c
+            .conn
+            .query_row("SELECT a.id FROM asset a JOIN asset_file af ON af.asset_id=a.id WHERE af.rel_path GLOB '*hero*'", [], |r| r.get(0))
+            .expect("hero");
+        let theme: i64 = c
+            .conn
+            .query_row("SELECT a.id FROM asset a JOIN asset_file af ON af.asset_id=a.id WHERE af.rel_path GLOB '*theme*'", [], |r| r.get(0))
+            .expect("theme");
+        c.set_tags(hero, "ai", Some("m"), &[TagAssignment::exact("usage", "character")])
+            .expect("tag hero");
+        c.set_tags(theme, "ai", Some("m"), &[TagAssignment::exact("usage", "music")])
+            .expect("tag theme");
+
+        let tax = c.create_starter_taxonomy().expect("starter");
+        assert_eq!(c.active_taxonomy().expect("active"), Some(tax));
+        assert!(c.list_categories(tax).expect("cats").len() >= 10, "a real category tree");
+
+        let n = c.apply_mapping(tax).expect("apply");
+        assert!(n >= 2, "both assets categorized");
+        assert_eq!(c.categories_of(hero, tax).expect("cats")[0].1, "Characters");
+        // The music clip lands in Audio/Music (alias, prio 100), not the coarse Audio (media_type 200).
+        assert_eq!(c.categories_of(theme, tax).expect("cats")[0].1, "Audio/Music");
     }
 
     /// A pinned manual assignment survives a re-apply; non-pinned rule rows regenerate. Also proves

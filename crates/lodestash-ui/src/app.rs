@@ -6937,13 +6937,35 @@ impl LodestashApp {
                         if ui
                             .add(
                                 egui::Button::new(
-                                    RichText::new("+ Create library").size(12.0).color(theme::BG),
+                                    RichText::new("+ Create empty").size(12.0).color(theme::BG),
                                 )
                                 .fill(theme::GOLD),
                             )
                             .clicked()
                         {
                             action = Some(MappingAction::CreateTaxonomy);
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("\u{2726} Load starter library")
+                                        .size(12.0)
+                                        .color(theme::ARCANE),
+                                )
+                                .stroke(egui::Stroke::new(1.0, theme::ARCANE))
+                                .rounding(6.0),
+                            )
+                            .on_hover_text(
+                                "A ready-made category tree (Characters, Environment, Props, \
+                                 Weapons, Audio\u{2026}) with rules matched to the tags Identify \
+                                 produces \u{2014} just press Apply after.",
+                            )
+                            .clicked()
+                        {
+                            action = Some(MappingAction::CreateStarter);
                         }
                     });
                 });
@@ -7156,6 +7178,12 @@ impl LodestashApp {
                     Err(e) => self.jobs.toast(format!("Create failed: {e}"), Intent::Danger),
                 }
             }
+            MappingAction::CreateStarter => match cat.create_starter_taxonomy() {
+                Ok(_) => self
+                    .jobs
+                    .toast("Starter library loaded \u{2014} press Apply", Intent::Success),
+                Err(e) => self.jobs.toast(format!("Starter failed: {e}"), Intent::Danger),
+            },
             MappingAction::AddCategory(tax) => {
                 let path = self.vocab.nc_label.trim().to_string();
                 if path.is_empty() {
@@ -11050,6 +11078,7 @@ enum VocabAction {
 /// `taxonomy_id` where the write needs it.
 enum MappingAction {
     CreateTaxonomy,
+    CreateStarter,
     AddCategory(i64),
     AddRule(i64),
     DeleteRule(i64),
