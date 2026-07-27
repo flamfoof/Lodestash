@@ -7650,7 +7650,7 @@ impl LodestashApp {
                                             .add(
                                                 egui::TextEdit::singleline(&mut self.config.api_key)
                                                     .password(true)
-                                                    .hint_text("stored locally; never logged")
+                                                    .hint_text("stored in Credential Manager; never logged")
                                                     .desired_width(320.0),
                                             )
                                             .lost_focus()

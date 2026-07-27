@@ -434,6 +434,50 @@ fn default_api_max_per_run() -> u32 {
     500
 }
 
+/// The cloud API key at rest (AI-PIPELINE §5.1). On Windows the key lives in Credential Manager via
+/// `keyring`; everywhere else these are no-ops and the caller keeps the plaintext-config fallback.
+/// Every call is failure-tolerant — a locked or absent keychain never breaks config save/load.
+mod secret {
+    #[cfg(windows)]
+    const SERVICE: &str = "Lodestash";
+    #[cfg(windows)]
+    const USER: &str = "api_key";
+
+    #[cfg(windows)]
+    fn entry() -> Option<keyring::Entry> {
+        keyring::Entry::new(SERVICE, USER).ok()
+    }
+
+    /// Store the key; returns `true` only if it was actually written to the OS store.
+    #[cfg(windows)]
+    pub fn store_api_key(key: &str) -> bool {
+        entry().is_some_and(|e| e.set_password(key).is_ok())
+    }
+
+    #[cfg(windows)]
+    pub fn load_api_key() -> Option<String> {
+        entry().and_then(|e| e.get_password().ok())
+    }
+
+    #[cfg(windows)]
+    pub fn clear_api_key() {
+        if let Some(e) = entry() {
+            let _ = e.delete_credential();
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub fn store_api_key(_key: &str) -> bool {
+        false // no OS store wired for this platform → plaintext-config fallback
+    }
+    #[cfg(not(windows))]
+    pub fn load_api_key() -> Option<String> {
+        None
+    }
+    #[cfg(not(windows))]
+    pub fn clear_api_key() {}
+}
+
 fn default_api_base_url() -> String {
     lodestash_ai::openai::DEFAULT_BASE_URL.to_string()
 }
@@ -483,7 +527,15 @@ impl AppConfig {
             Ok(b) => b,
             Err(_) => return Self::default(),
         };
-        serde_json::from_slice(&bytes).unwrap_or_default()
+        let mut cfg: Self = serde_json::from_slice(&bytes).unwrap_or_default();
+        // The API key lives in the OS credential store (AI-PIPELINE §5.1); the on-disk config keeps
+        // it blank when that succeeded. If it's blank on disk, recover it from the keychain.
+        if cfg.api_key.is_empty() {
+            if let Some(key) = secret::load_api_key() {
+                cfg.api_key = key;
+            }
+        }
+        cfg
     }
 
     pub fn save(&self) {
@@ -494,8 +546,26 @@ impl AppConfig {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Ok(json) = serde_json::to_vec_pretty(self) {
-            let _ = std::fs::write(path, json);
+        // Key at rest (AI-PIPELINE §5.1): try the OS credential store first. If it took the key we
+        // blank it in the on-disk JSON; if the store is unavailable, fall back to plaintext config so
+        // the app still works. An empty key clears any stored secret.
+        let stored_in_keychain = if self.api_key.trim().is_empty() {
+            secret::clear_api_key();
+            false
+        } else {
+            secret::store_api_key(&self.api_key)
+        };
+        let json = match serde_json::to_value(self) {
+            Ok(mut v) => {
+                if stored_in_keychain {
+                    v["api_key"] = serde_json::Value::String(String::new());
+                }
+                v
+            }
+            Err(_) => return,
+        };
+        if let Ok(bytes) = serde_json::to_vec_pretty(&json) {
+            let _ = std::fs::write(path, bytes);
         }
     }
 
