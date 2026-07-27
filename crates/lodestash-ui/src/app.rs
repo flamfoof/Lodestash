@@ -580,6 +580,8 @@ impl TriBucket {
 #[derive(Default)]
 struct ContentFilter {
     traits: std::collections::BTreeSet<String>,
+    /// Canonical category paths (mapping library, DATA-MODEL §4) selected in the CATEGORY facet.
+    categories: std::collections::BTreeSet<String>,
     tri_buckets: std::collections::BTreeSet<TriBucket>,
     sizes: std::collections::BTreeSet<SizeTier>,
     /// Minimum star rating (None = no constraint). DATA-MODEL §12.
@@ -654,6 +656,7 @@ impl LinkFilter {
 impl ContentFilter {
     fn active_count(&self) -> usize {
         self.traits.len()
+            + self.categories.len()
             + self.tri_buckets.len()
             + self.sizes.len()
             + usize::from(self.min_rating.is_some())
@@ -668,6 +671,7 @@ impl ContentFilter {
     /// Empty every filter set (the popover's "Clear all", and part of the Library nav reset).
     fn clear(&mut self) {
         self.traits.clear();
+        self.categories.clear();
         self.tri_buckets.clear();
         self.sizes.clear();
         self.min_rating = None;
@@ -905,6 +909,11 @@ pub struct LodestashApp {
     asset_tags: std::collections::HashMap<i64, Vec<lodestash_core::catalog::TagAssignment>>,
     /// Tag vocabulary with usage counts, most-used first — the ⚑ Filters TRAIT chips.
     tag_usage: Vec<(String, String, i64)>,
+    /// Each asset's mapping-library category paths (active taxonomy), refreshed per sync — the map
+    /// the CATEGORY facet filters on (mapping library, DATA-MODEL §4).
+    asset_categories: std::collections::HashMap<i64, Vec<String>>,
+    /// Category paths with assignment counts, most-used first — the ⚑ Filters CATEGORY chips.
+    category_usage: Vec<(String, i64)>,
     /// Material asset id → the absolute path of the texture its preview sphere wears, resolved
     /// from the dependency graph (DATA-MODEL §10). Refreshed per catalog sync with the tag maps.
     material_albedo: std::collections::HashMap<i64, String>,
@@ -1208,6 +1217,8 @@ impl LodestashApp {
             favorites: std::collections::HashSet::new(),
             asset_tags: std::collections::HashMap::new(),
             tag_usage: Vec::new(),
+            asset_categories: std::collections::HashMap::new(),
+            category_usage: Vec::new(),
             material_albedo: std::collections::HashMap::new(),
             edges_out: std::collections::HashSet::new(),
             edges_in: std::collections::HashSet::new(),
@@ -2009,6 +2020,27 @@ impl LodestashApp {
         match cat.tag_usage(60) {
             Ok(v) => self.tag_usage = v,
             Err(e) => tracing::warn!(%e, "tag vocabulary unavailable"),
+        }
+        // Canonical categories move on the same beat (mapping library, DATA-MODEL §4). Only the
+        // active taxonomy's assignments feed the facet; no taxonomy ⇒ empty (facet hides itself).
+        match cat.active_taxonomy() {
+            Ok(Some(tax)) => {
+                self.asset_categories = cat.all_asset_categories(tax).unwrap_or_default();
+                let mut counts: std::collections::BTreeMap<String, i64> =
+                    std::collections::BTreeMap::new();
+                for paths in self.asset_categories.values() {
+                    for p in paths {
+                        *counts.entry(p.clone()).or_default() += 1;
+                    }
+                }
+                let mut usage: Vec<(String, i64)> = counts.into_iter().collect();
+                usage.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                self.category_usage = usage;
+            }
+            _ => {
+                self.asset_categories.clear();
+                self.category_usage.clear();
+            }
         }
         self.vocab.dirty = true; // the Traits screen reloads its list next open
         match cat.favorite_ids() {
@@ -4608,6 +4640,20 @@ impl LodestashApp {
                     id.is_some_and(|id| favorites.contains(&id)),
                     tiers,
                 )
+            });
+        }
+        // CATEGORY facet (mapping library, DATA-MODEL §4) — a hard structural pre-filter, kept out
+        // of `passes` so that pure predicate stays free of an app-owned map. An asset passes if any
+        // of its canonical category paths is selected; an unmapped asset fails when the facet is on.
+        if !self.content_filter.categories.is_empty() {
+            let want = &self.content_filter.categories;
+            let asset_cats = &self.asset_categories;
+            let entries = &self.entries;
+            idxs.retain(|&i| {
+                entries[i]
+                    .asset_id
+                    .and_then(|id| asset_cats.get(&id))
+                    .is_some_and(|paths| paths.iter().any(|p| want.contains(p)))
             });
         }
 
@@ -9822,6 +9868,7 @@ impl eframe::App for LodestashApp {
                             let cf = &mut self.content_filter;
                             let tiers = &self.config.size_tiers;
                             let tag_usage = &self.tag_usage;
+                            let category_usage = &self.category_usage;
                             let mut filter_changed = false;
                             egui::popup::popup_below_widget(
                                 ui,
@@ -9830,7 +9877,7 @@ impl eframe::App for LodestashApp {
                                 egui::PopupCloseBehavior::CloseOnClickOutside,
                                 |ui| {
                                     filter_changed =
-                                        filter_popover(ui, cf, tag_usage, tiers);
+                                        filter_popover(ui, cf, tag_usage, category_usage, tiers);
                                 },
                             );
                             if filter_changed {
@@ -12641,6 +12688,7 @@ fn filter_popover(
     ui: &mut Ui,
     cf: &mut ContentFilter,
     tag_usage: &[(String, String, i64)],
+    category_usage: &[(String, i64)],
     tiers: &SizeTiers,
 ) -> bool {
     ui.set_min_width(320.0);
@@ -12715,6 +12763,27 @@ fn filter_popover(
         });
     }
     ui.add_space(6.0);
+
+    // CATEGORY — canonical mapping-library categories (DATA-MODEL §4). Hidden until a taxonomy has
+    // been applied (no assignments ⇒ nothing to filter on).
+    if !category_usage.is_empty() {
+        section_label(ui, "CATEGORY");
+        ui.horizontal_wrapped(|ui| {
+            for (path, count) in category_usage {
+                let sel = cf.categories.contains(path);
+                let label = format!("{path}  {count}");
+                if filter_chip(ui, &label, sel, theme::ARCANE_BRIGHT) {
+                    if sel {
+                        cf.categories.remove(path);
+                    } else {
+                        cf.categories.insert(path.clone());
+                    }
+                    changed = true;
+                }
+            }
+        });
+        ui.add_space(6.0);
+    }
 
     // TRIANGLES — backed by asset.tri_count (DATA-MODEL §14), extracted after each scan.
     section_label(ui, "TRIANGLES");

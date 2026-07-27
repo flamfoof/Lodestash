@@ -2636,6 +2636,37 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("categories_of row: {e}")))
     }
 
+    /// Category paths assigned to each live asset in a taxonomy, as `asset_id → [path]` — the map
+    /// the Library CATEGORY facet filters on (mirrors `all_asset_tags`).
+    pub fn all_asset_categories(
+        &self,
+        taxonomy_id: i64,
+    ) -> Result<std::collections::HashMap<i64, Vec<String>>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT ac.asset_id, c.path
+                   FROM asset_category ac
+                   JOIN category c ON c.id = ac.category_id
+                   JOIN asset a    ON a.id = ac.asset_id AND a.deleted_at IS NULL
+                  WHERE ac.taxonomy_id = ?1
+                  ORDER BY ac.asset_id, c.path",
+            )
+            .map_err(|e| CoreError::Catalog(format!("all_asset_categories prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![taxonomy_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| CoreError::Catalog(format!("all_asset_categories query: {e}")))?;
+        let mut out: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+        for row in rows {
+            let (id, path) =
+                row.map_err(|e| CoreError::Catalog(format!("all_asset_categories row: {e}")))?;
+            out.entry(id).or_default().push(path);
+        }
+        Ok(out)
+    }
+
     /// A taxonomy's `(name, version)`, if it exists.
     pub fn taxonomy_meta(&self, taxonomy_id: i64) -> Result<Option<(String, i64)>> {
         self.conn
@@ -3901,6 +3932,11 @@ mod tests {
         assert_eq!(barrel_cats.len(), 1);
         assert_eq!(barrel_cats[0].1, "Hero", "pinned override survived the re-apply");
         assert_eq!(c.categories_of(step, tax).expect("cats").len(), 1, "non-pinned regenerated once");
+
+        // The Library facet map reflects the assignments: barrel→Hero, step→SFX.
+        let by_asset = c.all_asset_categories(tax).expect("facet map");
+        assert_eq!(by_asset.get(&barrel).map(|v| v.as_slice()), Some(["Hero".to_string()].as_slice()));
+        assert_eq!(by_asset.get(&step).map(|v| v.as_slice()), Some(["SFX".to_string()].as_slice()));
     }
 
     /// New assets queue for extraction; storing facets clears the flag and the values reach the
