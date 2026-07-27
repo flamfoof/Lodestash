@@ -592,7 +592,7 @@ struct ContentFilter {
     trait_search: String,
 }
 
-/// Traits screen state (UI-SPEC §9). The Mapping tab is card 170 — stubbed here.
+/// Traits screen state (UI-SPEC §9), including the Mapping tab (card 172).
 #[derive(Default)]
 struct VocabState {
     tab: VocabTab,
@@ -606,6 +606,20 @@ struct VocabState {
     /// media_type code the trait applies to; empty = any.
     nt_scope: String,
     nt_usage: String,
+    /// Mapping tab, reloaded when `map_dirty`.
+    map_dirty: bool,
+    /// Active taxonomy `(id, name, version)`, `None` until one is created.
+    taxonomy: Option<(i64, String, i64)>,
+    /// `(id, pref_label, path)` per category in the active taxonomy.
+    categories: Vec<(i64, String, String)>,
+    /// `(id, category_id, category_path, match_type, pattern, priority, enabled)` per rule.
+    rules: Vec<(i64, i64, String, String, String, i64, bool)>,
+    /// NEW CATEGORY + NEW RULE forms.
+    nc_label: String,
+    nr_category: Option<i64>,
+    nr_match_type: String,
+    nr_pattern: String,
+    nr_priority: String,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -6594,21 +6608,16 @@ impl LodestashApp {
                     .clicked()
                 {
                     self.vocab.tab = tab;
+                    if tab == VocabTab::Mapping {
+                        self.vocab.map_dirty = true; // load the taxonomy on entry
+                    }
                 }
             }
         });
         ui.add(egui::Separator::default().spacing(10.0));
 
         if self.vocab.tab == VocabTab::Mapping {
-            ui.add_space(40.0);
-            ui.vertical_centered(|ui| {
-                ui.label(RichText::new("\u{21E2}").size(48.0).color(theme::TEXT_DIM));
-                ui.label(
-                    RichText::new("Mapping rules land with the mapping library.")
-                        .color(theme::TEXT_MUTED)
-                        .size(13.0),
-                );
-            });
+            self.mapping_tab(ui);
             return;
         }
 
@@ -6816,6 +6825,336 @@ impl LodestashApp {
             VocabAction::FindTagged(_) => unreachable!("handled above"),
         }
         self.vocab.dirty = true;
+    }
+
+    /// Mapping tab (UI-SPEC §9, DATA-MODEL §4): author categories + rules for the active taxonomy and
+    /// run the apply engine. Rules are raw-tag/metadata → canonical category; the engine
+    /// (`Catalog::apply_mapping`) is deterministic and keeps pinned overrides.
+    fn mapping_tab(&mut self, ui: &mut Ui) {
+        if self.vocab.nr_match_type.is_empty() {
+            self.vocab.nr_match_type = "exact_tag".to_string();
+        }
+        // Reload the active taxonomy, its categories and rules when marked stale.
+        if self.vocab.map_dirty {
+            if self.search_catalog.is_none() {
+                self.search_catalog = catalog_db_path().and_then(|p| Catalog::open(&p).ok());
+            }
+            if let Some(cat) = &self.search_catalog {
+                let tax = cat.active_taxonomy().ok().flatten();
+                self.vocab.taxonomy = tax.and_then(|id| {
+                    cat.taxonomy_meta(id)
+                        .ok()
+                        .flatten()
+                        .map(|(name, ver)| (id, name, ver))
+                });
+                if let Some((id, _, _)) = self.vocab.taxonomy {
+                    self.vocab.categories = cat.list_categories(id).unwrap_or_default();
+                    self.vocab.rules = cat.list_rules(id).unwrap_or_default();
+                } else {
+                    self.vocab.categories.clear();
+                    self.vocab.rules.clear();
+                }
+            }
+            self.vocab.map_dirty = false;
+        }
+
+        ui.label(
+            RichText::new(
+                "Map raw tags, paths and media types to a canonical category library. Apply is \
+                 non-destructive \u{2014} it never touches your tags, and pinned assignments survive \
+                 a re-run.",
+            )
+            .color(theme::TEXT_MUTED)
+            .size(12.0),
+        );
+        ui.add_space(8.0);
+
+        let mut action: Option<MappingAction> = None;
+
+        // No taxonomy yet → offer to create one.
+        let Some((tax_id, tax_name, tax_ver)) = self.vocab.taxonomy.clone() else {
+            egui::Frame::none()
+                .fill(theme::SURFACE)
+                .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                .rounding(6.0)
+                .inner_margin(egui::Margin::same(10.0))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("No mapping library yet.").size(12.0).color(theme::TEXT),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.vocab.nc_label)
+                                .hint_text("library name (e.g. Project taxonomy)")
+                                .desired_width(240.0),
+                        );
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("+ Create library").size(12.0).color(theme::BG),
+                                )
+                                .fill(theme::GOLD),
+                            )
+                            .clicked()
+                        {
+                            action = Some(MappingAction::CreateTaxonomy);
+                        }
+                    });
+                });
+            if let Some(a) = action {
+                self.apply_mapping_action(a);
+            }
+            return;
+        };
+
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("\u{21E2} {tax_name}"))
+                    .size(14.0)
+                    .color(theme::TEXT),
+            );
+            ui.label(
+                RichText::new(format!("v{tax_ver} \u{00b7} {} categories \u{00b7} {} rules",
+                    self.vocab.categories.len(), self.vocab.rules.len()))
+                    .size(10.0)
+                    .color(theme::TEXT_DIM),
+            );
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("\u{25B6} Apply").size(12.0).color(theme::BG))
+                        .fill(theme::ARCANE_BRIGHT),
+                )
+                .on_hover_text("Run the rules over the whole library (pinned assignments are kept)")
+                .clicked()
+            {
+                action = Some(MappingAction::Apply(tax_id));
+            }
+        });
+        ui.add_space(8.0);
+
+        // NEW CATEGORY.
+        egui::Frame::none()
+            .fill(theme::SURFACE)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER))
+            .rounding(6.0)
+            .inner_margin(egui::Margin::same(10.0))
+            .show(ui, |ui| {
+                section_label(ui, "NEW CATEGORY");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.vocab.nc_label)
+                            .hint_text("path e.g. Environment/Foliage")
+                            .desired_width(240.0),
+                    );
+                    if ui
+                        .add_enabled(
+                            !self.vocab.nc_label.trim().is_empty(),
+                            egui::Button::new(RichText::new("+ Add").size(12.0).color(theme::BG))
+                                .fill(theme::GOLD),
+                        )
+                        .clicked()
+                    {
+                        action = Some(MappingAction::AddCategory(tax_id));
+                    }
+                });
+            });
+
+        // NEW RULE (needs at least one category).
+        if !self.vocab.categories.is_empty() {
+            ui.add_space(8.0);
+            egui::Frame::none()
+                .fill(theme::SURFACE)
+                .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                .rounding(6.0)
+                .inner_margin(egui::Margin::same(10.0))
+                .show(ui, |ui| {
+                    section_label(ui, "NEW RULE");
+                    if self.vocab.nr_category.is_none() {
+                        self.vocab.nr_category = self.vocab.categories.first().map(|c| c.0);
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("when").size(11.0).color(theme::TEXT_DIM));
+                        egui::ComboBox::from_id_salt("nr_match")
+                            .selected_text(self.vocab.nr_match_type.clone())
+                            .width(110.0)
+                            .show_ui(ui, |ui| {
+                                // The engine-supported match types (DATA-MODEL §4); regex/embedding_knn
+                                // are defined but not yet evaluated, so they're not offered here.
+                                for m in ["exact_tag", "alias", "media_type", "glob_path"] {
+                                    ui.selectable_value(
+                                        &mut self.vocab.nr_match_type,
+                                        m.to_string(),
+                                        m,
+                                    );
+                                }
+                            });
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.vocab.nr_pattern)
+                                .hint_text(match self.vocab.nr_match_type.as_str() {
+                                    "media_type" => "audio | image | model_3d | \u{2026}",
+                                    "glob_path" => "*/Props/*",
+                                    "alias" => "barrel",
+                                    _ => "subject:barrel",
+                                })
+                                .desired_width(180.0),
+                        );
+                        ui.label(RichText::new("\u{2192}").size(12.0).color(theme::TEXT_DIM));
+                        let sel_label = self
+                            .vocab
+                            .categories
+                            .iter()
+                            .find(|c| Some(c.0) == self.vocab.nr_category)
+                            .map(|c| c.2.clone())
+                            .unwrap_or_default();
+                        egui::ComboBox::from_id_salt("nr_cat")
+                            .selected_text(sel_label)
+                            .width(160.0)
+                            .show_ui(ui, |ui| {
+                                for (id, _, path) in &self.vocab.categories {
+                                    ui.selectable_value(
+                                        &mut self.vocab.nr_category,
+                                        Some(*id),
+                                        path,
+                                    );
+                                }
+                            });
+                        ui.label(RichText::new("priority").size(11.0).color(theme::TEXT_DIM));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.vocab.nr_priority)
+                                .hint_text("100")
+                                .desired_width(48.0),
+                        );
+                        if ui
+                            .add_enabled(
+                                !self.vocab.nr_pattern.trim().is_empty()
+                                    && self.vocab.nr_category.is_some(),
+                                egui::Button::new(
+                                    RichText::new("+ Add rule").size(12.0).color(theme::BG),
+                                )
+                                .fill(theme::GOLD),
+                            )
+                            .clicked()
+                        {
+                            action = Some(MappingAction::AddRule(tax_id));
+                        }
+                    });
+                    ui.label(
+                        RichText::new("lower priority wins when two rules match the same asset")
+                            .size(10.0)
+                            .color(theme::TEXT_DIM),
+                    );
+                });
+        }
+
+        // RULES list.
+        ui.add_space(10.0);
+        section_label(ui, "RULES");
+        if self.vocab.rules.is_empty() {
+            ui.label(
+                RichText::new("No rules yet \u{2014} add one above, then Apply.")
+                    .size(11.0)
+                    .color(theme::TEXT_DIM),
+            );
+        }
+        ScrollArea::vertical().show(ui, |ui| {
+            for (id, _cat_id, path, mtype, pattern, priority, enabled) in self.vocab.rules.clone() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{priority}"))
+                            .size(10.0)
+                            .monospace()
+                            .color(theme::TEXT_DIM),
+                    );
+                    ui.label(
+                        RichText::new(format!("{mtype} \u{201c}{pattern}\u{201d}"))
+                            .size(11.0)
+                            .color(if enabled { theme::TEXT } else { theme::TEXT_DIM }),
+                    );
+                    ui.label(RichText::new("\u{2192}").size(11.0).color(theme::TEXT_DIM));
+                    ui.label(RichText::new(&path).size(11.0).color(theme::ARCANE_BRIGHT));
+                    if ui
+                        .add(egui::Button::new(RichText::new("\u{2715}").size(10.0)).small())
+                        .on_hover_text("Delete rule")
+                        .clicked()
+                    {
+                        action = Some(MappingAction::DeleteRule(id));
+                    }
+                });
+            }
+        });
+
+        if let Some(a) = action {
+            self.apply_mapping_action(a);
+        }
+    }
+
+    /// Apply one Mapping-tab edit on a short-lived connection (same inline pattern as
+    /// [`Self::apply_vocab_action`] — tiny writes, no worker-thread reload race). `Apply` runs the
+    /// whole-library engine, which is pure SQL (one statement per rule) and fast enough inline.
+    fn apply_mapping_action(&mut self, action: MappingAction) {
+        let Some(db) = catalog_db_path() else {
+            return;
+        };
+        let Ok(mut cat) = Catalog::open(&db) else {
+            return;
+        };
+        match action {
+            MappingAction::CreateTaxonomy => {
+                let name = self.vocab.nc_label.trim();
+                let name = if name.is_empty() { "Default" } else { name };
+                match cat.create_taxonomy(name, true) {
+                    Ok(_) => {
+                        self.vocab.nc_label.clear();
+                        self.jobs.toast("Mapping library created", Intent::Success);
+                    }
+                    Err(e) => self.jobs.toast(format!("Create failed: {e}"), Intent::Danger),
+                }
+            }
+            MappingAction::AddCategory(tax) => {
+                let path = self.vocab.nc_label.trim().to_string();
+                if path.is_empty() {
+                    return;
+                }
+                // pref_label is the leaf of the path (materialized path is the id-by-convention).
+                let label = path.rsplit('/').next().unwrap_or(&path).to_string();
+                match cat.add_category(tax, None, &label, &path) {
+                    Ok(_) => {
+                        self.vocab.nc_label.clear();
+                        self.jobs.toast(format!("Category \u{201c}{path}\u{201d} added"), Intent::Success);
+                    }
+                    Err(e) => self.jobs.toast(format!("Add category failed: {e}"), Intent::Danger),
+                }
+            }
+            MappingAction::AddRule(tax) => {
+                let Some(cat_id) = self.vocab.nr_category else {
+                    return;
+                };
+                let pattern = self.vocab.nr_pattern.trim().to_string();
+                if pattern.is_empty() {
+                    return;
+                }
+                let priority: i64 = self.vocab.nr_priority.trim().parse().unwrap_or(100);
+                match cat.add_rule(tax, cat_id, &self.vocab.nr_match_type, &pattern, priority) {
+                    Ok(_) => {
+                        self.vocab.nr_pattern.clear();
+                        self.jobs.toast("Rule added", Intent::Success);
+                    }
+                    Err(e) => self.jobs.toast(format!("Add rule failed: {e}"), Intent::Danger),
+                }
+            }
+            MappingAction::DeleteRule(id) => {
+                let _ = cat.delete_rule(id);
+            }
+            MappingAction::Apply(tax) => match cat.apply_mapping(tax) {
+                Ok(n) => self
+                    .jobs
+                    .toast(format!("Applied \u{2014} {n} assets categorized"), Intent::Success),
+                Err(e) => self.jobs.toast(format!("Apply failed: {e}"), Intent::Danger),
+            },
+        }
+        // The write went through the ephemeral connection; force the read connection to refresh.
+        self.search_catalog = None;
+        self.vocab.map_dirty = true;
     }
 
     // ── Trash screen (UI-SPEC §7) ───────────────────────────────────────────────
@@ -10658,6 +10997,16 @@ enum VocabAction {
     Unpromote(i64),
     SetStyle(i64, Option<String>, Option<String>),
     FindTagged(String),
+}
+
+/// A Mapping-tab edit (card 172), applied by `apply_mapping_action`. Carries the active
+/// `taxonomy_id` where the write needs it.
+enum MappingAction {
+    CreateTaxonomy,
+    AddCategory(i64),
+    AddRule(i64),
+    DeleteRule(i64),
+    Apply(i64),
 }
 
 /// The 6-colour trait palette (UI-SPEC §9 ✎ style). Facet-agnostic — a trait's colour is the

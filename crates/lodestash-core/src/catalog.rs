@@ -2636,6 +2636,74 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("categories_of row: {e}")))
     }
 
+    /// A taxonomy's `(name, version)`, if it exists.
+    pub fn taxonomy_meta(&self, taxonomy_id: i64) -> Result<Option<(String, i64)>> {
+        self.conn
+            .query_row(
+                "SELECT name, version FROM taxonomy WHERE id = ?1",
+                params![taxonomy_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| CoreError::Catalog(format!("taxonomy_meta: {e}")))
+    }
+
+    /// Every category in a taxonomy: `(id, pref_label, path)`, ordered by path.
+    pub fn list_categories(&self, taxonomy_id: i64) -> Result<Vec<(i64, String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, pref_label, path FROM category
+                  WHERE taxonomy_id = ?1 ORDER BY path",
+            )
+            .map_err(|e| CoreError::Catalog(format!("list_categories prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![taxonomy_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(|e| CoreError::Catalog(format!("list_categories query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("list_categories row: {e}")))
+    }
+
+    /// Every rule in a taxonomy with its category's path, ordered as the apply engine runs them
+    /// (`priority ASC, id`): `(id, category_id, category_path, match_type, pattern, priority, enabled)`.
+    pub fn list_rules(
+        &self,
+        taxonomy_id: i64,
+    ) -> Result<Vec<(i64, i64, String, String, String, i64, bool)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT r.id, r.category_id, c.path, r.match_type, r.pattern, r.priority, r.enabled
+                   FROM mapping_rule r JOIN category c ON c.id = r.category_id
+                  WHERE r.taxonomy_id = ?1
+                  ORDER BY r.priority ASC, r.id",
+            )
+            .map_err(|e| CoreError::Catalog(format!("list_rules prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![taxonomy_id], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get::<_, i64>(6)? != 0,
+                ))
+            })
+            .map_err(|e| CoreError::Catalog(format!("list_rules query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("list_rules row: {e}")))
+    }
+
+    /// Delete a mapping rule (and, via re-apply, the non-pinned rows it produced).
+    pub fn delete_rule(&self, rule_id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM mapping_rule WHERE id = ?1", params![rule_id])
+            .map_err(|e| CoreError::Catalog(format!("delete_rule: {e}")))?;
+        Ok(())
+    }
+
     /// Apply a taxonomy's rules to the whole library (DATA-MODEL §4 step 2). Deterministic and
     /// non-destructive:
     /// - Non-pinned rule rows for the taxonomy are dropped and regenerated; **pinned rows survive**.
