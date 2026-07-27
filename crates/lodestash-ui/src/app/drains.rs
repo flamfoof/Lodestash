@@ -207,6 +207,7 @@ pub(super) fn drain_api_tags(
     cat: &mut Catalog,
     tagger: &lodestash_ai::openai::OpenAiTagger,
     fallback: Option<&dyn lodestash_ai::tagger::Tagger>,
+    max_assets: u32,
     workspace_dir: Option<&std::path::Path>,
     cache_dir: Option<&std::path::Path>,
     progress: &crate::jobs::JobProgress,
@@ -217,6 +218,9 @@ pub(super) fn drain_api_tags(
     const BATCH: usize = 16;
     const TAG_PX: u32 = 384;
     let model_id = tagger.model_id().to_string();
+    // Budget guard (AI-PIPELINE §5.1): stop after `max_assets` API calls and leave the rest queued,
+    // so a mis-scoped run on a paid endpoint can't run away. `0` = uncapped (a local/free endpoint).
+    let mut tagged: u32 = 0;
     // Once a *hard* error proves the endpoint is unusable (bad key/quota/non-vision model), stop
     // hammering it for the rest of the pass — every remaining asset would fail the same way. If a
     // local fallback exists we use it for the remainder; if not, we've already stopped (see below).
@@ -237,6 +241,11 @@ pub(super) fn drain_api_tags(
         }
         for job in jobs {
             if progress.is_cancelled() {
+                return;
+            }
+            // Budget cap reached — stop and leave the remaining assets queued for the next run.
+            if max_assets != 0 && tagged >= max_assets {
+                tracing::info!(max_assets, "api tag budget cap reached; remaining assets stay queued");
                 return;
             }
             // Audio has no cloud path. If the CLAP pass already tagged it, it isn't in this queue;
@@ -291,6 +300,7 @@ pub(super) fn drain_api_tags(
                 continue;
             }
 
+            tagged += 1; // one asset went to the API (Ok or fell back after a real attempt)
             let tags = match attempt_api_tag(tagger, &input, progress) {
                 AttemptOutcome::Ok(tags) => tags,
                 AttemptOutcome::Cancelled => return,

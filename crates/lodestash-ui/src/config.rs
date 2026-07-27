@@ -423,6 +423,15 @@ pub struct AppConfig {
     /// API key for the endpoint. A secret — never logged. Empty = not configured.
     #[serde(default)]
     pub api_key: String,
+    /// Hard per-run cap on cloud-tagged assets (AI-PIPELINE §5.1 budget guard): a run stops after
+    /// this many API calls and leaves the rest queued, so a mis-scoped Full Run on a paid endpoint
+    /// can't become a surprise bill. Applies only to the API path; the local path is free.
+    #[serde(default = "default_api_max_per_run")]
+    pub api_max_per_run: u32,
+}
+
+fn default_api_max_per_run() -> u32 {
+    500
 }
 
 fn default_api_base_url() -> String {
@@ -457,6 +466,7 @@ impl Default for AppConfig {
             api_base_url: default_api_base_url(),
             api_model: None,
             api_key: String::new(),
+            api_max_per_run: default_api_max_per_run(),
         }
     }
 }

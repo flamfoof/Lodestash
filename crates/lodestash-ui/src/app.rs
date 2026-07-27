@@ -1126,6 +1126,9 @@ pub struct LodestashApp {
     scan_job: Option<u64>,
     /// Tray row id for a running tagging pass, so it can be finished when the drain reports back.
     tag_job: Option<u64>,
+    /// A cloud tagging run awaiting the paid-endpoint confirm (AI-PIPELINE §5.1 budget guard). Set
+    /// when a run is requested against a non-free endpoint; cleared on Continue (spawns) or Cancel.
+    pending_paid_run: Option<IdentifyScope>,
     /// Models Ollama reports as installed, fetched once when the Settings AI card first opens
     /// (the daemon may not be running, and asking every frame would block the UI thread).
     ollama_models: Option<Vec<String>>,
@@ -1310,6 +1313,7 @@ impl LodestashApp {
             jobs: Jobs::default(),
             scan_job: None,
             tag_job: None,
+            pending_paid_run: None,
             ollama_models: None,
             engine: None,
             engine_state: None,
@@ -2084,6 +2088,7 @@ impl LodestashApp {
             self.config.api_key.clone(),
             self.config.api_model.clone().unwrap_or_default(),
         );
+        let api_max_per_run = self.config.api_max_per_run;
         let workspace_dir = self.workspace_dir.clone();
         let cache_dir = self.thumb_cache_dir.clone();
         let generation = self.scan_generation;
@@ -2174,6 +2179,7 @@ impl LodestashApp {
                             fallback
                                 .as_ref()
                                 .map(|t| t as &dyn lodestash_ai::tagger::Tagger),
+                            api_max_per_run,
                             workspace_dir.as_deref(),
                             cache_dir.as_deref(),
                             &job_progress,
@@ -7652,6 +7658,32 @@ impl LodestashApp {
                                             save = true;
                                         }
                                         ui.end_row();
+
+                                        // Budget cap (AI-PIPELINE §5.1): a run stops after this many
+                                        // API calls; the rest stay queued. 0 = no cap.
+                                        ui.label(
+                                            RichText::new("Max per run")
+                                                .size(11.0)
+                                                .color(theme::TEXT_DIM),
+                                        );
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(
+                                                    &mut self.config.api_max_per_run,
+                                                )
+                                                .range(0..=100_000)
+                                                .speed(10),
+                                            )
+                                            .on_hover_text(
+                                                "Hard cap on assets tagged per run (0 = no cap). \
+                                                 Stops a run-away paid run; the remainder stay queued \
+                                                 for the next run.",
+                                            )
+                                            .changed()
+                                        {
+                                            save = true;
+                                        }
+                                        ui.end_row();
                                     });
 
                                 let api_ready = !self.config.api_key.trim().is_empty()
@@ -7757,10 +7789,65 @@ impl LodestashApp {
                             }
                         });
                         if let Some(scope) = identify_scope {
-                            self.spawn_tagging(scope);
+                            // Budget guard (AI-PIPELINE §5.1): a run that will hit a *paid* endpoint
+                            // gets a confirm first; free/local endpoints and the local Ollama path
+                            // spawn straight away.
+                            let api_ok = self.config.api_tagging_enabled
+                                && !self.config.api_key.trim().is_empty()
+                                && self.config.api_model.is_some();
+                            let paid = api_ok
+                                && !lodestash_ai::openai::is_free_endpoint(&self.config.api_base_url);
+                            if paid {
+                                self.pending_paid_run = Some(scope);
+                            } else {
+                                self.spawn_tagging(scope);
+                            }
                         }
                         if run_api_test {
                             self.spawn_api_test(ctx);
+                        }
+                        if self.pending_paid_run.is_some() {
+                            let cap = self.config.api_max_per_run;
+                            let mut decision: Option<bool> = None;
+                            egui::Window::new("Confirm cloud run")
+                                .collapsible(false)
+                                .resizable(false)
+                                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                                .show(ctx, |ui| {
+                                    ui.label(
+                                        RichText::new(
+                                            "This endpoint is not a known free tier — it may bill \
+                                             per call.",
+                                        )
+                                        .color(theme::WARNING),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "Up to {cap} assets will be tagged this run, one API \
+                                             call each. Remaining assets stay queued.",
+                                        ))
+                                        .size(11.0)
+                                        .color(theme::TEXT_DIM),
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Continue").clicked() {
+                                            decision = Some(true);
+                                        }
+                                        if ui.button("Cancel").clicked() {
+                                            decision = Some(false);
+                                        }
+                                    });
+                                });
+                            match decision {
+                                Some(true) => {
+                                    if let Some(scope) = self.pending_paid_run.take() {
+                                        self.spawn_tagging(scope);
+                                    }
+                                }
+                                Some(false) => self.pending_paid_run = None,
+                                None => {}
+                            }
                         }
                         settings_card(ui, "MCP", |ui| {
                             ui.label(
