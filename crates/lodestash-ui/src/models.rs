@@ -117,6 +117,7 @@ pub fn download_ort(progress: Arc<JobProgress>) -> Result<(), String> {
     let mut file = std::fs::File::create(&zip_path).map_err(|e| format!("create zip: {e}"))?;
     let mut reader = resp.into_reader();
     let mut buf = [0u8; 64 * 1024];
+    let mut written: u64 = 0;
     loop {
         if progress.is_cancelled() {
             let _ = std::fs::remove_file(&zip_path);
@@ -130,10 +131,17 @@ pub fn download_ort(progress: Arc<JobProgress>) -> Result<(), String> {
         }
         file.write_all(&buf[..n])
             .map_err(|e| format!("write runtime: {e}"))?;
+        written += n as u64;
         progress.done.fetch_add(n as u64, Ordering::Relaxed);
     }
     file.flush().map_err(|e| e.to_string())?;
     drop(file);
+    if len != 0 && written != len {
+        let _ = std::fs::remove_file(&zip_path);
+        return Err(format!(
+            "runtime download truncated ({written} of {len} bytes) — check the connection and retry"
+        ));
+    }
 
     // Extract onnxruntime.dll (+ providers_shared) by basename, ignoring the archive's dir prefix.
     let zf = std::fs::File::open(&zip_path).map_err(|e| e.to_string())?;
@@ -210,10 +218,18 @@ fn fetch_all(
         let resp = ureq::get(&url)
             .call()
             .map_err(|e| format!("GET {dest}: {e}"))?;
+        // The server's declared size. A dropped connection ends the read loop at EOF and the file
+        // would rename looking complete — so we verify the byte count against Content-Length and
+        // reject a short (truncated) file rather than leave a corrupt model that fails at load.
+        let expected: u64 = resp
+            .header("Content-Length")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         let tmp = dir.join(format!("{dest}.part"));
         let mut file = std::fs::File::create(&tmp).map_err(|e| format!("create {dest}: {e}"))?;
         let mut reader = resp.into_reader();
         let mut buf = [0u8; 64 * 1024];
+        let mut written: u64 = 0;
         loop {
             if progress.is_cancelled() {
                 let _ = std::fs::remove_file(&tmp);
@@ -227,11 +243,31 @@ fn fetch_all(
             }
             file.write_all(&buf[..n])
                 .map_err(|e| format!("write {dest}: {e}"))?;
+            written += n as u64;
             progress.done.fetch_add(n as u64, Ordering::Relaxed);
         }
         file.flush().map_err(|e| e.to_string())?;
         drop(file);
+        if expected != 0 && written != expected {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!(
+                "{dest} download truncated ({written} of {expected} bytes) — check the connection and retry"
+            ));
+        }
         std::fs::rename(&tmp, &final_path).map_err(|e| format!("finalize {dest}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Delete the SigLIP and CLAP model directories so a corrupt or partial install can be re-fetched
+/// (the ONNX Runtime dll is left in place — it is reused and rarely the problem). Missing dirs are
+/// not an error. Returns the first delete error, if any.
+pub fn remove_models() -> Result<(), String> {
+    for dir in [siglip_dir(), clap_dir()].into_iter().flatten() {
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)
+                .map_err(|e| format!("remove {}: {e}", dir.display()))?;
+        }
     }
     Ok(())
 }

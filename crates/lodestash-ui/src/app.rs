@@ -6946,6 +6946,7 @@ impl LodestashApp {
         let mut watch_changed = false;
         let mut quality_changed = false;
         let mut start_dl = false;
+        let mut remove_models = false;
         // Per-source actions collected during render, applied after.
         let mut toggle_expand: Option<usize> = None;
         let mut add_exclude: Option<(usize, lodestash_core::types::Exclude)> = None;
@@ -7263,6 +7264,27 @@ impl LodestashApp {
                                     .size(12.0)
                                     .color(theme::SUCCESS),
                                 );
+                                // Remove + re-download, for a corrupt or superseded install.
+                                if !ai_downloading {
+                                    ui.add_space(6.0);
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new("Remove models")
+                                                    .size(10.0)
+                                                    .color(theme::TEXT_DIM),
+                                            )
+                                            .rounding(6.0),
+                                        )
+                                        .on_hover_text(
+                                            "Delete the SigLIP + CLAP files so you can re-download \
+                                             them (the ONNX Runtime is kept).",
+                                        )
+                                        .clicked()
+                                    {
+                                        remove_models = true;
+                                    }
+                                }
                             } else if ai_downloading {
                                 ui.label(
                                     RichText::new("Downloading\u{2026} see the job tray below.")
@@ -8162,6 +8184,19 @@ impl LodestashApp {
         }
         if start_dl {
             self.start_siglip_download();
+        }
+        if remove_models {
+            match models::remove_models() {
+                Ok(()) => {
+                    // Drop the live embedders so the card falls back to its Download state and the
+                    // AI search paths honestly report "no model" until a re-fetch.
+                    self.ai_embedder = None;
+                    self.audio_embedder = None;
+                    self.jobs
+                        .toast("Models removed — click Download to re-fetch", Intent::Info);
+                }
+                Err(e) => self.jobs.toast(format!("Remove failed: {e}"), Intent::Danger),
+            }
         }
 
         // Apply blacklist actions (collected during render to avoid borrowing self mid-iteration).
