@@ -1139,6 +1139,10 @@ pub struct LodestashApp {
     /// Cached (thumbnail, workspace) cache sizes in bytes for the Storage caps card.
     storage_size: Option<(u64, u64)>,
     storage_size_rx: Option<Receiver<(u64, u64)>>,
+    /// Result of the CLOUD card's **Test** action (AI-PIPELINE §5.1): `Ok(tags summary)` or the raw
+    /// error, shown inline so a wrong URL / non-vision model / dead key is caught before a bulk run.
+    api_test_result: Option<Result<String, String>>,
+    api_test_rx: Option<Receiver<Result<String, String>>>,
     /// Pending destructive-action confirmations (entry indices).
     pending_confirm_trash: Option<Vec<usize>>,
     pending_delete_from_disk: Option<Vec<usize>>,
@@ -1315,6 +1319,8 @@ impl LodestashApp {
             source_info_pending: false,
             storage_size: None,
             storage_size_rx: None,
+            api_test_result: None,
+            api_test_rx: None,
             pending_confirm_trash: None,
             pending_delete_from_disk: None,
             duplicate_groups: 0,
@@ -3205,6 +3211,64 @@ impl LodestashApp {
             if let Ok((thumb, ws)) = rx.try_recv() {
                 self.storage_size = Some((thumb, ws));
                 self.storage_size_rx = None;
+            }
+        }
+    }
+
+    /// Run one cloud tagging call against a bundled sample image (AI-PIPELINE §5.1 "connection test
+    /// + vision preflight") off-thread, so a wrong endpoint / non-vision model / dead key is caught
+    /// in one click before any bulk run — the #1 cloud failure mode.
+    fn spawn_api_test(&mut self, ctx: &egui::Context) {
+        if self.api_test_rx.is_some() {
+            return; // one in flight is enough
+        }
+        let base = self.config.api_base_url.clone();
+        let key = self.config.api_key.clone();
+        let Some(model) = self.config.api_model.clone() else {
+            self.api_test_result = Some(Err("Set a model first.".into()));
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        self.api_test_rx = Some(rx);
+        self.api_test_result = None;
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            // A tiny, unmistakable sample: a solid red square. The point is a real round-trip, not the
+            // tags — any facet JSON back means URL+model+key+vision all work.
+            let sample = image::RgbaImage::from_pixel(64, 64, image::Rgba([200, 30, 30, 255]));
+            let tagger = lodestash_ai::openai::OpenAiTagger::new(&base, &key, &model);
+            let input = lodestash_ai::tagger::TagInput {
+                media_code: "image",
+                name: "sample",
+                image: Some(&sample),
+            };
+            let msg = match tagger.try_tag(&input) {
+                Ok(res) if res.tags.is_empty() => {
+                    Ok("Connected — the model returned no tags for the sample (still a valid response)."
+                        .to_string())
+                }
+                Ok(res) => {
+                    let summary = res
+                        .tags
+                        .iter()
+                        .map(|t| format!("{}={}", t.namespace, t.value))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    Ok(format!("Connected — sample tagged: {summary}"))
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Pick up the Test action's result once its thread finishes.
+    fn receive_api_test(&mut self) {
+        if let Some(rx) = &self.api_test_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.api_test_result = Some(res);
+                self.api_test_rx = None;
             }
         }
     }
@@ -7269,6 +7333,7 @@ impl LodestashApp {
                         // AI · IDENTIFY — local tagging through an Ollama model already on the
                         // machine (AI-PIPELINE §2). Manual: a full pass is hours of CPU.
                         let mut identify_scope: Option<IdentifyScope> = None;
+                        let mut run_api_test = false;
                         let tagging_running = self.tag_job.is_some();
                         settings_card(ui, "AI \u{00B7} IDENTIFY", |ui| {
                             let models = self.ollama_models.get_or_insert_with(|| {
@@ -7592,6 +7657,57 @@ impl LodestashApp {
                                 let api_ready = !self.config.api_key.trim().is_empty()
                                     && self.config.api_model.is_some();
                                 ui.add_space(6.0);
+                                // Connection test + vision preflight (AI-PIPELINE §5.1): one click
+                                // catches a wrong URL / non-vision model / dead key before any run.
+                                if api_ready {
+                                    let testing = self.api_test_rx.is_some();
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add_enabled(
+                                                !testing,
+                                                egui::Button::new(
+                                                    RichText::new("Test connection")
+                                                        .size(11.0)
+                                                        .color(theme::TEXT_DIM),
+                                                )
+                                                .rounding(6.0),
+                                            )
+                                            .on_hover_text(
+                                                "Tag one bundled sample image and show the raw result \
+                                                 or error.",
+                                            )
+                                            .clicked()
+                                        {
+                                            run_api_test = true;
+                                        }
+                                        if testing {
+                                            ui.add(egui::Spinner::new().size(12.0));
+                                            ui.label(
+                                                RichText::new("testing\u{2026}")
+                                                    .size(10.0)
+                                                    .color(theme::TEXT_DIM),
+                                            );
+                                        }
+                                    });
+                                    match &self.api_test_result {
+                                        Some(Ok(msg)) => {
+                                            ui.label(
+                                                RichText::new(format!("\u{2713} {msg}"))
+                                                    .size(10.0)
+                                                    .color(theme::SUCCESS),
+                                            );
+                                        }
+                                        Some(Err(err)) => {
+                                            ui.label(
+                                                RichText::new(format!("\u{2715} {err}"))
+                                                    .size(10.0)
+                                                    .color(theme::DANGER),
+                                            );
+                                        }
+                                        None => {}
+                                    }
+                                    ui.add_space(4.0);
+                                }
                                 if !api_ready {
                                     ui.label(
                                         RichText::new("Set a model and key to enable the run buttons.")
@@ -7642,6 +7758,9 @@ impl LodestashApp {
                         });
                         if let Some(scope) = identify_scope {
                             self.spawn_tagging(scope);
+                        }
+                        if run_api_test {
+                            self.spawn_api_test(ctx);
                         }
                         settings_card(ui, "MCP", |ui| {
                             ui.label(
@@ -8527,6 +8646,7 @@ impl eframe::App for LodestashApp {
         self.receive_catalog();
         self.receive_source_infos();
         self.receive_storage_size();
+        self.receive_api_test();
         self.receive_model_download();
         self.receive_viewer(ctx);
         // Tray ✕ on the scan row: the crawl thread finishes harmlessly (read-only) and
