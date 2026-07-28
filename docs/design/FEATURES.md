@@ -256,12 +256,16 @@ browse it in the folder explorer, §5.4).
 **Open → makes the pack a library and navigates it in the ordinary library browser**, not a separate
 extraction panel. Opening **pins** the pack (§5.5) and **mints an in-pack `asset` per entry** (M14,
 DATA-MODEL §7) in the background — no extraction — then jumps into the library grid **filtered to that
-pack**, in **Folders view** rooted at the pack's top folder. This reuses one browser (grid/list,
-Quick Look, breadcrumb) for on-disk libraries and packs alike; there is no bespoke pack-browse tree.
+pack**, in **Folders view** rooted at the pack's top folder. It reuses the library browser's
+machinery (grid/list, Quick Look), but for packs the **target layout is the three-pane file view**
+in [`PACK-DIRECTORY-NAV.md`](PACK-DIRECTORY-NAV.md): a **persistent left directory tree**, a
+**pack-rooted breadcrumb** bar, and a **folders-first contents list**. *(This supersedes the earlier
+"no bespoke pack-browse tree" note — the tree shipped 2026-07-25; the breadcrumb bar + single
+`Name/Size/Items` list are the remaining deltas, tracked on the KANBAN card.)*
 
 - **Folder navigation:** the in-archive directory tree (each asset's `Assets/…` path), navigated by
-  folder tiles + breadcrumb, with **← / → back-forward** history and Backspace = up. Re-opening an
-  already-surfaced pack is instant.
+  the **left tree pane** + breadcrumb (or folder rows), with **← / → back-forward** history and
+  Backspace = up. Re-opening an already-surfaced pack is instant.
 - **Two view modes** (the grid's own toggle): **thumbnails** (grid cards) or a **file list** with
   **folders first**, then assets. Thumbnails and previews are pulled from the archive on demand — a
   card's thumbnail and a Quick Look both surgically pull **that one payload** (one gzip skip-scan) into

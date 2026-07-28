@@ -322,9 +322,11 @@ lock long enough to starve a concurrent scan-persist ("database is locked"). The
 audio decodes more codecs (rodio `symphonia-all` — aiff/m4a/aac/alac, not opus/wma/fsb); Unity Assets
 list has a **sort** (Indexed first / Name / Size / Date), pack cards show archive **size** (KB/MB/GB);
 `docs/AI-PIPELINE.md` §2, `DATA-MODEL.md` §7/§8, `FEATURES.md` §5.3/§5.4/§6.6, `INGESTION.md` §2 all
-reconciled. A **design mockup for a better pack directory navigation** (persistent tree pane,
-pack-rooted breadcrumb, folders-first contents) is published as an Artifact:
-`https://claude.ai/code/artifact/357c39f4-0809-4f06-adc2-53c1d3be95b0`.
+reconciled. The **design for a better pack directory navigation** (persistent tree pane,
+pack-rooted breadcrumb, folders-first contents) is **stored** at
+[`design/PACK-DIRECTORY-NAV.md`](design/PACK-DIRECTORY-NAV.md) (captured 2026-07-28 from the Artifact
+`357c39f4-0809-4f06-adc2-53c1d3be95b0`); the remaining deltas are the KANBAN card "Pack directory
+navigation — finish the three-pane file view".
 
 **Favourites exist** (`asset.favorite`, M12): a pin, not a rating, catalog-side, surviving the Trash.
 The **shipped UI diverges from the design bundle** on four presentation points (star not heart, gold
@@ -529,8 +531,10 @@ Top of the list is finishing the in-pack feature (M14) the last session built, i
    OS-temp scratch file, so `drain_metrics`/`drain_audio_embeddings`/`drain_tags` and 3D embedding now
    identify a purely in-pack asset (see §2). Leftover polish: real tag `name` for in-pack (currently
    empty); not driven end-to-end in the running app.
-2. **Pack directory navigation redesign** — *left tree pane shipped 2026-07-25.* The published mockup
-   (§2, the Artifact URL) asked for a persistent left directory tree; it now renders as a nested
+2. **Pack directory navigation redesign** — design **stored** at
+   [`design/PACK-DIRECTORY-NAV.md`](design/PACK-DIRECTORY-NAV.md) (2026-07-28); tracked by the KANBAN
+   card "Pack directory navigation — finish the three-pane file view". *Left tree pane shipped
+   2026-07-25.* The mockup asked for a persistent left directory tree; it now renders as a nested
    `SidePanel::left("pack_dir_tree_pane")` in the pack browser (Folders mode over a pack): the pack's
    whole hierarchy, indented, expand chevrons, `direct (recursive)` counts, a gold selection rail, and
    click-to-navigate (drives/driven by `current_dir`). Data = `build_pack_dir_tree` (pure, cached in
