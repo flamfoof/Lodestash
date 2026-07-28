@@ -27,6 +27,9 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/assets/{id}/preview", get(preview))
         .route("/v1/assets/{id}/similar", get(similar))
         .route("/v1/packages", get(packages))
+        .route("/v1/projects/register", post(register_project))
+        .route("/v1/projects", get(list_projects))
+        .route("/v1/import", post(import_to_project))
         .route("/v1/export", post(export))
         .route("/v1/jobs/{id}", get(job_status))
         .route("/v1/jobs/{id}/cancel", post(cancel_job))
@@ -56,6 +59,9 @@ fn tool_for(method: &Method, path: &str, query: Option<&str>) -> Option<&'static
         ("GET", "/v1/assets/{id}/preview") => "get_asset_preview",
         ("GET", "/v1/assets/{id}/similar") => "find_similar",
         ("GET", "/v1/packages") => "list_packages",
+        ("POST", "/v1/projects/register") => "register_project",
+        ("GET", "/v1/projects") => "list_projects",
+        ("POST", "/v1/import") => "import_to_project",
         ("POST", "/v1/export") => "export_asset",
         ("GET", "/v1/jobs/{id}") => "get_job_status",
         ("POST", "/v1/jobs/{id}/cancel") => "cancel_job",
@@ -237,6 +243,78 @@ async fn packages(State(state): State<Shared>) -> Response {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct RegisterParams {
+    project_path: String,
+    unity_version: Option<String>,
+    pipeline: Option<String>,
+    /// Accepted per ENGINE-API §5.1; unused until the import-queue drain (plugin card) lands.
+    #[serde(default)]
+    #[allow(dead_code)]
+    can_execute_main_thread: bool,
+}
+
+/// The plugin announces the open editor (ENGINE-API §5.1). Idempotent on `project_path`.
+async fn register_project(State(state): State<Shared>, Json(p): Json<RegisterParams>) -> Response {
+    if p.project_path.trim().is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "project_path must not be empty.",
+            "",
+        );
+    }
+    match state.register_project(
+        &p.project_path,
+        p.unity_version.as_deref(),
+        p.pipeline.as_deref(),
+    ) {
+        Ok((id, is_active)) => {
+            Json(json!({ "project_id": id, "is_active": is_active })).into_response()
+        }
+        Err(e) => db_err(e),
+    }
+}
+
+async fn list_projects(State(state): State<Shared>) -> Response {
+    match state.list_projects() {
+        Ok(rows) => {
+            let out: Vec<Value> = rows.iter().map(project_json).collect();
+            Json(json!({ "projects": out })).into_response()
+        }
+        Err(e) => db_err(e),
+    }
+}
+
+/// *Side-effecting* (ENGINE-API §5.2). Parks a `202` job on the approval gate like `export`, or
+/// answers `200 { imported_existing, job_id: null }` when the dup-guard (§5.4) leaves nothing new,
+/// or `409 project_not_registered` when no editor is open.
+async fn import_to_project(
+    State(state): State<Shared>,
+    Json(req): Json<crate::ImportRequest>,
+) -> Response {
+    match state.request_import(req) {
+        Ok(crate::ImportKickoff::Awaiting(job)) => {
+            (StatusCode::ACCEPTED, Json(job.to_json())).into_response()
+        }
+        Ok(crate::ImportKickoff::AllAlreadyImported(ids)) => {
+            Json(json!({ "imported_existing": ids, "job_id": null })).into_response()
+        }
+        Err(crate::ImportError::Empty) => err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "asset_ids must not be empty.",
+            "",
+        ),
+        Err(crate::ImportError::NoProject) => err(
+            StatusCode::CONFLICT,
+            "project_not_registered",
+            "No Unity project is registered.",
+            "Open the Lodestash panel in Unity, or export to a folder instead.",
+        ),
+    }
+}
+
 /// *Side-effecting* (ENGINE-API §2). Returns `202` with a job that is **not running**: it waits
 /// on the desktop app's approval (MCP-AND-ENGINES §5 "confirm mutating ops server-side").
 async fn export(
@@ -325,6 +403,19 @@ pub fn package_json(p: &lodestash_core::catalog::PackageListing) -> Value {
         "category": p.category,
         "asset_count": p.asset_count,
         "unpacked_at": p.unpacked_at,
+    })
+}
+
+/// ENGINE-API §5.1 project row. The `is_active` one is the import target when none is named.
+pub fn project_json(p: &lodestash_core::catalog::ProjectRow) -> Value {
+    json!({
+        "id": p.id,
+        "name": p.name,
+        "project_path": p.project_path,
+        "unity_version": p.unity_version,
+        "pipeline": p.pipeline,
+        "is_active": p.is_active,
+        "last_seen_at": p.last_seen_at,
     })
 }
 
@@ -520,6 +611,69 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK);
         assert!(b["results"].as_array().unwrap().is_empty());
+    }
+
+    /// The register → import → dup-guard round-trip a client drives (ENGINE-API §5), headless: no
+    /// project ⇒ refused; register activates; import parks on approval and records nothing until
+    /// approved; a re-import is caught by the `UNIQUE(asset_id, project_id)` dup-guard.
+    #[tokio::test]
+    async fn import_registers_parks_on_approval_and_dup_guards() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        let ids = seed_embedded(&db);
+        let st =
+            Arc::new(ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap());
+
+        let mk = |asset: i64, project: Option<i64>| crate::ImportRequest {
+            asset_ids: vec![asset],
+            project_id: project,
+            dest_subfolder: None,
+            with_dependencies: false,
+        };
+
+        // No editor registered ⇒ NoProject.
+        assert!(matches!(
+            st.request_import(mk(ids[0], None)),
+            Err(crate::ImportError::NoProject)
+        ));
+
+        // Register: becomes the active project.
+        let (pid, is_active) = st
+            .register_project("C:/dev/Game", Some("6000.0.23f1"), Some("urp"))
+            .unwrap();
+        assert!(is_active);
+        assert_eq!(st.list_projects().unwrap().len(), 1);
+
+        // Import parks on the approval gate — nothing recorded yet, proven by a second request also
+        // parking rather than reporting the asset already imported.
+        let job = match st.request_import(mk(ids[0], None)) {
+            Ok(crate::ImportKickoff::Awaiting(job)) => job,
+            _ => panic!("expected an awaiting-approval job"),
+        };
+        assert_eq!(job.state(), crate::jobs::JobState::AwaitingApproval);
+        assert!(
+            matches!(
+                st.request_import(mk(ids[0], Some(pid))),
+                Ok(crate::ImportKickoff::Awaiting(_))
+            ),
+            "nothing is recorded before approval"
+        );
+
+        // Approve: the import records on a worker thread. Wait for the job to finish.
+        st.approve_job(&job.id);
+        for _ in 0..200 {
+            if job.state() == crate::jobs::JobState::Done {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(job.state(), crate::jobs::JobState::Done, "import completed");
+
+        // Re-import the same asset into the same project ⇒ dup-guard: nothing new, no job.
+        match st.request_import(mk(ids[0], Some(pid))) {
+            Ok(crate::ImportKickoff::AllAlreadyImported(v)) => assert_eq!(v, vec![ids[0]]),
+            _ => panic!("re-import must be dup-guarded"),
+        }
     }
 
     #[tokio::test]

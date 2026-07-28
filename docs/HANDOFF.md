@@ -549,10 +549,13 @@ Top of the list is finishing the in-pack feature (M14) the last session built, i
    previews** show only their type. (Pack **size** now shows on cards; **sort** shipped.)
 2. **Favourites design conformance** — four presentation deltas listed on the KANBAN card. Contained:
    glyph/colour/position, chip moves to the toolbar, plus a Favorites screen reusing the grid.
-3. **P5 — the Unity round-trip** *(now the biggest open frontier)*: land the **MCP per-tool allow-list**
-   (card 178, UI-SPEC §16) FIRST — it's self-contained and must gate the mutating ops on **both** planes
-   before they exist. Then `register_project` → `/v1/import` → import queue → `import_record` →
-   dup-guard, then the UPM C# plugin (the big piece; unverifiable without a Unity install).
+3. **P5 — the Unity round-trip** *(the biggest open frontier)*: the **MCP per-tool allow-list**
+   (card 178, engine half) and the **core register→import round-trip** (card #2 — `register_project`,
+   `list_projects`, `import_to_project` on both planes, approval-gated, dup-guarded; ENGINE-API §5.6)
+   both shipped 2026-07-27. What's left: the **import-queue long-poll + `import-queue`/`ack`** (§5.3),
+   `pipeline_mismatch` advisory + staging endpoints (§6), then the **UPM C# plugin** (the big piece;
+   unverifiable without a Unity install) — and the card-178 **toggle UI**. Interim: `import_record` is
+   written on approve, not a plugin ack.
 4. **P4 remainder** — *the P4 tail shipped almost whole 2026-07-27* (cloud reliability/cost card 170,
    SigLIP zero-shot + 3D multiview card 171, the whole Mapping library card 172, download hardening
    card 173 — see the P4-tail block in §2). Still open: **WD-EVA02** dense tagger (needs the GPU-tier

@@ -66,6 +66,28 @@ pub struct AssetArgs {
     pub id: i64,
 }
 
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct RegisterProjectArgs {
+    /// Absolute path to the Unity project root.
+    pub project_path: String,
+    /// Editor version, e.g. "6000.0.23f1".
+    pub unity_version: Option<String>,
+    /// Render pipeline: "built_in" | "urp" | "hdrp".
+    pub pipeline: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ImportArgs {
+    /// Assets to import into the project.
+    pub asset_ids: Vec<i64>,
+    /// Target project id; omit to use the active editor.
+    pub project_id: Option<i64>,
+    /// Subfolder under `Assets/` to import into (default "Lodestash").
+    pub dest_subfolder: Option<String>,
+    /// Bring each asset's dependency closure — materials, textures (default true).
+    pub with_dependencies: Option<bool>,
+}
+
 #[tool_router(router = tool_router)]
 impl Lodestash {
     pub fn new(state: Arc<ServerState>) -> Self {
@@ -204,6 +226,95 @@ impl Lodestash {
         let rows = self.state.packages().map_err(internal)?;
         let json: Vec<_> = rows.iter().map(lodestash_api::package_json).collect();
         Ok(CallToolResult::success(vec![ContentBlock::json(json)?]))
+    }
+
+    /// Register the open Unity editor as the active import target.
+    #[tool(
+        name = "register_project",
+        description = "Register the open Unity editor as the active import target. Idempotent per \
+                       project path; returns { project_id, is_active }."
+    )]
+    pub async fn register_project(
+        &self,
+        Parameters(args): Parameters<RegisterProjectArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.gate("register_project")?;
+        if args.project_path.trim().is_empty() {
+            return Err(ErrorData::invalid_params(
+                "project_path must not be empty",
+                None,
+            ));
+        }
+        let (id, is_active) = self
+            .state
+            .register_project(
+                &args.project_path,
+                args.unity_version.as_deref(),
+                args.pipeline.as_deref(),
+            )
+            .map_err(internal)?;
+        Ok(CallToolResult::success(vec![ContentBlock::json(
+            serde_json::json!({ "project_id": id, "is_active": is_active }),
+        )?]))
+    }
+
+    /// Registered Unity editors and which is active.
+    #[tool(
+        name = "list_projects",
+        description = "Registered Unity editors (path, version, pipeline) and which is active."
+    )]
+    pub async fn list_projects(&self) -> Result<CallToolResult, ErrorData> {
+        self.gate("list_projects")?;
+        let rows = self.state.list_projects().map_err(internal)?;
+        let json: Vec<_> = rows.iter().map(lodestash_api::project_json).collect();
+        Ok(CallToolResult::success(vec![ContentBlock::json(json)?]))
+    }
+
+    /// Import assets (with dependencies) into the open Unity project. Approval-gated.
+    #[tool(
+        name = "import_to_project",
+        description = "Import assets — with their dependency closure — into the open Unity project. \
+                       Returns a job in state 'awaiting_approval' until the desktop owner approves \
+                       (poll get_job_status), reports assets already imported, or errors if no \
+                       editor is registered."
+    )]
+    pub async fn import_to_project(
+        &self,
+        Parameters(args): Parameters<ImportArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.gate("import_to_project")?;
+        if args.asset_ids.is_empty() {
+            return Err(ErrorData::invalid_params(
+                "asset_ids must not be empty",
+                None,
+            ));
+        }
+        let req = lodestash_api::ImportRequest {
+            asset_ids: args.asset_ids,
+            project_id: args.project_id,
+            dest_subfolder: args.dest_subfolder,
+            with_dependencies: args.with_dependencies.unwrap_or(true),
+        };
+        match self.state.request_import(req) {
+            Ok(lodestash_api::ImportKickoff::Awaiting(job)) => {
+                Ok(CallToolResult::success(vec![ContentBlock::json(
+                    job.to_json(),
+                )?]))
+            }
+            Ok(lodestash_api::ImportKickoff::AllAlreadyImported(ids)) => {
+                Ok(CallToolResult::success(vec![ContentBlock::json(
+                    serde_json::json!({ "imported_existing": ids, "job_id": null }),
+                )?]))
+            }
+            Err(lodestash_api::ImportError::Empty) => Err(ErrorData::invalid_params(
+                "asset_ids must not be empty",
+                None,
+            )),
+            Err(lodestash_api::ImportError::NoProject) => Err(ErrorData::invalid_params(
+                "no Unity project is registered; register one or export to a folder instead",
+                None,
+            )),
+        }
     }
 
     /// Copy assets out to a folder. Waits for the person at the machine to approve.

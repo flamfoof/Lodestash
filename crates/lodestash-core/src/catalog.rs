@@ -1820,6 +1820,40 @@ pub struct PackageListing {
     pub license: Option<String>,
 }
 
+/// A registered Unity editor (ENGINE-API §5.1 / DATA-MODEL §9). The plugin upserts its row on
+/// panel open and heartbeats `last_seen_at`; exactly one row is `is_active` at a time.
+#[derive(Debug, Clone)]
+pub struct ProjectRow {
+    pub id: i64,
+    pub name: String,
+    pub project_path: String,
+    pub unity_version: Option<String>,
+    pub pipeline: Option<String>,
+    pub is_active: bool,
+    pub last_seen_at: Option<i64>,
+}
+
+/// One asset to record as imported into a project (the durable outcome of the ENGINE-API §5 flow).
+#[derive(Debug, Clone)]
+pub struct ImportSpec {
+    pub asset_id: i64,
+    pub source_package_id: Option<i64>,
+    /// In-project path, e.g. `Assets/Wildlife/Beaver.fbx`.
+    pub dest_path: String,
+    /// GUID Unity assigned; `None` until a plugin ack refines it (ENGINE-API §5.3).
+    pub unity_guid: Option<String>,
+    pub with_deps: bool,
+}
+
+/// What [`Catalog::record_imports`] did with one spec — the `UNIQUE(asset_id, project_id)`
+/// dup-guard (DATA-MODEL §9) makes a re-import of the same asset into the same project
+/// `AlreadyImported` instead of a second row.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImportOutcome {
+    Recorded { asset_id: i64, import_id: i64 },
+    AlreadyImported { asset_id: i64 },
+}
+
 /// One payload's location inside a `.unitypackage` (DATA-MODEL §13 M6; INGESTION §2
 /// surgical extraction).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2506,6 +2540,168 @@ impl Catalog {
     // Raw `asset_tag`s are observations; `asset_category` is the canonical interpretation, produced
     // by applying a taxonomy's rules. The two are separate so a re-map is non-destructive — it never
     // touches the tags. `apply_mapping` is the engine; the rest is minimal authoring + read.
+
+    // ── Projects & imports (ENGINE-API §5, DATA-MODEL §9) ────────────────────────────────────
+
+    /// Upsert the registered Unity project (ENGINE-API §5.1) and make it the single active editor.
+    /// Keyed on `project_path`, so a re-registration refreshes the heartbeat / version / pipeline
+    /// rather than minting a second row. Ensures the project's empty staging tray exists (§9). The
+    /// partial UNIQUE index `idx_project_active` allows only one `is_active=1`, so every other row is
+    /// cleared first. Returns the project id.
+    pub fn register_project(
+        &self,
+        project_path: &str,
+        unity_version: Option<&str>,
+        pipeline: Option<&str>,
+    ) -> Result<i64> {
+        let name = project_path
+            .trim_end_matches(['/', '\\'])
+            .rsplit(['/', '\\'])
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(project_path)
+            .to_string();
+        self.conn
+            .execute("UPDATE project SET is_active = 0", [])
+            .map_err(|e| CoreError::Catalog(format!("project deactivate: {e}")))?;
+        self.conn
+            .execute(
+                "INSERT INTO project
+                     (uuid, name, project_path, unity_version, pipeline, last_seen_at, is_active)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)
+                 ON CONFLICT(project_path) DO UPDATE SET
+                     name = excluded.name,
+                     unity_version = excluded.unity_version,
+                     pipeline = excluded.pipeline,
+                     last_seen_at = excluded.last_seen_at,
+                     is_active = 1",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    name,
+                    project_path,
+                    unity_version,
+                    pipeline,
+                    unix_now(),
+                ],
+            )
+            .map_err(|e| CoreError::Catalog(format!("project upsert: {e}")))?;
+        let id: i64 = self
+            .conn
+            .query_row(
+                "SELECT id FROM project WHERE project_path = ?1",
+                params![project_path],
+                |r| r.get(0),
+            )
+            .map_err(|e| CoreError::Catalog(format!("project id: {e}")))?;
+        // One staging tray per project (§9), created empty on first registration; the partial
+        // UNIQUE index enforces uniqueness, the guard keeps a re-register from erroring.
+        self.conn
+            .execute(
+                "INSERT INTO collection (uuid, name, is_staging, project_id)
+                     SELECT ?1, 'Staging', 1, ?2
+                     WHERE NOT EXISTS
+                       (SELECT 1 FROM collection WHERE is_staging=1 AND project_id=?2)",
+                params![uuid::Uuid::new_v4().to_string(), id],
+            )
+            .map_err(|e| CoreError::Catalog(format!("staging tray: {e}")))?;
+        Ok(id)
+    }
+
+    /// Registered editors, active first (ENGINE-API §5.1 `list_projects` / `GET /v1/projects`). The
+    /// active one is the `is_active` row — a client reads "which is active" from this list rather
+    /// than a separate call.
+    pub fn list_projects(&self) -> Result<Vec<ProjectRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, name, project_path, unity_version, pipeline, is_active, last_seen_at
+                   FROM project
+                  ORDER BY is_active DESC, last_seen_at DESC, name",
+            )
+            .map_err(|e| CoreError::Catalog(format!("projects prepare: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ProjectRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    project_path: r.get(2)?,
+                    unity_version: r.get(3)?,
+                    pipeline: r.get(4)?,
+                    is_active: r.get::<_, i64>(5)? != 0,
+                    last_seen_at: r.get(6)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("projects query: {e}")))?;
+        rows.collect::<std::result::Result<_, _>>()
+            .map_err(|e| CoreError::Catalog(format!("projects collect: {e}")))
+    }
+
+    /// Which of `asset_ids` already have an `import_record` for `project_id` (ENGINE-API §5.4
+    /// dup-guard advisory). A caller warns "already imported — re-import?" before enqueuing.
+    pub fn already_imported(&self, asset_ids: &[i64], project_id: i64) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT 1 FROM import_record WHERE asset_id = ?1 AND project_id = ?2")
+            .map_err(|e| CoreError::Catalog(format!("advisory prepare: {e}")))?;
+        let mut out = Vec::new();
+        for &aid in asset_ids {
+            if stmt
+                .exists(params![aid, project_id])
+                .map_err(|e| CoreError::Catalog(format!("advisory query: {e}")))?
+            {
+                out.push(aid);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Write the durable `import_record` per asset (ENGINE-API §5.3, the ack outcome). The
+    /// `UNIQUE(asset_id, project_id)` dup-guard (DATA-MODEL §9) is enforced by `ON CONFLICT … DO
+    /// NOTHING`: a second import of the same asset into the same project is reported
+    /// [`ImportOutcome::AlreadyImported`], never a duplicate row. All rows in one call share
+    /// `batch_id` so the run can be listed and undone (§9 batches).
+    pub fn record_imports(
+        &self,
+        project_id: i64,
+        specs: &[ImportSpec],
+        batch_id: &str,
+    ) -> Result<Vec<ImportOutcome>> {
+        let now = unix_now();
+        let mut out = Vec::with_capacity(specs.len());
+        for s in specs {
+            let changed = self
+                .conn
+                .execute(
+                    "INSERT INTO import_record
+                         (asset_id, project_id, source_package_id, dest_path, unity_guid,
+                          with_deps, imported_at, batch_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(asset_id, project_id) DO NOTHING",
+                    params![
+                        s.asset_id,
+                        project_id,
+                        s.source_package_id,
+                        s.dest_path,
+                        s.unity_guid,
+                        s.with_deps as i64,
+                        now,
+                        batch_id,
+                    ],
+                )
+                .map_err(|e| CoreError::Catalog(format!("import_record insert: {e}")))?;
+            out.push(if changed == 1 {
+                ImportOutcome::Recorded {
+                    asset_id: s.asset_id,
+                    import_id: self.conn.last_insert_rowid(),
+                }
+            } else {
+                ImportOutcome::AlreadyImported {
+                    asset_id: s.asset_id,
+                }
+            });
+        }
+        Ok(out)
+    }
 
     /// Create a taxonomy (mapping library). `activate` makes it the single active one.
     pub fn create_taxonomy(&self, name: &str, activate: bool) -> Result<i64> {
@@ -3853,6 +4049,111 @@ mod tests {
             dup.is_err(),
             "second staging tray for the same project rejected"
         );
+    }
+
+    #[test]
+    fn register_project_upserts_activates_and_dup_guards_imports() {
+        let c = Catalog::open_in_memory().expect("open");
+        c.conn
+            .execute_batch(
+                "INSERT INTO import_source (id, uuid, name, root_path, kind)
+                     VALUES (1, 's1', 'Src', 'C:/lib', 'folder');
+                 INSERT INTO media_type (id, code, label) VALUES (1, 'image', 'Image');
+                 INSERT INTO asset (id, uuid, source_id, media_type_id, name, created_at, updated_at)
+                     VALUES (1, 'a1', 1, 1, 'rock', 0, 0), (2, 'a2', 1, 1, 'tree', 0, 0);",
+            )
+            .expect("fixture");
+
+        // Re-register the same path: an upsert, not a second row; refreshes fields, stays active.
+        let p1 = c
+            .register_project("C:/dev/MyGame", Some("6000.0.23f1"), Some("urp"))
+            .unwrap();
+        let p1b = c
+            .register_project("C:/dev/MyGame", Some("6000.0.30f1"), Some("urp"))
+            .unwrap();
+        assert_eq!(p1, p1b, "same path upserts the same row");
+
+        // A different project registering becomes the sole active editor.
+        let p2 = c.register_project("D:/other", None, None).unwrap();
+        let projects = c.list_projects().unwrap();
+        assert_eq!(projects.len(), 2, "two distinct projects");
+        let active: Vec<i64> = projects
+            .iter()
+            .filter(|p| p.is_active)
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(
+            active,
+            vec![p2],
+            "exactly one active — the most recent register"
+        );
+        assert_eq!(projects[0].name, "other", "name is the last path segment");
+        assert_eq!(
+            projects
+                .iter()
+                .find(|p| p.id == p1)
+                .unwrap()
+                .unity_version
+                .as_deref(),
+            Some("6000.0.30f1"),
+            "upsert refreshed the version"
+        );
+
+        let trays: i64 = c
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM collection WHERE is_staging=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(trays, 2, "one staging tray per registered project");
+
+        let specs = |ids: &[i64]| {
+            ids.iter()
+                .map(|&asset_id| ImportSpec {
+                    asset_id,
+                    source_package_id: None,
+                    dest_path: format!("Assets/{asset_id}.png"),
+                    unity_guid: None,
+                    with_deps: true,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let first = c.record_imports(p1, &specs(&[1, 2]), "batch-1").unwrap();
+        assert!(matches!(
+            first[0],
+            ImportOutcome::Recorded { asset_id: 1, .. }
+        ));
+        assert!(matches!(
+            first[1],
+            ImportOutcome::Recorded { asset_id: 2, .. }
+        ));
+
+        // Advisory: both imported for p1, neither for p2.
+        assert_eq!(c.already_imported(&[1, 2], p1).unwrap(), vec![1, 2]);
+        assert!(c.already_imported(&[1, 2], p2).unwrap().is_empty());
+
+        // Re-import asset 1 into p1: dup-guarded, no second row.
+        let again = c.record_imports(p1, &specs(&[1]), "batch-2").unwrap();
+        assert_eq!(again, vec![ImportOutcome::AlreadyImported { asset_id: 1 }]);
+        let rows: i64 = c
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM import_record WHERE asset_id=1 AND project_id=?1",
+                [p1],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "dup-guard kept it at one row");
+
+        // Same asset into a *different* project is a fresh import, not a dup.
+        let cross = c.record_imports(p2, &specs(&[1]), "batch-3").unwrap();
+        assert!(matches!(
+            cross[0],
+            ImportOutcome::Recorded { asset_id: 1, .. }
+        ));
     }
 
     #[test]

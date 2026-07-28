@@ -14,11 +14,13 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use lodestash_core::catalog::{AssetSummaryRow, Catalog, PackageListing};
+use lodestash_core::catalog::{
+    AssetSummaryRow, Catalog, ImportOutcome, ImportSpec, PackageListing, ProjectRow,
+};
 use lodestash_core::vector::{BruteForceIndex, VectorIndex};
 
 pub use handshake::{write_handshake, Handshake};
-pub use routes::{package_json, router, summary_json};
+pub use routes::{package_json, project_json, router, summary_json};
 
 /// Every agent-facing operation in ENGINE-API §2, by MCP tool name. The MCP crate asserts its
 /// own tool list against this, which is how the 1:1 invariant stays enforced rather than hoped
@@ -32,6 +34,9 @@ pub const AGENT_OPERATIONS: &[(&str, &str)] = &[
     ("get_asset_preview", "GET /v1/assets/{id}/preview"),
     ("find_similar", "GET /v1/assets/{id}/similar"),
     ("list_packages", "GET /v1/packages"),
+    ("register_project", "POST /v1/projects/register"),
+    ("list_projects", "GET /v1/projects"),
+    ("import_to_project", "POST /v1/import"),
     ("export_asset", "POST /v1/export"),
     ("get_job_status", "GET /v1/jobs/{id}"),
     ("cancel_job", "POST /v1/jobs/{id}/cancel"),
@@ -44,6 +49,36 @@ pub type PreviewFn = Box<dyn Fn(&Path) -> Option<PathBuf> + Send + Sync>;
 /// `(model_id, vector)` pairs — SigLIP for visuals, CLAP for audio. Supplied by the caller so
 /// this crate stays model-free; empty (or absent) means semantic search is unavailable.
 pub type QueryEmbedFn = Box<dyn Fn(&str) -> Vec<(String, Vec<f32>)> + Send + Sync>;
+
+/// Body of `import_to_project` (ENGINE-API §5.2). `project_id` omitted ⇒ the active editor.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ImportRequest {
+    pub asset_ids: Vec<i64>,
+    #[serde(default)]
+    pub project_id: Option<i64>,
+    #[serde(default)]
+    pub dest_subfolder: Option<String>,
+    #[serde(default)]
+    pub with_dependencies: bool,
+}
+
+/// What [`ServerState::request_import`] decided (ENGINE-API §5.2/§5.4).
+pub enum ImportKickoff {
+    /// Parked on the human approval gate — the returned job is `awaiting_approval` (→ REST `202`).
+    Awaiting(std::sync::Arc<jobs::Job>),
+    /// Every requested asset is already in the project (dup-guard) — nothing to do (→ REST `200`
+    /// with `job_id: null`).
+    AllAlreadyImported(Vec<i64>),
+}
+
+/// Why an import could not even be queued.
+pub enum ImportError {
+    /// `asset_ids` was empty (→ `400`).
+    Empty,
+    /// No `project_id` given and no editor registered (→ `409 project_not_registered`). The caller
+    /// falls back to `export_asset` to a path (ENGINE-API §5.2).
+    NoProject,
+}
 
 /// What a handler needs to answer a request. The API owns its **own** catalog connection
 /// (read-only queries) so it never contends with the UI's single writer — DATA-MODEL §1.
@@ -67,6 +102,9 @@ pub struct ServerState {
     /// Approved-or-not export requests, keyed by job id. Held apart from the job itself so the
     /// job record stays a pure status object.
     pending_exports: Mutex<std::collections::HashMap<String, (export::ExportRequest, PathBuf)>>,
+    /// Approved-or-not import requests, keyed by job id — the import counterpart of
+    /// `pending_exports`. Stores the request and its resolved target project.
+    pending_imports: Mutex<std::collections::HashMap<String, (ImportRequest, i64)>>,
     /// Called when a job starts waiting on the user. The desktop app repaints on it — without
     /// this the approval prompt only appears the next time the window happens to redraw.
     wake: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
@@ -87,6 +125,7 @@ impl ServerState {
             token: new_token(),
             allowed: Mutex::new(None),
             pending_exports: Mutex::new(std::collections::HashMap::new()),
+            pending_imports: Mutex::new(std::collections::HashMap::new()),
             wake: Mutex::new(None),
         })
     }
@@ -249,6 +288,144 @@ impl ServerState {
         self.catalog.lock().unwrap().list_packages()
     }
 
+    /// Register/refresh the open Unity editor (ENGINE-API §5.1 `register_project`). Registration
+    /// always makes it the active project, so `is_active` is always `true`.
+    pub fn register_project(
+        &self,
+        project_path: &str,
+        unity_version: Option<&str>,
+        pipeline: Option<&str>,
+    ) -> lodestash_core::error::Result<(i64, bool)> {
+        let id =
+            self.catalog
+                .lock()
+                .unwrap()
+                .register_project(project_path, unity_version, pipeline)?;
+        Ok((id, true))
+    }
+
+    /// Registered editors, active first (ENGINE-API §5.1 `list_projects`).
+    pub fn list_projects(&self) -> lodestash_core::error::Result<Vec<ProjectRow>> {
+        self.catalog.lock().unwrap().list_projects()
+    }
+
+    /// Queue an import into a Unity project (ENGINE-API §5.2 `import_to_project`). Resolves the
+    /// target (given `project_id`, else the active editor), applies the §5.4 dup-guard, and — when
+    /// anything is new to import — parks a job on the approval gate exactly like `export_asset`:
+    /// nothing is written until [`Self::approve_job`]. This is the first *mutating* agent op after
+    /// export, so it obeys the same "confirm server-side" rule (MCP-AND-ENGINES §5).
+    pub fn request_import(&self, req: ImportRequest) -> Result<ImportKickoff, ImportError> {
+        if req.asset_ids.is_empty() {
+            return Err(ImportError::Empty);
+        }
+        let project_id = match req.project_id {
+            Some(id) => id,
+            None => self
+                .catalog
+                .lock()
+                .unwrap()
+                .list_projects()
+                .ok()
+                .and_then(|ps| ps.into_iter().find(|p| p.is_active).map(|p| p.id))
+                .ok_or(ImportError::NoProject)?,
+        };
+        // §5.4 dup-guard: assets already recorded for this project are dropped from the request.
+        let already = self
+            .catalog
+            .lock()
+            .unwrap()
+            .already_imported(&req.asset_ids, project_id)
+            .unwrap_or_default();
+        let fresh: Vec<i64> = req
+            .asset_ids
+            .iter()
+            .copied()
+            .filter(|id| !already.contains(id))
+            .collect();
+        if fresh.is_empty() {
+            return Ok(ImportKickoff::AllAlreadyImported(already));
+        }
+        let summary = format!(
+            "Import {} asset(s) into project {}",
+            fresh.len(),
+            project_id
+        );
+        let job = self
+            .jobs
+            .create("import", summary, jobs::JobState::AwaitingApproval);
+        let mut stored = req;
+        stored.asset_ids = fresh; // approve imports exactly what was advertised as new
+        self.pending_imports
+            .lock()
+            .unwrap()
+            .insert(job.id.clone(), (stored, project_id));
+        self.wake();
+        Ok(ImportKickoff::Awaiting(job))
+    }
+
+    /// The approved import runs here (the import counterpart of [`Self::run_export`]). Resolves the
+    /// dependency closure (a mesh drags its materials + textures — same resolver as export), then
+    /// writes one durable `import_record` per asset.
+    ///
+    /// **Interim divergence from ENGINE-API §5.3:** the spec writes `import_record` on the plugin's
+    /// *ack* (with Unity's real `dest_path`/`guid`). Until the UPM plugin + import-queue land, an
+    /// approved import records here with the computed `Assets/<sub>/<name>` path and a NULL guid;
+    /// the plugin ack will refine those. Recorded here in ENGINE-API §5, same change.
+    fn run_import(&self, job: std::sync::Arc<jobs::Job>, req: ImportRequest, project_id: i64) {
+        job.set_state(jobs::JobState::Running);
+        let ids = if req.with_dependencies {
+            match self
+                .catalog
+                .lock()
+                .unwrap()
+                .dependency_closure(&req.asset_ids)
+            {
+                Ok(ids) => ids,
+                Err(e) => return job.fail(e.to_string()),
+            }
+        } else {
+            req.asset_ids.clone()
+        };
+        let rows = match self.catalog.lock().unwrap().asset_summaries(&ids) {
+            Ok(rows) => rows,
+            Err(e) => return job.fail(e.to_string()),
+        };
+        let sub = req.dest_subfolder.as_deref().unwrap_or("Lodestash");
+        let specs: Vec<ImportSpec> = rows
+            .iter()
+            .map(|r| ImportSpec {
+                asset_id: r.id,
+                source_package_id: r.package_id,
+                dest_path: format!("Assets/{sub}/{}", file_name_for(r)),
+                unity_guid: None,
+                with_deps: req.with_dependencies,
+            })
+            .collect();
+        let batch_id = format!("imp-{}", job.id);
+        match self
+            .catalog
+            .lock()
+            .unwrap()
+            .record_imports(project_id, &specs, &batch_id)
+        {
+            Ok(outcomes) => {
+                let recorded = outcomes
+                    .iter()
+                    .filter(|o| matches!(o, ImportOutcome::Recorded { .. }))
+                    .count();
+                job.finish(serde_json::json!({
+                    "project_id": project_id,
+                    "recorded": recorded,
+                    "already_imported": outcomes.len() - recorded,
+                    "dependencies_included": req.with_dependencies,
+                    "dependencies_added": ids.len().saturating_sub(req.asset_ids.len()),
+                    "batch_id": batch_id,
+                }));
+            }
+            Err(e) => job.fail(e.to_string()),
+        }
+    }
+
     /// Queue an export (ENGINE-API §2 `export_asset`). Validates the destination against the
     /// sandbox *now* — a bad path is an error, not a job that fails later — then parks the job
     /// on the approval gate. Nothing is copied until [`Self::approve_job`].
@@ -288,17 +465,24 @@ impl ServerState {
         if job.state() != jobs::JobState::AwaitingApproval {
             return;
         }
-        let Some((req, dest)) = self.pending_exports.lock().unwrap().remove(job_id) else {
+        // The job is either a pending export or a pending import — run whichever it is.
+        if let Some((req, dest)) = self.pending_exports.lock().unwrap().remove(job_id) {
+            job.set_state(jobs::JobState::Queued);
+            let state = self.clone();
+            std::thread::spawn(move || state.run_export(job, req, dest));
             return;
-        };
-        job.set_state(jobs::JobState::Queued);
-        let state = self.clone();
-        std::thread::spawn(move || state.run_export(job, req, dest));
+        }
+        if let Some((req, project_id)) = self.pending_imports.lock().unwrap().remove(job_id) {
+            job.set_state(jobs::JobState::Queued);
+            let state = self.clone();
+            std::thread::spawn(move || state.run_import(job, req, project_id));
+        }
     }
 
     /// The desktop app said no.
     pub fn deny_job(&self, job_id: &str) {
         self.pending_exports.lock().unwrap().remove(job_id);
+        self.pending_imports.lock().unwrap().remove(job_id);
         if let Some(job) = self.jobs.get(job_id) {
             if job.state() == jobs::JobState::AwaitingApproval {
                 job.set_state(jobs::JobState::Cancelled);

@@ -278,6 +278,25 @@ proceeds. Advisory, never an error: the user/agent decides.
   user (GUIDs are reassigned per import). Same rule as
   [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md) §3.
 
+### 5.6 Shipped (interim) — 2026-07-27, card #2
+
+The **core round-trip** is in on both planes (`register_project`, `list_projects`, `import_to_project`
+— parity test green), gated by the per-tool allow-list (UI-SPEC §16). What differs from the flow
+above until the **UPM plugin + import-queue** land:
+
+- **`import_record` is written on approval, not on a plugin ack.** §5.3 has the plugin ack supply
+  Unity's real `dest_path`/`guid`; with no editor to ack, an **approved** `import_to_project` records
+  each asset here with the computed `Assets/<dest_subfolder>/<name>` path and a **NULL `unity_guid`**.
+  The plugin ack will refine those rows when §5.3 ships. `import_to_project` is otherwise a full
+  citizen of the approval gate — parked `awaiting_approval`, nothing recorded until the desktop owner
+  approves, exactly like `export_asset` (MCP-AND-ENGINES §5).
+- **`get_active_project` is folded into `list_projects`** — the list is ordered active-first and each
+  row carries `is_active`, so no separate call exists yet. The §2 row keeps both names; only
+  `list_projects` is implemented.
+- **The import queue + `import-queue`/`ack` endpoints (§5.3) are not built** — they are plugin↔core
+  plumbing, so they arrive with the Unity plugin card. §5.4's `pipeline_mismatch` advisory is likewise
+  deferred; the `already_imported` dup-guard advisory **is** live.
+
 ---
 
 ## 6. Staging (the per-project shortlist)
