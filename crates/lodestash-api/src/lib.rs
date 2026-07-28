@@ -10,6 +10,7 @@ pub mod handshake;
 pub mod jobs;
 pub mod routes;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -58,6 +59,11 @@ pub struct ServerState {
     /// `ai_unavailable` rather than silently degrading to keyword matching.
     query_embed: Mutex<Option<QueryEmbedFn>>,
     token: String,
+    /// The per-tool allow-list (UI-SPEC §16, card 178). `None` = every agent operation is live
+    /// (the default, so a fresh install behaves exactly as before); `Some(set)` restricts the
+    /// agent surface to the named tools. Enforced on **both** planes — REST checks it in its
+    /// `gate` middleware, MCP checks it per tool — so a disabled tool is disabled 1:1.
+    allowed: Mutex<Option<HashSet<String>>>,
     /// Approved-or-not export requests, keyed by job id. Held apart from the job itself so the
     /// job record stays a pure status object.
     pending_exports: Mutex<std::collections::HashMap<String, (export::ExportRequest, PathBuf)>>,
@@ -79,6 +85,7 @@ impl ServerState {
             preview,
             query_embed: Mutex::new(None),
             token: new_token(),
+            allowed: Mutex::new(None),
             pending_exports: Mutex::new(std::collections::HashMap::new()),
             wake: Mutex::new(None),
         })
@@ -86,6 +93,28 @@ impl ServerState {
 
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// Restrict the agent surface to `enabled` tool names (UI-SPEC §16). The GUI computes this
+    /// from config — every [`AGENT_OPERATIONS`] name the user hasn't switched off — and calls it
+    /// once at wiring time and again whenever the toggles change. An empty set disables every
+    /// tool; to re-open everything, call [`Self::allow_all`].
+    pub fn set_allowed(&self, enabled: HashSet<String>) {
+        *self.allowed.lock().unwrap() = Some(enabled);
+    }
+
+    /// Drop the allow-list — every agent operation is live again (the construction default).
+    pub fn allow_all(&self) {
+        *self.allowed.lock().unwrap() = None;
+    }
+
+    /// Is `tool` callable? `true` when no allow-list is set (default) or the tool is in it. Both
+    /// planes consult this before dispatch, which is what keeps the gate MCP↔REST 1:1.
+    pub fn allows(&self, tool: &str) -> bool {
+        match &*self.allowed.lock().unwrap() {
+            None => true,
+            Some(set) => set.contains(tool),
+        }
     }
 
     /// Wire the query encoder (the GUI does this once its embedders load).

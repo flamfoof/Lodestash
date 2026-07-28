@@ -465,17 +465,25 @@ toggle. **⚖ Resolution vs prototype:** this card controls the **optional Strea
 transport** of the one MCP server (MCP-AND-ENGINES §2; stdio needs no config and no token). When
 enabled: **ENDPOINT** (`http://127.0.0.1:<port>/mcp`, ⧉ Copy) on a **stable configurable port
 (default 4319)** — distinct from the engine API's ephemeral port; **ACCESS TOKEN** (mono, ↻
-Regenerate rotates it; per-session token semantics per ENGINE-API §1); **ALLOWED ACTIONS** — three
-permission-group toggles gating tool groups (not literal tool names):
+Regenerate rotates it; per-session token semantics per ENGINE-API §1); **ALLOWED ACTIONS** — a
+**literal per-tool allow-list** (card 178, **superseding** the earlier three-permission-group
+resolution): one toggle per real agent tool from the canonical inventory
+(`lodestash_api::AGENT_OPERATIONS` — `get_server_info`, `search_assets`, `semantic_search`,
+`get_asset`, `get_asset_preview`, `find_similar`, `list_packages`, `export_asset`, `get_job_status`,
+`cancel_job`; the list grows as tools land). **Default: every tool enabled** — a fresh install
+behaves exactly as before, and the user switches tools **off**. A disabled tool is gated on **both**
+planes at once: REST answers `403 tool_disabled`, MCP refuses the tool — because both consult one
+allow-list on `ServerState` (`set_allowed` / `allows`), which is what keeps the gate MCP↔REST 1:1
+rather than two lists that can drift. Persisted as `config.mcp_disabled_tools` (the names switched
+off). Side-effecting export/import stays **additionally** confirm-gated per call server-side
+(MCP-AND-ENGINES §5): the allow-list decides whether a tool exists for the agent at all; the approval
+modal still gates each mutation. The REST-only `…/file` byte route carries no tool name and is never
+on the allow-list — it is always reachable behind the auth token.
 
-| Group | Gates (MCP-AND-ENGINES §2 tools) |
-|---|---|
-| **search & read** | `search_assets`, `semantic_search`, `find_similar`, `get_asset*`, `list_*` |
-| **tag & traits** | `add_tag`, `retag`, `apply_mapping` |
-| **identify** | `identify_asset`, `suggest_tags`, `unpack_package` |
-
-Side-effecting import/export tools stay confirm-gated per call (MCP-AND-ENGINES §5) and are not a
-blanket toggle. MCP ↔ REST 1:1 invariant unaffected.
+**Shipped (interim).** The allow-list **engine** is in — both-plane gating, the config field, and
+tests (the parity test still asserts MCP↔REST 1:1). Not yet built: the per-tool toggle **UI** in this
+card, and the optional Streamable-HTTP transport (stable port 4319, rotating token). Until the UI
+lands, the list is driven by editing `config.mcp_disabled_tools` directly.
 
 ### 11.6 STORAGE CAPS
 

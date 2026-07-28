@@ -75,12 +75,27 @@ impl Lodestash {
         }
     }
 
+    /// Per-tool allow-list check (UI-SPEC §16, card 178). The REST plane refuses a disabled tool
+    /// with `403 tool_disabled`; here it's a tool error. Same [`ServerState::allows`] gate on both
+    /// planes, so a tool the user switched off is off 1:1.
+    fn gate(&self, tool: &str) -> Result<(), ErrorData> {
+        if self.state.allows(tool) {
+            Ok(())
+        } else {
+            Err(ErrorData::invalid_params(
+                format!("tool '{tool}' is disabled in Lodestash's MCP settings"),
+                None,
+            ))
+        }
+    }
+
     /// App, schema and API versions of the running Lodestash.
     #[tool(
         name = "get_server_info",
         description = "App, schema and API versions."
     )]
     pub async fn get_server_info(&self) -> Result<CallToolResult, ErrorData> {
+        self.gate("get_server_info")?;
         let (app, schema) = self.state.server_info().map_err(internal)?;
         Ok(CallToolResult::success(vec![ContentBlock::json(
             serde_json::json!({ "app": app, "schema": schema, "api": "v1" }),
@@ -96,6 +111,7 @@ impl Lodestash {
         &self,
         Parameters(args): Parameters<SearchArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.gate("search_assets")?;
         let rows = self
             .state
             .search(
@@ -117,6 +133,7 @@ impl Lodestash {
         &self,
         Parameters(args): Parameters<SearchArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.gate("semantic_search")?;
         let limit = args.limit.unwrap_or(25).clamp(1, 200);
         match self
             .state
@@ -143,6 +160,7 @@ impl Lodestash {
         &self,
         Parameters(args): Parameters<AssetArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.gate("get_asset")?;
         let Some(row) = self.state.asset(args.id).map_err(internal)? else {
             return Err(ErrorData::invalid_params("no such asset", None));
         };
@@ -167,6 +185,7 @@ impl Lodestash {
         &self,
         Parameters(args): Parameters<SimilarArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.gate("find_similar")?;
         let rows = self
             .state
             .similar(args.id, args.limit.unwrap_or(10).clamp(1, 200))
@@ -181,6 +200,7 @@ impl Lodestash {
         description = "Asset Store packages in the library (publisher, category, asset count)."
     )]
     pub async fn list_packages(&self) -> Result<CallToolResult, ErrorData> {
+        self.gate("list_packages")?;
         let rows = self.state.packages().map_err(internal)?;
         let json: Vec<_> = rows.iter().map(lodestash_api::package_json).collect();
         Ok(CallToolResult::success(vec![ContentBlock::json(json)?]))
@@ -197,6 +217,7 @@ impl Lodestash {
         &self,
         Parameters(args): Parameters<ExportArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.gate("export_asset")?;
         if args.asset_ids.is_empty() {
             return Err(ErrorData::invalid_params(
                 "asset_ids must not be empty",
@@ -226,6 +247,7 @@ impl Lodestash {
         &self,
         Parameters(args): Parameters<JobArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.gate("get_job_status")?;
         match self.state.jobs.get(&args.job_id) {
             Some(job) => Ok(CallToolResult::success(vec![ContentBlock::json(
                 job.to_json(),
@@ -243,6 +265,7 @@ impl Lodestash {
         &self,
         Parameters(args): Parameters<JobArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.gate("cancel_job")?;
         match self.state.jobs.cancel(&args.job_id) {
             Some(job) => Ok(CallToolResult::success(vec![ContentBlock::json(
                 job.to_json(),
@@ -261,6 +284,7 @@ impl Lodestash {
         &self,
         Parameters(args): Parameters<AssetArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.gate("get_asset_preview")?;
         let Some(row) = self.state.asset(args.id).map_err(internal)? else {
             return Err(ErrorData::invalid_params("no such asset", None));
         };
@@ -356,5 +380,25 @@ mod tests {
         tools.sort();
         expected.sort();
         assert_eq!(tools, expected, "MCP tools must mirror the REST operations");
+    }
+
+    /// The per-tool allow-list (UI-SPEC §16, card 178) gates the MCP plane: default allows
+    /// everything, a set restricts to its members, and a disabled tool errors.
+    #[test]
+    fn allow_list_gates_the_mcp_plane() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        let state =
+            Arc::new(ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap());
+
+        // Construction default: no allow-list, every tool live.
+        assert!(state.allows("export_asset"), "allow-all by default");
+
+        let enabled: std::collections::HashSet<String> = ["search_assets".to_string()].into();
+        state.set_allowed(enabled);
+
+        let lode = Lodestash::new(state);
+        assert!(lode.gate("search_assets").is_ok(), "enabled tool passes");
+        assert!(lode.gate("export_asset").is_err(), "disabled tool refused");
     }
 }

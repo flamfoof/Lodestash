@@ -578,5 +578,6 @@ pulling ~260 KB through context.
 Known gaps that are *recorded* rather than hidden — see the interim-status notes in
 [`ENGINE-API.md`](ENGINE-API.md) §2: `AssetSummary.tags` is always `[]` (tags exist in the catalog but the summary doesn't carry them
 yet), `Package` now has `license`/`version` for packs that state them, `AssetDetail` carries only `size_bytes` + `stats`, the MCP per-tool allow-list
-(UI-SPEC §16) is still a scaffold so every tool is live when the server runs, and job state is
-in-memory (a crash loses the queue, never the catalog).
+(UI-SPEC §16) has its **gating engine shipped** (2026-07-27, card 178 — both planes consult one
+`ServerState` allow-list, default all-on; driven by `config.mcp_disabled_tools`) but **no toggle UI
+yet**, and job state is in-memory (a crash loses the queue, never the catalog).

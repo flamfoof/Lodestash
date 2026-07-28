@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{MatchedPath, Path, Query, Request, State};
+use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -31,8 +31,58 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/jobs/{id}", get(job_status))
         .route("/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/v1/assets/{id}/file", get(file))
+        // Order matters: `guard` is added last so it wraps outermost and runs **first** — an
+        // unauthenticated caller is rejected before `gate` could reveal which tools exist.
+        .layer(from_fn_with_state(state.clone(), gate))
         .layer(from_fn_with_state(state.clone(), guard))
         .with_state(state)
+}
+
+/// The MCP tool name a request maps to, or `None` for a route with no tool (`…/file` is
+/// REST-only by design — always available behind auth, never on the per-tool allow-list). `search`
+/// splits on `?mode=ai`, mirroring the handler, so `semantic_search` and `search_assets` gate
+/// independently.
+fn tool_for(method: &Method, path: &str, query: Option<&str>) -> Option<&'static str> {
+    Some(match (method.as_str(), path) {
+        ("GET", "/v1/server-info") => "get_server_info",
+        ("GET", "/v1/search") => {
+            if query.unwrap_or("").split('&').any(|kv| kv == "mode=ai") {
+                "semantic_search"
+            } else {
+                "search_assets"
+            }
+        }
+        ("GET", "/v1/assets/{id}") => "get_asset",
+        ("GET", "/v1/assets/{id}/preview") => "get_asset_preview",
+        ("GET", "/v1/assets/{id}/similar") => "find_similar",
+        ("GET", "/v1/packages") => "list_packages",
+        ("POST", "/v1/export") => "export_asset",
+        ("GET", "/v1/jobs/{id}") => "get_job_status",
+        ("POST", "/v1/jobs/{id}/cancel") => "cancel_job",
+        _ => return None,
+    })
+}
+
+/// Per-tool allow-list check (UI-SPEC §16, card 178). Runs after [`guard`]. A disabled tool is a
+/// `403 tool_disabled` — the same operation the MCP plane refuses per tool, so the gate is 1:1.
+async fn gate(
+    State(state): State<Shared>,
+    matched: MatchedPath,
+    method: Method,
+    req: Request,
+    next: Next,
+) -> Response {
+    if let Some(tool) = tool_for(&method, matched.as_str(), req.uri().query()) {
+        if !state.allows(tool) {
+            return err(
+                StatusCode::FORBIDDEN,
+                "tool_disabled",
+                "This tool is disabled in Lodestash's MCP settings.",
+                "Enable it in Settings ▸ Model Context Protocol.",
+            );
+        }
+    }
+    next.run(req).await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -479,6 +529,59 @@ mod tests {
         let (s, b) = send(router(st), get_req("/v1/assets/999", Some(&token), None)).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
         assert_eq!(b["error"]["code"], "not_found");
+    }
+
+    /// The per-tool allow-list (UI-SPEC §16, card 178): a disabled tool is `403 tool_disabled`,
+    /// a still-enabled one works, and `search_assets`/`semantic_search` gate independently on the
+    /// shared `/v1/search` route (the `?mode=ai` split, mirroring the handler).
+    #[tokio::test]
+    async fn disabled_tools_are_403_and_the_search_route_splits_by_mode() {
+        let (_d, st) = state();
+        let token = st.token.clone();
+
+        // Everything except get_server_info and semantic_search.
+        let enabled: std::collections::HashSet<String> = crate::AGENT_OPERATIONS
+            .iter()
+            .map(|(t, _)| t.to_string())
+            .filter(|t| t != "get_server_info" && t != "semantic_search")
+            .collect();
+        st.set_allowed(enabled);
+
+        let (s, b) = send(
+            router(st.clone()),
+            get_req("/v1/server-info", Some(&token), None),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "disabled tool");
+        assert_eq!(b["error"]["code"], "tool_disabled");
+
+        // Same route, two tools: plain search is enabled, ?mode=ai (semantic_search) is not.
+        let (s, _) = send(
+            router(st.clone()),
+            get_req("/v1/search", Some(&token), None),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "search_assets still enabled");
+
+        let (s, b) = send(
+            router(st.clone()),
+            get_req("/v1/search?mode=ai&q=dog", Some(&token), None),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "semantic_search disabled");
+        assert_eq!(b["error"]["code"], "tool_disabled");
+
+        // The REST-only file route has no tool, so the allow-list never blocks it.
+        let (s, _) = send(
+            router(st),
+            get_req("/v1/assets/999/file", Some(&token), None),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::NOT_FOUND,
+            "file route ungated (404, not 403)"
+        );
     }
 
     #[tokio::test]

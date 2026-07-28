@@ -428,6 +428,12 @@ pub struct AppConfig {
     /// can't become a surprise bill. Applies only to the API path; the local path is free.
     #[serde(default = "default_api_max_per_run")]
     pub api_max_per_run: u32,
+    /// MCP/REST agent tools the user has switched **off** (UI-SPEC §16, card 178). Empty (the
+    /// default) = every tool is live, so a fresh install behaves as before. A name here disables
+    /// that tool on **both** agent planes at once (the gate is enforced in `lodestash-api`). Names
+    /// are [`lodestash_api::AGENT_OPERATIONS`] tool ids.
+    #[serde(default)]
+    pub mcp_disabled_tools: Vec<String>,
 }
 
 fn default_api_max_per_run() -> u32 {
@@ -511,12 +517,33 @@ impl Default for AppConfig {
             api_model: None,
             api_key: String::new(),
             api_max_per_run: default_api_max_per_run(),
+            mcp_disabled_tools: Vec::new(),
         }
     }
 }
 
 impl AppConfig {
     const MAX_RECENT: usize = 10;
+
+    /// The enabled agent tools as a set, or `None` when nothing is disabled (every tool live —
+    /// the default). Feeds [`lodestash_api::ServerState::set_allowed`]; `None` leaves the state's
+    /// construction default (allow-all) in place. A tool id in `mcp_disabled_tools` that isn't a
+    /// real operation is simply ignored — it can only ever narrow the real inventory.
+    pub fn mcp_enabled_tools(&self) -> Option<std::collections::HashSet<String>> {
+        if self.mcp_disabled_tools.is_empty() {
+            return None;
+        }
+        let disabled: std::collections::HashSet<&str> =
+            self.mcp_disabled_tools.iter().map(String::as_str).collect();
+        Some(
+            lodestash_api::AGENT_OPERATIONS
+                .iter()
+                .map(|(tool, _)| *tool)
+                .filter(|tool| !disabled.contains(tool))
+                .map(str::to_string)
+                .collect(),
+        )
+    }
 
     pub fn load() -> Self {
         let path = match config_path() {
@@ -777,6 +804,29 @@ mod tests {
             "same folder name from a different path gets a unique label"
         );
         assert_eq!(cfg.projects.len(), 2);
+    }
+
+    #[test]
+    fn mcp_enabled_tools_none_when_empty_and_narrows_the_real_inventory() {
+        let mut cfg = AppConfig::default();
+        assert!(
+            cfg.mcp_enabled_tools().is_none(),
+            "no disabled tools ⇒ allow-all (None)"
+        );
+
+        cfg.mcp_disabled_tools = vec!["export_asset".into(), "not_a_real_tool".into()];
+        let enabled = cfg.mcp_enabled_tools().unwrap();
+        assert!(!enabled.contains("export_asset"), "disabled tool dropped");
+        assert!(enabled.contains("search_assets"), "others kept");
+        assert!(
+            !enabled.contains("not_a_real_tool"),
+            "a bogus name can only narrow, never add"
+        );
+        assert_eq!(
+            enabled.len(),
+            lodestash_api::AGENT_OPERATIONS.len() - 1,
+            "exactly one real tool removed"
+        );
     }
 
     #[test]

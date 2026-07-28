@@ -12423,9 +12423,16 @@ pub fn agent_state(
             thumb::generate(path, dir, &key, params).ok()
         }
     };
-    lodestash_api::ServerState::new(&db, ws, Box::new(preview))
+    let state = lodestash_api::ServerState::new(&db, ws, Box::new(preview))
         .map_err(|e| tracing::warn!(%e, "agent plane: catalog unavailable"))
-        .ok()
+        .ok()?;
+    // Apply the per-tool allow-list (UI-SPEC §16, card 178). Both planes build their state here —
+    // the GUI's REST server and the `--mcp` stdio server — so gating at this one chokepoint keeps
+    // MCP↔REST 1:1. Empty config ⇒ `None` ⇒ allow-all (unchanged default behaviour).
+    if let Some(enabled) = crate::config::AppConfig::load().mcp_enabled_tools() {
+        state.set_allowed(enabled);
+    }
+    Some(state)
 }
 
 /// Default cache locations, shared by the GUI and the `--mcp` entry point.
