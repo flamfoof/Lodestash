@@ -80,6 +80,45 @@ pub enum ImportError {
     NoProject,
 }
 
+/// One asset the Unity plugin reports it imported (ENGINE-API §5.3 ack). Carries the *real*
+/// in-project path and GUID Unity assigned — the durable `import_record` is written from these.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct AckAsset {
+    pub asset_id: i64,
+    pub dest_path: String,
+    #[serde(default)]
+    pub unity_guid: Option<String>,
+}
+
+/// A pending import request the plugin drains on Unity's main thread (ENGINE-API §5.3). The
+/// `assets` carry `file_url`s so the plugin can fetch the bytes.
+pub struct ImportQueuePayload {
+    pub request_id: String,
+    pub job_id: String,
+    pub dest_subfolder: Option<String>,
+    pub assets: Vec<AssetSummaryRow>,
+}
+
+/// Why an ack could not be applied.
+#[derive(Debug)]
+pub enum AckError {
+    /// No queued request with that id (already acked, cancelled, or never existed).
+    UnknownRequest,
+    Db(lodestash_core::error::CoreError),
+}
+
+/// One approved import waiting for the plugin to pick it up (ENGINE-API §5.3). In-memory, like the
+/// job registry — a crash loses the queue, never the catalog (§5 "Transient vs durable").
+struct ImportQueueEntry {
+    request_id: String,
+    job_id: String,
+    project_id: i64,
+    /// The resolved dependency closure — what the plugin will actually import.
+    asset_ids: Vec<i64>,
+    with_deps: bool,
+    dest_subfolder: Option<String>,
+}
+
 /// What a handler needs to answer a request. The API owns its **own** catalog connection
 /// (read-only queries) so it never contends with the UI's single writer — DATA-MODEL §1.
 pub struct ServerState {
@@ -105,6 +144,8 @@ pub struct ServerState {
     /// Approved-or-not import requests, keyed by job id — the import counterpart of
     /// `pending_exports`. Stores the request and its resolved target project.
     pending_imports: Mutex<std::collections::HashMap<String, (ImportRequest, i64)>>,
+    /// Approved imports waiting for a Unity plugin to drain and ack (ENGINE-API §5.3).
+    import_queue: Mutex<Vec<ImportQueueEntry>>,
     /// Called when a job starts waiting on the user. The desktop app repaints on it — without
     /// this the approval prompt only appears the next time the window happens to redraw.
     wake: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
@@ -126,6 +167,7 @@ impl ServerState {
             allowed: Mutex::new(None),
             pending_exports: Mutex::new(std::collections::HashMap::new()),
             pending_imports: Mutex::new(std::collections::HashMap::new()),
+            import_queue: Mutex::new(Vec::new()),
             wake: Mutex::new(None),
         })
     }
@@ -363,15 +405,13 @@ impl ServerState {
         Ok(ImportKickoff::Awaiting(job))
     }
 
-    /// The approved import runs here (the import counterpart of [`Self::run_export`]). Resolves the
-    /// dependency closure (a mesh drags its materials + textures — same resolver as export), then
-    /// writes one durable `import_record` per asset.
-    ///
-    /// **Interim divergence from ENGINE-API §5.3:** the spec writes `import_record` on the plugin's
-    /// *ack* (with Unity's real `dest_path`/`guid`). Until the UPM plugin + import-queue land, an
-    /// approved import records here with the computed `Assets/<sub>/<name>` path and a NULL guid;
-    /// the plugin ack will refine those. Recorded here in ENGINE-API §5, same change.
-    fn run_import(&self, job: std::sync::Arc<jobs::Job>, req: ImportRequest, project_id: i64) {
+    /// The approved import is **enqueued** for the plugin here (ENGINE-API §5.3) — not recorded. It
+    /// resolves the dependency closure (a mesh drags its materials + textures — same resolver as
+    /// export) and appends a queue entry; the job stays `running` until a plugin drains it via
+    /// [`Self::poll_import_queue`] and acks via [`Self::ack_import`], which writes the durable
+    /// `import_record` with Unity's real path + GUID. With no editor connected the job simply stays
+    /// in flight — the import is pending, not failed.
+    fn enqueue_import(&self, job: std::sync::Arc<jobs::Job>, req: ImportRequest, project_id: i64) {
         job.set_state(jobs::JobState::Running);
         let ids = if req.with_dependencies {
             match self
@@ -386,44 +426,106 @@ impl ServerState {
         } else {
             req.asset_ids.clone()
         };
-        let rows = match self.catalog.lock().unwrap().asset_summaries(&ids) {
-            Ok(rows) => rows,
-            Err(e) => return job.fail(e.to_string()),
+        self.import_queue.lock().unwrap().push(ImportQueueEntry {
+            request_id: format!("req_{}", uuid::Uuid::new_v4().simple()),
+            job_id: job.id.clone(),
+            project_id,
+            asset_ids: ids,
+            with_deps: req.with_dependencies,
+            dest_subfolder: req.dest_subfolder,
+        });
+    }
+
+    /// The plugin drains this project's pending imports (ENGINE-API §5.3 `GET /v1/import-queue`).
+    /// Each payload carries the assets' summaries (with `file_url`s) so the plugin can fetch bytes.
+    ///
+    /// ponytail: returns immediately with whatever is pending (`[]` when nothing is). The spec's
+    /// ~25s long-poll is a busy-poll optimisation, not a correctness requirement — add a
+    /// `tokio::sync::Notify` wait here if a real plugin's poll rate ever matters.
+    pub fn poll_import_queue(
+        &self,
+        project_id: i64,
+    ) -> lodestash_core::error::Result<Vec<ImportQueuePayload>> {
+        let pending: Vec<(String, String, Option<String>, Vec<i64>)> = {
+            let q = self.import_queue.lock().unwrap();
+            q.iter()
+                .filter(|e| e.project_id == project_id)
+                .map(|e| {
+                    (
+                        e.request_id.clone(),
+                        e.job_id.clone(),
+                        e.dest_subfolder.clone(),
+                        e.asset_ids.clone(),
+                    )
+                })
+                .collect()
         };
-        let sub = req.dest_subfolder.as_deref().unwrap_or("Lodestash");
-        let specs: Vec<ImportSpec> = rows
-            .iter()
-            .map(|r| ImportSpec {
-                asset_id: r.id,
-                source_package_id: r.package_id,
-                dest_path: format!("Assets/{sub}/{}", file_name_for(r)),
-                unity_guid: None,
-                with_deps: req.with_dependencies,
+        let cat = self.catalog.lock().unwrap();
+        pending
+            .into_iter()
+            .map(|(request_id, job_id, dest_subfolder, ids)| {
+                Ok(ImportQueuePayload {
+                    request_id,
+                    job_id,
+                    dest_subfolder,
+                    assets: cat.asset_summaries(&ids)?,
+                })
             })
-            .collect();
-        let batch_id = format!("imp-{}", job.id);
-        match self
+            .collect()
+    }
+
+    /// The plugin reports an import finished (ENGINE-API §5.3 `POST /v1/import-queue/{req}/ack`):
+    /// remove the queued request, write one durable `import_record` per acked asset (with the real
+    /// `dest_path`/`guid` Unity assigned — the dup-guard still applies), and flip the job `done`.
+    pub fn ack_import(&self, request_id: &str, imported: Vec<AckAsset>) -> Result<(), AckError> {
+        let entry = {
+            let mut q = self.import_queue.lock().unwrap();
+            let pos = q
+                .iter()
+                .position(|e| e.request_id == request_id)
+                .ok_or(AckError::UnknownRequest)?;
+            q.remove(pos)
+        };
+        let ids: Vec<i64> = imported.iter().map(|a| a.asset_id).collect();
+        let rows = self
             .catalog
             .lock()
             .unwrap()
-            .record_imports(project_id, &specs, &batch_id)
-        {
-            Ok(outcomes) => {
-                let recorded = outcomes
+            .asset_summaries(&ids)
+            .map_err(AckError::Db)?;
+        let specs: Vec<ImportSpec> = imported
+            .iter()
+            .map(|a| ImportSpec {
+                asset_id: a.asset_id,
+                source_package_id: rows
                     .iter()
-                    .filter(|o| matches!(o, ImportOutcome::Recorded { .. }))
-                    .count();
-                job.finish(serde_json::json!({
-                    "project_id": project_id,
-                    "recorded": recorded,
-                    "already_imported": outcomes.len() - recorded,
-                    "dependencies_included": req.with_dependencies,
-                    "dependencies_added": ids.len().saturating_sub(req.asset_ids.len()),
-                    "batch_id": batch_id,
-                }));
-            }
-            Err(e) => job.fail(e.to_string()),
+                    .find(|r| r.id == a.asset_id)
+                    .and_then(|r| r.package_id),
+                dest_path: a.dest_path.clone(),
+                unity_guid: a.unity_guid.clone(),
+                with_deps: entry.with_deps,
+            })
+            .collect();
+        let batch_id = format!("imp-{}", entry.job_id);
+        let outcomes = self
+            .catalog
+            .lock()
+            .unwrap()
+            .record_imports(entry.project_id, &specs, &batch_id)
+            .map_err(AckError::Db)?;
+        if let Some(job) = self.jobs.get(&entry.job_id) {
+            let recorded = outcomes
+                .iter()
+                .filter(|o| matches!(o, ImportOutcome::Recorded { .. }))
+                .count();
+            job.finish(serde_json::json!({
+                "project_id": entry.project_id,
+                "recorded": recorded,
+                "already_imported": outcomes.len() - recorded,
+                "batch_id": batch_id,
+            }));
         }
+        Ok(())
     }
 
     /// Queue an export (ENGINE-API §2 `export_asset`). Validates the destination against the
@@ -473,9 +575,8 @@ impl ServerState {
             return;
         }
         if let Some((req, project_id)) = self.pending_imports.lock().unwrap().remove(job_id) {
-            job.set_state(jobs::JobState::Queued);
             let state = self.clone();
-            std::thread::spawn(move || state.run_import(job, req, project_id));
+            std::thread::spawn(move || state.enqueue_import(job, req, project_id));
         }
     }
 

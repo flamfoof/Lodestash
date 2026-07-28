@@ -30,6 +30,8 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/projects/register", post(register_project))
         .route("/v1/projects", get(list_projects))
         .route("/v1/import", post(import_to_project))
+        .route("/v1/import-queue", get(import_queue))
+        .route("/v1/import-queue/{request_id}/ack", post(import_queue_ack))
         .route("/v1/export", post(export))
         .route("/v1/jobs/{id}", get(job_status))
         .route("/v1/jobs/{id}/cancel", post(cancel_job))
@@ -312,6 +314,58 @@ async fn import_to_project(
             "No Unity project is registered.",
             "Open the Lodestash panel in Unity, or export to a folder instead.",
         ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct QueueParams {
+    project_id: i64,
+}
+
+/// **REST-only** plugin transport (ENGINE-API §5.3, excluded from the MCP↔REST parity scope): the
+/// plugin long-polls this on Unity's main thread for imports to perform. Returns a bare array.
+async fn import_queue(State(state): State<Shared>, Query(p): Query<QueueParams>) -> Response {
+    match state.poll_import_queue(p.project_id) {
+        Ok(reqs) => {
+            let out: Vec<Value> = reqs
+                .iter()
+                .map(|r| {
+                    json!({
+                        "request_id": r.request_id,
+                        "job_id": r.job_id,
+                        "dest_subfolder": r.dest_subfolder,
+                        "assets": r.assets.iter().map(summary_json).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            Json(out).into_response()
+        }
+        Err(e) => db_err(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AckBody {
+    imported: Vec<crate::AckAsset>,
+}
+
+/// **REST-only** plugin transport (ENGINE-API §5.3): the plugin reports what it imported, and the
+/// core writes the durable `import_record`s (with the real Unity `dest_path`/`guid`) + flips the
+/// job `done`.
+async fn import_queue_ack(
+    State(state): State<Shared>,
+    Path(request_id): Path<String>,
+    Json(body): Json<AckBody>,
+) -> Response {
+    match state.ack_import(&request_id, body.imported) {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(crate::AckError::UnknownRequest) => err(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "No such import request.",
+            "It may have been acked already, or the session restarted.",
+        ),
+        Err(crate::AckError::Db(e)) => db_err(e),
     }
 }
 
@@ -659,15 +713,47 @@ mod tests {
             "nothing is recorded before approval"
         );
 
-        // Approve: the import records on a worker thread. Wait for the job to finish.
+        // Approve: enqueues for the plugin on a worker thread. Wait until it is queued.
         st.approve_job(&job.id);
+        let mut reqs = Vec::new();
         for _ in 0..200 {
-            if job.state() == crate::jobs::JobState::Done {
+            reqs = st.poll_import_queue(pid).unwrap();
+            if !reqs.is_empty() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(job.state(), crate::jobs::JobState::Done, "import completed");
+        assert_eq!(reqs.len(), 1, "one request queued for the plugin");
+        assert_eq!(
+            job.state(),
+            crate::jobs::JobState::Running,
+            "in flight until the plugin acks"
+        );
+
+        // Simulate the Unity plugin acking with a real in-project path + GUID.
+        let req0 = &reqs[0];
+        let imported: Vec<crate::AckAsset> = req0
+            .assets
+            .iter()
+            .map(|a| crate::AckAsset {
+                asset_id: a.id,
+                dest_path: format!("Assets/Wildlife/{}", a.name),
+                unity_guid: Some("8e1c".into()),
+            })
+            .collect();
+        st.ack_import(&req0.request_id, imported).unwrap();
+        assert_eq!(
+            job.state(),
+            crate::jobs::JobState::Done,
+            "ack completes the job"
+        );
+
+        // Queue drained; a second ack of the same request is UnknownRequest.
+        assert!(st.poll_import_queue(pid).unwrap().is_empty());
+        assert!(matches!(
+            st.ack_import(&req0.request_id, vec![]),
+            Err(crate::AckError::UnknownRequest)
+        ));
 
         // Re-import the same asset into the same project ⇒ dup-guard: nothing new, no job.
         match st.request_import(mk(ids[0], Some(pid))) {

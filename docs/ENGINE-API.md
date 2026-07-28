@@ -278,24 +278,26 @@ proceeds. Advisory, never an error: the user/agent decides.
   user (GUIDs are reassigned per import). Same rule as
   [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md) §3.
 
-### 5.6 Shipped (interim) — 2026-07-27, card #2
+### 5.6 Shipped (interim) — cards #2 & queue, 2026-07-27/28
 
-The **core round-trip** is in on both planes (`register_project`, `list_projects`, `import_to_project`
-— parity test green), gated by the per-tool allow-list (UI-SPEC §16). What differs from the flow
-above until the **UPM plugin + import-queue** land:
+The **full server-side round-trip** is in: `register_project` / `list_projects` / `import_to_project`
+on both planes (parity green, allow-list-gated), plus the **REST-only** `GET /v1/import-queue` +
+`POST /v1/import-queue/{req}/ack` plugin transport (§5.3). `import_to_project` parks
+`awaiting_approval`; on approval it **enqueues** (nothing recorded yet); a client polling the queue
+gets the request with the assets' `file_url`s; its **ack writes the durable `import_record`** with
+Unity's real `dest_path`/`guid` and flips the job `done` — the `UNIQUE(asset_id, project_id)`
+dup-guard applies at that write. This is exercised end-to-end headless by a simulated plugin
+(register → approve → poll → ack → re-import is dup-guarded).
 
-- **`import_record` is written on approval, not on a plugin ack.** §5.3 has the plugin ack supply
-  Unity's real `dest_path`/`guid`; with no editor to ack, an **approved** `import_to_project` records
-  each asset here with the computed `Assets/<dest_subfolder>/<name>` path and a **NULL `unity_guid`**.
-  The plugin ack will refine those rows when §5.3 ships. `import_to_project` is otherwise a full
-  citizen of the approval gate — parked `awaiting_approval`, nothing recorded until the desktop owner
-  approves, exactly like `export_asset` (MCP-AND-ENGINES §5).
-- **`get_active_project` is folded into `list_projects`** — the list is ordered active-first and each
-  row carries `is_active`, so no separate call exists yet. The §2 row keeps both names; only
-  `list_projects` is implemented.
-- **The import queue + `import-queue`/`ack` endpoints (§5.3) are not built** — they are plugin↔core
-  plumbing, so they arrive with the Unity plugin card. §5.4's `pipeline_mismatch` advisory is likewise
-  deferred; the `already_imported` dup-guard advisory **is** live.
+Still interim until the real **UPM plugin** lands:
+
+- **The queue poll returns immediately**, not the spec's ~25 s long-poll — a busy-poll cost, not a
+  correctness gap (a `tokio::sync::Notify` wait slots in behind the same method).
+- **`get_active_project` is folded into `list_projects`** — active-first, each row carries
+  `is_active`, so no separate call. The §2 row keeps both names; only `list_projects` exists.
+- **`pipeline_mismatch` advisory (§5.4) and staging (§6) are not built yet**; the `already_imported`
+  dup-guard advisory **is** live. Only a real editor doing `AssetDatabase.ImportAsset` remains
+  unbuilt — every step it talks to exists and is tested.
 
 ---
 
