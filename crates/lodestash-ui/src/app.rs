@@ -5599,6 +5599,7 @@ impl LodestashApp {
 
         let mut toggle: Option<(i64, bool)> = None;
         let mut open_pkg: Option<usize> = None;
+        let mut sync_pkg: Option<usize> = None;
         let mut browse_pkg: Option<String> = None;
         let mut stats_pkg: Option<String> = None;
         let counts = self.package_asset_counts();
@@ -5647,6 +5648,21 @@ impl LodestashApp {
                                             .clicked()
                                     {
                                         open_pkg = Some(pkg_idx);
+                                    }
+                                    // ↻ Sync (§5.3): re-scan a library pack's archive index (picks
+                                    // up a .unitypackage rebuilt on disk). Pinned-only — an
+                                    // un-added pack has no index to re-scan.
+                                    if pinned
+                                        && ui
+                                            .button(
+                                                RichText::new("\u{21BB} Sync")
+                                                    .color(theme::ARCANE)
+                                                    .size(11.0),
+                                            )
+                                            .on_hover_text("Re-scan this package's archive index")
+                                            .clicked()
+                                    {
+                                        sync_pkg = Some(pkg_idx);
                                     }
                                     if let Some(n) = pkg.asset_count {
                                         // Extracted this session ⇒ its assets are in the grid,
@@ -5715,6 +5731,11 @@ impl LodestashApp {
         if let Some(i) = open_pkg {
             if let Some(pkg) = packages.get(i) {
                 self.open_package_browse(ctx, pkg);
+            }
+        }
+        if let Some(i) = sync_pkg {
+            if let Some(pkg) = packages.get(i) {
+                self.sync_package(ctx, pkg.id, pkg.name.clone(), PathBuf::from(&pkg.package_path));
             }
         }
         if import_clicked {
@@ -5903,6 +5924,48 @@ impl LodestashApp {
         self.pin_and_mint(ctx, pkg.id, name, abs_path, true);
     }
 
+    /// ↻ Sync (FEATURES.md §5.3): re-scan a pack's archive index. Force-re-reads the manifest and
+    /// refreshes the `package_entry` locators (offsets/paths shift when a `.unitypackage` is rebuilt
+    /// on disk), then re-mints any new classifiable entries and rehydrates. Reuses the Open→ job +
+    /// rehydrate channel; cancellable (a big pack's manifest read streams the whole gzip).
+    fn sync_package(
+        &mut self,
+        ctx: &egui::Context,
+        package_id: i64,
+        name: String,
+        abs_path: PathBuf,
+    ) {
+        let Some(db_path) = catalog_db_path() else {
+            return;
+        };
+        if !abs_path.exists() {
+            self.jobs.toast(
+                format!("Archive is gone from {}", abs_path.display()),
+                Intent::Warning,
+            );
+            return;
+        }
+        if let Some(id) = self.open_pack_job.take() {
+            self.jobs.finish(id);
+        }
+        let progress = Arc::new(crate::jobs::JobProgress::default());
+        self.open_pack_job =
+            Some(self.jobs.start(format!("Syncing {name}"), progress.clone(), true));
+        let tx = self.rehydrate_tx.clone();
+        let ctx2 = ctx.clone();
+        let path = abs_path.clone();
+        std::thread::spawn(move || {
+            match ensure_in_pack_minted(&db_path, package_id, &path, &progress, true) {
+                Ok(n) => tracing::info!(package_id, minted = n, "pack sync done"),
+                Err(err) => tracing::warn!(%err, package_id, "pack sync failed or cancelled"),
+            }
+            let _ = tx.send(());
+            ctx2.request_repaint();
+        });
+        self.jobs
+            .toast(format!("Syncing {name}\u{2026}"), Intent::Info);
+    }
+
     /// Pin + index a pack, prompting first if it is oversized and not yet indexed (indexing in
     /// place inflates the whole archive). Both **Add to Library** and **Open →** route through here,
     /// so the prompt guards every path that would inflate a large pack.
@@ -5993,7 +6056,7 @@ impl LodestashApp {
                     tracing::warn!(%err, package_id, "pin failed");
                 }
             }
-            if let Err(err) = ensure_in_pack_minted(&db_path, package_id, &path, &progress) {
+            if let Err(err) = ensure_in_pack_minted(&db_path, package_id, &path, &progress, false) {
                 tracing::warn!(%err, package_id, "in-pack mint failed or cancelled");
             }
             let _ = tx.send(());
@@ -6583,7 +6646,7 @@ impl LodestashApp {
                     // matters (the 21 GB case).
                     let progress = crate::jobs::JobProgress::default();
                     for (id, path) in ids {
-                        match ensure_in_pack_minted(&db2, id, &path, &progress) {
+                        match ensure_in_pack_minted(&db2, id, &path, &progress, false) {
                             Ok(k) => minted += k,
                             Err(err) => {
                                 tracing::warn!(%err, package_id = id, "in-pack mint failed")

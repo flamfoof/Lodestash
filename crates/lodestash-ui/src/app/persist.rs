@@ -36,18 +36,26 @@ pub(super) fn crawl_record(f: &CrawledFile) -> CrawlRecord {
 /// doesn't have them yet (reading the archive once), then mint an in-pack asset per classified
 /// entry. Idempotent — mint skips duplicates and extracted packs. Background-only: a manifest
 /// read streams the whole gzip. Returns how many assets were newly minted.
+///
+/// `force` re-reads the manifest and re-records locators **even when they already exist** — the
+/// ↻ Sync action's "re-scan archive index" (FEATURES.md §5.3), for a `.unitypackage` rebuilt on
+/// disk since import (offsets/paths shift). `record_package_entries` upserts by `(package_id, guid)`
+/// so a changed entry refreshes in place and a new one is added; mint then picks up new classifiable
+/// entries. ponytail: refresh is additive — a GUID *removed* from the archive leaves its stale
+/// locator + minted row (no prune); add a diff-and-delete pass if that case shows up in practice.
 pub(super) fn ensure_in_pack_minted(
     db: &std::path::Path,
     package_id: i64,
     pack_path: &std::path::Path,
     progress: &crate::jobs::JobProgress,
+    force: bool,
 ) -> Result<usize, String> {
     use std::sync::atomic::Ordering;
     let mut catalog = Catalog::open(db).map_err(|e| e.to_string())?;
     let mut entries = catalog
         .list_package_entries(package_id)
         .map_err(|e| e.to_string())?;
-    if entries.is_empty() {
+    if force || entries.is_empty() {
         // Streaming manifest read: a big pack (a 21 GB music collection) must inflate its whole
         // tar.gz to list its files, so drive a progress bar off compressed bytes and let the tray's
         // ✕ cancel it. Cancel surfaces as an Err, leaving nothing half-written (locators are

@@ -568,7 +568,12 @@ Assets §5 leftovers (#3). In rough order:
    contents + global inspector); **what remains is one human eyeball** — the tree rail, breadcrumb bar,
    and List row/rail pixels were never captured (Glow → blank PrintWindow, §6). The right inspector is
    the existing global one (preview + in-archive path + Package + stats).
-3. **Unity Assets §5 leftovers** — the pack **rows** don't yet carry **↻ Sync**; the import list has
+3. **Unity Assets §5 leftovers** — pack rows now carry **↻ Sync** (2026-07-29): pinned-only, force-
+   re-reads the manifest and refreshes `package_entry` locators + re-mints new entries via
+   `ensure_in_pack_minted(.., force=true)`, reusing the Open→ job + rehydrate channel (the guid-keyed
+   locator upsert it relies on is core-tested; end-to-end wants a rebuilt pack in the running app,
+   and refresh is additive — no prune of a GUID removed from the archive, ponytail-noted). The import
+   list still has
    no **category badge + override dropdown** and no category filter tabs; §5.6's `⧉` duplicate flag
    is unbuilt (its only real instance was the M13 defect); the sidebar facet's `✕` remove is missing
    (the browse-header **✓ In Libraries · remove** is the shipped path); **script/prefab/material
