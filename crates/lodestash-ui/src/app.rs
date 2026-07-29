@@ -10276,6 +10276,25 @@ impl eframe::App for LodestashApp {
         let mut inspector_nav: Option<i64> = None;
         let mut inspector_reject: Option<(i64, String, String)> = None;
         let mut inspector_confirm: Option<(usize, i64, bool)> = None;
+        // Pack browser breadcrumb bar (PACK-DIRECTORY-NAV §4 / delta a): the nav + pack-rooted
+        // breadcrumb + grid⇄list toggle as a **full-width bar above all three panes**. Shown on
+        // `ctx` here — before the inspector right panel and the central panel below — so the left
+        // tree and the inspector start beneath it. Non-pack Folders view keeps its inline breadcrumb
+        // in the body (gated out of the central call below when this bar is up).
+        let pack_toolbar = self.screen == Screen::Library
+            && matches!(self.source_filter, Some(LibraryFilter::Package(_)))
+            && self.view_mode == ViewMode::Folders
+            && !self.pack_dir_tree.is_empty();
+        if pack_toolbar {
+            egui::TopBottomPanel::top("pack_breadcrumb")
+                .frame(
+                    egui::Frame::none()
+                        .fill(theme::SURFACE)
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                        .inner_margin(egui::Margin::symmetric(10.0, 6.0)),
+                )
+                .show(ctx, |ui| self.folders_nav_ui(ui));
+        }
         if self.screen == Screen::Library {
             // Load the LINKED FILES rows before borrowing the entry (the load needs &mut self).
             if let Some(id) = self
@@ -10607,7 +10626,9 @@ impl eframe::App for LodestashApp {
                         )
                         .show_inside(ui, |ui| self.pack_dir_tree_ui(ui));
                 }
-                if self.view_mode == ViewMode::Folders {
+                // Breadcrumb: inline in the body for the ordinary Folders view; for a pack it moves
+                // to the full-width top bar (delta a), so skip it here to avoid a doubled crumb.
+                if self.view_mode == ViewMode::Folders && !pack_toolbar {
                     self.folders_nav_ui(ui);
                 }
                 // Offer the one-time full extraction when browsing a big in-pack pack (fast path).

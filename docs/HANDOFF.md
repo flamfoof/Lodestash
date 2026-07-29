@@ -560,12 +560,14 @@ Assets §5 leftovers (#3). In rough order:
    (`direct (recursive)`), then files with real size + a duration/dimensions third column + a
    colour-coded type glyph, virtualized `[folders…, files…]` over one `show_rows`; file rows reuse
    `asset_list`'s click/context/marquee plumbing, folder rows navigate `current_dir`. The third-column
-   derivation (`grid::content_third_col`) is unit- + mutation-checked; `format_bytes` reused. *Remaining
-   vs mockup:* **(a)** the breadcrumb is still atop the contents (right of the tree) rather than a
-   full-width bar above all three panes — a pure positional move (how-to on the KANBAN card), verifiable
-   only by eye, so deferred not done blind; and the new List **row/rail pixels need a human eyeball**.
-   The right inspector is the existing global one (already shows preview + in-archive path + Package +
-   stats).
+   derivation (`grid::content_third_col`) is unit- + mutation-checked; `format_bytes` reused. *Delta (a) shipped 2026-07-29:*
+   for a pack the breadcrumb + nav + grid⇄list toggle moved to a full-width
+   `TopBottomPanel::top("pack_breadcrumb")` above all three panes (shown on `ctx` before the inspector
+   + central; body breadcrumb gated out when the bar is up; ordinary Folders view keeps its inline
+   crumb). So the three-pane redesign is now **code-complete** (tree + full-width breadcrumb + List
+   contents + global inspector); **what remains is one human eyeball** — the tree rail, breadcrumb bar,
+   and List row/rail pixels were never captured (Glow → blank PrintWindow, §6). The right inspector is
+   the existing global one (preview + in-archive path + Package + stats).
 3. **Unity Assets §5 leftovers** — the pack **rows** don't yet carry **↻ Sync**; the import list has
    no **category badge + override dropdown** and no category filter tabs; §5.6's `⧉` duplicate flag
    is unbuilt (its only real instance was the M13 defect); the sidebar facet's `✕` remove is missing
