@@ -29,8 +29,8 @@ card **"Pack directory navigation — finish the redesign."**
 |---|---|
 | **A** Left directory tree | **Shipped** — nested `SidePanel`, indented hierarchy, expand chevrons, `direct (recursive)` counts, gold selection rail, click-to-navigate (`current_dir`). Layout/rail geometry **needs a human eyeball** (Glow → blank screenshots, HANDOFF §6). |
 | **B** Breadcrumb bar | **Partial** — the pack-rooted breadcrumb exists but sits **atop the contents** (right of the tree). Target: a **full-width bar above all three panes**, with back/forward/up left of it and the grid⇄list toggle right of it. |
-| **Center** Contents list | **Divergent** — currently folder-tiles-then-grid. Target: a **single `Name / Size / Items` list, folders first**. |
-| **C** Counts + type glyphs | Counts read `direct (recursive)`; type encoded by a coloured glyph. Fold into the list above. |
+| **Center** Contents list | **Shipped in List mode** (2026-07-29) — the folders-first `Name / Size / Items` list (`pack_contents_list`): folder rows first with `direct (recursive)`, then files with a real size + a duration/dimensions third column, virtualized as `[folders…, files…]` over one `show_rows`. Grid mode still shows thumbnail cards (the toggle). Column/row **pixel geometry needs a human eyeball** (Glow → blank screenshots, HANDOFF §6). |
+| **C** Counts + type glyphs | **Done** — folder rows read `direct (recursive)`; file rows carry a colour-coded type glyph + size + duration/dimensions (`content_third_col`, unit-tested). Folded into the Center list above. |
 | **Right** Inspector | **Reused** — the existing global inspector already shows preview + in-archive `Path` + `Package` + stats + Add-to-project. No bespoke inspector needed; keep reusing it. |
 
 ---

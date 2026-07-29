@@ -10617,18 +10617,47 @@ impl eframe::App for LodestashApp {
                 let tiles_shown = self.view_mode == ViewMode::Folders
                     && !self.folder_tiles.is_empty()
                     && self.search.is_empty();
-                if self.sorted_cache.is_empty() {
+                // Pack browser, List mode: the folders-first `Name/Size/Items` contents list
+                // (PACK-DIRECTORY-NAV §6). Renders folders even when no file sits directly in the
+                // dir, so it lives outside the sorted_cache-empty guard the grid uses.
+                let pack_list_mode = browsing_pack
+                    && self.view_mode == ViewMode::Folders
+                    && self.folders_as_list
+                    && self.search.is_empty();
+                let page_range = self.page_range();
+                let page_start = page_range.start;
+                let mut out: Option<GridOutput> = None;
+                if pack_list_mode && (!self.folder_tiles.is_empty() || !self.sorted_cache.is_empty())
+                {
+                    let tiles = self.folder_tiles.clone();
+                    let (o, folder_clicked) = pack_contents_list(
+                        ui,
+                        &self.entries,
+                        &self.sorted_cache[page_range],
+                        page_start,
+                        &tiles,
+                        self.last_row_start,
+                        self.last_row_end,
+                        self.selected_cache_idx,
+                        &self.selected,
+                        self.nav_generation.wrapping_add(self.page as u64),
+                    );
+                    if let Some(ti) = folder_clicked {
+                        if let Some((src, dir)) = self.current_dir.clone() {
+                            self.nav_to(Some((src, dir.join(&tiles[ti].name))));
+                        }
+                    }
+                    out = Some(o);
+                } else if self.sorted_cache.is_empty() {
                     if !tiles_shown {
                         no_results_state(ui, &self.search);
                     }
                 } else {
                     // Thumbnail pages: only the current page's slice reaches the
                     // grid, so decode work and textures stay bounded per page.
-                    let page_range = self.page_range();
-                    let page_start = page_range.start;
                     let as_list = self.view_mode == ViewMode::List
                         || (self.view_mode == ViewMode::Folders && self.folders_as_list);
-                    let out = if as_list {
+                    out = Some(if as_list {
                         asset_list(
                             ui,
                             &self.entries,
@@ -10658,7 +10687,9 @@ impl eframe::App for LodestashApp {
                             &self.favorites,
                             &self.config.size_tiers,
                         )
-                    };
+                    });
+                }
+                if let Some(out) = out {
                     if out.cols != self.last_cols
                         || out.row_start != self.last_row_start
                         || out.row_end != self.last_row_end
@@ -12219,6 +12250,200 @@ fn asset_list(
         context,
         rects,
     }
+}
+
+/// The pack browser's folders-first contents list (PACK-DIRECTORY-NAV §6): a single
+/// `Name / Size / Items` list where child folders sort first (each `direct (recursive)`), then the
+/// files directly in the current dir. Rows are `[folders…, files…]` over one virtualized
+/// `show_rows`, so a music pack's thousands of tracks stay windowed. File rows reuse the same
+/// click/context plumbing as [`asset_list`] (via `GridOutput.clicked`/`context`, cache-indexed);
+/// the returned `Option<usize>` is a clicked folder-tile index for the caller to navigate into.
+#[allow(clippy::too_many_arguments)] // ponytail: mirrors asset_list's state; a struct would just rename args
+fn pack_contents_list(
+    ui: &mut Ui,
+    entries: &[AssetEntry],
+    indices: &[usize],
+    index_offset: usize,
+    tiles: &[FolderTile],
+    prev_row_start: usize,
+    prev_row_end: usize,
+    selected_cache_idx: Option<usize>,
+    selected_entries: &std::collections::BTreeSet<usize>,
+    nav_salt: u64,
+) -> (GridOutput, Option<usize>) {
+    let n_folders = tiles.len();
+    let total_rows = n_folders + indices.len();
+    let mut to_spawn: Vec<usize> = Vec::new();
+    let mut row_start_out = prev_row_start;
+    let mut row_end_out = prev_row_end;
+    let mut clicked: Option<(usize, egui::Modifiers)> = None;
+    let mut context: Option<(usize, ContextAction)> = None;
+    let mut rects: Vec<(usize, usize, egui::Rect)> = Vec::new();
+    let mut folder_clicked: Option<usize> = None;
+
+    ScrollArea::vertical()
+        .id_salt(("pack_contents", nav_salt))
+        .auto_shrink([false; 2])
+        .show_rows(ui, LIST_ROW_HEIGHT, total_rows, |ui, row_range| {
+            row_start_out = row_range.start;
+            row_end_out = row_range.end;
+
+            // Prefetch thumbnails for the file rows in the lookahead window (folders have none).
+            if row_range.start != prev_row_start || row_range.end != prev_row_end {
+                let file_lo = row_range.start.max(n_folders) - n_folders;
+                let file_hi = row_range.end.max(n_folders) - n_folders;
+                let (buf_start, buf_end) = lookahead_window(file_lo, file_hi, indices.len());
+                for &idx in &indices[buf_start..buf_end] {
+                    if !entries[idx].thumb_spawned && needs_thumbnail(entries[idx].file.media_type) {
+                        to_spawn.push(idx);
+                    }
+                }
+            }
+
+            // Sticky column header.
+            if row_range.start == 0 {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("NAME").size(9.5).monospace().color(theme::TEXT_DIM));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new("ITEMS").size(9.5).monospace().color(theme::TEXT_DIM));
+                        ui.add_space(48.0);
+                        ui.label(RichText::new("SIZE").size(9.5).monospace().color(theme::TEXT_DIM));
+                    });
+                });
+                ui.add_space(2.0);
+            }
+
+            for row_idx in row_range {
+                if row_idx < n_folders {
+                    // Folder row: gold dot + name (bold), Size `—`, Items `direct (recursive)`.
+                    let t = &tiles[row_idx];
+                    let items = if t.recursive > t.direct {
+                        format!("{} ({})", t.direct, t.recursive)
+                    } else {
+                        t.direct.to_string()
+                    };
+                    let frame = egui::Frame::none()
+                        .fill(theme::SURFACE)
+                        .rounding(4.0)
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                        .inner_margin(egui::Margin::symmetric(6.0, 4.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.set_min_size(egui::Vec2::new(0.0, LIST_THUMB_SIZE));
+                                ui.label(RichText::new("\u{1F4C1}").color(theme::GOLD).size(13.0));
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(&t.name).color(theme::TEXT).strong().size(12.5));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new(items).monospace().size(11.0).color(theme::TEXT_MUTED),
+                                        );
+                                        ui.add_space(48.0);
+                                        ui.label(RichText::new("\u{2014}").size(11.0).color(theme::TEXT_DIM));
+                                    },
+                                );
+                            });
+                        });
+                    if frame.response.interact(egui::Sense::click()).clicked() {
+                        folder_clicked = Some(row_idx);
+                    }
+                    ui.add_space(2.0);
+                    continue;
+                }
+
+                // File row.
+                let file_i = row_idx - n_folders;
+                let idx = indices[file_i];
+                let cache_idx = index_offset + file_i;
+                let entry = &entries[idx];
+                let selected =
+                    selected_cache_idx == Some(cache_idx) || selected_entries.contains(&idx);
+                let type_color = entry
+                    .file
+                    .media_type
+                    .map(theme::media_type_color)
+                    .unwrap_or(theme::TEXT_DIM);
+                let border_color = if selected { theme::GOLD } else { theme::BORDER };
+                let border_width = if selected { 2.0 } else { 1.0 };
+                let size = format_bytes(entry.file.size_bytes);
+                let third = grid::content_third_col(entry.file.media_type, &entry.metrics);
+                let name = entry
+                    .file
+                    .rel_path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+
+                let frame = egui::Frame::none()
+                    .fill(theme::SURFACE)
+                    .rounding(4.0)
+                    .stroke(egui::Stroke::new(border_width, border_color))
+                    .inner_margin(egui::Margin::symmetric(6.0, 4.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.set_min_size(egui::Vec2::new(0.0, LIST_THUMB_SIZE));
+                            // Colour-coded type glyph (a swatch square behind it).
+                            let (resp, painter) = ui.allocate_painter(
+                                egui::Vec2::splat(LIST_THUMB_SIZE),
+                                egui::Sense::hover(),
+                            );
+                            painter.rect_filled(resp.rect, 3.0, type_color.linear_multiply(0.12));
+                            painter.text(
+                                resp.rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                type_label_char(entry.file.media_type),
+                                egui::FontId::proportional((LIST_THUMB_SIZE * 0.35).max(10.0)),
+                                type_color,
+                            );
+                            ui.add_space(6.0);
+                            ui.label(RichText::new(&name).color(theme::TEXT).size(12.0));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(third).monospace().size(11.0).color(theme::TEXT_MUTED),
+                                    );
+                                    ui.add_space(16.0);
+                                    ui.label(
+                                        RichText::new(size).monospace().size(11.0).color(theme::TEXT_DIM),
+                                    );
+                                },
+                            );
+                        });
+                    });
+
+                let resp = frame.response.interact(egui::Sense::click());
+                rects.push((cache_idx, idx, resp.rect));
+                if resp.clicked() {
+                    clicked = Some((cache_idx, ui.input(|i| i.modifiers)));
+                }
+                if resp.secondary_clicked() && !selected_entries.contains(&idx) {
+                    clicked = Some((cache_idx, egui::Modifiers::NONE));
+                }
+                let can_trash = entry.asset_id.is_some();
+                resp.context_menu(|ui| {
+                    ui.set_min_width(190.0);
+                    if let Some(action) = card_context_menu(ui, can_trash) {
+                        context = Some((cache_idx, action));
+                    }
+                });
+                ui.add_space(2.0);
+            }
+        });
+
+    (
+        GridOutput {
+            to_spawn,
+            cols: 1,
+            row_start: row_start_out,
+            row_end: row_end_out,
+            clicked,
+            context,
+            rects,
+        },
+        folder_clicked,
+    )
 }
 
 /// The right-click card menu (DESIGN-GUIDELINES §7). Catalog/engine actions render
@@ -14910,6 +15135,25 @@ mod tests {
             }],
             "tile counts are tab-filtered"
         );
+    }
+
+    #[test]
+    fn content_third_col_by_type() {
+        use lodestash_core::catalog::AssetMetrics;
+        let dur = AssetMetrics {
+            duration_ms: Some(161_000),
+            ..Default::default()
+        };
+        assert_eq!(content_third_col(Some(MediaType::Audio), &dur), "2:41");
+        let wide = AssetMetrics {
+            width_px: Some(1920),
+            height_px: Some(1080),
+            ..Default::default()
+        };
+        assert_eq!(content_third_col(Some(MediaType::Texture), &wide), "1920\u{00D7}1080");
+        // Unmeasured, or a type with no third-column meaning → em dash.
+        assert_eq!(content_third_col(Some(MediaType::Audio), &Default::default()), "\u{2014}");
+        assert_eq!(content_third_col(Some(MediaType::Model3d), &wide), "\u{2014}");
     }
 
     #[test]

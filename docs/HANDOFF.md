@@ -555,10 +555,17 @@ Assets §5 leftovers (#3). In rough order:
    first branch (`seed_expanded`). Ran clean against the real 1737-asset "Total Music Collection" (no
    panic) but **the pixels weren't captured** — both PrintWindow (blank; glow's GL surface isn't in the
    GDI DC) and CopyFromScreen (black; foreground-lock) hit the §6 traps, so **layout/rail geometry
-   needs a human eyeball**. *Remaining vs mockup:* breadcrumb is still atop the contents (right of the
-   tree) rather than a full-width bar above all three panes; the center contents keep the existing
-   folder-tiles-then-grid rather than the mockup's single Name/Size/Items list; the right inspector is
-   the existing global one (already shows preview + in-archive path + Package + stats).
+   needs a human eyeball**. *Delta (b) shipped 2026-07-29:* center **List** mode now renders the
+   folders-first `Name / Size / Items` list (`pack_contents_list`) — folder rows first
+   (`direct (recursive)`), then files with real size + a duration/dimensions third column + a
+   colour-coded type glyph, virtualized `[folders…, files…]` over one `show_rows`; file rows reuse
+   `asset_list`'s click/context/marquee plumbing, folder rows navigate `current_dir`. The third-column
+   derivation (`grid::content_third_col`) is unit- + mutation-checked; `format_bytes` reused. *Remaining
+   vs mockup:* **(a)** the breadcrumb is still atop the contents (right of the tree) rather than a
+   full-width bar above all three panes — a pure positional move (how-to on the KANBAN card), verifiable
+   only by eye, so deferred not done blind; and the new List **row/rail pixels need a human eyeball**.
+   The right inspector is the existing global one (already shows preview + in-archive path + Package +
+   stats).
 3. **Unity Assets §5 leftovers** — the pack **rows** don't yet carry **↻ Sync**; the import list has
    no **category badge + override dropdown** and no category filter tabs; §5.6's `⧉` duplicate flag
    is unbuilt (its only real instance was the M13 defect); the sidebar facet's `✕` remove is missing

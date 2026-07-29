@@ -187,3 +187,26 @@ pub(super) fn keep_range(
     let keep_end = ((row_end + keep) * cols).min(len);
     (keep_start, keep_end)
 }
+
+/// The pack-browser contents list's third column: duration for audio, dimensions for an image, `—`
+/// otherwise or when the metric hasn't been extracted yet (PACK-DIRECTORY-NAV §6). Pure/testable;
+/// the widget renders folders (from `folder_tiles`) then files (from `sorted_cache`) using this.
+pub(super) fn content_third_col(
+    mt: Option<MediaType>,
+    m: &lodestash_core::catalog::AssetMetrics,
+) -> String {
+    match mt {
+        Some(MediaType::Audio) => m
+            .duration_ms
+            .map(|d| crate::audio::fmt_time(d.max(0) as f32 / 1000.0))
+            .unwrap_or_else(|| "\u{2014}".into()),
+        Some(MediaType::Image | MediaType::Texture | MediaType::Sprite) => {
+            match (m.width_px, m.height_px) {
+                (Some(w), Some(h)) if w == h => format!("{w}\u{00B2}"),
+                (Some(w), Some(h)) => format!("{w}\u{00D7}{h}"),
+                _ => "\u{2014}".into(),
+            }
+        }
+        _ => "\u{2014}".into(),
+    }
+}
