@@ -6355,6 +6355,22 @@ impl LodestashApp {
     /// holds them (which is the publisher/category tree in an Asset Store cache), each
     /// tickable, importing as one Library apiece.
     fn import_dialog(&mut self, ctx: &egui::Context) {
+        // Duplicate check (§5.6): flag each candidate whose normalized name matches an
+        // already-indexed pack. Computed before the mutable `scan` borrow so both can be read.
+        let dupes: std::collections::HashMap<usize, String> =
+            match (&self.import_scan, &self.unity_packages) {
+                (Some(scan), Some(existing)) => {
+                    let names: Vec<&str> = existing.iter().map(|p| p.name.as_str()).collect();
+                    scan.found
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, (_, _, name, _))| {
+                            duplicate_pack_name(name, &names).map(|m| (i, m))
+                        })
+                        .collect()
+                }
+                _ => Default::default(),
+            };
         let Some(scan) = &mut self.import_scan else {
             return;
         };
@@ -6454,6 +6470,19 @@ impl LodestashApp {
                                             }
                                         }
                                         ui.label(RichText::new(name).color(theme::TEXT).size(11.0));
+                                        if let Some(existing) = dupes.get(&i) {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "\u{29C9} possibly already indexed as \u{201C}{existing}\u{201D}"
+                                                ))
+                                                .color(theme::WARNING)
+                                                .size(10.0),
+                                            )
+                                            .on_hover_text(
+                                                "A package with this name is already indexed \u{2014} \
+                                                 importing is non-destructive, you decide (\u{00A7}5.6)",
+                                            );
+                                        }
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
@@ -6505,6 +6534,20 @@ impl LodestashApp {
                 });
             });
         if import_now {
+            // §5.6: non-blocking heads-up if any picked pack looks already-indexed.
+            let dup_selected = self
+                .import_scan
+                .as_ref()
+                .map(|s| s.selected.iter().filter(|i| dupes.contains_key(i)).count())
+                .unwrap_or(0);
+            if dup_selected > 0 {
+                self.jobs.toast(
+                    format!(
+                        "{dup_selected} of the imported packages look already indexed \u{2014} nothing is duplicated on disk"
+                    ),
+                    Intent::Warning,
+                );
+            }
             self.import_selected_packages(ctx);
         } else if cancel || !open {
             self.import_scan = None;
@@ -11596,6 +11639,29 @@ fn is_unitypackage(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Normalized pack-name key for the §5.6 duplicate check: lowercased, a trailing `.unitypackage`
+/// dropped, and internal/surrounding whitespace collapsed to single spaces. Two candidates that
+/// normalize equal are treated as the same title (content hashing is the real-app refinement —
+/// FEATURES §5.6). Pure so the match is unit-testable.
+fn pack_name_key(name: &str) -> String {
+    let base = name.strip_suffix(".unitypackage").unwrap_or(name);
+    base.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// If `candidate` normalizes to the same title as one of the already-indexed `existing` names,
+/// return that existing name — the one to show in `⧉ possibly already indexed as "…"` (§5.6).
+/// `None` when nothing matches.
+fn duplicate_pack_name(candidate: &str, existing: &[&str]) -> Option<String> {
+    let key = pack_name_key(candidate);
+    existing
+        .iter()
+        .find(|e| pack_name_key(e) == key)
+        .map(|e| e.to_string())
+}
+
 /// Display name for a package: the file stem of its path (extension and directories stripped).
 fn package_display_name(path: &std::path::Path) -> String {
     path.file_stem()
@@ -15219,6 +15285,22 @@ mod tests {
             }],
             "tile counts are tab-filtered"
         );
+    }
+
+    #[test]
+    fn duplicate_pack_name_matches_normalized() {
+        let existing = ["Poly Nature", "Sci-Fi Props Pack"];
+        // Extension dropped, case- and whitespace-insensitive.
+        assert_eq!(
+            duplicate_pack_name("poly   nature.unitypackage", &existing).as_deref(),
+            Some("Poly Nature"),
+        );
+        assert_eq!(
+            duplicate_pack_name("Sci-Fi Props Pack", &existing).as_deref(),
+            Some("Sci-Fi Props Pack"),
+        );
+        // A genuinely different title does not match.
+        assert_eq!(duplicate_pack_name("Poly Dungeons", &existing), None);
     }
 
     #[test]

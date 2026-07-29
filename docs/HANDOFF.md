@@ -574,8 +574,12 @@ Assets §5 leftovers (#3). In rough order:
    locator upsert it relies on is core-tested; end-to-end wants a rebuilt pack in the running app,
    and refresh is additive — no prune of a GUID removed from the archive, ponytail-noted). The import
    list still has
-   no **category badge + override dropdown** and no category filter tabs; §5.6's `⧉` duplicate flag
-   is unbuilt (its only real instance was the M13 defect); the sidebar facet's `✕` remove is missing
+   no **category badge + override dropdown** and no category filter tabs. **§5.6's `⧉` duplicate flag
+   is built** (2026-07-29): the import dialog flags a candidate whose normalized name
+   (`pack_name_key`/`duplicate_pack_name`, unit- + mutation-checked) matches an already-indexed pack —
+   a `⧉ possibly already indexed as "…"` note per row + a non-blocking warning toast on import;
+   normalization is name-only for now (content hashing is the FEATURES §5.6 refinement). The sidebar
+   facet's `✕` remove is missing
    (the browse-header **✓ In Libraries · remove** is the shipped path); **script/prefab/material
    previews** show only their type. (Pack **size** now shows on cards; **sort** shipped.)
 4. **Favourites design conformance** — four presentation deltas listed on the KANBAN card. Contained:
