@@ -4,7 +4,7 @@ Working notes for whoever (or whatever) continues the build. Unlike the rest of 
 is **not** a design spec — it's the state of play, the decisions already settled, and the traps.
 The design docs still win on any question of what the software *should* do.
 
-Last updated: **2026-07-27**, at `75fa5e9`.
+Last updated: **2026-07-28**, at `2a12d44`.
 
 ---
 
@@ -47,8 +47,8 @@ stack is one-click installable on win-x64 (fetches the ONNX Runtime *and* both m
 **The agent plane is open** (P5, [`ENGINE-API.md`](ENGINE-API.md) + [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md)).
 `lodestash-api` binds an ephemeral loopback port at launch, writes `engine.json`, and serves `/v1/`
 behind a bearer token + loopback `Host`/`Origin` guard. `lodestash --mcp` runs the same operations
-over rmcp stdio. Nine operations exist on **both** planes, and a parity test fails the build if one
-plane grows a name the other lacks:
+over rmcp stdio. **Twelve** operations exist on **both** planes, and a parity test fails the build if
+one plane grows a name the other lacks:
 
 | Tool / route | Note |
 |---|---|
@@ -56,16 +56,26 @@ plane grows a name the other lacks:
 | `semantic_search` (`?mode=ai`) | 501 only while no model is loaded |
 | `get_asset_preview` | image block + `resource_link`; PNG from the grid's own thumb cache |
 | `find_similar` · `list_packages` | |
+| `register_project` · `list_projects` · `import_to_project` | **P5 Unity round-trip** (2026-07-28); import is side-effecting |
 | `export_asset` · `get_job_status` · `cancel_job` | **side-effecting**, see below |
 
 Both planes call the *same* `ServerState` methods the REST handlers call — that is what makes the 1:1
-rule structural rather than a convention. `GET /v1/assets/{id}/file` stays REST-only by design.
+rule structural rather than a convention. `GET /v1/assets/{id}/file` and the plugin transport
+(`GET /v1/import-queue`, `POST /v1/import-queue/{req}/ack`) stay **REST-only** by design.
 
-**Side-effecting ops are gated on the human.** `export_asset` returns a job in state
-`awaiting_approval` and copies nothing until someone approves the desktop modal (UI-SPEC §11.6b);
-denial cancels it permanently. `dest_path` must be absolute, `..`-free, and outside every library
-source root. This is MCP-AND-ENGINES §5 ("confirm server-side, don't rely on the client's
+**Side-effecting ops are gated on the human.** `export_asset` **and `import_to_project`** return a job
+in state `awaiting_approval` and write nothing until someone approves the desktop modal (UI-SPEC
+§11.6b); denial cancels it. Export's `dest_path` must be absolute, `..`-free, and outside every
+library source root. This is MCP-AND-ENGINES §5 ("confirm server-side, don't rely on the client's
 human-in-the-loop") made literal — keep it that way for every mutating op that follows.
+
+**The per-tool allow-list gates both planes** (card 178, 2026-07-28). One list on `ServerState`
+(`allows`/`set_allowed`, default all-on, config `mcp_disabled_tools`); REST checks it in a `gate`
+middleware after auth, MCP checks it per tool — so a disabled tool is off 1:1. **The Unity import
+round-trip is in** (ENGINE-API §5.6): approval **enqueues**; the plugin drains `GET /v1/import-queue`
+and its **ack** writes the durable `import_record` with Unity's real path+guid (the dup-guard is
+`UNIQUE(asset_id, project_id)`). Exercised headless by a simulated plugin. The two unbuilt pieces are
+the real **UPM C# plugin** (needs a Unity install to verify) and the allow-list **toggle UI**.
 
 **This machine's catalog is embedded** (2026-07-22): 1983 SigLIP vectors (1723 `model_3d`, 260
 `image`) + 84 CLAP vectors, from ~2274 assets. The 207 rows still `embedding_dirty` are `.mat`
@@ -522,7 +532,10 @@ fixture.
 
 ## 7. Suggested next work
 
-Top of the list is finishing the in-pack feature (M14) the last session built, in the user's order:
+**Recommended next: P5** (#5, the Unity round-trip) is the biggest open frontier — its whole server
+side shipped 2026-07-28, so what remains is the UPM C# plugin (needs Unity) and the allow-list toggle
+UI. The contained, verifiable-headless items are the pack-directory design deltas (#2) and Unity
+Assets §5 leftovers (#3). In rough order:
 
 0. ~~M14 step 8 — unify extraction with in-pack rows~~ **DONE 2026-07-25** (`materialize_in_pack_assets`;
    see §6 trap). Extraction now materializes a pack's existing in-pack rows instead of minting a
@@ -551,9 +564,9 @@ Top of the list is finishing the in-pack feature (M14) the last session built, i
    is unbuilt (its only real instance was the M13 defect); the sidebar facet's `✕` remove is missing
    (the browse-header **✓ In Libraries · remove** is the shipped path); **script/prefab/material
    previews** show only their type. (Pack **size** now shows on cards; **sort** shipped.)
-2. **Favourites design conformance** — four presentation deltas listed on the KANBAN card. Contained:
+4. **Favourites design conformance** — four presentation deltas listed on the KANBAN card. Contained:
    glyph/colour/position, chip moves to the toolbar, plus a Favorites screen reusing the grid.
-3. **P5 — the Unity round-trip** *(the biggest open frontier)*: shipped so far — the **MCP per-tool
+5. **P5 — the Unity round-trip** *(the biggest open frontier)*: shipped so far — the **MCP per-tool
    allow-list** (card 178, engine half), the **register→import round-trip** on both planes
    (`register_project`, `list_projects`, `import_to_project`, approval-gated, dup-guarded), and the
    **REST-only import-queue + ack** plugin transport (`GET /v1/import-queue`, `POST
@@ -561,18 +574,18 @@ Top of the list is finishing the in-pack feature (M14) the last session built, i
    real path+guid, exercised headless by a simulated plugin (ENGINE-API §5.6). What's left: the real
    **UPM C# plugin** (the one piece unverifiable without a Unity install), `pipeline_mismatch`
    advisory + staging endpoints (§6), the queue's real ~25 s long-poll, and the card-178 **toggle UI**.
-4. **P4 remainder** — *the P4 tail shipped almost whole 2026-07-27* (cloud reliability/cost card 170,
+6. **P4 remainder** — *the P4 tail shipped almost whole 2026-07-27* (cloud reliability/cost card 170,
    SigLIP zero-shot + 3D multiview card 171, the whole Mapping library card 172, download hardening
    card 173 — see the P4-tail block in §2). Still open: **WD-EVA02** dense tagger (needs the GPU-tier
    model registry — card 173) + YAMNet/PANNs + Whisper; **Claude-native** API impl + **Batches**; the
    optional `regex`/`embedding_knn` mapping match types; `+ trait` quick-add + trait colour on inspector
    chips. A full local Identify pass over this library is ~5 h of CPU; manual + resumable for that reason.
-5. **P2 remainder** — the naming heuristic for assets with no `.meta` (no GUID ⇒ no edges at all),
+7. **P2 remainder** — the naming heuristic for assets with no `.meta` (no GUID ⇒ no edges at all),
    prefabs inside an extracted workspace, the §13.6 relink panel, and `has_dependents`/
    `has_dependencies` as search filters rather than only chips.
-6. **List-view parity** — the new list rows show neither the favourite star, the link badge, nor
+8. **List-view parity** — the new list rows show neither the favourite star, the link badge, nor
    material previews. Also worth a card: `app.rs` is ~12k lines.
-7. Optional AI refinements: an LLM query parser (slots in behind `ParsedQuery::validate`),
+9. Optional AI refinements: an LLM query parser (slots in behind `ParsedQuery::validate`),
    cross-encoder rerank, glTF material textures. **Non-win-x64 ORT auto-fetch stays skipped** — it
    can't be tested from this machine.
 
