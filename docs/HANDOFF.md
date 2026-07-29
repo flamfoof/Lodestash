@@ -598,8 +598,12 @@ Assets §5 leftovers (#3). In rough order:
    model registry — card 173) + YAMNet/PANNs + Whisper; **Claude-native** API impl + **Batches**; the
    optional `regex`/`embedding_knn` mapping match types; `+ trait` quick-add + trait colour on inspector
    chips. A full local Identify pass over this library is ~5 h of CPU; manual + resumable for that reason.
-7. **P2 remainder** — the naming heuristic for assets with no `.meta` (no GUID ⇒ no edges at all),
-   prefabs inside an extracted workspace, the §13.6 relink panel, and `has_dependents`/
+7. **P2 remainder** — ~~the naming heuristic for assets with no `.meta`~~ **DONE 2026-07-29**
+   (DATA-MODEL §10 step 2): an edge-less model gains `uses_texture` edges to sibling textures whose
+   stem name-matches it (`deps::texture_matches_model`, `source='inferred'` conf 0.7), run in the
+   dependency drain (`edgeless_models` × `inference_textures` → `insert_inferred_texture_edges`);
+   pure matcher + catalog contract both mutation-checked; end-to-end count wants the running catalog.
+   Still open: prefabs inside an extracted workspace, the §13.6 relink panel, and `has_dependents`/
    `has_dependencies` as search filters rather than only chips.
 8. **List-view parity** — the new list rows show neither the favourite star, the link badge, nor
    material previews. Also worth a card: `app.rs` is ~12k lines.

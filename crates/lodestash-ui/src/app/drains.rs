@@ -569,6 +569,7 @@ pub(super) fn drain_dependencies(cat: &mut Catalog, workspace_dir: Option<&std::
     }
     if total > 0 {
         drain_prefab_edges(cat);
+        drain_inferred_texture_edges(cat);
     }
     match cat.resolve_pending_relationships() {
         Ok(late) if late > 0 => tracing::info!(late, "dependency edges late-bound"),
@@ -604,6 +605,70 @@ pub(super) fn drain_prefab_edges(cat: &mut Catalog) {
     match cat.replace_prefab_relationships(&pairs) {
         Ok(written) => tracing::info!(pairs = pairs.len(), written, "prefab edges rebuilt"),
         Err(e) => tracing::warn!(%e, "rebuilding prefab edges failed"),
+    }
+}
+
+/// The §10 step-2 naming heuristic: connect a raw-export model (no `.meta`, so no GUID and no edge)
+/// to sibling textures in the same source folder whose file stem name-matches the model's — e.g.
+/// `Human3.fbx` → `Human3_Albedo.png`. The matching (`deps::texture_matches_model`) runs here in the
+/// ingest-aware layer; the catalog only supplies the rows and takes the resolved edges. Applies only
+/// to edge-less models, so it never overrides the deterministic GUID/prefab graph.
+pub(super) fn drain_inferred_texture_edges(cat: &mut Catalog) {
+    use std::path::{Path, PathBuf};
+    let models = match cat.edgeless_models() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(%e, "naming heuristic: edge-less models query failed");
+            return;
+        }
+    };
+    if models.is_empty() {
+        return;
+    }
+    let textures = match cat.inference_textures() {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(%e, "naming heuristic: textures query failed");
+            return;
+        }
+    };
+    // Index textures by (source, parent folder) → (stem, id, rel_path).
+    type DirIndex = std::collections::HashMap<(i64, PathBuf), Vec<(String, i64, String)>>;
+    let mut by_dir: DirIndex = DirIndex::new();
+    for (id, src, rel) in &textures {
+        let p = Path::new(rel);
+        let dir = p.parent().map(Path::to_path_buf).unwrap_or_default();
+        if let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().into_owned()) {
+            by_dir
+                .entry((*src, dir))
+                .or_default()
+                .push((stem, *id, rel.clone()));
+        }
+    }
+    let mut edges: Vec<(i64, i64, String)> = Vec::new();
+    for (mid, src, rel) in &models {
+        let p = Path::new(rel);
+        let dir = p.parent().map(Path::to_path_buf).unwrap_or_default();
+        let Some(mstem) = p.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        if let Some(sibs) = by_dir.get(&(*src, dir)) {
+            for (tstem, tid, trel) in sibs {
+                if lodestash_ingest::deps::texture_matches_model(&mstem, tstem) {
+                    edges.push((*mid, *tid, trel.clone()));
+                }
+            }
+        }
+    }
+    if edges.is_empty() {
+        return;
+    }
+    let borrowed: Vec<(i64, i64, &str)> =
+        edges.iter().map(|(f, t, d)| (*f, *t, d.as_str())).collect();
+    match cat.insert_inferred_texture_edges(&borrowed) {
+        Ok(n) if n > 0 => tracing::info!(inferred = n, "naming-heuristic texture edges added"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(%e, "inserting inferred texture edges failed"),
     }
 }
 

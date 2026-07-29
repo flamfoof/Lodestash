@@ -143,6 +143,21 @@ pub fn prefab_pairs_under(root: &Path) -> Vec<(String, String)> {
     pairs
 }
 
+/// Path/naming heuristic (DATA-MODEL §10 step 2): does the texture named `tex` (file stem) belong
+/// to the model named `model` (file stem)? True when `tex` equals `model`, or begins with `model`
+/// followed by a separator (`_`, `-`, `.`, or space) — so `Human3.fbx` claims `Human3_Albedo` and
+/// `Human3 Normal` but **not** `Human30`. Case-insensitive, names only. The caller applies this only
+/// to a model with no real (GUID-derived) edges, minting `uses_texture` with `source='inferred'`.
+pub fn texture_matches_model(model: &str, tex: &str) -> bool {
+    let (m, t) = (model.to_ascii_lowercase(), tex.to_ascii_lowercase());
+    if m.is_empty() {
+        return false;
+    }
+    t == m
+        || t.strip_prefix(&m)
+            .is_some_and(|rest| rest.starts_with(['_', '-', '.', ' ']))
+}
+
 fn push_unique(v: &mut Vec<String>, item: String) {
     if !v.contains(&item) {
         v.push(item);
@@ -259,6 +274,20 @@ m_Component:
             vec!["42b64fdb315e3054ea757d8d1c4bcfa7"],
             "the block ends at the next key"
         );
+    }
+
+    #[test]
+    fn texture_matches_model_by_name_prefix() {
+        // Belongs: exact stem, or stem + separator (§10 example Human3.fbx ↔ Human3_Albedo.png).
+        assert!(texture_matches_model("Human3", "Human3"));
+        assert!(texture_matches_model("Human3", "Human3_Albedo"));
+        assert!(texture_matches_model("Human3", "Human3-Normal"));
+        assert!(texture_matches_model("Human3", "Human3 Spec"));
+        assert!(texture_matches_model("Human3", "human3_albedo"), "case-insensitive");
+        // Does not belong: a longer stem with no separator, or an unrelated name.
+        assert!(!texture_matches_model("Human3", "Human30"));
+        assert!(!texture_matches_model("Human3", "Rock_Albedo"));
+        assert!(!texture_matches_model("", "anything"), "empty model matches nothing");
     }
 
     #[test]

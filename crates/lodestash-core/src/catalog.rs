@@ -2370,6 +2370,75 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("deps commit: {e}")))
     }
 
+    /// Models (`model_3d`) that carry **no** dependency edge at all — raw exports with no `.meta`,
+    /// so no GUID and no meta/prefab edge — as `(asset_id, source_id, rel_path)`. These are the only
+    /// candidates for the §10 step-2 naming heuristic: a model that already reaches a material/texture
+    /// through a real edge is left alone. Pairs with [`Self::inference_textures`] +
+    /// [`Self::insert_inferred_texture_edges`]; the name matching itself lives in the ingest layer.
+    pub fn edgeless_models(&self) -> Result<Vec<(i64, i64, String)>> {
+        self.asset_locations(
+            &["model_3d"],
+            "AND NOT EXISTS (SELECT 1 FROM asset_relationship r WHERE r.from_asset_id = a.id)",
+        )
+    }
+
+    /// Catalogued textures/images/sprites as `(asset_id, source_id, rel_path)` — the pool the naming
+    /// heuristic pairs an edge-less model against (same source + folder).
+    pub fn inference_textures(&self) -> Result<Vec<(i64, i64, String)>> {
+        self.asset_locations(&["texture", "image", "sprite"], "")
+    }
+
+    /// Shared `(id, source_id, rel_path)` query for the naming heuristic; `codes` filters media type,
+    /// `extra` appends an optional predicate. Live rows with a present primary file only.
+    fn asset_locations(&self, codes: &[&str], extra: &str) -> Result<Vec<(i64, i64, String)>> {
+        let placeholders = vec!["?"; codes.len()].join(",");
+        let sql = format!(
+            "SELECT a.id, a.source_id, af.rel_path
+               FROM asset a
+               JOIN asset_file af ON af.id = a.primary_file_id AND af.missing = 0
+               JOIN media_type mt ON mt.id = a.media_type_id
+              WHERE mt.code IN ({placeholders}) AND a.deleted_at IS NULL {extra}"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| CoreError::Catalog(format!("infer locations prep: {e}")))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(codes), |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(|e| CoreError::Catalog(format!("infer locations query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("infer locations rows: {e}")))
+    }
+
+    /// Insert `uses_texture` edges the naming heuristic resolved (DATA-MODEL §10 step 2):
+    /// `(from_model_id, to_texture_id, texture_rel_path)`, each `source='inferred'`, `confidence
+    /// 0.7`, `state='resolved'`. Idempotent — `ON CONFLICT(from,to,kind) DO NOTHING` — so a re-run
+    /// adds nothing, and because inserting an edge makes the model non-edge-less it drops out of
+    /// [`Self::edgeless_models`] next pass. Returns the count actually inserted.
+    pub fn insert_inferred_texture_edges(&mut self, edges: &[(i64, i64, &str)]) -> Result<usize> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| CoreError::Catalog(format!("infer edges begin: {e}")))?;
+        let mut inserted = 0usize;
+        for (from_id, to_id, declared) in edges {
+            inserted += tx
+                .execute(
+                    "INSERT INTO asset_relationship
+                        (from_asset_id, to_asset_id, kind, source, confidence, declared_path, state)
+                     VALUES (?1, ?2, 'uses_texture', 'inferred', 0.7, ?3, 'resolved')
+                     ON CONFLICT(from_asset_id, to_asset_id, kind) DO NOTHING",
+                    params![from_id, to_id, declared],
+                )
+                .map_err(|e| CoreError::Catalog(format!("infer edge insert: {e}")))?;
+        }
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("infer edges commit: {e}")))?;
+        Ok(inserted)
+    }
+
     /// Write one asset's tags for a given `source` (`'ai'|'manual'|'imported'`), replacing
     /// whatever that source wrote before, and clear `tags_dirty` (IDENTIFICATION-AND-SEARCH §2).
     ///
@@ -5963,6 +6032,92 @@ mod tests {
                 confirmed: 1
             }
         );
+    }
+
+    #[test]
+    fn naming_heuristic_candidates_and_idempotent_insert() {
+        // §10 step-2 catalog contract: an edge-less model is a candidate, the insert is idempotent,
+        // and inserting an edge drops the model out of the candidate set. (The name matching itself
+        // lives in the ingest layer and is tested there — `deps::texture_matches_model`.)
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let s = c.upsert_import_source("A", "C:/a", "folder").expect("src");
+        let mk = |rel: &str, mt: &str| CrawlRecord {
+            workspace_rel: None,
+            rel_path: rel.to_string(),
+            name: rel.rsplit('/').next().unwrap_or(rel).to_string(),
+            media_type: mt.to_string(),
+            size_bytes: 1,
+            mtime: 1,
+        };
+        c.record_crawl(
+            s,
+            None,
+            &[
+                mk("Chars/Human3.fbx", "model_3d"),
+                mk("Chars/Human3_Albedo.png", "image"),
+                mk("Chars/Human3_Normal.png", "image"),
+                mk("Chars/Rock_Albedo.png", "image"), // unrelated stem
+            ],
+        )
+        .expect("crawl");
+        let id = |rel: &str| -> i64 {
+            c.conn
+                .query_row(
+                    "SELECT a.id FROM asset a JOIN asset_file af ON af.id = a.primary_file_id
+                     WHERE af.rel_path = ?1",
+                    params![rel],
+                    |r| r.get(0),
+                )
+                .expect("id")
+        };
+        let model = id("Chars/Human3.fbx");
+        assert_eq!(
+            c.edgeless_models()
+                .expect("models")
+                .iter()
+                .map(|(m, _, _)| *m)
+                .collect::<Vec<_>>(),
+            vec![model],
+            "the model with no edges is the sole candidate"
+        );
+        assert_eq!(c.inference_textures().expect("tex").len(), 3);
+
+        let (alb, nrm) = (id("Chars/Human3_Albedo.png"), id("Chars/Human3_Normal.png"));
+        assert_eq!(
+            c.insert_inferred_texture_edges(&[
+                (model, alb, "Chars/Human3_Albedo.png"),
+                (model, nrm, "Chars/Human3_Normal.png"),
+            ])
+            .expect("insert"),
+            2
+        );
+        assert!(
+            c.edgeless_models().expect("m2").is_empty(),
+            "a model that gained edges is no longer a candidate (idempotent re-run)"
+        );
+        assert_eq!(
+            c.insert_inferred_texture_edges(&[(model, alb, "x")])
+                .expect("reinsert"),
+            0,
+            "the UNIQUE conflict makes a re-insert a no-op"
+        );
+
+        let mut got: Vec<i64> = c
+            .conn
+            .prepare(
+                "SELECT to_asset_id FROM asset_relationship
+                 WHERE from_asset_id = ?1 AND source = 'inferred'",
+            )
+            .unwrap()
+            .query_map(params![model], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        got.sort();
+        let mut want = vec![alb, nrm];
+        want.sort();
+        assert_eq!(got, want, "exactly the resolved edges, confidence-tagged inferred");
     }
 
     #[test]

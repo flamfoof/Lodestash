@@ -692,10 +692,14 @@ re-walks nothing.
 
 > **Coverage today.** `uses_texture` (material → texture, from the material YAML) and
 > `uses_material` (mesh → material, from prefabs) — so a model's closure reaches its textures
-> through its material. Not yet: step 2's naming heuristic for raw exports outside a Unity project
-> (those have no `.meta`, so they have no GUIDs and no edges at all), `uses_mesh`/`uses_audio`/
-> `uses_script` from prefabs, and prefabs living inside an extracted package workspace rather than
-> a source root.
+> through its material. **Step 2's naming heuristic is in** (2026-07-29): a model with *no* edge at
+> all (a raw export — no `.meta`, so no GUID) gets `uses_texture` edges to sibling textures in the
+> same source folder whose file stem name-matches it (`Human3.fbx` → `Human3_Albedo.png`), as
+> `source='inferred'`, `confidence 0.7`. It applies only to edge-less models, so it never overrides
+> the deterministic GUID/prefab graph; the name match is `deps::texture_matches_model` (exact stem or
+> stem + separator), run in the dependency drain over `Catalog::edgeless_models` ×
+> `inference_textures`. Not yet: `uses_mesh`/`uses_audio`/`uses_script` from prefabs, and prefabs
+> living inside an extracted package workspace rather than a source root.
 
 ---
 
