@@ -967,6 +967,10 @@ pub struct LodestashApp {
     sort_asc: bool,
     thumb_size: f32,
     view_mode: ViewMode,
+    /// The Library's own view mode + folder position, saved when a Unity pack explorer forces
+    /// Folders (FEATURES §5.4) so returning to Library via the nav restores it — the folder
+    /// position only when the Library was itself in Folders view. `None` = nothing to restore.
+    saved_library_view: Option<(ViewMode, Option<(usize, PathBuf)>)>,
     /// Flat mode: restrict the grid to one source (None = all libraries).
     source_filter: Option<LibraryFilter>,
     /// Folders mode location: None = top level (source tiles); Some = (source, dir rel to root).
@@ -1261,6 +1265,7 @@ impl LodestashApp {
             sort_asc,
             thumb_size,
             view_mode,
+            saved_library_view: None,
             source_filter: None,
             current_dir: None,
             nav_history: vec![None],
@@ -3156,6 +3161,13 @@ impl LodestashApp {
             match res {
                 Ok(path) => {
                     self.in_pack_scratch.insert(id, path);
+                    // The asset's payload is now on disk, so refresh its grid card thumbnail — drop
+                    // the typed placeholder and let the worker regenerate it (a visible "loaded" cue
+                    // for a Unity in-pack asset the user just opened).
+                    if let Some(e) = self.entries.iter_mut().find(|e| e.asset_id == Some(id)) {
+                        e.thumb_spawned = false;
+                        e.texture = None;
+                    }
                     ctx.request_repaint(); // re-run ensure_viewer_loaded now the file exists
                 }
                 // A cancel (the tray's ✕) is not a failure — the user aborted a slow pull.
@@ -3899,9 +3911,19 @@ impl LodestashApp {
     /// Open a pack in the **folder-explorer** (FEATURES.md §5.4): the library grid filtered to the
     /// pack, in Folders view rooted at the pack's top folder, with a fresh back/forward history.
     fn browse_package_folders(&mut self, name: String) {
+        // Save the Library's own view mode (and folder position, only if it was in Folders) so
+        // returning to Library via the nav restores it — the pack explorer forces Folders below.
+        // Don't overwrite an already-saved view (Unity→pack→pack keeps the original Library view).
+        if self.saved_library_view.is_none() {
+            self.saved_library_view = Some((
+                self.view_mode,
+                (self.view_mode == ViewMode::Folders)
+                    .then(|| self.current_dir.clone())
+                    .flatten(),
+            ));
+        }
         self.source_filter = Some(LibraryFilter::Package(name));
         self.screen = Screen::Library;
-        // Switch to Folders for this browse without clobbering the saved default view mode.
         self.view_mode = ViewMode::Folders;
         // Root the explorer at the pack's own source; folder tiles below are its in-archive dirs.
         let src = self
@@ -4943,7 +4965,18 @@ impl LodestashApp {
         self.active_tab = Category::All;
         self.search.clear();
         self.content_filter.clear();
-        self.current_dir = self.default_dir();
+        // Restore the Library view saved when a pack explorer was opened (FEATURES §5.4): its view
+        // mode, and — only if it was Folders — its folder position. Otherwise reset to the default.
+        match self.saved_library_view.take() {
+            Some((vm, dir)) => {
+                self.view_mode = vm;
+                self.current_dir = match (vm, dir) {
+                    (ViewMode::Folders, Some(d)) => Some(d),
+                    _ => self.default_dir(),
+                };
+            }
+            None => self.current_dir = self.default_dir(),
+        }
         self.reset_nav_history();
         self.selected_cache_idx = None;
         self.nav_generation += 1;
@@ -11225,7 +11258,10 @@ impl eframe::App for LodestashApp {
                             .collapsible(false)
                             .resizable(true)
                             .default_size([640.0, 620.0])
-                            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                            // Open centered but stay draggable — `.anchor` pins the window and
+                            // blocks moving it, so use a centered default position instead.
+                            .pivot(egui::Align2::CENTER_CENTER)
+                            .default_pos(ctx.screen_rect().center())
                             .frame(
                                 egui::Frame::window(&ctx.style())
                                     .fill(theme::SURFACE_RAISED)
