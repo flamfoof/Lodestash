@@ -9213,18 +9213,30 @@ impl LodestashApp {
                         } else {
                             tile.direct.to_string()
                         };
+                        // A left-aligned, full-width row: folder name at the left, count at the
+                        // right — not `add_sized`, which centers the label in the row (design list is
+                        // left-aligned, PACK-DIRECTORY-NAV §6).
                         let full = ui.available_width();
-                        let resp = ui.add_sized(
-                            [full, 26.0],
-                            egui::SelectableLabel::new(
-                                false,
-                                RichText::new(format!(
-                                    "\u{1F4C1}  {}\u{2003}\u{00B7} {count}",
-                                    tile.name
-                                ))
-                                .color(theme::TEXT)
-                                .size(13.0),
-                            ),
+                        let (rect, resp) =
+                            ui.allocate_exact_size(egui::vec2(full, 26.0), egui::Sense::click());
+                        if resp.hovered() {
+                            ui.painter()
+                                .rect_filled(rect, 4.0, theme::OVERLAY.linear_multiply(0.5));
+                        }
+                        let painter = ui.painter();
+                        painter.text(
+                            egui::pos2(rect.left() + 8.0, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            format!("\u{1F4C1}  {}", tile.name),
+                            egui::FontId::proportional(13.0),
+                            theme::TEXT,
+                        );
+                        painter.text(
+                            egui::pos2(rect.right() - 8.0, rect.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            &count,
+                            egui::FontId::monospace(11.0),
+                            theme::TEXT_DIM,
                         );
                         if resp
                             .on_hover_text(format!(
