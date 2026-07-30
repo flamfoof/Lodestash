@@ -14389,17 +14389,13 @@ fn quick_look_content(
         ui.add_space(4.0);
     }
 
-    // Canvas fills the window minus the caption block below, so the viewport is centered (full
-    // width) and resizes with the window (both directions). Reserving the caption height instead of
-    // taking the *full* available height keeps total content == available: the earlier fixed-size
-    // canvas avoided the auto-fit creep by never growing, but it also killed vertical resize and left
-    // the viewport pinned to the left. `avail - caption + caption == avail`, so there is no feedback.
-    const CAPTION_H: f32 = 74.0;
-    let avail = ui.available_size();
-    let canvas = Vec2::new(
-        avail.x.max(200.0),
-        (avail.y - CAPTION_H).max(160.0),
-    );
+    // Canvas fills the window's WIDTH (so the viewport is centered and follows a horizontal resize)
+    // but keeps a FIXED height. The window auto-sizes its height to content, so deriving the canvas
+    // height from `available_size().y` feeds an unbounded value straight back and the window grows
+    // taller every frame (the vertical self-resize bug). Width is safe: the window fixes its width
+    // from the user, so `available_size().x` is bounded.
+    let avail_w = ui.available_size().x.max(200.0);
+    let canvas = Vec2::new(avail_w, 440.0);
 
     if is_image && (viewer.texture.is_some() || viewer.loading || viewer.error.is_some()) {
         let (resp, mut painter) = ui.allocate_painter(canvas, egui::Sense::click_and_drag());
