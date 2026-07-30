@@ -285,8 +285,11 @@ impl Default for SizeTiers {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PreviewQuality {
-    Low,
+    // Default to the low-fidelity grid the design shows (FEATURES §1.1/§5.2): grid cards are a
+    // browse view, so render them cheap (128px) and reserve full detail for Quick Look. Raise it in
+    // Settings ▸ Appearance for sharper cards at more VRAM / raster cost.
     #[default]
+    Low,
     Medium,
     High,
 }
@@ -1019,6 +1022,7 @@ mod tests {
     fn preview_quality_px_increases_with_quality() {
         assert!(PreviewQuality::Low.thumb_px() < PreviewQuality::Medium.thumb_px());
         assert!(PreviewQuality::Medium.thumb_px() < PreviewQuality::High.thumb_px());
-        assert_eq!(PreviewQuality::default(), PreviewQuality::Medium);
+        // The grid defaults to the low-fidelity preview the design shows (FEATURES §1.1/§5.2).
+        assert_eq!(PreviewQuality::default(), PreviewQuality::Low);
     }
 }
