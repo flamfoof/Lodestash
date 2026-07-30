@@ -579,8 +579,11 @@ Assets §5 leftovers (#3). In rough order:
    (`pack_name_key`/`duplicate_pack_name`, unit- + mutation-checked) matches an already-indexed pack —
    a `⧉ possibly already indexed as "…"` note per row + a non-blocking warning toast on import;
    normalization is name-only for now (content hashing is the FEATURES §5.6 refinement). The sidebar
-   facet's `✕` remove is missing
-   (the browse-header **✓ In Libraries · remove** is the shipped path); **script/prefab/material
+   facet's **`✕` remove is built** (2026-07-29): each LIBRARIES package facet row carries an ✕ at its
+   right edge that unpins the pack via the existing `set_package_pinned(false)` path (pulls its assets,
+   resets the filter, keeps catalog rows); the ✕ is evaluated before the row click so it removes rather
+   than navigating (the browse-header **✓ In Libraries · remove** remains the other path to it).
+   **script/prefab/material
    previews** show only their type. (Pack **size** now shows on cards; **sort** shipped.)
 4. **Favourites design conformance** — four presentation deltas listed on the KANBAN card. Contained:
    glyph/colour/position, chip moves to the toolbar, plus a Favorites screen reusing the grid.

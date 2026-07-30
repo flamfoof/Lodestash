@@ -4882,6 +4882,7 @@ impl LodestashApp {
         let mut new_screen: Option<Screen> = None;
         let mut new_status: Option<StatusFilter> = None;
         let mut new_source: Option<Option<LibraryFilter>> = None;
+        let mut remove_package: Option<String> = None;
         let mut add_source_clicked = false;
 
         let trashed_count = self.entries.iter().filter(|e| e.trashed).count();
@@ -5004,7 +5005,27 @@ impl LodestashApp {
                                 Some(LibraryFilter::Package(p)) if p == pkg
                             );
                             let label = format!("\u{25A4} {pkg}");
-                            if facet_row(ui, None, &label, count, active).clicked() {
+                            let resp = facet_row(ui, None, &label, count, active);
+                            // ✕ remove-from-Libraries at the row's right edge (§5 sidebar facet
+                            // remove): unpin the pack. Evaluated before the row click so hitting
+                            // the ✕ removes rather than navigating into the pack.
+                            let x = 18.0;
+                            let x_rect = egui::Rect::from_center_size(
+                                egui::pos2(resp.rect.right() - 14.0, resp.rect.center().y),
+                                egui::vec2(x, x),
+                            );
+                            let x_resp = ui
+                                .put(
+                                    x_rect,
+                                    egui::Button::new(
+                                        RichText::new("\u{2715}").size(10.0).color(theme::TEXT_DIM),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_hover_text("Remove from Libraries");
+                            if x_resp.clicked() {
+                                remove_package = Some(pkg.to_owned());
+                            } else if resp.clicked() {
                                 pick_package = Some(pkg.to_owned());
                             }
                         }
@@ -5051,6 +5072,22 @@ impl LodestashApp {
             self.source_filter = src;
             self.screen = Screen::Library;
             self.cache_dirty = true;
+        }
+        if let Some(pkg) = remove_package {
+            // Look up the pack's id (the facet lists by name); unpin reuses the landing-row path
+            // that pulls its assets and resets the filter (FEATURES.md §5.5).
+            if let Some(id) = self
+                .unity_packages
+                .as_ref()
+                .and_then(|l| l.iter().find(|p| p.name == pkg).map(|p| p.id))
+            {
+                self.set_package_pinned(id, false);
+            } else {
+                self.jobs.toast(
+                    format!("Couldn't find {pkg} to remove \u{2014} try the Unity Assets screen"),
+                    Intent::Warning,
+                );
+            }
         }
         if add_source_clicked {
             self.add_source(ctx);
