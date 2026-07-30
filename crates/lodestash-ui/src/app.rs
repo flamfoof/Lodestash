@@ -1056,6 +1056,9 @@ pub struct LodestashApp {
     package_mtimes: std::collections::HashMap<i64, i64>,
     /// Sort order for the Unity Assets list.
     unity_sort: UnitySort,
+    /// Category filter for the Unity Assets list (§5.3); `None` = All. Session-only — a content-
+    /// derived facet, not a persisted preference.
+    unity_category_filter: Option<PackCategory>,
     /// A confirm modal for opening an oversized pack (over `config.rapid_index_max_gb`): indexing
     /// it in place means inflating the whole archive, so the user chooses extract-to-temp,
     /// index-in-place anyway, or cancel.
@@ -1287,6 +1290,7 @@ impl LodestashApp {
             package_sizes: std::collections::HashMap::new(),
             package_mtimes: std::collections::HashMap::new(),
             unity_sort: UnitySort::default(),
+            unity_category_filter: None,
             large_pack_prompt: None,
             rehydrate_rx,
             rehydrate_tx,
@@ -5634,6 +5638,33 @@ impl LodestashApp {
             return;
         }
 
+        // Category filter tabs (§5.3), content-derived: All + the four derivable buckets. A pack
+        // with no catalogued assets has no derived category and hides under a specific tab.
+        let cats = package_categories(&self.entries);
+        ui.horizontal(|ui| {
+            let chip = |ui: &mut Ui, label: &str, active: bool| -> bool {
+                ui.selectable_label(
+                    active,
+                    RichText::new(label)
+                        .size(11.0)
+                        .color(if active { theme::GOLD } else { theme::TEXT_MUTED }),
+                )
+                .clicked()
+            };
+            if chip(ui, "All", self.unity_category_filter.is_none()) {
+                self.unity_category_filter = None;
+            }
+            for c in PackCategory::ALL {
+                if chip(ui, c.label(), self.unity_category_filter == Some(c)) {
+                    self.unity_category_filter = Some(c);
+                }
+            }
+        });
+        ui.add_space(6.0);
+        if let Some(f) = self.unity_category_filter {
+            packages.retain(|p| cats.get(&p.name) == Some(&f));
+        }
+
         let mut toggle: Option<(i64, bool)> = None;
         let mut open_pkg: Option<usize> = None;
         let mut sync_pkg: Option<usize> = None;
@@ -5652,7 +5683,20 @@ impl LodestashApp {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("\u{2B22}").color(theme::SUCCESS).size(14.0));
                             ui.vertical(|ui| {
-                                ui.label(RichText::new(&pkg.name).color(theme::TEXT).size(13.0));
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(&pkg.name).color(theme::TEXT).size(13.0));
+                                    // Content-derived category badge (§5.3); Unknown until indexed.
+                                    let cat = cats.get(&pkg.name).map(|c| c.label()).unwrap_or("Unknown");
+                                    egui::Frame::none()
+                                        .fill(theme::OVERLAY)
+                                        .rounding(3.0)
+                                        .inner_margin(egui::Margin::symmetric(5.0, 1.0))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                RichText::new(cat).size(9.0).color(theme::TEXT_DIM),
+                                            );
+                                        });
+                                });
                                 let sub = match (&pkg.publisher, &pkg.category) {
                                     (Some(p), Some(c)) => format!("{p} \u{2022} {c}"),
                                     (Some(p), None) => p.clone(),
@@ -13795,6 +13839,91 @@ fn inspector_pane(
 /// Assets per extracted pack as `(total, unidentified)`, trashed rows excluded (they left the
 /// grid, so counting them would contradict what Browse → shows). Free function so the rule is
 /// testable without an egui context.
+/// A pack's content category (FEATURES.md §5.3), **derived from its assets' media types** — the
+/// dominant bucket wins. Content-derived by design (per the 2026-07-29 decision), so the spec's
+/// Code/UI tabs aren't representable here — scripts are never catalogued (no `media_type`), and a 2D
+/// asset can't be told apart as UI vs game-art from its bytes; both fold into `TwoD`. A pack with no
+/// catalogued assets (browse-only, not yet indexed) has no entry in the map and reads **Unknown**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PackCategory {
+    ThreeD,
+    Materials,
+    Audio,
+    TwoD,
+}
+
+impl PackCategory {
+    /// Tie-break / filter-tab order.
+    const ALL: [PackCategory; 4] = [
+        PackCategory::ThreeD,
+        PackCategory::Materials,
+        PackCategory::Audio,
+        PackCategory::TwoD,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            PackCategory::ThreeD => "3D",
+            PackCategory::Materials => "Materials",
+            PackCategory::Audio => "Audio",
+            PackCategory::TwoD => "2D",
+        }
+    }
+
+    /// Which bucket a single asset's media type falls in. Textures ride with 3D (they clothe models);
+    /// image/sprite/font are the 2D/GUI bucket.
+    fn of_media(mt: MediaType) -> PackCategory {
+        match mt {
+            MediaType::Model3d | MediaType::Texture => PackCategory::ThreeD,
+            MediaType::Material => PackCategory::Materials,
+            MediaType::Audio => PackCategory::Audio,
+            MediaType::Image | MediaType::Sprite | MediaType::Font => PackCategory::TwoD,
+        }
+    }
+}
+
+/// The dominant category over a pack's `(media_type, count)` tallies: the bucket holding the most
+/// assets, ties broken by [`PackCategory::ALL`] order (deterministic). `None` when there is nothing
+/// to categorize. Pure so it is unit-testable.
+fn dominant_category(counts: &[(MediaType, usize)]) -> Option<PackCategory> {
+    let mut per_bucket: std::collections::HashMap<PackCategory, usize> = Default::default();
+    for (mt, n) in counts {
+        *per_bucket.entry(PackCategory::of_media(*mt)).or_default() += *n;
+    }
+    PackCategory::ALL
+        .into_iter()
+        .filter_map(|c| per_bucket.get(&c).map(|n| (c, *n)))
+        // max_by_key keeps the *last* max; ALL is ordered, so reverse-scan to keep the first.
+        .rev()
+        .max_by_key(|(_, n)| *n)
+        .map(|(c, _)| c)
+}
+
+/// Each pack's derived [`PackCategory`], keyed by pack name, from the live entries. A pack with no
+/// entry here (browse-only, not indexed) is treated as Unknown by the caller.
+fn package_categories(entries: &[AssetEntry]) -> std::collections::HashMap<String, PackCategory> {
+    // pack → (media_type → count)
+    let mut per_pack: std::collections::HashMap<String, std::collections::HashMap<MediaType, usize>> =
+        Default::default();
+    for e in entries.iter().filter(|e| !e.trashed) {
+        let (Some(pkg), Some(mt)) = (e.package.as_deref(), e.file.media_type) else {
+            continue;
+        };
+        *per_pack
+            .entry(pkg.to_string())
+            .or_default()
+            .entry(mt)
+            .or_default() += 1;
+    }
+    per_pack
+        .into_iter()
+        .filter_map(|(pkg, counts)| {
+            let tally: Vec<(MediaType, usize)> = counts.into_iter().collect();
+            dominant_category(&tally).map(|c| (pkg, c))
+        })
+        .collect()
+}
+
 fn package_asset_counts(
     entries: &[AssetEntry],
 ) -> std::collections::HashMap<String, (usize, usize)> {
@@ -15338,6 +15467,53 @@ mod tests {
         );
         // A genuinely different title does not match.
         assert_eq!(duplicate_pack_name("Poly Dungeons", &existing), None);
+    }
+
+    #[test]
+    fn dominant_category_maps_and_breaks_ties() {
+        use MediaType::*;
+        // Textures ride with 3D; the larger bucket wins.
+        assert_eq!(
+            dominant_category(&[(Model3d, 5), (Texture, 3)]),
+            Some(PackCategory::ThreeD)
+        );
+        assert_eq!(dominant_category(&[(Audio, 10)]), Some(PackCategory::Audio));
+        assert_eq!(
+            dominant_category(&[(Material, 2), (Model3d, 1)]),
+            Some(PackCategory::Materials)
+        );
+        assert_eq!(
+            dominant_category(&[(Image, 4), (Sprite, 1), (Font, 1)]),
+            Some(PackCategory::TwoD)
+        );
+        // Tie → earliest in ALL order (3D before Audio).
+        assert_eq!(
+            dominant_category(&[(Model3d, 2), (Audio, 2)]),
+            Some(PackCategory::ThreeD)
+        );
+        assert_eq!(dominant_category(&[]), None);
+    }
+
+    #[test]
+    fn package_categories_are_per_pack_and_skip_trashed() {
+        let mk = |rel: &str, pkg: &str, mt| {
+            let mut e = entry(0, rel, Some(mt));
+            e.package = Some(pkg.into());
+            e
+        };
+        let mut trashed = mk("P/loud.wav", "SoundPack", MediaType::Audio);
+        trashed.trashed = true;
+        let entries = vec![
+            mk("P/a.fbx", "MeshPack", MediaType::Model3d),
+            mk("P/b.fbx", "MeshPack", MediaType::Model3d),
+            mk("P/t.png", "MeshPack", MediaType::Texture),
+            mk("S/x.wav", "SoundPack", MediaType::Audio),
+            trashed, // ignored
+        ];
+        let cats = package_categories(&entries);
+        assert_eq!(cats.get("MeshPack"), Some(&PackCategory::ThreeD));
+        assert_eq!(cats.get("SoundPack"), Some(&PackCategory::Audio));
+        assert_eq!(cats.len(), 2, "one derived category per pack, trashed excluded");
     }
 
     #[test]

@@ -252,6 +252,16 @@ Cards for each imported package: `ls-unitypackage` mark, name, publisher · vers
 mono path, `N assets · size`, **↻ Sync** (re-scan archive index), **Open →** (open as a library and
 browse it in the folder explorer, §5.4).
 
+**Category — content-derived (2026-07-30).** A pack's category badge and the landing **filter tabs**
+(All / 3D / Materials / Audio / 2D) are derived from its catalogued assets' media types — the
+dominant bucket wins (`dominant_category`/`package_categories`; textures ride with 3D, image/sprite/
+font are 2D). A pack with no catalogued assets yet (browse-only) reads **Unknown** and shows only
+under All. This **replaces the earlier `3D / Audio / Code / UI / Materials` taxonomy** for the
+derived path: *Code* has no `media_type` (scripts are never catalogued) and *UI vs 2D game-art* can't
+be told from bytes, so neither is content-derivable. The **dropdown override** (§5.2) and the
+**§5.2 import-dialog tabs** are deferred: import candidates are unscanned files, so they have no
+content to categorize — those need the stored/overridable category (a later slice).
+
 ### 5.4 Browse one package — the folder explorer
 **Open → makes the pack a library and navigates it in the ordinary library browser**, not a separate
 extraction panel. Opening **pins** the pack (§5.5) and **mints an in-pack `asset` per entry** (M14,

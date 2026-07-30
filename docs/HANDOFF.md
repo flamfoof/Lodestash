@@ -572,9 +572,14 @@ Assets §5 leftovers (#3). In rough order:
    re-reads the manifest and refreshes `package_entry` locators + re-mints new entries via
    `ensure_in_pack_minted(.., force=true)`, reusing the Open→ job + rehydrate channel (the guid-keyed
    locator upsert it relies on is core-tested; end-to-end wants a rebuilt pack in the running app,
-   and refresh is additive — no prune of a GUID removed from the archive, ponytail-noted). The import
-   list still has
-   no **category badge + override dropdown** and no category filter tabs. **§5.6's `⧉` duplicate flag
+   and refresh is additive — no prune of a GUID removed from the archive, ponytail-noted). The Unity
+   Assets **landing now has a content-derived category badge + filter tabs** (2026-07-30, §5.3):
+   All / 3D / Materials / Audio / 2D from a pack's dominant catalogued media type
+   (`dominant_category`/`package_categories`, both mutation-checked); browse-only packs read Unknown.
+   The design's Code/UI tabs aren't content-derivable (no script `media_type`; UI vs 2D-art
+   indistinguishable) — FEATURES §5.3 reconciled. **Still deferred:** the **override dropdown** (needs
+   a stored/overridable per-pack category) and the **§5.2 import-dialog tabs** (candidates are
+   unscanned → nothing to categorize until the stored category lands). **§5.6's `⧉` duplicate flag
    is built** (2026-07-29): the import dialog flags a candidate whose normalized name
    (`pack_name_key`/`duplicate_pack_name`, unit- + mutation-checked) matches an already-indexed pack —
    a `⧉ possibly already indexed as "…"` note per row + a non-blocking warning toast on import;
