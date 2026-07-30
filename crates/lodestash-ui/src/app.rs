@@ -748,6 +748,8 @@ impl ContentFilter {
 enum Screen {
     #[default]
     Library,
+    /// Starred assets (FEATURES.md §4.7) — the library grid filtered to favourites; 2nd in nav.
+    Favorites,
     Identify,
     Collections,
     Packages,
@@ -760,9 +762,10 @@ enum Screen {
 }
 
 impl Screen {
-    /// Sidebar navigation order (UI-SPEC §0.2 — 10 destinations).
-    const NAV: [Screen; 10] = [
+    /// Sidebar navigation order (UI-SPEC §0.2). Favorites sits 2nd, directly under Library.
+    const NAV: [Screen; 11] = [
         Screen::Library,
+        Screen::Favorites,
         Screen::Identify,
         Screen::Collections,
         Screen::Packages,
@@ -777,6 +780,7 @@ impl Screen {
     fn label(self) -> &'static str {
         match self {
             Screen::Library => "Library",
+            Screen::Favorites => "Favorites",
             Screen::Identify => "Identify",
             Screen::Collections => "Collections",
             Screen::Packages => "Packages",
@@ -794,6 +798,7 @@ impl Screen {
     fn glyph(self) -> &'static str {
         match self {
             Screen::Library => "\u{229E}",
+            Screen::Favorites => "\u{2605}",
             Screen::Identify => "\u{2726}",
             Screen::Collections => "\u{27E1}",
             Screen::Packages => "\u{25A4}",
@@ -813,6 +818,7 @@ impl Screen {
     fn icon(self) -> egui::ImageSource<'static> {
         match self {
             Screen::Library => egui::include_image!("../assets/icons/nav-library.svg"),
+            Screen::Favorites => egui::include_image!("../assets/icons/nav-favorites.svg"),
             Screen::Identify => egui::include_image!("../assets/icons/nav-identify.svg"),
             Screen::Collections => egui::include_image!("../assets/icons/nav-collections.svg"),
             Screen::Packages => egui::include_image!("../assets/icons/nav-packages.svg"),
@@ -827,7 +833,7 @@ impl Screen {
 
     fn glyph_color(self) -> egui::Color32 {
         match self {
-            Screen::Library | Screen::Collections => theme::GOLD,
+            Screen::Library | Screen::Collections | Screen::Favorites => theme::GOLD,
             Screen::Identify | Screen::Vocabulary => theme::ARCANE_BRIGHT,
             Screen::Duplicates => theme::WARNING,
             Screen::Trash => theme::DANGER,
@@ -840,7 +846,7 @@ impl Screen {
     /// One sentence of what the destination will be, for the §12 stub screen.
     fn stub_line(self) -> &'static str {
         match self {
-            Screen::Library | Screen::Settings => "", // built — never stubbed
+            Screen::Library | Screen::Favorites | Screen::Settings => "", // built — never stubbed
             Screen::Identify => {
                 "Work through the Unidentified backlog with batch AI + hand tagging."
             }
@@ -4527,6 +4533,12 @@ impl LodestashApp {
         };
     }
 
+    /// The two screens that render the library grid (Library and its favourites-filtered twin).
+    /// Grid keyboard nav, the view toolbar, the inspector, and the pager all key off this.
+    fn on_grid(&self) -> bool {
+        matches!(self.screen, Screen::Library | Screen::Favorites)
+    }
+
     fn rebuild_cache(&mut self) {
         self.refresh_search_ranks();
         let selected_entry = self
@@ -4699,6 +4711,13 @@ impl LodestashApp {
                     tiers,
                 )
             });
+        }
+        // Favorites screen (FEATURES.md §4.7): a hard filter to starred assets, independent of the
+        // toolbar ★ toggle — the screen *is* the favourites view.
+        if self.screen == Screen::Favorites {
+            let favorites = &self.favorites;
+            let entries = &self.entries;
+            idxs.retain(|&i| entries[i].asset_id.is_some_and(|id| favorites.contains(&id)));
         }
         // CATEGORY facet (mapping library, DATA-MODEL §4) — a hard structural pre-filter, kept out
         // of `passes` so that pure predicate stays free of an app-owned map. An asset passes if any
@@ -5115,6 +5134,9 @@ impl LodestashApp {
             self.go_to_library();
         }
         if let Some(s) = new_screen {
+            // Favorites and Library share the grid but filter differently, so a switch between the
+            // two (or into either) must rebuild the sorted cache for the favourites hard-filter.
+            self.cache_dirty = self.cache_dirty || self.screen != s;
             self.screen = s;
             self.selected_cache_idx = None;
             self.quick_look = false;
@@ -9588,13 +9610,13 @@ impl eframe::App for LodestashApp {
                 self.quick_look = true;
             }
             // Ctrl/Cmd-A: select all within the current filter (§0.4, design §7).
-            if self.screen == Screen::Library
+            if self.on_grid()
                 && ctx.input(|i| i.modifiers.command && i.key_pressed(Key::A))
             {
                 self.selected = self.sorted_cache.iter().copied().collect();
             }
             // Del: move the selection (or the lead card) to the Trash (design §9).
-            if self.screen == Screen::Library && ctx.input(|i| i.key_pressed(Key::Delete)) {
+            if self.on_grid() && ctx.input(|i| i.key_pressed(Key::Delete)) {
                 let targets: Vec<usize> = if self.selected.is_empty() {
                     self.selected_cache_idx
                         .and_then(|ci| self.sorted_cache.get(ci).copied())
@@ -9610,7 +9632,7 @@ impl eframe::App for LodestashApp {
                 }
             }
             // Keys 1-5: rate the selection (or the lead card); same value again clears.
-            if self.screen == Screen::Library {
+            if self.on_grid() {
                 let pressed = ctx.input(|i| {
                     [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5]
                         .iter()
@@ -10086,7 +10108,7 @@ impl eframe::App for LodestashApp {
 
         // ── View toolbar ──────────────────────────────────────────────────────
         // (Category buckets moved into the top bar next to search — prototype §top bar.)
-        if self.screen == Screen::Library && !self.entries.is_empty() {
+        if self.on_grid() && !self.entries.is_empty() {
             egui::TopBottomPanel::top("toolbar")
                 .frame(
                     egui::Frame::none()
@@ -10571,7 +10593,7 @@ impl eframe::App for LodestashApp {
                 )
                 .show(ctx, |ui| self.folders_nav_ui(ui));
         }
-        if self.screen == Screen::Library {
+        if self.on_grid() {
             // Load the LINKED FILES rows before borrowing the entry (the load needs &mut self).
             if let Some(id) = self
                 .selected_cache_idx
@@ -10666,8 +10688,8 @@ impl eframe::App for LodestashApp {
             self.last_row_end = 0;
         }
 
-        // ── Pager bar (Library only): page controls + assets-per-page ─────────
-        if self.screen == Screen::Library && !self.sorted_cache.is_empty() {
+        // ── Pager bar (grid screens): page controls + assets-per-page ─────────
+        if self.on_grid() && !self.sorted_cache.is_empty() {
             egui::TopBottomPanel::bottom("pager")
                 .frame(
                     egui::Frame::none()
@@ -10816,7 +10838,7 @@ impl eframe::App for LodestashApp {
                         self.vocabulary_screen(ui);
                         return;
                     }
-                    Screen::Library => {}
+                    Screen::Library | Screen::Favorites => {}
                     // Unbuilt destinations render the §12 stub — never a dead click.
                     other => {
                         if stub_screen(ui, other) {
@@ -10831,6 +10853,31 @@ impl eframe::App for LodestashApp {
                     } else {
                         empty_state(ui, &self.config, &mut open_project, &mut open_single);
                     }
+                    return;
+                }
+                // Favorites screen with nothing starred (FEATURES.md §4.7): a dedicated empty state
+                // that routes back to the library, not the generic "no results".
+                if self.screen == Screen::Favorites && self.favorites.is_empty() {
+                    ui.add_space(60.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("\u{2606}").size(48.0).color(theme::TEXT_DIM));
+                        ui.label(
+                            RichText::new("Nothing starred yet")
+                                .color(theme::TEXT)
+                                .size(15.0),
+                        );
+                        ui.add_space(4.0);
+                        if ui
+                            .button(
+                                RichText::new("Browse Library \u{2192}")
+                                    .color(theme::GOLD)
+                                    .size(12.0),
+                            )
+                            .clicked()
+                        {
+                            back_to_library = true;
+                        }
+                    });
                     return;
                 }
                 // Unidentified nudge (UI-SPEC §2.1) — the real backlog now that
