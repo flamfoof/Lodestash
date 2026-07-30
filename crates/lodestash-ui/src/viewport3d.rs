@@ -19,7 +19,8 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui_glow::CallbackFn;
 use egui::{PointerButton, Response, Sense, Ui, Vec2};
-use lodestash_ingest::mesh::{self, MeshData};
+use lodestash_ingest::mesh::{self, AlbedoTex, MeshData};
+use lodestash_ingest::{material, raster};
 use three_d::{
     degrees, vec3, AmbientLight, AxisAlignedBoundingBox, Camera, ClearState, Context, CpuMaterial,
     CpuMesh, DirectionalLight, Geometry, Gm, Indices, InnerSpace, Mesh, Model, ModelPart,
@@ -113,6 +114,33 @@ impl Viewport3d {
         std::thread::spawn(move || {
             let result = load_cpu_model(&path, &tex_files);
             let _ = tx.send(result);
+            egui_ctx.request_repaint();
+        });
+    }
+
+    /// Open a **material** as an orbit-able shader ball (DESIGN-GUIDELINES §7): a generated UV
+    /// sphere wearing `albedo` (the material's resolved `uses_texture`, DATA-MODEL §10) or a neutral
+    /// grey when nothing resolved. Reuses the same background-parse → GPU-upload → frame pipeline as
+    /// [`load`]; the sphere is trivial to build, so the "parse" is just the albedo decode.
+    pub fn load_material(
+        &mut self,
+        entry_idx: usize,
+        albedo: Option<PathBuf>,
+        egui_ctx: &egui::Context,
+    ) {
+        self.entry_idx = Some(entry_idx);
+        self.loading = true;
+        self.error = None;
+        {
+            let mut s = self.scene.lock().unwrap();
+            s.models.clear();
+            s.flat.clear();
+        }
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        let egui_ctx = egui_ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(build_material_sphere(albedo.as_deref()));
             egui_ctx.request_repaint();
         });
     }
@@ -367,6 +395,24 @@ fn load_cpu_model(
     raw.deserialize::<three_d_asset::Model>(path)
         .map(LoadedModel::Direct)
         .map_err(|e| e.to_string())
+}
+
+/// Build the material shader-ball for the orbit viewport: a UV sphere carrying the decoded `albedo`
+/// (rows bottom-up, the same convention model textures use — see `material::render_sphere`) or a
+/// neutral base colour when nothing resolved. Runs on a worker thread; the albedo decode is the only
+/// real cost. Flattened so it flows through the existing textured-mesh upload path.
+fn build_material_sphere(albedo: Option<&Path>) -> Result<LoadedModel, String> {
+    let mut sphere = material::uv_sphere(48, 32, 1.0);
+    sphere.base_color = [200, 200, 200, 255];
+    if let Some(path) = albedo {
+        let img = raster::decode(path).map_err(|e| e.to_string())?.to_rgba8();
+        sphere.albedo = Some(Arc::new(AlbedoTex {
+            width: img.width(),
+            height: img.height(),
+            rgba: img.rows().rev().flat_map(|row| row.map(|p| p.0)).collect(),
+        }));
+    }
+    Ok(LoadedModel::Flattened(vec![sphere]))
 }
 
 #[cfg(test)]

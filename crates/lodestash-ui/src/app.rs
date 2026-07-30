@@ -1071,6 +1071,9 @@ pub struct LodestashApp {
     /// A pack mint waiting for the hydrate crawl's persist to finish before it writes (serialized to
     /// dodge the two-writer "database is locked", HANDOFF §6). Consumed in `receive_catalog`.
     pending_mint: Option<PendingMint>,
+    /// Material asset_id → resolved albedo texture path (DATA-MODEL §10), for the Quick Look material
+    /// shader ball. Lazily loaded on first material open; cleared (`None`) on catalog sync.
+    material_albedos: Option<std::collections::HashMap<i64, String>>,
     /// A confirm modal for opening an oversized pack (over `config.rapid_index_max_gb`): indexing
     /// it in place means inflating the whole archive, so the user chooses extract-to-temp,
     /// index-in-place anyway, or cancel.
@@ -1304,6 +1307,7 @@ impl LodestashApp {
             unity_sort: UnitySort::default(),
             unity_category_filter: None,
             pending_mint: None,
+            material_albedos: None,
             large_pack_prompt: None,
             rehydrate_rx,
             rehydrate_tx,
@@ -2917,6 +2921,23 @@ impl LodestashApp {
         });
     }
 
+    /// The albedo texture path for a material asset (DATA-MODEL §10 `uses_texture`), for the Quick
+    /// Look shader ball. The whole material→albedo map is loaded once and cached (`material_albedos`,
+    /// cleared on catalog sync); `None` when the material has no resolved texture — a neutral ball.
+    fn material_albedo_for(&mut self, asset_id: Option<i64>) -> Option<PathBuf> {
+        let id = asset_id?;
+        if self.material_albedos.is_none() {
+            self.material_albedos = catalog_db_path()
+                .and_then(|db| Catalog::open(&db).ok())
+                .and_then(|c| c.material_albedo_paths().ok())
+                .or_else(|| Some(std::collections::HashMap::new()));
+        }
+        self.material_albedos
+            .as_ref()
+            .and_then(|m| m.get(&id))
+            .map(PathBuf::from)
+    }
+
     /// Keep the viewer in sync with the Quick Look target: (re)load when the overlay
     /// is open on a raster asset it doesn't hold yet. Decode runs off-thread.
     fn ensure_viewer_loaded(&mut self, ctx: &egui::Context) {
@@ -3012,6 +3033,17 @@ impl LodestashApp {
             if let Some(vp) = &mut self.viewport3d {
                 if vp.entry_idx != Some(entry_idx) {
                     vp.load(entry_idx, local_path, tex_files, ctx);
+                }
+            }
+            return;
+        }
+        // Material branch — an orbit-able shader ball (a generated sphere wearing the material's
+        // resolved albedo). Resolve the albedo path before borrowing the viewport.
+        if media_type == Some(MediaType::Material) {
+            let albedo = self.material_albedo_for(asset_id);
+            if let Some(vp) = &mut self.viewport3d {
+                if vp.entry_idx != Some(entry_idx) {
+                    vp.load_material(entry_idx, albedo, ctx);
                 }
             }
             return;
@@ -3169,6 +3201,7 @@ impl LodestashApp {
             // Package rows may have changed (extraction persisted new ones) — let the
             // Unity Assets screen lazily reload its listing next open.
             self.unity_packages = None;
+            self.material_albedos = None; // dependency edges may have moved; re-resolve on demand
             self.reload_edge_sets();
             if let Some(id) = self.tag_job.take() {
                 self.jobs.finish(id);
@@ -14258,7 +14291,9 @@ fn quick_look_content(
     audio: Option<&mut AudioPlayer>,
 ) {
     let is_image = is_viewer_image(media_type);
-    let is_model = direct_model && viewport.is_some();
+    // A material renders as an orbit-able shader ball through the same viewport (generated sphere).
+    let is_material = media_type == Some(MediaType::Material) && viewport.is_some();
+    let is_model = (direct_model || is_material) && viewport.is_some();
     let is_audio = media_type == Some(MediaType::Audio) && audio.is_some();
 
     // Toolbar (image assets only): Fit / 1:1 / pixel-perfect toggle / zoom readout.
