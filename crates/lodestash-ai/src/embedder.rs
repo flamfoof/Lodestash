@@ -39,15 +39,16 @@ pub trait Embedder {
     }
 }
 
-/// Deterministic, dependency-free stand-in used until the ONNX encoders exist: hashes each
-/// whitespace token into the vector via a feature-hashing bucket, then L2-normalises. It
-/// carries no semantics (synonyms don't cluster), but it exercises the full
-/// embed → `Catalog::upsert_embedding` → `BruteForceIndex::knn` path end to end, and makes
-/// identical text embed identically (so an exact query self-retrieves).
+/// Deterministic, dependency-free stand-in that exercises the full
+/// embed → `Catalog::upsert_embedding` → `BruteForceIndex::knn` path: hashes each whitespace token
+/// into the vector via a feature-hashing bucket, then L2-normalises. Test-only — production uses the
+/// real ONNX encoders (SigLIP/CLAP) and the no-AI path is `Option::None`, never this stub.
+#[cfg(test)]
 pub struct HashEmbedder {
     dim: usize,
 }
 
+#[cfg(test)]
 impl HashEmbedder {
     pub fn new(dim: usize) -> Self {
         assert!(dim > 0, "embedding dim must be positive");
@@ -55,6 +56,7 @@ impl HashEmbedder {
     }
 }
 
+#[cfg(test)]
 impl Embedder for HashEmbedder {
     fn model_id(&self) -> &str {
         "hash-stub-v1"
@@ -79,6 +81,7 @@ impl Embedder for HashEmbedder {
     }
 }
 
+#[cfg(test)]
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
@@ -89,6 +92,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 /// Scale `v` to unit length in place (no-op for the zero vector — empty/blank input).
+#[cfg(test)]
 fn l2_normalise(v: &mut [f32]) {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {

@@ -11,7 +11,6 @@ description = "File crawling, format detection, Unity package ingestion, and thu
 [dependencies]
 lodestash-core = { workspace = true }
 tracing        = { workspace = true }
-rayon          = { workspace = true }
 blake3         = { workspace = true }
 ufbx           = { workspace = true }
 # glTF/GLB geometry for multiview embedding renders (data-only loader, no GPU).

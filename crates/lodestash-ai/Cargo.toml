@@ -11,7 +11,6 @@ description = "Tagger/Embedder traits and impls (ONNX, Ollama, cloud Claude)"
 [dependencies]
 lodestash-core = { workspace = true }
 tracing        = { workspace = true }
-tokio          = { workspace = true }
 
 # Phase 3 local embeddings (ONNX Runtime via ort; load-dynamic = dlopen at runtime,
 # so the build never needs the ~200MB native binary — see TECH-STACK §7).
