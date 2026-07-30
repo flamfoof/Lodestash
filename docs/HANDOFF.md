@@ -524,9 +524,12 @@ fixture.
   packs extracted under the *old* code still carry their pre-existing parallel rows (no migration
   reconciles them); the new path is only exercised by a *fresh* extract of an analyzed pack, which was
   not driven in the running app this session (headless can't click Extract).
-- **`pin_and_mint` fires `load_paths` (a crawl+persist) while the background mint writes** — two
-  writers. The chunked package writes + 15 s `busy_timeout` keep it from erroring, but if you touch
-  this path, prefer serializing (mint, *then* hydrate) over widening the timeout.
+- **`pin_and_mint` used to fire `load_paths` (a crawl+persist) while the background mint wrote** — two
+  writers, which surfaced as `last_scanned_at: database is locked`. **Fixed 2026-07-30 by serializing:**
+  `pin_and_mint_now` now stashes the mint in `pending_mint` and kicks only the hydrate crawl;
+  `receive_catalog` starts the mint (`start_pack_mint`) once that scan's persist has landed, so the
+  two writers never overlap. Keep this ordering — don't re-add a mint spawn that runs concurrently
+  with `load_paths`.
 
 ---
 

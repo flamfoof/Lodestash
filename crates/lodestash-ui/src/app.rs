@@ -123,6 +123,15 @@ enum UnitySort {
     Date,
 }
 
+/// A pack mint deferred until the current scan's persist finishes, so the mint's writes don't race
+/// the scan-persist ("database is locked", HANDOFF §6 — single-writer). Set by `pin_and_mint_now`
+/// right before it kicks the hydrate crawl; consumed in `receive_catalog` once that persist lands.
+struct PendingMint {
+    package_id: i64,
+    name: String,
+    abs_path: PathBuf,
+}
+
 /// A pending confirm for opening an oversized pack (FEATURES.md §5.4): indexing it in place would
 /// inflate the whole archive, so the user is asked whether to extract it to the temp cache instead.
 struct LargePackPrompt {
@@ -1059,6 +1068,9 @@ pub struct LodestashApp {
     /// Category filter for the Unity Assets list (§5.3); `None` = All. Session-only — a content-
     /// derived facet, not a persisted preference.
     unity_category_filter: Option<PackCategory>,
+    /// A pack mint waiting for the hydrate crawl's persist to finish before it writes (serialized to
+    /// dodge the two-writer "database is locked", HANDOFF §6). Consumed in `receive_catalog`.
+    pending_mint: Option<PendingMint>,
     /// A confirm modal for opening an oversized pack (over `config.rapid_index_max_gb`): indexing
     /// it in place means inflating the whole archive, so the user chooses extract-to-temp,
     /// index-in-place anyway, or cancel.
@@ -1291,6 +1303,7 @@ impl LodestashApp {
             package_mtimes: std::collections::HashMap::new(),
             unity_sort: UnitySort::default(),
             unity_category_filter: None,
+            pending_mint: None,
             large_pack_prompt: None,
             rehydrate_rx,
             rehydrate_tx,
@@ -3141,9 +3154,15 @@ impl LodestashApp {
         }
     }
 
-    fn receive_catalog(&mut self) {
+    fn receive_catalog(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.catalog_rx.try_recv() {
             self.catalog_persisting = false;
+            // The scan-persist just finished, so it is now safe to start a deferred pack mint
+            // without two writers colliding (HANDOFF §6). Do this regardless of generation — the
+            // mint belongs to whatever pack the user just opened.
+            if let Some(pm) = self.pending_mint.take() {
+                self.start_pack_mint(ctx, pm);
+            }
             if msg.generation != self.scan_generation {
                 continue;
             }
@@ -6116,34 +6135,15 @@ impl LodestashApp {
         if then_browse {
             self.pending_pack_browse = Some(name.clone());
         }
-        // A cancellable, progress-reporting job-tray row: reading a big pack's manifest inflates the
-        // whole archive (a 21 GB pack is minutes of CPU), so it shows a real bar and a ✕ to abort.
-        if let Some(id) = self.open_pack_job.take() {
-            self.jobs.finish(id);
-        }
-        let progress = Arc::new(crate::jobs::JobProgress::default());
-        self.open_pack_job = Some(self.jobs.start(
-            format!("Indexing {name}"),
-            progress.clone(),
-            true,
-        ));
-
-        let tx = self.rehydrate_tx.clone();
-        let ctx2 = ctx.clone();
-        let path = abs_path.clone();
-        std::thread::spawn(move || {
-            if let Ok(c) = Catalog::open(&db_path) {
-                if let Err(err) = c.set_package_pinned(package_id, true) {
-                    tracing::warn!(%err, package_id, "pin failed");
-                }
-            }
-            if let Err(err) = ensure_in_pack_minted(&db_path, package_id, &path, &progress, false) {
-                tracing::warn!(%err, package_id, "in-pack mint failed or cancelled");
-            }
-            let _ = tx.send(());
-            ctx2.request_repaint();
+        // Serialize against the hydrate crawl's persist: load_paths (below) kicks a crawl+persist,
+        // and minting *while* that persist writes trips "database is locked" (HANDOFF §6, single
+        // writer). Defer the mint into `pending_mint`; `receive_catalog` starts it once this scan's
+        // persist has landed, so the two writers never overlap.
+        self.pending_mint = Some(PendingMint {
+            package_id,
+            name: name.clone(),
+            abs_path,
         });
-
         self.jobs.toast(
             format!("Added {name} \u{2014} indexing\u{2026}"),
             Intent::Success,
@@ -6154,6 +6154,44 @@ impl LodestashApp {
             .map(|p| p.live_paths().iter().map(|p| p.to_path_buf()).collect())
             .unwrap_or_default();
         self.load_paths(ctx, live, Some(proj));
+    }
+
+    /// Spawn the background mint for a deferred pack open (see [`PendingMint`]). Runs only after the
+    /// hydrate crawl's persist has finished, so its writes don't race the scan-persist. On completion
+    /// it signals `rehydrate_tx`, which reloads the grid so the pack's in-pack assets surface.
+    fn start_pack_mint(&mut self, ctx: &egui::Context, pm: PendingMint) {
+        let Some(db_path) = catalog_db_path() else {
+            return;
+        };
+        // A cancellable, progress-reporting job-tray row: reading a big pack's manifest inflates the
+        // whole archive (a 21 GB pack is minutes of CPU), so it shows a real bar and a ✕ to abort.
+        if let Some(id) = self.open_pack_job.take() {
+            self.jobs.finish(id);
+        }
+        let progress = Arc::new(crate::jobs::JobProgress::default());
+        self.open_pack_job =
+            Some(self.jobs.start(format!("Indexing {}", pm.name), progress.clone(), true));
+        let tx = self.rehydrate_tx.clone();
+        let ctx2 = ctx.clone();
+        let PendingMint {
+            package_id,
+            abs_path,
+            ..
+        } = pm;
+        std::thread::spawn(move || {
+            if let Ok(c) = Catalog::open(&db_path) {
+                if let Err(err) = c.set_package_pinned(package_id, true) {
+                    tracing::warn!(%err, package_id, "pin failed");
+                }
+            }
+            if let Err(err) =
+                ensure_in_pack_minted(&db_path, package_id, &abs_path, &progress, false)
+            {
+                tracing::warn!(%err, package_id, "in-pack mint failed or cancelled");
+            }
+            let _ = tx.send(());
+            ctx2.request_repaint();
+        });
     }
 
     /// "Extract to temp & index" for an oversized pack (FEATURES.md §5.4): pin it, track its source,
@@ -9419,7 +9457,7 @@ impl eframe::App for LodestashApp {
         self.large_pack_modal(ctx);
         self.agent_approval_modal(ctx);
         self.render_modals(ctx);
-        self.receive_catalog();
+        self.receive_catalog(ctx);
         self.receive_source_infos();
         self.receive_storage_size();
         self.receive_api_test();
