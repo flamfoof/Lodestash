@@ -32,14 +32,18 @@ serving in `lodestash-api` (REST) and `lodestash-mcp` (MCP) — **REST and MCP s
 - **Search box** — the primary query input. Feeds either Tag search or AI search per the mode toggle.
 - **Mode toggle** — segmented `◇ Tags` / `✦ AI`. Tags = literal tag/name/pack substring match; AI =
   ranked semantic search (see §1.6). Persist last mode.
-- **Category tabs** — `◆ All / ◎ Models / ♪ Sounds / ▦ Images`, a coarse filter over the grid.
-  These four tabs are a **presentation grouping over the 7-value `media_type` enum**, which is
+- **Category tabs** — `◆ All / ◎ Models / ◇ Materials / ♪ Sounds / ▦ Images`, a coarse filter over
+  the grid. These tabs are a **presentation grouping over the 7-value `media_type` enum**, which is
   unchanged (`model_3d | texture | audio | image | sprite | material | font` — a data-model
-  invariant). Bucket → `media_type` mapping (finer distinctions live in the ⚑ Filters popover
-  §1.4, not the top bar):
+  invariant). **Materials is its own tab** (updated 2026-07-30, was folded into Models): once the
+  dependency graph landed, a material is the thing that *carries* an export's textures (DATA-MODEL
+  §10), so it's reached **for**, not browsed as a model — verified in-app with ~149 materials, each
+  badged with its outbound links. Bucket → `media_type` mapping (finer distinctions live in the
+  ⚑ Filters popover §1.4):
   | Tab | `media_type`(s) |
   |---|---|
-  | ◎ Models | `model_3d`, `material` |
+  | ◎ Models | `model_3d` |
+  | ◇ Materials | `material` |
   | ♪ Sounds | `audio` |
   | ▦ Images | `image`, `texture`, `sprite`, `font` |
 - **Project chip** (right) — shows the active Unity export target; click opens the **Project switcher**
