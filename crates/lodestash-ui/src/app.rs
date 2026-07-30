@@ -9062,8 +9062,13 @@ impl LodestashApp {
             } else {
                 theme::TEXT_MUTED
             });
-            ui.add(egui::Label::new(rt).sense(egui::Sense::click()))
-                .clicked()
+            let resp = ui.add(egui::Label::new(rt).sense(egui::Sense::click()));
+            // A crumb is a link (hand cursor) unless it's the current folder (not clickable).
+            if active {
+                resp.clicked()
+            } else {
+                resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+            }
         };
         let sep = |ui: &mut Ui| {
             ui.label(RichText::new("/").color(theme::TEXT_DIM).size(12.0));
@@ -9219,6 +9224,7 @@ impl LodestashApp {
                         let full = ui.available_width();
                         let (rect, resp) =
                             ui.allocate_exact_size(egui::vec2(full, 26.0), egui::Sense::click());
+                        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
                         if resp.hovered() {
                             ui.painter()
                                 .rect_filled(rect, 4.0, theme::OVERLAY.linear_multiply(0.5));
