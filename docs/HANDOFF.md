@@ -4,7 +4,7 @@ Working notes for whoever (or whatever) continues the build. Unlike the rest of 
 is **not** a design spec — it's the state of play, the decisions already settled, and the traps.
 The design docs still win on any question of what the software *should* do.
 
-Last updated: **2026-07-28**, at `2a12d44`.
+Last updated: **2026-07-30**, at `1e9954c`.
 
 ---
 
@@ -356,6 +356,45 @@ package-extracted entries), no `remove_dir_all`, and the catalog row marked tras
 the file actually left the disk. DATA-MODEL §12 and FEATURES.md §9 name the exception — an
 undocumented exception is an invariant break.
 
+**Session 2026-07-30 — UI conformance + two audits (commits `329324e`…`1e9954c`).** Driven by real
+in-app screenshots this session, so most of it is eyeballed. Shipped:
+- **Thumbnails now fill the whole page** (`d0f5af7`): the grid/list/pack-contents views recomputed
+  the spawn buffer only on scroll, so with the per-frame spawn throttle only the first ~cap
+  thumbnails ever generated on a static page — the rest kept `3D`/`MAT`/`IMG` placeholders. Now
+  recomputed every frame (the `thumb_spawned` guard keeps it cheap). This was the "why are only some
+  cards rendered" report.
+- **Quick Look fixes**: fills the window centered (`85a130b`), **fixed** canvas height so it stops
+  self-growing vertically (`2b8040d` — `available_size().y` fed an unbounded height into an
+  auto-height window), and **draggable again** (`881773d` — `.anchor` pins a window; use `.pivot` +
+  centered `.default_pos`).
+- **Interactive material shader ball in Quick Look** (`b8a1bd1`): `viewport3d::load_material` builds
+  a `material::uv_sphere` wearing the dependency-graph albedo (`Catalog::material_albedo_paths` →
+  `AlbedoTex`) through the existing flattened-mesh upload path; falls back to the static thumbnail
+  with no GL viewport.
+- **Favorites screen** (`37e9ee4`, §4.7): the design's 2nd nav destination, was toolbar-toggle-only.
+  `Screen::Favorites` reuses the library grid via a shared `on_grid()` predicate (grid keyboard nav /
+  toolbar / inspector / pager all key off it) + a hard favourites filter in `rebuild_cache` + a
+  "Nothing starred yet → Browse Library" empty state.
+- **`database is locked` on pack open fixed** (`086ff26`): the mint is deferred into `pending_mint`
+  and started by `receive_catalog` after the hydrate persist lands, so the two writers never overlap
+  (see §6 trap).
+- **View mode no longer leaks Unity↔Library** (`881773d`): opening a pack explorer forces Folders,
+  but the Library's own view mode + folder position are saved in `saved_library_view` and restored in
+  `go_to_library` (position only when it was Folders).
+- **Grid default preview quality → Low** (`1e9954c`): `PreviewQuality::default()` flipped Medium→Low
+  (128 px) to match the design's low-fidelity cards and cut raster/VRAM. **Only lowers *resolution*,
+  not poly count** — the real 3D preview cost is the mesh parse, addressed by the cache + throttle,
+  not this. See the low-poly-preview item in §7. Existing configs keep their saved value.
+- Small conformance: inspector 260→300 px (`6d9ec70`, §0.1); folder rows left-aligned (`54ba2bd`);
+  hand cursor on breadcrumb/folder rows (`cd109bf`); in-pack card thumbnail refresh on payload pull
+  (`881773d`).
+- **Over-engineering audit** (`aca9f1d`): dropped unused `tokio` (core, ai) + `rayon` (core, ingest)
+  deps; gated the test-only `HashEmbedder` `#[cfg(test)]`.
+- **Design-conformance audit**: Favorites screen (above), FEATURES §0.2 reconciled to the shipped
+  5-tab category row (`16d142c`), inspector width. **Not done, deliberately:** the **File menu** is
+  load-bearing (only working "Open folder" + project switcher; the design's project-chip switcher §7.1
+  is a stub) — retire it only after building the chip switcher.
+
 ---
 
 ## 3. Settled decisions — don't re-litigate
@@ -535,10 +574,31 @@ fixture.
 
 ## 7. Suggested next work
 
-**Recommended next: P5** (#5, the Unity round-trip) is the biggest open frontier — its whole server
-side shipped 2026-07-28, so what remains is the UPM C# plugin (needs Unity) and the allow-list toggle
-UI. The contained, verifiable-headless items are the pack-directory design deltas (#2) and Unity
-Assets §5 leftovers (#3). In rough order:
+**Recommended next: low-poly preview meshes (#A below)** — the focus the user called out. It cuts the
+overall footprint (smaller cached meshes, lower render + VRAM) and is the honest fix for 3D preview
+cost that the resolution knob (`1e9954c`) is *not*. After that, **P5** (#5, the Unity round-trip) is
+the biggest open frontier (server side shipped 2026-07-28; left: the UPM C# plugin (needs Unity) + the
+allow-list toggle UI). Contained, verifiable-headless: the low-poly work (#A) and the remaining Unity
+Assets §5 items (#3). In rough order:
+
+A. **Low-poly preview meshes (NEW, recommended).** Grid/Quick-Look 3D previews currently render the
+   *full* mesh; `1e9954c` only lowered the render *resolution*, not the triangle count, and the real
+   cost is the parse + the cached `MeshData` size. Decimate each model to a low-poly proxy **once**,
+   cache it beside the existing normalized mesh (`mesh::load_cached` → `cache_dir/mesh/<key>.msh`,
+   key `(path,size,mtime)`; see the P1 mesh-cache card), and render previews from the proxy. Wins:
+   smaller cache on disk, cheaper raster, lower VRAM — a lower overall footprint. *Approach that fits
+   what's here:* a pure decimation pass over `MeshData` (positions/indices/normals/uvs are already
+   the in-house vertex format) — quadric-error-metric collapse, or the lazier vertex-cluster / grid
+   quantization which is "relatively easy" and good enough for a thumbnail (the user's call). Keep it
+   in `lodestash-ingest` (no GPU, worker-thread, same as the rasteriser). Target e.g. ≤2–5k tris for
+   the proxy, or a ratio of the source. Full-detail stays for the textured Quick Look orbit *only if*
+   you want it sharp — otherwise the proxy is fine everywhere and the cache shrinks. Verify: a pure
+   `decimate(MeshData, target) -> MeshData` with a unit test (tri-count drops, AABB preserved within
+   tolerance, no degenerate/NaN verts — mutation-check the target-count guard), then eyeball a
+   rendered proxy PNG. `media_type` enum + the tri-count facet (which must stay the *source* count,
+   not the proxy's) are untouched. ponytail: don't add a mesh-processing crate if a ~100-line grid
+   collapse does the job at thumbnail fidelity.
+
 
 0. ~~M14 step 8 — unify extraction with in-pack rows~~ **DONE 2026-07-25** (`materialize_in_pack_assets`;
    see §6 trap). Extraction now materializes a pack's existing in-pack rows instead of minting a
@@ -593,8 +653,9 @@ Assets §5 leftovers (#3). In rough order:
    than navigating (the browse-header **✓ In Libraries · remove** remains the other path to it).
    **script/prefab/material
    previews** show only their type. (Pack **size** now shows on cards; **sort** shipped.)
-4. **Favourites design conformance** — four presentation deltas listed on the KANBAN card. Contained:
-   glyph/colour/position, chip moves to the toolbar, plus a Favorites screen reusing the grid.
+4. ~~**Favourites design conformance**~~ **DONE 2026-07-30** — the star/gold/top-right marker + the
+   ★ toolbar toggle already matched the reconciled design; the last delta, the **Favorites screen**
+   (2nd nav destination reusing the grid), shipped `37e9ee4` (§4.7). Nothing left here.
 5. **P5 — the Unity round-trip** *(the biggest open frontier)*: shipped so far — the **MCP per-tool
    allow-list** (card 178, engine half), the **register→import round-trip** on both planes
    (`register_project`, `list_projects`, `import_to_project`, approval-gated, dup-guarded), and the
