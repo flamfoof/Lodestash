@@ -10615,7 +10615,7 @@ impl eframe::App for LodestashApp {
                         egui::SidePanel::right("inspector")
                             .resizable(true)
                             .min_width(200.0)
-                            .default_width(260.0)
+                            .default_width(300.0) // FEATURES §0.1 inspector width
                             .frame(
                                 egui::Frame::none()
                                     .fill(theme::SURFACE)
