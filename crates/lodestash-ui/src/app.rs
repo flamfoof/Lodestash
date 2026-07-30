@@ -12246,23 +12246,21 @@ fn thumbnail_grid(
             row_start_out = row_range.start;
             row_end_out = row_range.end;
 
-            // Re-check the spawn buffer whenever the viewport window or column layout changes.
-            // Includes height-only resize (row_range.end grows, revealing new bottom rows).
-            if cols != prev_cols
-                || row_range.start != prev_row_start
-                || row_range.end != prev_row_end
-            {
-                let (buf_start, buf_end) =
-                    lookahead_window(row_range.start, row_range.end, total_rows);
-                for row in buf_start..buf_end {
-                    let start = row * cols;
-                    let end = (start + cols).min(indices.len());
-                    for &idx in &indices[start..end] {
-                        if !entries[idx].thumb_spawned
-                            && needs_thumbnail(entries[idx].file.media_type)
-                        {
-                            to_spawn.push(idx);
-                        }
+            // Recompute the spawn buffer every frame, not only when the window/columns change:
+            // the caller throttles spawns to a fraction of the cores per frame, so on a *static*
+            // page (no scroll) the remaining un-spawned cards must be re-offered next frame or they
+            // stay placeholders forever. Scanning one lookahead window of entries is cheap; the
+            // `thumb_spawned` guard keeps this from re-spawning anything already started. `prev_*`
+            // are still the eviction/row-tracking inputs.
+            let _ = (prev_cols, prev_row_start, prev_row_end);
+            let (buf_start, buf_end) =
+                lookahead_window(row_range.start, row_range.end, total_rows);
+            for row in buf_start..buf_end {
+                let start = row * cols;
+                let end = (start + cols).min(indices.len());
+                for &idx in &indices[start..end] {
+                    if !entries[idx].thumb_spawned && needs_thumbnail(entries[idx].file.media_type) {
+                        to_spawn.push(idx);
                     }
                 }
             }
@@ -12351,14 +12349,13 @@ fn asset_list(
             row_start_out = row_range.start;
             row_end_out = row_range.end;
 
-            if row_range.start != prev_row_start || row_range.end != prev_row_end {
-                let (buf_start, buf_end) =
-                    lookahead_window(row_range.start, row_range.end, total_rows);
-                for &idx in &indices[buf_start..buf_end] {
-                    if !entries[idx].thumb_spawned && needs_thumbnail(entries[idx].file.media_type)
-                    {
-                        to_spawn.push(idx);
-                    }
+            // Recompute every frame (see thumbnail_grid): the caller throttles spawns, so a static
+            // page must keep re-offering its un-spawned rows or they never generate.
+            let _ = (prev_row_start, prev_row_end);
+            let (buf_start, buf_end) = lookahead_window(row_range.start, row_range.end, total_rows);
+            for &idx in &indices[buf_start..buf_end] {
+                if !entries[idx].thumb_spawned && needs_thumbnail(entries[idx].file.media_type) {
+                    to_spawn.push(idx);
                 }
             }
 
@@ -12532,14 +12529,14 @@ fn pack_contents_list(
             row_end_out = row_range.end;
 
             // Prefetch thumbnails for the file rows in the lookahead window (folders have none).
-            if row_range.start != prev_row_start || row_range.end != prev_row_end {
-                let file_lo = row_range.start.max(n_folders) - n_folders;
-                let file_hi = row_range.end.max(n_folders) - n_folders;
-                let (buf_start, buf_end) = lookahead_window(file_lo, file_hi, indices.len());
-                for &idx in &indices[buf_start..buf_end] {
-                    if !entries[idx].thumb_spawned && needs_thumbnail(entries[idx].file.media_type) {
-                        to_spawn.push(idx);
-                    }
+            // Recompute every frame (see thumbnail_grid): throttled spawns need re-offering.
+            let _ = (prev_row_start, prev_row_end);
+            let file_lo = row_range.start.max(n_folders) - n_folders;
+            let file_hi = row_range.end.max(n_folders) - n_folders;
+            let (buf_start, buf_end) = lookahead_window(file_lo, file_hi, indices.len());
+            for &idx in &indices[buf_start..buf_end] {
+                if !entries[idx].thumb_spawned && needs_thumbnail(entries[idx].file.media_type) {
+                    to_spawn.push(idx);
                 }
             }
 
