@@ -14266,11 +14266,17 @@ fn quick_look_content(
         ui.add_space(4.0);
     }
 
-    // Fixed canvas, NOT `ui.available_size()`: the Quick Look window auto-fits to its content, so
-    // sizing the viewport from available space feeds that size straight back and the window creeps
-    // larger every frame (the same trap the audio branch's fixed waveform/scrub widths avoid). A
-    // constant size renders identically frame to frame.
-    let canvas = Vec2::new(600.0, 440.0);
+    // Canvas fills the window minus the caption block below, so the viewport is centered (full
+    // width) and resizes with the window (both directions). Reserving the caption height instead of
+    // taking the *full* available height keeps total content == available: the earlier fixed-size
+    // canvas avoided the auto-fit creep by never growing, but it also killed vertical resize and left
+    // the viewport pinned to the left. `avail - caption + caption == avail`, so there is no feedback.
+    const CAPTION_H: f32 = 74.0;
+    let avail = ui.available_size();
+    let canvas = Vec2::new(
+        avail.x.max(200.0),
+        (avail.y - CAPTION_H).max(160.0),
+    );
 
     if is_image && (viewer.texture.is_some() || viewer.loading || viewer.error.is_some()) {
         let (resp, mut painter) = ui.allocate_painter(canvas, egui::Sense::click_and_drag());
