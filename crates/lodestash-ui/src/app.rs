@@ -1199,8 +1199,11 @@ pub struct LodestashApp {
     source_info_tx: Sender<Vec<lodestash_core::catalog::SourceInfo>>,
     source_info_pending: bool,
     /// Cached (thumbnail, workspace) cache sizes in bytes for the Storage caps card.
-    storage_size: Option<(u64, u64)>,
-    storage_size_rx: Option<Receiver<(u64, u64)>>,
+    /// Measured cache footprint: `(thumbnail dir, workspace dir, catalog preview blobs)`. The
+    /// third term exists because vector previews are **rows, not files** (M15) — without it the
+    /// Storage card under-reports by everything the preview work moved into the catalog.
+    storage_size: Option<(u64, u64, u64)>,
+    storage_size_rx: Option<Receiver<(u64, u64, u64)>>,
     /// Result of the CLOUD card's **Test** action (AI-PIPELINE §5.1): `Ok(tags summary)` or the raw
     /// error, shown inline so a wrong URL / non-vision model / dead key is caught before a bulk run.
     api_test_result: Option<Result<String, String>>,
@@ -3417,15 +3420,22 @@ impl LodestashApp {
         std::thread::spawn(move || {
             let thumb = thumb_dir.as_deref().map_or(0, dir_size);
             let ws = ws_dir.as_deref().map_or(0, dir_size);
-            let _ = tx.send((thumb, ws));
+            // Its own short-lived read connection: measuring must not borrow the persist thread's
+            // writer, and an unopenable catalog just reports zero rather than failing the card.
+            let previews = catalog_db_path()
+                .and_then(|p| Catalog::open(&p).ok())
+                .and_then(|c| c.vector_preview_bytes().ok())
+                .unwrap_or(0)
+                .max(0) as u64;
+            let _ = tx.send((thumb, ws, previews));
         });
     }
 
     /// Receive the latest cache-size measurement and cache it for the Settings Storage card.
     fn receive_storage_size(&mut self) {
         if let Some(rx) = &self.storage_size_rx {
-            if let Ok((thumb, ws)) = rx.try_recv() {
-                self.storage_size = Some((thumb, ws));
+            if let Ok((thumb, ws, previews)) = rx.try_recv() {
+                self.storage_size = Some((thumb, ws, previews));
                 self.storage_size_rx = None;
             }
         }
@@ -8747,7 +8757,7 @@ impl LodestashApp {
                             if self.storage_size.is_none() && self.storage_size_rx.is_none() {
                                 self.refresh_storage_size();
                             }
-                            let (thumb_used, ws_used) = self.storage_size.unwrap_or((0, 0));
+                            let (thumb_used, ws_used, preview_rows) = self.storage_size.unwrap_or((0, 0, 0));
 
                             // Keep extracted packs cached toggle.
                             let mut cache = self.config.cache_extracted;
@@ -8806,7 +8816,11 @@ impl LodestashApp {
                                 config::PreviewQuality::Medium => 1.0,
                                 config::PreviewQuality::High => 2.0,
                             };
-                            let preview_used = (thumb_used as f64 * quality_scale) as u64;
+                            // Cache files projected to the selected quality, **plus** the vector
+                            // previews the catalog now holds — those are real measured bytes, not a
+                            // projection, so they are added rather than scaled.
+                            let preview_used =
+                                (thumb_used as f64 * quality_scale) as u64 + preview_rows;
                             let preview_cap_bytes =
                                 self.config.preview_cache_cap_gb as u64 * (1u64 << 30);
                             let preview_frac = if preview_cap_bytes > 0 {
@@ -8838,6 +8852,19 @@ impl LodestashApp {
                                     .fill(preview_color)
                                     .text(RichText::new(preview_text).size(11.0)),
                             );
+                            // Split the total, because the two halves behave differently: cache
+                            // files can be deleted freely, catalog previews travel with the .db.
+                            if preview_rows > 0 {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} cache files · {} vector previews in catalog",
+                                        format_bytes((thumb_used as f64 * quality_scale) as u64),
+                                        format_bytes(preview_rows)
+                                    ))
+                                    .size(10.0)
+                                    .color(theme::TEXT_DIM),
+                                );
+                            }
                             ui.add_space(6.0);
 
                             // Auto-purge toggle.
