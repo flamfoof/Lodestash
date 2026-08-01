@@ -105,7 +105,13 @@ pub fn trace(img: &RgbaImage, opts: Bands) -> ViewBands {
 /// `fill-rule="evenodd"` needs to punch the hole out.
 fn rings(mask: &[bool], w: u32, h: u32) -> Vec<Vec<[u32; 2]>> {
     let inside = |x: i64, y: i64| -> bool {
-        x >= 0 && y >= 0 && x < w as i64 && y < h as i64 && mask[(y as u32 * w + x as u32) as usize]
+        // Widen before multiplying: `y * w` overflows u32 on a very large image, and a wrapped
+        // index would read the wrong mask cell rather than fail.
+        x >= 0
+            && y >= 0
+            && x < w as i64
+            && y < h as i64
+            && mask[y as usize * w as usize + x as usize]
     };
 
     // start point -> the ends it can travel to (a vertex touched by two diagonal blobs has two).
