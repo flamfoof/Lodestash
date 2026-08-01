@@ -196,9 +196,14 @@ pub(super) fn persist_package_to_catalog(
     let stats = catalog
         .record_crawl(source_id, Some(package_id), &leftover)
         .map_err(|e| e.to_string())?;
-    catalog
-        .mark_package_unpacked(package_id, job.records.len())
-        .map_err(|e| e.to_string())?;
+    // Only a *finished* extraction may stamp the pack unpacked. A cancelled one placed valid,
+    // resumable files, but `records.len()` is a truncated count — recording it as the whole pack
+    // would make the catalog claim an extraction that never completed.
+    if job.complete {
+        catalog
+            .mark_package_unpacked(package_id, job.records.len())
+            .map_err(|e| e.to_string())?;
+    }
     tracing::info!(
         package = %job.name,
         inserted = stats.inserted,

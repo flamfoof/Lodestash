@@ -75,12 +75,19 @@ fn tool_for(method: &Method, path: &str, query: Option<&str>) -> Option<&'static
 /// `403 tool_disabled` — the same operation the MCP plane refuses per tool, so the gate is 1:1.
 async fn gate(
     State(state): State<Shared>,
-    matched: MatchedPath,
+    // `Option<MatchedPath>`: attached with `Router::layer`, this also runs for requests that match
+    // no route, where the extension is absent. A required extractor rejected there, so an
+    // authenticated request to an unknown path answered **500 instead of 404**. `None` means
+    // "no route matched" — nothing to gate, so pass it through and let axum answer.
+    matched: Option<MatchedPath>,
     method: Method,
     req: Request,
     next: Next,
 ) -> Response {
-    if let Some(tool) = tool_for(&method, matched.as_str(), req.uri().query()) {
+    if let Some(tool) = matched
+        .as_ref()
+        .and_then(|m| tool_for(&method, m.as_str(), req.uri().query()))
+    {
         if !state.allows(tool) {
             return err(
                 StatusCode::FORBIDDEN,
@@ -724,6 +731,14 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(reqs.len(), 1, "one request queued for the plugin");
+        // Visibility timeout: a plugin that polls again before acking — its own retry, a Unity
+        // domain reload, a dropped response — must NOT be handed the same request, or it copies
+        // the files into Assets/ twice. The UNIQUE(asset_id, project_id) guard only stops the
+        // duplicate *record*.
+        assert!(
+            st.poll_import_queue(pid).unwrap().is_empty(),
+            "a re-poll inside the lease window must return nothing"
+        );
         assert_eq!(
             job.state(),
             crate::jobs::JobState::Running,

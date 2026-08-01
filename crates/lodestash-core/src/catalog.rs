@@ -842,7 +842,12 @@ impl Catalog {
                        AND NOT EXISTS (
                          SELECT 1 FROM asset_file af2 JOIN asset a2 ON a2.id = af2.asset_id
                          WHERE af2.workspace_rel = af.workspace_rel
-                           AND af2.id != af.id AND a2.deleted_at IS NULL)",
+                           AND af2.id != af.id AND a2.deleted_at IS NULL
+                           -- The sharer must be OUTSIDE this pack. Counting a sibling row in the
+                           -- pack being unmaterialized meant two deduped assets each saw the other
+                           -- as a live user, so neither path was returned — and the very next
+                           -- statement cleared both `workspace_rel`s, leaking the bytes forever.
+                           AND (a2.package_id IS NULL OR a2.package_id != ?1))",
                 )
                 .map_err(|e| CoreError::Catalog(format!("unmaterialize query prep: {e}")))?;
             let rows = stmt
@@ -1723,10 +1728,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_package_path ON package(package_path);
 /// — `(path, size, mtime)` plus the proxy budget — so an edited file regenerates instead of serving
 /// a preview of geometry that no longer exists.
 ///
-/// The budget is in the key so a *quality* change invalidates too, but that is not yet reachable:
-/// the metrics drain has no access to `config.preview_quality` and always generates at the Low
-/// budget, so raising on-screen quality currently leaves previews as they are. Threading the
-/// configured budget into the drain is the fix; until then this is a known gap, not a claim.
+/// The budget is in the key, so raising on-screen quality also invalidates: the metrics drain
+/// generates at `config.preview_quality.proxy_budget()`, and a different budget is a different
+/// `source_key`, which regenerates rather than serving a coarser preview than the user asked for.
 const MIGRATION_15_VECTOR_PREVIEWS: &str = "
 CREATE TABLE IF NOT EXISTS asset_preview (
   asset_id     INTEGER PRIMARY KEY REFERENCES asset(id) ON DELETE CASCADE,
@@ -3175,7 +3179,11 @@ impl Catalog {
                 "alias" => {
                     "EXISTS (SELECT 1 FROM asset_tag at JOIN tag t ON t.id = at.tag_id
                              WHERE at.asset_id = a.id
-                               AND (t.norm_name = ?4 OR t.norm_name LIKE '%:' || ?4))"
+                               AND (t.norm_name = ?4
+                                    -- ESCAPE, because ?4 is the user's rule pattern: an alias
+                                    -- literally named `low_poly` would otherwise have its `_` read
+                                    -- as a wildcard and match unrelated tags.
+                                    OR t.norm_name LIKE '%:' || ?5 ESCAPE '\\'))"
                 }
                 "glob_path" => {
                     "EXISTS (SELECT 1 FROM asset_file af
@@ -3191,9 +3199,22 @@ impl Catalog {
                 "exact_tag" | "alias" => pattern.to_lowercase(),
                 _ => pattern.clone(),
             };
+            // ?5 is the same pattern with LIKE metacharacters escaped, for the alias arm. Bound
+            // unconditionally so every branch takes the same parameter list; only `alias` reads it.
+            let like_escaped = bind
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
             let sql = format!("{HEAD}{cond}");
+            // Only the alias arm references ?5, and SQLite rejects a parameter list longer than the
+            // statement uses — so bind it per branch rather than unconditionally.
+            let mut binds: Vec<&dyn rusqlite::ToSql> =
+                vec![&category_id, &taxonomy_id, &rule_id, &bind];
+            if match_type == "alias" {
+                binds.push(&like_escaped);
+            }
             let n = tx
-                .execute(&sql, params![category_id, taxonomy_id, rule_id, bind])
+                .execute(&sql, binds.as_slice())
                 .map_err(|e| CoreError::Catalog(format!("apply rule {rule_id}: {e}")))?;
             assigned += n;
         }
@@ -5496,6 +5517,60 @@ mod tests {
         assert_eq!(row.usage_count, 1, "un-promote never drops assignments");
     }
 
+    /// An `alias` rule pattern is user text, so LIKE metacharacters must be literals. Note `_`
+    /// can't reach `norm_name` — `normalize_tag` turns it into a space — but `%` survives, so that
+    /// is the case that actually bites.
+    #[test]
+    fn alias_rule_treats_like_metacharacters_literally() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let src = c
+            .upsert_import_source("Lib", "C:/lib", "folder")
+            .expect("src");
+        c.record_crawl(src, None, &[rec("a.png", 1, 1), rec("b.png", 1, 1)])
+            .unwrap();
+        let ids: Vec<i64> = c
+            .conn
+            .prepare("SELECT id FROM asset ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        // `50zzz off` must NOT match the rule `50% off` — unescaped, `%` matches any run.
+        c.set_tags(
+            ids[0],
+            "manual",
+            None,
+            &[TagAssignment::exact("style", "50% off")],
+        )
+        .unwrap();
+        c.set_tags(
+            ids[1],
+            "manual",
+            None,
+            &[TagAssignment::exact("style", "50zzz off")],
+        )
+        .unwrap();
+
+        let tax = c.create_taxonomy("Default", true).expect("tax");
+        let cat = c
+            .add_category(tax, None, "Low Poly", "Low Poly")
+            .expect("cat");
+        c.add_rule(tax, cat, "alias", "50% off", 10).expect("rule");
+        c.apply_mapping(tax).expect("apply");
+
+        assert_eq!(
+            c.categories_of(ids[0], tax).expect("cats").len(),
+            1,
+            "the literal alias still matches"
+        );
+        assert!(
+            c.categories_of(ids[1], tax).expect("cats").is_empty(),
+            "`%` must be a literal percent sign, not a wildcard"
+        );
+    }
+
     #[test]
     fn unmaterialize_returns_only_unshared_files_and_reverts_rows() {
         let mut c = Catalog::open_in_memory().expect("open");
@@ -5551,6 +5626,37 @@ mod tests {
             freed,
             vec!["hashB/B.png".to_string()],
             "only B is deletable — A is shared with P2 and must survive"
+        );
+
+        // Two assets *inside one pack* that deduped to the same file must still be reclaimed. The
+        // sharer has to be outside the pack being unmaterialized; counting a sibling row meant each
+        // saw the other as a live user, so neither was returned — and the update cleared both
+        // `workspace_rel`s in the next statement, leaking those bytes permanently.
+        let p3 = c
+            .upsert_package(sid, "G:/s/P3.unitypackage", "P3", None, None)
+            .expect("p3");
+        c.record_package_entries(
+            p3,
+            &[entry("g_d", "Assets/D.png"), entry("g_e", "Assets/E.png")],
+        )
+        .unwrap();
+        c.mint_in_pack_assets(
+            p3,
+            &HashMap::from([("g_d".into(), tex("D")), ("g_e".into(), tex("E"))]),
+        )
+        .unwrap();
+        c.materialize_in_pack_assets(
+            p3,
+            &[
+                ("Assets/D.png".into(), "hashD/D.png".into()),
+                ("Assets/E.png".into(), "hashD/D.png".into()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            c.unmaterialize_package(p3).expect("unmaterialize p3"),
+            vec!["hashD/D.png".to_string()],
+            "an intra-pack duplicate is still reclaimed, exactly once"
         );
         // P1's rows reverted to in-pack (workspace_rel NULL, locator kept); P2 untouched.
         let p1_extracted: i64 = c

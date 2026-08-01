@@ -117,7 +117,21 @@ struct ImportQueueEntry {
     asset_ids: Vec<i64>,
     with_deps: bool,
     dest_subfolder: Option<String>,
+    /// Visibility timeout: while this is in the future the entry is considered in flight and is
+    /// **not** handed out again. Set by [`ServerState::poll_import_queue`], cleared by removal in
+    /// [`ServerState::ack_import`].
+    ///
+    /// Without it, a plugin that polls twice before acking — its own retry, a Unity domain reload,
+    /// a dropped response — receives the same request again and copies the files into `Assets/` a
+    /// second time. The `UNIQUE(asset_id, project_id)` guard only stops the duplicate *record*, not
+    /// the duplicate copy.
+    leased_until: Option<std::time::Instant>,
 }
+
+/// How long a polled import stays invisible to further polls. Long enough to cover a Unity import
+/// plus a domain reload; short enough that a crashed plugin's work is redelivered in the same
+/// session rather than stranding the job.
+const IMPORT_LEASE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// What a handler needs to answer a request. The API owns its **own** catalog connection
 /// (read-only queries) so it never contends with the UI's single writer — DATA-MODEL §1.
@@ -431,6 +445,7 @@ impl ServerState {
             job_id: job.id.clone(),
             project_id,
             asset_ids: ids,
+            leased_until: None,
             with_deps: req.with_dependencies,
             dest_subfolder: req.dest_subfolder,
         });
@@ -447,10 +462,16 @@ impl ServerState {
         project_id: i64,
     ) -> lodestash_core::error::Result<Vec<ImportQueuePayload>> {
         let pending: Vec<(String, String, Option<String>, Vec<i64>)> = {
-            let q = self.import_queue.lock().unwrap();
-            q.iter()
-                .filter(|e| e.project_id == project_id)
+            let mut q = self.import_queue.lock().unwrap();
+            let now = std::time::Instant::now();
+            q.iter_mut()
+                // Skip anything already handed out and still inside its lease.
+                .filter(|e| {
+                    // ponytail: map_or, not is_none_or — the workspace MSRV is 1.80.
+                    e.project_id == project_id && e.leased_until.map_or(true, |until| until <= now)
+                })
                 .map(|e| {
+                    e.leased_until = Some(now + IMPORT_LEASE);
                     (
                         e.request_id.clone(),
                         e.job_id.clone(),
@@ -484,6 +505,22 @@ impl ServerState {
                 .iter()
                 .position(|e| e.request_id == request_id)
                 .ok_or(AckError::UnknownRequest)?;
+            // The ack must only claim assets this request actually queued. Without the check, any
+            // holder of the session token could write durable `import_record` rows for arbitrary
+            // assets — and that record is the part that survives a crash. Reject the whole request
+            // rather than filtering: a client acking ids it was never given is malformed, and
+            // quietly dropping them would hide it.
+            if let Some(bad) = imported
+                .iter()
+                .find(|a| !q[pos].asset_ids.contains(&a.asset_id))
+            {
+                tracing::warn!(
+                    request_id,
+                    asset_id = bad.asset_id,
+                    "ack claimed an asset that was not queued for this request"
+                );
+                return Err(AckError::UnknownRequest);
+            }
             q.remove(pos)
         };
         let ids: Vec<i64> = imported.iter().map(|a| a.asset_id).collect();

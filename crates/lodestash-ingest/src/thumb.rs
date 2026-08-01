@@ -92,6 +92,58 @@ pub fn generate(
     Ok(dest)
 }
 
+/// Enforce the preview-cache size cap by deleting the least-recently-touched thumbnails.
+///
+/// Planning is [`crate::workspace::plan_eviction`] — the same size-cap-then-age policy the
+/// extraction workspace already uses, and already tested there; this only supplies the entries and
+/// executes the result. Evicting is always safe: a missing thumbnail regenerates on next browse.
+///
+/// Returns `(bytes freed, files deleted)`. Only `.png` files are considered, so a stray file in the
+/// cache dir is never deleted.
+pub fn evict_cache(
+    cache_dir: &Path,
+    cap_bytes: u64,
+    retention_days: u32,
+    now: i64,
+) -> (u64, usize) {
+    let Ok(dir) = std::fs::read_dir(cache_dir) else {
+        return (0, 0);
+    };
+    let mut sizes: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut entries = Vec::new();
+    for e in dir.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("png") {
+            continue;
+        }
+        let Ok(meta) = e.metadata() else { continue };
+        let touched = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs() as i64);
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        sizes.insert(name.clone(), meta.len());
+        entries.push(crate::workspace::WorkspaceEntry {
+            content_hash: name,
+            size_bytes: meta.len(),
+            last_touched: touched,
+        });
+    }
+    let doomed = crate::workspace::plan_eviction(&entries, cap_bytes, retention_days, now);
+    let mut freed = 0;
+    let mut count = 0;
+    for name in doomed {
+        if std::fs::remove_file(cache_dir.join(&name)).is_ok() {
+            freed += sizes.get(&name).copied().unwrap_or(0);
+            count += 1;
+        }
+    }
+    (freed, count)
+}
+
 /// Where a pack's own icon lives once harvested (`.icon.png` out of the `.unitypackage`).
 /// Keyed by the package path, so two packs never collide and a re-harvest overwrites in place.
 pub fn package_icon_path(cache_dir: &Path, package_path: &str) -> PathBuf {

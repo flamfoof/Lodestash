@@ -464,6 +464,10 @@ struct PackagePersist {
     entries: Vec<PackageEntryRecord>,
     /// (name, root) of every project source, for the read-back status counts.
     all_roots: Vec<(String, String)>,
+    /// False when the extraction was cancelled part-way. The rows that *were* placed are valid and
+    /// resumable, so they still persist — but the pack must not be stamped `unpacked`, or a
+    /// cancelled extract permanently records a truncated asset count as the whole pack.
+    complete: bool,
 }
 
 /// One source's worth of persist work handed to the catalog thread.
@@ -2426,6 +2430,9 @@ impl LodestashApp {
             .flatten();
         let workspace_dir = self.workspace_dir.clone();
         let cache_dir = self.thumb_cache_dir.clone();
+        // Preview proxies are generated inside the metrics drain, so the drain needs the same
+        // budget the grid renders at — otherwise raising on-screen quality never regenerates.
+        let proxy_budget = self.config.preview_quality.proxy_budget();
         let generation = self.scan_generation;
         let tx = self.catalog_tx.clone();
         let roots = self.scan_root_names();
@@ -2439,6 +2446,7 @@ impl LodestashApp {
                     audio_embedder,
                     workspace_dir.as_deref(),
                     cache_dir.as_deref(),
+                    proxy_budget,
                     &roots,
                 ),
                 Err(e) => {
@@ -2496,6 +2504,9 @@ impl LodestashApp {
         let audio_embedder = self.audio_embedder.clone();
         let workspace_dir = self.workspace_dir.clone();
         let cache_dir = self.thumb_cache_dir.clone();
+        // Preview proxies are generated inside the metrics drain, so the drain needs the same
+        // budget the grid renders at — otherwise raising on-screen quality never regenerates.
+        let proxy_budget = self.config.preview_quality.proxy_budget();
         let roots = self.scan_root_names();
         self.catalog_persisting = true;
         std::thread::spawn(move || {
@@ -2523,6 +2534,7 @@ impl LodestashApp {
                     audio_embedder,
                     workspace_dir.as_deref(),
                     cache_dir.as_deref(),
+                    proxy_budget,
                     &roots,
                 );
                 // Second message: the drain promoted rows, so the meter and STATUS facet
@@ -2549,6 +2561,7 @@ impl LodestashApp {
         package_path: &std::path::Path,
         files: &[CrawledFile],
         entries: Vec<PackageEntryRecord>,
+        complete: bool,
     ) {
         let Some(db_path) = catalog_db_path() else {
             return;
@@ -2591,6 +2604,7 @@ impl LodestashApp {
                 .iter()
                 .map(|r| (config::stem_name(r), r.to_string_lossy().into_owned()))
                 .collect(),
+            complete,
         };
 
         let generation = self.scan_generation;
@@ -2599,6 +2613,9 @@ impl LodestashApp {
         let audio_embedder = self.audio_embedder.clone();
         let workspace_dir = self.workspace_dir.clone();
         let cache_dir = self.thumb_cache_dir.clone();
+        // Preview proxies are generated inside the metrics drain, so the drain needs the same
+        // budget the grid renders at — otherwise raising on-screen quality never regenerates.
+        let proxy_budget = self.config.preview_quality.proxy_budget();
         let roots = job.all_roots.clone();
         self.catalog_persisting = true;
         std::thread::spawn(move || {
@@ -2624,6 +2641,7 @@ impl LodestashApp {
                     audio_embedder,
                     workspace_dir.as_deref(),
                     cache_dir.as_deref(),
+                    proxy_budget,
                     &roots,
                 );
                 if counts.is_some() {
@@ -3422,7 +3440,24 @@ impl LodestashApp {
         let (thumb_dir, ws_dir) = default_cache_dirs();
         let (tx, rx) = mpsc::channel();
         self.storage_size_rx = Some(rx);
+        // The cap and its toggle have existed in Settings since the Storage card shipped, but
+        // nothing enforced them — the bar filled past 100% and no bytes were ever reclaimed.
+        let purge = self.config.auto_purge_preview_cache;
+        let cap_bytes = self.config.preview_cache_cap_gb as u64 * (1u64 << 30);
+        let retention_days = self.config.workspace_cache_retention_days;
         std::thread::spawn(move || {
+            if purge && cap_bytes > 0 {
+                if let Some(dir) = thumb_dir.as_deref() {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs() as i64);
+                    let (freed, files) =
+                        lodestash_ingest::thumb::evict_cache(dir, cap_bytes, retention_days, now);
+                    if files > 0 {
+                        tracing::info!(freed, files, "preview cache trimmed to cap");
+                    }
+                }
+            }
             let thumb = thumb_dir.as_deref().map_or(0, dir_size);
             let ws = ws_dir.as_deref().map_or(0, dir_size);
             // Its own short-lived read connection: measuring must not borrow the persist thread's
@@ -4317,7 +4352,15 @@ impl LodestashApp {
                 self.pending_packages.retain(|p| p.abs_path != msg.abs_path);
             }
             // Write-behind: package row + extracted asset rows (DATA-MODEL §7).
-            self.spawn_package_persist(msg.source_idx, &msg.abs_path, &msg.files, msg.entries);
+            // A cancelled extraction still persists what it placed (valid, resumable) but must
+            // not stamp the pack unpacked with a truncated count.
+            self.spawn_package_persist(
+                msg.source_idx,
+                &msg.abs_path,
+                &msg.files,
+                msg.entries,
+                !cancelled,
+            );
             for file in msg.files.into_iter().filter(is_browseable) {
                 self.entries.push(AssetEntry {
                     package: Some(msg.display_name.clone()),

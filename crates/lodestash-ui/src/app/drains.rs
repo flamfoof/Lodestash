@@ -686,6 +686,7 @@ pub(super) fn drain_metrics(
     cat: &mut Catalog,
     workspace_dir: Option<&std::path::Path>,
     cache_dir: Option<&std::path::Path>,
+    proxy: lodestash_ingest::decimate::Budget,
 ) {
     const BATCH: usize = 64;
     let mut total = 0usize;
@@ -731,7 +732,7 @@ pub(super) fn drain_metrics(
             // stable identity to key a preview on — see `store_vector_preview`.
             let is_scratch = resolved.as_ref().is_some_and(|(_, g)| g.is_some());
             if let (Some(p), Some(dir), false) = (path.as_deref(), cache_dir, is_scratch) {
-                store_vector_preview(cat, job.asset_id, p, &job.media_code, dir);
+                store_vector_preview(cat, job.asset_id, p, &job.media_code, dir, proxy);
             }
             total += 1;
         }
@@ -765,13 +766,13 @@ fn store_vector_preview(
     path: &std::path::Path,
     media_code: &str,
     cache_dir: &std::path::Path,
+    budget: lodestash_ingest::decimate::Budget,
 ) {
-    use lodestash_ingest::{decimate, mesh, render3d, vectorize};
+    use lodestash_ingest::{mesh, render3d, vectorize};
 
     if media_code != "model_3d" {
         return;
     }
-    let budget = decimate::PREVIEW_BUDGET;
     let key = format!("{}-{}", mesh::cache_key(path), budget.tag());
     match cat.has_current_preview(asset_id, &key) {
         Ok(true) => return,
@@ -802,6 +803,29 @@ fn store_vector_preview(
 /// the contour follows the silhouette — 256 px matches the multiview encoder's render size.
 const PREVIEW_RENDER_PX: u32 = 256;
 
+/// Largest in-pack payload we will pull into memory. `read_payload_at` buffers the whole thing —
+/// its own doc says the caller decides whether a payload is small enough — and nothing checked, so
+/// a single multi-GB asset inside a `.unitypackage` allocated multi-GB in the identify drain.
+///
+/// Above the cap the asset simply isn't identified from inside the archive; extracting the pack
+/// once materializes it on disk and every drain then reads it normally. That is the same trade the
+/// in-pack *thumbnail* cap already makes, and gzip has no random access to make streaming cheaper
+/// (HANDOFF §3).
+const IN_PACK_PULL_MAX_BYTES: i64 = 256 * 1024 * 1024;
+
+fn in_pack_pull_ok(size_bytes: i64, pack: &str) -> bool {
+    if size_bytes > IN_PACK_PULL_MAX_BYTES {
+        tracing::warn!(
+            size_bytes,
+            cap = IN_PACK_PULL_MAX_BYTES,
+            pack,
+            "in-pack payload too large to pull into memory; extract the pack to identify it"
+        );
+        return false;
+    }
+    true
+}
+
 /// Clip length via the decoder the player already uses. `total_duration` answers from the header
 /// for WAV/FLAC; formats that can't (some MP3s) report `None`, which stays "unknown" rather than
 /// paying for a full decode just to fill a stat row.
@@ -824,9 +848,10 @@ pub(super) fn drain_promote_resync(
     audio_embedder: Option<Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
     workspace_dir: Option<&std::path::Path>,
     cache_dir: Option<&std::path::Path>,
+    proxy: lodestash_ingest::decimate::Budget,
     roots: &[(String, String)],
 ) -> (Option<StatusCounts>, AssetIdentityMaps) {
-    drain_metrics(cat, workspace_dir, cache_dir);
+    drain_metrics(cat, workspace_dir, cache_dir, proxy);
     drain_dependencies(cat, workspace_dir);
     if let Some(emb) = embedder {
         drain_image_embeddings(cat, emb.as_ref(), workspace_dir, cache_dir);
@@ -1051,6 +1076,9 @@ pub(super) fn resolve_job_image(
             .ok();
     }
     if let (Some(pack), Some(off), Some(sz)) = (&job.pack_path, job.pack_offset, job.pack_size) {
+        if !in_pack_pull_ok(sz, pack) {
+            return None;
+        }
         let bytes = lodestash_ingest::unitypackage::read_payload_at(
             std::path::Path::new(pack),
             off as u64,
@@ -1104,6 +1132,9 @@ pub(super) fn resolve_job_path(
         return Some((ws.join(rel), None));
     }
     if let (Some(pack), Some(off), Some(sz)) = (&job.pack_path, job.pack_offset, job.pack_size) {
+        if !in_pack_pull_ok(sz, pack) {
+            return None;
+        }
         let bytes = lodestash_ingest::unitypackage::read_payload_at(
             std::path::Path::new(pack),
             off as u64,
