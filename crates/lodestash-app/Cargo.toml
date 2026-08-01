@@ -1,0 +1,19 @@
+[package]
+name        = "lodestash-app"
+version     = { workspace = true }
+edition     = { workspace = true }
+rust-version = { workspace = true }
+license     = { workspace = true }
+
+[dependencies]
+# Headless desktop orchestration: everything the app does that is not drawing. Consumed by the
+# egui shell today and by the Tauri backend once the port lands, so it must never gain a UI dep.
+lodestash-core   = { workspace = true }
+lodestash-ingest = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+tracing          = { workspace = true }
+# Model artifact downloads (SigLIP / CLAP / ONNX Runtime): HTTP + zip extraction.
+ureq             = { workspace = true }
+zip              = { workspace = true }
+dirs             = { workspace = true }

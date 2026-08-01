@@ -5,6 +5,7 @@ members = [
     "crates/lodestash-ai",
     "crates/lodestash-mcp",
     "crates/lodestash-api",
+    "crates/lodestash-app",
     "crates/lodestash-ui",
 ]
 resolver = "2"
@@ -95,6 +96,7 @@ lodestash-ingest = { path = "crates/lodestash-ingest" }
 lodestash-ai     = { path = "crates/lodestash-ai" }
 lodestash-mcp    = { path = "crates/lodestash-mcp" }
 lodestash-api    = { path = "crates/lodestash-api" }
+lodestash-app    = { path = "crates/lodestash-app" }
 lodestash-ui     = { path = "crates/lodestash-ui" }
 
 [profile.dev]

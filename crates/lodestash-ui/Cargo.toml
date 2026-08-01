@@ -16,6 +16,8 @@ path = "src/main.rs"
 lodestash-core   = { workspace = true }
 lodestash-ingest = { workspace = true }
 lodestash-api    = { workspace = true }
+# Headless orchestration (jobs, model downloads, ...) — see ARCHITECTURE §6.
+lodestash-app    = { workspace = true }
 lodestash-mcp    = { workspace = true }
 lodestash-ai     = { workspace = true }
 serde            = { workspace = true }

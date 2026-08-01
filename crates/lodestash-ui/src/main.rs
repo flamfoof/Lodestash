@@ -5,10 +5,13 @@ mod app;
 mod audio;
 mod config;
 mod fonts;
-mod jobs;
-mod models;
 mod theme;
 mod viewport3d;
+
+// Moved to the headless `lodestash-app` crate (ARCHITECTURE §6). Aliased under their old paths so
+// the ~15 `crate::jobs::` / `crate::models::` call sites stay untouched — the extraction is a
+// relocation, not a rename.
+use lodestash_app::{jobs, models};
 
 fn main() -> eframe::Result {
     // `lodestash --mcp` is the MCP stdio server (MCP-AND-ENGINES §2 "Registration"): same binary,
