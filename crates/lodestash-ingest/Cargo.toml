@@ -34,3 +34,7 @@ notify     = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 insta    = { workspace = true }
+# Rasterises a generated preview SVG so it can be *looked at* beside the source render
+# (HANDOFF §5 — visual output is never asserted-only). Test-only, and already in the tree via
+# egui_extras' svg feature, so it costs no new build.
+resvg    = "0.37"

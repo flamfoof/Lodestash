@@ -15,6 +15,7 @@ pub mod raster;
 pub mod render3d;
 pub mod thumb;
 pub mod unitypackage;
+pub mod vectorize;
 pub mod watch;
 pub mod workspace;
 
