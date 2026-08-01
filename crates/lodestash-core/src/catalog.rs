@@ -1720,8 +1720,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_package_path ON package(package_path);
 /// 32 px list row and a 780 px Quick Look, and thousands of small cache files become rows.
 ///
 /// Its **own table**, so `SELECT` on `asset` never drags a blob. `source_key` is the mesh cache key
-/// — `(path, size, mtime)` plus the proxy budget — so an edited file or a raised on-screen quality
-/// regenerates instead of serving a stale preview.
+/// — `(path, size, mtime)` plus the proxy budget — so an edited file regenerates instead of serving
+/// a preview of geometry that no longer exists.
+///
+/// The budget is in the key so a *quality* change invalidates too, but that is not yet reachable:
+/// the metrics drain has no access to `config.preview_quality` and always generates at the Low
+/// budget, so raising on-screen quality currently leaves previews as they are. Threading the
+/// configured budget into the drain is the fix; until then this is a known gap, not a claim.
 const MIGRATION_15_VECTOR_PREVIEWS: &str = "
 CREATE TABLE IF NOT EXISTS asset_preview (
   asset_id     INTEGER PRIMARY KEY REFERENCES asset(id) ON DELETE CASCADE,

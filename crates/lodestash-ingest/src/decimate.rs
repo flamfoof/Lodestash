@@ -170,21 +170,24 @@ fn collapse(mesh: &MeshData, n: u32) -> MeshData {
             (counts.len() - 1) as u32
         }) as usize;
         vert_slot.push(s as u32);
-        // Skip a non-finite contribution rather than averaging NaN into the whole cell.
+        // Skip a non-finite contribution rather than averaging NaN into the whole cell — and skip
+        // it for *every* attribute, not just the position. `counts` is the divisor all three
+        // averages use, so accumulating a vertex's UV while not counting it divides by too small a
+        // number and pushes the proxy's UVs out of range.
         if p.iter().all(|c| c.is_finite()) {
             for a in 0..3 {
                 pos_acc[s][a] += p[a] as f64;
             }
             counts[s] += 1.0;
-        }
-        if let Some(nv) = mesh.normals.as_ref().and_then(|n| n.get(vi)) {
-            for a in 0..3 {
-                nrm_acc[s][a] += nv[a] as f64;
+            if let Some(nv) = mesh.normals.as_ref().and_then(|n| n.get(vi)) {
+                for a in 0..3 {
+                    nrm_acc[s][a] += nv[a] as f64;
+                }
             }
-        }
-        if let Some(uv) = mesh.uvs.as_ref().and_then(|u| u.get(vi)) {
-            for a in 0..2 {
-                uv_acc[s][a] += uv[a] as f64;
+            if let Some(uv) = mesh.uvs.as_ref().and_then(|u| u.get(vi)) {
+                for a in 0..2 {
+                    uv_acc[s][a] += uv[a] as f64;
+                }
             }
         }
     }
@@ -415,6 +418,36 @@ mod tests {
         // Collapses to nothing renderable, but must not panic or emit NaN.
         let out = collapse(&flat, 8);
         assert!(out.positions.iter().flatten().all(|c| c.is_finite()));
+    }
+
+    /// A NaN-positioned vertex must not skew the *other* attributes of its cell. `counts` is the
+    /// shared divisor, so a vertex that contributes a UV without being counted inflates the average.
+    #[test]
+    fn a_non_finite_vertex_does_not_skew_its_cell_uvs() {
+        // Three vertices in one cell: two valid at u=0.5, one NaN-positioned carrying u=0.5 too.
+        // Averaged correctly the answer is 0.5; counting only two of the three contributions gives
+        // 0.75, and counting none gives the raw sum 1.5.
+        let m = MeshData {
+            name: "cell".into(),
+            positions: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [f32::NAN, 0.0, 0.0]],
+            normals: None,
+            uvs: Some(vec![[0.5, 0.5], [0.5, 0.5], [0.5, 0.5]]),
+            indices: vec![0, 1, 2],
+            base_color: [0; 4],
+            albedo: None,
+        };
+        let out = collapse(&m, 4);
+        let uvs = out.uvs.expect("uvs survive");
+        for uv in &uvs {
+            assert!(
+                uv.iter().all(|c| c.is_finite() && (0.0..=1.0).contains(c)),
+                "UV out of range — a skipped vertex still contributed its UV: {uv:?}"
+            );
+            assert!(
+                (uv[0] - 0.5).abs() < 1e-5,
+                "expected the true mean, got {uv:?}"
+            );
+        }
     }
 
     #[test]

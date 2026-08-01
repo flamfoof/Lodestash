@@ -3005,6 +3005,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "lodestash-app"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "lodestash-core",
+ "lodestash-ingest",
+ "serde",
+ "serde_json",
+ "tracing",
+ "ureq",
+ "zip",
+]
+
+[[package]]
 name = "lodestash-core"
 version = "0.1.0"
 dependencies = [
@@ -3069,6 +3083,7 @@ dependencies = [
  "keyring",
  "lodestash-ai",
  "lodestash-api",
+ "lodestash-app",
  "lodestash-core",
  "lodestash-ingest",
  "lodestash-mcp",

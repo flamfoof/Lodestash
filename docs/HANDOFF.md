@@ -440,6 +440,31 @@ affordance isn't in the designs today. Also open from the same plan: material-em
 bytes, and the shape-signature search (design-first). Note the egui payoff is limited — resvg
 rasterises the SVG anyway; the artifact is native in a webview.
 
+**Open defects found by review 2026-08-01, not fixed** — all pre-date this session's work, none
+are in the preview/decimation path, and each wants its own card:
+
+- `drains.rs` `resolve_job_path` pulls an in-pack payload **wholly into RAM** with no size check,
+  though `read_payload_at`'s own doc says the caller must decide. A 3 GB in-pack asset allocates
+  3 GB in the identify drain. `PULL_CAP_HINT` only bounds the capacity hint, not the read.
+- `lodestash-api` `poll_import_queue` never removes entries — only `ack_import` does. A plugin that
+  polls twice before acking (retry, Unity domain reload, lost response) **imports the files twice**;
+  the `UNIQUE(asset_id, project_id)` guard stops the duplicate *record*, not the duplicate copy.
+- `unitypackage.rs` `extract_to_workspace_with_progress` swallows the cancel sentinel and returns
+  `Ok(partial)`, so a **cancelled extraction is recorded as fully unpacked** with a truncated asset
+  count (`mark_package_unpacked`). A re-extract heals the rows; the stamp is wrong in between.
+- `routes.rs` `gate` takes `MatchedPath` as an extractor under `Router::layer`, which also runs for
+  unmatched routes — an authenticated request to an unknown path returns **500 instead of 404**.
+  `Option<MatchedPath>` or `route_layer` fixes it.
+- `ack_import` never checks the acked `asset_id`s are a subset of the queued entry's, so a token
+  holder can write `import_record` rows for arbitrary assets. Low impact behind loopback+token, but
+  that record is the part that survives a crash.
+- `catalog.rs` `unmaterialize_package`'s "safe to delete" query excludes any `workspace_rel` shared
+  with another live `asset_file` **including rows in the pack being unmaterialized**, so two
+  deduped assets in one pack leak their workspace bytes permanently.
+- `apply_mapping`'s `alias` arm interpolates the user's pattern into `LIKE '%:' || ?4` unescaped, so
+  a rule containing `_` or `%` (e.g. `low_poly`) matches unintended tags. `exact_tag` uses `=` and
+  is fine.
+
 ---
 
 ## 3. Settled decisions — don't re-litigate

@@ -29,10 +29,17 @@ impl Default for ThumbParams {
 
 /// Derive the cache path for a thumbnail.
 /// `cache_dir` is the app's thumbnail cache directory (e.g. `~/.lodestash/thumbs/`).
+/// The proxy budget is part of the key, not just the pixel size: two callers can ask for the same
+/// `WxH` at *different* mesh fidelities — the tagging preview renders 384px from the Low proxy while
+/// `PreviewQuality::High`'s grid thumbnail renders 384px from the High one — and with `WxH` alone
+/// whichever ran first silently served the other the wrong-fidelity render.
 pub fn cache_path(cache_dir: &Path, content_hash: &str, params: ThumbParams) -> PathBuf {
     cache_dir.join(format!(
-        "{}_{}x{}.png",
-        content_hash, params.width, params.height
+        "{}_{}x{}_{}.png",
+        content_hash,
+        params.width,
+        params.height,
+        params.proxy.tag()
     ))
 }
 

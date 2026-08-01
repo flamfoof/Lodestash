@@ -727,7 +727,10 @@ pub(super) fn drain_metrics(
             // The mesh is parsed and cached right here, so this is the one place that can produce
             // the vector preview without a second parse — and it is already the persist thread, so
             // the write respects the single-writer rule (ARCHITECTURE §5).
-            if let (Some(p), Some(dir)) = (path.as_deref(), cache_dir) {
+            // An in-pack payload resolves to a *scratch* file with a random stem, so it has no
+            // stable identity to key a preview on — see `store_vector_preview`.
+            let is_scratch = resolved.as_ref().is_some_and(|(_, g)| g.is_some());
+            if let (Some(p), Some(dir), false) = (path.as_deref(), cache_dir, is_scratch) {
                 store_vector_preview(cat, job.asset_id, p, &job.media_code, dir);
             }
             total += 1;
@@ -748,6 +751,14 @@ pub(super) fn drain_metrics(
 /// Skipped when the asset already has a preview built from the same mesh cache key, so a re-scan
 /// that finds nothing changed doesn't spend four CPU renders per model. Every failure is silent:
 /// a missing preview falls back to the raster thumbnail, which is not worth failing a scan over.
+///
+/// **Never called for an in-pack asset** (the caller checks the scratch guard). Its bytes resolve to
+/// a temp file with a random stem, so `mesh::cache_key` — which is `(path, size, mtime)` — is unique
+/// on every run: the staleness check could never hit, every metrics pass would re-render four views,
+/// and each one would leave an orphan `.lod` in the cache that nothing reads or evicts. An in-pack
+/// model keeps its raster thumbnail until the pack is materialized, at which point it has a real
+/// path and picks up a preview like anything else. Giving in-pack assets previews needs the job to
+/// carry a stable identity (the `package_entry` locator) rather than the scratch path.
 fn store_vector_preview(
     cat: &Catalog,
     asset_id: i64,
