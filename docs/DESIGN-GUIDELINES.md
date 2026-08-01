@@ -240,6 +240,23 @@ The hero component. Compact, scannable:
 - Hover: raise + faint type-colored glow; quick actions appear (Preview, Import, Tag).
 - Density target: ≥ 5 columns at 1440px; virtualized grid.
 
+**3D previews are vector, and they spin on hover.** A model's card art is not a rendered bitmap but
+a **traced contour preview**: a silhouette plus two nested tone bands, painted in the type colour
+(`--ls-type-model`) via `currentColor`, so one artifact serves the 32 px list row, the card, and the
+780 px Quick Look with no per-size asset. It reads as flat and low-fidelity **by design** — that is
+the card language, not a downscaled render.
+
+The artifact stores **four viewpoints** (45° apart), and **hovering the card cycles them** at ~0.45 s
+per frame so the asset reads in the round without being opened. Leaving the card returns it to the
+hero view — a card at rest is always the same canonical angle, so a resting grid stays scannable.
+Only the hovered card animates.
+
+Authoring note: the four views live in one SVG document as `<g id="v0">…<g id="v3">` with only `v0`
+displayed, so a web renderer spins it by toggling visibility rather than fetching four images.
+
+*Applies to `model_3d` only.* Textures, sprites and audio keep their raster thumbnail and waveform —
+neither gains anything from being vectorised.
+
 ### Asset list row (table)
 For max density: `[type] name | package | stats (tabular cols) | status gem | tags…`. 32px rows,
 zebra via `--ls-surface`/`--ls-surface-raised`, sortable columns.

@@ -73,7 +73,13 @@ serving in `lodestash-api` (REST) and `lodestash-mcp` (MCP) — **REST and MCP s
 The core screen: a responsive grid of asset cards with a filter/sort toolbar and an inspector.
 
 ### 1.1 Asset card
-- **Thumbnail** (procedurally tinted in the prototype; real app renders a cached preview), a **size
+- **Thumbnail** (procedurally tinted in the prototype; real app renders a cached preview). For
+  `model_3d` this is a **vector preview** — a traced contour + tone bands in the type colour,
+  holding four viewpoints, which **cycle while the card is hovered** and rest on the hero view
+  otherwise. Contract in [`../DESIGN-GUIDELINES.md`](../DESIGN-GUIDELINES.md) §7 "Asset card";
+  grid-specific behaviour in [`../UI-SPEC.md`](../UI-SPEC.md) §2. Other media types keep raster
+  thumbnails, and a model with no preview yet falls back to one.
+- A **size
   tier badge** (S/M/L/XL, coloured by tier — see §5.3), a **status gem** (`?` unid / `✓` identified /
   `★` confirmed), **stage** button (adds to the staging tray), and a **⤢ full-size** affordance.
 - **Favourite star** — a 20×20 tile pinned **top-right of the thumbnail, immediately left of the

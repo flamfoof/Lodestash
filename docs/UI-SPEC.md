@@ -182,6 +182,15 @@ next time"** checkbox writes the same flag).
 
 ## 2. Library (home screen)
 
+**Card art for 3D models is a vector preview that spins on hover** — see
+[`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §7 "Asset card" for the visual contract (traced
+contour + tone bands in `--ls-type-model`, four stored viewpoints, ~0.45 s per frame, resting cards
+return to the hero view). Grid behaviour that belongs here rather than there: only the **hovered**
+card animates, hover-spin applies in the grid only (a **list row** shows the hero view and does not
+spin), and the spin is presentation-only — it changes no selection, no filter, and nothing on disk.
+A model whose preview hasn't been generated yet falls back to its rendered raster thumbnail, so the
+grid never shows a hole while a scan is still draining.
+
 The browse-everything grid. Composition top→bottom:
 
 1. **Unidentified nudge** (when count > 0): slim amber banner — *"N assets are Unidentified —

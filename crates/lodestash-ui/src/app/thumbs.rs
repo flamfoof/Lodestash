@@ -13,6 +13,13 @@ pub(super) enum ThumbKind {
     Material {
         albedo: Option<PathBuf>,
     },
+    /// A stored traced-contour preview (M15), rasterised instead of re-rendering the mesh — no
+    /// parse, no raster, no cache file. `view` selects which of the stored viewpoints to show,
+    /// which is what makes hover-spin work.
+    Vector {
+        svg: String,
+        view: usize,
+    },
 }
 
 /// Is `path` inside a source root the user opened, or the extraction workspace this app owns?
@@ -101,6 +108,17 @@ pub(super) fn generate_texture(
     // decode cached PNGs instead of full-size originals. The cache filename embeds WxH
     // (`thumb::cache_path`), so each on-screen-quality size gets its own cache entry. Falls back
     // to a direct decode when the cache dir is unavailable or generation fails (exotic format).
+    // A stored vector preview short-circuits the whole cache: it needs no source file, no mesh
+    // parse and no PNG on disk — just a rasterise at whatever size the grid is showing.
+    if let ThumbKind::Vector { svg, view } = &kind {
+        let one = lodestash_ingest::vectorize::view_svg(svg, *view);
+        if let Some(img) = lodestash_ingest::vectorize::rasterize(&one, gen_px) {
+            let (w, h) = img.dimensions();
+            let color = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &img);
+            return Some(ctx.load_texture("thumb", color, egui::TextureOptions::LINEAR));
+        }
+        // A preview that won't rasterise falls through to the ordinary render path below.
+    }
     let img = cache_dir
         .and_then(|dir| {
             let key = thumb::meta_key(abs_path, size_bytes, mtime);
@@ -127,6 +145,9 @@ pub(super) fn generate_texture(
                     thumb::generate_material(dir, &key, params, albedo.as_deref()).ok()
                 }
                 ThumbKind::Raster => thumb::generate(abs_path, dir, &key, params).ok(),
+                // Handled above; only reachable if its SVG failed to rasterise, in which case the
+                // ordinary render is the right fallback.
+                ThumbKind::Vector { .. } => thumb::generate(abs_path, dir, &key, params).ok(),
             }
         })
         .and_then(|cached| image::open(cached).ok())

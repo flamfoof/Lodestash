@@ -2109,8 +2109,9 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("embed queue row: {e}")))
     }
 
-    /// Dirty assets the vision tower can encode — 2D (`image`/`texture`/`sprite`) and 3D
-    /// (`model_3d`, multiview-rendered by the caller). Returns on-disk sources
+    /// Dirty assets the vision tower can encode — 2D (`image`/`texture`/`sprite`), 3D
+    /// (`model_3d`, multiview-rendered by the caller) and `material` (rendered as a shader ball,
+    /// its albedo resolved by the caller from the dependency graph). Returns on-disk sources
     /// (`disk_path = root_path/rel_path`) *and* package-extracted files (`workspace_rel` set —
     /// the caller joins it onto the workspace dir). `missing` rows excluded.
     pub fn visual_assets_needing_embedding(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
@@ -2130,7 +2131,7 @@ impl Catalog {
                  LEFT JOIN package pk       ON pk.id = pe.package_id
                  WHERE a.embedding_dirty = 1 AND a.deleted_at IS NULL
                    AND af.missing = 0
-                   AND mt.code IN ('image', 'texture', 'sprite', 'model_3d')
+                   AND mt.code IN ('image', 'texture', 'sprite', 'model_3d', 'material')
                  ORDER BY a.id LIMIT ?1",
             )
             .map_err(|e| CoreError::Catalog(format!("visual embed queue prep: {e}")))?;

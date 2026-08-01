@@ -31,10 +31,10 @@ notify     = { workspace = true }
 # Added later in P2:
 # image_dds = "0.7" # DDS/BCn textures
 
+# Rasterises a stored preview SVG for renderers with no SVG support (the egui grid); a webview
+# renders it natively and needs none of this. Already in the tree via egui_extras' svg feature.
+resvg = "0.37"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 insta    = { workspace = true }
-# Rasterises a generated preview SVG so it can be *looked at* beside the source render
-# (HANDOFF §5 — visual output is never asserted-only). Test-only, and already in the tree via
-# egui_extras' svg feature, so it costs no new build.
-resvg    = "0.37"

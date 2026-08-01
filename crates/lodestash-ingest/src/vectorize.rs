@@ -306,6 +306,59 @@ fn push_ring(s: &mut String, ring: &Contour) {
     s.push('Z');
 }
 
+/// Extract one view from a multi-view preview document as a standalone SVG.
+///
+/// The stored artifact holds every viewpoint as a `<g id="vN">` with only `v0` shown, which is what
+/// makes hover-spin a visibility toggle in a webview. A rasteriser has no such toggle, so egui pulls
+/// the group it wants out of the document. Structural, not a regex: [`to_svg`] writes these groups,
+/// they never nest, and an unknown index falls back to the whole document rather than to nothing.
+pub fn view_svg(svg: &str, view: usize) -> String {
+    let open = format!(r#"<g id="v{view}""#);
+    let Some(start) = svg.find(&open) else {
+        return svg.to_string();
+    };
+    let Some(end) = svg[start..].find("</g>").map(|e| start + e + 4) else {
+        return svg.to_string();
+    };
+    let header_end = match svg.find('>') {
+        Some(i) => i + 1,
+        None => return svg.to_string(),
+    };
+    // Root element (which carries viewBox + color) + just this group.
+    let mut out = String::with_capacity(header_end + (end - start) + 8);
+    out.push_str(&svg[..header_end]);
+    out.push_str(&svg[start..end]);
+    out.push_str("</svg>");
+    // The extracted group is the one being shown, so drop the hiding attribute it may carry.
+    out.replace(r#" display="none""#, "")
+}
+
+/// Rasterise a preview SVG to `size`² RGBA over a transparent background, so a renderer with no SVG
+/// support (the egui grid) can still show it. Returns `None` if the document doesn't parse.
+///
+/// A webview needs none of this — it renders the SVG natively, which is where the real win is.
+pub fn rasterize(svg: &str, size: u32) -> Option<image::RgbaImage> {
+    use resvg::usvg::TreeParsing;
+    let parsed =
+        resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default()).ok()?;
+    let scale = size as f32 / parsed.size.width().max(1.0);
+    let tree = resvg::Tree::from_usvg(&parsed);
+    let size = size.max(1);
+    let mut pix = resvg::tiny_skia::Pixmap::new(size, size)?;
+    tree.render(
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pix.as_mut(),
+    );
+    // tiny-skia stores **premultiplied** RGBA; `image` (and egui's ColorImage) want straight alpha.
+    // Handing the raw buffer over would darken every semi-transparent band by its own opacity.
+    let mut out = image::RgbaImage::new(size, size);
+    for (dst, src) in out.pixels_mut().zip(pix.pixels()) {
+        let c = src.demultiply();
+        *dst = image::Rgba([c.red(), c.green(), c.blue(), c.alpha()]);
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,21 +518,41 @@ mod tests {
         );
     }
 
-    /// Rasterise `svg` at `size`² over the dark surface token, so it can be viewed as a PNG.
-    fn rasterize(svg: &str, size: u32) -> RgbaImage {
-        use resvg::usvg::TreeParsing;
-        let parsed = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
-            .expect("the generated SVG must parse");
-        let scale = size as f32 / parsed.size.width();
-        let tree = resvg::Tree::from_usvg(&parsed);
-        // The design's surface token, so the preview is judged against the card it will sit on.
-        let mut pix = resvg::tiny_skia::Pixmap::new(size, size).expect("pixmap");
-        pix.fill(resvg::tiny_skia::Color::from_rgba8(0x16, 0x1B, 0x26, 0xFF));
-        tree.render(
-            resvg::tiny_skia::Transform::from_scale(scale, scale),
-            &mut pix.as_mut(),
-        );
-        RgbaImage::from_raw(size, size, pix.data().to_vec()).expect("pixmap -> image")
+    /// The production rasteriser, composited over the design's surface token so a probe PNG is
+    /// judged against the card the preview will actually sit on.
+    fn on_surface(svg: &str, size: u32) -> RgbaImage {
+        let fg = super::rasterize(svg, size).expect("the generated SVG must parse");
+        let mut out = RgbaImage::from_pixel(size, size, image::Rgba([0x16, 0x1B, 0x26, 0xFF]));
+        for (x, y, p) in fg.enumerate_pixels() {
+            let a = p.0[3] as f32 / 255.0;
+            let bg = out.get_pixel(x, y).0;
+            let mix = |i: usize| (p.0[i] as f32 * a + bg[i] as f32 * (1.0 - a)) as u8;
+            out.put_pixel(x, y, image::Rgba([mix(0), mix(1), mix(2), 255]));
+        }
+        out
+    }
+
+    #[test]
+    fn view_svg_extracts_one_group_and_unhides_it() {
+        let views: Vec<ViewBands> = (0..4)
+            .map(|_| vec![silhouette(&["....", ".##.", ".##.", "...."], 0.5)])
+            .collect();
+        let doc = to_svg(&views, 256, "#A98BFF");
+
+        for i in 0..4 {
+            let one = view_svg(&doc, i);
+            assert_eq!(one.matches("<g id=").count(), 1, "exactly one group");
+            assert!(one.contains(&format!(r#"<g id="v{i}""#)), "the right one");
+            assert!(
+                !one.contains(r#"display="none""#),
+                "the extracted view must be shown, not inherit the hidden attribute"
+            );
+            assert!(one.contains("viewBox"), "root attributes are preserved");
+            assert!(rasterize(&one, 32).is_some(), "and it still parses");
+        }
+        // An index that isn't there falls back to the whole document rather than to nothing.
+        assert_eq!(view_svg(&doc, 9), doc);
+        assert_eq!(view_svg("not svg", 0), "not svg");
     }
 
     /// The generated SVG must survive a real SVG parser, not just look like markup.
@@ -489,7 +562,7 @@ mod tests {
             &["......", ".####.", ".####.", ".####.", ".####.", "......"],
             0.5,
         )]];
-        let img = rasterize(&to_svg(&views, 6, "#E7B765"), 96);
+        let img = on_surface(&to_svg(&views, 6, "#E7B765"), 96);
         let inked = img.pixels().filter(|p| p.0[0] > 0x40).count();
         assert!(
             inked > 96 * 96 / 8,
@@ -532,7 +605,7 @@ mod tests {
         renders[0]
             .save(out.join("vec-source.png"))
             .expect("write source");
-        rasterize(&svg, 256)
+        on_surface(&svg, 256)
             .save(out.join("vec-traced.png"))
             .expect("write traced");
         println!(

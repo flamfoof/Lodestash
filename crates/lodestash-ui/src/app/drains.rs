@@ -1054,6 +1054,27 @@ pub(super) fn resolve_job_image(
     None
 }
 
+/// Render a **material** job as a shader ball for the encoder: the albedo painted on a sphere, or —
+/// when the dependency graph resolved no texture — the flat base colour, which still encodes as a
+/// material rather than leaving the row `embedding_dirty` forever. Same shape as
+/// `thumb::generate_material`, minus the cache: the vector is the artifact here, not a PNG.
+///
+/// Opaque backdrop, unlike the thumbnail's transparent one — SigLIP reads RGB, so an alpha
+/// background composites to black and eats the ball's silhouette.
+pub(super) fn render_job_material(albedo: Option<&std::path::Path>) -> Option<image::RgbaImage> {
+    // A texture we can't decode is not a failure: the ball still shows the material's colour.
+    let tex = albedo
+        .and_then(|p| lodestash_ingest::raster::decode(p).ok())
+        // Downscale first: a 4k atlas costs far more to sample per pixel than 256² is worth.
+        .map(|img| img.thumbnail(512, 512).to_rgba8());
+    lodestash_ingest::material::render_sphere(
+        tex.as_ref(),
+        [210, 210, 210, 255],
+        RENDER_SIZE,
+        [32, 32, 32, 255],
+    )
+}
+
 /// Resolve a drain job to a readable on-disk path from whichever §7 byte-source applies. On-disk and
 /// workspace-extracted files resolve to their real path with no guard; an **in-pack** asset has its
 /// one payload surgically pulled to an OS-temp scratch file (DATA-MODEL §7 / M14), returned with a
@@ -1108,6 +1129,13 @@ pub(super) fn drain_image_embeddings(
 ) {
     const BATCH: usize = 64;
     let mut total = 0usize;
+    // A material's albedo lives on the `uses_texture` edges, not on the job row, so it takes one
+    // whole-library read up front — trivial next to a single encoder pass, and materials without a
+    // resolved edge simply render flat.
+    let albedo = cat.material_albedo_paths().unwrap_or_else(|e| {
+        tracing::warn!(%e, "material albedo lookup failed; shader balls render flat");
+        Default::default()
+    });
     loop {
         let jobs = match cat.visual_assets_needing_embedding(BATCH) {
             Ok(j) => j,
@@ -1134,6 +1162,11 @@ pub(super) fn drain_image_embeddings(
                 resolved
                     .as_ref()
                     .and_then(|(p, _)| embed_model_multiview(p, emb, cache_dir))
+            } else if job.media_code == "material" {
+                // A `.mat` has no decodable pixels of its own — it encodes as the shader ball the
+                // grid shows for it (UI-SPEC §13.1), so search matches on its look, not its name.
+                render_job_material(albedo.get(&job.asset_id).map(std::path::Path::new))
+                    .map(|img| emb.embed_image(&img))
             } else {
                 resolve_job_image(&job, workspace_dir).map(|img| emb.embed_image(&img.to_rgba8()))
             }

@@ -932,6 +932,14 @@ pub struct LodestashApp {
     /// Material asset id → the absolute path of the texture its preview sphere wears, resolved
     /// from the dependency graph (DATA-MODEL §10). Refreshed per catalog sync with the tag maps.
     material_albedo: std::collections::HashMap<i64, String>,
+    /// Traced vector previews (M15) for the models on screen, keyed by asset id — refreshed per
+    /// catalog sync rather than hung off `AssetEntry`, because the rayon thumbnail worker has no
+    /// catalog connection (single-writer rule) and because state beside the grid survives a
+    /// rebuilt entry list (see HANDOFF §6).
+    preview_svgs: std::collections::HashMap<i64, String>,
+    /// Which of the four stored viewpoints each card is showing. Only ever holds hovered cards, so
+    /// it stays small; a card that isn't spinning is view 0 and has no entry.
+    preview_view: std::collections::HashMap<i64, usize>,
     /// Favourited asset ids (DATA-MODEL §12). A set beside the entries, like the tag and edge
     /// maps: entries outlive any single catalog read, and a favourite toggles far more often than
     /// the grid rebuilds.
@@ -1248,6 +1256,8 @@ impl LodestashApp {
             asset_categories: std::collections::HashMap::new(),
             category_usage: Vec::new(),
             material_albedo: std::collections::HashMap::new(),
+            preview_svgs: std::collections::HashMap::new(),
+            preview_view: std::collections::HashMap::new(),
             edges_out: std::collections::HashSet::new(),
             edges_in: std::collections::HashSet::new(),
             related: Vec::new(),
@@ -2097,6 +2107,76 @@ impl LodestashApp {
             }
             Err(e) => tracing::warn!(%e, "material albedo paths unavailable"),
         }
+    }
+
+    /// Hover-to-spin (DESIGN-GUIDELINES §7): while a card with a vector preview is hovered, cycle
+    /// the four stored viewpoints so the asset reads in the round without opening it.
+    ///
+    /// Only the hovered card ever holds a view index, and leaving it resets to `v0` — so the map
+    /// stays at most one entry and a card at rest always shows the canonical hero view. Dropping
+    /// the texture is what makes the next frame re-rasterise at the new view.
+    fn spin_hovered_preview(&mut self, ctx: &egui::Context, hovered: Option<i64>) {
+        /// One frame per this long. Slow enough to read as four distinct angles rather than a
+        /// flicker, fast enough to complete a turn inside a normal hover.
+        const FRAME: f32 = 0.45;
+        const VIEWS: usize = 4;
+
+        let hovered = hovered.filter(|id| self.preview_svgs.get(id).is_some_and(|s| !s.is_empty()));
+        // Anything no longer hovered goes back to the hero view.
+        let stale: Vec<i64> = self
+            .preview_view
+            .keys()
+            .copied()
+            .filter(|id| Some(*id) != hovered)
+            .collect();
+        for id in stale {
+            self.preview_view.remove(&id);
+            self.invalidate_thumb(id);
+        }
+        let Some(id) = hovered else { return };
+
+        let want = ((ctx.input(|i| i.time) / FRAME as f64) as usize) % VIEWS;
+        if self.preview_view.get(&id).copied().unwrap_or(0) != want {
+            self.preview_view.insert(id, want);
+            self.invalidate_thumb(id);
+        }
+        // Keep the frames coming while the pointer rests on the card.
+        ctx.request_repaint_after(std::time::Duration::from_secs_f32(FRAME));
+    }
+
+    /// Drop `asset_id`'s cached texture so the next frame regenerates it.
+    fn invalidate_thumb(&mut self, asset_id: i64) {
+        for entry in &mut self.entries {
+            if entry.asset_id == Some(asset_id) {
+                entry.texture = None;
+                entry.thumb_spawned = false;
+            }
+        }
+    }
+
+    /// The traced vector preview for `asset_id` (M15), fetched through the grid's own **read**
+    /// connection and memoised. Lazy per card rather than bulk-loaded at sync: a full library is
+    /// ~20 MB of SVG and only the visible page is ever drawn.
+    ///
+    /// A miss is cached as an empty string, so an asset the metrics drain hasn't reached yet costs
+    /// one query, not one per frame.
+    fn preview_svg_for(&mut self, asset_id: i64) -> Option<&str> {
+        if !self.preview_svgs.contains_key(&asset_id) {
+            if self.search_catalog.is_none() {
+                self.search_catalog = catalog_db_path().and_then(|p| Catalog::open(&p).ok());
+            }
+            let svg = self
+                .search_catalog
+                .as_ref()
+                .and_then(|c| c.vector_preview(asset_id).ok().flatten())
+                .map(|(svg, _)| svg)
+                .unwrap_or_default();
+            self.preview_svgs.insert(asset_id, svg);
+        }
+        self.preview_svgs
+            .get(&asset_id)
+            .filter(|s| !s.is_empty())
+            .map(String::as_str)
     }
 
     /// LINKED FILES rows for `asset_id`, reloaded only when the selection changes (UI-SPEC §13.6).
@@ -9490,7 +9570,20 @@ impl LodestashApp {
             // count are separate costs. Quick Look is unaffected: it decodes/loads at full detail.
             let gen_px = self.config.preview_quality.thumb_px();
             let proxy = self.config.preview_quality.proxy_budget();
+            // A model with a stored vector preview draws that instead of a rendered PNG — one
+            // artifact for every size, and no mesh touched at browse time.
+            let vector = (self.entries[idx].file.media_type == Some(MediaType::Model3d))
+                .then(|| self.entries[idx].asset_id)
+                .flatten()
+                .and_then(|id| {
+                    let view = self.preview_view.get(&id).copied().unwrap_or(0);
+                    self.preview_svg_for(id).map(|svg| (svg.to_string(), view))
+                });
             let kind = match self.entries[idx].file.media_type {
+                _ if vector.is_some() => {
+                    let (svg, view) = vector.expect("checked");
+                    ThumbKind::Vector { svg, view }
+                }
                 Some(MediaType::Audio) => ThumbKind::Audio,
                 // A material has no pixels of its own: paint its albedo on a sphere.
                 Some(MediaType::Material) => ThumbKind::Material {
@@ -11105,6 +11198,7 @@ impl eframe::App for LodestashApp {
                     spawn_queue = out.to_spawn;
                     clicked_cache = out.clicked;
                     context_action = out.context;
+                    self.spin_hovered_preview(ui.ctx(), out.hovered_asset);
 
                     // Marquee drag-select: track pointer drag, draw overlay, and on release
                     // select all visible cards/rows that intersect the rubber-band rectangle.
@@ -12391,6 +12485,10 @@ struct GridOutput {
     /// Visible rows/cards with their screen-space rectangles for marquee drag-select.
     /// (cache_idx, entry_idx, rect).
     rects: Vec<(usize, usize, egui::Rect)>,
+    /// Asset id of the hovered card, if any — drives hover-to-spin on vector previews. Reported
+    /// out like `clicked` rather than mutated in place, because the grid is a free function over
+    /// borrowed state and the spin cadence belongs to the frame loop.
+    hovered_asset: Option<i64>,
 }
 
 #[allow(clippy::too_many_arguments)] // ponytail: internal fn mirroring grid state; a struct would just rename the args
@@ -12419,6 +12517,7 @@ fn thumbnail_grid(
     let total_rows = indices.len().div_ceil(cols);
 
     let mut to_spawn: Vec<usize> = Vec::new();
+    let mut hovered_asset: Option<i64> = None;
     let mut row_start_out: usize = prev_row_start;
     let mut row_end_out: usize = prev_row_end;
     let mut clicked: Option<(usize, egui::Modifiers)> = None;
@@ -12475,6 +12574,9 @@ fn thumbnail_grid(
                             tiers,
                         );
                         rects.push((cache_idx, idx, resp.rect));
+                        if resp.hovered() {
+                            hovered_asset = entries[idx].asset_id;
+                        }
                         if resp.clicked() {
                             clicked = Some((cache_idx, ui.input(|i| i.modifiers)));
                         }
@@ -12502,6 +12604,7 @@ fn thumbnail_grid(
         clicked,
         context,
         rects,
+        hovered_asset,
     }
 }
 
@@ -12668,6 +12771,9 @@ fn asset_list(
         });
 
     GridOutput {
+        // The list row is not a card, so it has no hover-spin (DESIGN-GUIDELINES §7 scopes the
+        // affordance to the asset card).
+        hovered_asset: None,
         to_spawn,
         cols: 1,
         row_start: row_start_out,
@@ -12893,6 +12999,7 @@ fn pack_contents_list(
 
     (
         GridOutput {
+            hovered_asset: None,
             to_spawn,
             cols: 1,
             row_start: row_start_out,
