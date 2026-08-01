@@ -259,6 +259,7 @@ impl Catalog {
             (12, MIGRATION_12_FAVORITES),
             (13, MIGRATION_13_ONE_PACKAGE_PER_PATH),
             (14, MIGRATION_14_IN_PACK_ASSETS),
+            (15, MIGRATION_15_VECTOR_PREVIEWS),
         ];
 
         for (version, sql) in migrations {
@@ -1712,6 +1713,23 @@ DELETE FROM package WHERE id NOT IN (SELECT keep_id FROM pkg_survivor);
 DROP TABLE pkg_survivor;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_package_path ON package(package_path);
+";
+
+/// M15 — vector previews (DESIGN-GUIDELINES §7). One traced-contour SVG per 3D asset, holding every
+/// rendered viewpoint as its own `<g>`, replacing the per-size PNG set: the same artifact serves a
+/// 32 px list row and a 780 px Quick Look, and thousands of small cache files become rows.
+///
+/// Its **own table**, so `SELECT` on `asset` never drags a blob. `source_key` is the mesh cache key
+/// — `(path, size, mtime)` plus the proxy budget — so an edited file or a raised on-screen quality
+/// regenerates instead of serving a stale preview.
+const MIGRATION_15_VECTOR_PREVIEWS: &str = "
+CREATE TABLE IF NOT EXISTS asset_preview (
+  asset_id     INTEGER PRIMARY KEY REFERENCES asset(id) ON DELETE CASCADE,
+  svg          BLOB    NOT NULL,
+  view_count   INTEGER NOT NULL,
+  source_key   TEXT    NOT NULL,
+  generated_at TEXT    NOT NULL
+);
 ";
 
 const MIGRATION_12_FAVORITES: &str = "
@@ -3733,6 +3751,66 @@ impl Catalog {
         Ok(())
     }
 
+    /// Store an asset's traced vector preview (M15). `source_key` is the mesh cache key it was
+    /// generated from, so a later scan can tell a stale preview from a current one without
+    /// re-rendering. Replaces any existing row — one preview per asset, always the current one.
+    pub fn set_vector_preview(
+        &self,
+        asset_id: i64,
+        svg: &str,
+        view_count: i64,
+        source_key: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO asset_preview (asset_id, svg, view_count, source_key, generated_at)
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'))
+                 ON CONFLICT(asset_id) DO UPDATE SET
+                     svg = excluded.svg,
+                     view_count = excluded.view_count,
+                     source_key = excluded.source_key,
+                     generated_at = excluded.generated_at",
+                params![asset_id, svg.as_bytes(), view_count, source_key],
+            )
+            .map_err(|e| CoreError::Catalog(format!("set_vector_preview: {e}")))?;
+        Ok(())
+    }
+
+    /// An asset's vector preview and the key it was generated from. `None` when there is none.
+    pub fn vector_preview(&self, asset_id: i64) -> Result<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT svg, source_key FROM asset_preview WHERE asset_id = ?1",
+                params![asset_id],
+                |r| {
+                    let svg: Vec<u8> = r.get(0)?;
+                    Ok((String::from_utf8_lossy(&svg).into_owned(), r.get(1)?))
+                },
+            )
+            .optional()
+            .map_err(|e| CoreError::Catalog(format!("vector_preview: {e}")))
+    }
+
+    /// Whether `asset_id` already has a preview built from `source_key` — the skip check the drain
+    /// runs before spending four CPU renders on a model nothing has changed about.
+    pub fn has_current_preview(&self, asset_id: i64, source_key: &str) -> Result<bool> {
+        Ok(self
+            .vector_preview(asset_id)?
+            .is_some_and(|(_, key)| key == source_key))
+    }
+
+    /// Total bytes of stored previews — the catalog half of the footprint the Storage settings
+    /// report, now that previews are rows rather than cache files.
+    pub fn vector_preview_bytes(&self) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(svg)), 0) FROM asset_preview",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| CoreError::Catalog(format!("vector_preview_bytes: {e}")))
+    }
+
     /// Summaries for `ids`, in the order given (the agent planes rank first, then hydrate).
     /// Unknown or soft-deleted ids are dropped rather than erroring — a stale id from a client
     /// is a miss, not a fault.
@@ -4041,7 +4119,62 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 14, "all 14 migrations should have run");
+        assert_eq!(version, 15, "all 15 migrations should have run");
+    }
+
+    #[test]
+    fn vector_preview_round_trips_and_tracks_staleness() {
+        let mut catalog = Catalog::open_in_memory().expect("catalog open");
+        catalog.seed_media_types().expect("seed");
+        let source = catalog
+            .upsert_import_source("Lib", "C:/lib", "folder")
+            .expect("source");
+        catalog
+            .record_crawl(source, None, &[rec("Rock.png", 1, 1)])
+            .expect("crawl");
+        let asset: i64 = catalog
+            .conn
+            .query_row("SELECT id FROM asset LIMIT 1", [], |r| r.get(0))
+            .expect("asset");
+
+        assert_eq!(catalog.vector_preview(asset).unwrap(), None);
+        assert!(!catalog.has_current_preview(asset, "key-a").unwrap());
+
+        let svg = r#"<svg viewBox="0 0 256 256"><g id="v0"/></svg>"#;
+        catalog
+            .set_vector_preview(asset, svg, 4, "key-a")
+            .expect("store");
+        assert_eq!(
+            catalog.vector_preview(asset).unwrap(),
+            Some((svg.to_string(), "key-a".into()))
+        );
+        assert!(catalog.has_current_preview(asset, "key-a").unwrap());
+        // A changed file (or a raised quality) yields a different key, so the drain regenerates
+        // rather than serving a preview of the old geometry.
+        assert!(!catalog.has_current_preview(asset, "key-b").unwrap());
+        assert_eq!(
+            catalog.vector_preview_bytes().unwrap(),
+            svg.len() as i64,
+            "the Storage readout counts catalog preview bytes"
+        );
+
+        // Upsert replaces rather than duplicating — one preview per asset, always the current one.
+        catalog
+            .set_vector_preview(asset, "<svg/>", 1, "key-b")
+            .expect("replace");
+        assert_eq!(
+            catalog.vector_preview(asset).unwrap(),
+            Some(("<svg/>".to_string(), "key-b".into()))
+        );
+        assert_eq!(catalog.vector_preview_bytes().unwrap(), 6);
+
+        // Previews are derived data: deleting the asset must not leave an orphan row behind.
+        catalog
+            .conn
+            .execute("DELETE FROM asset WHERE id = ?1", params![asset])
+            .expect("delete asset");
+        assert_eq!(catalog.vector_preview(asset).unwrap(), None);
+        assert_eq!(catalog.vector_preview_bytes().unwrap(), 0);
     }
 
     /// A catalog stopped at schema v4, for exercising M5's data steps.

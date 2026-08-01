@@ -724,6 +724,12 @@ pub(super) fn drain_metrics(
                 tracing::warn!(%e, "set_metrics failed; stopping metrics drain");
                 return;
             }
+            // The mesh is parsed and cached right here, so this is the one place that can produce
+            // the vector preview without a second parse — and it is already the persist thread, so
+            // the write respects the single-writer rule (ARCHITECTURE §5).
+            if let (Some(p), Some(dir)) = (path.as_deref(), cache_dir) {
+                store_vector_preview(cat, job.asset_id, p, &job.media_code, dir);
+            }
             total += 1;
         }
         if n < BATCH {
@@ -734,6 +740,56 @@ pub(super) fn drain_metrics(
         tracing::info!(measured = total, "technical facets extracted");
     }
 }
+
+/// Render `path`'s four orbit views from its low-poly proxy, trace them into one contour SVG and
+/// store it on the asset (M15). Only 3D models — a texture has pixels of its own and audio has a
+/// waveform, so neither gains anything from being vectorised.
+///
+/// Skipped when the asset already has a preview built from the same mesh cache key, so a re-scan
+/// that finds nothing changed doesn't spend four CPU renders per model. Every failure is silent:
+/// a missing preview falls back to the raster thumbnail, which is not worth failing a scan over.
+fn store_vector_preview(
+    cat: &Catalog,
+    asset_id: i64,
+    path: &std::path::Path,
+    media_code: &str,
+    cache_dir: &std::path::Path,
+) {
+    use lodestash_ingest::{decimate, mesh, render3d, vectorize};
+
+    if media_code != "model_3d" {
+        return;
+    }
+    let budget = decimate::PREVIEW_BUDGET;
+    let key = format!("{}-{}", mesh::cache_key(path), budget.tag());
+    match cat.has_current_preview(asset_id, &key) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(e) => {
+            tracing::debug!(%e, "preview staleness check failed; regenerating");
+        }
+    }
+    let Ok(meshes) = mesh::load_preview_cached(path, cache_dir, budget) else {
+        return;
+    };
+    let views =
+        render3d::render_views_on(&meshes, PREVIEW_RENDER_PX, render3d::DEFAULT_VIEWS, [0; 4]);
+    if views.is_empty() {
+        return;
+    }
+    let traced: Vec<vectorize::ViewBands> = views
+        .iter()
+        .map(|v| vectorize::trace(v, vectorize::Bands::default()))
+        .collect();
+    let svg = vectorize::to_svg(&traced, PREVIEW_RENDER_PX, crate::theme::MODEL_HEX);
+    if let Err(e) = cat.set_vector_preview(asset_id, &svg, traced.len() as i64, &key) {
+        tracing::debug!(%e, "storing vector preview failed");
+    }
+}
+
+/// Trace resolution. The SVG is resolution-independent once traced, so this only sets how finely
+/// the contour follows the silhouette — 256 px matches the multiview encoder's render size.
+const PREVIEW_RENDER_PX: u32 = 256;
 
 /// Clip length via the decoder the player already uses. `total_duration` answers from the header
 /// for WAV/FLAC; formats that can't (some MP3s) report `None`, which stays "unknown" rather than

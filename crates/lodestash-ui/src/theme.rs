@@ -26,6 +26,9 @@ pub const ARCANE_BRIGHT: Color32 = Color32::from_rgb(0x7B, 0xF0, 0xE5);
 
 // Element-type colors (media type categories)
 pub const TYPE_MODEL: Color32 = Color32::from_rgb(0xA9, 0x8B, 0xFF); // #A98BFF amethyst
+/// Same token as [`TYPE_MODEL`], as CSS hex — vector previews carry it on the SVG root so the
+/// artifact is correct in a plain SVG renderer as well as in a stylesheet.
+pub const MODEL_HEX: &str = "#A98BFF";
 pub const TYPE_SOUND: Color32 = Color32::from_rgb(0x49, 0xC9, 0xE0); // #49C9E0 aqua
 pub const TYPE_IMAGE: Color32 = Color32::from_rgb(0x6F, 0xB1, 0xFF); // #6FB1FF sapphire
 pub const TYPE_MATERIAL: Color32 = Color32::from_rgb(0xF2, 0xB8, 0x4B); // amber

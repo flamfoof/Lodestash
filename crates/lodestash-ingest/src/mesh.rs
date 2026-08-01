@@ -333,7 +333,7 @@ pub fn load_any(
 pub fn load_cached(path: &Path, cache_dir: &Path) -> Result<Vec<MeshData>, String> {
     let cache_path = cache_dir
         .join("mesh")
-        .join(format!("{}.msh", mesh_cache_key(path)));
+        .join(format!("{}.msh", cache_key(path)));
     if let Ok(bytes) = std::fs::read(&cache_path) {
         if let Some(meshes) = decode_meshes(&bytes) {
             return Ok(meshes);
@@ -373,7 +373,7 @@ pub fn load_preview_cached(
     cache_dir: &Path,
     budget: crate::decimate::Budget,
 ) -> Result<Vec<MeshData>, String> {
-    let key = mesh_cache_key(path);
+    let key = cache_key(path);
     // The budget is part of the identity: same file, coarser budget, different proxy.
     let proxy_path = cache_dir
         .join("mesh")
@@ -393,7 +393,9 @@ pub fn load_preview_cached(
     Ok(proxy)
 }
 
-fn mesh_cache_key(path: &Path) -> String {
+/// Identity of a file for the mesh caches: `(path, size, mtime)`. Public because the vector-preview
+/// drain keys its stored SVG on the same value, so a preview and its geometry go stale together.
+pub fn cache_key(path: &Path) -> String {
     let (size, mtime) = std::fs::metadata(path)
         .map(|m| {
             let mtime = m
@@ -576,7 +578,7 @@ mod mesh_cache_tests {
 
         let first = load_cached(&obj, &cache).expect("parse + cache");
         assert!(!first.is_empty(), "OBJ parsed to geometry");
-        let key = mesh_cache_key(&obj);
+        let key = cache_key(&obj);
         let cache_file = cache.join("mesh").join(format!("{key}.msh"));
         assert!(cache_file.exists(), "cache written on first load");
 
