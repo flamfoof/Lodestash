@@ -4,7 +4,7 @@ Working notes for whoever (or whatever) continues the build. Unlike the rest of 
 is **not** a design spec — it's the state of play, the decisions already settled, and the traps.
 The design docs still win on any question of what the software *should* do.
 
-Last updated: **2026-07-30**, at `1e9954c`.
+Last updated: **2026-08-01**, at `afadc97`.
 
 ---
 
@@ -395,6 +395,47 @@ in-app screenshots this session, so most of it is eyeballed. Shipped:
   load-bearing (only working "Open folder" + project switcher; the design's project-chip switcher §7.1
   is a stub) — retire it only after building the chip switcher.
 
+**Session 2026-08-01 — low-poly proxies + vector previews (`e08da23`…`afadc97`).** HANDOFF §7 item A,
+then the storage half of it. Shipped:
+
+- **Low-poly preview proxies** (`e08da23`). `lodestash_ingest::decimate` collapses `MeshData` onto a
+  uniform voxel grid — binary-search the grid resolution for the finest grid inside the budget,
+  average each cell's members, drop degenerate + duplicate triangles. **Vertex-cluster, not QEM**:
+  QEM wants a half-edge structure and an error heap, and at 128–256 px the silhouette is the whole
+  signal (`collapse` is drop-in replaceable if that changes). `mesh::load_preview_cached` caches it
+  as `<key>-<budget>.lod` and **deletes the staging `.msh`** — that is where the disk win comes from
+  (ceiling: a re-scan re-parses). Budget is a **ratio clamped to a floor and a ceiling**
+  (`PreviewQuality::proxy_budget()`), because a bare ratio leaves a 500k-tri hull heavy and erases a
+  400-tri prop. Thumbnails **and** the multiview embedding both render the proxy — SigLIP reads
+  silhouette. `metrics::triangle_count` deliberately stays on `load_cached`: the `triangles` facet is
+  the **source** count. Measured on a real 31,869-tri character: **1,026 tris, 3,361 KB → 38 KB (88×)**,
+  eyeballed against the full render.
+- **Vector previews** (`9eee857`). `lodestash_ingest::vectorize` traces a *rendered view* into a
+  contour SVG: nested bands (band 0 = alpha silhouette, bands 1.. = luminance thresholds inside it,
+  as fractions of the observed peak), boundary-edge chaining instead of marching squares (no saddle
+  cases; holes fall out with opposite winding, which is what `fill-rule="evenodd"` wants), then
+  Douglas-Peucker cut at two anchors and rejoined. One SVG holds **all four `DEFAULT_VIEWS` as `<g>`s
+  with only `v0` shown**, so hover-spin is a visibility toggle rather than four fetches; paths paint
+  `currentColor` with the token hex on the root, so a webview restyles it with one CSS rule while
+  resvg still gets the colour. Real model: **4 views, 12 paths, 12.8 KB**, viewed beside the source
+  render. `resvg` added **dev-dependency only**, to rasterise a generated SVG so it can be looked at.
+- **Catalog storage + generation** (`afadc97`). **M15 `asset_preview`** — own table so `SELECT` on
+  `asset` never drags a blob, `ON DELETE CASCADE` because a preview is derived data. `source_key` is
+  the mesh cache key **plus the budget tag**, so an edited file *or* a raised quality regenerates.
+  Generation hangs off `drain_metrics`, the only place that already has the mesh parsed *and* already
+  owns the persist thread's connection — no second parse, no second writer.
+
+**Not done — the visible half.** Nothing renders these yet: grid cards still show the raster
+thumbnail. The remaining slice is (a) a `HashMap<asset_id, String>` of previews refreshed per catalog
+sync (the §6 "state beside `AssetEntry`" pattern — the rayon thumbnail worker has no catalog handle,
+which is the whole reason it can't just query), (b) `generate_texture` preferring it via
+`egui_extras`' svg loader, (c) hover-spin cycling `v0..v3`, and (d) the design-doc sections that
+hover-spin needs written (`DESIGN-GUIDELINES` §7 asset card, `UI-SPEC` §2, `FEATURES` §1) since the
+affordance isn't in the designs today. Also open from the same plan: material-embedding backfill
+(the 207 rows, now that a renderer exists), preview-cache accounting across disk **and** catalog
+bytes, and the shape-signature search (design-first). Note the egui payoff is limited — resvg
+rasterises the SVG anyway; the artifact is native in a webview.
+
 ---
 
 ## 3. Settled decisions — don't re-litigate
@@ -581,7 +622,25 @@ the biggest open frontier (server side shipped 2026-07-28; left: the UPM C# plug
 allow-list toggle UI). Contained, verifiable-headless: the low-poly work (#A) and the remaining Unity
 Assets §5 items (#3). In rough order:
 
-A. **Low-poly preview meshes (NEW, recommended).** Grid/Quick-Look 3D previews currently render the
+**A big decision landed this session and is not yet started: the UI is being ported to Tauri 2 +
+Svelte 5.** The reasoning is structural rather than taste — the design source of truth is *already*
+web tech (`DESIGN-GUIDELINES.md:50` says CSS custom properties are canonical;
+`docs/design/Lodestash Prototype.dc.html` is a runnable HTML/CSS prototype of every screen;
+`docs/design/icons/` ships 50 real SVGs that egui renders as Unicode stand-ins), so egui forces a
+lossy translation on every screen and the docs have already bent to it
+(`docs/design/README.md:52-58` tells implementers *not* to reproduce HTML/CSS specifics). Settled:
+Svelte 5 + TS + Vite; `#[tauri::command]` for ops plus an `ls://` scheme for binary, with the axum
+`/v1/` + MCP agent plane **untouched** (the 1:1 invariant covers the agent surface only); extract a
+headless `lodestash-app` crate first and keep egui buildable as the reference until parity; Rust
+parses/decimates and three.js orbits in WebGL. Four features ride along (drag out to Unity, drag
+in, Ctrl-K palette, Quick Look as its own window) plus a real `lodestash-cli`. Phase A (previews,
+above) ships on `main` first and the port inherits it.
+
+A. ~~**Low-poly preview meshes**~~ **DONE 2026-08-01** (`e08da23`), and extended into vector
+   previews — see the session block in §2. What remains of that thread is the *display* half
+   (§2, "Not done"). Original note kept below for the reasoning.
+
+   Grid/Quick-Look 3D previews currently render the
    *full* mesh; `1e9954c` only lowered the render *resolution*, not the triangle count, and the real
    cost is the parse + the cached `MeshData` size. Decimate each model to a low-poly proxy **once**,
    cache it beside the existing normalized mesh (`mesh::load_cached` → `cache_dir/mesh/<key>.msh`,
