@@ -4739,7 +4739,11 @@ impl LodestashApp {
         if self.screen == Screen::Favorites {
             let favorites = &self.favorites;
             let entries = &self.entries;
-            idxs.retain(|&i| entries[i].asset_id.is_some_and(|id| favorites.contains(&id)));
+            idxs.retain(|&i| {
+                entries[i]
+                    .asset_id
+                    .is_some_and(|id| favorites.contains(&id))
+            });
         }
         // CATEGORY facet (mapping library, DATA-MODEL §4) — a hard structural pre-filter, kept out
         // of `passes` so that pure predicate stays free of an app-owned map. An asset passes if any
@@ -5752,9 +5756,11 @@ impl LodestashApp {
             let chip = |ui: &mut Ui, label: &str, active: bool| -> bool {
                 ui.selectable_label(
                     active,
-                    RichText::new(label)
-                        .size(11.0)
-                        .color(if active { theme::GOLD } else { theme::TEXT_MUTED }),
+                    RichText::new(label).size(11.0).color(if active {
+                        theme::GOLD
+                    } else {
+                        theme::TEXT_MUTED
+                    }),
                 )
                 .clicked()
             };
@@ -5791,9 +5797,12 @@ impl LodestashApp {
                             ui.label(RichText::new("\u{2B22}").color(theme::SUCCESS).size(14.0));
                             ui.vertical(|ui| {
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new(&pkg.name).color(theme::TEXT).size(13.0));
+                                    ui.label(
+                                        RichText::new(&pkg.name).color(theme::TEXT).size(13.0),
+                                    );
                                     // Content-derived category badge (§5.3); Unknown until indexed.
-                                    let cat = cats.get(&pkg.name).map(|c| c.label()).unwrap_or("Unknown");
+                                    let cat =
+                                        cats.get(&pkg.name).map(|c| c.label()).unwrap_or("Unknown");
                                     egui::Frame::none()
                                         .fill(theme::OVERLAY)
                                         .rounding(3.0)
@@ -5923,7 +5932,12 @@ impl LodestashApp {
         }
         if let Some(i) = sync_pkg {
             if let Some(pkg) = packages.get(i) {
-                self.sync_package(ctx, pkg.id, pkg.name.clone(), PathBuf::from(&pkg.package_path));
+                self.sync_package(
+                    ctx,
+                    pkg.id,
+                    pkg.name.clone(),
+                    PathBuf::from(&pkg.package_path),
+                );
             }
         }
         if import_clicked {
@@ -6137,8 +6151,11 @@ impl LodestashApp {
             self.jobs.finish(id);
         }
         let progress = Arc::new(crate::jobs::JobProgress::default());
-        self.open_pack_job =
-            Some(self.jobs.start(format!("Syncing {name}"), progress.clone(), true));
+        self.open_pack_job = Some(self.jobs.start(
+            format!("Syncing {name}"),
+            progress.clone(),
+            true,
+        ));
         let tx = self.rehydrate_tx.clone();
         let ctx2 = ctx.clone();
         let path = abs_path.clone();
@@ -6257,8 +6274,11 @@ impl LodestashApp {
             self.jobs.finish(id);
         }
         let progress = Arc::new(crate::jobs::JobProgress::default());
-        self.open_pack_job =
-            Some(self.jobs.start(format!("Indexing {}", pm.name), progress.clone(), true));
+        self.open_pack_job = Some(self.jobs.start(
+            format!("Indexing {}", pm.name),
+            progress.clone(),
+            true,
+        ));
         let tx = self.rehydrate_tx.clone();
         let ctx2 = ctx.clone();
         let PendingMint {
@@ -9193,7 +9213,8 @@ impl LodestashApp {
             if active {
                 resp.clicked()
             } else {
-                resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+                resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
             }
         };
         let sep = |ui: &mut Ui| {
@@ -9352,8 +9373,11 @@ impl LodestashApp {
                             ui.allocate_exact_size(egui::vec2(full, 26.0), egui::Sense::click());
                         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
                         if resp.hovered() {
-                            ui.painter()
-                                .rect_filled(rect, 4.0, theme::OVERLAY.linear_multiply(0.5));
+                            ui.painter().rect_filled(
+                                rect,
+                                4.0,
+                                theme::OVERLAY.linear_multiply(0.5),
+                            );
                         }
                         let painter = ui.painter();
                         painter.text(
@@ -9461,9 +9485,11 @@ impl LodestashApp {
             let size_bytes = self.entries[idx].file.size_bytes;
             let mtime = self.entries[idx].file.mtime;
             let cache_dir = self.thumb_cache_dir.clone();
-            // On-screen quality drives the grid thumbnail render size (design §5.2). Quick Look is
-            // unaffected — it decodes the original at full detail.
+            // On-screen quality drives the grid thumbnail render size (design §5.2) **and** the
+            // triangle budget of the low-poly proxy a model renders from — resolution and polygon
+            // count are separate costs. Quick Look is unaffected: it decodes/loads at full detail.
             let gen_px = self.config.preview_quality.thumb_px();
+            let proxy = self.config.preview_quality.proxy_budget();
             let kind = match self.entries[idx].file.media_type {
                 Some(MediaType::Audio) => ThumbKind::Audio,
                 // A material has no pixels of its own: paint its albedo on a sphere.
@@ -9507,6 +9533,7 @@ impl LodestashApp {
                     src_mtime,
                     cache_dir.as_deref(),
                     gen_px,
+                    proxy,
                     kind,
                 );
                 let _ = tx.send(ThumbReady {
@@ -9643,9 +9670,7 @@ impl eframe::App for LodestashApp {
                 self.quick_look = true;
             }
             // Ctrl/Cmd-A: select all within the current filter (§0.4, design §7).
-            if self.on_grid()
-                && ctx.input(|i| i.modifiers.command && i.key_pressed(Key::A))
-            {
+            if self.on_grid() && ctx.input(|i| i.modifiers.command && i.key_pressed(Key::A)) {
                 self.selected = self.sorted_cache.iter().copied().collect();
             }
             // Del: move the selection (or the lead card) to the Trash (design §9).
@@ -11004,7 +11029,8 @@ impl eframe::App for LodestashApp {
                 let page_range = self.page_range();
                 let page_start = page_range.start;
                 let mut out: Option<GridOutput> = None;
-                if pack_list_mode && (!self.folder_tiles.is_empty() || !self.sorted_cache.is_empty())
+                if pack_list_mode
+                    && (!self.folder_tiles.is_empty() || !self.sorted_cache.is_empty())
                 {
                     let tiles = self.folder_tiles.clone();
                     let (o, folder_clicked) = pack_contents_list(
@@ -12413,13 +12439,13 @@ fn thumbnail_grid(
             // `thumb_spawned` guard keeps this from re-spawning anything already started. `prev_*`
             // are still the eviction/row-tracking inputs.
             let _ = (prev_cols, prev_row_start, prev_row_end);
-            let (buf_start, buf_end) =
-                lookahead_window(row_range.start, row_range.end, total_rows);
+            let (buf_start, buf_end) = lookahead_window(row_range.start, row_range.end, total_rows);
             for row in buf_start..buf_end {
                 let start = row * cols;
                 let end = (start + cols).min(indices.len());
                 for &idx in &indices[start..end] {
-                    if !entries[idx].thumb_spawned && needs_thumbnail(entries[idx].file.media_type) {
+                    if !entries[idx].thumb_spawned && needs_thumbnail(entries[idx].file.media_type)
+                    {
                         to_spawn.push(idx);
                     }
                 }
@@ -12703,11 +12729,26 @@ fn pack_contents_list(
             // Sticky column header.
             if row_range.start == 0 {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("NAME").size(9.5).monospace().color(theme::TEXT_DIM));
+                    ui.label(
+                        RichText::new("NAME")
+                            .size(9.5)
+                            .monospace()
+                            .color(theme::TEXT_DIM),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new("ITEMS").size(9.5).monospace().color(theme::TEXT_DIM));
+                        ui.label(
+                            RichText::new("ITEMS")
+                                .size(9.5)
+                                .monospace()
+                                .color(theme::TEXT_DIM),
+                        );
                         ui.add_space(48.0);
-                        ui.label(RichText::new("SIZE").size(9.5).monospace().color(theme::TEXT_DIM));
+                        ui.label(
+                            RichText::new("SIZE")
+                                .size(9.5)
+                                .monospace()
+                                .color(theme::TEXT_DIM),
+                        );
                     });
                 });
                 ui.add_space(2.0);
@@ -12732,15 +12773,27 @@ fn pack_contents_list(
                                 ui.set_min_size(egui::Vec2::new(0.0, LIST_THUMB_SIZE));
                                 ui.label(RichText::new("\u{1F4C1}").color(theme::GOLD).size(13.0));
                                 ui.add_space(4.0);
-                                ui.label(RichText::new(&t.name).color(theme::TEXT).strong().size(12.5));
+                                ui.label(
+                                    RichText::new(&t.name)
+                                        .color(theme::TEXT)
+                                        .strong()
+                                        .size(12.5),
+                                );
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
                                         ui.label(
-                                            RichText::new(items).monospace().size(11.0).color(theme::TEXT_MUTED),
+                                            RichText::new(items)
+                                                .monospace()
+                                                .size(11.0)
+                                                .color(theme::TEXT_MUTED),
                                         );
                                         ui.add_space(48.0);
-                                        ui.label(RichText::new("\u{2014}").size(11.0).color(theme::TEXT_DIM));
+                                        ui.label(
+                                            RichText::new("\u{2014}")
+                                                .size(11.0)
+                                                .color(theme::TEXT_DIM),
+                                        );
                                     },
                                 );
                             });
@@ -12802,11 +12855,17 @@ fn pack_contents_list(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.label(
-                                        RichText::new(third).monospace().size(11.0).color(theme::TEXT_MUTED),
+                                        RichText::new(third)
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(theme::TEXT_MUTED),
                                     );
                                     ui.add_space(16.0);
                                     ui.label(
-                                        RichText::new(size).monospace().size(11.0).color(theme::TEXT_DIM),
+                                        RichText::new(size)
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(theme::TEXT_DIM),
                                     );
                                 },
                             );
@@ -13038,6 +13097,7 @@ pub fn agent_state(
         let params = thumb::ThumbParams {
             width: 256,
             height: 256,
+            ..Default::default()
         };
         if detect::by_extension(path) == Some(MediaType::Audio) {
             thumb::generate_waveform(dir, &key, params, |bars| {
@@ -14072,8 +14132,10 @@ fn dominant_category(counts: &[(MediaType, usize)]) -> Option<PackCategory> {
 /// entry here (browse-only, not indexed) is treated as Unknown by the caller.
 fn package_categories(entries: &[AssetEntry]) -> std::collections::HashMap<String, PackCategory> {
     // pack → (media_type → count)
-    let mut per_pack: std::collections::HashMap<String, std::collections::HashMap<MediaType, usize>> =
-        Default::default();
+    let mut per_pack: std::collections::HashMap<
+        String,
+        std::collections::HashMap<MediaType, usize>,
+    > = Default::default();
     for e in entries.iter().filter(|e| !e.trashed) {
         let (Some(pkg), Some(mt)) = (e.package.as_deref(), e.file.media_type) else {
             continue;
@@ -15686,7 +15748,11 @@ mod tests {
         let cats = package_categories(&entries);
         assert_eq!(cats.get("MeshPack"), Some(&PackCategory::ThreeD));
         assert_eq!(cats.get("SoundPack"), Some(&PackCategory::Audio));
-        assert_eq!(cats.len(), 2, "one derived category per pack, trashed excluded");
+        assert_eq!(
+            cats.len(),
+            2,
+            "one derived category per pack, trashed excluded"
+        );
     }
 
     #[test]
@@ -15702,10 +15768,19 @@ mod tests {
             height_px: Some(1080),
             ..Default::default()
         };
-        assert_eq!(content_third_col(Some(MediaType::Texture), &wide), "1920\u{00D7}1080");
+        assert_eq!(
+            content_third_col(Some(MediaType::Texture), &wide),
+            "1920\u{00D7}1080"
+        );
         // Unmeasured, or a type with no third-column meaning → em dash.
-        assert_eq!(content_third_col(Some(MediaType::Audio), &Default::default()), "\u{2014}");
-        assert_eq!(content_third_col(Some(MediaType::Model3d), &wide), "\u{2014}");
+        assert_eq!(
+            content_third_col(Some(MediaType::Audio), &Default::default()),
+            "\u{2014}"
+        );
+        assert_eq!(
+            content_third_col(Some(MediaType::Model3d), &wide),
+            "\u{2014}"
+        );
     }
 
     #[test]

@@ -11,6 +11,10 @@ use image::{DynamicImage, ImageFormat};
 pub struct ThumbParams {
     pub width: u32,
     pub height: u32,
+    /// Triangle budget for the low-poly proxy a **3D model** thumbnail renders from. Ignored by
+    /// every other media type — and by the cache key, which only needs `WxH`, because a coarser
+    /// proxy is identified inside the mesh cache instead (`decimate::Budget::tag`).
+    pub proxy: crate::decimate::Budget,
 }
 
 impl Default for ThumbParams {
@@ -18,6 +22,7 @@ impl Default for ThumbParams {
         Self {
             width: 256,
             height: 256,
+            proxy: crate::decimate::PREVIEW_BUDGET,
         }
     }
 }
@@ -61,7 +66,12 @@ pub fn generate(
     // 3D models have no pixels to decode — render one hero view instead. Same cache key and
     // same output contract, so callers don't care which branch produced the PNG.
     let img = if is_model(source) {
-        render_model_thumb(source, params.width.max(params.height), cache_dir)?
+        render_model_thumb(
+            source,
+            params.width.max(params.height),
+            cache_dir,
+            params.proxy,
+        )?
     } else {
         crate::raster::decode(source)?
     };
@@ -201,10 +211,17 @@ fn is_model(path: &Path) -> bool {
 /// Render a 3D model to a single 3/4 hero view on a **transparent** background, so the grid card
 /// shows through. Reuses the same CPU rasteriser the embedding pipeline uses — no GPU context,
 /// so this runs happily on the thumbnail worker threads.
-fn render_model_thumb(source: &Path, size: u32, cache_dir: &Path) -> std::io::Result<DynamicImage> {
-    // Parse-once cache: the metrics drain warms it on scan, so this browse-time render skips the
-    // FBX parse (the spike). Untextured, which is exactly what the thumbnail renders.
-    let meshes = crate::mesh::load_cached(source, cache_dir).map_err(std::io::Error::other)?;
+fn render_model_thumb(
+    source: &Path,
+    size: u32,
+    cache_dir: &Path,
+    proxy: crate::decimate::Budget,
+) -> std::io::Result<DynamicImage> {
+    // Low-poly proxy through the parse-once cache: the metrics drain warms it on scan, so this
+    // browse-time render skips the FBX parse (the spike) *and* rasterises a fraction of the
+    // triangles. Untextured, which is exactly what the thumbnail renders.
+    let meshes = crate::mesh::load_preview_cached(source, cache_dir, proxy)
+        .map_err(std::io::Error::other)?;
     let views = crate::render3d::render_views_on(
         &meshes,
         size.max(1),
@@ -253,6 +270,7 @@ mod tests {
         let params = ThumbParams {
             width: 32,
             height: 32,
+            ..Default::default()
         };
         let hash = "deadbeef";
 
@@ -295,6 +313,7 @@ mod tests {
             ThumbParams {
                 width: 128,
                 height: 128,
+                ..Default::default()
             },
         );
         let p2 = cache_path(
@@ -303,6 +322,7 @@ mod tests {
             ThumbParams {
                 width: 128,
                 height: 128,
+                ..Default::default()
             },
         );
         assert_eq!(p1, p2);
@@ -343,6 +363,7 @@ mod tests {
         let params = ThumbParams {
             width: 64,
             height: 64,
+            ..Default::default()
         };
         let calls = std::cell::Cell::new(0);
         let peaks = |n: usize| {
@@ -402,6 +423,7 @@ mod tests {
         let params = ThumbParams {
             width: 96,
             height: 96,
+            ..Default::default()
         };
         let out = generate(&src, &dir, "hash3d", params).expect("generate 3d thumb");
         assert!(out.exists());

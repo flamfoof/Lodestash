@@ -6117,7 +6117,10 @@ mod tests {
         got.sort();
         let mut want = vec![alb, nrm];
         want.sort();
-        assert_eq!(got, want, "exactly the resolved edges, confidence-tagged inferred");
+        assert_eq!(
+            got, want,
+            "exactly the resolved edges, confidence-tagged inferred"
+        );
     }
 
     #[test]

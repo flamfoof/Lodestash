@@ -309,6 +309,18 @@ impl PreviewQuality {
             PreviewQuality::High => 384,
         }
     }
+
+    /// Triangle budget for the cached low-poly preview proxy (`mesh::load_preview_cached`). This is
+    /// the half of "preview quality" that [`Self::thumb_px`] doesn't cover: resolution and polygon
+    /// count are separate costs, and the mesh is the one that drives cache size and VRAM.
+    pub fn proxy_budget(self) -> lodestash_ingest::decimate::Budget {
+        use lodestash_ingest::decimate::Budget;
+        match self {
+            PreviewQuality::Low => Budget::new(0.02, 300, 1500),
+            PreviewQuality::Medium => Budget::new(0.05, 600, 4000),
+            PreviewQuality::High => Budget::new(0.12, 1200, 12000),
+        }
+    }
 }
 
 // ── AppConfig ─────────────────────────────────────────────────────────────────

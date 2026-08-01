@@ -22,6 +22,7 @@ pub struct AlbedoTex {
 }
 
 /// One flattened, triangulated mesh in world space.
+#[derive(Clone)]
 pub struct MeshData {
     pub name: String,
     pub positions: Vec<[f32; 3]>,
@@ -339,17 +340,57 @@ pub fn load_cached(path: &Path, cache_dir: &Path) -> Result<Vec<MeshData>, Strin
         }
     }
     let meshes = load_any(path, &BTreeMap::new())?;
-    if let Some(dir) = cache_path.parent() {
-        if std::fs::create_dir_all(dir).is_ok() {
-            let bytes = encode_meshes(&meshes);
-            // Write to a temp then rename so a concurrent reader can't see a half-written file.
-            let tmp = cache_path.with_extension("msh.part");
-            if std::fs::write(&tmp, &bytes).is_ok() {
-                let _ = std::fs::rename(&tmp, &cache_path);
-            }
+    write_cache(&cache_path, &encode_meshes(&meshes));
+    Ok(meshes)
+}
+
+/// Best-effort cache write: temp file then rename, so a concurrent reader never sees a half-written
+/// file. Every failure is silent — the cache is disposable and the caller already has the data.
+fn write_cache(dest: &Path, bytes: &[u8]) {
+    let Some(dir) = dest.parent() else { return };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    // Append rather than replace the extension: `.msh` and `.lod` share a directory and a stem, so
+    // a replaced extension would give both the same temp path and let concurrent writes collide.
+    let Some(name) = dest.file_name() else { return };
+    let tmp = dest.with_file_name(format!("{}.part", name.to_string_lossy()));
+    if std::fs::write(&tmp, bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, dest);
+    }
+}
+
+/// Load `path` as a **low-poly preview proxy** — the geometry every 3D *preview* renders from
+/// (grid/list thumbnails, the multiview embedding), as opposed to [`load_cached`]'s full-fidelity
+/// mesh. Decimates once (`decimate::decimate_meshes` under `budget`), caches the result as
+/// `cache_dir/mesh/<key>.lod` on the same `(path, size, mtime)` key, and serves that on every later
+/// call. Wins: smaller cache on disk, cheaper raster, lower VRAM.
+///
+/// **The `triangles` facet must not come from here** — `metrics::triangle_count` deliberately stays
+/// on [`load_cached`] so the count the user sees is the *source* mesh's, not the proxy's.
+pub fn load_preview_cached(
+    path: &Path,
+    cache_dir: &Path,
+    budget: crate::decimate::Budget,
+) -> Result<Vec<MeshData>, String> {
+    let key = mesh_cache_key(path);
+    // The budget is part of the identity: same file, coarser budget, different proxy.
+    let proxy_path = cache_dir
+        .join("mesh")
+        .join(format!("{key}-{}.lod", budget.tag()));
+    if let Ok(bytes) = std::fs::read(&proxy_path) {
+        if let Some(meshes) = decode_meshes(&bytes) {
+            return Ok(meshes);
         }
     }
-    Ok(meshes)
+    let proxy = crate::decimate::decimate_meshes(&load_cached(path, cache_dir)?, budget);
+    write_cache(&proxy_path, &encode_meshes(&proxy));
+    // ponytail: the full mesh is a parse-once staging artifact — once a proxy exists, no preview
+    // consumer needs it again, so drop it and let the cache shrink. Ceiling: a re-scan (or a
+    // triangle-count refresh) re-parses the source. Keep it instead if that ever shows up as a
+    // scan-time cost.
+    let _ = std::fs::remove_file(cache_dir.join("mesh").join(format!("{key}.msh")));
+    Ok(proxy)
 }
 
 fn mesh_cache_key(path: &Path) -> String {

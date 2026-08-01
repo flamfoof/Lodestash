@@ -94,6 +94,7 @@ pub(super) fn generate_texture(
     mtime: i64,
     cache_dir: Option<&std::path::Path>,
     gen_px: u32,
+    proxy: lodestash_ingest::decimate::Budget,
     kind: ThumbKind,
 ) -> Option<TextureHandle> {
     // Serve from / populate the on-disk thumbnail cache (INGESTION.md §6): restarts then
@@ -106,6 +107,7 @@ pub(super) fn generate_texture(
             let params = thumb::ThumbParams {
                 width: gen_px,
                 height: gen_px,
+                proxy,
             };
             match &kind {
                 // Audio has no pixels: draw the peak waveform the Quick Look player already

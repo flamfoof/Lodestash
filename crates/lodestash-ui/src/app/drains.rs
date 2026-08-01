@@ -31,9 +31,15 @@ pub(super) fn embed_model_multiview(
     cache_dir: Option<&std::path::Path>,
 ) -> Option<Vec<f32>> {
     // Untextured multiview, so it shares the parse-once mesh cache with thumbnails/metrics
-    // (TECH-STACK §7): the FBX parses once across all three consumers.
+    // (TECH-STACK §7): the FBX parses once across all three consumers. It embeds the same low-poly
+    // proxy the grid thumbnails render — SigLIP reads silhouette, which decimation preserves, and
+    // sharing the artifact keeps one cached mesh per file rather than two.
     let meshes = match cache_dir {
-        Some(dir) => lodestash_ingest::mesh::load_cached(path, dir),
+        Some(dir) => lodestash_ingest::mesh::load_preview_cached(
+            path,
+            dir,
+            lodestash_ingest::decimate::PREVIEW_BUDGET,
+        ),
         None => lodestash_ingest::mesh::load_any(path, &std::collections::BTreeMap::new()),
     }
     .map_err(|e| tracing::warn!(%e, "mesh load failed"))
@@ -952,6 +958,7 @@ pub(super) fn tag_preview(
     let params = lodestash_ingest::thumb::ThumbParams {
         width: px,
         height: px,
+        ..Default::default()
     };
     let png = lodestash_ingest::thumb::generate(source, cache_dir, &key, params).ok()?;
     Some(image::open(png).ok()?.to_rgba8())

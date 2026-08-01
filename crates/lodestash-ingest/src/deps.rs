@@ -283,11 +283,17 @@ m_Component:
         assert!(texture_matches_model("Human3", "Human3_Albedo"));
         assert!(texture_matches_model("Human3", "Human3-Normal"));
         assert!(texture_matches_model("Human3", "Human3 Spec"));
-        assert!(texture_matches_model("Human3", "human3_albedo"), "case-insensitive");
+        assert!(
+            texture_matches_model("Human3", "human3_albedo"),
+            "case-insensitive"
+        );
         // Does not belong: a longer stem with no separator, or an unrelated name.
         assert!(!texture_matches_model("Human3", "Human30"));
         assert!(!texture_matches_model("Human3", "Rock_Albedo"));
-        assert!(!texture_matches_model("", "anything"), "empty model matches nothing");
+        assert!(
+            !texture_matches_model("", "anything"),
+            "empty model matches nothing"
+        );
     }
 
     #[test]

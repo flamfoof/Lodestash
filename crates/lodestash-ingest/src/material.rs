@@ -115,6 +115,7 @@ mod tests {
             crate::thumb::ThumbParams {
                 width: 256,
                 height: 256,
+                ..Default::default()
             },
             tex.as_deref().map(std::path::Path::new),
         )
