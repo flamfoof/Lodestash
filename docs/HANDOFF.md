@@ -78,9 +78,13 @@ and its **ack** writes the durable `import_record` with Unity's real path+guid (
 the real **UPM C# plugin** (needs a Unity install to verify) and the allow-list **toggle UI**.
 
 **This machine's catalog is embedded** (2026-07-22): 1983 SigLIP vectors (1723 `model_3d`, 260
-`image`) + 84 CLAP vectors, from ~2274 assets. The 207 rows still `embedding_dirty` are `.mat`
-materials — there is no material renderer yet, so they legitimately have nothing to encode and will
-drain themselves once one exists.
+`image`) + 84 CLAP vectors, from ~2274 assets. The 207 rows that were `embedding_dirty` are `.mat`
+materials; **fixed 2026-08-01** — the recorded reason ("no material renderer yet") was only half of
+it. `visual_assets_needing_embedding` filtered `mt.code IN ('image','texture','sprite','model_3d')`,
+so materials were never *queued*, and wiring a renderer alone would have been dead code. The queue
+now admits `material` and the drain encodes the shader ball (opaque background — SigLIP sees RGB and
+alpha composites to black). Unresolved albedo still renders a flat ball, which beats a permanently
+dirty row.
 
 **Local tagging runs** (P4, [`AI-PIPELINE.md`](AI-PIPELINE.md) §2). Settings ▸ AI · IDENTIFY picks
 an Ollama model (and optionally a captioning model) and starts a pass in the job tray: manual,
@@ -635,6 +639,13 @@ headless `lodestash-app` crate first and keep egui buildable as the reference un
 parses/decimates and three.js orbits in WebGL. Four features ride along (drag out to Unity, drag
 in, Ctrl-K palette, Quick Look as its own window) plus a real `lodestash-cli`. Phase A (previews,
 above) ships on `main` first and the port inherits it.
+
+**Extraction started (2026-08-01, `cdd5c40`).** `crates/lodestash-app` exists and holds `jobs` +
+`models` (433 LOC out of `lodestash-ui`), aliased under their old `crate::jobs` / `crate::models`
+paths in `main.rs` so no call site changed. **Beachhead only** — `config`, `drains`, `persist`,
+`thumbs`, `grid` and the ~900 lines of domain types at `app.rs:1-903` have **not** moved, and the
+four `app/*.rs` children still open with `use super::*` + `pub(super)`, which is the real work
+(move + visibility flip only, no cleanups; success = a byte-identical screenshot).
 
 A. ~~**Low-poly preview meshes**~~ **DONE 2026-08-01** (`e08da23`), and extended into vector
    previews — see the session block in §2. What remains of that thread is the *display* half
