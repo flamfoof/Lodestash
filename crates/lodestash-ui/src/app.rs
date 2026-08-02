@@ -21,6 +21,9 @@ use crate::config::{self, AppConfig, SizeTier, SizeTiers, SortBy, ViewMode};
 use crate::jobs::{Intent, JobProgress, Jobs};
 use crate::models;
 use crate::theme;
+// Glob-imported so the ~2,000 bare references to these types read exactly as they did when they
+// were declared in this file — the extraction is a relocation, not a rename.
+use crate::types::*;
 use crate::viewport3d::{self, Viewport3d};
 mod drains;
 use drains::*;
@@ -33,52 +36,39 @@ use grid::*;
 
 // ── Category tabs ─────────────────────────────────────────────────────────────
 
-/// The top-bar category tabs (UI-SPEC §0.3, prototype `catDefs`): four coarse buckets
-/// grouping the 7-value `media_type` enum. The enum itself is unchanged (a data-model
-/// invariant) — these are a presentation grouping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Category {
-    All,
-    Models,
-    Materials,
-    Sounds,
-    Images,
+// ── Screen chrome (egui-only halves of `types::Screen`) ───────────────────────
+
+/// White-stroke SVG nav icon (tinted per row state in the sidebar). Design icons from
+/// `docs/design/icons/`, recolored to white so egui can tint them.
+///
+/// A free function rather than a `Screen` method: `Screen` itself is headless and lives in
+/// `lodestash-app`, and `include_image!` is an egui macro. The webview reads the same marks
+/// straight out of the `icons.svg` sprite.
+fn screen_icon(screen: Screen) -> egui::ImageSource<'static> {
+    match screen {
+        Screen::Library => egui::include_image!("../assets/icons/nav-library.svg"),
+        Screen::Favorites => egui::include_image!("../assets/icons/nav-favorites.svg"),
+        Screen::Identify => egui::include_image!("../assets/icons/nav-identify.svg"),
+        Screen::Collections => egui::include_image!("../assets/icons/nav-collections.svg"),
+        Screen::Packages => egui::include_image!("../assets/icons/nav-packages.svg"),
+        Screen::Unity => egui::include_image!("../assets/icons/unitypackage.svg"),
+        Screen::Vocabulary => egui::include_image!("../assets/icons/nav-traits.svg"),
+        Screen::Stats => egui::include_image!("../assets/icons/nav-stats.svg"),
+        Screen::Duplicates => egui::include_image!("../assets/icons/nav-duplicates.svg"),
+        Screen::Trash => egui::include_image!("../assets/icons/nav-trash.svg"),
+        Screen::Settings => egui::include_image!("../assets/icons/nav-settings.svg"),
+    }
 }
 
-impl Category {
-    const TABS: &'static [(Category, &'static str)] = &[
-        (Category::All, "\u{25C6} All"),
-        (Category::Models, "\u{2B21} Models"),
-        (Category::Materials, "\u{25C7} Materials"),
-        (Category::Sounds, "\u{266A} Sounds"),
-        (Category::Images, "\u{25A6} Images"),
-    ];
-
-    /// Bucket → `media_type` mapping: Models = model_3d, Materials = material, Sounds = audio,
-    /// Images = image+texture+sprite+font (UI-SPEC §0.3). Materials used to ride along with
-    /// Models; they carry their own texture dependencies, so they are worth reaching directly.
-    fn matches(self, mt: Option<MediaType>) -> bool {
-        match self {
-            Category::All => true,
-            Category::Models => mt == Some(MediaType::Model3d),
-            Category::Materials => mt == Some(MediaType::Material),
-            Category::Sounds => mt == Some(MediaType::Audio),
-            Category::Images => matches!(
-                mt,
-                Some(MediaType::Image | MediaType::Texture | MediaType::Sprite | MediaType::Font)
-            ),
-        }
-    }
-
-    /// Active-tab color (prototype `catColors`).
-    fn color(self) -> egui::Color32 {
-        match self {
-            Category::All => theme::GOLD,
-            Category::Models => theme::TYPE_MODEL,
-            Category::Materials => theme::TYPE_MATERIAL,
-            Category::Sounds => theme::TYPE_SOUND,
-            Category::Images => theme::TYPE_IMAGE,
-        }
+fn screen_glyph_color(screen: Screen) -> egui::Color32 {
+    match screen {
+        Screen::Library | Screen::Collections | Screen::Favorites => theme::GOLD,
+        Screen::Identify | Screen::Vocabulary => theme::ARCANE_BRIGHT,
+        Screen::Duplicates => theme::WARNING,
+        Screen::Trash => theme::DANGER,
+        // SUCCESS green per the design's `ls-unitypackage` mark (FEATURES.md §11).
+        Screen::Unity => theme::SUCCESS,
+        Screen::Packages | Screen::Stats | Screen::Settings => theme::TEXT_MUTED,
     }
 }
 
@@ -110,60 +100,6 @@ struct AssetEntry {
     content_hash: Option<String>,
     texture: Option<TextureHandle>,
     thumb_spawned: bool,
-}
-
-/// Sort order for the Unity Assets package list (FEATURES.md §5.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum UnitySort {
-    /// Indexed / added packs first, then alphabetical (the default landing order).
-    #[default]
-    IndexedFirst,
-    Name,
-    Size,
-    Date,
-}
-
-/// A pack mint deferred until the current scan's persist finishes, so the mint's writes don't race
-/// the scan-persist ("database is locked", HANDOFF §6 — single-writer). Set by `pin_and_mint_now`
-/// right before it kicks the hydrate crawl; consumed in `receive_catalog` once that persist lands.
-struct PendingMint {
-    package_id: i64,
-    name: String,
-    abs_path: PathBuf,
-}
-
-/// A pending confirm for opening an oversized pack (FEATURES.md §5.4): indexing it in place would
-/// inflate the whole archive, so the user is asked whether to extract it to the temp cache instead.
-struct LargePackPrompt {
-    package_id: i64,
-    name: String,
-    abs_path: PathBuf,
-    size_bytes: u64,
-    /// Carried from the triggering action: Open → jumps into the folders after indexing.
-    then_browse: bool,
-}
-
-/// A child-folder tile in Folders view: its name, the count of assets **directly** inside it, and
-/// the **recursive** total including everything in its subfolders (shown as `direct (recursive)`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FolderTile {
-    name: String,
-    direct: usize,
-    recursive: usize,
-}
-
-/// One folder in the pack directory tree — the persistent left pane of the pack browser (FEATURES.md
-/// §5.4, the published nav redesign). `path` is source-root-relative (the browse `current_dir` key);
-/// `depth` (component count) drives indentation; `direct`/`recursive` mirror [`FolderTile`]; and
-/// `has_children` gates the expand chevron. The tree is path-sorted, so parents precede their children.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DirNode {
-    path: PathBuf,
-    name: String,
-    depth: usize,
-    direct: usize,
-    recursive: usize,
-    has_children: bool,
 }
 
 /// Build the whole folder hierarchy for one pack's assets, path-sorted, each node carrying its
@@ -210,149 +146,10 @@ fn build_pack_dir_tree(entries: &[AssetEntry], src: usize, pack: &str) -> Vec<Di
         .collect()
 }
 
-/// A tree row is visible only when every one of its ancestor folders is expanded. Root-level nodes
-/// (whose only ancestor is the empty source root) are always visible.
-fn ancestors_expanded(
-    path: &std::path::Path,
-    expanded: &std::collections::HashSet<PathBuf>,
-) -> bool {
-    let mut anc = path.parent();
-    while let Some(a) = anc {
-        if a.as_os_str().is_empty() {
-            break;
-        }
-        if !expanded.contains(a) {
-            return false;
-        }
-        anc = a.parent();
-    }
-    true
-}
-
-/// Seed the expanded set by auto-opening down the **linear spine** to where the content first fans
-/// out: a folder opens iff every one of its ancestors is a single-child link. That opens the spine
-/// **and** the first branching folder (so its children show), exactly like the mockup — deeper
-/// branches stay closed until the user opens them.
-fn seed_expanded(nodes: &[DirNode]) -> std::collections::HashSet<PathBuf> {
-    let mut child_dirs: std::collections::HashMap<PathBuf, usize> =
-        std::collections::HashMap::new();
-    for n in nodes {
-        if let Some(par) = n.path.parent() {
-            *child_dirs.entry(par.to_path_buf()).or_default() += 1;
-        }
-    }
-    nodes
-        .iter()
-        .filter(|n| {
-            let mut anc = n.path.parent();
-            while let Some(a) = anc {
-                if a.as_os_str().is_empty() {
-                    break;
-                }
-                if child_dirs.get(a).copied().unwrap_or(0) != 1 {
-                    return false;
-                }
-                anc = a.parent();
-            }
-            true
-        })
-        .map(|n| n.path.clone())
-        .collect()
-}
-
 struct ThumbReady {
     index: usize,
     /// None when generate_texture fails; sent so pending_thumbs is always decremented.
     texture: Option<TextureHandle>,
-}
-
-/// Result of a background crawl. `generation` guards against a stale scan landing
-/// after the user has already opened a different folder/project.
-/// `partial` is `Some(source_idx)` when only one source was rescanned; the handler merges
-/// those entries into the existing grid instead of replacing everything.
-struct ScanDone {
-    generation: u64,
-    /// (source index into scan_roots, crawled file)
-    entries: Vec<(usize, CrawledFile)>,
-    pending_packages: Vec<PendingPackage>,
-    partial: Option<usize>,
-}
-
-/// Sidebar LIBRARIES facet selection: a source root, or one extracted package.
-/// Scope of a manual Identify pass (embeddings + tags, AI-PIPELINE §2). The user picks how much work
-/// to (re)do; core just re-flags the matching rows dirty and the drains run over the dirty set.
-#[derive(Clone, PartialEq)]
-enum IdentifyScope {
-    /// Only never-processed assets — the default; a mint leaves them dirty until first drained.
-    New,
-    /// Re-identify the whole live library (redo everything).
-    Full,
-    /// Re-identify only assets with no tags (failed / never tagged).
-    Unidentified,
-    /// A specific selection (right-click "Identify selected").
-    Selected(Vec<i64>),
-}
-
-#[derive(Clone, PartialEq)]
-enum LibraryFilter {
-    Source(usize),
-    Package(String),
-}
-
-/// A `.unitypackage` found while crawling, not yet extracted into the grid. Its manifest is
-/// already resolved (read on the same background crawl thread) so the UI can offer an "Extract"
-/// action immediately, with no separate loading step.
-struct PendingPackage {
-    source_idx: usize,
-    abs_path: PathBuf,
-    display_name: String,
-    /// (display label, real `pathname`) for each nested sub-package — e.g. a URP/Built-in
-    /// render-pipeline-variant wrapper (INGESTION.md §2 "Container nuance"). Empty when this
-    /// package directly contains real assets (no wrapper).
-    nested_candidates: Vec<(String, String)>,
-    /// Index into `nested_candidates`, defaulted to the URP variant when one exists.
-    chosen_variant: usize,
-    extracting: bool,
-    progress: Arc<JobProgress>,
-    /// Manifest locators (guid/pathname/tar-offset/size) captured at browse time —
-    /// persisted as `package_entry` rows on extraction so surgical re-extraction never
-    /// needs a second full scan (DATA-MODEL §7, INGESTION §2).
-    entries: Vec<PackageEntryRecord>,
-    /// Tray row of the running extraction (full or surgical), if any.
-    job: Option<u64>,
-    /// Contents list expanded under the package row (pick-and-extract).
-    browsing: bool,
-    /// Indices into `entries` picked for surgical extraction.
-    picked: std::collections::BTreeSet<usize>,
-}
-
-impl PendingPackage {
-    /// The pickable entries grouped by their in-archive folder, folder-ordered
-    /// (FEATURES.md §5.4). Indices point back into `entries`; a pack holds hundreds of
-    /// them, and a flat list of hundreds is not a file tree.
-    fn folders(&self) -> Vec<(String, Vec<usize>)> {
-        let mut by_folder: std::collections::BTreeMap<String, Vec<usize>> =
-            std::collections::BTreeMap::new();
-        for i in self.extractable() {
-            // `extractable()` already proved the pathname is Some.
-            let path = self.entries[i].pathname.as_deref().unwrap_or_default();
-            let folder = path.rsplit_once('/').map_or("", |(dir, _)| dir);
-            by_folder.entry(folder.to_string()).or_default().push(i);
-        }
-        by_folder.into_iter().collect()
-    }
-
-    /// Indices of entries a surgical extraction can pull: a real (non-.meta) pathname
-    /// plus the tar offset + size recorded at browse time.
-    fn extractable(&self) -> impl Iterator<Item = usize> + '_ {
-        self.entries.iter().enumerate().filter_map(|(i, e)| {
-            let p = e.pathname.as_deref()?;
-            (!p.to_ascii_lowercase().ends_with(".meta")
-                && e.tar_offset.is_some()
-                && e.size_bytes.is_some())
-            .then_some(i)
-        })
-    }
 }
 
 /// Longest side a full-detail viewer texture may have; larger sources are
@@ -406,124 +203,6 @@ impl ImageViewer {
     }
 }
 
-/// Startup hydrate: the catalog's view of the sources, shown instantly while the
-/// filesystem crawl reconciles in the background. Superseded by that crawl's ScanDone.
-struct HydrateDone {
-    generation: u64,
-    /// (source index, hydrated rows) per source.
-    sources: Vec<(usize, Vec<HydratedAsset>)>,
-    /// Package-extracted rows (only when "cache extracted packs" is on), with the
-    /// workspace-existence check already done on the hydrate thread.
-    extracted: Vec<(usize, Vec<lodestash_core::catalog::HydratedExtracted>)>,
-    /// In-pack rows for pinned packs (DATA-MODEL §7 / M14) — bytes still inside the archive,
-    /// carried with their locator for on-demand thumbnail/preview pulls.
-    in_pack: Vec<(usize, Vec<lodestash_core::catalog::HydratedInPack>)>,
-}
-
-/// Per-root asset identity maps: root → (rel_path → (asset id, status, content_hash)).
-type AssetIdentityMaps = Vec<(
-    String,
-    std::collections::HashMap<
-        String,
-        (
-            i64,
-            AssetStatus,
-            bool,
-            Option<u8>,
-            lodestash_core::catalog::AssetMetrics,
-            Option<String>,
-        ),
-    >,
-)>;
-
-/// Result of the write-behind catalog persist that follows every finished scan.
-/// `counts` is None when the persist failed (logged; the UI falls back to in-memory).
-struct CatalogSynced {
-    generation: u64,
-    counts: Option<StatusCounts>,
-    /// True for a backlog drain, which computes no counts — `None` there means "nothing to
-    /// report", not the persist failure it means everywhere else.
-    drain_only: bool,
-    /// The read path: per source root, `rel_path → (asset id, status)` for every live
-    /// catalog row, joined onto the in-memory entries on receipt.
-    assets: AssetIdentityMaps,
-}
-
-/// An extracted package's worth of persist work: the `package` row plus its
-/// extracted assets (DATA-MODEL §7), handed to the catalog thread.
-struct PackagePersist {
-    /// Source root the package was found under (existing or to-be-created source row).
-    root: String,
-    root_name: String,
-    package_path: String,
-    name: String,
-    publisher: Option<String>,
-    category: Option<String>,
-    records: Vec<CrawlRecord>,
-    /// Manifest locators for `package_entry` (surgical re-extraction, DATA-MODEL §7).
-    entries: Vec<PackageEntryRecord>,
-    /// (name, root) of every project source, for the read-back status counts.
-    all_roots: Vec<(String, String)>,
-    /// False when the extraction was cancelled part-way. The rows that *were* placed are valid and
-    /// resumable, so they still persist — but the pack must not be stamped `unpacked`, or a
-    /// cancelled extract permanently records a truncated asset count as the whole pack.
-    complete: bool,
-}
-
-/// One source's worth of persist work handed to the catalog thread.
-struct PersistBatch {
-    root: String,
-    name: String,
-    /// `import_source.blacklist` JSON for the one-time config adoption (DATA-MODEL §13).
-    excludes_json: Option<String>,
-    records: Vec<CrawlRecord>,
-}
-
-/// One pack payload pulled out for preview (FEATURES.md §5.4). The file lives in a scratch
-/// directory, not the workspace: a peek is a look, so it must not leave catalog rows, grid
-/// entries or cached extractions behind.
-struct PackagePeek {
-    name: String,
-    media_type: Option<MediaType>,
-    size_bytes: u64,
-    path: PathBuf,
-}
-
-/// The Import-packages dialog (FEATURES.md §5.2): a folder scanned for `.unitypackage`
-/// files, each of which can be imported as its own Library. Nothing is copied or unpacked —
-/// importing writes a `package` row that points at the archive where it already lives.
-struct ImportScan {
-    root: PathBuf,
-    scanning: bool,
-    /// (in-folder group, archive path, display name, size) — group is the containing folder
-    /// relative to the picked root, which is the publisher/category tree in an Asset Store cache.
-    found: Vec<(String, PathBuf, String, u64)>,
-    selected: std::collections::BTreeSet<usize>,
-}
-
-/// `PendingPackage.source_idx` for a pack opened from the catalog that lies outside every
-/// library source: browse and preview work, extraction has nowhere to persist to.
-const NO_SOURCE: usize = usize::MAX;
-
-/// Sentinel `entry_idx` for the viewer stack while it is showing a peeked pack entry —
-/// no grid entry backs it, and a real index must never collide with it.
-const PEEK_ENTRY_IDX: usize = usize::MAX;
-
-/// Result of a background package extraction.
-struct ExtractDone {
-    display_name: String,
-    /// Identifies which `PendingPackage` this came from — matched by path rather than index
-    /// since `pending_packages` may have been mutated while the extraction ran.
-    abs_path: PathBuf,
-    source_idx: usize,
-    files: Vec<CrawledFile>,
-    /// The package's manifest locators, carried through for `package_entry` persist.
-    entries: Vec<PackageEntryRecord>,
-    /// True for a surgical (picked-assets) extraction: the pending card stays so more
-    /// can be pulled later; false for a full extraction, which retires it.
-    partial: bool,
-}
-
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const CARD_LABEL: f32 = 36.0;
@@ -548,360 +227,7 @@ const PAGE_SIZE_PRESETS: [usize; 3] = [50, 75, 100];
 
 // ── Content filter (⚑ Filters popover) ─────────────────────────────────────────
 
-/// Triangle-count bucket for the Triangles facet (models only). Design §3 "TRIANGLES".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum TriBucket {
-    Le1k,
-    K1to3,
-    K3to6,
-    Ge6k,
-}
-
-impl TriBucket {
-    const ALL: [TriBucket; 4] = [
-        TriBucket::Le1k,
-        TriBucket::K1to3,
-        TriBucket::K3to6,
-        TriBucket::Ge6k,
-    ];
-
-    fn of(tris: u32) -> TriBucket {
-        match tris {
-            0..=1000 => TriBucket::Le1k,
-            1001..=3000 => TriBucket::K1to3,
-            3001..=6000 => TriBucket::K3to6,
-            _ => TriBucket::Ge6k,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            TriBucket::Le1k => "\u{2264} 1k",
-            TriBucket::K1to3 => "1k\u{2013}3k",
-            TriBucket::K3to6 => "3k\u{2013}6k",
-            TriBucket::Ge6k => "6k +",
-        }
-    }
-}
-
-/// The dedicated content filter (distinct from the sidebar facet nav): multi-select Trait,
-/// Triangles, and File-size sets that AND together. Transient (not persisted). Design §3.
-///
-/// Trait and Triangle data don't exist in the pre-catalog build yet (traits arrive with P4 AI
-/// tagging, tri counts with P1 3D metadata), so those sets are currently always empty and the
-/// predicate below degenerates to the File-size filter — which is fully backed by `size_bytes`.
-#[derive(Default)]
-struct ContentFilter {
-    traits: std::collections::BTreeSet<String>,
-    /// Canonical category paths (mapping library, DATA-MODEL §4) selected in the CATEGORY facet.
-    categories: std::collections::BTreeSet<String>,
-    tri_buckets: std::collections::BTreeSet<TriBucket>,
-    sizes: std::collections::BTreeSet<SizeTier>,
-    /// Minimum star rating (None = no constraint). DATA-MODEL §12.
-    min_rating: Option<u8>,
-    /// Dependency-graph constraint (DATA-MODEL §10 "Search"). None = no constraint.
-    link: Option<LinkFilter>,
-    /// Show only favourites (DATA-MODEL §12). A one-way switch: "not favourited" is not a thing
-    /// anyone browses for.
-    favorites_only: bool,
-    trait_search: String,
-}
-
-/// Traits screen state (UI-SPEC §9), including the Mapping tab (card 172).
-#[derive(Default)]
-struct VocabState {
-    tab: VocabTab,
-    /// The vocabulary, reloaded from the catalog when `dirty`. Traits first (see `list_vocabulary`).
-    rows: Vec<lodestash_core::catalog::VocabTrait>,
-    dirty: bool,
-    search: String,
-    /// NEW TRAIT form.
-    nt_name: String,
-    nt_namespace: String,
-    /// media_type code the trait applies to; empty = any.
-    nt_scope: String,
-    nt_usage: String,
-    /// Mapping tab, reloaded when `map_dirty`.
-    map_dirty: bool,
-    /// Active taxonomy `(id, name, version)`, `None` until one is created.
-    taxonomy: Option<(i64, String, i64)>,
-    /// `(id, pref_label, path)` per category in the active taxonomy.
-    categories: Vec<(i64, String, String)>,
-    /// `(id, category_id, category_path, match_type, pattern, priority, enabled)` per rule.
-    rules: Vec<(i64, i64, String, String, String, i64, bool)>,
-    /// NEW CATEGORY + NEW RULE forms.
-    nc_label: String,
-    nr_category: Option<i64>,
-    nr_match_type: String,
-    nr_pattern: String,
-    nr_priority: String,
-}
-
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
-enum VocabTab {
-    #[default]
-    Traits,
-    Mapping,
-}
-
-/// The `has_dependencies` / `has_dependents` chips (DATA-MODEL §10). Single-select: an asset that
-/// is both ends of a chain (a material) satisfies either, so combining them would only ever
-/// narrow to that intersection — not what the chips read as.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LinkFilter {
-    /// Uses something: a material with textures, a mesh with a material.
-    HasDependencies,
-    /// Something uses it: a texture some material paints with.
-    HasDependents,
-}
-
-impl LinkFilter {
-    const ALL: [LinkFilter; 2] = [LinkFilter::HasDependencies, LinkFilter::HasDependents];
-
-    fn label(self) -> &'static str {
-        match self {
-            LinkFilter::HasDependencies => "uses others",
-            LinkFilter::HasDependents => "used by others",
-        }
-    }
-}
-
-impl ContentFilter {
-    fn active_count(&self) -> usize {
-        self.traits.len()
-            + self.categories.len()
-            + self.tri_buckets.len()
-            + self.sizes.len()
-            + usize::from(self.min_rating.is_some())
-            + usize::from(self.link.is_some())
-            + usize::from(self.favorites_only)
-    }
-
-    fn any_active(&self) -> bool {
-        self.active_count() > 0
-    }
-
-    /// Empty every filter set (the popover's "Clear all", and part of the Library nav reset).
-    fn clear(&mut self) {
-        self.traits.clear();
-        self.categories.clear();
-        self.tri_buckets.clear();
-        self.sizes.clear();
-        self.min_rating = None;
-        self.link = None;
-        self.favorites_only = false;
-        self.trait_search.clear();
-    }
-
-    /// Pure predicate: does an asset pass the filter? An asset passes if it matches the selected
-    /// traits (any) AND selected tri-buckets (any) AND selected size tiers (any); an empty section
-    /// imposes no constraint. Assets lacking a tri count are excluded when any tri-bucket is
-    /// selected (design §3). Kept pure over primitives so it's unit-testable without an
-    /// `AssetEntry` (TECH-STACK.md §5.1).
-    // ponytail: a predicate over primitives, kept free of an AssetEntry so it stays unit-testable.
-    #[allow(clippy::too_many_arguments)]
-    fn passes(
-        &self,
-        size: u64,
-        tri: Option<u32>,
-        rating: Option<u8>,
-        traits: &[String],
-        links: (bool, bool),
-        favorite: bool,
-        tiers: &SizeTiers,
-    ) -> bool {
-        if self.favorites_only && !favorite {
-            return false;
-        }
-        let (has_dependencies, has_dependents) = links;
-        match self.link {
-            Some(LinkFilter::HasDependencies) if !has_dependencies => return false,
-            Some(LinkFilter::HasDependents) if !has_dependents => return false,
-            _ => {}
-        }
-        if let Some(min) = self.min_rating {
-            if rating.unwrap_or(0) < min {
-                return false;
-            }
-        }
-        if !self.traits.is_empty() && !traits.iter().any(|t| self.traits.contains(t)) {
-            return false;
-        }
-        if !self.tri_buckets.is_empty() {
-            match tri {
-                Some(n) => {
-                    if !self.tri_buckets.contains(&TriBucket::of(n)) {
-                        return false;
-                    }
-                }
-                None => return false,
-            }
-        }
-        if !self.sizes.is_empty() && !self.sizes.contains(&tiers.tier_of(size)) {
-            return false;
-        }
-        true
-    }
-}
-
 // ── Top-level screen ────────────────────────────────────────────────────────────
-
-/// Which screen the sidebar has selected (UI-SPEC §0.2). Screens without a build yet
-/// render the §12 stub — the nav row is never hidden.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum Screen {
-    #[default]
-    Library,
-    /// Starred assets (FEATURES.md §4.7) — the library grid filtered to favourites; 2nd in nav.
-    Favorites,
-    Identify,
-    Collections,
-    Packages,
-    Unity,
-    Vocabulary,
-    Stats,
-    Duplicates,
-    Trash,
-    Settings,
-}
-
-impl Screen {
-    /// Sidebar navigation order (UI-SPEC §0.2). Favorites sits 2nd, directly under Library.
-    const NAV: [Screen; 11] = [
-        Screen::Library,
-        Screen::Favorites,
-        Screen::Identify,
-        Screen::Collections,
-        Screen::Packages,
-        Screen::Unity,
-        Screen::Vocabulary,
-        Screen::Stats,
-        Screen::Duplicates,
-        Screen::Trash,
-        Screen::Settings,
-    ];
-
-    fn label(self) -> &'static str {
-        match self {
-            Screen::Library => "Library",
-            Screen::Favorites => "Favorites",
-            Screen::Identify => "Identify",
-            Screen::Collections => "Collections",
-            Screen::Packages => "Packages",
-            Screen::Unity => "Unity Assets",
-            // Prototype nav label is "Traits" (the Mapping tab lives inside this screen).
-            Screen::Vocabulary => "Traits",
-            Screen::Stats => "Stats",
-            Screen::Duplicates => "Duplicates",
-            Screen::Trash => "Trash",
-            Screen::Settings => "Settings",
-        }
-    }
-
-    /// Unicode stand-ins for the `ls-nav-*` glyphs (glyph catalog §01) until SVG icons load.
-    fn glyph(self) -> &'static str {
-        match self {
-            Screen::Library => "\u{229E}",
-            Screen::Favorites => "\u{2605}",
-            Screen::Identify => "\u{2726}",
-            Screen::Collections => "\u{27E1}",
-            Screen::Packages => "\u{25A4}",
-            // ponytail: Unicode cube stands in for the `ls-unitypackage` SVG until the
-            // sidebar renders vector icons (UI-SPEC §0.2).
-            Screen::Unity => "\u{2B22}",
-            Screen::Vocabulary => "\u{2756}",
-            Screen::Stats => "\u{25C9}",
-            Screen::Duplicates => "\u{29C9}",
-            Screen::Trash => "\u{2298}",
-            Screen::Settings => "\u{2699}",
-        }
-    }
-
-    /// White-stroke SVG nav icon (tinted per row state in the sidebar). Design icons from
-    /// `docs/design/icons/`, recolored to white so egui can tint them.
-    fn icon(self) -> egui::ImageSource<'static> {
-        match self {
-            Screen::Library => egui::include_image!("../assets/icons/nav-library.svg"),
-            Screen::Favorites => egui::include_image!("../assets/icons/nav-favorites.svg"),
-            Screen::Identify => egui::include_image!("../assets/icons/nav-identify.svg"),
-            Screen::Collections => egui::include_image!("../assets/icons/nav-collections.svg"),
-            Screen::Packages => egui::include_image!("../assets/icons/nav-packages.svg"),
-            Screen::Unity => egui::include_image!("../assets/icons/unitypackage.svg"),
-            Screen::Vocabulary => egui::include_image!("../assets/icons/nav-traits.svg"),
-            Screen::Stats => egui::include_image!("../assets/icons/nav-stats.svg"),
-            Screen::Duplicates => egui::include_image!("../assets/icons/nav-duplicates.svg"),
-            Screen::Trash => egui::include_image!("../assets/icons/nav-trash.svg"),
-            Screen::Settings => egui::include_image!("../assets/icons/nav-settings.svg"),
-        }
-    }
-
-    fn glyph_color(self) -> egui::Color32 {
-        match self {
-            Screen::Library | Screen::Collections | Screen::Favorites => theme::GOLD,
-            Screen::Identify | Screen::Vocabulary => theme::ARCANE_BRIGHT,
-            Screen::Duplicates => theme::WARNING,
-            Screen::Trash => theme::DANGER,
-            // SUCCESS green per the design's `ls-unitypackage` mark (FEATURES.md §11).
-            Screen::Unity => theme::SUCCESS,
-            Screen::Packages | Screen::Stats | Screen::Settings => theme::TEXT_MUTED,
-        }
-    }
-
-    /// One sentence of what the destination will be, for the §12 stub screen.
-    fn stub_line(self) -> &'static str {
-        match self {
-            Screen::Library | Screen::Favorites | Screen::Settings => "", // built — never stubbed
-            Screen::Identify => {
-                "Work through the Unidentified backlog with batch AI + hand tagging."
-            }
-            Screen::Collections => "Pinned loadouts \u{2014} stash tabs for your best assets.",
-            Screen::Packages => "Everything you own, by publisher and pack.",
-            Screen::Unity => {
-                ".unitypackage libraries \u{2014} indexed in place, surgically extracted on demand."
-            }
-            Screen::Vocabulary => {
-                "Traits and the mapping library \u{2014} your canonical tag vocabulary."
-            }
-            Screen::Stats => "Library insights \u{2014} counts, sizes, identification coverage.",
-            Screen::Duplicates => {
-                "Review near-duplicate groups \u{2014} keep, merge, or trash; never auto-delete."
-            }
-            Screen::Trash => "Removed assets wait here for restore or explicit deletion.",
-        }
-    }
-}
-
-/// Top-bar search mode (UI-SPEC §0.1): Tags = live substring filter (live today),
-/// AI = semantic search (stub until the P3/P4 embedding pipeline lands).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum SearchMode {
-    #[default]
-    Tags,
-    Ai,
-}
-
-/// STATUS facet single-select (UI-SPEC §0.2). Maps to `status` (DATA-MODEL §8);
-/// `discovered|indexed` fold into Unidentified.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum StatusFilter {
-    #[default]
-    All,
-    Unidentified,
-    Identified,
-    Confirmed,
-}
-
-impl StatusFilter {
-    /// Does an asset's catalog status pass this facet? Pure for testability.
-    fn matches(self, status: AssetStatus) -> bool {
-        match self {
-            StatusFilter::All => true,
-            StatusFilter::Unidentified => status.is_unidentified(),
-            StatusFilter::Identified => status == AssetStatus::Identified,
-            StatusFilter::Confirmed => status == AssetStatus::Confirmed,
-        }
-    }
-}
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
@@ -5170,8 +4496,8 @@ impl LodestashApp {
                         };
                         if sidebar_nav_row(
                             ui,
-                            screen.icon(),
-                            screen.glyph_color(),
+                            screen_icon(screen),
+                            screen_glyph_color(screen),
                             screen.label(),
                             (badge > 0).then_some(badge),
                             self.screen == screen,
@@ -10183,7 +9509,7 @@ impl eframe::App for LodestashApp {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         for &(cat, label) in Category::TABS {
                             let active = self.active_tab == cat;
-                            let color = cat.color();
+                            let color = theme::token(cat.token());
                             let resp = ui.add(
                                 egui::Button::new(
                                     RichText::new(label).size(12.0).color(if active {

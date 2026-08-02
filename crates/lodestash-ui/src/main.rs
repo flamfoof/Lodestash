@@ -10,7 +10,7 @@ mod viewport3d;
 // Moved to the headless `lodestash-app` crate (ARCHITECTURE §6). Aliased under their old paths so
 // the `crate::config::` / `crate::jobs::` / `crate::models::` call sites stay untouched — the
 // extraction is a relocation, not a rename.
-use lodestash_app::{config, jobs, models};
+use lodestash_app::{config, jobs, models, types};
 
 fn main() -> eframe::Result {
     // `lodestash --mcp` is the MCP stdio server (MCP-AND-ENGINES §2 "Registration"): same binary,

@@ -1,9 +1,39 @@
 //! Design tokens from DESIGN-GUIDELINES.md §2.
 //! Every colour reference in the UI must come from here — no inline hex.
 //! Most constants are forward-declared for future panels — the allow is intentional.
+//!
+//! This module hand-mirrors `docs/design/tokens.css`, which is the source of truth. It is
+//! retired at the B7 cutover, when the webview reads the token file directly.
 #![allow(dead_code)]
 
 use egui::Color32;
+
+/// Resolve a CSS custom-property name to its colour.
+///
+/// Shared code in `lodestash-app` names tokens as strings (`Category::token`) so it can stay free
+/// of any renderer; this is the egui side of that contract. Unknown names fall back to [`TEXT`]
+/// rather than panicking — a mistyped token should show as plain text, not take the app down.
+pub fn token(name: &str) -> Color32 {
+    match name {
+        "--ls-gold" => GOLD,
+        "--ls-gold-bright" => GOLD_BRIGHT,
+        "--ls-arcane" => ARCANE,
+        "--ls-arcane-bright" => ARCANE_BRIGHT,
+        "--ls-type-model" => TYPE_MODEL,
+        "--ls-type-sound" => TYPE_SOUND,
+        "--ls-type-image" | "--ls-type-texture" => TYPE_IMAGE,
+        "--ls-type-material" => TYPE_MATERIAL,
+        "--ls-type-sprite" => TYPE_SPRITE,
+        "--ls-type-font" => TYPE_FONT,
+        "--ls-success" => SUCCESS,
+        "--ls-warning" => WARNING,
+        "--ls-danger" => DANGER,
+        "--ls-info" => INFO,
+        "--ls-text-muted" => TEXT_MUTED,
+        "--ls-text-dim" => TEXT_DIM,
+        _ => TEXT,
+    }
+}
 
 // Surfaces & text
 pub const BG: Color32 = Color32::from_rgb(0x0E, 0x11, 0x17); // #0E1117
@@ -45,6 +75,8 @@ pub const STATUS_CONFIRMED: Color32 = Color32::from_rgb(0xE7, 0xB7, 0x65);
 pub const SUCCESS: Color32 = Color32::from_rgb(0x5B, 0xD8, 0x97);
 pub const WARNING: Color32 = Color32::from_rgb(0xF2, 0xB8, 0x4B);
 pub const DANGER: Color32 = Color32::from_rgb(0xF2, 0x66, 0x6E);
+/// #5AA9F0 — listed in DESIGN-GUIDELINES §2 but never declared here until `token` needed it.
+pub const INFO: Color32 = Color32::from_rgb(0x5A, 0xA9, 0xF0);
 
 use lodestash_core::types::MediaType;
 
@@ -100,4 +132,18 @@ pub fn apply(ctx: &egui::Context) {
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
     style.spacing.window_margin = egui::Margin::same(12.0);
     ctx.set_style(style);
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    #[test]
+    fn known_tokens_resolve_and_unknown_falls_back() {
+        assert_eq!(token("--ls-type-model"), TYPE_MODEL);
+        assert_eq!(token("--ls-gold"), GOLD);
+        // Aliased in tokens.css: textures share the image hue.
+        assert_eq!(token("--ls-type-texture"), token("--ls-type-image"));
+        assert_eq!(token("--ls-nope"), TEXT);
+    }
 }

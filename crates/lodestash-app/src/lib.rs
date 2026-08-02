@@ -10,3 +10,4 @@
 pub mod config;
 pub mod jobs;
 pub mod models;
+pub mod types;
