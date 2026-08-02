@@ -160,6 +160,22 @@ try {
     await page.waitForTimeout(500);
   });
 
+  // Both view modes must render the same result set — a list that quietly shows a different
+  // number of rows than the grid means one of them is filtering on its own.
+  await check("list view shows the same assets as the grid", async () => {
+    await page.fill('input[type="text"]', "Stairs");
+    await page.waitForTimeout(700);
+    const cards = await page.locator(".card").count();
+    await page.getByRole("button", { name: "List view" }).click();
+    await page.waitForSelector(".list .row", { timeout: 5000 });
+    const rows = await page.locator(".list .row").count();
+    assert.equal(rows, cards, `list showed ${rows} rows for ${cards} cards`);
+    await page.getByRole("button", { name: "Grid view" }).click();
+    await page.waitForSelector(".card", { timeout: 5000 });
+    await page.fill('input[type="text"]', "");
+    await page.waitForTimeout(500);
+  });
+
   await check("double-click opens Quick Look on the right asset", async () => {
     await page.fill('input[type="text"]', "");
     // Wait for the grid to settle before pinning an element: a `locator` re-resolves on every

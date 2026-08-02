@@ -35,6 +35,28 @@
       {view.sortAsc ? "↑" : "↓"}
     </button>
 
+    <div class="group" role="group" aria-label="View mode">
+      <button
+        class="icon-btn"
+        class:on={view.viewMode === "grid"}
+        onclick={() => (view.viewMode = "grid")}
+        title="Grid"
+        aria-label="Grid view"
+      >
+        <Icon name="ls-view-grid" size={16} />
+      </button>
+      <button
+        class="icon-btn"
+        class:on={view.viewMode === "list"}
+        onclick={() => (view.viewMode = "list")}
+        title="List"
+        aria-label="List view"
+      >
+        <Icon name="ls-view-list" size={16} />
+      </button>
+    </div>
+
+    {#if view.viewMode === "grid"}
     <div class="group" role="group" aria-label="Density">
       {#each DENSITIES as d (d.id)}
         <button
@@ -48,6 +70,7 @@
         </button>
       {/each}
     </div>
+    {/if}
 
     <button
       class="icon-btn"

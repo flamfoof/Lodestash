@@ -14,6 +14,8 @@ class ViewState {
   sortBy = $state("name");
   sortAsc = $state(true);
   density = $state<"compact" | "cozy" | "large">("cozy");
+  /** Grid of cards, or the dense table (UI-SPEC §1.3 view toggle). */
+  viewMode = $state<"grid" | "list">("grid");
   inspectorOpen = $state(true);
   /** Lead selection, as an asset id. Selection is view state: no worker writes it. */
   selected = $state<number | null>(null);
