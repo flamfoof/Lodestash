@@ -64,6 +64,45 @@ try {
     assert.equal(broken.length, 0, `${broken.length} broken: ${broken.map((b) => b.src).join(", ")}`);
   });
 
+  await check("clicking a card fills the inspector with that asset", async () => {
+    await page.fill('input[type="text"]', "");
+    await page.waitForTimeout(600);
+    const first = page.locator(".card").first();
+    const name = (await first.locator(".name").textContent())?.trim();
+    await first.click();
+    await page.waitForSelector('[data-testid="inspector-name"]', { timeout: 5000 });
+    const shown = (await page.locator('[data-testid="inspector-name"]').textContent())?.trim();
+    assert.equal(shown, name, "inspector shows a different asset than the one clicked");
+  });
+
+  // Descending must be the exact reverse, tie-breaks included. If it is not, page 2 of a
+  // descending sort can repeat or drop rows page 1 already showed — invisible on page 1,
+  // which is the only page anyone checks by hand. Sorted on `size`, where thousands of assets
+  // tie, so a comparator that reverses only the primary key fails here and not on `name`.
+  await check("descending sort is the exact reverse of ascending", async () => {
+    const all = (asc) =>
+      invoke("grid_page", {
+        query: {
+          tab: "all", search: "", status: "all",
+          sort_by: "size", sort_asc: asc, page: 0, page_size: 100000,
+        },
+      }).then((p) => p.items.map((i) => i.asset_id));
+    const [up, down] = await Promise.all([all(true), all(false)]);
+    assert.ok(up.length > 100, `need a real library, got ${up.length} rows`);
+    assert.deepEqual(down, up.slice().reverse());
+  });
+
+  await check("the status facet folds discovered and indexed into Unidentified", async () => {
+    const count = async (status) =>
+      (await invoke("grid_page", {
+        query: { tab: "all", search: "", status, sort_by: "name", sort_asc: true, page: 0, page_size: 1 },
+      })).total;
+    const [all, un, id, conf] = await Promise.all(
+      ["all", "unidentified", "identified", "confirmed"].map(count),
+    );
+    assert.equal(un + id + conf, all, "the three status buckets must partition the library");
+  });
+
   await check("ls:// serves a preview as SVG", async () => {
     const r = await page.evaluate(async (src) => {
       const res = await fetch(src);

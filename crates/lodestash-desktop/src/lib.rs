@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use serde::Serialize;
 use tauri::Manager;
 
-use crate::library::{GridPage, GridQuery, Library, LibraryStatus};
+use crate::library::{AssetDetail, GridPage, GridQuery, Library, LibraryStatus};
 
 #[derive(Serialize)]
 pub struct AppInfo {
@@ -60,6 +60,19 @@ fn grid_page(state: tauri::State<'_, AppState>, query: GridQuery) -> Result<Grid
         .map_err(|_| "library lock poisoned".to_string())
 }
 
+/// Everything the Inspector shows for one asset (UI-SPEC §13).
+#[tauri::command]
+fn asset_detail(
+    state: tauri::State<'_, AppState>,
+    asset_id: i64,
+) -> Result<Option<AssetDetail>, String> {
+    state
+        .library
+        .lock()
+        .map(|l| l.detail(asset_id))
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
 /// Re-read the catalog. The egui app writes it, so a scan there shows up here on request —
 /// there is no change notification until the pump thread exists.
 #[tauri::command]
@@ -102,6 +115,7 @@ pub fn run() {
             app_info,
             library_status,
             grid_page,
+            asset_detail,
             reload_library
         ])
         .run(tauri::generate_context!())

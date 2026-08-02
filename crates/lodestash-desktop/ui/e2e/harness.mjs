@@ -9,7 +9,7 @@
  * The debugging port is opened here and only here, by env var. It must never be configured in
  * `tauri.conf.json` — anything on localhost can drive the app and read the catalog through it.
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -20,6 +20,33 @@ const REPO = path.resolve(UI_DIR, "..", "..", "..");
 const BIN = path.join(REPO, "target", "debug", "lodestash-desktop.exe");
 const CDP_PORT = 9222;
 const VITE_URL = "http://localhost:5173";
+
+/**
+ * Kill a spawned process **and its descendants**, synchronously.
+ *
+ * Two things make this fussier than `child.kill()`:
+ *
+ * - `kill()` signals only the direct child. Vite is a grandchild — `cmd.exe` -> `bun` ->
+ *   `node vite.js` — so killing the shell leaves Vite alive holding :5173.
+ * - It must be **synchronous**. An async `spawn("taskkill")` loses the race against
+ *   `process.exit()` and never runs, which looks exactly like no cleanup at all.
+ *
+ * A leaked Vite is not merely untidy: it inherits the runner's stdio, so a piped invocation
+ * (`bun run e2e | ...`) never sees end-of-stream and appears to hang forever — long after the
+ * checks have finished and reported.
+ */
+function killTree(child) {
+  if (!child.pid) return;
+  if (process.platform === "win32") {
+    spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+  } else {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+    } catch {
+      child.kill("SIGKILL");
+    }
+  }
+}
 
 async function reachable(url, ms) {
   const deadline = Date.now() + ms;
@@ -80,7 +107,7 @@ export async function launch() {
       page.evaluate(([c, a]) => window.__TAURI_INTERNALS__.invoke(c, a), [cmd, args ?? {}]),
     async close() {
       await browser.close().catch(() => {});
-      for (const p of spawned.reverse()) p.kill();
+      for (const p of spawned.reverse()) killTree(p);
     },
   };
 }

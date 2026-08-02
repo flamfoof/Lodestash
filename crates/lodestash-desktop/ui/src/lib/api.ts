@@ -24,11 +24,63 @@ export type LibraryStatus = {
   with_preview: number;
 };
 
-export type GridQuery = { tab: string; search: string; page: number; page_size: number };
+export type GridQuery = {
+  tab: string;
+  search: string;
+  status: string;
+  sort_by: string;
+  sort_asc: boolean;
+  page: number;
+  page_size: number;
+};
+
+export type AssetDetail = {
+  asset_id: number;
+  name: string;
+  rel_path: string;
+  abs_path: string;
+  media_type: string;
+  size_bytes: number;
+  status: string;
+  rating: number | null;
+  has_preview: boolean;
+  triangles: number | null;
+  width_px: number | null;
+  height_px: number | null;
+  duration_ms: number | null;
+  source: string | null;
+  in_pack: boolean;
+};
+
+/** Sort keys the backend understands (config::SortBy minus Relevance, which needs BM25 ranks). */
+export const SORTS = [
+  { id: "name", label: "Name" },
+  { id: "type", label: "Type" },
+  { id: "size", label: "Size" },
+  { id: "modified", label: "Date" },
+  { id: "rating", label: "Rating" },
+] as const;
+
+/** STATUS facet (UI-SPEC §0.2). `discovered`/`indexed` both read as Unidentified. */
+export const STATUSES = [
+  { id: "all", label: "All" },
+  { id: "unidentified", label: "Unidentified" },
+  { id: "identified", label: "Identified" },
+  { id: "confirmed", label: "Confirmed" },
+] as const;
+
+/** Grid density stops (DESIGN-GUIDELINES §4) — card min-width in px. */
+export const DENSITIES = [
+  { id: "compact", label: "Compact", icon: "ls-grid-compact", px: 118 },
+  { id: "cozy", label: "Cozy", icon: "ls-grid-cozy", px: 148 },
+  { id: "large", label: "Large", icon: "ls-grid-large", px: 200 },
+] as const;
 
 export const libraryStatus = () => invoke<LibraryStatus>("library_status");
 export const gridPage = (query: GridQuery) => invoke<GridPage>("grid_page", { query });
 export const reloadLibrary = () => invoke<LibraryStatus>("reload_library");
+export const assetDetail = (assetId: number) =>
+  invoke<AssetDetail | null>("asset_detail", { assetId });
 
 /**
  * Base for the custom scheme.
@@ -79,6 +131,24 @@ export function typeIcon(mediaType: string): string {
       return "ls-type-texture";
     default:
       return "ls-type-image";
+  }
+}
+
+/** `mm:ss` from milliseconds, matching the egui transport readout. */
+export function fmtDuration(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+/** The user-facing status vocabulary is two words, not four (DATA-MODEL §8). */
+export function statusLabel(status: string): string {
+  switch (status) {
+    case "identified":
+      return "Identified";
+    case "confirmed":
+      return "Confirmed";
+    default:
+      return "Unidentified";
   }
 }
 

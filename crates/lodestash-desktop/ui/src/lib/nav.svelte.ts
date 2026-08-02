@@ -10,7 +10,13 @@ class ViewState {
   tab = $state<TabId>("all");
   search = $state("");
   searchMode = $state<"tags" | "ai">("tags");
+  status = $state("all");
+  sortBy = $state("name");
+  sortAsc = $state(true);
+  density = $state<"compact" | "cozy" | "large">("cozy");
   inspectorOpen = $state(true);
+  /** Lead selection, as an asset id. Selection is view state: no worker writes it. */
+  selected = $state<number | null>(null);
 
   go(route: Route) {
     this.route = route;

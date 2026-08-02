@@ -2,6 +2,7 @@
   import TopBar from "./lib/TopBar.svelte";
   import Sidebar from "./lib/Sidebar.svelte";
   import Screen from "./lib/Screen.svelte";
+  import Inspector from "./lib/Inspector.svelte";
   import LibraryScreen from "./lib/LibraryScreen.svelte";
   import { SCREENS } from "./lib/routes";
   import { view } from "./lib/nav.svelte";
@@ -39,6 +40,9 @@
         <Screen title={screen.title} milestone={screen.milestone} />
       {/if}
     </main>
+    {#if onLibrary && view.inspectorOpen}
+      <Inspector assetId={view.selected} />
+    {/if}
   </div>
   <footer class="statusbar">
     {#if status?.open}
