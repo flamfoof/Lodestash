@@ -238,6 +238,21 @@ until B7.
 - [ ] **B7 — Cutover.** `[[bin]] lodestash` moves to `lodestash-desktop`, **preserving the `--mcp`
       stdio branch verbatim**; delete `crates/lodestash-ui`; update every doc that names egui.
 
+## 🔍 Findings — not bugs, but worth knowing
+
+- **546 orphaned package rows (dev catalog, 2026-08-02).** Live assets carrying a `package_id`
+  but *neither* `workspace_rel` nor `package_entry_id` — no locator of any kind. No hydrate query
+  returns them, and that is **correct**: sampling 400 of them found **0 files present** at
+  `source_root/rel_path`, so surfacing them would put unopenable entries in the grid (no
+  thumbnail, `ls://file` 503, an inspector path that does not exist).
+  Widening `entries_for_source` to select on "no pack locator" instead of `package_id IS NULL`
+  was tried and reverted — it breaks `hydrate_and_missing_reconcile_round_trip`, which encodes
+  the real invariant: *package assets stay out of the folder hydrate because their bytes are not
+  under the source root.*
+  So this is a **data** question, not a query one: rows recorded against a pack before a locator
+  was written. Worth an ingest-side audit (are they re-derivable from the pack manifest, or
+  should they be reaped?) — not a frontend concern.
+
 ## In Progress
 *(empty — pull from Ready)*
 

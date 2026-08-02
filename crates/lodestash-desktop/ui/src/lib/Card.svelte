@@ -6,7 +6,13 @@
     item,
     selected = false,
     onselect,
-  }: { item: GridItem; selected?: boolean; onselect?: (id: number) => void } = $props();
+    onopen,
+  }: {
+    item: GridItem;
+    selected?: boolean;
+    onselect?: (id: number) => void;
+    onopen?: (id: number) => void;
+  } = $props();
 
   let tint = $derived(`var(${typeToken(item.media_type)})`);
   let unidentified = $derived(item.status === "discovered" || item.status === "indexed");
@@ -17,6 +23,7 @@
   class:selected
   style="--tint: {tint}"
   onclick={() => onselect?.(item.asset_id)}
+  ondblclick={() => onopen?.(item.asset_id)}
   title={item.rel_path}
 >
   <div class="thumb">

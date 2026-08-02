@@ -160,6 +160,126 @@ try {
     await page.waitForTimeout(500);
   });
 
+  await check("double-click opens Quick Look on the right asset", async () => {
+    await page.fill('input[type="text"]', "");
+    // Wait for the grid to settle before pinning an element: a `locator` re-resolves on every
+    // call, so reading the name and clicking can land on two different cards while the previous
+    // screen's results are still being replaced.
+    await page.waitForFunction(
+      () => document.querySelectorAll(".card").length > 10,
+      undefined,
+      { timeout: 5000 },
+    );
+    await page.waitForTimeout(400);
+    const first = await page.locator(".card").first().elementHandle();
+    const name = (await first.$eval(".name", (e) => e.textContent))?.trim();
+    await first.dblclick();
+    await page.waitForSelector('[data-testid="quicklook"]', { timeout: 5000 });
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="ql-stage"]')?.getAttribute("data-kind") !== "loading",
+      undefined,
+      { timeout: 5000 },
+    );
+    const shown = (await page.locator('[data-testid="ql-name"]').textContent())?.trim();
+    assert.equal(shown, name, `Quick Look showed "${shown}" for a double-click on "${name}"`);
+  });
+
+  await check("arrow keys step, Escape closes", async () => {
+    const before = (await page.locator('[data-testid="ql-name"]').textContent())?.trim();
+    await page.keyboard.press("ArrowRight");
+    await page.waitForFunction(
+      (prev) => document.querySelector('[data-testid="ql-name"]')?.textContent?.trim() !== prev,
+      before,
+      { timeout: 5000 },
+    );
+    await page.keyboard.press("Escape");
+    await page.waitForSelector('[data-testid="quicklook"]', { state: "detached", timeout: 5000 });
+  });
+
+  // An in-pack asset must say so rather than showing a broken viewer — the read-only
+  // invariant only means something if the UI explains it instead of looking failed.
+  await check("Quick Look on an in-pack asset explains itself", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    const packed = p.items.find((i) => i.in_pack);
+    assert.ok(packed, "no in-pack asset loaded");
+    await page.fill('input[type="text"]', packed.name);
+    await page.waitForFunction(
+      (n) => document.querySelector(".card .name")?.textContent?.trim() === n,
+      packed.name,
+      { timeout: 5000 },
+    );
+    await page.locator(".card").first().dblclick();
+    await page.waitForSelector('[data-testid="ql-stage"]', { timeout: 5000 });
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="ql-stage"]')?.getAttribute("data-kind") !== "loading",
+      undefined,
+      { timeout: 5000 },
+    );
+    const kind = await page.locator('[data-testid="ql-stage"]').getAttribute("data-kind");
+    assert.equal(kind, "not_local", "an in-pack asset must render the not_local explanation");
+    await page.keyboard.press("Escape");
+    await page.fill('input[type="text"]', "");
+    await page.waitForTimeout(400);
+  });
+
+  // The B2b hard gate. Note the range forms deliberately: WebView2 does **not** forward suffix
+  // ranges (`bytes=-N`) to a custom protocol handler — verified by logging, the header simply
+  // never arrives — so asserting on them would test the platform, not this code. Chromium's
+  // media stack seeks with open-ended `bytes=N-`, which is what is checked here.
+  await check("audio streams over ls://file and an <audio> element can seek it", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "sounds", search: "", status: "all", sort_by: "size", sort_asc: false,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    const audio = p.items.find((i) => !i.in_pack);
+    if (!audio) {
+      console.log("       (skipped: no on-disk audio in this library)");
+      return;
+    }
+    const r = await page.evaluate(async ([id, size]) => {
+      const mid = Math.floor(size / 2);
+      const head = await fetch(`http://ls.localhost/file/${id}`, { headers: { Range: "bytes=0-1023" } });
+      const tail = await fetch(`http://ls.localhost/file/${id}`, { headers: { Range: `bytes=${mid}-` } });
+      // Then the real thing: decode metadata and seek, which is what scrubbing does.
+      const el = new Audio(`http://ls.localhost/file/${id}`);
+      const meta = await new Promise((res) => {
+        el.addEventListener("loadedmetadata", () => res(true), { once: true });
+        el.addEventListener("error", () => res(false), { once: true });
+        setTimeout(() => res(false), 10000);
+      });
+      let seeked = false;
+      if (meta && Number.isFinite(el.duration)) {
+        el.currentTime = el.duration / 2;
+        seeked = await new Promise((res) => {
+          el.addEventListener("seeked", () => res(true), { once: true });
+          setTimeout(() => res(false), 10000);
+        });
+      }
+      return {
+        headStatus: head.status,
+        headLen: (await head.arrayBuffer()).byteLength,
+        tailStatus: tail.status,
+        tailRange: tail.headers.get("content-range"),
+        meta,
+        duration: el.duration,
+        seeked,
+        at: el.currentTime,
+      };
+    }, [audio.asset_id, audio.size_bytes]);
+
+    assert.equal(r.headStatus, 206, "leading range");
+    assert.equal(r.headLen, 1024);
+    assert.equal(r.tailStatus, 206, "open-ended range from the middle");
+    assert.match(r.tailRange, /^bytes \d+-\d+\/\d+$/);
+    assert.ok(r.meta, "<audio> could not decode metadata over ls://file");
+    assert.ok(r.duration > 0, `expected a real duration, got ${r.duration}`);
+    assert.ok(r.seeked, "seeking did not complete — Range streaming is not working for playback");
+    assert.ok(r.at > 0, "playhead did not move");
+  });
+
   await check("ls:// serves a preview as SVG", async () => {
     // Ask for an asset that actually has a preview rather than whatever is on screen — which
     // page 1 shows depends on the sort, and most of this library is in-pack with no preview.

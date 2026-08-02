@@ -611,6 +611,15 @@ fixture.
   Walk the chain with `FindWindowEx`; convert screen coordinates into that child's client space
   (`GetWindowRect` on the child, not the parent). Unlike Glow, the webview also screenshots
   correctly under `PrintWindow`, so the Svelte UI can be verified visually end to end.
+- **WebView2 drops suffix Range headers (`bytes=-N`) on a custom protocol.** Explicit
+  (`bytes=0-1023`) and open-ended (`bytes=N-`) forms arrive intact; a suffix range reaches the
+  handler with **no Range header at all**, so it serves the whole file and the `fetch` fails with
+  a bare `TypeError: Failed to fetch` — no status, nothing in any log until you add one. Confirmed
+  by logging every request: the suffix probe logged `status=200 bytes=7816376` while the explicit
+  one logged `206 bytes=10`. This is not worth working around: Chromium's media stack seeks with
+  `bytes=N-`, so `<audio>`/`<video>` scrubbing is unaffected. Don't assert on suffix ranges in a
+  webview test — you would be testing the platform, not your handler. `parse_range` still supports
+  them (unit-tested) for any client that can actually send one.
 - **Screenshot to a fresh filename every time.** Re-reading the same path served a *stale* image
   twice in a row, once hiding a fix that had actually worked and once hiding that the capture script
   was pointed at a dead PID (PrintWindow on an invalid handle leaves the old file in place). Write
