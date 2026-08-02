@@ -8,9 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use egui::{Key, RichText, ScrollArea, TextureHandle, Ui, Vec2};
-use lodestash_core::catalog::{
-    Catalog, CrawlRecord, HydratedAsset, InPackClass, PackageEntryRecord, StatusCounts,
-};
+use lodestash_core::catalog::{Catalog, HydratedAsset, PackageEntryRecord, StatusCounts};
 use lodestash_core::types::{AssetStatus, MediaType};
 use lodestash_ingest::asset_store::{self, AssetStorePackage};
 use lodestash_ingest::crawler::{self, CrawledFile};
@@ -25,14 +23,14 @@ use crate::theme;
 // were declared in this file — the extraction is a relocation, not a rename.
 use crate::types::*;
 use crate::viewport3d::{self, Viewport3d};
-mod drains;
-use drains::*;
-mod persist;
-use persist::*;
+// Moved to `lodestash-app` (B1); glob-imported so the call sites read as they did when these
+// were child modules of `app`.
+use lodestash_app::drains::*;
+use lodestash_app::grid::{self, *};
+use lodestash_app::paths::*;
+use lodestash_app::persist::*;
 mod thumbs;
 use thumbs::*;
-mod grid;
-use grid::*;
 
 // ── Category tabs ─────────────────────────────────────────────────────────────
 
@@ -141,18 +139,11 @@ impl ImageViewer {
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const CARD_LABEL: f32 = 36.0;
-const CARD_PAD: f32 = 8.0;
 pub const THUMB_MIN: f32 = 64.0;
 pub const THUMB_MAX: f32 = 256.0;
 /// Row height and thumbnail size for the list/table view.
 const LIST_ROW_HEIGHT: f32 = 38.0;
 const LIST_THUMB_SIZE: f32 = 28.0;
-/// Floor for the proportional prefetch window (half the viewport each side),
-/// so tiny windows still get some lookahead.
-const LOOKAHEAD_ROWS_MIN: usize = 2;
-/// Floor for the proportional resident window (1.5x the viewport each side).
-/// ponytail: window-based eviction, not true LRU — swap for a budgeted LRU if thrashing shows.
-const KEEP_ROWS_MIN: usize = 4;
 
 /// Discrete grid-size stops for the segmented selector, all driving `thumb_size` (design §2).
 const GRID_STOPS: [(f32, &str); 3] = [(96.0, "Compact"), (128.0, "Cozy"), (176.0, "Large")];
@@ -12563,47 +12554,6 @@ pub fn agent_state(
     Some(state)
 }
 
-/// Default cache locations, shared by the GUI and the `--mcp` entry point.
-pub fn default_cache_dirs() -> (Option<PathBuf>, Option<PathBuf>) {
-    (
-        dirs::cache_dir().map(|d| d.join("Lodestash").join("thumbs")),
-        dirs::cache_dir().map(|d| d.join("Lodestash").join("workspace")),
-    )
-}
-
-fn catalog_db_path() -> Option<PathBuf> {
-    let dir = dirs::data_dir()?.join("Lodestash");
-    std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join("catalog.db"))
-}
-
-/// Model id recorded with every vector; the query side reads back under the same id. Bump if
-/// the encoder changes (old vectors then simply don't match — no collision).
-const SIGLIP_MODEL_ID: &str = "siglip2-base-patch16-256";
-
-/// Locate the SigLIP towers + tokenizer: `SIGLIP_{VISION,TEXT,TOKENIZER}` env override (dev),
-/// else `<data>/Lodestash/models/siglip/{vision.onnx,text.onnx,tokenizer.json}` where the model
-/// manager downloads them. `None` unless all three are present.
-fn siglip_model_paths() -> Option<(PathBuf, PathBuf, PathBuf)> {
-    if let (Ok(v), Ok(t), Ok(k)) = (
-        std::env::var("SIGLIP_VISION"),
-        std::env::var("SIGLIP_TEXT"),
-        std::env::var("SIGLIP_TOKENIZER"),
-    ) {
-        return Some((PathBuf::from(v), PathBuf::from(t), PathBuf::from(k)));
-    }
-    let dir = dirs::data_dir()?
-        .join("Lodestash")
-        .join("models")
-        .join("siglip");
-    let (v, t, k) = (
-        dir.join("vision.onnx"),
-        dir.join("text.onnx"),
-        dir.join("tokenizer.json"),
-    );
-    (v.exists() && t.exists() && k.exists()).then_some((v, t, k))
-}
-
 /// Raster types the Quick Look viewer can decode via the shared raster seam
 /// (`image` formats + DDS/PSD). HDR/EXR tone-map is the remaining #29 follow-up.
 fn is_viewer_image(mt: Option<MediaType>) -> bool {
@@ -13291,7 +13241,11 @@ fn inspector_pane(
                 stat_row(ui, "Triangles", &format_thousands(tris));
             }
             if let Some(ms) = metrics.duration_ms {
-                stat_row(ui, "Duration", &crate::audio::fmt_time(ms as f32 / 1000.0));
+                stat_row(
+                    ui,
+                    "Duration",
+                    &lodestash_app::audio::fmt_time(ms as f32 / 1000.0),
+                );
             }
             stat_row(ui, "Modified", &format_mtime(file.mtime));
             // Status row — user-facing terms fold discovered|indexed (DATA-MODEL §8).
@@ -14123,8 +14077,8 @@ fn quick_look_content(
                     ui.label(
                         RichText::new(format!(
                             "{} / {}",
-                            crate::audio::fmt_time(ap.position()),
-                            crate::audio::fmt_time(dur)
+                            lodestash_app::audio::fmt_time(ap.position()),
+                            lodestash_app::audio::fmt_time(dur)
                         ))
                         .monospace()
                         .color(theme::TEXT_MUTED)

@@ -70,6 +70,10 @@ impl Category {
     }
 }
 
+/// `--ls-type-model` as CSS hex. Vector previews carry it on the SVG root so the stored artifact
+/// is correct in a plain SVG renderer as well as under a stylesheet (DESIGN-GUIDELINES §2).
+pub const MODEL_HEX: &str = "#A98BFF";
+
 pub struct AssetEntry<T = ()> {
     /// Extracted-package origin (the sidebar "package library" facet). None for plain
     /// on-disk files. ponytail: session-only — rehydration re-derives it when the

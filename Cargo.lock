@@ -3857,13 +3857,16 @@ name = "lodestash-app"
 version = "0.1.0"
 dependencies = [
  "dirs 5.0.1",
+ "image",
  "keyring",
  "lodestash-ai",
  "lodestash-api",
  "lodestash-core",
  "lodestash-ingest",
+ "rodio",
  "serde",
  "serde_json",
+ "tempfile",
  "tracing",
  "ureq",
  "zip",

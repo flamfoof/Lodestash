@@ -23,7 +23,7 @@ fn main() -> eframe::Result {
                     .unwrap_or_else(|_| "lodestash=info".into()),
             )
             .init();
-        let (thumbs, ws) = app::default_cache_dirs();
+        let (thumbs, ws) = lodestash_app::paths::default_cache_dirs();
         let Some(state) = app::agent_state(thumbs, ws) else {
             eprintln!("lodestash --mcp: no catalog available");
             std::process::exit(1);

@@ -21,6 +21,13 @@ tracing          = { workspace = true }
 ureq             = { workspace = true }
 zip              = { workspace = true }
 dirs             = { workspace = true }
+# Audio *decode* for the CLAP embedding drain. Playback (`AudioPlayer`) stays in the UI crate —
+# its stream handle is `!Send` and belongs to whatever owns the window.
+rodio            = { workspace = true }
+# Thumbnail + preview raster handling in the identify drains.
+image            = { workspace = true }
+# Scratch pulls for in-pack identify (DATA-MODEL §7 / M14).
+tempfile         = { workspace = true }
 
 # Windows Credential Manager for the cloud API key at rest (AI-PIPELINE §5.1). Windows-only on
 # purpose: the app targets win-x64, and other platforms fall back to the plaintext-config path

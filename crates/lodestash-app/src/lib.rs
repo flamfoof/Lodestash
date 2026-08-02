@@ -7,7 +7,12 @@
 //! Spec: ARCHITECTURE.md §6. It is being filled incrementally — see the extraction card in
 //! `docs/KANBAN.md` for what has moved and what is still parked in `lodestash-ui`.
 
+pub mod audio;
 pub mod config;
+pub mod drains;
+pub mod grid;
 pub mod jobs;
 pub mod models;
+pub mod paths;
+pub mod persist;
 pub mod types;

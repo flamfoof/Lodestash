@@ -1,10 +1,18 @@
 //! Crawl-record building + catalog persistence for scans and package extraction, split out of
-//! app.rs. Child module of `app`: reaches app's private items via `use super::*`.
-use super::*;
+//! app.rs. Moved to `lodestash-app` (B1); carries no renderer.
+use lodestash_core::catalog::{
+    Catalog, CrawlRecord, InPackClass, PackageEntryRecord, StatusCounts,
+};
+use lodestash_core::types::AssetStatus;
+use lodestash_ingest::crawler::CrawledFile;
+use lodestash_ingest::{detect, thumb, unitypackage};
+
+use crate::paths::*;
+use crate::types::*;
 
 /// Classified files → catalog crawl records; unclassified files stay grid-only
 /// (`asset.media_type_id` is NOT NULL). Paths are stored `/`-separated.
-pub(super) fn crawl_records<'a>(files: impl Iterator<Item = &'a CrawledFile>) -> Vec<CrawlRecord> {
+pub fn crawl_records<'a>(files: impl Iterator<Item = &'a CrawledFile>) -> Vec<CrawlRecord> {
     files
         .filter(|f| f.media_type.is_some())
         .map(crawl_record)
@@ -13,7 +21,7 @@ pub(super) fn crawl_records<'a>(files: impl Iterator<Item = &'a CrawledFile>) ->
 
 /// One classified file as a catalog record. Callers that know where the file lives fill in
 /// `workspace_rel` afterwards; an on-disk crawl leaves it None.
-pub(super) fn crawl_record(f: &CrawledFile) -> CrawlRecord {
+pub fn crawl_record(f: &CrawledFile) -> CrawlRecord {
     CrawlRecord {
         rel_path: f.rel_path.to_string_lossy().replace('\\', "/"),
         name: f
@@ -43,7 +51,7 @@ pub(super) fn crawl_record(f: &CrawledFile) -> CrawlRecord {
 /// so a changed entry refreshes in place and a new one is added; mint then picks up new classifiable
 /// entries. ponytail: refresh is additive — a GUID *removed* from the archive leaves its stale
 /// locator + minted row (no prune); add a diff-and-delete pass if that case shows up in practice.
-pub(super) fn ensure_in_pack_minted(
+pub fn ensure_in_pack_minted(
     db: &std::path::Path,
     package_id: i64,
     pack_path: &std::path::Path,
@@ -90,7 +98,7 @@ pub(super) fn ensure_in_pack_minted(
 /// type + display name the in-pack asset should carry. Entries whose extension classifies to no
 /// `media_type` (scripts, prefabs, manifests) are dropped — the same "unclassified never reaches
 /// the grid" rule the crawl applies, enforced here by their absence from the returned map.
-pub(super) fn classify_in_pack_entries(
+pub fn classify_in_pack_entries(
     entries: &[PackageEntryRecord],
 ) -> std::collections::HashMap<String, InPackClass> {
     entries
@@ -120,7 +128,7 @@ pub(super) fn classify_in_pack_entries(
 /// The location has to be resolved in the same pass that builds the record: `crawl_records` drops
 /// unclassified files, so a record list and the file list it came from are different lengths and
 /// pairing them positionally mis-assigns every path after the first dropped file.
-pub(super) fn crawl_records_in_workspace<'a>(
+pub fn crawl_records_in_workspace<'a>(
     files: impl Iterator<Item = &'a CrawledFile>,
     workspace_dir: Option<&std::path::Path>,
 ) -> Vec<CrawlRecord> {
@@ -141,7 +149,7 @@ pub(super) fn crawl_records_in_workspace<'a>(
 
 /// Runs on the persist thread: the extracted package's `package` row, its asset rows
 /// (carrying `package_id`), the unpack stamp, then project-wide status counts.
-pub(super) fn persist_package_to_catalog(
+pub fn persist_package_to_catalog(
     db_path: &std::path::Path,
     job: &PackagePersist,
 ) -> Result<(StatusCounts, AssetIdentityMaps, Catalog), String> {
@@ -235,7 +243,7 @@ pub(super) fn persist_package_to_catalog(
 /// A pack with a publisher came from the Asset Store cache tree, and that is enough to know its
 /// licence — the EULA is a fact about where the pack came from, so it fills in only when the pack
 /// itself said nothing.
-pub(super) fn harvest_package_metadata(catalog: &Catalog, package_id: i64, job: &PackagePersist) {
+pub fn harvest_package_metadata(catalog: &Catalog, package_id: i64, job: &PackagePersist) {
     let entries: Vec<unitypackage::PackageEntry> = job
         .entries
         .iter()
@@ -289,7 +297,7 @@ pub(super) fn harvest_package_metadata(catalog: &Catalog, package_id: i64, job: 
 
 /// Read every live asset row back for the given `(root, source_id)` pairs, keyed for
 /// the UI-side join (unknown status strings are dropped, not fatal).
-pub(super) fn read_back_assets(
+pub fn read_back_assets(
     catalog: &Catalog,
     sources: &[(String, i64)],
 ) -> Result<AssetIdentityMaps, String> {
@@ -324,7 +332,7 @@ pub(super) fn read_back_assets(
 /// Runs on the persist thread: open the catalog, upsert each source, record its crawl
 /// incrementally, adopt any config blacklists (one-time M5 data step), and read back
 /// the per-status counts + asset identities for exactly these sources.
-pub(super) fn persist_to_catalog(
+pub fn persist_to_catalog(
     db_path: &std::path::Path,
     batches: &[PersistBatch],
 ) -> Result<(StatusCounts, AssetIdentityMaps, Catalog), String> {

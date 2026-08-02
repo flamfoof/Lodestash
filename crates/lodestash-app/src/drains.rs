@@ -1,14 +1,19 @@
 //! Identify/persist backend: embedder loaders + the metrics/deps/embedding/tag drains, split
-//! out of app.rs to shrink it. A child module of `app`, so it reaches app's private items
-//! (types, consts, sibling free functions) through `use super::*`.
+//! out of app.rs to shrink it. Moved to `lodestash-app` (B1); carries no renderer.
 #![allow(clippy::too_many_arguments)]
-use super::*;
+use std::sync::Arc;
+
+use lodestash_core::catalog::{Catalog, StatusCounts};
+
+use crate::models;
+use crate::paths::*;
+use crate::persist::read_back_assets;
+use crate::types::*;
 
 /// Load the SigLIP joint image↔text embedder if its artifacts (+ a matching ONNX Runtime,
 /// discovered via `load-dynamic`) are present. Any failure is `None` — AI search falls back to
 /// its stub, never crashes. On a stock machine with no model this returns `None` immediately.
-pub(super) fn resolve_embedder() -> Option<Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>
-{
+pub fn resolve_embedder() -> Option<Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>> {
     let (vision, text, tok) = siglip_model_paths()?;
     match lodestash_ai::siglip::SiglipEmbedder::load(&vision, &text, &tok, SIGLIP_MODEL_ID) {
         Ok(e) => {
@@ -25,7 +30,7 @@ pub(super) fn resolve_embedder() -> Option<Arc<dyn lodestash_ai::embedder::Embed
 /// Encode one 3D model by rendering it from a few orbit views and mean-pooling the per-view
 /// SigLIP embeddings (IDENTIFICATION-AND-SEARCH §3 Tier 1, "SigLIP 2 image / 3D-multiview").
 /// `None` when the mesh can't be loaded or carries no geometry.
-pub(super) fn embed_model_multiview(
+pub fn embed_model_multiview(
     path: &std::path::Path,
     emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync),
     cache_dir: Option<&std::path::Path>,
@@ -72,16 +77,15 @@ pub(super) fn embed_model_multiview(
 
 /// Offscreen render resolution per view — SigLIP resizes to 256² anyway, so rendering larger
 /// only costs rasterisation time.
-pub(super) const RENDER_SIZE: u32 = 256;
+pub const RENDER_SIZE: u32 = 256;
 
 /// Model id for the audio space. Kept distinct from the visual one so the two never mix in
 /// `asset_embedding` — `embeddings_for_knn` shards on `model_id`.
-pub(super) const CLAP_MODEL_ID: &str = "clap-htsat-unfused";
+pub const CLAP_MODEL_ID: &str = "clap-htsat-unfused";
 
 /// Load the CLAP audio embedder if its artifacts are present, else `None` (audio simply gets no
 /// vectors — visual search is unaffected). Mirrors `resolve_embedder`.
-pub(super) fn resolve_audio_embedder(
-) -> Option<Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>> {
+pub fn resolve_audio_embedder() -> Option<Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>> {
     let dir = models::clap_dir()?;
     let (a, t, k) = (
         dir.join("audio.onnx"),
@@ -107,7 +111,7 @@ pub(super) fn resolve_audio_embedder(
 /// no new dependency. Capped at a little over the 10 s the encoder consumes.
 /// ponytail: linear resampling — inaudible at mel resolution; swap in a windowed-sinc if audio
 /// retrieval quality ever demands it.
-pub(super) fn decode_audio_48k_mono(path: &std::path::Path) -> Result<Vec<f32>, String> {
+pub fn decode_audio_48k_mono(path: &std::path::Path) -> Result<Vec<f32>, String> {
     use rodio::Source;
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let dec = rodio::Decoder::new(std::io::BufReader::new(file)).map_err(|e| e.to_string())?;
@@ -148,7 +152,7 @@ pub(super) fn decode_audio_48k_mono(path: &std::path::Path) -> Result<Vec<f32>, 
 /// Embed dirty **audio** assets with CLAP: decode → 48 kHz mono → log-mel → audio tower.
 /// Same sole-writer connection and same forward-progress rule as the visual drain (an
 /// undecodable file stores a zero vector so it's never re-queried forever).
-pub(super) fn drain_audio_embeddings(
+pub fn drain_audio_embeddings(
     cat: &mut Catalog,
     emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync),
     workspace_dir: Option<&std::path::Path>,
@@ -230,7 +234,7 @@ fn zeroshot_tags(
     img.map(|i| zs.tag(i)).unwrap_or_default()
 }
 
-pub(super) fn drain_api_tags(
+pub fn drain_api_tags(
     cat: &mut Catalog,
     tagger: &lodestash_ai::openai::OpenAiTagger,
     fallback: Option<&dyn lodestash_ai::tagger::Tagger>,
@@ -461,7 +465,7 @@ fn sleep_cancellable(dur: std::time::Duration, progress: &crate::jobs::JobProgre
 /// queue, run before the VLM tag drain (which can't see audio anyway), so an audio re-tag pass works
 /// without a re-embed. Same forward-progress rule: a clip that yields nothing still clears its flag
 /// (`set_tags` with an empty set), so it is never re-queued forever.
-pub(super) fn drain_audio_tags(
+pub fn drain_audio_tags(
     cat: &mut Catalog,
     zero_shot: &lodestash_ai::clap_tags::AudioZeroShot,
     workspace_dir: Option<&std::path::Path>,
@@ -528,7 +532,7 @@ pub(super) fn drain_audio_tags(
 /// Order matters within a drain but not across them: an edge whose target isn't catalogued yet is
 /// stored `missing` and late-bound by `resolve_pending_relationships`, so a texture indexed after
 /// its material still connects.
-pub(super) fn drain_dependencies(cat: &mut Catalog, workspace_dir: Option<&std::path::Path>) {
+pub fn drain_dependencies(cat: &mut Catalog, workspace_dir: Option<&std::path::Path>) {
     const BATCH: usize = 256;
     let mut total = 0usize;
     let mut edges = 0usize;
@@ -594,7 +598,7 @@ pub(super) fn drain_dependencies(cat: &mut Catalog, workspace_dir: Option<&std::
 /// Runs only when the dependency drain actually scanned something, so a steady-state library
 /// re-walks nothing. ponytail: on-disk sources only — a prefab extracted into the package
 /// workspace is skipped until someone wants that.
-pub(super) fn drain_prefab_edges(cat: &mut Catalog) {
+pub fn drain_prefab_edges(cat: &mut Catalog) {
     let roots = match cat.source_roots() {
         Ok(r) => r,
         Err(e) => {
@@ -619,7 +623,7 @@ pub(super) fn drain_prefab_edges(cat: &mut Catalog) {
 /// `Human3.fbx` → `Human3_Albedo.png`. The matching (`deps::texture_matches_model`) runs here in the
 /// ingest-aware layer; the catalog only supplies the rows and takes the resolved edges. Applies only
 /// to edge-less models, so it never overrides the deterministic GUID/prefab graph.
-pub(super) fn drain_inferred_texture_edges(cat: &mut Catalog) {
+pub fn drain_inferred_texture_edges(cat: &mut Catalog) {
     use std::path::{Path, PathBuf};
     let models = match cat.edgeless_models() {
         Ok(m) => m,
@@ -682,7 +686,7 @@ pub(super) fn drain_inferred_texture_edges(cat: &mut Catalog) {
 /// `metrics_dirty` (DATA-MODEL §14). Runs on the persist thread's own connection like the embedding
 /// drains, but unconditionally — facets are plain measurements and must not depend on the AI stack
 /// being installed. A file we can't measure still gets its flag cleared (forward progress).
-pub(super) fn drain_metrics(
+pub fn drain_metrics(
     cat: &mut Catalog,
     workspace_dir: Option<&std::path::Path>,
     cache_dir: Option<&std::path::Path>,
@@ -793,7 +797,7 @@ fn store_vector_preview(
         .iter()
         .map(|v| vectorize::trace(v, vectorize::Bands::default()))
         .collect();
-    let svg = vectorize::to_svg(&traced, PREVIEW_RENDER_PX, crate::theme::MODEL_HEX);
+    let svg = vectorize::to_svg(&traced, PREVIEW_RENDER_PX, crate::types::MODEL_HEX);
     if let Err(e) = cat.set_vector_preview(asset_id, &svg, traced.len() as i64, &key) {
         tracing::debug!(%e, "storing vector preview failed");
     }
@@ -829,7 +833,7 @@ fn in_pack_pull_ok(size_bytes: i64, pack: &str) -> bool {
 /// Clip length via the decoder the player already uses. `total_duration` answers from the header
 /// for WAV/FLAC; formats that can't (some MP3s) report `None`, which stays "unknown" rather than
 /// paying for a full decode just to fill a stat row.
-pub(super) fn audio_duration_ms(path: &std::path::Path) -> Option<i64> {
+pub fn audio_duration_ms(path: &std::path::Path) -> Option<i64> {
     use rodio::Source;
     let file = std::fs::File::open(path).ok()?;
     let dec = rodio::Decoder::new(std::io::BufReader::new(file)).ok()?;
@@ -842,7 +846,7 @@ pub(super) fn audio_duration_ms(path: &std::path::Path) -> Option<i64> {
 /// count-neutral: the health meter and STATUS facet need the re-read.
 ///
 /// Runs on the persist thread's own connection — the sole writer (ARCHITECTURE §5).
-pub(super) fn drain_promote_resync(
+pub fn drain_promote_resync(
     cat: &mut Catalog,
     embedder: Option<Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
     audio_embedder: Option<Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
@@ -872,7 +876,7 @@ pub(super) fn drain_promote_resync(
 
 /// Re-read per-status counts + asset identities for `roots` after a drain has changed them.
 /// Shared by every drain path, so what the grid learns never depends on which one ran.
-pub(super) fn resync_after_drain(
+pub fn resync_after_drain(
     cat: &mut Catalog,
     roots: &[(String, String)],
 ) -> (Option<StatusCounts>, AssetIdentityMaps) {
@@ -908,7 +912,7 @@ pub(super) fn resync_after_drain(
 /// Forward progress is unconditional: an asset the tagger refuses (audio), one whose preview can't
 /// be made, and one the model answers nothing for all still clear `tags_dirty` via an empty write.
 /// Otherwise the queue would hand back the same rows forever.
-pub(super) fn drain_tags(
+pub fn drain_tags(
     cat: &mut Catalog,
     tagger: &dyn lodestash_ai::tagger::Tagger,
     zero_shot: Option<&lodestash_ai::image_tags::ImageZeroShot>,
@@ -1034,7 +1038,7 @@ pub(super) fn drain_tags(
 
 /// The cached preview PNG for `source`, decoded. `None` when the file can't be previewed at all
 /// (an audio clip, an unreadable model) — the caller then tags from the name alone.
-pub(super) fn tag_preview(
+pub fn tag_preview(
     source: &std::path::Path,
     cache_dir: &std::path::Path,
     px: u32,
@@ -1061,7 +1065,7 @@ pub(super) fn tag_preview(
 /// payload pulled into memory and decoded from bytes (DATA-MODEL §7 / M14). The in-pack path
 /// never writes to disk: identify surgically reads a single payload, one asset at a time.
 /// `None` = no source resolved / undecodable (the caller stores a zero vector to advance).
-pub(super) fn resolve_job_image(
+pub fn resolve_job_image(
     job: &lodestash_core::catalog::VisualEmbedJob,
     workspace_dir: Option<&std::path::Path>,
 ) -> Option<image::DynamicImage> {
@@ -1100,7 +1104,7 @@ pub(super) fn resolve_job_image(
 ///
 /// Opaque backdrop, unlike the thumbnail's transparent one — SigLIP reads RGB, so an alpha
 /// background composites to black and eats the ball's silhouette.
-pub(super) fn render_job_material(albedo: Option<&std::path::Path>) -> Option<image::RgbaImage> {
+pub fn render_job_material(albedo: Option<&std::path::Path>) -> Option<image::RgbaImage> {
     // A texture we can't decode is not a failure: the ball still shows the material's colour.
     let tex = albedo
         .and_then(|p| lodestash_ingest::raster::decode(p).ok())
@@ -1121,7 +1125,7 @@ pub(super) fn render_job_material(albedo: Option<&std::path::Path>) -> Option<im
 /// identify an in-pack asset without a workspace extraction. Serial + manual by design (INGESTION
 /// §2), so the pull-per-file cost is fine. `None` when nothing resolves (evicted workspace file, no
 /// locator). Keep the returned guard alive for as long as the path is used.
-pub(super) fn resolve_job_path(
+pub fn resolve_job_path(
     job: &lodestash_core::catalog::VisualEmbedJob,
     workspace_dir: Option<&std::path::Path>,
 ) -> Option<(std::path::PathBuf, Option<tempfile::TempPath>)> {
@@ -1163,7 +1167,7 @@ pub(super) fn resolve_job_path(
     None
 }
 
-pub(super) fn drain_image_embeddings(
+pub fn drain_image_embeddings(
     cat: &mut Catalog,
     emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync),
     workspace_dir: Option<&std::path::Path>,
