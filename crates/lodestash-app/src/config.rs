@@ -755,7 +755,7 @@ impl AppConfig {
     }
 }
 
-pub(crate) fn stem_name(path: &Path) -> String {
+pub fn stem_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned())

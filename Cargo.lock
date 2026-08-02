@@ -3857,6 +3857,9 @@ name = "lodestash-app"
 version = "0.1.0"
 dependencies = [
  "dirs 5.0.1",
+ "keyring",
+ "lodestash-ai",
+ "lodestash-api",
  "lodestash-core",
  "lodestash-ingest",
  "serde",
@@ -3940,7 +3943,6 @@ dependencies = [
  "egui_extras",
  "flate2",
  "image",
- "keyring",
  "lodestash-ai",
  "lodestash-api",
  "lodestash-app",
