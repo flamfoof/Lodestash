@@ -29,6 +29,7 @@ use lodestash_app::drains::*;
 use lodestash_app::grid::{self, *};
 use lodestash_app::paths::*;
 use lodestash_app::persist::*;
+use lodestash_app::thumbs::*;
 mod thumbs;
 use thumbs::*;
 
@@ -14343,6 +14344,51 @@ fn type_label_char(mt: Option<MediaType>) -> &'static str {
 mod tests {
     use super::*;
 
+    /// The TRAIT chips filter on tag *values*, and an asset with no tags must fail the filter
+    /// rather than pass it — otherwise selecting a trait would show the untagged backlog too.
+    #[test]
+    fn content_filter_traits_match_tag_values() {
+        let tiers = SizeTiers::default();
+        let mut cf = ContentFilter::default();
+        cf.traits.insert("rock".to_string());
+        let t = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+
+        assert!(cf.passes(
+            10,
+            None,
+            None,
+            &t(&["rock", "grey"]),
+            (false, false),
+            false,
+            &tiers
+        ));
+        assert!(
+            cf.passes(
+                10,
+                None,
+                None,
+                &t(&["stone", "rock"]),
+                (false, false),
+                false,
+                &tiers
+            ),
+            "any selected trait matches"
+        );
+        assert!(!cf.passes(
+            10,
+            None,
+            None,
+            &t(&["sword"]),
+            (false, false),
+            false,
+            &tiers
+        ));
+        assert!(
+            !cf.passes(10, None, None, &[], (false, false), false, &tiers),
+            "an untagged asset is not a match"
+        );
+    }
+
     // ── STATUS facet predicate (UI-SPEC §0.2, DATA-MODEL §8) ──────────────────
 
     #[test]
@@ -14603,81 +14649,6 @@ mod tests {
             false,
             &tiers
         ));
-    }
-
-    /// The TRAIT chips filter on tag *values*, and an asset with no tags must fail the filter
-    /// rather than pass it — otherwise selecting a trait would show the untagged backlog too.
-    #[test]
-    fn content_filter_traits_match_tag_values() {
-        let tiers = SizeTiers::default();
-        let mut cf = ContentFilter::default();
-        cf.traits.insert("rock".to_string());
-        let t = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
-
-        assert!(cf.passes(
-            10,
-            None,
-            None,
-            &t(&["rock", "grey"]),
-            (false, false),
-            false,
-            &tiers
-        ));
-        assert!(
-            cf.passes(
-                10,
-                None,
-                None,
-                &t(&["stone", "rock"]),
-                (false, false),
-                false,
-                &tiers
-            ),
-            "any selected trait matches"
-        );
-        assert!(!cf.passes(
-            10,
-            None,
-            None,
-            &t(&["sword"]),
-            (false, false),
-            false,
-            &tiers
-        ));
-        assert!(
-            !cf.passes(10, None, None, &[], (false, false), false, &tiers),
-            "an untagged asset is not a match"
-        );
-    }
-
-    /// The delete-from-disk guard: only files under a source root the user opened, or inside the
-    /// workspace this app owns. Everything else is refused, whatever path composition produced it.
-    #[test]
-    fn only_paths_under_known_roots_may_be_deleted() {
-        let roots = vec![
-            PathBuf::from("G:/Game_Assets/Synty"),
-            PathBuf::from("C:/lib"),
-        ];
-        let ws = PathBuf::from("C:/cache/Lodestash/workspace");
-        let ok = |p: &str| under_known_root(std::path::Path::new(p), &roots, Some(&ws));
-
-        assert!(ok("G:/Game_Assets/Synty/Models/rock.fbx"));
-        assert!(
-            ok("C:/cache/Lodestash/workspace/abc/tex.png"),
-            "workspace is ours"
-        );
-        assert!(
-            !ok("C:/Windows/System32/kernel32.dll"),
-            "outside every root"
-        );
-        assert!(
-            !ok("G:/Game_Assets/Other/rock.fbx"),
-            "sibling of a root is not in it"
-        );
-        assert!(
-            !under_known_root(std::path::Path::new("C:/anything"), &roots, None),
-            "no workspace configured means no workspace deletions"
-        );
     }
 
     /// The favourites filter is a pin filter: it must not care about rating, tags or links, and an

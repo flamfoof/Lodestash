@@ -15,4 +15,5 @@ pub mod jobs;
 pub mod models;
 pub mod paths;
 pub mod persist;
+pub mod thumbs;
 pub mod types;
