@@ -36,6 +36,13 @@ use grid::*;
 
 // ── Category tabs ─────────────────────────────────────────────────────────────
 
+/// `types::AssetEntry` wearing egui's texture handle.
+///
+/// The shared type is generic over the preview handle so it can live in a crate with no
+/// renderer; this alias pins it for the egui shell and shadows the glob import above, so every
+/// bare `AssetEntry` in this file keeps working unchanged. It disappears with the crate at B7.
+type AssetEntry = crate::types::AssetEntry<TextureHandle>;
+
 // ── Screen chrome (egui-only halves of `types::Screen`) ───────────────────────
 
 /// White-stroke SVG nav icon (tinted per row state in the sidebar). Design icons from
@@ -73,78 +80,6 @@ fn screen_glyph_color(screen: Screen) -> egui::Color32 {
 }
 
 // ── Asset entry ───────────────────────────────────────────────────────────────
-
-struct AssetEntry {
-    /// Extracted-package origin (the sidebar "package library" facet). None for plain
-    /// on-disk files. ponytail: session-only — rehydration re-derives it when the
-    /// catalog packages model lands (P2 card).
-    package: Option<String>,
-    file: CrawledFile,
-    /// Index into `scan_roots` — which source this asset came from (the Library Source).
-    source_idx: usize,
-    /// Catalog identity, attached when the write-behind persist reads back
-    /// (None until then, or for files the catalog doesn't hold — unclassified).
-    asset_id: Option<i64>,
-    /// Catalog lifecycle status (DATA-MODEL §8); entries default to Discovered
-    /// until the read-back lands.
-    status: AssetStatus,
-    /// In the Trash (catalog-only soft delete; files on disk untouched). Hidden from
-    /// the grid, listed on the Trash screen (DATA-MODEL §8).
-    trashed: bool,
-    /// 1..=5 stars; None = unrated (DATA-MODEL §12).
-    rating: Option<u8>,
-    /// Technical facets extracted from the file (DATA-MODEL §14); all-None until the
-    /// extraction drain has reached this asset.
-    metrics: lodestash_core::catalog::AssetMetrics,
-    /// BLAKE3 hash of the primary file; exact-dedup key for the Duplicates badge.
-    content_hash: Option<String>,
-    texture: Option<TextureHandle>,
-    thumb_spawned: bool,
-}
-
-/// Build the whole folder hierarchy for one pack's assets, path-sorted, each node carrying its
-/// direct and recursive asset counts (DATA-MODEL §7 pack browse). Pure over the entry list so it is
-/// unit-testable; the UI caches it and rebuilds it with the grid cache. Complement of
-/// [`folder_children`], which resolves a single level — this is the full tree the left pane draws.
-fn build_pack_dir_tree(entries: &[AssetEntry], src: usize, pack: &str) -> Vec<DirNode> {
-    use std::collections::BTreeMap;
-    // dir path → (direct assets in it, recursive assets under it). BTreeMap keeps path order.
-    let mut counts: BTreeMap<PathBuf, (usize, usize)> = BTreeMap::new();
-    for e in entries {
-        if e.source_idx != src || e.trashed || e.package.as_deref() != Some(pack) {
-            continue;
-        }
-        let Some(parent) = e.file.rel_path.parent() else {
-            continue;
-        };
-        // Every ancestor dir counts the file recursively; only its immediate parent counts it direct.
-        let mut dir = PathBuf::new();
-        for comp in parent.components() {
-            dir.push(comp);
-            let slot = counts.entry(dir.clone()).or_insert((0, 0));
-            slot.1 += 1;
-            if dir == parent {
-                slot.0 += 1;
-            }
-        }
-    }
-    let paths: Vec<PathBuf> = counts.keys().cloned().collect();
-    paths
-        .iter()
-        .map(|p| DirNode {
-            name: p
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            depth: p.components().count(),
-            direct: counts[p].0,
-            recursive: counts[p].1,
-            // Component-wise prefix: `Assets/AB` is not a child of `Assets/A`.
-            has_children: paths.iter().any(|q| q != p && q.starts_with(p)),
-            path: p.clone(),
-        })
-        .collect()
-}
 
 struct ThumbReady {
     index: usize,

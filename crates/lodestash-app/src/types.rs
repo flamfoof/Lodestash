@@ -70,6 +70,84 @@ impl Category {
     }
 }
 
+pub struct AssetEntry<T = ()> {
+    /// Extracted-package origin (the sidebar "package library" facet). None for plain
+    /// on-disk files. ponytail: session-only — rehydration re-derives it when the
+    /// catalog packages model lands (P2 card).
+    pub package: Option<String>,
+    pub file: CrawledFile,
+    /// Index into `scan_roots` — which source this asset came from (the Library Source).
+    pub source_idx: usize,
+    /// Catalog identity, attached when the write-behind persist reads back
+    /// (None until then, or for files the catalog doesn't hold — unclassified).
+    pub asset_id: Option<i64>,
+    /// Catalog lifecycle status (DATA-MODEL §8); entries default to Discovered
+    /// until the read-back lands.
+    pub status: AssetStatus,
+    /// In the Trash (catalog-only soft delete; files on disk untouched). Hidden from
+    /// the grid, listed on the Trash screen (DATA-MODEL §8).
+    pub trashed: bool,
+    /// 1..=5 stars; None = unrated (DATA-MODEL §12).
+    pub rating: Option<u8>,
+    /// Technical facets extracted from the file (DATA-MODEL §14); all-None until the
+    /// extraction drain has reached this asset.
+    pub metrics: lodestash_core::catalog::AssetMetrics,
+    /// BLAKE3 hash of the primary file; exact-dedup key for the Duplicates badge.
+    pub content_hash: Option<String>,
+    /// Frontend-owned preview handle. Generic so this type carries no renderer: the egui shell
+    /// instantiates it with `egui::TextureHandle`, headless callers leave it as `()`.
+    ///
+    /// It stays a field rather than a side table keyed by entry index because `entries` is
+    /// rebuilt from a filtered subset on a partial rescan — indices shift, and a side table
+    /// would silently pair a card with another asset's thumbnail.
+    pub texture: Option<T>,
+    pub thumb_spawned: bool,
+}
+
+/// Build the whole folder hierarchy for one pack's assets, path-sorted, each node carrying its
+/// direct and recursive asset counts (DATA-MODEL §7 pack browse). Pure over the entry list so it is
+/// unit-testable; the UI caches it and rebuilds it with the grid cache. Complement of
+/// [`folder_children`], which resolves a single level — this is the full tree the left pane draws.
+pub fn build_pack_dir_tree<T>(entries: &[AssetEntry<T>], src: usize, pack: &str) -> Vec<DirNode> {
+    use std::collections::BTreeMap;
+    // dir path → (direct assets in it, recursive assets under it). BTreeMap keeps path order.
+    let mut counts: BTreeMap<PathBuf, (usize, usize)> = BTreeMap::new();
+    for e in entries {
+        if e.source_idx != src || e.trashed || e.package.as_deref() != Some(pack) {
+            continue;
+        }
+        let Some(parent) = e.file.rel_path.parent() else {
+            continue;
+        };
+        // Every ancestor dir counts the file recursively; only its immediate parent counts it direct.
+        let mut dir = PathBuf::new();
+        for comp in parent.components() {
+            dir.push(comp);
+            let slot = counts.entry(dir.clone()).or_insert((0, 0));
+            slot.1 += 1;
+            if dir == parent {
+                slot.0 += 1;
+            }
+        }
+    }
+    let paths: Vec<PathBuf> = counts.keys().cloned().collect();
+    paths
+        .iter()
+        .map(|p| DirNode {
+            name: p
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            depth: p.components().count(),
+            direct: counts[p].0,
+            recursive: counts[p].1,
+            // Component-wise prefix: `Assets/AB` is not a child of `Assets/A`.
+            has_children: paths.iter().any(|q| q != p && q.starts_with(p)),
+            path: p.clone(),
+        })
+        .collect()
+}
+
 /// Sort order for the Unity Assets package list (FEATURES.md §5.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UnitySort {
