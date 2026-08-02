@@ -27,3 +27,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Read-only catalog access. The desktop shell holds its own connection and never writes:
+# every write goes through the persist thread (ARCHITECTURE §5, single writer).
+lodestash-core = { workspace = true }
+lodestash-app = { workspace = true }

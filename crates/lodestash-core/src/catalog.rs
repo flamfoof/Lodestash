@@ -3826,6 +3826,82 @@ impl Catalog {
             .is_some_and(|(_, key)| key == source_key))
     }
 
+    /// Models that have no stored vector preview yet.
+    ///
+    /// Preview generation used to ride inside the metrics drain, which visits only
+    /// `metrics_dirty = 1` rows. That silently did nothing on any library indexed before previews
+    /// existed: those assets were already metriced, so they were never revisited and never got a
+    /// preview. This queue asks the question previews actually depend on — "is there a row in
+    /// `asset_preview`?" — so a backlog drains once and stays drained.
+    /// `after_id` is an exclusive cursor. A model whose preview generation *fails* writes no
+    /// `asset_preview` row, so it stays in this queue; without a cursor a drain would re-attempt
+    /// the same broken batch on every pass and never reach the models behind it. The caller
+    /// advances the cursor past everything it attempted, successful or not.
+    pub fn assets_needing_preview(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<VisualEmbedJob>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT a.id,
+                        CASE WHEN af.workspace_rel IS NULL AND af.package_entry_id IS NULL
+                             THEN s.root_path || '/' || af.rel_path END,
+                        af.workspace_rel, a.media_type_id, a.source_id, mt.code,
+                        pk.package_path, pe.tar_offset, pe.size_bytes, af.ext
+                 FROM asset a
+                 JOIN media_type mt   ON mt.id = a.media_type_id
+                 JOIN import_source s ON s.id = a.source_id
+                 JOIN asset_file af   ON af.id = a.primary_file_id
+                 LEFT JOIN package_entry pe ON pe.id = af.package_entry_id
+                 LEFT JOIN package pk       ON pk.id = pe.package_id
+                 LEFT JOIN asset_preview ap ON ap.asset_id = a.id
+                 WHERE mt.code = 'model_3d'
+                   AND ap.asset_id IS NULL
+                   AND a.id > ?1
+                   AND a.deleted_at IS NULL
+                   AND af.missing = 0
+                 ORDER BY a.id LIMIT ?2",
+            )
+            .map_err(|e| CoreError::Catalog(format!("preview queue prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![after_id, limit as i64], |r| {
+                Ok(VisualEmbedJob {
+                    asset_id: r.get(0)?,
+                    disk_path: r.get(1)?,
+                    workspace_rel: r.get(2)?,
+                    media_type_id: r.get(3)?,
+                    source_id: r.get(4)?,
+                    media_code: r.get(5)?,
+                    pack_path: r.get(6)?,
+                    pack_offset: r.get(7)?,
+                    pack_size: r.get(8)?,
+                    ext: r.get(9)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("preview queue: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("preview queue row: {e}")))
+    }
+
+    /// Every asset id carrying a stored preview.
+    ///
+    /// One query for the whole library rather than `vector_preview` per row: a grid deciding
+    /// which cards can draw vector previews asks about thousands of assets at once, and the
+    /// answer is a set of ids, not blobs — the blobs are fetched per card over `ls://`.
+    pub fn assets_with_preview(&self) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT asset_id FROM asset_preview")
+            .map_err(|e| CoreError::Catalog(format!("assets_with_preview: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))
+            .map_err(|e| CoreError::Catalog(format!("assets_with_preview: {e}")))?;
+        rows.collect::<std::result::Result<Vec<i64>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("assets_with_preview: {e}")))
+    }
+
     /// Total bytes of stored previews — the catalog half of the footprint the Storage settings
     /// report, now that previews are rows rather than cache files.
     pub fn vector_preview_bytes(&self) -> Result<i64> {
@@ -4147,6 +4223,72 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
         assert_eq!(version, 15, "all 15 migrations should have run");
+    }
+
+    /// The regression this queue exists for: previews used to be generated only inside the metrics
+    /// drain, which visits `metrics_dirty = 1` rows. On a library indexed before previews existed
+    /// every asset is already clean, so nothing was ever revisited and the grid stayed blank
+    /// forever. A model with no preview must surface here regardless of `metrics_dirty`.
+    #[test]
+    fn preview_queue_finds_clean_models_and_walks_past_failures() {
+        let mut catalog = Catalog::open_in_memory().expect("catalog open");
+        catalog.seed_media_types().expect("seed");
+        let source = catalog
+            .upsert_import_source("Lib", "C:/lib", "folder")
+            .expect("source");
+        let model = |rel: &str| CrawlRecord {
+            media_type: "model_3d".to_string(),
+            ..rec(rel, 1, 1)
+        };
+        catalog
+            .record_crawl(
+                source,
+                None,
+                &[model("a.fbx"), model("b.fbx"), rec("tex.png", 1, 1)],
+            )
+            .expect("crawl");
+        // Exactly what the real catalog looked like: everything already measured.
+        catalog
+            .conn
+            .execute("UPDATE asset SET metrics_dirty = 0", [])
+            .expect("clean");
+
+        let ids: Vec<i64> = catalog
+            .assets_needing_preview(0, 10)
+            .expect("queue")
+            .iter()
+            .map(|j| j.asset_id)
+            .collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "both clean models queue; the texture does not"
+        );
+
+        // A model whose render fails writes no row, so it stays queued. The cursor is what stops
+        // it from wedging the queue ahead of everything behind it.
+        let after_first = catalog
+            .assets_needing_preview(ids[0], 10)
+            .expect("queue")
+            .iter()
+            .map(|j| j.asset_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            after_first,
+            vec![ids[1]],
+            "cursor advances past the failure"
+        );
+
+        catalog
+            .set_vector_preview(ids[0], "<svg/>", 4, "k")
+            .expect("store");
+        let left: Vec<i64> = catalog
+            .assets_needing_preview(0, 10)
+            .expect("queue")
+            .iter()
+            .map(|j| j.asset_id)
+            .collect();
+        assert_eq!(left, vec![ids[1]], "a stored preview leaves the queue");
     }
 
     #[test]

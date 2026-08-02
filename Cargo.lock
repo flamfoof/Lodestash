@@ -3891,6 +3891,8 @@ dependencies = [
 name = "lodestash-desktop"
 version = "0.1.0"
 dependencies = [
+ "lodestash-app",
+ "lodestash-core",
  "serde",
  "serde_json",
  "tauri",

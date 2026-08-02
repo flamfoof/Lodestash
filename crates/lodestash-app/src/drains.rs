@@ -749,6 +749,79 @@ pub fn drain_metrics(
     }
 }
 
+/// Generate vector previews for models that have none.
+///
+/// The metrics drain also produces previews, because it is the one place that already has the mesh
+/// parsed — but it only visits `metrics_dirty` rows. That leaves every model indexed *before*
+/// previews existed with no preview and no path to ever getting one, since nothing re-dirties an
+/// unchanged file. This drain closes that hole: it asks the catalog which models lack a preview
+/// and fills them in, so an existing library converges instead of staying blank forever.
+///
+/// Runs on the persist thread with the writer connection, like every other drain (ARCHITECTURE §5).
+/// In-pack assets are skipped for the same reason as in the metrics path — a scratch file has no
+/// stable identity to key a preview on.
+/// How long one pass may spend backfilling previews. Four 256px CPU renders per model is tens of
+/// milliseconds each, so a few thousand models is minutes — too long to hold the persist thread
+/// away from scans and mutations in one go.
+pub const PREVIEW_BACKFILL_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+pub fn drain_previews(
+    cat: &mut Catalog,
+    workspace_dir: Option<&std::path::Path>,
+    cache_dir: Option<&std::path::Path>,
+    proxy: lodestash_ingest::decimate::Budget,
+    budget: std::time::Duration,
+) -> usize {
+    const BATCH: usize = 16;
+    let Some(dir) = cache_dir else {
+        return 0;
+    };
+    let started = std::time::Instant::now();
+    let mut total = 0usize;
+    let mut cursor = 0i64;
+    loop {
+        // Time-boxed rather than run-to-completion: four CPU renders per model over a few
+        // thousand models is minutes of work, and it must not hold the persist thread away from
+        // scans and mutations. The queue is durable, so the next pass picks up where this left off.
+        if started.elapsed() >= budget {
+            break;
+        }
+        let jobs = match cat.assets_needing_preview(cursor, BATCH) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(%e, "preview queue query failed; retries next pass");
+                break;
+            }
+        };
+        if jobs.is_empty() {
+            break;
+        }
+        let n = jobs.len();
+        for job in jobs {
+            // Advance past every id we look at, successful or not, so a model that fails to
+            // render cannot wedge the queue ahead of the ones behind it.
+            cursor = cursor.max(job.asset_id);
+            let resolved = resolve_job_path(&job, workspace_dir);
+            let is_scratch = resolved.as_ref().is_some_and(|(_, g)| g.is_some());
+            let Some((p, _)) = resolved.as_ref() else {
+                continue;
+            };
+            if is_scratch {
+                continue;
+            }
+            store_vector_preview(cat, job.asset_id, p, &job.media_code, dir, proxy);
+            total += 1;
+        }
+        if n < BATCH {
+            break;
+        }
+    }
+    if total > 0 {
+        tracing::info!(previews = total, "vector previews generated");
+    }
+    total
+}
+
 /// Render `path`'s four orbit views from its low-poly proxy, trace them into one contour SVG and
 /// store it on the asset (M15). Only 3D models — a texture has pixels of its own and audio has a
 /// waveform, so neither gains anything from being vectorised.
@@ -856,6 +929,17 @@ pub fn drain_promote_resync(
     roots: &[(String, String)],
 ) -> (Option<StatusCounts>, AssetIdentityMaps) {
     drain_metrics(cat, workspace_dir, cache_dir, proxy);
+    // Backfill previews for models the metrics drain will never revisit — anything indexed before
+    // previews existed is already clean, so without this it stays blank forever. Time-boxed so a
+    // few thousand models don't hold the persist thread; the queue is durable and converges over
+    // successive passes.
+    drain_previews(
+        cat,
+        workspace_dir,
+        cache_dir,
+        proxy,
+        PREVIEW_BACKFILL_BUDGET,
+    );
     drain_dependencies(cat, workspace_dir);
     if let Some(emb) = embedder {
         drain_image_embeddings(cat, emb.as_ref(), workspace_dir, cache_dir);
