@@ -603,6 +603,14 @@ fixture.
   captures the **whole window** while `GetClientRect` reports the **client area**, so image
   coordinates are offset by the title bar (~31 px) before you convert them. When a click won't
   land, verify the mechanism headlessly instead of burning the session on input synthesis.
+- **The Tauri shell is the exception: synthetic input *does* land, on the right HWND.** Posting to
+  the top-level window does nothing, which reads exactly like the egui case above and cost a session
+  before it was pinned down. WebView2 nests its input target four levels down —
+  `WRY_WEBVIEW` → `Chrome_WidgetWin_0` → `Chrome_WidgetWin_1` → **`Chrome_RenderWidgetHostHWND`** —
+  and `PostMessage(WM_LBUTTONDOWN/UP)` plus `WM_CHAR` to *that* handle drive the page reliably.
+  Walk the chain with `FindWindowEx`; convert screen coordinates into that child's client space
+  (`GetWindowRect` on the child, not the parent). Unlike Glow, the webview also screenshots
+  correctly under `PrintWindow`, so the Svelte UI can be verified visually end to end.
 - **Screenshot to a fresh filename every time.** Re-reading the same path served a *stale* image
   twice in a row, once hiding a fix that had actually worked and once hiding that the capture script
   was pointed at a dead PID (PrintWindow on an invalid handle leaves the old file in place). Write
