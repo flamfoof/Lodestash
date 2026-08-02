@@ -26,6 +26,14 @@ pub struct GridItem {
     pub rating: Option<u8>,
     /// True when `asset_preview` holds a traced vector preview for this asset (M15).
     pub has_preview: bool,
+    /// Starred (DATA-MODEL §12). Carried on the item so a card can draw the pin without a
+    /// second round-trip per asset.
+    pub favorite: bool,
+    /// The bytes are still inside a `.unitypackage` (DATA-MODEL §7 / M14). Browsable and
+    /// searchable, but `ls://file` answers 503 rather than extracting — pulling is a command.
+    pub in_pack: bool,
+    /// Owning pack name, for in-pack assets.
+    pub package: Option<String>,
     pub triangles: Option<i64>,
 }
 
@@ -43,6 +51,9 @@ pub struct GridQuery {
     /// BM25 ranks, which arrive with FTS search).
     pub sort_by: String,
     pub sort_asc: bool,
+    /// Restrict to starred assets — what the Favorites screen is (FEATURES §4.7). A one-way
+    /// switch: "not favourited" is not a thing anyone browses for.
+    pub favorites_only: bool,
     pub page: usize,
     pub page_size: usize,
 }
@@ -55,6 +66,7 @@ impl Default for GridQuery {
             status: "all".into(),
             sort_by: "name".into(),
             sort_asc: true,
+            favorites_only: false,
             page: 0,
             page_size: 100,
         }
@@ -108,6 +120,11 @@ pub struct LibraryStatus {
     pub catalog_path: Option<String>,
     pub sources: Vec<SourceSummary>,
     pub total_assets: usize,
+    /// Assets whose bytes are still inside a `.unitypackage`. On a real Unity library this is
+    /// the majority — 5,963 of 7,691 here — so a zero means a hydrate query is missing, not
+    /// that the library has no packs.
+    pub in_pack: usize,
+    pub favorites: usize,
     /// Assets carrying a stored vector preview — the honest measure of how much of the grid
     /// can draw without touching a mesh.
     pub with_preview: usize,
@@ -191,6 +208,7 @@ impl Library {
             }
         };
 
+        let (_, workspace_dir) = lodestash_app::paths::default_cache_dirs();
         let mut rows = Vec::new();
         let mut paths = HashMap::new();
         let mut sources = Vec::new();
@@ -207,31 +225,46 @@ impl Library {
                 if e.trashed {
                     continue;
                 }
-                let name = Path::new(&e.rel_path)
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| e.rel_path.clone());
                 paths.insert(e.asset_id, root.join(&e.rel_path));
-                rows.push(Row {
-                    search_key: name.to_lowercase(),
-                    mtime: e.mtime,
-                    width_px: e.metrics.width_px,
-                    height_px: e.metrics.height_px,
-                    duration_ms: e.metrics.duration_ms,
-                    source: Some(info.name.clone()),
-                    item: GridItem {
-                        asset_id: e.asset_id,
-                        name,
-                        rel_path: e.rel_path,
-                        media_type: e.media_type,
-                        size_bytes: e.size_bytes,
-                        status: e.status,
-                        rating: e.rating,
-                        // Filled in below in one pass rather than a query per row.
-                        has_preview: false,
-                        triangles: e.metrics.tri_count,
-                    },
-                });
+                rows.push(row_from(e, &info.name, None));
+            }
+
+            // In-pack rows are the bulk of a real library — on this machine 5,963 of 8,237 live
+            // assets. Loading only `entries_for_source` showed ~21% of the catalog with nothing
+            // saying so, which reads as a small library rather than a missing query.
+            match cat.in_pack_entries_for_source(info.id) {
+                Ok(v) => {
+                    for e in v {
+                        if e.asset.trashed {
+                            continue;
+                        }
+                        // No local path: `ls://file` resolves nothing and answers 503 not_local,
+                        // which is the correct read-only behaviour — extraction is a command.
+                        rows.push(row_from(e.asset, &info.name, Some(e.package_name)));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(%e, source = %info.name, "in_pack_entries_for_source failed")
+                }
+            }
+
+            // Extracted-package rows (workspace_rel). Empty on this catalog, but a library that
+            // has unpacked anything would otherwise lose those assets the same way.
+            match cat.extracted_entries_for_source(info.id) {
+                Ok(v) => {
+                    for e in v {
+                        if e.asset.trashed {
+                            continue;
+                        }
+                        if let Some(ws) = workspace_dir.as_ref() {
+                            paths.insert(e.asset.asset_id, ws.join(&e.workspace_rel));
+                        }
+                        rows.push(row_from(e.asset, &info.name, Some(e.package_name)));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(%e, source = %info.name, "extracted_entries_for_source failed")
+                }
             }
             sources.push(SourceSummary {
                 id: info.id,
@@ -246,6 +279,25 @@ impl Library {
         self.paths = paths;
         self.sources = sources;
         self.mark_previews();
+        self.mark_favorites();
+    }
+
+    /// Flag starred rows, in one query rather than one per row.
+    fn mark_favorites(&mut self) {
+        let Some(cat) = self.catalog.as_ref() else {
+            return;
+        };
+        let ids = match cat.favorite_ids() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(%e, "favorite_ids failed");
+                return;
+            }
+        };
+        let set: std::collections::HashSet<i64> = ids.into_iter().collect();
+        for r in &mut self.rows {
+            r.item.favorite = set.contains(&r.item.asset_id);
+        }
     }
 
     /// Flag which rows have a stored vector preview, in one query instead of one per row.
@@ -275,6 +327,8 @@ impl Library {
                 .map(|p| p.to_string_lossy().into_owned()),
             sources: self.sources.clone(),
             total_assets: self.rows.len(),
+            in_pack: self.rows.iter().filter(|r| r.item.in_pack).count(),
+            favorites: self.rows.iter().filter(|r| r.item.favorite).count(),
             with_preview: self.rows.iter().filter(|r| r.item.has_preview).count(),
         }
     }
@@ -287,6 +341,7 @@ impl Library {
             .iter()
             .filter(|r| tab_matches(&q.tab, &r.item.media_type))
             .filter(|r| status_matches(&q.status, &r.item.status))
+            .filter(|r| !q.favorites_only || r.item.favorite)
             .filter(|r| needle.is_empty() || r.search_key.contains(&needle))
             .collect();
 
@@ -368,14 +423,21 @@ impl Library {
             height_px: row.height_px,
             duration_ms: row.duration_ms,
             source: row.source.clone(),
-            // The bytes live inside a `.unitypackage` until it is materialized; `ls://file`
-            // answers 503 for these rather than extracting, so the UI must be able to say so.
-            in_pack: abs.map_or(true, |p| !p.exists()),
+            in_pack: row.item.in_pack,
         })
     }
 
     pub fn asset_path(&self, asset_id: i64) -> Option<&Path> {
         self.paths.get(&asset_id).map(|p| p.as_path())
+    }
+
+    /// Is this an asset we know about at all?
+    ///
+    /// Distinguishes "no such id" from "known, but its bytes are inside a pack" — the two need
+    /// different answers over `ls://file` (404 vs 503 `not_local`), and conflating them tells a
+    /// client the asset does not exist when it is sitting in the grid in front of the user.
+    pub fn knows(&self, asset_id: i64) -> bool {
+        self.rows.iter().any(|r| r.item.asset_id == asset_id)
     }
 
     pub fn preview_svg(&self, asset_id: i64) -> Option<String> {
@@ -384,6 +446,44 @@ impl Library {
             .ok()
             .flatten()
             .map(|(svg, _)| svg)
+    }
+}
+
+/// Build a grid row from a hydrated catalog entry, whatever storage class it came from.
+///
+/// `package` is `Some` for assets that live inside a pack — those have no local path, so the
+/// row is browsable and searchable while `ls://file` correctly answers 503.
+fn row_from(
+    e: lodestash_core::catalog::HydratedAsset,
+    source: &str,
+    package: Option<String>,
+) -> Row {
+    let name = Path::new(&e.rel_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| e.rel_path.clone());
+    Row {
+        search_key: name.to_lowercase(),
+        mtime: e.mtime,
+        width_px: e.metrics.width_px,
+        height_px: e.metrics.height_px,
+        duration_ms: e.metrics.duration_ms,
+        source: Some(source.to_string()),
+        item: GridItem {
+            asset_id: e.asset_id,
+            name,
+            rel_path: e.rel_path,
+            media_type: e.media_type,
+            size_bytes: e.size_bytes,
+            status: e.status,
+            rating: e.rating,
+            // Preview and favourite flags are filled in one pass each, not a query per row.
+            has_preview: false,
+            favorite: false,
+            in_pack: package.is_some(),
+            package,
+            triangles: e.metrics.tri_count,
+        },
     }
 }
 
@@ -434,6 +534,9 @@ mod tests {
                     status: "indexed".into(),
                     rating: None,
                     has_preview: false,
+                    favorite: false,
+                    in_pack: false,
+                    package: None,
                     triangles: None,
                 },
             })
@@ -533,6 +636,46 @@ mod tests {
         for s in ["discovered", "indexed", "identified", "confirmed"] {
             assert!(status_matches("all", s), "{s} must pass All");
         }
+    }
+
+    /// Favorites is a *filter over the library*, not a separate screen with its own data. The
+    /// bug this guards: routing Favorites at the same grid without passing the flag renders the
+    /// entire library under a "Favorites" heading, which reads as "you have starred everything".
+    #[test]
+    fn favorites_only_narrows_to_starred_assets() {
+        let mut l = lib(&[("a", "model_3d"), ("b", "model_3d"), ("c", "audio")]);
+        l.rows[1].item.favorite = true;
+
+        let all = l.page(&GridQuery::default());
+        assert_eq!(all.total, 3, "the unfiltered grid still shows everything");
+
+        let starred = l.page(&GridQuery {
+            favorites_only: true,
+            ..Default::default()
+        });
+        assert_eq!(starred.total, 1);
+        assert_eq!(starred.items[0].name, "b");
+        assert!(starred.items.iter().all(|i| i.favorite));
+    }
+
+    /// Favourites compose with the other facets rather than replacing them — a starred audio
+    /// file must not appear under Favorites + Models.
+    #[test]
+    fn favorites_compose_with_tab_and_search() {
+        let mut l = lib(&[("rock", "model_3d"), ("rain", "audio")]);
+        for r in &mut l.rows {
+            r.item.favorite = true;
+        }
+        let q = GridQuery {
+            favorites_only: true,
+            tab: "models".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            l.page(&q).total,
+            1,
+            "the audio favourite is excluded by the tab"
+        );
     }
 
     #[test]

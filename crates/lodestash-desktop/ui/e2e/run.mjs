@@ -36,8 +36,23 @@ try {
     assert.ok(s.sources.length > 0, "catalog has no sources");
   });
 
+  // The bug this exists for: `Library` loaded only `entries_for_source`, which filters
+  // `package_id IS NULL`. That showed 1,728 of 7,691 assets — 21% of the library — with nothing
+  // saying so. It reads as a small library, not a missing query, so it never gets reported.
+  await check("in-pack assets are loaded, not just plain on-disk files", async () => {
+    const s = await invoke("library_status");
+    assert.ok(s.in_pack > 0, "no in-pack assets loaded — a hydrate query is missing");
+    assert.ok(
+      s.in_pack < s.total_assets,
+      "every asset is in-pack, which means the on-disk query is missing instead",
+    );
+  });
+
   await check("the grid renders a card per returned item", async () => {
-    const p = await invoke("grid_page", { query: { tab: "all", search: "", page: 0, page_size: 100 } });
+    const p = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100 },
+    });
     const cards = await page.locator(".card").count();
     assert.equal(cards, p.items.length, "DOM card count disagrees with grid_page");
   });
@@ -103,19 +118,74 @@ try {
     assert.equal(un + id + conf, all, "the three status buckets must partition the library");
   });
 
+  // Favorites is a filter over the library, not its own dataset. Routing it at the same grid
+  // without passing the flag shows the whole library under a "Favorites" heading — which reads
+  // as "everything is starred" rather than as a bug, so nobody reports it.
+  await check("the Favorites route narrows to starred assets", async () => {
+    const s = await invoke("library_status");
+    const all = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 1 },
+    });
+    const fav = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: true, page: 0, page_size: 500 },
+    });
+    assert.equal(fav.total, s.favorites, "the filter must agree with the catalog's own count");
+    assert.ok(fav.total <= all.total, "favourites cannot exceed the library");
+    assert.ok(fav.items.every((i) => i.favorite), "every returned item must be starred");
+  });
+
+  // The check above exercises the Rust filter but calls `invoke` directly, so it would pass even
+  // with the routing bug intact. This one goes through the sidebar, which is where the defect
+  // actually was: the route rendered the shared grid without passing the flag.
+  await check("clicking Favorites in the nav shows only starred cards", async () => {
+    await page.fill('input[type="text"]', "");
+    const s = await invoke("library_status");
+    await page.getByRole("button", { name: "Favorites" }).click();
+    await page.waitForFunction(
+      (n) => document.querySelector("h1")?.textContent?.trim() === "Favorites" &&
+             (document.querySelectorAll(".card").length === n ||
+              document.querySelector('[data-testid="empty"]') !== null),
+      s.favorites,
+      { timeout: 5000 },
+    );
+    const cards = await page.locator(".card").count();
+    assert.equal(cards, s.favorites, `Favorites rendered ${cards} cards for ${s.favorites} favourites`);
+    const starred = await page
+      .locator(".card")
+      .evaluateAll((els) => els.filter((e) => e.querySelector(".star")).length);
+    assert.equal(starred, cards, "every card on Favorites must carry the star");
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.waitForTimeout(500);
+  });
+
   await check("ls:// serves a preview as SVG", async () => {
-    const r = await page.evaluate(async (src) => {
-      const res = await fetch(src);
+    // Ask for an asset that actually has a preview rather than whatever is on screen — which
+    // page 1 shows depends on the sort, and most of this library is in-pack with no preview.
+    const p = await invoke("grid_page", {
+      query: { tab: "models", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    const withPreview = p.items.find((i) => i.has_preview);
+    assert.ok(withPreview, "no asset in the library has a stored preview");
+    const r = await page.evaluate(async (id) => {
+      const res = await fetch(`http://ls.localhost/preview/${id}.svg`);
       return { status: res.status, type: res.headers.get("content-type"), len: (await res.text()).length };
-    }, await page.locator(".thumb img").first().getAttribute("src"));
+    }, withPreview.asset_id);
     assert.equal(r.status, 200);
     assert.equal(r.type, "image/svg+xml");
     assert.ok(r.len > 100, "preview body is implausibly small");
   });
 
   await check("ls://file honours Range with a 206 and the right window", async () => {
-    const p = await invoke("grid_page", { query: { tab: "all", search: "", page: 0, page_size: 50 } });
-    const id = p.items[0].asset_id;
+    // Must be an on-disk asset: most of this library is in-pack, and those correctly answer 503.
+    const p = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    const local = p.items.find((i) => !i.in_pack);
+    assert.ok(local, "no on-disk asset in the library to range-request");
     const r = await page.evaluate(async (assetId) => {
       const res = await fetch(`http://ls.localhost/file/${assetId}`, {
         headers: { Range: "bytes=10-19" },
@@ -126,11 +196,28 @@ try {
         accept: res.headers.get("accept-ranges"),
         len: (await res.arrayBuffer()).byteLength,
       };
-    }, id);
-    assert.equal(r.status, 206, `expected 206, got ${r.status} (503 means the file is in-pack)`);
+    }, local.asset_id);
+    assert.equal(r.status, 206, `expected 206, got ${r.status}`);
     assert.equal(r.len, 10, "a 10-byte window must return 10 bytes");
     assert.match(r.range, /^bytes 10-19\/\d+$/);
     assert.equal(r.accept, "bytes");
+  });
+
+  // An in-pack asset exists but its bytes are in the archive. 503 not_local is the contract;
+  // 404 would tell the client an asset it can see in the grid does not exist.
+  await check("an in-pack asset answers 503 not_local, not 404", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    const packed = p.items.find((i) => i.in_pack);
+    assert.ok(packed, "no in-pack asset loaded");
+    const r = await page.evaluate(async (assetId) => {
+      const res = await fetch(`http://ls.localhost/file/${assetId}`);
+      return { status: res.status, body: await res.text() };
+    }, packed.asset_id);
+    assert.equal(r.status, 503, `expected 503 not_local, got ${r.status}`);
+    assert.match(r.body, /not_local/);
   });
 
   await check("an unknown ls:// route is a 404, not a hang", async () => {

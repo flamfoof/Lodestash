@@ -25,8 +25,11 @@
   }
 
   let screen = $derived(SCREENS[view.route]);
-  // Favorites shares the library body; it filters rather than being its own screen.
+  // Favorites shares the library body; it is a *filter over the library*, not its own data.
+  // Routing it here without passing the flag renders the whole library under a "Favorites"
+  // heading, which reads as though everything is starred.
   let onLibrary = $derived(view.route === "library" || view.route === "favorites");
+  let favoritesOnly = $derived(view.route === "favorites");
 </script>
 
 <div class="frame">
@@ -35,7 +38,7 @@
     <Sidebar />
     <main>
       {#if onLibrary}
-        <LibraryScreen {status} />
+        <LibraryScreen {status} {favoritesOnly} title={favoritesOnly ? "Favorites" : "Library"} />
       {:else}
         <Screen title={screen.title} milestone={screen.milestone} />
       {/if}

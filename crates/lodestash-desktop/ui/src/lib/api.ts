@@ -9,6 +9,9 @@ export type GridItem = {
   status: string;
   rating: number | null;
   has_preview: boolean;
+  favorite: boolean;
+  in_pack: boolean;
+  package: string | null;
   triangles: number | null;
 };
 
@@ -21,6 +24,8 @@ export type LibraryStatus = {
   catalog_path: string | null;
   sources: SourceSummary[];
   total_assets: number;
+  in_pack: number;
+  favorites: number;
   with_preview: number;
 };
 
@@ -30,6 +35,7 @@ export type GridQuery = {
   status: string;
   sort_by: string;
   sort_asc: boolean;
+  favorites_only: boolean;
   page: number;
   page_size: number;
 };

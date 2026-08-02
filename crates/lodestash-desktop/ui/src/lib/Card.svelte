@@ -29,6 +29,9 @@
     {#if unidentified}
       <span class="gem" title="Unidentified">???</span>
     {/if}
+    {#if item.favorite}
+      <span class="star" title="Favourite" aria-label="Favourite">★</span>
+    {/if}
   </div>
   <div class="meta">
     <span class="name">{item.name}</span>
@@ -87,6 +90,16 @@
     background: color-mix(in srgb, var(--ls-bg) 80%, transparent);
     border-radius: var(--r-pill);
     padding: 0 6px;
+  }
+
+  .star {
+    position: absolute;
+    top: var(--sp-1);
+    left: var(--sp-1);
+    font-size: var(--fs-sm);
+    line-height: 1;
+    color: var(--ls-gold);
+    text-shadow: 0 1px 2px var(--ls-bg);
   }
 
   .meta {

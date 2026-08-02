@@ -76,15 +76,21 @@ fn file(lib: &Mutex<Library>, rest: &str, req: &Request<Vec<u8>>) -> Response<Ve
     let Some(id) = rest.split('/').next().and_then(|s| s.parse::<i64>().ok()) else {
         return status(StatusCode::BAD_REQUEST, "file: bad asset id");
     };
-    let path = match lib.lock() {
-        Ok(l) => l.asset_path(id).map(Path::to_path_buf),
-        Err(_) => None,
+    let (path, known) = match lib.lock() {
+        Ok(l) => (l.asset_path(id).map(Path::to_path_buf), l.knows(id)),
+        Err(_) => (None, false),
     };
+    // An in-pack asset has no local path but is very much a real asset. Answering 404 there
+    // would tell the client it does not exist while it is on screen in the grid.
     let Some(path) = path else {
-        return status(StatusCode::NOT_FOUND, "unknown asset");
+        return if known {
+            status(StatusCode::SERVICE_UNAVAILABLE, "not_local")
+        } else {
+            status(StatusCode::NOT_FOUND, "unknown asset")
+        };
     };
     if !path.exists() {
-        // An in-pack asset's bytes are inside the archive; extracting is a command, never a GET.
+        // Extracting is a command, never a GET — the handler stays read-only by construction.
         return status(StatusCode::SERVICE_UNAVAILABLE, "not_local");
     }
 

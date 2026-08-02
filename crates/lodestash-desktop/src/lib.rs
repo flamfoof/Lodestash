@@ -98,6 +98,8 @@ pub fn run() {
     tracing::info!(
         open = status.open,
         assets = status.total_assets,
+        in_pack = status.in_pack,
+        favorites = status.favorites,
         previews = status.with_preview,
         sources = status.sources.len(),
         "catalog"
