@@ -17,6 +17,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Mutex;
 
+use tauri::http::response::Builder;
 use tauri::http::{Request, Response, StatusCode};
 
 use crate::library::Library;
@@ -58,8 +59,7 @@ fn preview(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
     };
     let svg = lib.lock().ok().and_then(|l| l.preview_svg(id));
     match svg {
-        Some(svg) => Response::builder()
-            .status(StatusCode::OK)
+        Some(svg) => reply(StatusCode::OK)
             .header("Content-Type", "image/svg+xml")
             // The preview is regenerated under a new source_key when the file changes, and the
             // frontend re-reads the id list on reload, so a cached body is never stale in a way
@@ -109,8 +109,7 @@ fn file(lib: &Mutex<Library>, rest: &str, req: &Request<Vec<u8>>) -> Response<Ve
             if f.seek(SeekFrom::Start(start)).is_err() || f.read_exact(&mut buf).is_err() {
                 return status(StatusCode::INTERNAL_SERVER_ERROR, "read failed");
             }
-            Response::builder()
-                .status(StatusCode::PARTIAL_CONTENT)
+            reply(StatusCode::PARTIAL_CONTENT)
                 .header("Content-Type", mime)
                 .header("Accept-Ranges", "bytes")
                 .header("Content-Range", format!("bytes {start}-{end}/{len}"))
@@ -127,8 +126,7 @@ fn file(lib: &Mutex<Library>, rest: &str, req: &Request<Vec<u8>>) -> Response<Ve
                 if f.read_exact(&mut buf).is_err() {
                     return status(StatusCode::INTERNAL_SERVER_ERROR, "read failed");
                 }
-                return Response::builder()
-                    .status(StatusCode::PARTIAL_CONTENT)
+                return reply(StatusCode::PARTIAL_CONTENT)
                     .header("Content-Type", mime)
                     .header("Accept-Ranges", "bytes")
                     .header("Content-Range", format!("bytes 0-{end}/{len}"))
@@ -140,8 +138,7 @@ fn file(lib: &Mutex<Library>, rest: &str, req: &Request<Vec<u8>>) -> Response<Ve
             if f.read_to_end(&mut buf).is_err() {
                 return status(StatusCode::INTERNAL_SERVER_ERROR, "read failed");
             }
-            Response::builder()
-                .status(StatusCode::OK)
+            reply(StatusCode::OK)
                 .header("Content-Type", mime)
                 .header("Accept-Ranges", "bytes")
                 .header("Content-Length", len.to_string())
@@ -204,9 +201,28 @@ fn mime_for(path: &Path) -> &'static str {
     }
 }
 
-fn status(code: StatusCode, msg: &str) -> Response<Vec<u8>> {
+/// Start a response with the headers every `ls://` reply carries.
+///
+/// `Access-Control-Allow-Origin` is required because the page and the protocol are different
+/// origins: `<img src>` is a no-CORS load and works regardless, but `fetch()` — which the mesh
+/// loader and the e2e checks use — is blocked without it. The scheme is only routable from
+/// inside this app's webview, so a wildcard grants nothing a page here could not already read.
+fn reply(code: StatusCode) -> Builder {
     Response::builder()
         .status(code)
+        .header("Access-Control-Allow-Origin", "*")
+        // A cross-origin response only exposes the CORS-safelisted headers to script.
+        // `Content-Range` and `Accept-Ranges` are not on that list, so without this a client
+        // doing its own range arithmetic reads them as null while the bytes arrive fine —
+        // a failure that looks like a header bug in the server rather than a CORS rule.
+        .header(
+            "Access-Control-Expose-Headers",
+            "Content-Range, Accept-Ranges, Content-Length, Content-Type",
+        )
+}
+
+fn status(code: StatusCode, msg: &str) -> Response<Vec<u8>> {
+    reply(code)
         .header("Content-Type", "application/json")
         .body(format!("{{\"error\":{:?}}}", msg).into_bytes())
         .expect("static response builds")

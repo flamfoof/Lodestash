@@ -22,7 +22,7 @@ flagged.
 | `lodestash-ai` | Tagger/Embedder traits + impls | `ort` (ONNX Runtime; CUDA/DirectML/CPU EPs) — alt `candle`/`fastembed`, `tokenizers`, `ndarray`, `ureq` (Ollama over loopback + cloud HTTP), `whisper-rs` (speech), `image` (preprocess) |
 | `lodestash-app` | **headless desktop orchestration** — jobs, model downloads, config, the catalog scan/persist loop and the identify drains | `lodestash-core`, `lodestash-ingest`, `ureq`+`zip` (model artifacts), `dirs`, `serde`. **Never a UI dependency** — this crate exists so the frontend is replaceable (the Tauri/Svelte port consumes it unchanged). Filled incrementally; `jobs`/`models` moved 2026-08-01, the rest still parked in `lodestash-ui`. |
 | `lodestash-ui` | egui app + 3D/audio/image preview | `eframe`/`egui` + **`egui_glow`** (OpenGL renderer — see §7), `three-d` + `three-d-asset` (3D viewport; glow-lockstep with eframe, §7), `rodio` (+ `symphonia`) audio, `egui_extras` (`svg` feature — resvg; renders the sidebar nav icons, tinted per row state) + `egui_plot` (waveform), `rfd` (file dialogs), `poll-promise` (async UI), `keyring` *(Windows-only; cloud API key in Credential Manager, AI-PIPELINE §5.1 — other platforms fall back to plaintext config)* |
-| `lodestash-desktop` | **Tauri 2 desktop shell** — hosts the Svelte frontend, owns the window, the `#[tauri::command]` surface, and (from B3) the `ls://` protocol and pump thread | `tauri` 2 + `tauri-build` 2 (MIT/Apache-2.0; WebView2 on Windows — no bundled browser), `serde`/`serde_json`, `tracing`. Its frontend lives in `crates/lodestash-desktop/ui/` and is **deliberately four dependencies**: `svelte` 5, `vite`, `typescript`, `@tauri-apps/api` (all MIT). No component library, no CSS framework, no state library, no icon package — see §5. **`bun` is the package manager and script runner** (MIT); `bun.lock` is committed, and there is no npm lockfile — one lockfile or they drift. Replaces `lodestash-ui` at the B7 cutover. |
+| `lodestash-desktop` | **Tauri 2 desktop shell** — hosts the Svelte frontend, owns the window, the `#[tauri::command]` surface, and (from B3) the `ls://` protocol and pump thread | `tauri` 2 + `tauri-build` 2 (MIT/Apache-2.0; WebView2 on Windows — no bundled browser), `serde`/`serde_json`, `tracing`. Its frontend lives in `crates/lodestash-desktop/ui/` and is **deliberately four dependencies**: `svelte` 5, `vite`, `typescript`, `@tauri-apps/api` (all MIT). No component library, no CSS framework, no state library, no icon package — see §5. **`bun` is the package manager and script runner** (MIT); `bun.lock` is committed, and there is no npm lockfile — one lockfile or they drift. A fifth package, `playwright-core`, is a **dev**-dependency only (see §5.2). Replaces `lodestash-ui` at the B7 cutover. |
 | `lodestash-mcp` | MCP server | `rmcp` **2.2** (official Rust MCP SDK; features `server, macros, transport-io, schemars`), `schemars` (tool JSON Schema from the arg structs), `base64` (image content blocks), `tokio`, `serde_json` |
 | `lodestash-api` | loopback HTTP/JSON | `axum`, `tokio`, `serde_json`, `uuid` (session token), `dirs` (handshake path); `tower` is a dev-dependency for `oneshot` route tests. `tower-http` limits/tracing arrive with the mutating routes. |
 | `lodestash-cli` *(planned)* | headless ops (scan/index/tag) | `clap`, `lodestash-core`. **Not a crate yet** — an empty skeleton was carrying seven unused dependencies, so it was removed until a real command exists. |
@@ -74,7 +74,7 @@ flagged.
 | **Toolchain** | Rust stable, Cargo workspace; pin via `rust-toolchain.toml` |
 | **Lint/format** | `rustfmt` + `clippy` (CI: `-D warnings`) |
 | **Tests** | `cargo test` + `insta` (snapshots) + `proptest` (properties) + `criterion` (benches); a **regression corpus** of small real asset samples — full layer matrix in **§5.1** |
-| **Frontend build** | `bun` + Vite, in `crates/lodestash-desktop/ui/`. `bun run build` gates on `svelte-check`, so a type error fails the build. **Dependencies are capped at four** (§1) — a webview app is where a dependency tree metastasises, and every added package is another thing to audit for a runtime network fetch against the offline invariant. `bun.lock` is committed and installs are offline-reproducible; there is no npm lockfile. |
+| **Frontend build** | `bun` + Vite, in `crates/lodestash-desktop/ui/`. `bun run build` gates on `svelte-check`, so a type error fails the build. **Runtime dependencies are capped at four** (§1) — a webview app is where a dependency tree metastasises, and every added package is another thing to audit for a runtime network fetch against the offline invariant. `bun.lock` is committed and installs are offline-reproducible; there is no npm lockfile. |
 | **CI** | GitHub Actions: `fmt` + `clippy` (`-D warnings`) + build + test on Windows/macOS/Linux; sccache; artifact upload |
 | **Packaging** | `cargo-dist` (installers) / `cargo-bundle` / WiX (Windows); single binary + bundled sidecar; first-run **model download** step |
 | **Versioning** | semver for the app; the engine **REST/MCP surface is `/v1/`** and independently versioned |
@@ -116,6 +116,31 @@ Tracks the §6/§3 perf claims (FTS5 sub-10 ms, KNN tens-of-ms) so a regression 
 release.
 
 ---
+
+### 5.2 Desktop end-to-end checks (`bun run e2e`)
+
+WebView2 is Edge, so it speaks **CDP** natively. Launching the app with
+`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222` lets `playwright-core`
+attach to the *real* binary — real catalog connection, real `ls://` handler, real
+`#[tauri::command]` surface. No WebDriver, no mocked IPC. (`tauri-driver` is the official route
+but speaks WebDriver Classic, which Playwright does not.)
+
+**`playwright-core` is a fifth frontend package, and a deliberate exception to the four-package
+cap in §1** — dev-only, never bundled, and it needs no browser download because it attaches to
+the WebView2 already installed. The cap still governs anything shipped.
+
+**Scope rule: this suite covers only what fails *silently*.** Behaviour invisible to `cargo test`
+because it lives in the browser, and invisible in a screenshot because a failure looks like an
+empty state. The motivating case is real: a routing bug made every `ls://` request 404, and the
+only symptom was a broken `<img>` — indistinguishable from a styled placeholder in a screenshot,
+absent from every log. `naturalWidth > 0` catches it in one assertion. Anything assertable in
+Rust stays in Rust; this is not a second home for the paging or Range-parsing tests.
+
+No test framework — plain `node:assert` and one runner, so the package count stays at one.
+
+**The debugging port is opened by the harness and nowhere else.** It must never appear in
+`tauri.conf.json`: while open, anything on localhost can drive the app and read the catalog
+through it.
 
 ## 6. Licensing watch-list
 
