@@ -25,15 +25,16 @@ canonical path so there is exactly one token file in the repo.
 
 ## Running it
 
-Two terminals — no Tauri CLI is installed, deliberately (see `docs/TECH-STACK.md` §1 on keeping the
-frontend to four npm dependencies).
+**Bun** is the package manager and script runner — `bun.lock` is the committed lockfile and there is
+no `package-lock.json`. Two terminals; no Tauri CLI is installed, deliberately (see
+`docs/TECH-STACK.md` §1 on keeping the frontend to four dependencies).
 
 ```sh
 # once
-npm --prefix crates/lodestash-desktop/ui install
+bun install --cwd crates/lodestash-desktop/ui
 
 # terminal 1 — the frontend dev server on :5173 (debug builds load devUrl)
-npm --prefix crates/lodestash-desktop/ui run dev
+bun run --cwd crates/lodestash-desktop/ui dev
 
 # terminal 2
 cargo run -p lodestash-desktop
@@ -43,11 +44,11 @@ For a build that runs standalone, compile the frontend first — release builds 
 from the bundle rather than the dev server:
 
 ```sh
-npm --prefix crates/lodestash-desktop/ui run build
+bun run --cwd crates/lodestash-desktop/ui build
 cargo run --release -p lodestash-desktop
 ```
 
-`npm run build` runs `svelte-check` first, so a type error fails the build rather than shipping.
+`bun run build` runs `svelte-check` first, so a type error fails the build rather than shipping.
 
 ## Status
 

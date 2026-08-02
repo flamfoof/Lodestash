@@ -218,7 +218,7 @@ until B7.
 - [ ] **B1.5 — `lodestash-cli`.** Headless `scan|index|tag|export` over `lodestash-app`. Gives the
       port a smoke test that needs no window.
 - [x] **B2a — desktop scaffold + shell.** `crates/lodestash-desktop` (Tauri 2) + `ui/` (Svelte 5,
-      Vite, TypeScript). `docs/design/tokens.css` extracted as the single token source; bundled
+      Vite, TypeScript, built with Bun). `docs/design/tokens.css` extracted as the single token source; bundled
       `@font-face` with no webfont link; the real `icons.svg` sprite; app frame, 11 nav
       destinations, 12 stub routes; one command (`app_info`) proving IPC. Screenshot verified —
       a webview captures reliably where Glow returns blank.
