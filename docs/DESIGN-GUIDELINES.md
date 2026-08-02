@@ -50,6 +50,11 @@ Keep it tasteful: think **Octopath / Persona menu polish**, not cluttered fantas
 CSS custom properties are the source of truth (prefix `--ls-`). All pairings below meet AA for their
 intended text/background use.
 
+The executable form of this section is [`design/tokens.css`](design/tokens.css) — the single
+checked-in token file, imported directly by the Svelte frontend. The tables below and that file must
+not drift; change both together. `crates/lodestash-ui/src/theme.rs` mirrors the same values by hand
+for the egui build and is retired at the B7 cutover.
+
 ### Surfaces & text
 | Token | Hex | Use |
 |---|---|---|

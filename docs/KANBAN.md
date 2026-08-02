@@ -204,6 +204,40 @@ source → render-pipeline harvest (cheap now that `.mat` files are parsed).
 
 ---
 
+## ▶ Ready — Phase B: Tauri + Svelte port
+
+The egui build keeps drifting from the designs because the design source of truth is already web
+tech (CSS tokens, an SVG icon set, a runnable HTML prototype), so every screen costs a lossy hand
+translation. The port removes the translation. `lodestash-ui` stays buildable as the reference
+until B7.
+
+- [ ] **B1 — finish `lodestash-app` extraction.** `jobs` + `models` moved 2026-08-01; `config`,
+      `drains`, `persist`, `thumbs`, `grid` and app.rs's domain types are still in `lodestash-ui`,
+      and the four `app/*.rs` children still use `use super::*`. Move + visibility flip only, no
+      cleanups. *Done:* `lodestash-ui` is a thin egui shell; screenshot identical to before.
+- [ ] **B1.5 — `lodestash-cli`.** Headless `scan|index|tag|export` over `lodestash-app`. Gives the
+      port a smoke test that needs no window.
+- [x] **B2a — desktop scaffold + shell.** `crates/lodestash-desktop` (Tauri 2) + `ui/` (Svelte 5,
+      Vite, TypeScript). `docs/design/tokens.css` extracted as the single token source; bundled
+      `@font-face` with no webfont link; the real `icons.svg` sprite; app frame, 11 nav
+      destinations, 12 stub routes; one command (`app_info`) proving IPC. Screenshot verified —
+      a webview captures reliably where Glow returns blank.
+- [ ] **B2b — Engine + pump + `ls://`.** `Arc<Mutex<Engine>>`, the 33ms pump running the drain
+      order verbatim from `app.rs:9533`, the four `ls://` handlers, `open_library`/`grid_page`/
+      `jobs_snapshot`. *Done:* a real library opens with real previews and scan progress.
+      **Hard gate:** stream a >1 GB file over `ls://file` with a Range request and confirm
+      `<audio>` scrubbing.
+- [ ] **B3 — Library parity** (search, toolbar, tabs, filters, pager with virtualized rows,
+      Folders + nav history, selection, Inspector, hover-spin cards, drag files in, Ctrl-K palette).
+- [ ] **B4 — Viewers** (Quick Look as its own OS window — rewrites `UI-SPEC` §14 — image, audio,
+      three.js orbit over `ls://mesh?lod=preview`, `ensure_local` pull).
+- [ ] **B5 — Writes, jobs, agent approval gate, settings, drag-out to Unity.** **Cutover gate:**
+      `approve_job`/`deny_job` must be reachable, or every agent export hangs silently.
+- [ ] **B6 — Remaining screens** (Packages + pack browser, Unity Assets, Traits, Stats, Duplicates,
+      Trash, Collections, Identify, Onboarding).
+- [ ] **B7 — Cutover.** `[[bin]] lodestash` moves to `lodestash-desktop`, **preserving the `--mcp`
+      stdio branch verbatim**; delete `crates/lodestash-ui`; update every doc that names egui.
+
 ## In Progress
 *(empty — pull from Ready)*
 

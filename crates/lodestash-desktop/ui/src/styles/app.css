@@ -1,0 +1,82 @@
+/* Tokens are imported from their canonical home in docs/design/ — never copied here. */
+@import "../../../../../docs/design/tokens.css";
+@import "./fonts.css";
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--ls-bg);
+  color: var(--ls-text);
+  font-family: var(--ff-ui);
+  font-size: var(--fs-md);
+  line-height: var(--lh-body);
+  -webkit-font-smoothing: antialiased;
+  /* Desktop app, not a document: no text selection or rubber-banding by default. */
+  user-select: none;
+  overflow: hidden;
+}
+
+/* Two faint radial glows behind everything — decorative only (FEATURES §0.1). */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(60vw 40vh at 12% -5%, rgba(231, 183, 101, 0.06), transparent 70%),
+    radial-gradient(50vw 40vh at 95% 105%, rgba(169, 139, 255, 0.06), transparent 70%);
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--ff-display);
+  line-height: var(--lh-heading);
+  font-weight: 600;
+  margin: 0;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+:focus-visible {
+  outline: none;
+  box-shadow: var(--el-focus-ring);
+  border-radius: var(--r-sm);
+}
+
+.num {
+  font-family: var(--ff-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Thin dark scrollbars so panes don't sprout a bright system bar. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--ls-border-strong);
+  border-radius: var(--r-pill);
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}

@@ -1,0 +1,101 @@
+/*
+ * Lodestash design tokens — the single checked-in source.
+ *
+ * DESIGN-GUIDELINES.md §2-§4 is the prose spec; this file is its executable form and the
+ * two must not drift. The Svelte frontend imports this file directly (no build step, no
+ * CSS-in-JS). `crates/lodestash-ui/src/theme.rs` mirrors these values by hand and is
+ * retired at the B7 cutover.
+ *
+ * Dark mode is the only theme. The elevation rule is: surfaces get *lighter* as they rise
+ * (bg -> surface -> raised -> overlay); shadows are reserved for modals.
+ */
+
+:root {
+  /* ---- Surfaces & text (§2) ---- */
+  --ls-bg: #0e1117;
+  --ls-surface: #161b26;
+  --ls-surface-raised: #1e2533;
+  --ls-overlay: #232c3d;
+  --ls-border: #2c3547;
+  --ls-border-strong: #3a465c;
+  --ls-text: #e6e9f0;
+  --ls-text-muted: #a7b0c0;
+  --ls-text-dim: #6e7689;
+
+  /* ---- Brand & action accents ---- */
+  --ls-gold: #e7b765;
+  --ls-gold-bright: #ffd98a;
+  --ls-arcane: #49d6c9;
+  --ls-arcane-bright: #7bf0e5;
+  --ls-violet: #a98bff;
+
+  /* ---- Element-type colors: one per media_type (DATA-MODEL 7-value enum) ---- */
+  --ls-type-model: #a98bff;
+  --ls-type-sound: #49c9e0;
+  --ls-type-image: #6fb1ff;
+  --ls-type-texture: #6fb1ff;
+  --ls-type-material: #a98bff;
+  --ls-type-sprite: #5bd897;
+  --ls-type-font: #f2966e;
+
+  /* ---- Status / rarity ---- */
+  --ls-status-unidentified: #8a93a6;
+  --ls-status-identified: #5bd897;
+  --ls-status-confirmed: #e7b765;
+
+  /* ---- Semantic ---- */
+  --ls-success: #5bd897;
+  --ls-warning: #f2b84b;
+  --ls-danger: #f2666e;
+  --ls-info: #5aa9f0;
+  --ls-focus: #ffd98a;
+
+  /* ---- Typography (§3) ---- */
+  --ff-display: "Cinzel", Georgia, serif;
+  --ff-ui: "Inter", "Segoe UI", system-ui, sans-serif;
+  --ff-mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
+
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-md: 13px; /* body */
+  --fs-lg: 15px;
+  --fs-xl: 18px;
+  --fs-2xl: 24px;
+  --fs-3xl: 32px;
+
+  --lh-body: 1.45;
+  --lh-heading: 1.2;
+
+  /* ---- Spacing, 4px base (§4) ---- */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --sp-7: 48px;
+
+  /* ---- Radius ---- */
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 10px;
+  --r-pill: 999px;
+
+  /* ---- Density: compact default; [data-density="comfortable"] adds 4px (§4, a11y) ---- */
+  --row-h: 32px;
+  --control-h: 30px;
+
+  /* ---- Elevation ---- */
+  --el-popover-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  --el-focus-ring: 0 0 0 2px var(--ls-focus);
+
+  /* ---- Frame metrics (FEATURES §0.1) ---- */
+  --topbar-h: 48px;
+  --sidebar-w: 210px;
+  --inspector-w: 300px;
+}
+
+:root[data-density="comfortable"] {
+  --row-h: 36px;
+  --control-h: 34px;
+}
