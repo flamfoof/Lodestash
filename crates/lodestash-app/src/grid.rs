@@ -43,6 +43,18 @@ pub fn dir(o: std::cmp::Ordering, asc: bool) -> std::cmp::Ordering {
     }
 }
 
+/// Relevance ordering key: **ranked hits first, in rank order; unranked after.**
+///
+/// `Option`'s own ordering is the wrong way round for this — `None < Some` would put every
+/// non-matching asset *above* the best BM25 hit — so relevance never sorts on the bare
+/// `Option<usize>`. Callers break ties on name.
+pub fn relevance_key(rank: Option<usize>) -> (u8, usize) {
+    match rank {
+        Some(r) => (0, r),
+        None => (1, 0),
+    }
+}
+
 /// Sort `idxs` (indices into `entries`) in place per the view/sort toolbar's `sort_by`/`asc`.
 /// Name pre-computes keys once (decorate-sort-undecorate) since `name_key` allocates —
 /// worth avoiding at O(n log n) comparisons on 10k+ entry libraries.
@@ -71,12 +83,9 @@ pub fn sort_indices<T>(
             paired.sort_by(|&(_, ka), &(_, kb)| {
                 let (ra, na) = &keys[ka];
                 let (rb, nb) = &keys[kb];
-                let o = match (ra, rb) {
-                    (Some(x), Some(y)) => x.cmp(y).then_with(|| na.cmp(nb)),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => na.cmp(nb),
-                };
+                let o = relevance_key(*ra)
+                    .cmp(&relevance_key(*rb))
+                    .then_with(|| na.cmp(nb));
                 dir(o, asc)
             });
             *idxs = paired.into_iter().map(|(i, _)| i).collect();

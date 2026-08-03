@@ -17,7 +17,8 @@
     <input
       type="text"
       placeholder="Search assets, tags, packs…"
-      bind:value={view.search}
+      value={view.search}
+      oninput={(e) => view.setSearch(e.currentTarget.value)}
       spellcheck="false"
     />
     <div class="mode" role="group" aria-label="Search mode">

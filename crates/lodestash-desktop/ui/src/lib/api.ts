@@ -59,8 +59,14 @@ export type AssetDetail = {
   in_pack: boolean;
 };
 
-/** Sort keys the backend understands (config::SortBy minus Relevance, which needs BM25 ranks). */
+/**
+ * Sort keys the backend understands — the ids are `config::SortBy`'s serde names.
+ *
+ * Relevance is BM25 order from the FTS index and only means anything while a query is active;
+ * with an empty search box every asset is unranked and it degrades to Name.
+ */
 export const SORTS = [
+  { id: "relevance", label: "Relevance" },
   { id: "name", label: "Name" },
   { id: "type", label: "Type" },
   { id: "size", label: "Size" },

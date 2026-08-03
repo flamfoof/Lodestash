@@ -23,6 +23,22 @@ class ViewState {
   go(route: Route) {
     this.route = route;
   }
+
+  /**
+   * Set the query, and follow it with the sort.
+   *
+   * Typing a query switches to Relevance so BM25 order is what you see; clearing it puts Name
+   * back. Both moves are skipped if the user has chosen some *other* sort — picking Size and
+   * then searching should not silently re-sort the results, and this only ever swaps between
+   * the two orders it owns.
+   */
+  setSearch(text: string) {
+    const had = this.search.trim().length > 0;
+    const has = text.trim().length > 0;
+    this.search = text;
+    if (has && !had && this.sortBy === "name") this.sortBy = "relevance";
+    else if (!has && had && this.sortBy === "relevance") this.sortBy = "name";
+  }
 }
 
 export const view = new ViewState();

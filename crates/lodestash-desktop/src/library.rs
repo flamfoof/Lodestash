@@ -391,16 +391,35 @@ impl Library {
         }
     }
 
-    /// Filter, sort, page. Pure over the held rows, so it is testable without a catalog.
+    /// Filter, sort, page. Runs the FTS query for the active search, then hands the ranks to
+    /// [`Self::page_with_ranks`], which is where the actual work — and the testability — lives.
     pub fn page(&self, q: &GridQuery) -> GridPage {
         let needle = q.search.trim().to_lowercase();
+        let ranks = self.search_ranks(&needle);
+        self.page_with_ranks(q, ranks.as_ref())
+    }
+
+    /// Filter, sort, page against a **given** set of BM25 ranks. Pure over the held rows, so the
+    /// union rule and the relevance order can be tested without standing up an FTS index.
+    fn page_with_ranks(&self, q: &GridQuery, ranks: Option<&HashMap<i64, usize>>) -> GridPage {
+        let needle = q.search.trim().to_lowercase();
+        let hit = |r: &Row| {
+            // Union, exactly as the egui grid does it (`app.rs` `rebuild_cache`): FTS5 reaches
+            // tags and descriptions and ranks by BM25, but it matches whole tokens by prefix, so
+            // a mid-word query ("olygon") would stop matching things that matched yesterday.
+            // Keeping the substring pass means the search only ever gains results.
+            ranks
+                .as_ref()
+                .is_some_and(|m| m.contains_key(&r.item.asset_id))
+                || r.search_key.contains(&needle)
+        };
         let mut matched: Vec<&Row> = self
             .rows
             .iter()
             .filter(|r| q.tab.matches(r.media_type))
             .filter(|r| q.status.matches(r.status))
             .filter(|r| !q.favorites_only || r.item.favorite)
-            .filter(|r| needle.is_empty() || r.search_key.contains(&needle))
+            .filter(|r| needle.is_empty() || hit(r))
             .collect();
 
         // Every key falls back to name for ties, which keeps paging stable when a key has many
@@ -422,10 +441,16 @@ impl Library {
             grid::dir(o.then_with(|| key(a).cmp(&key(b))), q.sort_asc)
         };
         match q.sort_by {
-            // Relevance needs BM25 ranks, which arrive with FTS search (T4). Name until then.
-            SortBy::Name | SortBy::Relevance => {
-                matched.sort_by(|a, b| by(std::cmp::Ordering::Equal, a, b))
-            }
+            SortBy::Name => matched.sort_by(|a, b| by(std::cmp::Ordering::Equal, a, b)),
+            // BM25 order, hits before non-hits. With no query (or no catalog) every row is
+            // unranked and this degrades to name order, which is why the toolbar can leave
+            // Relevance selected while the user clears the search box.
+            SortBy::Relevance => matched.sort_by(|a, b| {
+                let k = |r: &Row| {
+                    grid::relevance_key(ranks.as_ref().and_then(|m| m.get(&r.item.asset_id).copied()))
+                };
+                by(k(a).cmp(&k(b)), a, b)
+            }),
             SortBy::Size => {
                 matched.sort_by(|a, b| by(a.item.size_bytes.cmp(&b.item.size_bytes), a, b))
             }
@@ -492,6 +517,32 @@ impl Library {
             texture_asset_id: self.model_texture(asset_id),
             in_pack: row.item.in_pack,
         })
+    }
+
+    /// BM25 ranks for the active query: `asset_id -> position`, best first.
+    ///
+    /// This is Search by Tags (IDENTIFICATION-AND-SEARCH §5.A) — FTS5 over name, description and
+    /// the denormalised tags, which is the whole point: the substring pass it unions with can
+    /// only ever see the file name. `None` when there is no catalog, no query, or the query is
+    /// punctuation-only; the caller then falls back to substring alone.
+    ///
+    /// ponytail: re-queried per keystroke rather than cached by query text (the egui build keys
+    /// it on `search_ranks_key`). FTS5 over 8k rows is sub-millisecond and `page` takes `&self`;
+    /// cache it behind a `Mutex` only if a profile says to.
+    fn search_ranks(&self, needle: &str) -> Option<HashMap<i64, usize>> {
+        if needle.is_empty() {
+            return None;
+        }
+        // A high cap: the grid re-scopes by tab/status/favourites afterwards, so truncating here
+        // would silently drop matches the user *is* filtering to.
+        const HIT_CAP: usize = 100_000;
+        let ids = self
+            .catalog
+            .as_ref()?
+            .search_assets(needle, HIT_CAP)
+            .ok()
+            .flatten()?;
+        Some(ids.into_iter().enumerate().map(|(r, id)| (id, r)).collect())
     }
 
     pub fn thumb_cache_dir(&self) -> Option<&Path> {
@@ -717,6 +768,85 @@ mod tests {
         assert_eq!(
             up, down,
             "descending must be the exact reverse of ascending"
+        );
+    }
+
+    /// Three rows with ids 1..3, so a synthetic rank map can name them.
+    fn searchable() -> Library {
+        let mut l = lib(&[
+            ("zeta", "model_3d"),
+            ("alpha", "model_3d"),
+            ("mid", "model_3d"),
+        ]);
+        for (i, r) in l.rows.iter_mut().enumerate() {
+            r.item.asset_id = i as i64 + 1;
+        }
+        l
+    }
+
+    /// The point of wiring FTS in: an asset matches on its **tags and description**, which the
+    /// substring pass cannot see because it only has the file name. Here "haunted" appears in no
+    /// row's name, so the only way `alpha` comes back is through the rank map.
+    #[test]
+    fn a_rank_only_hit_is_returned_even_though_no_name_contains_the_query() {
+        let l = searchable();
+        let ranks: HashMap<i64, usize> = [(2, 0)].into_iter().collect();
+        let q = GridQuery {
+            search: "haunted".into(),
+            ..Default::default()
+        };
+        assert_eq!(l.page_with_ranks(&q, None).total, 0, "no name matches it");
+        let hits = l.page_with_ranks(&q, Some(&ranks));
+        assert_eq!(hits.total, 1);
+        assert_eq!(hits.items[0].name, "alpha", "matched through its tags");
+    }
+
+    /// The union, not a replacement: FTS matches whole tokens by prefix, so a mid-word query
+    /// only the substring pass can satisfy must keep working. Dropping the substring arm is a
+    /// silent regression — the grid just quietly stops finding things it used to.
+    #[test]
+    fn substring_matches_survive_alongside_the_ranked_hits() {
+        let l = searchable();
+        let ranks: HashMap<i64, usize> = [(2, 0)].into_iter().collect();
+        let q = GridQuery {
+            search: "et".into(), // mid-word in "zeta"; FTS prefix search would miss it
+            ..Default::default()
+        };
+        let names: Vec<String> = l
+            .page_with_ranks(&q, Some(&ranks))
+            .items
+            .iter()
+            .map(|i| i.name.clone())
+            .collect();
+        assert!(names.contains(&"zeta".to_string()), "substring hit kept");
+        assert!(names.contains(&"alpha".to_string()), "ranked hit kept");
+    }
+
+    /// Relevance puts BM25 hits first, in rank order, and everything else after — the reason
+    /// `grid::relevance_key` exists. Sorting on the bare `Option<usize>` inverts it (`None` is
+    /// less than `Some`), which buries the best match under every asset that did not match.
+    #[test]
+    fn relevance_puts_ranked_hits_first_then_the_rest_by_name() {
+        let l = searchable();
+        // "zeta" ranks best, "mid" second, "alpha" is not a hit but matches as a substring.
+        let ranks: HashMap<i64, usize> = [(1, 0), (3, 1)].into_iter().collect();
+        let names: Vec<String> = l
+            .page_with_ranks(
+                &GridQuery {
+                    search: "a".into(), // substring of every name, so ordering is what is tested
+                    sort_by: SortBy::Relevance,
+                    ..Default::default()
+                },
+                Some(&ranks),
+            )
+            .items
+            .iter()
+            .map(|i| i.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            ["zeta", "mid", "alpha"],
+            "rank 0, rank 1, then the unranked"
         );
     }
 

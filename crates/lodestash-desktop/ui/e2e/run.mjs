@@ -67,6 +67,52 @@ try {
     assert.ok(after > 0 && after < before, `expected a narrower result, got ${after} of ${before}`);
   });
 
+  // T4's whole point: the grid used to filter with `contains()` over file names, so a query only
+  // ever reached what was spelled in the name. FTS5 indexes name + description + tags, and a
+  // tag-only hit is the proof the index is actually being consulted.
+  await check("search reaches tags, not just file names", async () => {
+    const q = (search) =>
+      invoke("grid_page", {
+        query: { tab: "all", search, status: "all", sort_by: "relevance", sort_asc: true,
+                 favorites_only: false, page: 0, page_size: 200 },
+      });
+    // Any asset whose name does not contain the query text can only have matched through the
+    // index. Probing a few terms keeps this from depending on one particular tagged asset.
+    let proof = null;
+    for (const term of ["haunted", "dark", "environment", "level", "dungeon"]) {
+      const r = await q(term);
+      const viaIndex = r.items.filter((i) => !i.name.toLowerCase().includes(term));
+      if (viaIndex.length > 0) {
+        proof = { term, name: viaIndex[0].name, total: r.total };
+        break;
+      }
+    }
+    assert.ok(
+      proof,
+      "no query matched an asset whose name lacks the term — FTS is not being consulted (or this catalog has no tags: run Identify in the egui build)",
+    );
+    console.log(`       "${proof.term}" matched ${proof.name} through the index`);
+  });
+
+  // Ranked order, and the guard on `grid::relevance_key`: `Option`'s ordering puts None first,
+  // which would bury every real hit under the assets that merely matched as substrings.
+  await check("relevance puts index hits above substring-only matches", async () => {
+    const q = (sort_by) =>
+      invoke("grid_page", {
+        query: { tab: "all", search: "dungeon", status: "all", sort_by, sort_asc: true,
+                 favorites_only: false, page: 0, page_size: 200 },
+      });
+    const rel = await q("relevance");
+    const byName = await q("name");
+    assert.ok(rel.total > 1, "need more than one match to have an order at all");
+    assert.equal(rel.total, byName.total, "the sort must not change what matched");
+    assert.notDeepEqual(
+      rel.items.map((i) => i.asset_id),
+      byName.items.map((i) => i.asset_id),
+      "relevance produced name order — the ranks are not reaching the sort",
+    );
+  });
+
   // The check that would have caught the `lodestash://localhost` routing bug on the spot. A broken
   // image is indistinguishable from a styled placeholder in a screenshot, but its naturalWidth
   // is 0 — so the failure that cost a debugging session becomes one assertion.
