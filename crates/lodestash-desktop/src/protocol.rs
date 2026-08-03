@@ -26,6 +26,13 @@ use crate::library::Library;
 /// client asking for `bytes=0-` on a 20 GB pack cannot make us allocate 20 GB.
 const MAX_CHUNK: u64 = 8 * 1024 * 1024;
 
+/// Triangle count above which `ls://mesh` decimates rather than shipping the source.
+///
+/// Everything under this travels whole so textures stay correct (see [`mesh`]). At ~50 bytes per
+/// triangle of `LSM1` this caps a response near 15 MB, which a local protocol and a GPU buffer both
+/// shrug at; beyond it, a banded texture beats a stalled viewer.
+const MESH_DECIMATE_ABOVE: usize = 300_000;
+
 pub fn handle(lib: &Mutex<Library>, req: &Request<Vec<u8>>) -> Response<Vec<u8>> {
     let uri = req.uri();
     // Tauri normalises every form of the scheme to `ls://localhost/<kind>/<rest>` before the
@@ -35,6 +42,7 @@ pub fn handle(lib: &Mutex<Library>, req: &Request<Vec<u8>>) -> Response<Vec<u8>>
 
     let res = match kind {
         "preview" => preview(lib, rest),
+        "mesh" => mesh(lib, rest),
         "file" => file(lib, rest, req),
         _ => status(StatusCode::NOT_FOUND, "unknown ls:// kind"),
     };
@@ -69,6 +77,76 @@ fn preview(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
             .unwrap_or_else(|_| status(StatusCode::INTERNAL_SERVER_ERROR, "preview: build")),
         None => status(StatusCode::NOT_FOUND, "no preview for that asset"),
     }
+}
+
+/// `ls://mesh/{asset_id}` — decimated geometry as `LSM1`, for the WebGL viewer.
+///
+/// Deliberately the **same encoder as the on-disk mesh cache** (`mesh::encode_meshes`): the wire
+/// format and the cache format are one thing, so the TypeScript parser and `decode_meshes` cannot
+/// drift apart. Drift would surface as garbled geometry, not an error.
+///
+/// **Served undecimated.** `decimate` *averages* UVs across each vertex cluster
+/// (`decimate.rs:195`), which is fine for its real consumers — silhouette previews and untextured
+/// multiview embeddings — but wrong for a textured viewer: these models paint from small palette
+/// atlases of flat colour blocks, so an averaged UV lands *between* two cells and the model comes
+/// out speckled with colours that are in neither. Verified by eye; the artifact is obvious.
+///
+/// Full geometry is cheap here anyway: a typical model is ~1-2 MB of `LSM1` over a local protocol,
+/// straight into a GPU buffer. Only a pathologically large mesh is decimated, and its textures may
+/// band for the reason above.
+fn mesh(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
+    let Some(id) = rest
+        .split('/')
+        .next()
+        .and_then(|s| s.trim_end_matches(".msh").parse::<i64>().ok())
+    else {
+        return status(StatusCode::BAD_REQUEST, "mesh: bad asset id");
+    };
+    let (path, known) = match lib.lock() {
+        Ok(l) => (l.asset_path(id).map(Path::to_path_buf), l.knows(id)),
+        Err(_) => (None, false),
+    };
+    let Some(path) = path.filter(|p| p.exists()) else {
+        // Same contract as `ls://file`: a known asset whose bytes are in a pack is not missing.
+        return if known {
+            status(StatusCode::SERVICE_UNAVAILABLE, "not_local")
+        } else {
+            status(StatusCode::NOT_FOUND, "unknown asset")
+        };
+    };
+
+    let meshes = match lodestash_ingest::mesh::load_any(&path, &std::collections::BTreeMap::new()) {
+        Ok(m) if !m.is_empty() => m,
+        Ok(_) => return status(StatusCode::NO_CONTENT, "mesh has no geometry"),
+        Err(e) => {
+            tracing::debug!(%e, ?path, "mesh load failed");
+            return status(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "mesh could not be parsed",
+            );
+        }
+    };
+    let tris: usize = meshes.iter().map(|m| m.indices.len() / 3).sum();
+    let served = if tris > MESH_DECIMATE_ABOVE {
+        tracing::debug!(
+            tris,
+            "mesh over the wire cap; decimating (textures may band)"
+        );
+        std::borrow::Cow::Owned(lodestash_ingest::decimate::decimate_meshes(
+            &meshes,
+            lodestash_ingest::decimate::VIEWER_BUDGET,
+        ))
+    } else {
+        std::borrow::Cow::Borrowed(&meshes)
+    };
+    let bytes = lodestash_ingest::mesh::encode_meshes(&served);
+    reply(StatusCode::OK)
+        .header("Content-Type", "application/octet-stream")
+        // The cache key is `(path, size, mtime)`, so an edited file yields a new URL.
+        .header("Cache-Control", "max-age=3600")
+        .header("Content-Length", bytes.len().to_string())
+        .body(bytes)
+        .unwrap_or_else(|_| status(StatusCode::INTERNAL_SERVER_ERROR, "mesh: build"))
 }
 
 /// `ls://file/{asset_id}` — the original bytes, with Range support.

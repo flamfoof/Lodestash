@@ -3893,6 +3893,7 @@ version = "0.1.0"
 dependencies = [
  "lodestash-app",
  "lodestash-core",
+ "lodestash-ingest",
  "serde",
  "serde_json",
  "tauri",

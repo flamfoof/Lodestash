@@ -1,5 +1,6 @@
 <script lang="ts">
   import Icon from "./Icon.svelte";
+  import Viewer3D from "./Viewer3D.svelte";
   import {
     assetDetail,
     fileUrl,
@@ -50,6 +51,8 @@
         return "image";
       case "audio":
         return "audio";
+      case "model_3d":
+        return "model";
       default:
         return "other";
     }
@@ -105,7 +108,9 @@
           alt={detail?.name}
           onerror={() => (loadError = "This file could not be decoded.")}
         />
-      {:else if kind === "audio"}
+      {:else if kind === "model" && detail}
+      <Viewer3D assetId={detail.asset_id} textureAssetId={detail.texture_asset_id} />
+    {:else if kind === "audio"}
         <div class="audio">
           <Icon name="ls-type-sound" size={40} />
           <!-- svelte-ignore a11y_media_has_caption -->
@@ -197,6 +202,10 @@
     background: var(--ls-bg);
     box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--tint) 18%, transparent);
     padding: var(--sp-4);
+  }
+  .stage :global(.wrap) {
+    justify-self: stretch;
+    align-self: stretch;
   }
   .stage img {
     max-width: 100%;

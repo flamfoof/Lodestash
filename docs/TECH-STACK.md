@@ -117,6 +117,23 @@ release.
 
 ---
 
+### 5.3 Quick Look 3D viewer — hand-rolled WebGL2, no dependency
+
+`crates/lodestash-desktop/ui/src/lib/viewer3d.ts` is ~300 lines of WebGL2: one Lambert program, an
+orbit camera and one optional albedo texture. **three.js was evaluated and rejected** — it would
+have added ~150 KB gzipped against a 62 KB bundle and a fifth runtime package, to supply a scene
+graph, loaders and a material system none of which this needs. `LSM1` already hands the frontend
+flat `f32`/`u32` arrays, so vertex data goes straight into GPU buffers.
+
+Camera constants mirror `lodestash-ui/src/viewport3d.rs` so both frontends feel identical, and
+shading mirrors `render3d` so the viewer and the thumbnails agree.
+
+**Geometry is served undecimated.** `decimate` averages UVs across each vertex cluster, which is
+correct for its real consumers (silhouette previews, untextured multiview embeddings) but wrong for
+a textured viewer: these are palette atlases of flat colour blocks, so an averaged UV samples
+*between* two cells and the model renders speckled. Only meshes above `MESH_DECIMATE_ABOVE`
+(300k tris) are cut down, accepting banded textures over a stalled viewer.
+
 ### 5.2 Desktop end-to-end checks (`bun run e2e`)
 
 WebView2 is Edge, so it speaks **CDP** natively. Launching the app with

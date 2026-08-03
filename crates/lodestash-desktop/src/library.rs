@@ -93,6 +93,9 @@ pub struct AssetDetail {
     pub duration_ms: Option<i64>,
     /// Which source root it came from.
     pub source: Option<String>,
+    /// The albedo texture this model paints with, reached through the dependency graph
+    /// (DATA-MODEL §10). `None` when the graph has no edge — the viewer then renders flat.
+    pub texture_asset_id: Option<i64>,
     /// True when the file is not on disk — an in-pack asset whose bytes are still in the archive.
     pub in_pack: bool,
 }
@@ -423,12 +426,24 @@ impl Library {
             height_px: row.height_px,
             duration_ms: row.duration_ms,
             source: row.source.clone(),
+            texture_asset_id: self.model_texture(asset_id),
             in_pack: row.item.in_pack,
         })
     }
 
     pub fn asset_path(&self, asset_id: i64) -> Option<&Path> {
         self.paths.get(&asset_id).map(|p| p.as_path())
+    }
+
+    /// The albedo texture a model paints with: `model --uses_material--> material --uses_texture-->
+    /// image`, in one query.
+    ///
+    /// **Two hops, not one.** A single hop lands on the *material*, which is not an image — the
+    /// viewer would fetch it over `ls://file`, fail to decode it, and silently render untextured.
+    /// The join is written so that mistake cannot compile away quietly.
+    pub fn model_texture(&self, asset_id: i64) -> Option<i64> {
+        let cat = self.catalog.as_ref()?;
+        cat.model_albedo_texture(asset_id).ok().flatten()
     }
 
     /// Is this an asset we know about at all?

@@ -10,8 +10,8 @@
 //! Tradeoff: photoreal/textured output gets harder later — this is silhouette + shading only.
 //!
 //! ponytail: orthographic projection, flat material colour + Lambert shading, no textures, no
-//! shadows/AA. Silhouette and form are what the encoder keys on; albedo sampling is the obvious
-//! upgrade (`MeshData` already carries `uvs` + `albedo`) if retrieval quality asks for it.
+//! shadows/AA. Albedo **is** sampled when the mesh carries one (nearest-neighbour, see
+//! `sample_albedo`); an untextured mesh falls back to its flat `base_color`.
 
 use image::{Rgba, RgbaImage};
 

@@ -55,6 +55,7 @@ export type AssetDetail = {
   height_px: number | null;
   duration_ms: number | null;
   source: string | null;
+  texture_asset_id: number | null;
   in_pack: boolean;
 };
 
@@ -103,6 +104,8 @@ const LS_BASE = navigator.userAgent.includes("Windows")
 /** Preview bytes come over the custom scheme, never through IPC — a page of cards is JSON only. */
 export const previewUrl = (assetId: number) => `${LS_BASE}/preview/${assetId}.svg`;
 export const fileUrl = (assetId: number) => `${LS_BASE}/file/${assetId}`;
+/** Decimated geometry as LSM1, for the WebGL viewer. */
+export const meshUrl = (assetId: number) => `${LS_BASE}/mesh/${assetId}`;
 
 /** `media_type.code` -> the CSS custom property naming its colour (DESIGN-GUIDELINES §2). */
 export function typeToken(mediaType: string): string {

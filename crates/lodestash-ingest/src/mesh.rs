@@ -418,7 +418,11 @@ const MESH_CACHE_MAGIC: &[u8; 4] = b"LSM1";
 
 /// Serialize the flattened geometry (no albedo — see [`load_cached`]). Flat `f32`/`u32` arrays, so
 /// read-back is a bounded parse rather than a full mesh re-parse.
-fn encode_meshes(meshes: &[MeshData]) -> Vec<u8> {
+///
+/// Public because this is also the **wire format** for `ls://mesh`: the desktop viewer parses these
+/// exact bytes in TypeScript. Disk cache and wire share one encoder deliberately — two encoders
+/// would drift, and the drift would only show up as a garbled mesh in the viewer.
+pub fn encode_meshes(meshes: &[MeshData]) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(MESH_CACHE_MAGIC);
     b.extend_from_slice(&(meshes.len() as u32).to_le_bytes());

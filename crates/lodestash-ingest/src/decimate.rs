@@ -66,6 +66,13 @@ impl Budget {
 /// have a quality setting should pass its own budget instead.
 pub const PREVIEW_BUDGET: Budget = Budget::new(0.02, 300, 1500);
 
+/// Budget for the Quick Look viewer's **fallback** path on pathologically large meshes.
+///
+/// The viewer normally ships source geometry undecimated, because this function averages UVs across
+/// each cluster and that visibly breaks palette-atlas texturing. Only a mesh too large to send whole
+/// gets decimated, accepting banded textures over a stalled viewer.
+pub const VIEWER_BUDGET: Budget = Budget::new(0.35, 2_000, 8_000);
+
 /// Coarsest and finest grid resolution the search will consider. 256³ cells is already finer than
 /// any thumbnail budget; 2³ is the floor below which nothing is recognizable.
 const MIN_GRID: u32 = 2;
@@ -480,6 +487,23 @@ mod tests {
         assert_eq!(b.target_for(120), 120);
         // A floor above the ceiling must not panic in `clamp`.
         assert_eq!(Budget::new(0.5, 9_000, 100).target_for(10_000), 100);
+    }
+
+    /// The viewer budget must sit strictly above the card proxy — if they converge, the viewer is
+    /// silently showing thumbnail-grade geometry at full size and nobody notices until they zoom.
+    #[test]
+    fn viewer_budget_is_coarser_than_source_but_finer_than_the_card_proxy() {
+        let src = 200_000;
+        let card = PREVIEW_BUDGET.target_for(src);
+        let viewer = VIEWER_BUDGET.target_for(src);
+        assert!(
+            viewer > card,
+            "viewer {viewer} must exceed card proxy {card}"
+        );
+        assert!(viewer < src, "viewer {viewer} must still decimate {src}");
+        assert_eq!(viewer, 8_000, "ceiling caps a large model");
+        // A small model is not inflated: the target never exceeds the source.
+        assert_eq!(VIEWER_BUDGET.target_for(900), 900);
     }
 
     #[test]

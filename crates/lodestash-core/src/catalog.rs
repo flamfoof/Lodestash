@@ -3885,6 +3885,35 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("preview queue row: {e}")))
     }
 
+    /// The albedo texture a model paints with, via the dependency graph (DATA-MODEL §10):
+    /// `model --uses_material--> material --uses_texture--> image`.
+    ///
+    /// **Two hops on purpose.** One hop lands on the material, which is not an image; a caller that
+    /// stopped there would hand a material id to an image loader and get a silent blank texture.
+    /// Only `resolved` edges count — a `missing` edge names a texture that was never found.
+    /// A model with several materials yields the lowest texture id, deterministically, so repeated
+    /// calls agree (see the one-albedo-per-model limitation in the viewer).
+    pub fn model_albedo_texture(&self, asset_id: i64) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT MIN(t.id)
+                   FROM asset_relationship m
+                   JOIN asset_relationship x ON x.from_asset_id = m.to_asset_id
+                   JOIN asset t              ON t.id = x.to_asset_id
+                   JOIN media_type mt        ON mt.id = t.media_type_id
+                  WHERE m.from_asset_id = ?1
+                    AND m.kind = 'uses_material' AND m.state = 'resolved'
+                    AND x.kind = 'uses_texture'  AND x.state = 'resolved'
+                    AND t.deleted_at IS NULL
+                    AND mt.code IN ('image', 'texture', 'sprite')",
+                params![asset_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(|e| CoreError::Catalog(format!("model_albedo_texture: {e}")))
+    }
+
     /// Every asset id carrying a stored preview.
     ///
     /// One query for the whole library rather than `vector_preview` per row: a grid deciding
@@ -4223,6 +4252,75 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
         assert_eq!(version, 15, "all 15 migrations should have run");
+    }
+
+    /// The viewer's texture lookup must walk **both** hops. Stopping at the first lands on the
+    /// material — not an image — which the viewer would hand to an image loader and render blank,
+    /// with no error anywhere. Also checks that an unresolved edge is not followed.
+    #[test]
+    fn model_albedo_texture_walks_both_hops_and_ignores_unresolved_edges() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let src = c
+            .upsert_import_source("Lib", "C:/lib", "folder")
+            .expect("source");
+        fn mk(c: &mut Catalog, src: i64, rel: &str, code: &str) -> i64 {
+            c.record_crawl(
+                src,
+                None,
+                &[CrawlRecord {
+                    media_type: code.to_string(),
+                    ..rec(rel, 1, 1)
+                }],
+            )
+            .expect("crawl");
+            c.conn
+                .query_row(
+                    "SELECT a.id FROM asset a JOIN asset_file af ON af.id=a.primary_file_id
+                      WHERE af.rel_path = ?1",
+                    params![rel],
+                    |r| r.get::<_, i64>(0),
+                )
+                .expect("id")
+        }
+        let model = mk(&mut c, src, "rock.fbx", "model_3d");
+        let material = mk(&mut c, src, "rock.mat", "material");
+        let texture = mk(&mut c, src, "rock.png", "image");
+        let lonely = mk(&mut c, src, "bare.fbx", "model_3d");
+        let dead_mat = mk(&mut c, src, "bare.mat", "material");
+
+        let edge = |c: &Catalog, from: i64, to: i64, kind: &str, state: &str| {
+            c.conn
+                .execute(
+                    "INSERT INTO asset_relationship
+                        (from_asset_id, to_asset_id, kind, source, confidence, state)
+                     VALUES (?1, ?2, ?3, 'test', 1.0, ?4)",
+                    params![from, to, kind, state],
+                )
+                .expect("edge");
+        };
+        edge(&c, model, material, "uses_material", "resolved");
+        edge(&c, material, texture, "uses_texture", "resolved");
+        // `lonely` reaches a material, but that material's texture edge never resolved.
+        edge(&c, lonely, dead_mat, "uses_material", "resolved");
+        edge(&c, dead_mat, texture, "uses_texture", "missing");
+
+        assert_eq!(
+            c.model_albedo_texture(model).expect("query"),
+            Some(texture),
+            "two resolved hops must reach the image"
+        );
+        assert_ne!(
+            c.model_albedo_texture(model).expect("query"),
+            Some(material),
+            "must not stop at the material — it is not an image"
+        );
+        assert_eq!(
+            c.model_albedo_texture(lonely).expect("query"),
+            None,
+            "an unresolved second hop yields no texture"
+        );
+        assert_eq!(c.model_albedo_texture(texture).expect("query"), None);
     }
 
     /// The regression this queue exists for: previews used to be generated only inside the metrics

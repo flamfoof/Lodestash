@@ -296,6 +296,95 @@ try {
     assert.ok(r.at > 0, "playhead did not move");
   });
 
+  // Wire/parser drift between `encode_meshes` and lsm1.ts would surface as garbled geometry, not
+  // an error — so parse a real response rather than trusting the shape.
+  await check("ls://mesh returns LSM1 the TS parser can read", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "models", search: "", status: "all", sort_by: "size", sort_asc: false,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    const model = p.items.find((i) => !i.in_pack);
+    assert.ok(model, "no on-disk model in the library");
+    const r = await page.evaluate(async (id) => {
+      const res = await fetch(`http://ls.localhost/mesh/${id}`);
+      if (!res.ok) return { status: res.status };
+      const buf = await res.arrayBuffer();
+      const magic = new TextDecoder().decode(new Uint8Array(buf, 0, 4));
+      const { parseLsm1, bounds } = await import("/src/lib/lsm1.ts");
+      const meshes = parseLsm1(buf);
+      const tris = meshes.reduce((n, m) => n + m.indices.length / 3, 0);
+      return {
+        status: res.status, magic, bytes: buf.byteLength,
+        meshes: meshes.length, tris,
+        hasUvs: meshes.some((m) => m.uvs !== null),
+        radius: bounds(meshes).radius,
+      };
+    }, model.asset_id);
+    assert.equal(r.status, 200);
+    assert.equal(r.magic, "LSM1");
+    assert.ok(r.meshes > 0 && r.tris > 0, `parsed ${r.meshes} meshes / ${r.tris} tris`);
+    // Geometry is served undecimated so palette-atlas UVs stay exact; only pathological meshes
+    // are cut down. The cap is on the response, not the triangle count.
+    assert.ok(r.bytes < 20 * 1024 * 1024, `mesh response too large: ${r.bytes} bytes`);
+    assert.ok(r.radius > 0, "degenerate bounds — the camera would have nothing to frame");
+  });
+
+  // The automated stand-in for looking at it: if shaders, buffers, camera framing or the mesh
+  // fetch break, the canvas is a flat background and this fails.
+  await check("a model renders non-blank pixels, and orbit + zoom change them", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "models", search: "", status: "all", sort_by: "size", sort_asc: false,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    const model = p.items.find((i) => !i.in_pack);
+    await page.fill('input[type="text"]', model.name);
+    await page.waitForFunction(
+      (n) => document.querySelector(".card .name")?.textContent?.trim() === n,
+      model.name, { timeout: 5000 });
+    await page.locator(".card").first().dblclick();
+    await page.waitForSelector('[data-testid="viewer3d"][data-status="ready"]', { timeout: 20000 });
+    await page.waitForTimeout(600);
+
+    const sample = () =>
+      page.evaluate(() => {
+        const c = document.querySelector('[data-testid="viewer3d-canvas"]');
+        const gl = c.getContext("webgl2", { preserveDrawingBuffer: true });
+        const px = new Uint8Array(c.width * c.height * 4);
+        gl.readPixels(0, 0, c.width, c.height, gl.RGBA, gl.UNSIGNED_BYTE, px);
+        // Background is --ls-bg (14,17,23). Anything materially different is drawn geometry.
+        let lit = 0, hash = 0;
+        for (let i = 0; i < px.length; i += 4) {
+          if (Math.abs(px[i] - 14) + Math.abs(px[i + 1] - 17) + Math.abs(px[i + 2] - 23) > 24) lit++;
+          hash = (hash * 31 + px[i] + px[i + 1] * 3 + px[i + 2] * 7) | 0;
+        }
+        return { lit, total: px.length / 4, hash };
+      });
+
+    const first = await sample();
+    assert.ok(
+      first.lit > first.total * 0.01,
+      `canvas is effectively blank: ${first.lit} of ${first.total} pixels differ from background`,
+    );
+
+    const box = await page.locator('[data-testid="viewer3d-canvas"]').boundingBox();
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(box.x + box.width / 2 + 120, box.y + box.height / 2 + 40, { steps: 8 });
+    await page.mouse.up();
+    await page.waitForTimeout(300);
+    const orbited = await sample();
+    assert.notEqual(orbited.hash, first.hash, "dragging did not change the render — orbit is dead");
+
+    await page.mouse.wheel(0, -400);
+    await page.waitForTimeout(300);
+    const zoomed = await sample();
+    assert.notEqual(zoomed.hash, orbited.hash, "scrolling did not change the render — zoom is dead");
+
+    await page.keyboard.press("Escape");
+    await page.fill('input[type="text"]', "");
+    await page.waitForTimeout(400);
+  });
+
   await check("ls:// serves a preview as SVG", async () => {
     // Ask for an asset that actually has a preview rather than whatever is on screen — which
     // page 1 shows depends on the sort, and most of this library is in-pack with no preview.
