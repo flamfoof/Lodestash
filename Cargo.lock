@@ -3898,6 +3898,7 @@ dependencies = [
  "serde_json",
  "tauri",
  "tauri-build",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]
