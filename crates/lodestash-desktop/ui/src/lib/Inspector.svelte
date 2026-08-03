@@ -77,10 +77,6 @@
         <dt>Duration</dt>
         <dd class="num">{fmtDuration(detail.duration_ms)}</dd>
       {/if}
-      {#if detail.rating}
-        <dt>Rating</dt>
-        <dd>{"★".repeat(detail.rating)}</dd>
-      {/if}
       {#if detail.source}
         <dt>Source</dt>
         <dd>{detail.source}</dd>

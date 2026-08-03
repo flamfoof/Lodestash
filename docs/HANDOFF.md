@@ -32,7 +32,23 @@ Sanity check before starting: `cargo test --workspace` and `cargo clippy --works
 and orbit a textured model — and change nothing. That is the gap that stops it replacing the egui
 build for real work, and it is the agreed next task.
 
-**Scope:** favourite, rating, trash / untrash, delete-from-disk, empty trash — with confirm modals.
+**Scope:** favourite, **Remove from library**, trash / untrash, delete-from-disk, empty trash — with
+confirm modals. **Rating is not in scope** — parked 2026-08-03 (`DATA-MODEL.md` §12): a private
+library gets nothing from scoring its own files, and Favourites already answers "find this again".
+It earns its place if Lodestash ever hosts or distributes assets, so the column stays.
+
+**Three actions the user must never confuse (owner's call, 2026-08-03):**
+
+- **Remove from library** — the safe one, and the one most people mean. Soft-delete the row **and**
+  write an `Exclude { kind: Asset, value: rel_path }` to that source's blacklist, so the next scan
+  does not resurrect it; re-importing that file explicitly is the only way back. `Exclude` and
+  `Exclude::matches` are already implemented and tested in `lodestash_core::types` — the work is
+  wiring, not invention.
+- **Trash** — soft-delete only. Recoverable, and still re-scannable.
+- **Delete from disk** — irreversible, fenced by `only_paths_under_known_roots_may_be_deleted`. The
+  confirm modal names the absolute path, uses the word **permanently**, is not the default button,
+  and offers Remove from library as the alternative *inside the same dialog* — the moment before a
+  delete is when someone finds out the safe option existed.
 
 **The two things that make this different from everything shipped so far:**
 
@@ -48,8 +64,9 @@ build for real work, and it is the agreed next task.
    files. It is mutation-checked — keep it that way.
 
 **Already written and tested in core, do not reimplement:** `set_favorite`, `favorite_ids`,
-`set_rating`, `set_trashed`, `related_assets`. The desktop crate has a habit of growing its own
-copies (see T5) — check `lodestash-app` and `lodestash-core` first.
+`set_trashed`, `related_assets`, and `Exclude`/`Exclude::matches` for the Remove path. The desktop
+crate has a habit of growing its own copies (see T5) — check `lodestash-app` and `lodestash-core`
+first.
 
 **Verification bar:** the e2e suite must gain a check per mutation that reads the value back
 *through a separate call*, not from the response — a write that returns success while persisting

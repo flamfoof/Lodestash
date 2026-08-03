@@ -27,7 +27,6 @@ pub struct GridItem {
     pub media_type: String,
     pub size_bytes: i64,
     pub status: String,
-    pub rating: Option<u8>,
     /// True when `asset_preview` holds a traced vector preview for this asset (M15).
     pub has_preview: bool,
     /// Starred (DATA-MODEL §12). Carried on the item so a card can draw the pin without a
@@ -116,7 +115,6 @@ pub struct AssetDetail {
     pub media_type: String,
     pub size_bytes: i64,
     pub status: String,
-    pub rating: Option<u8>,
     pub has_preview: bool,
     pub triangles: Option<i64>,
     pub width_px: Option<i64>,
@@ -423,7 +421,7 @@ impl Library {
             .collect();
 
         // Every key falls back to name for ties, which keeps paging stable when a key has many
-        // equal values (thousands of assets share a rating, or have none). Name is sorted
+        // equal values (thousands of assets share an mtime, or a size). Name is sorted
         // explicitly rather than leaning on load order: relying on `reload` having sorted
         // `rows` makes the result depend on how the Library was built, not on the query.
         //
@@ -441,7 +439,13 @@ impl Library {
             grid::dir(o.then_with(|| key(a).cmp(&key(b))), q.sort_asc)
         };
         match q.sort_by {
-            SortBy::Name => matched.sort_by(|a, b| by(std::cmp::Ordering::Equal, a, b)),
+            // Rating is not part of this product's surface (see the note in DATA-MODEL §12): a
+            // personal library nobody else browses gets no value from ranking your own files, and
+            // the toolbar no longer offers it. The variant still exists for the egui build, so it
+            // is accepted and treated as Name rather than failing a query nobody can now send.
+            SortBy::Name | SortBy::Rating => {
+                matched.sort_by(|a, b| by(std::cmp::Ordering::Equal, a, b))
+            }
             // BM25 order, hits before non-hits. With no query (or no catalog) every row is
             // unranked and this degrades to name order, which is why the toolbar can leave
             // Relevance selected while the user clears the search box.
@@ -455,13 +459,6 @@ impl Library {
                 matched.sort_by(|a, b| by(a.item.size_bytes.cmp(&b.item.size_bytes), a, b))
             }
             SortBy::Modified => matched.sort_by(|a, b| by(a.mtime.cmp(&b.mtime), a, b)),
-            SortBy::Rating => matched.sort_by(|a, b| {
-                by(
-                    a.item.rating.unwrap_or(0).cmp(&b.item.rating.unwrap_or(0)),
-                    a,
-                    b,
-                )
-            }),
             // Enum order, not alphabetical on the code string — `grid::media_key` owns that rule.
             SortBy::Type => matched.sort_by(|a, b| {
                 by(
@@ -507,7 +504,6 @@ impl Library {
             media_type: row.item.media_type.clone(),
             size_bytes: row.item.size_bytes,
             status: row.item.status.clone(),
-            rating: row.item.rating,
             has_preview: row.item.has_preview,
             triangles: row.item.triangles,
             width_px: row.width_px,
@@ -658,7 +654,6 @@ fn row_from(
             media_type: e.media_type,
             size_bytes: e.size_bytes,
             status: e.status,
-            rating: e.rating,
             // Preview and favourite flags are filled in one pass each, not a query per row.
             has_preview: false,
             favorite: false,
@@ -693,7 +688,6 @@ mod tests {
                     media_type: (*mt).into(),
                     size_bytes: 1,
                     status: "indexed".into(),
-                    rating: None,
                     has_preview: false,
                     favorite: false,
                     in_pack: false,

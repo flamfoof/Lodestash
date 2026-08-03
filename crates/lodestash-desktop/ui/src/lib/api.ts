@@ -7,7 +7,6 @@ export type GridItem = {
   media_type: string;
   size_bytes: number;
   status: string;
-  rating: number | null;
   has_preview: boolean;
   favorite: boolean;
   in_pack: boolean;
@@ -48,7 +47,6 @@ export type AssetDetail = {
   media_type: string;
   size_bytes: number;
   status: string;
-  rating: number | null;
   has_preview: boolean;
   triangles: number | null;
   width_px: number | null;
@@ -71,7 +69,6 @@ export const SORTS = [
   { id: "type", label: "Type" },
   { id: "size", label: "Size" },
   { id: "modified", label: "Date" },
-  { id: "rating", label: "Rating" },
 ] as const;
 
 /** STATUS facet (UI-SPEC §0.2). `discovered`/`indexed` both read as Unidentified. */

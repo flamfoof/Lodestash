@@ -732,10 +732,13 @@ ALTER TABLE package ADD COLUMN pipeline TEXT;     -- 'built_in'|'urp'|'hdrp'|'mi
 ALTER TABLE project ADD COLUMN pipeline TEXT;     -- the registered editor's pipeline (from register_project)
 ```
 
-- **Rating** — the classic DAM "my go-to assets" signal. Set manually (grid/inspector stars,
-  keyboard 1–5); a numeric range filter in the query grammar
-  ([`IDENTIFICATION-AND-SEARCH.md`](IDENTIFICATION-AND-SEARCH.md) §6) and a sort key. Never
-  AI-written — it is pure user curation.
+- **Rating** — **parked, not part of the product surface (2026-08-03).** The column stays and the
+  read paths keep carrying it, but no rating UI ships in the Tauri frontend: nobody else browses
+  your library, so scoring your own files earns nothing that Favourites (a pin) does not already
+  give. It becomes worth building **if Lodestash ever hosts or distributes assets**, where a rating
+  is a signal between users rather than a note to yourself — which is why the column is left in
+  place rather than migrated away. The egui build's stars remain until B7 deletes that crate.
+  Never AI-written in any case — it is pure user curation.
 - **Pipeline** — which Unity render pipeline a pack targets, harvested at ingest
   ([`INGESTION.md`](INGESTION.md) §2): shader GUID references in `.mat` files (URP/HDRP shaders have
   well-known GUIDs; custom/`Standard` shaders ⇒ `built_in`) and `com.unity.render-pipelines.*`

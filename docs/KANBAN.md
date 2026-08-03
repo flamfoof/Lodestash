@@ -283,7 +283,24 @@ until B7.
       drain order **verbatim** from `app.rs:9533` (that order encodes the `database is locked`
       fix). Blocked on B1. Until then the shell reads the catalog directly, which is sound because
       browsing is a read.
-- [ ] **B5 — writes.** Favourite, rating, trash, delete-from-disk, confirm modals. Crosses from
+- [ ] **B5 — writes.** Favourite, **Remove from library**, trash, delete-from-disk, confirm modals.
+      **Rating is out of scope** (parked — [`DATA-MODEL.md`](DATA-MODEL.md) §12).
+
+      **Three different destructive-sounding actions, and the UI must not let them blur:**
+      1. **Remove from library** — non-destructive and the one most people actually want. The
+         asset stops showing up anywhere, **and stops coming back on the next scan**: the row is
+         soft-deleted *and* an `Exclude { kind: Asset, value: rel_path }` is written to that
+         source's blacklist (`lodestash_core::types::Exclude`, already implemented and tested —
+         `Exclude::matches` handles both full-path and file-name form). Undone only by importing
+         that file again explicitly. No file is touched.
+      2. **Trash** — soft-delete alone, recoverable from the Trash screen, still re-scannable.
+      3. **Delete from disk** — the one genuinely irreversible action, fenced by
+         `only_paths_under_known_roots_may_be_deleted`. Its confirm modal must **name the file's
+         absolute path and say the word "permanently"**, and must not be the default button. The
+         non-destructive alternative belongs *in that dialog* ("just hide it instead"), because
+         the moment someone is about to delete is the moment they learn Remove exists.
+
+      Crosses from
       reading into mutating: every write goes through the persist thread (ARCHITECTURE §5), and
       `only_paths_under_known_roots_may_be_deleted` fences the one destructive path.
       **Cutover gate:** `approve_job`/`deny_job` must be reachable or every agent export hangs
