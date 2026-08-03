@@ -35,6 +35,12 @@ const MAX_CHUNK: u64 = 8 * 1024 * 1024;
 /// shrug at; beyond it, a banded texture beats a stalled viewer.
 const MESH_DECIMATE_ABOVE: usize = 300_000;
 
+/// Tessellation of the material shader ball. The same numbers `material::render_sphere` uses for
+/// the grid thumbnail, so the card and the viewer show the same object — ~3k triangles, which is
+/// nothing to a GPU and smooth under the orbit camera.
+const SPHERE_SEGMENTS: u32 = 48;
+const SPHERE_RINGS: u32 = 32;
+
 pub fn handle(lib: &Mutex<Library>, req: &Request<Vec<u8>>) -> Response<Vec<u8>> {
     let uri = req.uri();
     // Tauri normalises every form of the scheme to `lodestash://localhost/<kind>/<rest>` before the
@@ -225,10 +231,31 @@ fn mesh(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
     else {
         return status(StatusCode::BAD_REQUEST, "mesh: bad asset id");
     };
-    let (path, known) = match lib.lock() {
-        Ok(l) => (l.asset_path(id).map(Path::to_path_buf), l.knows(id)),
-        Err(_) => (None, false),
+    let (path, known, media_type) = match lib.lock() {
+        Ok(l) => (
+            l.asset_path(id).map(Path::to_path_buf),
+            l.knows(id),
+            l.media_type(id),
+        ),
+        Err(_) => (None, false, None),
     };
+
+    // A material has no geometry of its own — it is a description of a surface. The viewer gets
+    // the same shader ball the grid thumbnail renders (`material::render_sphere`), painted by the
+    // texture `AssetDetail::texture_asset_id` resolves. Generated, so it needs no file at all:
+    // an in-pack material previews without pulling anything out of its archive.
+    if media_type == Some(lodestash_core::types::MediaType::Material) {
+        let ball = lodestash_ingest::material::uv_sphere(SPHERE_SEGMENTS, SPHERE_RINGS, 1.0);
+        let bytes = lodestash_ingest::mesh::encode_meshes(std::slice::from_ref(&ball));
+        return reply(StatusCode::OK)
+            .header("Content-Type", "application/octet-stream")
+            // The sphere is a constant; only the texture varies, and that is a separate URL.
+            .header("Cache-Control", "max-age=3600")
+            .header("Content-Length", bytes.len().to_string())
+            .body(bytes)
+            .unwrap_or_else(|_| status(StatusCode::INTERNAL_SERVER_ERROR, "sphere: build"));
+    }
+
     let Some(path) = path.filter(|p| p.exists()) else {
         // Same contract as `lodestash://file`: a known asset whose bytes are in a pack is not missing.
         return if known {

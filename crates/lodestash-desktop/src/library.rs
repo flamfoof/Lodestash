@@ -514,7 +514,7 @@ impl Library {
             height_px: row.height_px,
             duration_ms: row.duration_ms,
             source: row.source.clone(),
-            texture_asset_id: self.model_texture(asset_id),
+            texture_asset_id: self.albedo_texture(asset_id),
             in_pack: row.item.in_pack,
         })
     }
@@ -551,6 +551,28 @@ impl Library {
 
     pub fn asset_path(&self, asset_id: i64) -> Option<&Path> {
         self.paths.get(&asset_id).map(|p| p.as_path())
+    }
+
+    /// The parsed `media_type` of a known asset, for routes that behave differently per type.
+    pub fn media_type(&self, asset_id: i64) -> Option<MediaType> {
+        self.rows
+            .iter()
+            .find(|r| r.item.asset_id == asset_id)?
+            .media_type
+    }
+
+    /// The albedo texture this asset paints with, whatever kind of asset it is.
+    ///
+    /// A model is two hops away from its texture; a **material is one** — it *is* the middle of
+    /// that chain. Sending a model down the one-hop path returns its material (not an image), and
+    /// sending a material down the two-hop path returns nothing at all, so the viewer renders a
+    /// grey ball with no error anywhere. The branch is the whole point.
+    fn albedo_texture(&self, asset_id: i64) -> Option<i64> {
+        let cat = self.catalog.as_ref()?;
+        match self.media_type(asset_id) {
+            Some(MediaType::Material) => cat.material_albedo_texture(asset_id).ok().flatten(),
+            _ => cat.model_albedo_texture(asset_id).ok().flatten(),
+        }
     }
 
     /// The albedo texture a model paints with: `model --uses_material--> material --uses_texture-->

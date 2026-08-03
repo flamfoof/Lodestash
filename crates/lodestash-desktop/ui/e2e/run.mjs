@@ -431,6 +431,103 @@ try {
     await page.waitForTimeout(400);
   });
 
+  // T3: a material has no geometry of its own, so the route generates the same shader ball the
+  // grid thumbnail renders. It is generated rather than parsed, which is why an in-pack material
+  // previews without pulling anything — assert that explicitly, since it is the interesting part.
+  await check("a material's shader ball comes back as a unit sphere, in-pack included", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "materials", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    const packed = p.items.find((i) => i.in_pack) ?? p.items[0];
+    assert.ok(packed, "no materials in the library");
+    const r = await page.evaluate(async (id) => {
+      const res = await fetch(`http://lodestash.localhost/mesh/${id}`);
+      if (!res.ok) return { status: res.status };
+      const buf = await res.arrayBuffer();
+      const { parseLsm1, bounds } = await import("/src/lib/lsm1.ts");
+      const meshes = parseLsm1(buf);
+      // Every vertex of a unit sphere sits at radius 1 — the cheapest proof this is the ball
+      // and not some other mesh that happens to parse.
+      let minR = Infinity, maxR = 0;
+      for (const m of meshes) {
+        for (let i = 0; i < m.positions.length; i += 3) {
+          const d = Math.hypot(m.positions[i], m.positions[i + 1], m.positions[i + 2]);
+          if (d < minR) minR = d;
+          if (d > maxR) maxR = d;
+        }
+      }
+      return {
+        status: res.status,
+        magic: new TextDecoder().decode(new Uint8Array(buf, 0, 4)),
+        tris: meshes.reduce((n, m) => n + m.indices.length / 3, 0),
+        hasUvs: meshes.every((m) => m.uvs !== null),
+        minR, maxR, radius: bounds(meshes).radius,
+      };
+    }, packed.asset_id);
+    assert.equal(r.status, 200, `in-pack material must still get a ball, got ${r.status}`);
+    assert.equal(r.magic, "LSM1");
+    assert.ok(r.tris > 100, `too coarse to be the shader ball: ${r.tris} tris`);
+    assert.ok(r.hasUvs, "no UVs — the albedo texture would have nowhere to land");
+    assert.ok(r.maxR - r.minR < 0.01, `not a unit sphere: radii ${r.minR}..${r.maxR}`);
+  });
+
+  // A material is **one** hop from its texture; a model is two. Send a material down the model's
+  // two-hop join and it resolves nothing, so the ball renders flat grey with no error anywhere —
+  // which looks exactly like a material that genuinely has no texture.
+  await check("a material resolves its albedo through the one-hop join", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "materials", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    // Walk the whole tab, not a prefix: only ~130 of the 668 materials have a resolved edge and
+    // none of them sort near the front, so sampling the first page proves nothing either way.
+    let found = null;
+    for (const m of p.items) {
+      const d = await invoke("asset_detail", { assetId: m.asset_id });
+      if (d?.texture_asset_id) { found = { mat: m.name, tex: d.texture_asset_id }; break; }
+    }
+    assert.ok(found, "no material resolved a texture — the one-hop join is dead");
+    console.log(`       ${found.mat} -> texture ${found.tex}`);
+    // And the thing it resolved must be an image, not the material itself or another material.
+    const tex = await invoke("asset_detail", { assetId: found.tex });
+    assert.ok(
+      ["image", "texture", "sprite"].includes(tex.media_type),
+      `resolved a ${tex.media_type}, not an image — that is the two-hop bug in reverse`,
+    );
+  });
+
+  await check("a material renders non-blank pixels in Quick Look", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "materials", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    const mat = p.items[0];
+    assert.ok(mat, "no materials in the library");
+    await page.fill('input[type="text"]', mat.name);
+    await page.waitForFunction(
+      (n) => document.querySelector(".card .name")?.textContent?.trim() === n,
+      mat.name, { timeout: 5000 });
+    await page.locator(".card").first().dblclick();
+    await page.waitForSelector('[data-testid="viewer3d"][data-status="ready"]', { timeout: 20000 });
+    await page.waitForTimeout(600);
+    const lit = await page.evaluate(() => {
+      const c = document.querySelector('[data-testid="viewer3d-canvas"]');
+      const gl = c.getContext("webgl2", { preserveDrawingBuffer: true });
+      const px = new Uint8Array(c.width * c.height * 4);
+      gl.readPixels(0, 0, c.width, c.height, gl.RGBA, gl.UNSIGNED_BYTE, px);
+      let n = 0;
+      for (let i = 0; i < px.length; i += 4) {
+        if (Math.abs(px[i] - 14) + Math.abs(px[i + 1] - 17) + Math.abs(px[i + 2] - 23) > 24) n++;
+      }
+      return { n, total: px.length / 4 };
+    });
+    assert.ok(lit.n > lit.total * 0.01, `blank canvas: ${lit.n} of ${lit.total} pixels lit`);
+    await page.keyboard.press("Escape");
+    await page.fill('input[type="text"]', "");
+    await page.waitForTimeout(400);
+  });
+
   // Every asset with pixels should get a picture. The three generators already existed in
   // `lodestash_ingest::thumb`; none of them was reachable from the frontend until `lodestash://thumb`.
   await check("lodestash://thumb renders images, audio waveforms and material balls", async () => {

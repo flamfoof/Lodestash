@@ -43,6 +43,9 @@
   // stored vector preview or the type mark, rather than an empty pane that looks broken.
   let kind = $derived.by(() => {
     if (!detail) return "loading";
+    // A material's shader ball is *generated* — no bytes are read from the pack — so it is the
+    // one type that previews fine while still in an archive.
+    if (detail.media_type === "material") return "model";
     if (detail.in_pack) return "not_local";
     switch (detail.media_type) {
       case "image":

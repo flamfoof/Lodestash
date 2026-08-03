@@ -248,17 +248,30 @@ until B7.
       20s -> 90s. At 20s a 3,400-model library needed dozens of launches to converge, so in
       practice it never did. Still a fixed slice, not adaptive: if it ever competes with a scan,
       make it a Settings action rather than growing the constant.
-- [ ] **T3 — material shader balls.** 668 materials have no viewer. `material::uv_sphere` already
-      generates the mesh and the graph has 204 resolved `material --uses_texture--> image` edges;
-      `lodestash://mesh` returns a generated sphere for a material and `Viewer3D` renders it unchanged.
-- [ ] **T4 — real search.** The grid filters with `contains()` over lowercased names.
-      `catalog::search_assets` (FTS5 + BM25), `query::parse_query` (structured `ParsedQuery`) and
-      `fusion::rrf_fuse` all exist and are unused. Fuse on **rank**, never on score.
-- [ ] **T5 — drop duplicated helpers.** `lodestash-desktop` reimplements logic that already exists
-      and is tested in `lodestash-app`: sorting (`grid::sort_indices` + `grid::dir`), tab matching
-      (`Category::matches`), status folding (`StatusFilter::matches`), `fmtDuration`
-      (`audio::fmt_time`), `typeToken` (`Category::token`). Built in isolation; exactly the drift
-      the extraction exists to prevent.
+- [x] **T3 — material shader balls.** *Shipped 2026-08-03.* `lodestash://mesh` returns a generated
+      `material::uv_sphere` for a material — the same ball the grid thumbnail renders — and Quick
+      Look routes materials to `Viewer3D` unchanged. Generated, not parsed, so an **in-pack
+      material previews without pulling anything** (the only type that can). `AssetDetail`'s
+      texture now branches on media type: a material is **one** hop from its albedo, a model two;
+      sending a material down the two-hop join resolves nothing and renders a grey ball with no
+      error, which is indistinguishable from a material that has no texture. Only ~130 of 668
+      materials have a resolved edge and none sort near the front, so the e2e check walks the
+      whole tab.
+- [x] **T4 — real search.** *Shipped 2026-08-03.* `catalog::search_assets` (FTS5 + BM25 over name,
+      description and denormalised tags) now backs the grid, **unioned** with the old substring
+      pass because FTS matches whole tokens by prefix and a mid-word query would otherwise stop
+      matching. Relevance is a real sort via the new `grid::relevance_key` (`Option`'s own order
+      is backwards for it); typing switches to it, clearing restores Name. `query::parse_query`
+      and `fusion::rrf_fuse` stay unused — RRF earns its place when vector search gives it genuinely
+      separate spaces to fuse on rank, not for one lexical retriever.
+- [x] **T5 — drop duplicated helpers.** *Shipped 2026-08-03.* `GridQuery` deserializes into
+      `Category`/`StatusFilter`/`SortBy` instead of re-matching strings; `grid::media_key` and
+      `grid::dir` own the type ordering and the sort direction. Two divergences fell out: Type
+      sorted media_type strings alphabetically (`audio` before `model_3d`), and the order was not
+      total, so descending was not the reverse of ascending for rows sharing a name and a size.
+      `fmtDuration`/`typeToken` stay in TypeScript deliberately (an IPC round-trip to format
+      `mm:ss` is not a deduplication) — `fmtDuration` did round where `fmt_time` truncates, and now
+      matches.
 
 ### Then — bigger, each wants its own session
 
