@@ -3,6 +3,7 @@
   import {
     assetDetail,
     previewUrl,
+    thumbUrl,
     typeToken,
     typeIcon,
     fmtSize,
@@ -31,6 +32,8 @@
     };
   });
 
+  const hideBroken = (e: Event) => ((e.currentTarget as HTMLImageElement).style.display = "none");
+
   let tint = $derived(detail ? `var(${typeToken(detail.media_type)})` : "var(--ls-text-dim)");
 </script>
 
@@ -41,6 +44,8 @@
     <div class="hero" data-testid="inspector-hero">
       {#if detail.has_preview}
         <img src={previewUrl(detail.asset_id)} alt="" />
+      {:else if detail.media_type !== "model_3d" && !detail.in_pack}
+        <img src={thumbUrl(detail.asset_id)} alt="" onerror={hideBroken} />
       {:else}
         <Icon name={typeIcon(detail.media_type)} size={40} />
       {/if}

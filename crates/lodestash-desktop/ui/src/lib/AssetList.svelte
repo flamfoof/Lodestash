@@ -3,6 +3,7 @@
   import {
     type GridItem,
     previewUrl,
+    thumbUrl,
     typeToken,
     typeIcon,
     fmtSize,
@@ -20,6 +21,9 @@
     onselect: (id: number) => void;
     onopen: (id: number) => void;
   } = $props();
+
+  /** A row that cannot be thumbnailed just shows nothing rather than a broken-image glyph. */
+  const hideBroken = (e: Event) => ((e.currentTarget as HTMLImageElement).style.display = "none");
 </script>
 
 <div class="list" role="table" aria-label="Assets">
@@ -44,6 +48,8 @@
         <span class="thumb">
           {#if item.has_preview}
             <img src={previewUrl(item.asset_id)} alt="" loading="lazy" />
+          {:else if item.media_type !== "model_3d" && !item.in_pack}
+            <img src={thumbUrl(item.asset_id)} alt="" loading="lazy" onerror={hideBroken} />
           {:else}
             <Icon name={typeIcon(item.media_type)} size={16} />
           {/if}

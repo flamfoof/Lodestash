@@ -43,6 +43,7 @@ pub fn handle(lib: &Mutex<Library>, req: &Request<Vec<u8>>) -> Response<Vec<u8>>
     let res = match kind {
         "preview" => preview(lib, rest),
         "mesh" => mesh(lib, rest),
+        "thumb" => thumb(lib, rest),
         "file" => file(lib, rest, req),
         _ => status(StatusCode::NOT_FOUND, "unknown ls:// kind"),
     };
@@ -76,6 +77,87 @@ fn preview(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
             .body(svg.into_bytes())
             .unwrap_or_else(|_| status(StatusCode::INTERNAL_SERVER_ERROR, "preview: build")),
         None => status(StatusCode::NOT_FOUND, "no preview for that asset"),
+    }
+}
+
+/// `ls://thumb/{asset_id}.png` — a raster thumbnail, generated on first request and cached.
+///
+/// This is what stops the grid being a wall of type icons: only models with a stored vector
+/// preview had a picture, which was 208 of 7,691 assets. Every branch here already existed in
+/// `lodestash_ingest::thumb` — images and models through `generate`, audio through
+/// `generate_waveform`, materials through `generate_material` — none of it was reachable from the
+/// frontend.
+///
+/// Generation is synchronous but writes through the existing on-disk cache, so it happens once per
+/// asset and the webview's own cache absorbs the rest.
+fn thumb(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
+    let Some(id) = rest
+        .split('/')
+        .next()
+        .and_then(|s| s.trim_end_matches(".png").parse::<i64>().ok())
+    else {
+        return status(StatusCode::BAD_REQUEST, "thumb: bad asset id");
+    };
+    let (job, cache_dir) = match lib.lock() {
+        Ok(l) => (l.thumb_job(id), l.thumb_cache_dir().map(Path::to_path_buf)),
+        Err(_) => (None, None),
+    };
+    let (Some(job), Some(cache)) = (job, cache_dir) else {
+        return status(StatusCode::NOT_FOUND, "unknown asset");
+    };
+    if job.in_pack {
+        // Same contract as the other routes: real asset, bytes not local, never extract on a GET.
+        return status(StatusCode::SERVICE_UNAVAILABLE, "not_local");
+    }
+    let Some(path) = job.path.filter(|p| p.exists()) else {
+        return status(StatusCode::NOT_FOUND, "file missing");
+    };
+
+    // Models are served by the vector-preview pipeline, not here: a raster model thumbnail costs a
+    // full mesh parse, and a grid page would trigger a hundred of them. Refusing at the route
+    // means a hand-written URL cannot cause the stampede either.
+    if job.media_type == "model_3d" {
+        return status(
+            StatusCode::NOT_FOUND,
+            "models use ls://preview, not ls://thumb",
+        );
+    }
+
+    let params = lodestash_ingest::thumb::ThumbParams::default();
+    let key = lodestash_ingest::thumb::meta_key(
+        &path,
+        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+        0,
+    );
+    let made = match job.media_type.as_str() {
+        "audio" => lodestash_ingest::thumb::generate_waveform(&cache, &key, params, |bars| {
+            lodestash_app::audio::load_waveform(&path, bars).map(|m| m.peaks)
+        }),
+        "material" => {
+            // The texture is part of the picture, so it is part of the key: swap a material's
+            // albedo and the previously cached ball must not be served.
+            let key = match &job.albedo {
+                Some(a) => format!("{key}-{}", lodestash_ingest::thumb::meta_key(a, 0, 0)),
+                None => format!("{key}-flat"),
+            };
+            lodestash_ingest::thumb::generate_material(&cache, &key, params, job.albedo.as_deref())
+        }
+        _ => lodestash_ingest::thumb::generate(&path, &cache, &key, params),
+    };
+    match made.and_then(std::fs::read) {
+        Ok(bytes) => reply(StatusCode::OK)
+            .header("Content-Type", "image/png")
+            .header("Cache-Control", "max-age=3600")
+            .header("Content-Length", bytes.len().to_string())
+            .body(bytes)
+            .unwrap_or_else(|_| status(StatusCode::INTERNAL_SERVER_ERROR, "thumb: build")),
+        Err(e) => {
+            tracing::debug!(%e, ?path, "thumbnail generation failed");
+            status(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "no thumbnail for this file",
+            )
+        }
     }
 }
 

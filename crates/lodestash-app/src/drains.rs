@@ -760,10 +760,17 @@ pub fn drain_metrics(
 /// Runs on the persist thread with the writer connection, like every other drain (ARCHITECTURE §5).
 /// In-pack assets are skipped for the same reason as in the metrics path — a scratch file has no
 /// stable identity to key a preview on.
-/// How long one pass may spend backfilling previews. Four 256px CPU renders per model is tens of
-/// milliseconds each, so a few thousand models is minutes — too long to hold the persist thread
-/// away from scans and mutations in one go.
-pub const PREVIEW_BACKFILL_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+/// How long one pass may spend backfilling previews.
+///
+/// Four 256px CPU renders per model is tens of milliseconds each, so the whole backlog is minutes
+/// and cannot run in one go without starving scans and mutations. At 20s a pass a 3,400-model
+/// library needed dozens of launches to converge, which in practice meant it never did — the grid
+/// sat at 6% coverage. 90s still yields the thread promptly but actually finishes a library over a
+/// handful of sessions.
+///
+/// ponytail: a fixed slice, not adaptive. If this ever competes with a scan, make it a Settings
+/// action rather than growing the constant.
+pub const PREVIEW_BACKFILL_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 
 pub fn drain_previews(
     cat: &mut Catalog,

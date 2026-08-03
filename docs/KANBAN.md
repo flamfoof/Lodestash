@@ -228,14 +228,20 @@ until B7.
 
 ### Next up — ordered by what a user actually sees
 
-- [ ] **T1 — `ls://thumb` raster thumbnails.** *The biggest visible gap: **7,483 of 7,691 assets
-      render a generic type icon**.* Only models with a stored vector preview (208) show a picture;
-      every image, audio file and material shows an icon. `thumb::generate` already produces
-      rasters and waveforms and **826 PNGs / 10.8 MB are already cached on disk** — this route was
-      in the B3 plan and never built. No new dependencies.
-- [ ] **T2 — drain the vector-preview backlog.** 208 of 3,439 models have previews because
-      `PREVIEW_BACKFILL_BUDGET` is 20 s per pass. Raise it, or add an explicit
-      "generate previews" action in Settings so it is the user's choice rather than a constant.
+- [x] **T1 — `ls://thumb` raster thumbnails.** *Shipped 2026-08-03.* Images, audio waveforms and
+      material shader balls now render through `thumb::generate` / `generate_waveform` /
+      `generate_material`. **Reach is smaller than the headline suggested:** only **1,728 of 7,691
+      assets are on disk** (image 191/2,288 · audio 84/1,841 · material 149/668 · model 1,304/3,439)
+      — the rest are in-pack and answer 503 by design. Models are refused by the route: a raster
+      model thumbnail costs a full mesh parse, so a grid page would trigger a hundred of them; they
+      use the vector-preview pipeline instead.
+      **Follow-up:** in-pack thumbnails are possible via `thumbs::ensure_in_pack_scratch` (the egui
+      build does exactly this, capped at `IN_PACK_THUMB_MAX_BYTES`), but it needs the pack locator
+      carried on each row and it relaxes "the protocol never pulls" — worth its own decision.
+- [x] **T2 — drain the vector-preview backlog.** *Shipped 2026-08-03.* `PREVIEW_BACKFILL_BUDGET`
+      20s -> 90s. At 20s a 3,400-model library needed dozens of launches to converge, so in
+      practice it never did. Still a fixed slice, not adaptive: if it ever competes with a scan,
+      make it a Settings action rather than growing the constant.
 - [ ] **T3 — material shader balls.** 668 materials have no viewer. `material::uv_sphere` already
       generates the mesh and the graph has 204 resolved `material --uses_texture--> image` edges;
       `ls://mesh` returns a generated sphere for a material and `Viewer3D` renders it unchanged.

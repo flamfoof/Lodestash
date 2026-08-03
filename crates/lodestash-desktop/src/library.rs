@@ -73,6 +73,15 @@ impl Default for GridQuery {
     }
 }
 
+/// What the thumbnail handler needs, lifted out of the `Library` lock in one go.
+pub struct ThumbJob {
+    pub path: Option<PathBuf>,
+    pub media_type: String,
+    /// Only set for materials: the texture its shader ball wears.
+    pub albedo: Option<PathBuf>,
+    pub in_pack: bool,
+}
+
 /// Everything the Inspector shows for one asset (UI-SPEC §13). Separate from `GridItem` so a
 /// page of 100 cards never carries per-asset detail nobody is looking at.
 #[derive(Debug, Clone, Serialize)]
@@ -136,6 +145,9 @@ pub struct LibraryStatus {
 /// Everything the shell holds about the open catalog.
 pub struct Library {
     catalog: Option<Catalog>,
+    /// Where generated thumbnails live — the same cache the egui build writes, so a thumbnail
+    /// rendered by either frontend serves the other.
+    thumb_cache: Option<PathBuf>,
     catalog_path: Option<PathBuf>,
     sources: Vec<SourceSummary>,
     /// All live rows, name-sorted once at open. The whole library is ~10k rows of small structs,
@@ -173,6 +185,7 @@ impl Library {
             Ok(cat) => {
                 let mut lib = Self {
                     catalog: Some(cat),
+                    thumb_cache: lodestash_app::paths::default_cache_dirs().0,
                     catalog_path: Some(path),
                     sources: Vec::new(),
                     rows: Vec::new(),
@@ -191,6 +204,7 @@ impl Library {
     fn empty() -> Self {
         Self {
             catalog: None,
+            thumb_cache: lodestash_app::paths::default_cache_dirs().0,
             catalog_path: None,
             sources: Vec::new(),
             rows: Vec::new(),
@@ -431,6 +445,10 @@ impl Library {
         })
     }
 
+    pub fn thumb_cache_dir(&self) -> Option<&Path> {
+        self.thumb_cache.as_deref()
+    }
+
     pub fn asset_path(&self, asset_id: i64) -> Option<&Path> {
         self.paths.get(&asset_id).map(|p| p.as_path())
     }
@@ -444,6 +462,28 @@ impl Library {
     pub fn model_texture(&self, asset_id: i64) -> Option<i64> {
         let cat = self.catalog.as_ref()?;
         cat.model_albedo_texture(asset_id).ok().flatten()
+    }
+
+    /// Everything `ls://thumb` needs to render one asset, resolved under the lock so the handler
+    /// does its file work without holding it.
+    pub fn thumb_job(&self, asset_id: i64) -> Option<ThumbJob> {
+        let row = self.rows.iter().find(|r| r.item.asset_id == asset_id)?;
+        Some(ThumbJob {
+            path: self.paths.get(&asset_id).cloned(),
+            media_type: row.item.media_type.clone(),
+            // A material has no pixels of its own — it wears a texture reached through the graph.
+            albedo: (row.item.media_type == "material")
+                .then(|| self.material_texture_path(asset_id))
+                .flatten(),
+            in_pack: row.item.in_pack,
+        })
+    }
+
+    /// The on-disk texture a material paints its shader ball with — one hop, unlike a model's two.
+    fn material_texture_path(&self, material_id: i64) -> Option<PathBuf> {
+        let cat = self.catalog.as_ref()?;
+        let tex = cat.material_albedo_texture(material_id).ok().flatten()?;
+        self.paths.get(&tex).cloned()
     }
 
     /// Is this an asset we know about at all?
@@ -558,6 +598,7 @@ mod tests {
             .collect();
         Library {
             catalog: None,
+            thumb_cache: lodestash_app::paths::default_cache_dirs().0,
             catalog_path: None,
             sources: Vec::new(),
             rows,

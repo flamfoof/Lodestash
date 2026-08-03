@@ -1,6 +1,6 @@
 <script lang="ts">
   import Icon from "./Icon.svelte";
-  import { type GridItem, previewUrl, typeToken, typeIcon, fmtSize } from "./api";
+  import { type GridItem, previewUrl, thumbUrl, typeToken, typeIcon, fmtSize } from "./api";
 
   let {
     item,
@@ -15,6 +15,16 @@
   } = $props();
 
   let tint = $derived(`var(${typeToken(item.media_type)})`);
+  // Vector preview if the model has one, else a raster thumbnail, else the type mark. `thumbFailed`
+  // covers the cases the backend cannot render (in-pack, exotic formats) without a second request.
+  let thumbFailed = $state(false);
+  // Raster thumbnails are for assets that *have* pixels. A `model_3d` thumbnail costs a full FBX
+  // parse per card — 100 of those is why the grid must not ask for one; models get the cheap
+  // vector preview from the drain instead, and show their type mark until it arrives.
+  let canRaster = $derived(item.media_type !== "model_3d" && !item.in_pack && !thumbFailed);
+  let src = $derived(
+    item.has_preview ? previewUrl(item.asset_id) : canRaster ? thumbUrl(item.asset_id) : null,
+  );
   let unidentified = $derived(item.status === "discovered" || item.status === "indexed");
 </script>
 
@@ -27,9 +37,9 @@
   title={item.rel_path}
 >
   <div class="thumb">
-    {#if item.has_preview}
-      <!-- Vector preview: the webview renders the stored SVG natively, no rasterisation. -->
-      <img src={previewUrl(item.asset_id)} alt="" loading="lazy" />
+    {#if src}
+      <!-- Vector previews render natively as SVG; rasters come from the on-disk thumb cache. -->
+      <img {src} alt="" loading="lazy" onerror={() => (thumbFailed = true)} />
     {:else}
       <Icon name={typeIcon(item.media_type)} size={28} />
     {/if}

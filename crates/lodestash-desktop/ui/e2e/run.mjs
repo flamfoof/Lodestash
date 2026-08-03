@@ -385,6 +385,53 @@ try {
     await page.waitForTimeout(400);
   });
 
+  // Every asset with pixels should get a picture. The three generators already existed in
+  // `lodestash_ingest::thumb`; none of them was reachable from the frontend until `ls://thumb`.
+  await check("ls://thumb renders images, audio waveforms and material balls", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    const pick = (mt) => p.items.find((i) => i.media_type === mt && !i.in_pack);
+    for (const mt of ["image", "audio", "material"]) {
+      const a = pick(mt);
+      if (!a) { console.log(`       (skipped ${mt}: none on disk)`); continue; }
+      const r = await page.evaluate(async (id) => {
+        const res = await fetch(`http://ls.localhost/thumb/${id}.png`);
+        if (!res.ok) return { status: res.status };
+        const buf = new Uint8Array(await res.arrayBuffer());
+        const png = buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
+        const decoded = await new Promise((ok) => {
+          const i = new Image();
+          i.onload = () => ok(i.naturalWidth);
+          i.onerror = () => ok(0);
+          i.src = `http://ls.localhost/thumb/${id}.png`;
+          setTimeout(() => ok(0), 15000);
+        });
+        return { status: res.status, png, bytes: buf.length, decoded };
+      }, a.asset_id);
+      assert.equal(r.status, 200, `${mt}: ${r.status}`);
+      assert.ok(r.png, `${mt}: not a PNG`);
+      assert.ok(r.decoded > 0, `${mt}: PNG served but the browser could not decode it`);
+    }
+  });
+
+  // A model thumbnail costs a full mesh parse; a grid page would trigger a hundred of them.
+  // Models are served by the vector-preview pipeline instead, and the route refuses so a
+  // hand-written URL cannot cause the stampede either.
+  await check("ls://thumb refuses models — they use ls://preview", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "models", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    const model = p.items.find((i) => !i.in_pack);
+    const status = await page.evaluate(async (id) => {
+      const res = await fetch(`http://ls.localhost/thumb/${id}.png`);
+      return res.status;
+    }, model.asset_id);
+    assert.equal(status, 404, "a model must not be raster-thumbnailed on demand");
+  });
+
   await check("ls:// serves a preview as SVG", async () => {
     // Ask for an asset that actually has a preview rather than whatever is on screen — which
     // page 1 shows depends on the sort, and most of this library is in-pack with no preview.

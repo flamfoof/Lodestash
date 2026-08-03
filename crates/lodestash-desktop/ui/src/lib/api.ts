@@ -104,6 +104,14 @@ const LS_BASE = navigator.userAgent.includes("Windows")
 /** Preview bytes come over the custom scheme, never through IPC — a page of cards is JSON only. */
 export const previewUrl = (assetId: number) => `${LS_BASE}/preview/${assetId}.svg`;
 export const fileUrl = (assetId: number) => `${LS_BASE}/file/${assetId}`;
+/**
+ * Raster thumbnail, generated on first request and cached on disk.
+ *
+ * Preferred over the type icon for everything without a vector preview — which is most of the
+ * library. In-pack assets answer 503 and fall back to the icon.
+ */
+export const thumbUrl = (assetId: number) => `${LS_BASE}/thumb/${assetId}.png`;
+
 /** Decimated geometry as LSM1, for the WebGL viewer. */
 export const meshUrl = (assetId: number) => `${LS_BASE}/mesh/${assetId}`;
 

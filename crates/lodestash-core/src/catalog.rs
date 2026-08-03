@@ -3914,6 +3914,30 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("model_albedo_texture: {e}")))
     }
 
+    /// The texture a **material** paints with — one hop, `material --uses_texture--> image`.
+    ///
+    /// The model variant above needs two hops because a model reaches its texture *through* a
+    /// material; a material is already there. Keeping them separate makes the hop count explicit
+    /// at each call site rather than a parameter someone gets wrong.
+    pub fn material_albedo_texture(&self, material_id: i64) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT MIN(t.id)
+                   FROM asset_relationship x
+                   JOIN asset t       ON t.id = x.to_asset_id
+                   JOIN media_type mt ON mt.id = t.media_type_id
+                  WHERE x.from_asset_id = ?1
+                    AND x.kind = 'uses_texture' AND x.state = 'resolved'
+                    AND t.deleted_at IS NULL
+                    AND mt.code IN ('image', 'texture', 'sprite')",
+                params![material_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(|e| CoreError::Catalog(format!("material_albedo_texture: {e}")))
+    }
+
     /// Every asset id carrying a stored preview.
     ///
     /// One query for the whole library rather than `vector_preview` per row: a grid deciding
