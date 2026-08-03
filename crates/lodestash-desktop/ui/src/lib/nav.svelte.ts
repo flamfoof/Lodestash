@@ -3,7 +3,7 @@ import type { Route, TabId } from "./routes";
 /**
  * Frontend-owned view state (plan Phase B, "State ownership"): route, tab, and search
  * live here because no background thread ever writes them. Anything a worker mutates —
- * entries, jobs, config — stays behind the Rust `Engine` and arrives via `ls://changed`.
+ * entries, jobs, config — stays behind the Rust `Engine` and arrives via `lodestash://changed`.
  */
 class ViewState {
   route = $state<Route>("library");

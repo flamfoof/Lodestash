@@ -22,7 +22,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data: blob: ls: http://ls.localhost; media-src 'self' blob: ls: http://ls.localhost; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost ls: http://ls.localhost"
+      "csp": "default-src 'self'; img-src 'self' data: blob: lodestash: http://lodestash.localhost; media-src 'self' blob: lodestash: http://lodestash.localhost; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost lodestash: http://lodestash.localhost"
     }
   },
   "bundle": {

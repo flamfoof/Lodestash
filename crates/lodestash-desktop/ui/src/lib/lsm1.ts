@@ -1,7 +1,7 @@
 /**
  * `LSM1` mesh parser — the TypeScript half of `lodestash_ingest::mesh::encode_meshes`.
  *
- * That encoder serves double duty: it writes the on-disk mesh cache *and* the `ls://mesh` wire
+ * That encoder serves double duty: it writes the on-disk mesh cache *and* the `lodestash://mesh` wire
  * format. One encoder, two readers — so this file and `decode_meshes` must stay in lockstep. Drift
  * shows up as garbled geometry rather than an error, which is why the e2e suite parses a real
  * response rather than trusting the shape.

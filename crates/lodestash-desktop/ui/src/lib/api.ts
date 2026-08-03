@@ -92,28 +92,28 @@ export const assetDetail = (assetId: number) =>
 /**
  * Base for the custom scheme.
  *
- * WebView2 does not intercept a bare `ls://` URL — Tauri registers custom schemes there as
+ * WebView2 does not intercept a bare `lodestash://` URL — Tauri registers custom schemes there as
  * `http://<scheme>.localhost/`, and only that form reaches the Rust handler. Everywhere else the
  * real scheme works. Getting this wrong fails silently as a broken image, so it is computed once
  * here rather than spelled out at each call site.
  */
-const LS_BASE = navigator.userAgent.includes("Windows")
-  ? "http://ls.localhost"
-  : "ls:/";
+const LODESTASH_BASE = navigator.userAgent.includes("Windows")
+  ? "http://lodestash.localhost"
+  : "lodestash:/";
 
 /** Preview bytes come over the custom scheme, never through IPC — a page of cards is JSON only. */
-export const previewUrl = (assetId: number) => `${LS_BASE}/preview/${assetId}.svg`;
-export const fileUrl = (assetId: number) => `${LS_BASE}/file/${assetId}`;
+export const previewUrl = (assetId: number) => `${LODESTASH_BASE}/preview/${assetId}.svg`;
+export const fileUrl = (assetId: number) => `${LODESTASH_BASE}/file/${assetId}`;
 /**
  * Raster thumbnail, generated on first request and cached on disk.
  *
  * Preferred over the type icon for everything without a vector preview — which is most of the
  * library. In-pack assets answer 503 and fall back to the icon.
  */
-export const thumbUrl = (assetId: number) => `${LS_BASE}/thumb/${assetId}.png`;
+export const thumbUrl = (assetId: number) => `${LODESTASH_BASE}/thumb/${assetId}.png`;
 
 /** Decimated geometry as LSM1, for the WebGL viewer. */
-export const meshUrl = (assetId: number) => `${LS_BASE}/mesh/${assetId}`;
+export const meshUrl = (assetId: number) => `${LODESTASH_BASE}/mesh/${assetId}`;
 
 /** `media_type.code` -> the CSS custom property naming its colour (DESIGN-GUIDELINES §2). */
 export function typeToken(mediaType: string): string {

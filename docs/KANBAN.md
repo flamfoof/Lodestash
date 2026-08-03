@@ -218,7 +218,7 @@ until B7.
       link, the real `icons.svg` sprite, app frame, 11 nav destinations, 12 routes.
 - [x] **e2e harness.** `bun run e2e` drives the *real* binary over CDP with `playwright-core`
       (TECH-STACK §5.2). 22 checks, each named after the failure it prevents.
-- [x] **`ls://` protocol — `preview`, `file`, `mesh`.** Range-capable, read-only by construction,
+- [x] **`lodestash://` protocol — `preview`, `file`, `mesh`.** Range-capable, read-only by construction,
       503 `not_local` for in-pack. **B2b hard gate met and asserted**: a real 7.8 MB WAV decodes in
       `<audio>` and seeks.
 - [x] **Library grid on real data.** 8,237 assets across three storage classes, category tabs,
@@ -228,7 +228,7 @@ until B7.
 
 ### Next up — ordered by what a user actually sees
 
-- [x] **T1 — `ls://thumb` raster thumbnails.** *Shipped 2026-08-03.* Images, audio waveforms and
+- [x] **T1 — `lodestash://thumb` raster thumbnails.** *Shipped 2026-08-03.* Images, audio waveforms and
       material shader balls now render through `thumb::generate` / `generate_waveform` /
       `generate_material`. **Reach is smaller than the headline suggested:** only **1,728 of 7,691
       assets are on disk** (image 191/2,288 · audio 84/1,841 · material 149/668 · model 1,304/3,439)
@@ -244,7 +244,7 @@ until B7.
       make it a Settings action rather than growing the constant.
 - [ ] **T3 — material shader balls.** 668 materials have no viewer. `material::uv_sphere` already
       generates the mesh and the graph has 204 resolved `material --uses_texture--> image` edges;
-      `ls://mesh` returns a generated sphere for a material and `Viewer3D` renders it unchanged.
+      `lodestash://mesh` returns a generated sphere for a material and `Viewer3D` renders it unchanged.
 - [ ] **T4 — real search.** The grid filters with `contains()` over lowercased names.
       `catalog::search_assets` (FTS5 + BM25), `query::parse_query` (structured `ParsedQuery`) and
       `fusion::rrf_fuse` all exist and are unused. Fuse on **rank**, never on score.
@@ -286,7 +286,7 @@ until B7.
   but *neither* `workspace_rel` nor `package_entry_id` — no locator of any kind. No hydrate query
   returns them, and that is **correct**: sampling 400 of them found **0 files present** at
   `source_root/rel_path`, so surfacing them would put unopenable entries in the grid (no
-  thumbnail, `ls://file` 503, an inspector path that does not exist).
+  thumbnail, `lodestash://file` 503, an inspector path that does not exist).
   Widening `entries_for_source` to select on "no pack locator" instead of `package_id IS NULL`
   was tried and reverted — it breaks `hydrate_and_missing_reconcile_round_trip`, which encodes
   the real invariant: *package assets stay out of the folder hydrate because their bytes are not

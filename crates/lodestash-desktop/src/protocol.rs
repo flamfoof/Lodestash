@@ -1,4 +1,4 @@
-//! The `ls://` binary protocol.
+//! The `lodestash://` binary protocol.
 //!
 //! Everything that is bytes rather than JSON comes through here: preview SVGs, thumbnails, and
 //! original asset files. Commands stay for operations; a custom scheme is what lets `<img>`,
@@ -9,7 +9,7 @@
 //! - **Read-only by construction.** No handler extracts, pulls or writes. An asset whose bytes
 //!   live inside an unextracted `.unitypackage` returns `503 not_local` and the pull is a
 //!   command, so the non-destructive invariant cannot be violated from a URL.
-//! - **Range-capable.** `ls://file` honours `Range`, returning `206` with only the requested
+//! - **Range-capable.** `lodestash://file` honours `Range`, returning `206` with only the requested
 //!   window. A multi-GB audio file is never read into memory to be scrubbed.
 
 use std::fs::File;
@@ -26,7 +26,7 @@ use crate::library::Library;
 /// client asking for `bytes=0-` on a 20 GB pack cannot make us allocate 20 GB.
 const MAX_CHUNK: u64 = 8 * 1024 * 1024;
 
-/// Triangle count above which `ls://mesh` decimates rather than shipping the source.
+/// Triangle count above which `lodestash://mesh` decimates rather than shipping the source.
 ///
 /// Everything under this travels whole so textures stay correct (see [`mesh`]). At ~50 bytes per
 /// triangle of `LSM1` this caps a response near 15 MB, which a local protocol and a GPU buffer both
@@ -35,8 +35,8 @@ const MESH_DECIMATE_ABOVE: usize = 300_000;
 
 pub fn handle(lib: &Mutex<Library>, req: &Request<Vec<u8>>) -> Response<Vec<u8>> {
     let uri = req.uri();
-    // Tauri normalises every form of the scheme to `ls://localhost/<kind>/<rest>` before the
-    // handler sees it — including the `http://ls.localhost/...` shape WebView2 requires. So the
+    // Tauri normalises every form of the scheme to `lodestash://localhost/<kind>/<rest>` before the
+    // handler sees it — including the `http://lodestash.localhost/...` shape WebView2 requires. So the
     // host carries no routing information and the path carries all of it.
     let (kind, rest) = split_route(uri.path());
 
@@ -45,9 +45,9 @@ pub fn handle(lib: &Mutex<Library>, req: &Request<Vec<u8>>) -> Response<Vec<u8>>
         "mesh" => mesh(lib, rest),
         "thumb" => thumb(lib, rest),
         "file" => file(lib, rest, req),
-        _ => status(StatusCode::NOT_FOUND, "unknown ls:// kind"),
+        _ => status(StatusCode::NOT_FOUND, "unknown lodestash:// kind"),
     };
-    tracing::debug!(path = %uri.path(), status = res.status().as_u16(), bytes = res.body().len(), "ls://");
+    tracing::debug!(path = %uri.path(), status = res.status().as_u16(), bytes = res.body().len(), "lodestash://");
     res
 }
 
@@ -61,7 +61,7 @@ fn split_route(path: &str) -> (&str, &str) {
     }
 }
 
-/// `ls://preview/{asset_id}.svg` — the stored traced-contour preview (M15).
+/// `lodestash://preview/{asset_id}.svg` — the stored traced-contour preview (M15).
 fn preview(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
     let Some(id) = rest.trim_end_matches(".svg").parse::<i64>().ok() else {
         return status(StatusCode::BAD_REQUEST, "preview: bad asset id");
@@ -80,7 +80,7 @@ fn preview(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
     }
 }
 
-/// `ls://thumb/{asset_id}.png` — a raster thumbnail, generated on first request and cached.
+/// `lodestash://thumb/{asset_id}.png` — a raster thumbnail, generated on first request and cached.
 ///
 /// This is what stops the grid being a wall of type icons: only models with a stored vector
 /// preview had a picture, which was 208 of 7,691 assets. Every branch here already existed in
@@ -119,7 +119,7 @@ fn thumb(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
     if job.media_type == "model_3d" {
         return status(
             StatusCode::NOT_FOUND,
-            "models use ls://preview, not ls://thumb",
+            "models use lodestash://preview, not lodestash://thumb",
         );
     }
 
@@ -161,7 +161,7 @@ fn thumb(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
     }
 }
 
-/// `ls://mesh/{asset_id}` — decimated geometry as `LSM1`, for the WebGL viewer.
+/// `lodestash://mesh/{asset_id}` — decimated geometry as `LSM1`, for the WebGL viewer.
 ///
 /// Deliberately the **same encoder as the on-disk mesh cache** (`mesh::encode_meshes`): the wire
 /// format and the cache format are one thing, so the TypeScript parser and `decode_meshes` cannot
@@ -189,7 +189,7 @@ fn mesh(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
         Err(_) => (None, false),
     };
     let Some(path) = path.filter(|p| p.exists()) else {
-        // Same contract as `ls://file`: a known asset whose bytes are in a pack is not missing.
+        // Same contract as `lodestash://file`: a known asset whose bytes are in a pack is not missing.
         return if known {
             status(StatusCode::SERVICE_UNAVAILABLE, "not_local")
         } else {
@@ -231,7 +231,7 @@ fn mesh(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
         .unwrap_or_else(|_| status(StatusCode::INTERNAL_SERVER_ERROR, "mesh: build"))
 }
 
-/// `ls://file/{asset_id}` — the original bytes, with Range support.
+/// `lodestash://file/{asset_id}` — the original bytes, with Range support.
 fn file(lib: &Mutex<Library>, rest: &str, req: &Request<Vec<u8>>) -> Response<Vec<u8>> {
     let Some(id) = rest.split('/').next().and_then(|s| s.parse::<i64>().ok()) else {
         return status(StatusCode::BAD_REQUEST, "file: bad asset id");
@@ -367,7 +367,7 @@ fn mime_for(path: &Path) -> &'static str {
     }
 }
 
-/// Start a response with the headers every `ls://` reply carries.
+/// Start a response with the headers every `lodestash://` reply carries.
 ///
 /// `Access-Control-Allow-Origin` is required because the page and the protocol are different
 /// origins: `<img src>` is a no-CORS load and works regardless, but `fetch()` — which the mesh
@@ -399,7 +399,7 @@ mod tests {
     use super::*;
 
     /// The routing bug this replaced: the handler tried to read the kind from the URL *host*,
-    /// but Tauri rewrites every request to `ls://localhost/...`, so "localhost" was taken as the
+    /// but Tauri rewrites every request to `lodestash://localhost/...`, so "localhost" was taken as the
     /// kind and every request 404'd. It failed as a broken image with nothing in any log.
     #[test]
     fn the_route_comes_from_the_path_whatever_the_host_is() {

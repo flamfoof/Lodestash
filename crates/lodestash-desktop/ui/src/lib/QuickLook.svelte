@@ -101,7 +101,7 @@
           <p class="dim">Extracting is an explicit action — it never happens just by looking.</p>
         </div>
       {:else if kind === "image"}
-        <!-- Straight from ls://file: no base64 round-trip through IPC, and the webview
+        <!-- Straight from lodestash://file: no base64 round-trip through IPC, and the webview
              streams it with Range like any other image. -->
         <img
           src={fileUrl(assetId)}
@@ -115,7 +115,7 @@
           <Icon name="ls-type-sound" size={40} />
           <!-- svelte-ignore a11y_media_has_caption -->
           <audio src={fileUrl(assetId)} controls preload="metadata"></audio>
-          <p class="dim">Scrubbing issues Range requests against <code>ls://file</code>.</p>
+          <p class="dim">Scrubbing issues Range requests against <code>lodestash://file</code>.</p>
         </div>
       {:else if detail?.has_preview}
         <img src={previewUrl(assetId)} alt="" class="vector" />

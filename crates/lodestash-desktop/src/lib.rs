@@ -1,7 +1,7 @@
 //! Lodestash desktop shell (Tauri 2).
 //!
 //! Hosts the Svelte frontend and owns the command surface. Today it reads the catalog directly
-//! (see [`library`]); the write path, the pump thread and the rest of the `ls://` handlers arrive
+//! (see [`library`]); the write path, the pump thread and the rest of the `lodestash://` handlers arrive
 //! with `Engine` once the B1 extraction lands. Nothing here writes to the catalog — the
 //! single-writer rule (ARCHITECTURE §5) puts every write on the persist thread.
 
@@ -109,7 +109,7 @@ pub fn run() {
         .manage(AppState {
             library: Mutex::new(library),
         })
-        .register_uri_scheme_protocol("ls", |ctx, req| {
+        .register_uri_scheme_protocol("lodestash", |ctx, req| {
             let state = ctx.app_handle().state::<AppState>();
             protocol::handle(&state.library, &req)
         })

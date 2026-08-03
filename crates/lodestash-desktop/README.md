@@ -2,7 +2,7 @@
 
 The Tauri 2 desktop shell — the target frontend for Lodestash. Hosts a Svelte 5 + TypeScript app
 in a WebView2 window and talks to the Rust core over `#[tauri::command]` plus (from B3) the
-`ls://` binary protocol.
+`lodestash://` binary protocol.
 
 Until the B7 cutover this ships alongside `lodestash-ui` (egui), which stays buildable as the
 reference implementation. The port plan and its milestones are in `docs/KANBAN.md`.

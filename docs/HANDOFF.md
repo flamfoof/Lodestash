@@ -675,7 +675,7 @@ web tech (`DESIGN-GUIDELINES.md:50` says CSS custom properties are canonical;
 `docs/design/icons/` ships 50 real SVGs that egui renders as Unicode stand-ins), so egui forces a
 lossy translation on every screen and the docs have already bent to it
 (`docs/design/README.md:52-58` tells implementers *not* to reproduce HTML/CSS specifics). Settled:
-Svelte 5 + TS + Vite; `#[tauri::command]` for ops plus an `ls://` scheme for binary, with the axum
+Svelte 5 + TS + Vite; `#[tauri::command]` for ops plus an `lodestash://` scheme for binary, with the axum
 `/v1/` + MCP agent plane **untouched** (the 1:1 invariant covers the agent surface only); extract a
 headless `lodestash-app` crate first and keep egui buildable as the reference until parity; Rust
 parses/decimates and three.js orbits in WebGL. Four features ride along (drag out to Unity, drag

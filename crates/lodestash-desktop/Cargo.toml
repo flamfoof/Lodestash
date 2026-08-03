@@ -31,5 +31,5 @@ tracing-subscriber = { workspace = true }
 # every write goes through the persist thread (ARCHITECTURE §5, single writer).
 lodestash-core = { workspace = true }
 lodestash-app = { workspace = true }
-# Mesh parse + decimation for the Quick Look viewer (ls://mesh).
+# Mesh parse + decimation for the Quick Look viewer (lodestash://mesh).
 lodestash-ingest = { workspace = true }

@@ -12,7 +12,7 @@ use lodestash_core::catalog::Catalog;
 use serde::{Deserialize, Serialize};
 
 /// One asset as the grid needs it. Carries a `preview_key`, never bytes — the frontend fetches
-/// pixels over `ls://`, so a page of 100 cards is a few KB of JSON rather than a few MB.
+/// pixels over `lodestash://`, so a page of 100 cards is a few KB of JSON rather than a few MB.
 #[derive(Debug, Clone, Serialize)]
 pub struct GridItem {
     pub asset_id: i64,
@@ -30,7 +30,7 @@ pub struct GridItem {
     /// second round-trip per asset.
     pub favorite: bool,
     /// The bytes are still inside a `.unitypackage` (DATA-MODEL §7 / M14). Browsable and
-    /// searchable, but `ls://file` answers 503 rather than extracting — pulling is a command.
+    /// searchable, but `lodestash://file` answers 503 rather than extracting — pulling is a command.
     pub in_pack: bool,
     /// Owning pack name, for in-pack assets.
     pub package: Option<String>,
@@ -155,7 +155,7 @@ pub struct Library {
     /// ponytail: re-reads only on `reload`; a catalog written by the egui app while this is open
     /// will not show until then. Fine while this is a read-only viewer.
     rows: Vec<Row>,
-    /// asset_id -> absolute path on disk, for `ls://file`.
+    /// asset_id -> absolute path on disk, for `lodestash://file`.
     paths: HashMap<i64, PathBuf>,
 }
 
@@ -255,7 +255,7 @@ impl Library {
                         if e.asset.trashed {
                             continue;
                         }
-                        // No local path: `ls://file` resolves nothing and answers 503 not_local,
+                        // No local path: `lodestash://file` resolves nothing and answers 503 not_local,
                         // which is the correct read-only behaviour — extraction is a command.
                         rows.push(row_from(e.asset, &info.name, Some(e.package_name)));
                     }
@@ -457,14 +457,14 @@ impl Library {
     /// image`, in one query.
     ///
     /// **Two hops, not one.** A single hop lands on the *material*, which is not an image — the
-    /// viewer would fetch it over `ls://file`, fail to decode it, and silently render untextured.
+    /// viewer would fetch it over `lodestash://file`, fail to decode it, and silently render untextured.
     /// The join is written so that mistake cannot compile away quietly.
     pub fn model_texture(&self, asset_id: i64) -> Option<i64> {
         let cat = self.catalog.as_ref()?;
         cat.model_albedo_texture(asset_id).ok().flatten()
     }
 
-    /// Everything `ls://thumb` needs to render one asset, resolved under the lock so the handler
+    /// Everything `lodestash://thumb` needs to render one asset, resolved under the lock so the handler
     /// does its file work without holding it.
     pub fn thumb_job(&self, asset_id: i64) -> Option<ThumbJob> {
         let row = self.rows.iter().find(|r| r.item.asset_id == asset_id)?;
@@ -489,7 +489,7 @@ impl Library {
     /// Is this an asset we know about at all?
     ///
     /// Distinguishes "no such id" from "known, but its bytes are inside a pack" — the two need
-    /// different answers over `ls://file` (404 vs 503 `not_local`), and conflating them tells a
+    /// different answers over `lodestash://file` (404 vs 503 `not_local`), and conflating them tells a
     /// client the asset does not exist when it is sitting in the grid in front of the user.
     pub fn knows(&self, asset_id: i64) -> bool {
         self.rows.iter().any(|r| r.item.asset_id == asset_id)
@@ -507,7 +507,7 @@ impl Library {
 /// Build a grid row from a hydrated catalog entry, whatever storage class it came from.
 ///
 /// `package` is `Some` for assets that live inside a pack — those have no local path, so the
-/// row is browsable and searchable while `ls://file` correctly answers 503.
+/// row is browsable and searchable while `lodestash://file` correctly answers 503.
 fn row_from(
     e: lodestash_core::catalog::HydratedAsset,
     source: &str,

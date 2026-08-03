@@ -67,7 +67,7 @@ try {
     assert.ok(after > 0 && after < before, `expected a narrower result, got ${after} of ${before}`);
   });
 
-  // The check that would have caught the `ls://localhost` routing bug on the spot. A broken
+  // The check that would have caught the `lodestash://localhost` routing bug on the spot. A broken
   // image is indistinguishable from a styled placeholder in a screenshot, but its naturalWidth
   // is 0 — so the failure that cost a debugging session becomes one assertion.
   await check("every vector preview decodes (naturalWidth > 0)", async () => {
@@ -245,7 +245,7 @@ try {
   // ranges (`bytes=-N`) to a custom protocol handler — verified by logging, the header simply
   // never arrives — so asserting on them would test the platform, not this code. Chromium's
   // media stack seeks with open-ended `bytes=N-`, which is what is checked here.
-  await check("audio streams over ls://file and an <audio> element can seek it", async () => {
+  await check("audio streams over lodestash://file and an <audio> element can seek it", async () => {
     const p = await invoke("grid_page", {
       query: { tab: "sounds", search: "", status: "all", sort_by: "size", sort_asc: false,
                favorites_only: false, page: 0, page_size: 100000 },
@@ -257,10 +257,10 @@ try {
     }
     const r = await page.evaluate(async ([id, size]) => {
       const mid = Math.floor(size / 2);
-      const head = await fetch(`http://ls.localhost/file/${id}`, { headers: { Range: "bytes=0-1023" } });
-      const tail = await fetch(`http://ls.localhost/file/${id}`, { headers: { Range: `bytes=${mid}-` } });
+      const head = await fetch(`http://lodestash.localhost/file/${id}`, { headers: { Range: "bytes=0-1023" } });
+      const tail = await fetch(`http://lodestash.localhost/file/${id}`, { headers: { Range: `bytes=${mid}-` } });
       // Then the real thing: decode metadata and seek, which is what scrubbing does.
-      const el = new Audio(`http://ls.localhost/file/${id}`);
+      const el = new Audio(`http://lodestash.localhost/file/${id}`);
       const meta = await new Promise((res) => {
         el.addEventListener("loadedmetadata", () => res(true), { once: true });
         el.addEventListener("error", () => res(false), { once: true });
@@ -290,7 +290,7 @@ try {
     assert.equal(r.headLen, 1024);
     assert.equal(r.tailStatus, 206, "open-ended range from the middle");
     assert.match(r.tailRange, /^bytes \d+-\d+\/\d+$/);
-    assert.ok(r.meta, "<audio> could not decode metadata over ls://file");
+    assert.ok(r.meta, "<audio> could not decode metadata over lodestash://file");
     assert.ok(r.duration > 0, `expected a real duration, got ${r.duration}`);
     assert.ok(r.seeked, "seeking did not complete — Range streaming is not working for playback");
     assert.ok(r.at > 0, "playhead did not move");
@@ -298,7 +298,7 @@ try {
 
   // Wire/parser drift between `encode_meshes` and lsm1.ts would surface as garbled geometry, not
   // an error — so parse a real response rather than trusting the shape.
-  await check("ls://mesh returns LSM1 the TS parser can read", async () => {
+  await check("lodestash://mesh returns LSM1 the TS parser can read", async () => {
     const p = await invoke("grid_page", {
       query: { tab: "models", search: "", status: "all", sort_by: "size", sort_asc: false,
                favorites_only: false, page: 0, page_size: 100000 },
@@ -306,7 +306,7 @@ try {
     const model = p.items.find((i) => !i.in_pack);
     assert.ok(model, "no on-disk model in the library");
     const r = await page.evaluate(async (id) => {
-      const res = await fetch(`http://ls.localhost/mesh/${id}`);
+      const res = await fetch(`http://lodestash.localhost/mesh/${id}`);
       if (!res.ok) return { status: res.status };
       const buf = await res.arrayBuffer();
       const magic = new TextDecoder().decode(new Uint8Array(buf, 0, 4));
@@ -386,8 +386,8 @@ try {
   });
 
   // Every asset with pixels should get a picture. The three generators already existed in
-  // `lodestash_ingest::thumb`; none of them was reachable from the frontend until `ls://thumb`.
-  await check("ls://thumb renders images, audio waveforms and material balls", async () => {
+  // `lodestash_ingest::thumb`; none of them was reachable from the frontend until `lodestash://thumb`.
+  await check("lodestash://thumb renders images, audio waveforms and material balls", async () => {
     const p = await invoke("grid_page", {
       query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
                favorites_only: false, page: 0, page_size: 100000 },
@@ -397,7 +397,7 @@ try {
       const a = pick(mt);
       if (!a) { console.log(`       (skipped ${mt}: none on disk)`); continue; }
       const r = await page.evaluate(async (id) => {
-        const res = await fetch(`http://ls.localhost/thumb/${id}.png`);
+        const res = await fetch(`http://lodestash.localhost/thumb/${id}.png`);
         if (!res.ok) return { status: res.status };
         const buf = new Uint8Array(await res.arrayBuffer());
         const png = buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
@@ -405,7 +405,7 @@ try {
           const i = new Image();
           i.onload = () => ok(i.naturalWidth);
           i.onerror = () => ok(0);
-          i.src = `http://ls.localhost/thumb/${id}.png`;
+          i.src = `http://lodestash.localhost/thumb/${id}.png`;
           setTimeout(() => ok(0), 15000);
         });
         return { status: res.status, png, bytes: buf.length, decoded };
@@ -419,20 +419,20 @@ try {
   // A model thumbnail costs a full mesh parse; a grid page would trigger a hundred of them.
   // Models are served by the vector-preview pipeline instead, and the route refuses so a
   // hand-written URL cannot cause the stampede either.
-  await check("ls://thumb refuses models — they use ls://preview", async () => {
+  await check("lodestash://thumb refuses models — they use lodestash://preview", async () => {
     const p = await invoke("grid_page", {
       query: { tab: "models", search: "", status: "all", sort_by: "name", sort_asc: true,
                favorites_only: false, page: 0, page_size: 100000 },
     });
     const model = p.items.find((i) => !i.in_pack);
     const status = await page.evaluate(async (id) => {
-      const res = await fetch(`http://ls.localhost/thumb/${id}.png`);
+      const res = await fetch(`http://lodestash.localhost/thumb/${id}.png`);
       return res.status;
     }, model.asset_id);
     assert.equal(status, 404, "a model must not be raster-thumbnailed on demand");
   });
 
-  await check("ls:// serves a preview as SVG", async () => {
+  await check("lodestash:// serves a preview as SVG", async () => {
     // Ask for an asset that actually has a preview rather than whatever is on screen — which
     // page 1 shows depends on the sort, and most of this library is in-pack with no preview.
     const p = await invoke("grid_page", {
@@ -442,7 +442,7 @@ try {
     const withPreview = p.items.find((i) => i.has_preview);
     assert.ok(withPreview, "no asset in the library has a stored preview");
     const r = await page.evaluate(async (id) => {
-      const res = await fetch(`http://ls.localhost/preview/${id}.svg`);
+      const res = await fetch(`http://lodestash.localhost/preview/${id}.svg`);
       return { status: res.status, type: res.headers.get("content-type"), len: (await res.text()).length };
     }, withPreview.asset_id);
     assert.equal(r.status, 200);
@@ -450,7 +450,7 @@ try {
     assert.ok(r.len > 100, "preview body is implausibly small");
   });
 
-  await check("ls://file honours Range with a 206 and the right window", async () => {
+  await check("lodestash://file honours Range with a 206 and the right window", async () => {
     // Must be an on-disk asset: most of this library is in-pack, and those correctly answer 503.
     const p = await invoke("grid_page", {
       query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
@@ -459,7 +459,7 @@ try {
     const local = p.items.find((i) => !i.in_pack);
     assert.ok(local, "no on-disk asset in the library to range-request");
     const r = await page.evaluate(async (assetId) => {
-      const res = await fetch(`http://ls.localhost/file/${assetId}`, {
+      const res = await fetch(`http://lodestash.localhost/file/${assetId}`, {
         headers: { Range: "bytes=10-19" },
       });
       return {
@@ -485,16 +485,16 @@ try {
     const packed = p.items.find((i) => i.in_pack);
     assert.ok(packed, "no in-pack asset loaded");
     const r = await page.evaluate(async (assetId) => {
-      const res = await fetch(`http://ls.localhost/file/${assetId}`);
+      const res = await fetch(`http://lodestash.localhost/file/${assetId}`);
       return { status: res.status, body: await res.text() };
     }, packed.asset_id);
     assert.equal(r.status, 503, `expected 503 not_local, got ${r.status}`);
     assert.match(r.body, /not_local/);
   });
 
-  await check("an unknown ls:// route is a 404, not a hang", async () => {
+  await check("an unknown lodestash:// route is a 404, not a hang", async () => {
     const status = await page.evaluate(async () => {
-      const res = await fetch("http://ls.localhost/nonsense/1");
+      const res = await fetch("http://lodestash.localhost/nonsense/1");
       return res.status;
     });
     assert.equal(status, 404);
@@ -502,7 +502,7 @@ try {
 
   await check("an unknown asset id is a 404", async () => {
     const status = await page.evaluate(async () => {
-      const res = await fetch("http://ls.localhost/file/999999999");
+      const res = await fetch("http://lodestash.localhost/file/999999999");
       return res.status;
     });
     assert.equal(status, 404);

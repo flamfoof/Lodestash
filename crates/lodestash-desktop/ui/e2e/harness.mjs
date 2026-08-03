@@ -2,7 +2,7 @@
  * Launch the real desktop app and hand back a Playwright page attached to it.
  *
  * WebView2 is Edge, so it speaks CDP natively — no WebDriver, no mocks. The app runs with its
- * real catalog connection and its real `ls://` handler, which is the whole point: these checks
+ * real catalog connection and its real `lodestash://` handler, which is the whole point: these checks
  * exist to catch the failures that unit tests structurally cannot see, like an image element
  * whose src 404s.
  *
