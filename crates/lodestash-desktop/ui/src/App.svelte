@@ -6,7 +6,18 @@
   import LibraryScreen from "./lib/LibraryScreen.svelte";
   import { SCREENS } from "./lib/routes";
   import { view } from "./lib/nav.svelte";
-  import { libraryStatus, reloadLibrary, type LibraryStatus } from "./lib/api";
+  import ConfirmDelete from "./lib/ConfirmDelete.svelte";
+  import {
+    libraryStatus,
+    reloadLibrary,
+    assetDetail,
+    setFavorite,
+    setTrashed,
+    removeFromLibrary,
+    deleteFromDisk,
+    type AssetDetail,
+    type LibraryStatus,
+  } from "./lib/api";
 
   let status = $state<LibraryStatus | null>(null);
   let reloading = $state(false);
@@ -28,8 +39,52 @@
   // Favorites shares the library body; it is a *filter over the library*, not its own data.
   // Routing it here without passing the flag renders the whole library under a "Favorites"
   // heading, which reads as though everything is starred.
-  let onLibrary = $derived(view.route === "library" || view.route === "favorites");
+  let onLibrary = $derived(
+    view.route === "library" || view.route === "favorites" || view.route === "trash",
+  );
   let favoritesOnly = $derived(view.route === "favorites");
+  let trashedOnly = $derived(view.route === "trash");
+
+  // The Inspector's actions need the selected asset's own flags, and the delete dialog needs its
+  // absolute path — the user is entitled to see exactly which file is about to stop existing.
+  let selectedDetail = $state<AssetDetail | null>(null);
+  $effect(() => {
+    const id = view.selected;
+    view.dataVersion;
+    if (id == null) {
+      selectedDetail = null;
+      return;
+    }
+    let stale = false;
+    assetDetail(id).then((d) => {
+      if (!stale) selectedDetail = d;
+    });
+    return () => {
+      stale = true;
+    };
+  });
+
+  let confirming = $state(false);
+  let actionError = $state<string | null>(null);
+
+  /** Run a write, surface any failure, and make every screen re-ask its question. */
+  async function write(run: () => Promise<unknown>) {
+    actionError = null;
+    try {
+      await run();
+      view.dataVersion += 1;
+      status = await libraryStatus();
+    } catch (e) {
+      actionError = String(e);
+    }
+  }
+
+  function afterRemoval() {
+    // The asset just left this view; keeping it selected would leave the Inspector describing
+    // something the grid no longer shows.
+    view.selected = null;
+    confirming = false;
+  }
 </script>
 
 <div class="frame">
@@ -38,15 +93,43 @@
     <Sidebar />
     <main>
       {#if onLibrary}
-        <LibraryScreen {status} {favoritesOnly} title={favoritesOnly ? "Favorites" : "Library"} />
+        <LibraryScreen
+          {status}
+          {favoritesOnly}
+          {trashedOnly}
+          title={favoritesOnly ? "Favorites" : trashedOnly ? "Trash" : "Library"}
+        />
       {:else}
         <Screen title={screen.title} milestone={screen.milestone} />
       {/if}
     </main>
     {#if onLibrary && view.inspectorOpen}
-      <Inspector assetId={view.selected} />
+      <Inspector
+        assetId={view.selected}
+        favorite={selectedDetail?.favorite ?? false}
+        trashed={selectedDetail?.trashed ?? false}
+        onfavorite={(on) => write(() => setFavorite([view.selected!], on))}
+        ontrash={() => write(() => setTrashed([view.selected!], true)).then(afterRemoval)}
+        onrestore={() => write(() => setTrashed([view.selected!], false)).then(afterRemoval)}
+        onremove={() => write(() => removeFromLibrary([view.selected!])).then(afterRemoval)}
+        ondelete={() => (confirming = true)}
+      />
     {/if}
   </div>
+  {#if confirming && selectedDetail}
+    <ConfirmDelete
+      names={[selectedDetail.name]}
+      paths={[selectedDetail.abs_path]}
+      onconfirm={() => write(() => deleteFromDisk([selectedDetail!.asset_id])).then(afterRemoval)}
+      onremove={() => write(() => removeFromLibrary([selectedDetail!.asset_id])).then(afterRemoval)}
+      oncancel={() => (confirming = false)}
+    />
+  {/if}
+
+  {#if actionError}
+    <p class="action-error" data-testid="action-error">{actionError}</p>
+  {/if}
+
   <footer class="statusbar">
     {#if status?.open}
       <span class="num">{status.total_assets.toLocaleString()} assets</span>
@@ -80,6 +163,18 @@
     min-width: 0;
     background: var(--ls-bg);
   }
+  /* A failed write is never silent: the frontend cannot know whether the catalog changed, so
+     saying nothing would leave the user believing an action happened. */
+  .action-error {
+    flex: none;
+    margin: 0;
+    padding: var(--sp-2) var(--sp-3);
+    background: var(--ls-surface);
+    border-top: 1px solid var(--ls-danger);
+    color: var(--ls-danger);
+    font-size: var(--fs-sm);
+  }
+
   .statusbar {
     flex: none;
     display: flex;

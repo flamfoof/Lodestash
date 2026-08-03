@@ -61,6 +61,9 @@ pub struct GridQuery {
     /// Restrict to starred assets — what the Favorites screen is (FEATURES §4.7). A one-way
     /// switch: "not favourited" is not a thing anyone browses for.
     pub favorites_only: bool,
+    /// Show the Trash instead of the library. Not a facet you combine with the others — a
+    /// soft-deleted asset is absent from every normal view by definition (DATA-MODEL §8).
+    pub trashed_only: bool,
     pub page: usize,
     pub page_size: usize,
 }
@@ -74,6 +77,7 @@ impl Default for GridQuery {
             sort_by: SortBy::Name,
             sort_asc: true,
             favorites_only: false,
+            trashed_only: false,
             page: 0,
             page_size: 100,
         }
@@ -127,6 +131,10 @@ pub struct AssetDetail {
     pub texture_asset_id: Option<i64>,
     /// True when the file is not on disk — an in-pack asset whose bytes are still in the archive.
     pub in_pack: bool,
+    /// Starred, and soft-deleted. The Inspector draws its actions from these — a trashed asset
+    /// offers Restore, not another Trash button.
+    pub favorite: bool,
+    pub trashed: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -160,6 +168,8 @@ pub struct LibraryStatus {
     /// Assets carrying a stored vector preview — the honest measure of how much of the grid
     /// can draw without touching a mesh.
     pub with_preview: usize,
+    /// Soft-deleted assets waiting in the Trash. Drives the nav count.
+    pub trashed: usize,
 }
 
 /// Everything the shell holds about the open catalog.
@@ -191,6 +201,9 @@ struct Row {
     source: Option<String>,
     /// Set only for in-pack rows, so `lodestash://thumb` can pull the one payload it needs.
     locator: Option<InPackLocator>,
+    /// Soft-deleted (DATA-MODEL §8). Held rather than dropped so the Trash screen can list it and
+    /// `set_trashed(false)` can bring it back; every other view filters it out.
+    trashed: bool,
     /// The catalog strings parsed once at hydrate, so filtering and sorting run over the shared
     /// enums instead of re-matching a string per row per keystroke. `media_type` is `None` for a
     /// code this build does not know (schema drift), which sorts last and matches no tab but All.
@@ -266,9 +279,8 @@ impl Library {
                 }
             };
             for e in entries {
-                if e.trashed {
-                    continue;
-                }
+                // Trashed rows are **kept**, flagged: the Trash screen is the only way back from
+                // a soft delete, and a row the shell never loaded cannot be restored.
                 paths.insert(e.asset_id, root.join(&e.rel_path));
                 rows.push(row_from(e, &info.name, None));
             }
@@ -279,9 +291,6 @@ impl Library {
             match cat.in_pack_entries_for_source(info.id) {
                 Ok(v) => {
                     for e in v {
-                        if e.asset.trashed {
-                            continue;
-                        }
                         // No local path: `lodestash://file` resolves nothing and answers 503 not_local,
                         // which is the correct read-only behaviour — extraction is a command.
                         let ext = Path::new(&e.asset.rel_path)
@@ -309,9 +318,6 @@ impl Library {
             match cat.extracted_entries_for_source(info.id) {
                 Ok(v) => {
                     for e in v {
-                        if e.asset.trashed {
-                            continue;
-                        }
                         if let Some(ws) = workspace_dir.as_ref() {
                             paths.insert(e.asset.asset_id, ws.join(&e.workspace_rel));
                         }
@@ -374,6 +380,11 @@ impl Library {
         }
     }
 
+    /// Rows that are actually in the library — everything except the Trash.
+    fn live(&self) -> impl Iterator<Item = &Row> {
+        self.rows.iter().filter(|r| !r.trashed)
+    }
+
     pub fn status(&self) -> LibraryStatus {
         LibraryStatus {
             open: self.catalog.is_some(),
@@ -382,10 +393,14 @@ impl Library {
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
             sources: self.sources.clone(),
-            total_assets: self.rows.len(),
-            in_pack: self.rows.iter().filter(|r| r.item.in_pack).count(),
-            favorites: self.rows.iter().filter(|r| r.item.favorite).count(),
-            with_preview: self.rows.iter().filter(|r| r.item.has_preview).count(),
+            // Counts are of the *live* library: a trashed asset is gone as far as every screen
+            // except the Trash is concerned, so counting it would make the totals disagree with
+            // the grid the user is looking at.
+            total_assets: self.live().count(),
+            in_pack: self.live().filter(|r| r.item.in_pack).count(),
+            favorites: self.live().filter(|r| r.item.favorite).count(),
+            with_preview: self.live().filter(|r| r.item.has_preview).count(),
+            trashed: self.rows.iter().filter(|r| r.trashed).count(),
         }
     }
 
@@ -416,6 +431,7 @@ impl Library {
             .iter()
             .filter(|r| q.tab.matches(r.media_type))
             .filter(|r| q.status.matches(r.status))
+            .filter(|r| r.trashed == q.trashed_only)
             .filter(|r| !q.favorites_only || r.item.favorite)
             .filter(|r| needle.is_empty() || hit(r))
             .collect();
@@ -511,6 +527,8 @@ impl Library {
             duration_ms: row.duration_ms,
             source: row.source.clone(),
             texture_asset_id: self.albedo_texture(asset_id),
+            favorite: row.item.favorite,
+            trashed: row.trashed,
             in_pack: row.item.in_pack,
         })
     }
@@ -547,6 +565,34 @@ impl Library {
 
     pub fn asset_path(&self, asset_id: i64) -> Option<&Path> {
         self.paths.get(&asset_id).map(|p| p.as_path())
+    }
+
+    /// Resolve ids into everything the writer thread needs, while the lock is held — so the
+    /// writer never reaches back into the library and cannot deadlock against a read.
+    pub fn write_targets(&self, ids: &[i64]) -> Vec<crate::writer::Target> {
+        ids.iter()
+            .filter_map(|id| {
+                let row = self.rows.iter().find(|r| r.item.asset_id == *id)?;
+                Some(crate::writer::Target {
+                    asset_id: *id,
+                    abs_path: self.paths.get(id).cloned(),
+                    source_root: row
+                        .source
+                        .as_deref()
+                        .and_then(|name| self.sources.iter().find(|s| s.name == name))
+                        .map(|s| PathBuf::from(&s.root_path)),
+                    rel_path: row.item.rel_path.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// The source roots the user opened — the outer bound on what delete-from-disk may touch.
+    pub fn roots(&self) -> Vec<PathBuf> {
+        self.sources
+            .iter()
+            .map(|s| PathBuf::from(&s.root_path))
+            .collect()
     }
 
     /// The parsed `media_type` of a known asset, for routes that behave differently per type.
@@ -637,6 +683,7 @@ fn row_from(
         .unwrap_or_else(|| e.rel_path.clone());
     Row {
         search_key: name.to_lowercase(),
+        trashed: e.trashed,
         media_type: MediaType::from_code(&e.media_type),
         // An unparseable status is treated as the earliest lifecycle state rather than dropped:
         // the asset is real and browsable, it just has not been identified as far as we can tell.
@@ -681,6 +728,7 @@ mod tests {
                 duration_ms: None,
                 source: None,
                 locator: None,
+                trashed: false,
                 item: GridItem {
                     asset_id: 0,
                     name: (*n).into(),
@@ -864,6 +912,31 @@ mod tests {
             ["zeta", "mid", "alpha"],
             "rank 0, rank 1, then the unranked"
         );
+    }
+
+    /// A soft-deleted asset is absent from every normal view and present in exactly one. Getting
+    /// this backwards either hides the Trash (nothing to restore from) or leaks deleted assets
+    /// into the library, which is worse — the user thinks the delete did not work and tries again.
+    #[test]
+    fn trashed_rows_appear_only_in_the_trash_view() {
+        let mut l = lib(&[("kept", "model_3d"), ("binned", "model_3d")]);
+        l.rows[1].trashed = true;
+
+        let live = l.page(&GridQuery::default());
+        assert_eq!(live.total, 1);
+        assert_eq!(live.items[0].name, "kept");
+
+        let trash = l.page(&GridQuery {
+            trashed_only: true,
+            ..Default::default()
+        });
+        assert_eq!(trash.total, 1);
+        assert_eq!(trash.items[0].name, "binned");
+
+        // And the counts follow the same rule, or the nav disagrees with the grid.
+        let s = l.status();
+        assert_eq!(s.total_assets, 1, "the Trash is not part of the library count");
+        assert_eq!(s.trashed, 1);
     }
 
     /// Rows that compare **fully** equal — same name, same key — still need a deterministic

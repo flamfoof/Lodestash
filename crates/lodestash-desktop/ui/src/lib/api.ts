@@ -26,6 +26,7 @@ export type LibraryStatus = {
   in_pack: number;
   favorites: number;
   with_preview: number;
+  trashed: number;
 };
 
 export type GridQuery = {
@@ -35,6 +36,8 @@ export type GridQuery = {
   sort_by: string;
   sort_asc: boolean;
   favorites_only: boolean;
+  /** Show the Trash instead of the library — not a facet you combine with the others. */
+  trashed_only: boolean;
   page: number;
   page_size: number;
 };
@@ -55,6 +58,8 @@ export type AssetDetail = {
   source: string | null;
   texture_asset_id: number | null;
   in_pack: boolean;
+  favorite: boolean;
+  trashed: boolean;
 };
 
 /**
@@ -85,6 +90,27 @@ export const DENSITIES = [
   { id: "cozy", label: "Cozy", icon: "ls-grid-cozy", px: 148 },
   { id: "large", label: "Large", icon: "ls-grid-large", px: 200 },
 ] as const;
+
+/** What a write actually did. `refused` + `failed` are the parts worth telling the user about. */
+export type WriteResult = { changed: number; refused: number; failed: number };
+
+export const setFavorite = (assetIds: number[], on: boolean) =>
+  invoke<WriteResult>("set_favorite", { assetIds, on });
+
+/** Soft delete / restore. The file on disk is never touched. */
+export const setTrashed = (assetIds: number[], trashed: boolean) =>
+  invoke<WriteResult>("set_trashed", { assetIds, trashed });
+
+/**
+ * Hide an asset for good without deleting it: the row is soft-deleted **and** the file is added
+ * to its source's blacklist, so re-indexing that folder will not bring it back.
+ */
+export const removeFromLibrary = (assetIds: number[]) =>
+  invoke<WriteResult>("remove_from_library", { assetIds });
+
+/** **Irreversible.** Confirm before calling — the command does not ask. */
+export const deleteFromDisk = (assetIds: number[]) =>
+  invoke<WriteResult>("delete_from_disk", { assetIds });
 
 export const libraryStatus = () => invoke<LibraryStatus>("library_status");
 export const gridPage = (query: GridQuery) => invoke<GridPage>("grid_page", { query });

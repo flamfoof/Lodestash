@@ -7,6 +7,7 @@
 
 pub mod library;
 pub mod protocol;
+pub mod writer;
 
 use std::sync::Mutex;
 
@@ -14,6 +15,7 @@ use serde::Serialize;
 use tauri::Manager;
 
 use crate::library::{AssetDetail, GridPage, GridQuery, Library, LibraryStatus};
+use crate::writer::{Op, WriteResult, Writer};
 
 #[derive(Serialize)]
 pub struct AppInfo {
@@ -26,6 +28,38 @@ pub struct AppInfo {
 
 struct AppState {
     library: Mutex<Library>,
+    /// `None` when there is no catalog on disk yet — every write then reports why instead of
+    /// pretending to succeed.
+    writer: Option<Writer>,
+}
+
+impl AppState {
+    /// Run a write, then re-read the library so the next `grid_page` reflects it.
+    ///
+    /// The reload is the honest option while this crate has no change notification: the rows are
+    /// an in-memory snapshot, and patching them locally to match what we *think* the write did is
+    /// how a UI ends up disagreeing with its own database. 8k rows re-read in a few milliseconds,
+    /// and only on a mutation. ponytail: patch in place once the pump (B2b) can tell us what
+    /// actually changed.
+    fn write(&self, op: Op) -> Result<WriteResult, String> {
+        let writer = self
+            .writer
+            .as_ref()
+            .ok_or_else(|| "no catalog is open — nothing to write to".to_string())?;
+        let result = writer.run(op)?;
+        self.library
+            .lock()
+            .map_err(|_| "library lock poisoned".to_string())?
+            .reload();
+        Ok(result)
+    }
+
+    fn targets(&self, ids: &[i64]) -> Result<Vec<writer::Target>, String> {
+        self.library
+            .lock()
+            .map(|l| l.write_targets(ids))
+            .map_err(|_| "library lock poisoned".to_string())
+    }
 }
 
 #[tauri::command]
@@ -73,6 +107,68 @@ fn asset_detail(
         .map_err(|_| "library lock poisoned".to_string())
 }
 
+/// Star / unstar assets (DATA-MODEL §12). A pin, not a rating — "find this again".
+#[tauri::command]
+fn set_favorite(
+    state: tauri::State<'_, AppState>,
+    asset_ids: Vec<i64>,
+    on: bool,
+) -> Result<WriteResult, String> {
+    state.write(Op::SetFavorite { ids: asset_ids, on })
+}
+
+/// Move to Trash, or restore from it. **Catalog-only** — the file on disk is never touched, and a
+/// later scan can still find it (DATA-MODEL §8). This is the recoverable middle option between
+/// `remove_from_library` and `delete_from_disk`.
+#[tauri::command]
+fn set_trashed(
+    state: tauri::State<'_, AppState>,
+    asset_ids: Vec<i64>,
+    trashed: bool,
+) -> Result<WriteResult, String> {
+    state.write(Op::SetTrashed {
+        ids: asset_ids,
+        trashed,
+    })
+}
+
+/// **Remove from library** — hide an asset for good without deleting anything.
+///
+/// The row is soft-deleted *and* the asset is added to its source's blacklist, so re-indexing that
+/// folder does not bring it back; importing the file again explicitly is the way back. This is the
+/// action most people want when they reach for "delete", which is why the delete dialog offers it.
+#[tauri::command]
+fn remove_from_library(
+    state: tauri::State<'_, AppState>,
+    asset_ids: Vec<i64>,
+) -> Result<WriteResult, String> {
+    let targets = state.targets(&asset_ids)?;
+    let project = lodestash_app::config::AppConfig::load().last_project_name;
+    state.write(Op::RemoveFromLibrary { targets, project })
+}
+
+/// **Delete from disk — irreversible.** The frontend must confirm first; this command does not
+/// ask. Fenced by `under_known_root`, and only files that actually left the disk are recorded as
+/// gone.
+#[tauri::command]
+fn delete_from_disk(
+    state: tauri::State<'_, AppState>,
+    asset_ids: Vec<i64>,
+) -> Result<WriteResult, String> {
+    let targets = state.targets(&asset_ids)?;
+    let roots = state
+        .library
+        .lock()
+        .map(|l| l.roots())
+        .map_err(|_| "library lock poisoned".to_string())?;
+    let workspace = lodestash_app::paths::default_cache_dirs().1;
+    state.write(Op::DeleteFromDisk {
+        targets,
+        roots,
+        workspace,
+    })
+}
+
 /// Re-read the catalog. The egui app writes it, so a scan there shows up here on request —
 /// there is no change notification until the pump thread exists.
 #[tauri::command]
@@ -105,9 +201,15 @@ pub fn run() {
         "catalog"
     );
 
+    // One writer for the process (ARCHITECTURE §5), spawned before any command can run.
+    let writer = lodestash_app::paths::catalog_db_path()
+        .filter(|p| p.exists())
+        .map(Writer::spawn);
+
     tauri::Builder::default()
         .manage(AppState {
             library: Mutex::new(library),
+            writer,
         })
         .register_uri_scheme_protocol("lodestash", |ctx, req| {
             let state = ctx.app_handle().state::<AppState>();
@@ -118,7 +220,11 @@ pub fn run() {
             library_status,
             grid_page,
             asset_detail,
-            reload_library
+            reload_library,
+            set_favorite,
+            set_trashed,
+            remove_from_library,
+            delete_from_disk
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lodestash");

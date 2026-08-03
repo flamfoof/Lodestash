@@ -19,6 +19,15 @@ class ViewState {
   inspectorOpen = $state(true);
   /** Lead selection, as an asset id. Selection is view state: no worker writes it. */
   selected = $state<number | null>(null);
+  /**
+   * Bumped after every catalog write. Screens depend on it, so a mutation re-runs their query.
+   *
+   * Crude on purpose: there is no change notification until the pump thread (B2b) exists, and the
+   * backend already re-reads the library after a write. A counter re-asks the question rather than
+   * guessing the answer — the alternative, patching rows locally to match what we think the write
+   * did, is how a UI ends up disagreeing with its own database.
+   */
+  dataVersion = $state(0);
 
   go(route: Route) {
     this.route = route;

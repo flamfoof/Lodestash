@@ -12,7 +12,28 @@
     type AssetDetail,
   } from "./api";
 
-  let { assetId }: { assetId: number | null } = $props();
+  let {
+    assetId,
+    favorite = false,
+    trashed = false,
+    onfavorite,
+    ontrash,
+    onrestore,
+    onremove,
+    ondelete,
+  }: {
+    assetId: number | null;
+    /** Carried by the grid row, so the star reflects the same state the card draws. */
+    favorite?: boolean;
+    /** True when the selection is in the Trash — the actions change to Restore. */
+    trashed?: boolean;
+    onfavorite: (on: boolean) => void;
+    ontrash: () => void;
+    onrestore: () => void;
+    onremove: () => void;
+    /** Opens the confirm dialog. This panel never deletes anything directly. */
+    ondelete: () => void;
+  } = $props();
 
   let detail = $state<AssetDetail | null>(null);
   $effect(() => {
@@ -82,10 +103,91 @@
         <dd>{detail.source}</dd>
       {/if}
     </dl>
+
+    <!--
+      Three removal actions, deliberately not equal-weight (KANBAN B5). Remove is the safe one and
+      reads as ordinary; Delete is danger-coloured, last, and opens a confirm dialog. A trashed
+      asset shows Restore instead — the Trash has to be a way back, not a second dead end.
+    -->
+    <div class="actions" data-testid="inspector-actions">
+      <button
+        class="star"
+        class:on={favorite}
+        onclick={() => onfavorite(!favorite)}
+        data-testid="action-favorite"
+        aria-pressed={favorite}
+      >
+        {favorite ? "★" : "☆"} Favorite
+      </button>
+
+      {#if trashed}
+        <button onclick={onrestore} data-testid="action-restore">Restore</button>
+      {:else}
+        <button onclick={ontrash} data-testid="action-trash">Move to Trash</button>
+        <button onclick={onremove} data-testid="action-remove" title="Hides it and stops future scans finding it. The file stays on disk.">
+          Remove from library
+        </button>
+      {/if}
+
+      <!--
+        No delete for an in-pack asset: it has no file of its own, and the only file behind it is
+        the .unitypackage holding every other asset in that pack. The backend refuses this anyway
+        (`writer::deletable`), but an offered button that always fails is worse than no button —
+        it reads as the app being broken rather than the action being impossible.
+      -->
+      {#if !detail.in_pack}
+        <button class="danger" onclick={ondelete} data-testid="action-delete">
+          Delete from disk…
+        </button>
+      {:else}
+        <span class="note">Inside a pack — extract it before it can be deleted individually.</span>
+      {/if}
+    </div>
   {/if}
 </aside>
 
 <style>
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--sp-2);
+    margin-top: var(--sp-3);
+    padding-top: var(--sp-3);
+    border-top: 1px solid var(--ls-border);
+  }
+  .actions button {
+    padding: var(--sp-1) var(--sp-2);
+    border-radius: var(--r-sm);
+    border: 1px solid var(--ls-border-strong);
+    background: var(--ls-surface);
+    color: var(--ls-text);
+    font: inherit;
+    font-size: var(--fs-sm);
+    cursor: pointer;
+  }
+  .actions button:hover {
+    border-color: var(--ls-gold);
+  }
+  .actions .star.on {
+    color: var(--ls-gold);
+    border-color: var(--ls-gold);
+  }
+  /* Danger colour and last position: the destructive option should never be the one a hand
+     lands on by muscle memory. */
+  .actions .danger {
+    color: var(--ls-danger);
+    border-color: var(--ls-danger);
+    margin-left: auto;
+  }
+  .actions .note {
+    margin-left: auto;
+    align-self: center;
+    max-width: 14rem;
+    text-align: right;
+    color: var(--ls-text-dim);
+    font-size: var(--fs-sm);
+  }
+
   .inspector {
     width: var(--inspector-w);
     flex: none;

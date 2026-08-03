@@ -27,9 +27,14 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-# Read-only catalog access. The desktop shell holds its own connection and never writes:
-# every write goes through the persist thread (ARCHITECTURE §5, single writer).
+# Catalog access. Reads come off this crate's own connection; every write goes through the one
+# writer thread in `writer.rs` (ARCHITECTURE §5, single writer).
 lodestash-core = { workspace = true }
 lodestash-app = { workspace = true }
 # Mesh parse + decimation for the Quick Look viewer (lodestash://mesh).
 lodestash-ingest = { workspace = true }
+
+[dev-dependencies]
+# Real files under a real root, for the delete fence — the guard is about paths on disk, so a
+# test that fakes the filesystem would not be testing it.
+tempfile = { workspace = true }

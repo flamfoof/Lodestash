@@ -692,6 +692,173 @@ try {
     assert.match(r.body, /not_local/);
   });
 
+  // ── B5: writes ────────────────────────────────────────────────────────────────────────────
+  // Every check below reads the value back through a **separate call**, never from the write's
+  // own response. A command that returns `{changed: 1}` while persisting nothing is the failure
+  // mode here, and it is invisible if you trust the reply.
+  //
+  // **This suite never deletes a file, and no check here may be changed to.** It runs against the
+  // developer's real library, so a test that deletes is a test that destroys someone's assets on
+  // a green run. The delete path is exercised the only safe way: against an **in-pack** asset,
+  // which the fence must refuse — so the assertion is that nothing happened. The fence's positive
+  // case (a real file under a real root passes) lives in `writer.rs`, where the file is one the
+  // test created in a temp dir and owns.
+  //
+  // Catalog writes are fine because they are reversible, and each one is reverted in a `finally`.
+  // `remove_from_library` is deliberately **not** exercised here either: it writes an exclude into
+  // the developer's real `AppConfig`, which nothing in this suite can take back.
+
+  await check("favourite round-trips through the catalog", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, trashed_only: false, page: 0, page_size: 50 },
+    });
+    const a = p.items.find((i) => !i.favorite);
+    assert.ok(a, "every sampled asset is already starred — nothing to toggle");
+    try {
+      await invoke("set_favorite", { assetIds: [a.asset_id], on: true });
+      const after = await invoke("asset_detail", { assetId: a.asset_id });
+      assert.equal(after.favorite, true, "the star did not persist");
+      const starred = await invoke("grid_page", {
+        query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+                 favorites_only: true, trashed_only: false, page: 0, page_size: 100000 },
+      });
+      assert.ok(
+        starred.items.some((i) => i.asset_id === a.asset_id),
+        "starred, but the Favorites filter does not show it",
+      );
+    } finally {
+      // Leave the user's library exactly as it was found.
+      await invoke("set_favorite", { assetIds: [a.asset_id], on: false });
+    }
+    const restored = await invoke("asset_detail", { assetId: a.asset_id });
+    assert.equal(restored.favorite, false, "unstarring did not persist");
+  });
+
+  // Trash is the recoverable middle option: the row leaves every normal view, appears in exactly
+  // one, and comes back intact. A trashed asset that no view can reach is a trapdoor.
+  await check("trash hides an asset, the Trash lists it, and restore brings it back", async () => {
+    const live = () =>
+      invoke("grid_page", {
+        query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+                 favorites_only: false, trashed_only: false, page: 0, page_size: 100000 },
+      });
+    const trash = () =>
+      invoke("grid_page", {
+        query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+                 favorites_only: false, trashed_only: true, page: 0, page_size: 100000 },
+      });
+    const before = await live();
+    const a = before.items[0];
+    assert.ok(a, "empty library");
+    try {
+      await invoke("set_trashed", { assetIds: [a.asset_id], trashed: true });
+      const after = await live();
+      assert.equal(after.total, before.total - 1, "the library count did not drop");
+      assert.ok(!after.items.some((i) => i.asset_id === a.asset_id), "still in the library view");
+      const binned = await trash();
+      assert.ok(binned.items.some((i) => i.asset_id === a.asset_id), "not in the Trash either");
+      const status = await invoke("library_status");
+      assert.ok(status.trashed > 0, "library_status does not count it");
+    } finally {
+      await invoke("set_trashed", { assetIds: [a.asset_id], trashed: false });
+    }
+    const back = await live();
+    assert.equal(back.total, before.total, "restore did not bring it back");
+  });
+
+  // The delete fence, exercised through the real command against a real asset. An in-pack asset
+  // has no file of its own — its `abs_path` is the .unitypackage holding hundreds of others — so
+  // deleting it must refuse, change nothing, and leave the asset exactly where it was.
+  await check("delete_from_disk refuses an in-pack asset instead of touching its archive", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, trashed_only: false, page: 0, page_size: 100000 },
+    });
+    const packed = p.items.find((i) => i.in_pack);
+    assert.ok(packed, "no in-pack asset loaded");
+    const r = await invoke("delete_from_disk", { assetIds: [packed.asset_id] });
+    assert.equal(r.changed, 0, "it reported deleting something");
+    assert.equal(r.refused, 1, "it was not refused by the fence");
+    const still = await invoke("asset_detail", { assetId: packed.asset_id });
+    assert.ok(still && !still.trashed, "the asset was trashed despite nothing being deleted");
+  });
+
+  // The dialog is the whole point of the feature: it must name the file, say the word, and offer
+  // the safe alternative. Cancelling must leave the asset alone.
+  await check("the delete dialog names the path, says permanently, and offers Remove", async () => {
+    // An on-disk asset specifically: an in-pack one has no file of its own, so the Inspector
+    // deliberately offers no delete button for it (checked separately below).
+    const p = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, trashed_only: false, page: 0, page_size: 100000 },
+    });
+    const local = p.items.find((i) => !i.in_pack);
+    assert.ok(local, "no on-disk asset in the library");
+    await page.fill('input[type="text"]', local.name);
+    await page.waitForFunction(
+      (n) => document.querySelector(".card .name")?.textContent?.trim() === n,
+      local.name, { timeout: 5000 });
+    await page.locator(".card").first().click();
+    // Wait for the Inspector to be describing *this* asset. It keeps showing the previous
+    // selection until its detail fetch resolves, so asserting straight after the click reads
+    // whatever the last check left behind.
+    await page.waitForFunction(
+      (n) => document.querySelector('[data-testid="inspector-name"]')?.textContent?.trim() === n,
+      local.name, { timeout: 5000 });
+    await page.waitForSelector('[data-testid="inspector-actions"]', { timeout: 5000 });
+    const name = local.name;
+
+    await page.locator('[data-testid="action-delete"]').click();
+    await page.waitForSelector('[data-testid="confirm-delete"]', { timeout: 5000 });
+
+    const text = await page.locator('[data-testid="confirm-delete"]').textContent();
+    assert.match(text, /permanently/i, "the dialog never says the word");
+    const paths = await page.locator('[data-testid="confirm-delete-paths"]').textContent();
+    assert.match(paths, /[\\/]/, "no path shown — the user cannot see what is about to go");
+    assert.ok(
+      await page.locator('[data-testid="confirm-delete-remove"]').isVisible(),
+      "the safe alternative is not offered where the decision is made",
+    );
+    // Delete must not be the default action: Escape and the scrim both cancel.
+    await page.keyboard.press("Escape");
+    await page.waitForSelector('[data-testid="confirm-delete"]', { state: "detached", timeout: 5000 });
+
+    const shown = (await page.locator('[data-testid="inspector-name"]').textContent())?.trim();
+    assert.equal(shown, name, "cancelling the dialog changed the selection");
+    await page.fill('input[type="text"]', "");
+    await page.waitForTimeout(400);
+  });
+
+  // The counterpart: an in-pack asset offers no delete button at all. A button that can only ever
+  // fail reads as a broken app rather than an impossible action — and the empty path list this
+  // check was born from told the user nothing about what was at stake.
+  await check("an in-pack asset offers no delete button", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, trashed_only: false, page: 0, page_size: 100000 },
+    });
+    const packed = p.items.find((i) => i.in_pack);
+    await page.fill('input[type="text"]', packed.name);
+    await page.waitForFunction(
+      (n) => document.querySelector(".card .name")?.textContent?.trim() === n,
+      packed.name, { timeout: 5000 });
+    await page.locator(".card").first().click();
+    await page.waitForFunction(
+      (n) => document.querySelector('[data-testid="inspector-name"]')?.textContent?.trim() === n,
+      packed.name, { timeout: 5000 });
+    await page.waitForSelector('[data-testid="inspector-actions"]', { timeout: 5000 });
+    assert.equal(
+      await page.locator('[data-testid="action-delete"]').count(),
+      0,
+      "an in-pack asset must not offer a delete that cannot work",
+    );
+    // Remove from library still applies — it hides the row without touching any bytes.
+    assert.ok(await page.locator('[data-testid="action-remove"]').isVisible());
+    await page.fill('input[type="text"]', "");
+    await page.waitForTimeout(400);
+  });
+
   await check("an unknown lodestash:// route is a 404, not a hang", async () => {
     const status = await page.evaluate(async () => {
       const res = await fetch("http://lodestash.localhost/nonsense/1");

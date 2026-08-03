@@ -283,28 +283,34 @@ until B7.
       drain order **verbatim** from `app.rs:9533` (that order encodes the `database is locked`
       fix). Blocked on B1. Until then the shell reads the catalog directly, which is sound because
       browsing is a read.
-- [ ] **B5 — writes.** Favourite, **Remove from library**, trash, delete-from-disk, confirm modals.
+- [~] **B5 — writes.** *First slice shipped 2026-08-03.* Favourite, Move to Trash / Restore,
+      **Remove from library**, delete-from-disk with its confirm dialog, and a Trash view.
       **Rating is out of scope** (parked — [`DATA-MODEL.md`](DATA-MODEL.md) §12).
 
-      **Three different destructive-sounding actions, and the UI must not let them blur:**
-      1. **Remove from library** — non-destructive and the one most people actually want. The
-         asset stops showing up anywhere, **and stops coming back on the next scan**: the row is
-         soft-deleted *and* an `Exclude { kind: Asset, value: rel_path }` is written to that
-         source's blacklist (`lodestash_core::types::Exclude`, already implemented and tested —
-         `Exclude::matches` handles both full-path and file-name form). Undone only by importing
-         that file again explicitly. No file is touched.
-      2. **Trash** — soft-delete alone, recoverable from the Trash screen, still re-scannable.
-      3. **Delete from disk** — the one genuinely irreversible action, fenced by
-         `only_paths_under_known_roots_may_be_deleted`. Its confirm modal must **name the file's
-         absolute path and say the word "permanently"**, and must not be the default button. The
-         non-destructive alternative belongs *in that dialog* ("just hide it instead"), because
-         the moment someone is about to delete is the moment they learn Remove exists.
+      **One writer thread** (`writer.rs`), fed by a channel, per [`ARCHITECTURE.md`](ARCHITECTURE.md)
+      §5 — not a `Mutex<Connection>`: the spec names a thread/actor owning the connection, and
+      Tauri runs every command on a pool thread, so two commands writing at once is exactly the
+      `database is locked` shape. Commands block on the reply because the frontend cannot honestly
+      redraw before it knows the outcome. Reads keep their own connection (WAL), so browsing never
+      queues behind a write.
 
-      Crosses from
-      reading into mutating: every write goes through the persist thread (ARCHITECTURE §5), and
-      `only_paths_under_known_roots_may_be_deleted` fences the one destructive path.
-      **Cutover gate:** `approve_job`/`deny_job` must be reachable or every agent export hangs
-      silently with no error.
+      **Three actions, deliberately unequal in the UI:**
+      1. **Remove from library** — soft-delete **and** an `Exclude { kind: Asset }` on the source's
+         blacklist, so a re-scan does not resurrect it. Written to the **app config**, which is what
+         `crawler::crawl` is actually handed (`app.rs:812`) — `import_source.blacklist` is M5
+         storage nothing reads yet, so writing only the column would look right and change nothing.
+      2. **Trash** — soft-delete only, listed by the Trash view (`GridQuery::trashed_only`),
+         restored by `set_trashed(false)`.
+      3. **Delete from disk** — irreversible, fenced by `under_known_root`. The dialog names the
+         absolute path, says *permanently*, focuses Cancel, and offers Remove inside itself.
+         **Not offered at all for an in-pack asset**: its only file is the `.unitypackage` holding
+         hundreds of others, and a button that can only fail reads as a broken app.
+
+      *Remaining:* **Empty Trash** (needs a core purge — nothing hard-deletes a soft-deleted row
+      today), multi-select (every action is single-asset), undo, and the toasts the egui build has.
+      **Not covered by an automated test:** the blacklist write itself, because `AppConfig::load`
+      resolves a fixed path and a test would have to write the developer's real config. The trash
+      half of Remove is covered; the exclude half is manual.
 - [ ] **B3 remainder — Folders view, facet filters, Ctrl-K palette, drag-in.** Note
       `build_pack_dir_tree`, `folder_children`, `ancestors_expanded`, `seed_expanded` and
       `ContentFilter::passes` are all already written and tested in `lodestash-app` — this is
