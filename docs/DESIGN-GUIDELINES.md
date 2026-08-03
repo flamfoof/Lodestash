@@ -376,7 +376,11 @@ at every level. Two **browse views**, toggled in the view/sort toolbar and persi
   contained-asset count) for the subdirectories at the current level, then the assets that live
   directly in that folder. The top level lists the project's sources as tiles (single-source projects
   descend automatically). Typing in search while in Folders searches the **current subtree**; the
-  media-type tabs keep filtering both tiles' counts and assets. This is how a pack-structured library
+  media-type tabs keep filtering both tiles' counts and assets. **An in-pack asset browses under its
+  pack**: its path gets a synthetic `<pack>/` first segment, because every `.unitypackage` lays its
+  contents out under `Assets/…` and one source can hold dozens of them — browsing by the stored
+  relative path alone merges every pack into one `Assets` folder, which is the anonymous pile this
+  view exists to prevent. This is how a pack-structured library
   (`Synty/PolygonCity/…`) is browsed pack-by-pack before P2 packages land; the sidebar
   Libraries/Packages tree (publisher → category → pack, §above) complements it once package metadata
   exists.

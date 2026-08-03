@@ -290,6 +290,70 @@ try {
     }
   });
 
+  // The defect this exists to catch is invisible by inspection: every `.unitypackage` lays its
+  // assets out under `Assets/…`, so browsing by `rel_path` alone merges every pack in a source
+  // into one folder holding thousands of files from unrelated products. In-pack assets are the
+  // majority of this library, so that failure looks like a working folder tree — just a useless one.
+  await check("packs browse as their own folders instead of merging under Assets/", async () => {
+    const s = await invoke("library_status");
+    let widest = 0;
+    for (const src of s.sources) {
+      const level = await invoke("folder_page", {
+        query: { tab: "all", search: "", status: "all", source: src.name, dir: "" },
+      });
+      if (level.total === 0) continue;
+      const names = level.tiles.map((t) => t.name);
+      // The merge bug's exact signature: a source's whole tree collapsed into one `Assets` tile.
+      assert.ok(
+        !(names.length === 1 && names[0] === "Assets"),
+        `${src.name} shows a single Assets/ tile — that is every pack merged into one pile`,
+      );
+      // The level's own count must be everything it leads to: the files sitting directly in it
+      // plus everything under each tile. Some sources really do keep loose files at their root,
+      // so dropping `items` here under-counts by exactly those.
+      const sum = level.tiles.reduce((a, t) => a + t.recursive, 0) + level.items.length;
+      assert.equal(sum, level.total, `${src.name}: parts sum to ${sum}, level says ${level.total}`);
+      widest = Math.max(widest, names.length);
+    }
+    // Sources here hold anywhere from one pack to eighty-six, so this asserts the shape of the
+    // library rather than a per-source count: somewhere in it, packs are separate folders.
+    assert.ok(widest > 1, `no source browses as more than one folder (widest was ${widest})`);
+  });
+
+  await check("the Folders view walks in, and Backspace walks back out", async () => {
+    try {
+      await page.fill('input[type="text"]', "");
+      await page.getByRole("button", { name: "Folders view" }).click();
+      await page.waitForSelector('[data-testid="folder-tiles"]', { timeout: 5000 });
+
+      // A single-source library descends on its own, so the first crumb is already the source.
+      const crumbsBefore = await page.getByTestId("folder-crumbs").textContent();
+      const first = page.locator('[data-testid="folder-tiles"] .tile').first();
+      const name = (await first.locator(".name").textContent())?.trim();
+      await first.click();
+      await page.waitForFunction(
+        (n) => document.querySelector('[data-testid="folder-crumbs"]')?.textContent?.includes(n),
+        name,
+        { timeout: 5000 },
+      );
+      assert.notEqual(
+        await page.getByTestId("folder-crumbs").textContent(),
+        crumbsBefore,
+        "entering a folder must move the breadcrumb",
+      );
+
+      await page.keyboard.press("Backspace");
+      await page.waitForFunction(
+        (c) => document.querySelector('[data-testid="folder-crumbs"]')?.textContent === c,
+        crumbsBefore,
+        { timeout: 5000 },
+      );
+    } finally {
+      await page.getByRole("button", { name: "Grid view" }).click();
+      await page.waitForSelector(".card", { timeout: 5000 });
+    }
+  });
+
   // Both view modes must render the same result set — a list that quietly shows a different
   // number of rows than the grid means one of them is filtering on its own.
   await check("list view shows the same assets as the grid", async () => {

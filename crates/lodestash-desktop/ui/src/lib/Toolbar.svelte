@@ -24,7 +24,9 @@
     {/each}
   </div>
 
-  <span class="count num" data-testid="result-count">{total.toLocaleString()}</span>
+  {#if view.viewMode !== "folders"}
+    <span class="count num" data-testid="result-count">{total.toLocaleString()}</span>
+  {/if}
 
   <div class="right">
     <label class="sort">
@@ -80,6 +82,15 @@
         aria-label="List view"
       >
         <Icon name="ls-view-list" size={16} />
+      </button>
+      <button
+        class="icon-btn"
+        class:on={view.viewMode === "folders"}
+        onclick={() => (view.viewMode = "folders")}
+        title="Folders"
+        aria-label="Folders view"
+      >
+        <Icon name="ls-nav-packages" size={16} />
       </button>
     </div>
 

@@ -71,6 +71,25 @@ export type GridQuery = {
   page_size: number;
 };
 
+/**
+ * One level of the Folders view. `source: null` is the top level, where the tiles are the sources.
+ * `dir` is source-root-relative and `/`-separated; for an in-pack asset its first segment is the
+ * pack name, which is what keeps a source's dozens of packs from merging into one `Assets` folder.
+ */
+export type FolderQuery = {
+  tab: string;
+  search: string;
+  status: string;
+  filter: ContentFilter;
+  source: string | null;
+  dir: string;
+};
+
+export type FolderTile = { name: string; direct: number; recursive: number };
+export type FolderPage = { tiles: FolderTile[]; items: GridItem[]; total: number };
+
+export const folderPage = (query: FolderQuery) => invoke<FolderPage>("folder_page", { query });
+
 export type AssetDetail = {
   asset_id: number;
   name: string;

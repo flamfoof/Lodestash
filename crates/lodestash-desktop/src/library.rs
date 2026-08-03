@@ -176,6 +176,57 @@ pub struct LibraryStatus {
     pub trashed: usize,
 }
 
+/// One level of the Folders view (DESIGN-GUIDELINES §7 "Browse views").
+///
+/// `source: None` is the top level, where the tiles are the **sources** themselves — "assets from
+/// many sources must never blur into one anonymous pile". Below that, `dir` walks the source's own
+/// directories. Search narrows the current **subtree** rather than the whole library, and it
+/// narrows the tile counts with it: a tile promising 40 assets that opens onto 2 is worse than no
+/// count at all.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct FolderQuery {
+    pub tab: Category,
+    pub search: String,
+    pub status: StatusFilter,
+    pub filter: ContentFilter,
+    /// Which source we are inside; `None` at the top level.
+    pub source: Option<String>,
+    /// Source-root-relative directory, `/`-separated. Empty is the source's root.
+    pub dir: String,
+}
+
+impl Default for FolderQuery {
+    fn default() -> Self {
+        Self {
+            tab: Category::All,
+            search: String::new(),
+            status: StatusFilter::All,
+            filter: ContentFilter::default(),
+            source: None,
+            dir: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FolderTileOut {
+    pub name: String,
+    /// Assets directly inside it, and everything under it recursively — shown as `direct (recursive)`.
+    pub direct: usize,
+    pub recursive: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FolderPage {
+    pub tiles: Vec<FolderTileOut>,
+    /// The assets living **directly** in this folder. Not paged: a single directory holding more
+    /// than a screenful is the exception, and the tiles above it are the navigation.
+    pub items: Vec<GridItem>,
+    /// Everything under this level, tiles included — the "N assets" the breadcrumb reports.
+    pub total: usize,
+}
+
 /// What the ⚑ Filters popover needs to draw itself (UI-SPEC §2.3).
 ///
 /// Sent from Rust rather than hardcoded in TypeScript because every id and label here is a wire
@@ -246,6 +297,15 @@ struct Row {
     status: AssetStatus,
     /// Tag names, filled in one bulk pass (`mark_traits`) — the trait facet needs them per row.
     traits: Vec<String>,
+    /// The path the Folders view browses by: `rel_path` for a loose file, but
+    /// `<pack>/<rel_path>` for an in-pack asset.
+    ///
+    /// The synthetic first segment is load-bearing. Every `.unitypackage` lays its assets out
+    /// under `Assets/…`, and one source holds dozens of packs — browsing by `rel_path` alone
+    /// merges all of them into a single `Assets` folder containing thousands of files from
+    /// unrelated products, which is exactly the "anonymous pile" the browse-views design exists to
+    /// prevent. In-pack assets are 72% of a real library, so excluding them instead is not an option.
+    browse_path: PathBuf,
 }
 
 impl Library {
@@ -509,6 +569,37 @@ impl Library {
         }
     }
 
+    /// The facets both browse views share: tab, status and the ⚑ filter. Trash and favourites are
+    /// **not** here — they scope the grid, not the Folders tree.
+    ///
+    /// Links are passed to `passes` as `(false, false)`: the dependency-graph chips are not on the
+    /// popover (UI-SPEC §2.3 lists traits, triangles and size), so `filter.link` is always `None`
+    /// here and the flags are never read. Wiring them means two more bulk queries at hydrate, and
+    /// belongs with the chips that use them.
+    fn keeps(&self, r: &Row, tab: Category, status: StatusFilter, filter: &ContentFilter) -> bool {
+        tab.matches(r.media_type)
+            && status.matches(r.status)
+            && filter.passes(
+                r.item.size_bytes.max(0) as u64,
+                r.item.triangles.map(|t| t.max(0) as u32),
+                None,
+                &r.traits,
+                (false, false),
+                r.item.favorite,
+                &self.tiers,
+            )
+    }
+
+    /// Does this row match the active query?
+    ///
+    /// Union, exactly as the egui grid does it (`app.rs` `rebuild_cache`): FTS5 reaches tags and
+    /// descriptions and ranks by BM25, but it matches whole tokens by prefix, so a mid-word query
+    /// ("olygon") would stop matching things that matched yesterday. Keeping the substring pass
+    /// means the search only ever gains results.
+    fn hits(&self, r: &Row, needle: &str, ranks: Option<&HashMap<i64, usize>>) -> bool {
+        ranks.is_some_and(|m| m.contains_key(&r.item.asset_id)) || r.search_key.contains(needle)
+    }
+
     /// Filter, sort, page. Runs the FTS query for the active search, then hands the ranks to
     /// [`Self::page_with_ranks`], which is where the actual work — and the testability — lives.
     pub fn page(&self, q: &GridQuery) -> GridPage {
@@ -521,40 +612,13 @@ impl Library {
     /// union rule and the relevance order can be tested without standing up an FTS index.
     fn page_with_ranks(&self, q: &GridQuery, ranks: Option<&HashMap<i64, usize>>) -> GridPage {
         let needle = q.search.trim().to_lowercase();
-        let hit = |r: &Row| {
-            // Union, exactly as the egui grid does it (`app.rs` `rebuild_cache`): FTS5 reaches
-            // tags and descriptions and ranks by BM25, but it matches whole tokens by prefix, so
-            // a mid-word query ("olygon") would stop matching things that matched yesterday.
-            // Keeping the substring pass means the search only ever gains results.
-            ranks
-                .as_ref()
-                .is_some_and(|m| m.contains_key(&r.item.asset_id))
-                || r.search_key.contains(&needle)
-        };
         let mut matched: Vec<&Row> = self
             .rows
             .iter()
-            .filter(|r| q.tab.matches(r.media_type))
-            .filter(|r| q.status.matches(r.status))
+            .filter(|r| self.keeps(r, q.tab, q.status, &q.filter))
             .filter(|r| r.trashed == q.trashed_only)
             .filter(|r| !q.favorites_only || r.item.favorite)
-            // The ⚑ popover's facets, through the **shared** predicate. Links are passed as
-            // `(false, false)`: the dependency-graph chips are not on this popover (UI-SPEC §2.3
-            // lists traits, triangles and size), so `filter.link` is always `None` here and the
-            // flags are never read. Wiring them means two more bulk queries at hydrate, and
-            // belongs with the chips that use them.
-            .filter(|r| {
-                q.filter.passes(
-                    r.item.size_bytes.max(0) as u64,
-                    r.item.triangles.map(|t| t.max(0) as u32),
-                    None,
-                    &r.traits,
-                    (false, false),
-                    r.item.favorite,
-                    &self.tiers,
-                )
-            })
-            .filter(|r| needle.is_empty() || hit(r))
+            .filter(|r| needle.is_empty() || self.hits(r, &needle, ranks))
             .collect();
 
         // Every key falls back to name for ties, which keeps paging stable when a key has many
@@ -624,6 +688,81 @@ impl Library {
             total,
             page,
             pages,
+        }
+    }
+
+    /// One level of the Folders view.
+    ///
+    /// Shares every non-folder facet with [`Self::page`] through [`Self::keeps`], so a tab or a
+    /// filter chip means the same thing in both views — a Folders browser that quietly ignores the
+    /// toolbar is a second, subtly different library.
+    pub fn folder_page(&self, q: &FolderQuery) -> FolderPage {
+        let needle = q.search.trim().to_lowercase();
+        let ranks = self.search_ranks(&needle);
+        let scoped: Vec<&Row> = self
+            .rows
+            .iter()
+            // The Folders tree is the *live* library — the Trash is its own screen.
+            .filter(|r| !r.trashed)
+            .filter(|r| self.keeps(r, q.tab, q.status, &q.filter))
+            .filter(|r| needle.is_empty() || self.hits(r, &needle, ranks.as_ref()))
+            .filter(|r| match &q.source {
+                Some(name) => r.source.as_deref() == Some(name.as_str()),
+                None => true,
+            })
+            .collect();
+
+        // The top level: one tile per source, not per folder. A single-source library is descended
+        // automatically by the frontend, so nobody meets a screen with one tile on it.
+        if q.source.is_none() {
+            let mut per_source: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
+            for r in &scoped {
+                *per_source
+                    .entry(r.source.as_deref().unwrap_or("(unknown)"))
+                    .or_default() += 1;
+            }
+            return FolderPage {
+                total: scoped.len(),
+                tiles: per_source
+                    .into_iter()
+                    .map(|(name, recursive)| FolderTileOut {
+                        name: name.to_string(),
+                        // A source is a root: nothing lives directly in it, so `direct` would
+                        // always read 0 and the tile would say "0 (1,204)".
+                        direct: recursive,
+                        recursive,
+                    })
+                    .collect(),
+                items: Vec::new(),
+            };
+        }
+
+        let dir = PathBuf::from(q.dir.replace('\\', "/"));
+        let (idxs, tiles) = grid::folder_level(
+            scoped
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (i, r.browse_path.as_path(), r.media_type)),
+            &dir,
+            q.tab,
+        );
+        // Everything at or under this folder, which is what the header counts — the files here
+        // plus everything the tiles lead to.
+        let total = idxs.len() + tiles.iter().map(|t| t.recursive).sum::<usize>();
+        let mut items: Vec<GridItem> = idxs.iter().map(|&i| scoped[i].item.clone()).collect();
+        items.sort_by_key(|i| i.name.to_lowercase());
+        FolderPage {
+            tiles: tiles
+                .into_iter()
+                .map(|t| FolderTileOut {
+                    name: t.name,
+                    direct: t.direct,
+                    recursive: t.recursive,
+                })
+                .collect(),
+            items,
+            total,
         }
     }
 
@@ -824,7 +963,12 @@ fn row_from(
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| e.rel_path.clone());
+    let browse_path = match package.as_deref() {
+        Some(p) => PathBuf::from(p).join(&e.rel_path),
+        None => PathBuf::from(&e.rel_path),
+    };
     Row {
+        browse_path,
         search_key: name.to_lowercase(),
         trashed: e.trashed,
         media_type: MediaType::from_code(&e.media_type),
@@ -874,6 +1018,7 @@ mod tests {
                 locator: None,
                 trashed: false,
                 traits: Vec::new(),
+                browse_path: PathBuf::from(format!("{n}.x")),
                 item: GridItem {
                     asset_id: 0,
                     name: (*n).into(),
@@ -1172,10 +1317,23 @@ mod tests {
             metrics: Default::default(),
             content_hash: None,
         };
-        let row = row_from(e, "Synty", None);
+        let row = row_from(e.clone(), "Synty", None);
         assert_eq!(row.media_type, Some(MediaType::Model3d));
         assert_eq!(row.status, AssetStatus::Identified);
         assert_eq!(row.item.media_type, "model_3d", "the JSON keeps the code");
+        assert_eq!(
+            row.browse_path,
+            PathBuf::from("Assets/Rock.fbx"),
+            "a loose file browses at its own path"
+        );
+
+        // …and an in-pack asset browses under its pack, or every pack in the source merges into
+        // one `Assets` folder (see the `browse_path` field doc).
+        let packed = row_from(e, "Synty", Some("PolygonCity".into()));
+        assert_eq!(
+            packed.browse_path,
+            PathBuf::from("PolygonCity/Assets/Rock.fbx")
+        );
     }
 
     /// Favorites is a *filter over the library*, not a separate screen with its own data. The
@@ -1329,6 +1487,165 @@ mod tests {
         assert_eq!(f.traits.len(), 1, "the trashed row's trait is not offered");
         assert_eq!(f.traits[0].name, "common");
         assert_eq!(f.traits[0].count, 2);
+    }
+
+    /// Rows placed in a source, at a path, optionally inside a pack — what the Folders view walks.
+    fn foldered(rows: &[(&str, &str, Option<&str>, &str)]) -> Library {
+        let mut l = lib(&rows
+            .iter()
+            .map(|(name, mt, _, _)| (*name, *mt))
+            .collect::<Vec<_>>());
+        for (r, (_, _, pack, path)) in l.rows.iter_mut().zip(rows) {
+            r.source = Some("Synty".into());
+            r.item.rel_path = (*path).to_string();
+            r.item.in_pack = pack.is_some();
+            r.item.package = pack.map(|p| p.to_string());
+            r.browse_path = match pack {
+                Some(p) => PathBuf::from(p).join(path),
+                None => PathBuf::from(path),
+            };
+        }
+        l
+    }
+
+    /// The top level is the **sources**, not folders. Landing straight in a directory tree loses
+    /// the answer to "where is this from?", which the browse-views design exists to keep.
+    #[test]
+    fn the_top_level_of_folders_lists_sources() {
+        let l = foldered(&[
+            ("a", "model_3d", None, "Assets/Rocks/a.fbx"),
+            ("b", "model_3d", None, "Assets/b.fbx"),
+        ]);
+        let p = l.folder_page(&FolderQuery::default());
+        assert_eq!(p.tiles.len(), 1);
+        assert_eq!(p.tiles[0].name, "Synty");
+        assert_eq!(p.tiles[0].recursive, 2);
+        assert!(p.items.is_empty(), "no files hang off the top level");
+    }
+
+    /// Inside a source: subfolders become tiles, files at this level become items, and the counts
+    /// distinguish "directly in here" from "somewhere under here".
+    #[test]
+    fn a_folder_level_splits_tiles_from_the_files_directly_in_it() {
+        let l = foldered(&[
+            ("deep", "model_3d", None, "Assets/Rocks/Big/deep.fbx"),
+            ("near", "model_3d", None, "Assets/Rocks/near.fbx"),
+            ("here", "model_3d", None, "Assets/here.fbx"),
+        ]);
+        let p = l.folder_page(&FolderQuery {
+            source: Some("Synty".into()),
+            dir: "Assets".into(),
+            ..Default::default()
+        });
+        assert_eq!(p.items.len(), 1, "only the file directly in Assets/");
+        assert_eq!(p.items[0].name, "here");
+        assert_eq!(p.tiles.len(), 1);
+        assert_eq!(p.tiles[0].name, "Rocks");
+        assert_eq!(p.tiles[0].direct, 1, "near.fbx is directly in Rocks/");
+        assert_eq!(p.tiles[0].recursive, 2, "…and deep.fbx is under it");
+        assert_eq!(p.total, 3, "the header counts everything at or under this level");
+    }
+
+    /// **Packs do not merge.** Every `.unitypackage` lays its assets out under `Assets/…`, and one
+    /// source holds dozens of them, so browsing by `rel_path` alone collapses unrelated products
+    /// into one `Assets` folder of thousands of files. In-pack assets are the majority of a real
+    /// library, so this is the difference between a browsable tree and an anonymous pile.
+    #[test]
+    fn in_pack_assets_browse_under_their_pack_rather_than_merging() {
+        let l = foldered(&[
+            ("city", "model_3d", Some("PolygonCity"), "Assets/city.fbx"),
+            ("farm", "model_3d", Some("PolygonFarm"), "Assets/farm.fbx"),
+        ]);
+        let top = l.folder_page(&FolderQuery {
+            source: Some("Synty".into()),
+            ..Default::default()
+        });
+        let names: Vec<&str> = top.tiles.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["PolygonCity", "PolygonFarm"],
+            "each pack is its own folder, not a shared Assets/"
+        );
+
+        let inside = l.folder_page(&FolderQuery {
+            source: Some("Synty".into()),
+            dir: "PolygonCity/Assets".into(),
+            ..Default::default()
+        });
+        assert_eq!(inside.items.len(), 1);
+        assert_eq!(inside.items[0].name, "city");
+    }
+
+    /// Search inside Folders narrows the **subtree**, tile counts included — a tile promising 40
+    /// assets that opens onto 2 is worse than showing no count at all.
+    #[test]
+    fn searching_in_folders_narrows_the_tile_counts_too() {
+        let l = foldered(&[
+            ("rock_01", "model_3d", None, "Assets/Rocks/rock_01.fbx"),
+            ("rock_02", "model_3d", None, "Assets/Rocks/rock_02.fbx"),
+            ("tree_01", "model_3d", None, "Assets/Rocks/tree_01.fbx"),
+        ]);
+        let q = |search: &str| FolderQuery {
+            source: Some("Synty".into()),
+            dir: "Assets".into(),
+            search: search.into(),
+            ..Default::default()
+        };
+        assert_eq!(l.folder_page(&q("")).tiles[0].recursive, 3);
+        assert_eq!(l.folder_page(&q("rock")).tiles[0].recursive, 2);
+    }
+
+    /// The toolbar means the same thing in both browse views. A Folders tree that ignores the tab
+    /// is a second library that disagrees with the first one.
+    #[test]
+    fn the_tab_and_the_filter_reach_the_folders_view() {
+        let mut l = foldered(&[
+            ("mesh", "model_3d", None, "Assets/Art/mesh.fbx"),
+            ("noise", "audio", None, "Assets/Art/noise.wav"),
+        ]);
+        l.rows[0].traits = vec!["stylized".into()];
+        let at = |q: FolderQuery| l.folder_page(&q).tiles[0].recursive;
+        assert_eq!(
+            at(FolderQuery {
+                source: Some("Synty".into()),
+                dir: "Assets".into(),
+                tab: Category::Models,
+                ..Default::default()
+            }),
+            1,
+            "the tab filters the tile counts"
+        );
+        assert_eq!(
+            at(FolderQuery {
+                source: Some("Synty".into()),
+                dir: "Assets".into(),
+                filter: ContentFilter {
+                    traits: ["stylized".to_string()].into_iter().collect(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            1,
+            "and so does the ⚑ filter"
+        );
+    }
+
+    /// A trashed asset is gone from every view but the Trash — including this one, which walks a
+    /// different code path from the grid and so can lose the rule on its own.
+    #[test]
+    fn folders_never_show_a_trashed_asset() {
+        let mut l = foldered(&[
+            ("kept", "model_3d", None, "Assets/Art/kept.fbx"),
+            ("binned", "model_3d", None, "Assets/Art/binned.fbx"),
+        ]);
+        l.rows[1].trashed = true;
+        let p = l.folder_page(&FolderQuery {
+            source: Some("Synty".into()),
+            dir: "Assets/Art".into(),
+            ..Default::default()
+        });
+        assert_eq!(p.items.len(), 1);
+        assert_eq!(p.items[0].name, "kept");
     }
 
     #[test]

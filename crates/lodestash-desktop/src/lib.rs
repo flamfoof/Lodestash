@@ -14,7 +14,9 @@ use std::sync::Mutex;
 use serde::Serialize;
 use tauri::Manager;
 
-use crate::library::{AssetDetail, Facets, GridPage, GridQuery, Library, LibraryStatus};
+use crate::library::{
+    AssetDetail, Facets, FolderPage, FolderQuery, GridPage, GridQuery, Library, LibraryStatus,
+};
 use crate::writer::{Op, WriteResult, Writer};
 
 #[derive(Serialize)]
@@ -91,6 +93,17 @@ fn grid_page(state: tauri::State<'_, AppState>, query: GridQuery) -> Result<Grid
         .library
         .lock()
         .map(|l| l.page(&query))
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
+/// One level of the Folders view (DESIGN-GUIDELINES §7). `source: null` is the top level, where
+/// the tiles are the sources themselves.
+#[tauri::command]
+fn folder_page(state: tauri::State<'_, AppState>, query: FolderQuery) -> Result<FolderPage, String> {
+    state
+        .library
+        .lock()
+        .map(|l| l.folder_page(&query))
         .map_err(|_| "library lock poisoned".to_string())
 }
 
@@ -231,6 +244,7 @@ pub fn run() {
             library_status,
             grid_page,
             filter_facets,
+            folder_page,
             asset_detail,
             reload_library,
             set_favorite,

@@ -330,7 +330,21 @@ until B7.
       [`DATA-MODEL.md`](DATA-MODEL.md) §12). **The trait cloud is nearly empty on a fresh library**
       — only 24 of 8,237 assets here carry a tag — so it says so rather than rendering a blank box.
 
-      *Remaining:* Folders view, Ctrl-K palette, drag-in.
+      **Folders view shipped 2026-08-03.** Breadcrumb + folder tiles + the assets directly in the
+      current folder, Backspace up a level, a third stop on the view toggle. The tiling rule moved
+      to `grid::folder_level`, which takes `(index, path, media_type)` triples so both frontends
+      share it; `grid::folder_children` is now that function scoped to one source. Tab, status,
+      search and the ⚑ filter all reach it through `Library::keeps`, so the tile counts agree with
+      the grid the toolbar produces.
+
+      **In-pack assets browse under a synthetic `<pack>/` first segment** (`Row::browse_path`).
+      Every `.unitypackage` lays its assets out under `Assets/…` and one source here holds 86
+      packs, so browsing by `rel_path` alone collapses them into a single `Assets` folder of
+      thousands of files from unrelated products — the anonymous pile the browse-views design
+      exists to prevent. In-pack assets are 72% of this library, so excluding them was not an
+      option. The e2e asserts the collapse cannot happen.
+
+      *Remaining:* Ctrl-K palette, drag-in.
 - [ ] **B6 — remaining screens.** Packages + pack browser, Unity Assets, Traits, Stats, Duplicates,
       Trash, Collections, Identify, Onboarding.
 - [ ] **B1.5 — `lodestash-cli`.** Headless `scan|index|tag|export`; gives the port a smoke test

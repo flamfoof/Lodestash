@@ -15,8 +15,11 @@ class ViewState {
   sortBy = $state("name");
   sortAsc = $state(true);
   density = $state<"compact" | "cozy" | "large">("cozy");
-  /** Grid of cards, or the dense table (UI-SPEC §1.3 view toggle). */
-  viewMode = $state<"grid" | "list">("grid");
+  /** Grid of cards, the dense table, or the directory browser (DESIGN-GUIDELINES §7). */
+  viewMode = $state<"grid" | "list" | "folders">("grid");
+  /** Folders view position: which source we are inside, and where in it. */
+  source = $state<string | null>(null);
+  dir = $state("");
   inspectorOpen = $state(true);
   /** Lead selection, as an asset id. Selection is view state: no worker writes it. */
   selected = $state<number | null>(null);

@@ -121,32 +121,27 @@ pub fn sort_indices<T>(
     }
 }
 
-/// Folders view, inside a source: the assets living directly in `dir` plus one tile
-/// per child directory with its contained-asset count (recursive), both `tab`-filtered.
-/// Tiles come back name-sorted (BTreeMap).
-pub fn folder_children<T>(
-    entries: &[AssetEntry<T>],
-    src: usize,
-    dir: &std::path::Path,
-    tab: Category,
-    pack: Option<&str>,
-) -> (Vec<usize>, Vec<FolderTile>) {
+/// One level of the Folders view, over **already-scoped** paths: which of them sit directly in
+/// `dir`, and one tile per child directory with its direct and recursive counts.
+///
+/// Takes `(caller's index, path)` pairs rather than a slice of anything, because the two frontends
+/// hold different row types and this rule — what counts as "in this folder" versus "under it" — is
+/// the part that must not diverge between them. Scoping (which source, which pack, trashed,
+/// search) belongs to the caller; only the tab filter is applied here, because tile counts have to
+/// agree with the grid the tab produces. Tiles come back name-sorted (BTreeMap).
+pub fn folder_level<'a, I>(items: I, dir: &std::path::Path, tab: Category) -> (Vec<usize>, Vec<FolderTile>)
+where
+    I: IntoIterator<Item = (usize, &'a std::path::Path, Option<MediaType>)>,
+{
     // name → (direct children in that folder, total recursive under it)
     let mut tiles: std::collections::BTreeMap<String, (usize, usize)> =
         std::collections::BTreeMap::new();
     let mut idxs = Vec::new();
-    for (i, e) in entries.iter().enumerate() {
-        if e.source_idx != src || e.trashed || !tab.matches(e.file.media_type) {
+    for (i, rel_path, media_type) in items {
+        if !tab.matches(media_type) {
             continue;
         }
-        // When browsing one pack, its folder tree is only that pack's assets — several packs can
-        // share a source (and all use `Assets/…` paths), so without this they would merge.
-        if let Some(p) = pack {
-            if e.package.as_deref() != Some(p) {
-                continue;
-            }
-        }
-        let Ok(rest) = e.file.rel_path.strip_prefix(dir) else {
+        let Ok(rest) = rel_path.strip_prefix(dir) else {
             continue;
         };
         let comps: Vec<_> = rest.components().collect();
@@ -174,6 +169,29 @@ pub fn folder_children<T>(
         })
         .collect();
     (idxs, tiles)
+}
+
+/// Folders view, inside a source: [`folder_level`] scoped to one source (and optionally one pack).
+pub fn folder_children<T>(
+    entries: &[AssetEntry<T>],
+    src: usize,
+    dir: &std::path::Path,
+    tab: Category,
+    pack: Option<&str>,
+) -> (Vec<usize>, Vec<FolderTile>) {
+    folder_level(
+        entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.source_idx == src && !e.trashed)
+            // When browsing one pack, its folder tree is only that pack's assets — several packs
+            // can share a source (and all use `Assets/…` paths), so without this they would merge.
+            // MSRV 1.80: `Option::is_none_or` is 1.82.
+            .filter(|(_, e)| pack.map_or(true, |p| e.package.as_deref() == Some(p)))
+            .map(|(i, e)| (i, e.file.rel_path.as_path(), e.file.media_type)),
+        dir,
+        tab,
+    )
 }
 
 /// Max thumbnails generating at once — half the cores (min 2). A 3D/material thumbnail is a
