@@ -211,32 +211,68 @@ tech (CSS tokens, an SVG icon set, a runnable HTML prototype), so every screen c
 translation. The port removes the translation. `lodestash-ui` stays buildable as the reference
 until B7.
 
-- [ ] **B1 — finish `lodestash-app` extraction.** `jobs` + `models` moved 2026-08-01; `config`,
-      `drains`, `persist`, `thumbs`, `grid` and app.rs's domain types are still in `lodestash-ui`,
-      and the four `app/*.rs` children still use `use super::*`. Move + visibility flip only, no
-      cleanups. *Done:* `lodestash-ui` is a thin egui shell; screenshot identical to before.
-- [ ] **B1.5 — `lodestash-cli`.** Headless `scan|index|tag|export` over `lodestash-app`. Gives the
-      port a smoke test that needs no window.
-- [x] **B2a — desktop scaffold + shell.** `crates/lodestash-desktop` (Tauri 2) + `ui/` (Svelte 5,
-      Vite, TypeScript, built with Bun). `docs/design/tokens.css` extracted as the single token source; bundled
-      `@font-face` with no webfont link; the real `icons.svg` sprite; app frame, 11 nav
-      destinations, 12 stub routes; one command (`app_info`) proving IPC. Screenshot verified —
-      a webview captures reliably where Glow returns blank.
-- [ ] **B2b — Engine + pump + `ls://`.** `Arc<Mutex<Engine>>`, the 33ms pump running the drain
-      order verbatim from `app.rs:9533`, the four `ls://` handlers, `open_library`/`grid_page`/
-      `jobs_snapshot`. *Done:* a real library opens with real previews and scan progress.
-      **Hard gate:** stream a >1 GB file over `ls://file` with a Range request and confirm
-      `<audio>` scrubbing.
-- [ ] **B3 — Library parity** (search, toolbar, tabs, filters, pager with virtualized rows,
-      Folders + nav history, selection, Inspector, hover-spin cards, drag files in, Ctrl-K palette).
-- [ ] **B4 — Viewers** (Quick Look as its own OS window — rewrites `UI-SPEC` §14 — image, audio,
-      three.js orbit over `ls://mesh?lod=preview`, `ensure_local` pull).
-- [ ] **B5 — Writes, jobs, agent approval gate, settings, drag-out to Unity.** **Cutover gate:**
-      `approve_job`/`deny_job` must be reachable, or every agent export hangs silently.
-- [ ] **B6 — Remaining screens** (Packages + pack browser, Unity Assets, Traits, Stats, Duplicates,
-      Trash, Collections, Identify, Onboarding).
-- [ ] **B7 — Cutover.** `[[bin]] lodestash` moves to `lodestash-desktop`, **preserving the `--mcp`
-      stdio branch verbatim**; delete `crates/lodestash-ui`; update every doc that names egui.
+### Done
+
+- [x] **B2a — desktop scaffold + shell.** Tauri 2 + Svelte 5 / Vite / TS on Bun.
+      `docs/design/tokens.css` as the single token source, bundled `@font-face` with no webfont
+      link, the real `icons.svg` sprite, app frame, 11 nav destinations, 12 routes.
+- [x] **e2e harness.** `bun run e2e` drives the *real* binary over CDP with `playwright-core`
+      (TECH-STACK §5.2). 22 checks, each named after the failure it prevents.
+- [x] **`ls://` protocol — `preview`, `file`, `mesh`.** Range-capable, read-only by construction,
+      503 `not_local` for in-pack. **B2b hard gate met and asserted**: a real 7.8 MB WAV decodes in
+      `<audio>` and seeks.
+- [x] **Library grid on real data.** 8,237 assets across three storage classes, category tabs,
+      search, pager, sort, STATUS facet, density, list view, Inspector, Favorites.
+- [x] **Quick Look.** Image + audio viewers; **3D model viewer** in hand-rolled WebGL2 with
+      textures via the dependency graph — no new dependency (TECH-STACK §5.3).
+
+### Next up — ordered by what a user actually sees
+
+- [ ] **T1 — `ls://thumb` raster thumbnails.** *The biggest visible gap: **7,483 of 7,691 assets
+      render a generic type icon**.* Only models with a stored vector preview (208) show a picture;
+      every image, audio file and material shows an icon. `thumb::generate` already produces
+      rasters and waveforms and **826 PNGs / 10.8 MB are already cached on disk** — this route was
+      in the B3 plan and never built. No new dependencies.
+- [ ] **T2 — drain the vector-preview backlog.** 208 of 3,439 models have previews because
+      `PREVIEW_BACKFILL_BUDGET` is 20 s per pass. Raise it, or add an explicit
+      "generate previews" action in Settings so it is the user's choice rather than a constant.
+- [ ] **T3 — material shader balls.** 668 materials have no viewer. `material::uv_sphere` already
+      generates the mesh and the graph has 204 resolved `material --uses_texture--> image` edges;
+      `ls://mesh` returns a generated sphere for a material and `Viewer3D` renders it unchanged.
+- [ ] **T4 — real search.** The grid filters with `contains()` over lowercased names.
+      `catalog::search_assets` (FTS5 + BM25), `query::parse_query` (structured `ParsedQuery`) and
+      `fusion::rrf_fuse` all exist and are unused. Fuse on **rank**, never on score.
+- [ ] **T5 — drop duplicated helpers.** `lodestash-desktop` reimplements logic that already exists
+      and is tested in `lodestash-app`: sorting (`grid::sort_indices` + `grid::dir`), tab matching
+      (`Category::matches`), status folding (`StatusFilter::matches`), `fmtDuration`
+      (`audio::fmt_time`), `typeToken` (`Category::token`). Built in isolation; exactly the drift
+      the extraction exists to prevent.
+
+### Then — bigger, each wants its own session
+
+- [ ] **B1 — finish the `lodestash-app` extraction.** `config`, `drains`, `persist`, `thumbs`,
+      `grid`, `paths`, `types` and `audio` have moved; **`app.rs` is still 15,628 lines** and
+      `Engine` itself has not been split from the egui `LodestashApp`. Splitting ~120 fields on
+      *does a background thread write it?* is judgement per field, not a mechanical move.
+- [ ] **B2b remainder — `Engine` + pump.** `Arc<Mutex<Engine>>` and the 33 ms pump running the
+      drain order **verbatim** from `app.rs:9533` (that order encodes the `database is locked`
+      fix). Blocked on B1. Until then the shell reads the catalog directly, which is sound because
+      browsing is a read.
+- [ ] **B5 — writes.** Favourite, rating, trash, delete-from-disk, confirm modals. Crosses from
+      reading into mutating: every write goes through the persist thread (ARCHITECTURE §5), and
+      `only_paths_under_known_roots_may_be_deleted` fences the one destructive path.
+      **Cutover gate:** `approve_job`/`deny_job` must be reachable or every agent export hangs
+      silently with no error.
+- [ ] **B3 remainder — Folders view, facet filters, Ctrl-K palette, drag-in.** Note
+      `build_pack_dir_tree`, `folder_children`, `ancestors_expanded`, `seed_expanded` and
+      `ContentFilter::passes` are all already written and tested in `lodestash-app` — this is
+      mostly wiring.
+- [ ] **B6 — remaining screens.** Packages + pack browser, Unity Assets, Traits, Stats, Duplicates,
+      Trash, Collections, Identify, Onboarding.
+- [ ] **B1.5 — `lodestash-cli`.** Headless `scan|index|tag|export`; gives the port a smoke test
+      needing no window.
+- [ ] **B7 — cutover.** `[[bin]] lodestash` moves to `lodestash-desktop`, **preserving the `--mcp`
+      stdio branch verbatim**; delete `crates/lodestash-ui`; update every doc naming egui.
 
 ## 🔍 Findings — not bugs, but worth knowing
 
