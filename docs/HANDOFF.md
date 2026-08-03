@@ -26,6 +26,42 @@ Sanity check before starting: `cargo test --workspace` and `cargo clippy --works
 
 ---
 
+## 1.5 Next session: B5 — writes (decided 2026-08-03)
+
+**The Svelte app is read-only.** You can browse 8,237 assets, search, sort, facet, open Quick Look
+and orbit a textured model — and change nothing. That is the gap that stops it replacing the egui
+build for real work, and it is the agreed next task.
+
+**Scope:** favourite, rating, trash / untrash, delete-from-disk, empty trash — with confirm modals.
+
+**The two things that make this different from everything shipped so far:**
+
+1. **Single-writer rule (`ARCHITECTURE.md` §5).** Every catalog write goes through the persist
+   thread's own connection. `lodestash-desktop` currently holds a **read-only** connection and no
+   persist thread — that is exactly why browsing was safe to build ahead of the `Engine` split. A
+   `#[tauri::command]` must **not** write on the command thread. Either spawn the same short-lived
+   writer the egui app already spawns (`app.rs:2730-2913`) or wait for `Engine`. Two concurrent
+   writers is how `database is locked` came back last time (`HANDOFF` §6).
+2. **The destructive path is fenced, and the fence must stay green.**
+   `only_paths_under_known_roots_may_be_deleted` (now in `lodestash-app/src/thumbs.rs`) guards
+   `under_known_root`; delete-from-disk is the one operation in this product that touches a user's
+   files. It is mutation-checked — keep it that way.
+
+**Already written and tested in core, do not reimplement:** `set_favorite`, `favorite_ids`,
+`set_rating`, `set_trashed`, `related_assets`. The desktop crate has a habit of growing its own
+copies (see T5) — check `lodestash-app` and `lodestash-core` first.
+
+**Verification bar:** the e2e suite must gain a check per mutation that reads the value back
+*through a separate call*, not from the response — a write that returns success while persisting
+nothing is the failure mode, and it is invisible otherwise.
+
+**Open decision, deliberately not made:** in-pack thumbnails need `lodestash://thumb` to pull a
+payload into a scratch file via `thumbs::ensure_in_pack_scratch` (the egui build does this under
+`IN_PACK_THUMB_MAX_BYTES`). That relaxes "the protocol never pulls", which is a stated contract in
+`protocol.rs`. Three options were put to the user and none chosen yet: relax it for `thumb` alone,
+keep the handler pure, or add an explicit `warm_thumbnails` command with job-tray progress. Worth
+5,963 assets gaining a picture; ask before choosing.
+
 ## 2. Where the build is
 
 **Search-with-AI is complete against its design**, and the grid is fully visual.
