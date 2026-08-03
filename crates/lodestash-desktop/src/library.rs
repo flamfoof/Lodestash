@@ -8,7 +8,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use lodestash_app::config::SortBy;
+use lodestash_app::grid;
+use lodestash_app::types::{Category, StatusFilter};
 use lodestash_core::catalog::Catalog;
+use lodestash_core::types::{AssetStatus, MediaType};
 use serde::{Deserialize, Serialize};
 
 /// One asset as the grid needs it. Carries a `preview_key`, never bytes — the frontend fetches
@@ -37,19 +41,23 @@ pub struct GridItem {
     pub triangles: Option<i64>,
 }
 
+/// One grid request from the frontend.
+///
+/// The three facets deserialize **into the shared enums** (`all | models | …`,
+/// `all | unidentified | …`, `name | type | …`) rather than arriving as strings this crate
+/// re-matches. That is what keeps the two frontends answering a query the same way: the tab
+/// grouping, the status fold and the sort vocabulary each have exactly one definition, in
+/// `lodestash-app`. An id outside those sets is a frontend bug and fails the command loudly —
+/// silently falling back to "All" is how a broken facet ships unnoticed.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct GridQuery {
-    /// Category tab id: `all | models | materials | sounds | images`.
-    pub tab: String,
+    pub tab: Category,
     /// Substring match over the name — the Tags-mode filter, before FTS is wired.
     pub search: String,
-    /// STATUS facet (UI-SPEC §0.2): `all | unidentified | identified | confirmed`.
     /// `discovered` and `indexed` both fold into Unidentified (DATA-MODEL §8).
-    pub status: String,
-    /// `name | type | size | modified | rating` (config::SortBy, minus Relevance — that needs
-    /// BM25 ranks, which arrive with FTS search).
-    pub sort_by: String,
+    pub status: StatusFilter,
+    pub sort_by: SortBy,
     pub sort_asc: bool,
     /// Restrict to starred assets — what the Favorites screen is (FEATURES §4.7). A one-way
     /// switch: "not favourited" is not a thing anyone browses for.
@@ -61,10 +69,10 @@ pub struct GridQuery {
 impl Default for GridQuery {
     fn default() -> Self {
         Self {
-            tab: "all".into(),
+            tab: Category::All,
             search: String::new(),
-            status: "all".into(),
-            sort_by: "name".into(),
+            status: StatusFilter::All,
+            sort_by: SortBy::Name,
             sort_asc: true,
             favorites_only: false,
             page: 0,
@@ -185,6 +193,11 @@ struct Row {
     source: Option<String>,
     /// Set only for in-pack rows, so `lodestash://thumb` can pull the one payload it needs.
     locator: Option<InPackLocator>,
+    /// The catalog strings parsed once at hydrate, so filtering and sorting run over the shared
+    /// enums instead of re-matching a string per row per keystroke. `media_type` is `None` for a
+    /// code this build does not know (schema drift), which sorts last and matches no tab but All.
+    media_type: Option<MediaType>,
+    status: AssetStatus,
 }
 
 impl Library {
@@ -384,8 +397,8 @@ impl Library {
         let mut matched: Vec<&Row> = self
             .rows
             .iter()
-            .filter(|r| tab_matches(&q.tab, &r.item.media_type))
-            .filter(|r| status_matches(&q.status, &r.item.status))
+            .filter(|r| q.tab.matches(r.media_type))
+            .filter(|r| q.status.matches(r.status))
             .filter(|r| !q.favorites_only || r.item.favorite)
             .filter(|r| needle.is_empty() || r.search_key.contains(&needle))
             .collect();
@@ -394,36 +407,44 @@ impl Library {
         // equal values (thousands of assets share a rating, or have none). Name is sorted
         // explicitly rather than leaning on load order: relying on `reload` having sorted
         // `rows` makes the result depend on how the Library was built, not on the query.
-        match q.sort_by.as_str() {
-            "name" => matched.sort_by(|a, b| a.search_key.cmp(&b.search_key)),
-            "size" => matched.sort_by(|a, b| {
-                a.item
-                    .size_bytes
-                    .cmp(&b.item.size_bytes)
-                    .then_with(|| a.search_key.cmp(&b.search_key))
-            }),
-            "modified" => matched.sort_by(|a, b| {
-                a.mtime
-                    .cmp(&b.mtime)
-                    .then_with(|| a.search_key.cmp(&b.search_key))
-            }),
-            "rating" => matched.sort_by(|a, b| {
-                a.item
-                    .rating
-                    .unwrap_or(0)
-                    .cmp(&b.item.rating.unwrap_or(0))
-                    .then_with(|| a.search_key.cmp(&b.search_key))
-            }),
-            "type" => matched.sort_by(|a, b| {
-                a.item
-                    .media_type
-                    .cmp(&b.item.media_type)
-                    .then_with(|| a.search_key.cmp(&b.search_key))
-            }),
-            _ => {}
+        //
+        // Direction goes through `grid::dir` on the comparator rather than reversing the sorted
+        // vector, which is the rule the egui grid applies. That swap is only safe because the
+        // comparator below is a **total** order: reversing a stable sort keeps rows that compare
+        // fully equal in load order *in both directions*, so without a unique final key a
+        // descending page is not the reverse of the ascending one, and page boundaries can repeat
+        // or drop the duplicates. `asset_id` is that key — this library really does hold assets
+        // with the same name and the same size.
+        fn key(r: &Row) -> (&str, i64) {
+            (r.search_key.as_str(), r.item.asset_id)
         }
-        if !q.sort_asc {
-            matched.reverse();
+        let by = |o: std::cmp::Ordering, a: &Row, b: &Row| {
+            grid::dir(o.then_with(|| key(a).cmp(&key(b))), q.sort_asc)
+        };
+        match q.sort_by {
+            // Relevance needs BM25 ranks, which arrive with FTS search (T4). Name until then.
+            SortBy::Name | SortBy::Relevance => {
+                matched.sort_by(|a, b| by(std::cmp::Ordering::Equal, a, b))
+            }
+            SortBy::Size => {
+                matched.sort_by(|a, b| by(a.item.size_bytes.cmp(&b.item.size_bytes), a, b))
+            }
+            SortBy::Modified => matched.sort_by(|a, b| by(a.mtime.cmp(&b.mtime), a, b)),
+            SortBy::Rating => matched.sort_by(|a, b| {
+                by(
+                    a.item.rating.unwrap_or(0).cmp(&b.item.rating.unwrap_or(0)),
+                    a,
+                    b,
+                )
+            }),
+            // Enum order, not alphabetical on the code string — `grid::media_key` owns that rule.
+            SortBy::Type => matched.sort_by(|a, b| {
+                by(
+                    grid::media_key(a.media_type).cmp(&grid::media_key(b.media_type)),
+                    a,
+                    b,
+                )
+            }),
         }
 
         let page_size = q.page_size.max(1);
@@ -547,6 +568,10 @@ fn row_from(
         .unwrap_or_else(|| e.rel_path.clone());
     Row {
         search_key: name.to_lowercase(),
+        media_type: MediaType::from_code(&e.media_type),
+        // An unparseable status is treated as the earliest lifecycle state rather than dropped:
+        // the asset is real and browsable, it just has not been identified as far as we can tell.
+        status: AssetStatus::from_code(&e.status).unwrap_or(AssetStatus::Discovered),
         mtime: e.mtime,
         width_px: e.metrics.width_px,
         height_px: e.metrics.height_px,
@@ -571,30 +596,6 @@ fn row_from(
     }
 }
 
-/// STATUS facet matching. `discovered` and `indexed` are both "Unidentified" to the user —
-/// the lifecycle has four states but the UI names two (DATA-MODEL §8).
-fn status_matches(filter: &str, status: &str) -> bool {
-    match filter {
-        "unidentified" => matches!(status, "discovered" | "indexed"),
-        "identified" => status == "identified",
-        "confirmed" => status == "confirmed",
-        _ => true,
-    }
-}
-
-/// Tab -> `media_type` mapping (FEATURES §0.2). A presentation grouping over the 7-value enum,
-/// which is unchanged.
-fn tab_matches(tab: &str, media_type: &str) -> bool {
-    match tab {
-        "models" => media_type == "model_3d",
-        "materials" => media_type == "material",
-        "sounds" => media_type == "audio",
-        "images" => matches!(media_type, "image" | "texture" | "sprite" | "font"),
-        // "all", and anything unrecognised, imposes no constraint.
-        _ => true,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,6 +605,8 @@ mod tests {
             .iter()
             .map(|(n, mt)| Row {
                 search_key: n.to_lowercase(),
+                media_type: MediaType::from_code(mt),
+                status: AssetStatus::Indexed,
                 mtime: 0,
                 width_px: None,
                 height_px: None,
@@ -636,22 +639,53 @@ mod tests {
         }
     }
 
+    /// The bucket rule itself lives in `lodestash_app::types` and is tested there. What this
+    /// asserts is the *wiring*: that a query's tab reaches that rule, over rows whose
+    /// `media_type` came out of the catalog as a string. A parse that silently yields `None`
+    /// would empty every tab but All while the grid still looks populated.
     #[test]
-    fn tab_buckets_cover_the_media_type_enum() {
-        for mt in [
-            "model_3d", "material", "audio", "image", "texture", "sprite", "font",
-        ] {
-            assert!(tab_matches("all", mt), "{mt} must pass All");
-        }
-        assert!(tab_matches("models", "model_3d"));
-        assert!(
-            !tab_matches("models", "material"),
-            "materials are their own tab"
+    fn the_tab_facet_filters_through_the_shared_bucket_rule() {
+        let l = lib(&[
+            ("m", "model_3d"),
+            ("t", "material"),
+            ("s", "audio"),
+            ("i", "image"),
+            ("f", "font"),
+        ]);
+        let on = |tab| {
+            l.page(&GridQuery {
+                tab,
+                ..Default::default()
+            })
+            .total
+        };
+        assert_eq!(on(Category::All), 5);
+        assert_eq!(on(Category::Models), 1);
+        assert_eq!(on(Category::Materials), 1, "materials are their own tab");
+        assert_eq!(on(Category::Sounds), 1);
+        assert_eq!(on(Category::Images), 2, "image + font");
+    }
+
+    /// Sort by Type follows the `media_type` enum order, not the alphabet. Sorting the code
+    /// strings instead puts `audio` before `model_3d`, so the two frontends disagree on the
+    /// same query — the drift `grid::media_key` exists to prevent.
+    #[test]
+    fn type_sort_follows_enum_order_not_alphabetical() {
+        let l = lib(&[("a", "audio"), ("m", "model_3d"), ("t", "texture")]);
+        let names: Vec<String> = l
+            .page(&GridQuery {
+                sort_by: SortBy::Type,
+                ..Default::default()
+            })
+            .items
+            .iter()
+            .map(|i| i.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            ["m", "t", "a"],
+            "model_3d, texture, audio — declaration order"
         );
-        for mt in ["image", "texture", "sprite", "font"] {
-            assert!(tab_matches("images", mt), "{mt} belongs to Images");
-        }
-        assert!(!tab_matches("sounds", "image"));
     }
 
     /// Descending must reverse the *whole* comparison, ties included. Reversing a stably-sorted
@@ -662,7 +696,7 @@ mod tests {
     fn sorting_is_total_and_descending_is_the_exact_reverse() {
         let l = lib(&[("b", "model_3d"), ("a", "model_3d"), ("c", "model_3d")]);
         let q = |asc| GridQuery {
-            sort_by: "name".into(),
+            sort_by: SortBy::Name,
             sort_asc: asc,
             ..Default::default()
         };
@@ -686,6 +720,33 @@ mod tests {
         );
     }
 
+    /// Rows that compare **fully** equal — same name, same key — still need a deterministic
+    /// order, or descending is not the reverse of ascending and a page boundary can show the
+    /// same asset twice. A stable sort preserves load order in both directions, so the
+    /// comparator ends in `asset_id`. Caught in e2e first: this library has duplicate names.
+    #[test]
+    fn rows_that_tie_on_every_key_still_reverse_cleanly() {
+        let mut l = lib(&[("dup", "model_3d"), ("dup", "model_3d"), ("dup", "model_3d")]);
+        for (i, r) in l.rows.iter_mut().enumerate() {
+            r.item.asset_id = i as i64 + 1;
+            r.item.size_bytes = 100;
+        }
+        let ids = |asc| -> Vec<i64> {
+            l.page(&GridQuery {
+                sort_by: SortBy::Size,
+                sort_asc: asc,
+                ..Default::default()
+            })
+            .items
+            .iter()
+            .map(|i| i.asset_id)
+            .collect()
+        };
+        let mut down = ids(false);
+        down.reverse();
+        assert_eq!(ids(true), down, "identical rows must still order totally");
+    }
+
     #[test]
     fn size_sort_breaks_ties_by_name_so_paging_is_stable() {
         let mut l = lib(&[("z", "model_3d"), ("a", "model_3d"), ("m", "model_3d")]);
@@ -694,7 +755,7 @@ mod tests {
         }
         let names: Vec<String> = l
             .page(&GridQuery {
-                sort_by: "size".into(),
+                sort_by: SortBy::Size,
                 ..Default::default()
             })
             .items
@@ -708,20 +769,48 @@ mod tests {
         );
     }
 
-    /// The lifecycle has four states but the UI names two: `discovered` and `indexed` are both
-    /// "Unidentified" (DATA-MODEL §8). Getting this wrong hides the entire backlog the Identify
-    /// screen exists to work through.
+    /// Wiring again: the fold itself is tested in `lodestash_app::types`. This asserts the
+    /// catalog's status *string* reaches it — the four states arrive as text and are parsed once
+    /// at hydrate, so a parse failure would silently file every asset under Unidentified.
     #[test]
-    fn unidentified_folds_discovered_and_indexed() {
-        assert!(status_matches("unidentified", "discovered"));
-        assert!(status_matches("unidentified", "indexed"));
-        assert!(!status_matches("unidentified", "identified"));
-        assert!(!status_matches("unidentified", "confirmed"));
-        assert!(status_matches("identified", "identified"));
-        assert!(status_matches("confirmed", "confirmed"));
-        for s in ["discovered", "indexed", "identified", "confirmed"] {
-            assert!(status_matches("all", s), "{s} must pass All");
-        }
+    fn the_status_facet_filters_through_the_shared_fold() {
+        let mut l = lib(&[("a", "model_3d"), ("b", "model_3d"), ("c", "model_3d")]);
+        l.rows[0].status = AssetStatus::Discovered;
+        l.rows[1].status = AssetStatus::Identified;
+        l.rows[2].status = AssetStatus::Confirmed;
+        let on = |status| {
+            l.page(&GridQuery {
+                status,
+                ..Default::default()
+            })
+            .total
+        };
+        assert_eq!(on(StatusFilter::All), 3);
+        assert_eq!(on(StatusFilter::Unidentified), 1);
+        assert_eq!(on(StatusFilter::Identified), 1);
+        assert_eq!(on(StatusFilter::Confirmed), 1);
+    }
+
+    /// A row hydrated from the catalog carries parsed enums, not just the JSON strings — the
+    /// step both facet tests above depend on and neither exercises directly.
+    #[test]
+    fn hydrating_a_row_parses_its_media_type_and_status() {
+        let e = lodestash_core::catalog::HydratedAsset {
+            rel_path: "Assets/Rock.fbx".into(),
+            asset_id: 7,
+            media_type: "model_3d".into(),
+            size_bytes: 10,
+            mtime: 0,
+            status: "identified".into(),
+            trashed: false,
+            rating: None,
+            metrics: Default::default(),
+            content_hash: None,
+        };
+        let row = row_from(e, "Synty", None);
+        assert_eq!(row.media_type, Some(MediaType::Model3d));
+        assert_eq!(row.status, AssetStatus::Identified);
+        assert_eq!(row.item.media_type, "model_3d", "the JSON keeps the code");
     }
 
     /// Favorites is a *filter over the library*, not a separate screen with its own data. The
@@ -754,7 +843,7 @@ mod tests {
         }
         let q = GridQuery {
             favorites_only: true,
-            tab: "models".into(),
+            tab: Category::Models,
             ..Default::default()
         };
         assert_eq!(

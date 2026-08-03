@@ -115,7 +115,14 @@ export const thumbUrl = (assetId: number) => `${LODESTASH_BASE}/thumb/${assetId}
 /** Decimated geometry as LSM1, for the WebGL viewer. */
 export const meshUrl = (assetId: number) => `${LODESTASH_BASE}/mesh/${assetId}`;
 
-/** `media_type.code` -> the CSS custom property naming its colour (DESIGN-GUIDELINES §2). */
+/**
+ * `media_type.code` -> the CSS custom property naming its colour (DESIGN-GUIDELINES §2).
+ *
+ * Deliberately not shared with `lodestash_app::types::Category::token`: that maps the five
+ * *tabs*, this maps the seven *media types*, and the tokens themselves live in
+ * `docs/design/tokens.css`, which the webview reads directly. Sending a CSS variable name per
+ * card over IPC to avoid a switch statement would be the more coupled design, not the less.
+ */
 export function typeToken(mediaType: string): string {
   switch (mediaType) {
     case "model_3d":
@@ -151,9 +158,17 @@ export function typeIcon(mediaType: string): string {
   }
 }
 
-/** `mm:ss` from milliseconds, matching the egui transport readout. */
+/**
+ * `mm:ss` from milliseconds.
+ *
+ * Truncates, matching `lodestash_app::audio::fmt_time` — which is the reference, not a
+ * coincidence: both frontends show the same asset's duration and a 9.7 s clip reading `0:09` in
+ * one and `0:10` in the other is a bug report nobody can reproduce. Formatting stays in the view
+ * layer (an IPC round-trip to format two numbers is not a deduplication), so the rule lives in two
+ * places on purpose and this comment is the link between them.
+ */
 export function fmtDuration(ms: number): string {
-  const s = Math.max(0, Math.round(ms / 1000));
+  const s = Math.max(0, Math.floor(ms / 1000));
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 

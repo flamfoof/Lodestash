@@ -23,7 +23,15 @@ pub fn name_key<T>(e: &AssetEntry<T>) -> String {
 }
 
 pub fn type_key<T>(e: &AssetEntry<T>) -> u8 {
-    e.file.media_type.map(|m| m as u8).unwrap_or(255)
+    media_key(e.file.media_type)
+}
+
+/// Sort-by-Type ordering: **enum declaration order**, unclassified last.
+///
+/// Not alphabetical on the code string — that would put `audio` before `model_3d` and give the
+/// two frontends different grids for the same query. This is the one home for that rule.
+pub fn media_key(mt: Option<MediaType>) -> u8 {
+    mt.map(|m| m as u8).unwrap_or(255)
 }
 
 /// Apply the sort direction. Every arm of [`sort_indices`] ends in this.

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use lodestash_core::catalog::{CrawlRecord, HydratedAsset, PackageEntryRecord, StatusCounts};
 use lodestash_core::types::{AssetStatus, MediaType};
 use lodestash_ingest::crawler::CrawledFile;
+use serde::{Deserialize, Serialize};
 
 use crate::config::{SizeTier, SizeTiers};
 use crate::jobs::JobProgress;
@@ -18,8 +19,14 @@ use crate::jobs::JobProgress;
 /// The top-bar category tabs (UI-SPEC §0.3, prototype `catDefs`): four coarse buckets
 /// grouping the 7-value `media_type` enum. The enum itself is unchanged (a data-model
 /// invariant) — these are a presentation grouping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The serde names **are** the tab ids the frontends use (`all`, `models`, …), so a query
+/// arriving as JSON deserializes straight into this type rather than being re-matched against
+/// string literals on the other side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Category {
+    #[default]
     All,
     Models,
     Materials,
@@ -764,8 +771,10 @@ pub enum SearchMode {
 }
 
 /// STATUS facet single-select (UI-SPEC §0.2). Maps to `status` (DATA-MODEL §8);
-/// `discovered|indexed` fold into Unidentified.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// `discovered|indexed` fold into Unidentified. Serde names are the facet ids the frontends
+/// send, as with [`Category`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StatusFilter {
     #[default]
     All,
@@ -782,6 +791,93 @@ impl StatusFilter {
             StatusFilter::Unidentified => status.is_unidentified(),
             StatusFilter::Identified => status == AssetStatus::Identified,
             StatusFilter::Confirmed => status == AssetStatus::Confirmed,
+        }
+    }
+}
+
+#[cfg(test)]
+mod facet_tests {
+    use super::*;
+
+    /// Every `media_type` reaches a tab. A type that falls through every arm is invisible in the
+    /// grid unless the user is on All — which reads as a missing asset, not a missing tab.
+    #[test]
+    fn tab_buckets_cover_the_media_type_enum() {
+        for mt in [
+            MediaType::Model3d,
+            MediaType::Material,
+            MediaType::Audio,
+            MediaType::Image,
+            MediaType::Texture,
+            MediaType::Sprite,
+            MediaType::Font,
+        ] {
+            assert!(Category::All.matches(Some(mt)), "{mt:?} must pass All");
+            let bucketed = Category::TABS
+                .iter()
+                .filter(|(c, _)| *c != Category::All)
+                .any(|(c, _)| c.matches(Some(mt)));
+            assert!(bucketed, "{mt:?} belongs to no tab");
+        }
+        assert!(Category::Models.matches(Some(MediaType::Model3d)));
+        assert!(
+            !Category::Models.matches(Some(MediaType::Material)),
+            "materials are their own tab, not part of Models"
+        );
+        for mt in [
+            MediaType::Image,
+            MediaType::Texture,
+            MediaType::Sprite,
+            MediaType::Font,
+        ] {
+            assert!(Category::Images.matches(Some(mt)), "{mt:?} is an Image");
+        }
+        assert!(!Category::Sounds.matches(Some(MediaType::Image)));
+        // Unclassified: only All takes it, so it stays browsable without polluting a bucket.
+        assert!(Category::All.matches(None));
+        assert!(!Category::Models.matches(None));
+    }
+
+    /// The lifecycle has four states but the UI names two: `discovered` and `indexed` are both
+    /// "Unidentified" (DATA-MODEL §8). Getting this wrong hides the entire backlog the Identify
+    /// screen exists to work through.
+    #[test]
+    fn unidentified_folds_discovered_and_indexed() {
+        use AssetStatus::*;
+        assert!(StatusFilter::Unidentified.matches(Discovered));
+        assert!(StatusFilter::Unidentified.matches(Indexed));
+        assert!(!StatusFilter::Unidentified.matches(Identified));
+        assert!(!StatusFilter::Unidentified.matches(Confirmed));
+        assert!(StatusFilter::Identified.matches(Identified));
+        assert!(StatusFilter::Confirmed.matches(Confirmed));
+        for s in [Discovered, Indexed, Identified, Confirmed] {
+            assert!(StatusFilter::All.matches(s), "{s:?} must pass All");
+        }
+    }
+
+    /// The serde names are a **wire contract**: the Svelte toolbar sends these ids and the query
+    /// deserializes straight into these enums. Renaming a variant silently breaks the facet, so
+    /// the ids are pinned here rather than left to the derive.
+    #[test]
+    fn facet_ids_are_the_strings_the_frontends_send() {
+        for (c, expect) in [
+            (Category::All, "\"all\""),
+            (Category::Models, "\"models\""),
+            (Category::Materials, "\"materials\""),
+            (Category::Sounds, "\"sounds\""),
+            (Category::Images, "\"images\""),
+        ] {
+            assert_eq!(serde_json::to_string(&c).unwrap(), expect);
+            assert_eq!(serde_json::from_str::<Category>(expect).unwrap(), c);
+        }
+        for (s, expect) in [
+            (StatusFilter::All, "\"all\""),
+            (StatusFilter::Unidentified, "\"unidentified\""),
+            (StatusFilter::Identified, "\"identified\""),
+            (StatusFilter::Confirmed, "\"confirmed\""),
+        ] {
+            assert_eq!(serde_json::to_string(&s).unwrap(), expect);
+            assert_eq!(serde_json::from_str::<StatusFilter>(expect).unwrap(), s);
         }
     }
 }
