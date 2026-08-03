@@ -6,9 +6,11 @@
 //!
 //! Two properties are structural rather than conventional:
 //!
-//! - **Read-only by construction.** No handler extracts, pulls or writes. An asset whose bytes
-//!   live inside an unextracted `.unitypackage` returns `503 not_local` and the pull is a
-//!   command, so the non-destructive invariant cannot be violated from a URL.
+//! - **Non-destructive by construction.** No handler ever writes to an asset, a pack, or anything
+//!   outside our own cache. `file` and `mesh` serve whole assets and never extract: bytes inside an
+//!   unextracted `.unitypackage` return `503 not_local`, and pulling them is a command. `thumb` is
+//!   the one deliberate exception — it may pull a single payload into the thumbnail cache, under a
+//!   size cap, because a grid of 5,963 typed placeholders is not a library (see [`in_pack_scratch`]).
 //! - **Range-capable.** `lodestash://file` honours `Range`, returning `206` with only the requested
 //!   window. A multi-GB audio file is never read into memory to be scrubbed.
 
@@ -105,23 +107,28 @@ fn thumb(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
     let (Some(job), Some(cache)) = (job, cache_dir) else {
         return status(StatusCode::NOT_FOUND, "unknown asset");
     };
-    if job.in_pack {
-        // Same contract as the other routes: real asset, bytes not local, never extract on a GET.
-        return status(StatusCode::SERVICE_UNAVAILABLE, "not_local");
-    }
-    let Some(path) = job.path.filter(|p| p.exists()) else {
-        return status(StatusCode::NOT_FOUND, "file missing");
-    };
-
     // Models are served by the vector-preview pipeline, not here: a raster model thumbnail costs a
     // full mesh parse, and a grid page would trigger a hundred of them. Refusing at the route
-    // means a hand-written URL cannot cause the stampede either.
+    // means a hand-written URL cannot cause the stampede either. Checked before the in-pack pull
+    // below so a model never pays for a gzip scan we are about to refuse anyway.
     if job.media_type == "model_3d" {
         return status(
             StatusCode::NOT_FOUND,
             "models use lodestash://preview, not lodestash://thumb",
         );
     }
+
+    let path = match job.path.clone().filter(|p| p.exists()) {
+        Some(p) => p,
+        None => match in_pack_scratch(&job, &cache) {
+            Some(p) => p,
+            // A known in-pack asset over the size cap, or one whose pull failed. Not "missing".
+            None if job.in_pack.is_some() => {
+                return status(StatusCode::SERVICE_UNAVAILABLE, "not_local")
+            }
+            None => return status(StatusCode::NOT_FOUND, "file missing"),
+        },
+    };
 
     let params = lodestash_ingest::thumb::ThumbParams::default();
     let key = lodestash_ingest::thumb::meta_key(
@@ -159,6 +166,40 @@ fn thumb(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
             )
         }
     }
+}
+
+/// Materialize an in-pack payload into the thumbnail cache so the generator can decode it.
+///
+/// **This is the one place a GET writes anything**, and the exception is narrow by construction:
+/// it writes only into our own cache directory, and only the bytes of the one asset being drawn.
+/// The `.unitypackage` and the asset's own bytes are untouched, so the non-destructive invariant
+/// holds; what it costs is CPU, not correctness. `lodestash://file` and `lodestash://mesh` still
+/// never pull — those serve whole assets, where the honest answer to "not local" is to extract
+/// the pack.
+///
+/// **Gated on archive size.** `.unitypackage` is gzip, which has no random access: pulling one
+/// payload inflates the archive from byte zero to that payload's offset. On the real 21.9 GB
+/// music pack a single page of cards re-inflated gigabytes each and pegged the CPU. Above
+/// [`IN_PACK_THUMB_MAX_BYTES`] the card keeps its type placeholder until the pack is extracted,
+/// which is the fast random-access path anyway.
+///
+/// ponytail: O(page) independent pulls under the cap; batching a page into one sorted
+/// `extract_at_offsets` skip-scan is what lifts it.
+fn in_pack_scratch(job: &crate::library::ThumbJob, cache: &Path) -> Option<std::path::PathBuf> {
+    let loc = job.in_pack.as_ref()?;
+    let archive = std::fs::metadata(&loc.pack_path).ok()?.len();
+    if archive > lodestash_app::thumbs::IN_PACK_THUMB_MAX_BYTES {
+        tracing::debug!(pack = %loc.pack_path, archive, "pack over the thumbnail pull cap");
+        return None;
+    }
+    lodestash_app::thumbs::ensure_in_pack_scratch(
+        Some(cache),
+        &loc.pack_path,
+        loc.offset,
+        loc.size,
+        &loc.ext,
+    )
+    .map(|(p, _)| p)
 }
 
 /// `lodestash://mesh/{asset_id}` — decimated geometry as `LSM1`, for the WebGL viewer.

@@ -432,6 +432,63 @@ try {
     assert.equal(status, 404, "a model must not be raster-thumbnailed on demand");
   });
 
+  // The one route that may write: an in-pack image is pulled to the thumbnail cache rather than
+  // left as a typed placeholder. Two outcomes are legitimate and nothing else is — a decodable PNG
+  // (pack under the size cap) or 503 not_local (pack over it). A 404 would mean the route lost the
+  // asset; a 500 would mean the pull half-succeeded and served a truncated file.
+  await check("in-pack image thumbnails are pulled, or refused over the size cap", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "images", search: "", status: "all", sort_by: "size", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    const packed = p.items.filter((i) => i.in_pack).slice(0, 6);
+    assert.ok(packed.length > 0, "no in-pack images loaded — nothing was exercised");
+    const seen = [];
+    for (const a of packed) {
+      const r = await page.evaluate(async (id) => {
+        const res = await fetch(`http://lodestash.localhost/thumb/${id}.png`);
+        if (res.status !== 200) return { status: res.status, body: await res.text() };
+        const buf = new Uint8Array(await res.arrayBuffer());
+        const png = buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
+        const decoded = await new Promise((ok) => {
+          const i = new Image();
+          i.onload = () => ok(i.naturalWidth);
+          i.onerror = () => ok(0);
+          i.src = `http://lodestash.localhost/thumb/${id}.png`;
+          setTimeout(() => ok(0), 15000);
+        });
+        return { status: res.status, png, decoded };
+      }, a.asset_id);
+      if (r.status === 200) {
+        assert.ok(r.png, `${a.name}: 200 but not a PNG`);
+        assert.ok(r.decoded > 0, `${a.name}: PNG served but the browser could not decode it`);
+      } else {
+        assert.equal(r.status, 503, `${a.name}: expected 200 or 503, got ${r.status}`);
+        assert.match(r.body, /not_local/);
+      }
+      seen.push(r.status);
+    }
+    console.log(`       ${seen.filter((s) => s === 200).length}/${seen.length} pulled, rest over cap`);
+    assert.ok(seen.includes(200), "every sampled pack was over the cap — no pull was exercised");
+  });
+
+  // The pull must not resurrect the model stampede: a model is refused before any gzip scan,
+  // in-pack or not. If this ever answers 200, a grid page of in-pack models re-inflates the
+  // archive once per card *and* parses a mesh each time.
+  await check("an in-pack model is refused before any pull", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "models", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    const model = p.items.find((i) => i.in_pack);
+    assert.ok(model, "no in-pack model loaded");
+    const status = await page.evaluate(async (id) => {
+      const res = await fetch(`http://lodestash.localhost/thumb/${id}.png`);
+      return res.status;
+    }, model.asset_id);
+    assert.equal(status, 404, "an in-pack model must be refused, not pulled");
+  });
+
   await check("lodestash:// serves a preview as SVG", async () => {
     // Ask for an asset that actually has a preview rather than whatever is on screen — which
     // page 1 shows depends on the sort, and most of this library is in-pack with no preview.

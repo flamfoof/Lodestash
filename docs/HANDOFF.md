@@ -55,12 +55,15 @@ copies (see T5) — check `lodestash-app` and `lodestash-core` first.
 *through a separate call*, not from the response — a write that returns success while persisting
 nothing is the failure mode, and it is invisible otherwise.
 
-**Open decision, deliberately not made:** in-pack thumbnails need `lodestash://thumb` to pull a
-payload into a scratch file via `thumbs::ensure_in_pack_scratch` (the egui build does this under
-`IN_PACK_THUMB_MAX_BYTES`). That relaxes "the protocol never pulls", which is a stated contract in
-`protocol.rs`. Three options were put to the user and none chosen yet: relax it for `thumb` alone,
-keep the handler pure, or add an explicit `warm_thumbnails` command with job-tray progress. Worth
-5,963 assets gaining a picture; ask before choosing.
+**Settled 2026-08-03: `lodestash://thumb` may pull, nothing else may.** Of the three options (relax
+`thumb` alone / keep the handler pure / an explicit `warm_thumbnails` command with job-tray
+progress) the first shipped, gated on `IN_PACK_THUMB_MAX_BYTES` exactly as the egui build is. An
+in-pack card now pulls its one payload into the thumbnail cache (`thumbs::ensure_in_pack_scratch`)
+instead of showing a typed placeholder; over the cap it still answers 503 `not_local`. The contract
+narrowed rather than dissolved — `file` and `mesh` serve whole assets and never extract, and the
+write lands only in our own cache, so non-destructive holds. **`warm_thumbnails` is still the better
+end state** (user-visible, cancellable, batchable into one skip-scan); it wants the job tray, which
+the Svelte side does not have yet.
 
 ## 2. Where the build is
 

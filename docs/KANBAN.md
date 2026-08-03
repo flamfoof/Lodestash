@@ -235,9 +235,15 @@ until B7.
       — the rest are in-pack and answer 503 by design. Models are refused by the route: a raster
       model thumbnail costs a full mesh parse, so a grid page would trigger a hundred of them; they
       use the vector-preview pipeline instead.
-      **Follow-up:** in-pack thumbnails are possible via `thumbs::ensure_in_pack_scratch` (the egui
-      build does exactly this, capped at `IN_PACK_THUMB_MAX_BYTES`), but it needs the pack locator
-      carried on each row and it relaxes "the protocol never pulls" — worth its own decision.
+- [x] **T1b — in-pack thumbnails.** *Shipped 2026-08-03, the decision T1 deferred.* Each in-pack row
+      now carries its `InPackLocator` (pack path + offset + size + ext) from the hydrate, and
+      `lodestash://thumb` pulls that one payload through `thumbs::ensure_in_pack_scratch` when the
+      archive is under `IN_PACK_THUMB_MAX_BYTES` (256 MB), 503 `not_local` above it. Models are
+      refused **before** the pull, so an in-pack model costs neither a gzip scan nor a mesh parse.
+      This is the only route that writes, and only into our own thumbnail cache — see the
+      `protocol.rs` module doc. **ponytail:** O(page) independent pulls under the cap; batching a
+      page into one sorted `extract_at_offsets` skip-scan is what lifts the cap, and belongs with a
+      `warm_thumbnails` command once the Svelte job tray exists.
 - [x] **T2 — drain the vector-preview backlog.** *Shipped 2026-08-03.* `PREVIEW_BACKFILL_BUDGET`
       20s -> 90s. At 20s a 3,400-model library needed dozens of launches to converge, so in
       practice it never did. Still a fixed slice, not adaptive: if it ever competes with a scan,

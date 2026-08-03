@@ -21,7 +21,11 @@
   // Raster thumbnails are for assets that *have* pixels. A `model_3d` thumbnail costs a full FBX
   // parse per card — 100 of those is why the grid must not ask for one; models get the cheap
   // vector preview from the drain instead, and show their type mark until it arrives.
-  let canRaster = $derived(item.media_type !== "model_3d" && !item.in_pack && !thumbFailed);
+  //
+  // In-pack assets *are* asked for: the route pulls the one payload into the thumbnail cache when
+  // the archive is small enough, and answers 503 when it is not — which `thumbFailed` turns into
+  // the type mark with no second request.
+  let canRaster = $derived(item.media_type !== "model_3d" && !thumbFailed);
   let src = $derived(
     item.has_preview ? previewUrl(item.asset_id) : canRaster ? thumbUrl(item.asset_id) : null,
   );

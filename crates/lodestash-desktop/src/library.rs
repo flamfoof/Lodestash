@@ -73,13 +73,27 @@ impl Default for GridQuery {
     }
 }
 
+/// Where one in-pack payload lives inside its `.unitypackage` — everything
+/// `thumbs::ensure_in_pack_scratch` needs to pull it without going back to the catalog.
+#[derive(Debug, Clone)]
+pub struct InPackLocator {
+    pub pack_path: String,
+    pub offset: i64,
+    pub size: i64,
+    /// The asset's own extension, so the pulled scratch file decodes as what it is rather than
+    /// as the archive it came out of.
+    pub ext: String,
+}
+
 /// What the thumbnail handler needs, lifted out of the `Library` lock in one go.
 pub struct ThumbJob {
     pub path: Option<PathBuf>,
     pub media_type: String,
     /// Only set for materials: the texture its shader ball wears.
     pub albedo: Option<PathBuf>,
-    pub in_pack: bool,
+    /// `Some` when the bytes are still inside a pack — the handler decides whether pulling them
+    /// is worth it (see `protocol::in_pack_scratch`).
+    pub in_pack: Option<InPackLocator>,
 }
 
 /// Everything the Inspector shows for one asset (UI-SPEC §13). Separate from `GridItem` so a
@@ -169,6 +183,8 @@ struct Row {
     height_px: Option<i64>,
     duration_ms: Option<i64>,
     source: Option<String>,
+    /// Set only for in-pack rows, so `lodestash://thumb` can pull the one payload it needs.
+    locator: Option<InPackLocator>,
 }
 
 impl Library {
@@ -257,7 +273,19 @@ impl Library {
                         }
                         // No local path: `lodestash://file` resolves nothing and answers 503 not_local,
                         // which is the correct read-only behaviour — extraction is a command.
-                        rows.push(row_from(e.asset, &info.name, Some(e.package_name)));
+                        let ext = Path::new(&e.asset.rel_path)
+                            .extension()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let mut row = row_from(e.asset, &info.name, Some(e.package_name));
+                        // Carried per row so a thumbnail pull costs no catalog round-trip.
+                        row.locator = Some(InPackLocator {
+                            pack_path: e.pack_path,
+                            offset: e.tar_offset,
+                            size: e.size,
+                            ext,
+                        });
+                        rows.push(row);
                     }
                 }
                 Err(e) => {
@@ -475,7 +503,7 @@ impl Library {
             albedo: (row.item.media_type == "material")
                 .then(|| self.material_texture_path(asset_id))
                 .flatten(),
-            in_pack: row.item.in_pack,
+            in_pack: row.locator.clone(),
         })
     }
 
@@ -524,6 +552,7 @@ fn row_from(
         height_px: e.metrics.height_px,
         duration_ms: e.metrics.duration_ms,
         source: Some(source.to_string()),
+        locator: None,
         item: GridItem {
             asset_id: e.asset_id,
             name,
@@ -580,6 +609,7 @@ mod tests {
                 height_px: None,
                 duration_ms: None,
                 source: None,
+                locator: None,
                 item: GridItem {
                     asset_id: 0,
                     name: (*n).into(),
