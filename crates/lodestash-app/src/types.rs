@@ -471,7 +471,13 @@ pub struct ExtractDone {
 }
 
 /// Triangle-count bucket for the Triangles facet (models only). Design §3 "TRIANGLES".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// The serde names are the **wire ids** the Svelte popover sends back — see the note on
+/// [`ContentFilter`].
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum TriBucket {
     Le1k,
     K1to3,
@@ -512,7 +518,14 @@ impl TriBucket {
 /// Trait and Triangle data don't exist in the pre-catalog build yet (traits arrive with P4 AI
 /// tagging, tri counts with P1 3D metadata), so those sets are currently always empty and the
 /// predicate below degenerates to the File-size filter — which is fully backed by `size_bytes`.
-#[derive(Default)]
+///
+/// **This is also the wire type.** The Svelte popover posts one of these inside `GridQuery`
+/// rather than three parallel arrays the desktop crate re-assembles: the filter and its
+/// [`Self::passes`] predicate then have exactly one definition, shared by both frontends, and a
+/// facet that means one thing in egui cannot come to mean another in the webview. `#[serde(default)]`
+/// so a frontend that knows about fewer facets than this build still sends a valid filter.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ContentFilter {
     pub traits: std::collections::BTreeSet<String>,
     /// Canonical category paths (mapping library, DATA-MODEL §4) selected in the CATEGORY facet.
@@ -569,7 +582,8 @@ pub enum VocabTab {
 /// The `has_dependencies` / `has_dependents` chips (DATA-MODEL §10). Single-select: an asset that
 /// is both ends of a chain (a material) satisfies either, so combining them would only ever
 /// narrow to that intersection — not what the chips read as.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LinkFilter {
     /// Uses something: a material with textures, a mesh with a material.
     HasDependencies,

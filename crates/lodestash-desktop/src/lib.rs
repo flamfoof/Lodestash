@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use serde::Serialize;
 use tauri::Manager;
 
-use crate::library::{AssetDetail, GridPage, GridQuery, Library, LibraryStatus};
+use crate::library::{AssetDetail, Facets, GridPage, GridQuery, Library, LibraryStatus};
 use crate::writer::{Op, WriteResult, Writer};
 
 #[derive(Serialize)]
@@ -91,6 +91,17 @@ fn grid_page(state: tauri::State<'_, AppState>, query: GridQuery) -> Result<Grid
         .library
         .lock()
         .map(|l| l.page(&query))
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
+/// The chips the ⚑ Filters popover draws (UI-SPEC §2.3). Fetched once per library load, not per
+/// keystroke — it changes only when the catalog does.
+#[tauri::command]
+fn filter_facets(state: tauri::State<'_, AppState>) -> Result<Facets, String> {
+    state
+        .library
+        .lock()
+        .map(|l| l.facets())
         .map_err(|_| "library lock poisoned".to_string())
 }
 
@@ -219,6 +230,7 @@ pub fn run() {
             app_info,
             library_status,
             grid_page,
+            filter_facets,
             asset_detail,
             reload_library,
             set_favorite,

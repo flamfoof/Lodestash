@@ -29,6 +29,34 @@ export type LibraryStatus = {
   trashed: number;
 };
 
+/**
+ * The ⚑ Filters popover's selection (UI-SPEC §2.3), sent as one object because it deserializes
+ * into `lodestash_app::types::ContentFilter` — the same filter the egui build applies, with the
+ * same `passes` predicate. Chips OR within a group and AND across groups.
+ *
+ * The ids are opaque here on purpose: they come from `filter_facets`, which derives them from the
+ * Rust enums' own serde names. Spelling one out in TypeScript is how a chip comes to select
+ * nothing.
+ */
+export type ContentFilter = {
+  traits: string[];
+  tri_buckets: string[];
+  sizes: string[];
+};
+
+export const emptyFilter = (): ContentFilter => ({ traits: [], tri_buckets: [], sizes: [] });
+
+export const filterCount = (f: ContentFilter): number =>
+  f.traits.length + f.tri_buckets.length + f.sizes.length;
+
+/** One selectable chip: `id` goes back in the filter, `label` is what it reads as. */
+export type FacetOption = { id: string; label: string };
+export type Facets = {
+  traits: { name: string; count: number }[];
+  tri_buckets: FacetOption[];
+  sizes: FacetOption[];
+};
+
 export type GridQuery = {
   tab: string;
   search: string;
@@ -38,6 +66,7 @@ export type GridQuery = {
   favorites_only: boolean;
   /** Show the Trash instead of the library — not a facet you combine with the others. */
   trashed_only: boolean;
+  filter: ContentFilter;
   page: number;
   page_size: number;
 };
@@ -111,6 +140,9 @@ export const removeFromLibrary = (assetIds: number[]) =>
 /** **Irreversible.** Confirm before calling — the command does not ask. */
 export const deleteFromDisk = (assetIds: number[]) =>
   invoke<WriteResult>("delete_from_disk", { assetIds });
+
+/** The chips the popover draws. Changes only when the catalog does — fetch per load, not per keystroke. */
+export const filterFacets = () => invoke<Facets>("filter_facets");
 
 export const libraryStatus = () => invoke<LibraryStatus>("library_status");
 export const gridPage = (query: GridQuery) => invoke<GridPage>("grid_page", { query });

@@ -1,4 +1,5 @@
 import type { Route, TabId } from "./routes";
+import { emptyFilter, filterCount, type ContentFilter } from "./api";
 
 /**
  * Frontend-owned view state (plan Phase B, "State ownership"): route, tab, and search
@@ -19,6 +20,9 @@ class ViewState {
   inspectorOpen = $state(true);
   /** Lead selection, as an asset id. Selection is view state: no worker writes it. */
   selected = $state<number | null>(null);
+  /** The ⚑ popover's selection, and whether it is open. Transient — never persisted (design §3). */
+  filter = $state<ContentFilter>(emptyFilter());
+  filtersOpen = $state(false);
   /**
    * Bumped after every catalog write. Screens depend on it, so a mutation re-runs their query.
    *
@@ -31,6 +35,30 @@ class ViewState {
 
   go(route: Route) {
     this.route = route;
+  }
+
+  /** How many chips are on — the gold badge on the ⚑ button. */
+  get filterCount() {
+    return filterCount(this.filter);
+  }
+
+  /**
+   * Toggle one chip in one group.
+   *
+   * Reassigns the whole filter rather than mutating the array in place: `$state` tracks the
+   * property, and a screen deriving its query from `view.filter` would otherwise keep the stale
+   * one and quietly not re-query.
+   */
+  toggleFacet(group: keyof ContentFilter, id: string) {
+    const on = this.filter[group];
+    this.filter = {
+      ...this.filter,
+      [group]: on.includes(id) ? on.filter((x) => x !== id) : [...on, id],
+    };
+  }
+
+  clearFilter() {
+    this.filter = emptyFilter();
   }
 
   /**

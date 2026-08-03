@@ -8,9 +8,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use lodestash_app::config::SortBy;
+use lodestash_app::config::{SizeTier, SizeTiers, SortBy};
 use lodestash_app::grid;
-use lodestash_app::types::{Category, StatusFilter};
+use lodestash_app::types::{Category, ContentFilter, StatusFilter, TriBucket};
 use lodestash_core::catalog::Catalog;
 use lodestash_core::types::{AssetStatus, MediaType};
 use serde::{Deserialize, Serialize};
@@ -64,6 +64,9 @@ pub struct GridQuery {
     /// Show the Trash instead of the library. Not a facet you combine with the others — a
     /// soft-deleted asset is absent from every normal view by definition (DATA-MODEL §8).
     pub trashed_only: bool,
+    /// The ⚑ Filters popover (UI-SPEC §2.3): traits, triangle buckets, size tiers. The **shared**
+    /// type, so `ContentFilter::passes` is the one definition of what passing means.
+    pub filter: ContentFilter,
     pub page: usize,
     pub page_size: usize,
 }
@@ -78,6 +81,7 @@ impl Default for GridQuery {
             sort_asc: true,
             favorites_only: false,
             trashed_only: false,
+            filter: ContentFilter::default(),
             page: 0,
             page_size: 100,
         }
@@ -172,6 +176,34 @@ pub struct LibraryStatus {
     pub trashed: usize,
 }
 
+/// What the ⚑ Filters popover needs to draw itself (UI-SPEC §2.3).
+///
+/// Sent from Rust rather than hardcoded in TypeScript because every id and label here is a wire
+/// contract with `ContentFilter`: a bucket the frontend spells differently is a filter that
+/// silently matches nothing, and the size ranges are user-editable (§11.4), so a TS copy would be
+/// wrong for anyone who has touched them.
+#[derive(Debug, Clone, Serialize)]
+pub struct Facets {
+    /// Traits present in the live library, most-used first, with the count that carries each.
+    pub traits: Vec<TraitCount>,
+    pub tri_buckets: Vec<FacetOption>,
+    /// Size tiers, labelled with their resolved KB range so `L` reads as a size, not a letter.
+    pub sizes: Vec<FacetOption>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TraitCount {
+    pub name: String,
+    pub count: usize,
+}
+
+/// One selectable chip: the id goes back in the `ContentFilter`, the label is what it reads as.
+#[derive(Debug, Clone, Serialize)]
+pub struct FacetOption {
+    pub id: String,
+    pub label: String,
+}
+
 /// Everything the shell holds about the open catalog.
 pub struct Library {
     catalog: Option<Catalog>,
@@ -187,6 +219,9 @@ pub struct Library {
     rows: Vec<Row>,
     /// asset_id -> absolute path on disk, for `lodestash://file`.
     paths: HashMap<i64, PathBuf>,
+    /// The user's S/M/L/XL boundaries (§11.4), read from the same config the egui build writes —
+    /// so the size badge on a card and the size facet in the popover agree with each other.
+    tiers: SizeTiers,
 }
 
 struct Row {
@@ -209,6 +244,8 @@ struct Row {
     /// code this build does not know (schema drift), which sorts last and matches no tab but All.
     media_type: Option<MediaType>,
     status: AssetStatus,
+    /// Tag names, filled in one bulk pass (`mark_traits`) — the trait facet needs them per row.
+    traits: Vec<String>,
 }
 
 impl Library {
@@ -230,6 +267,7 @@ impl Library {
                     sources: Vec::new(),
                     rows: Vec::new(),
                     paths: HashMap::new(),
+                    tiers: lodestash_app::config::AppConfig::load().size_tiers.normalized(),
                 };
                 lib.reload();
                 lib
@@ -249,6 +287,7 @@ impl Library {
             sources: Vec::new(),
             rows: Vec::new(),
             paths: HashMap::new(),
+            tiers: SizeTiers::default(),
         }
     }
 
@@ -342,6 +381,72 @@ impl Library {
         self.sources = sources;
         self.mark_previews();
         self.mark_favorites();
+        self.mark_traits();
+    }
+
+    /// Attach tag names to rows, in one query rather than one per row.
+    fn mark_traits(&mut self) {
+        let Some(cat) = self.catalog.as_ref() else {
+            return;
+        };
+        let mut by_asset = match cat.all_asset_tags() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(%e, "all_asset_tags failed");
+                return;
+            }
+        };
+        for r in &mut self.rows {
+            if let Some(t) = by_asset.remove(&r.item.asset_id) {
+                // The facet matches on the tag's **value**; its namespace is a grouping for the
+                // Traits screen, not part of the chip's identity.
+                r.traits = t.into_iter().map(|a| a.value).collect();
+            }
+        }
+    }
+
+    /// The chips the ⚑ popover draws, derived from what the library actually holds.
+    ///
+    /// Traits are counted over **live** rows and sorted by count: a cloud in catalog order puts
+    /// whatever happens to sort first in front of the trait 900 assets share. Buckets and tiers
+    /// are the full fixed sets, including empty ones — a facet that appears and disappears as you
+    /// filter is a facet you cannot learn.
+    pub fn facets(&self) -> Facets {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for r in self.live() {
+            for t in &r.traits {
+                *counts.entry(t.as_str()).or_default() += 1;
+            }
+        }
+        let mut traits: Vec<TraitCount> = counts
+            .into_iter()
+            .map(|(name, count)| TraitCount {
+                name: name.to_string(),
+                count,
+            })
+            .collect();
+        traits.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+
+        Facets {
+            traits,
+            tri_buckets: TriBucket::ALL
+                .iter()
+                .map(|b| FacetOption {
+                    id: serde_id(b),
+                    label: b.label().to_string(),
+                })
+                .collect(),
+            sizes: SizeTier::ALL
+                .iter()
+                .map(|t| {
+                    let (lo, hi) = self.tiers.range_kb(*t);
+                    FacetOption {
+                        id: serde_id(t),
+                        label: format!("{} · {}", t.letter(), kb_range(lo, hi)),
+                    }
+                })
+                .collect(),
+        }
     }
 
     /// Flag starred rows, in one query rather than one per row.
@@ -433,6 +538,22 @@ impl Library {
             .filter(|r| q.status.matches(r.status))
             .filter(|r| r.trashed == q.trashed_only)
             .filter(|r| !q.favorites_only || r.item.favorite)
+            // The ⚑ popover's facets, through the **shared** predicate. Links are passed as
+            // `(false, false)`: the dependency-graph chips are not on this popover (UI-SPEC §2.3
+            // lists traits, triangles and size), so `filter.link` is always `None` here and the
+            // flags are never read. Wiring them means two more bulk queries at hydrate, and
+            // belongs with the chips that use them.
+            .filter(|r| {
+                q.filter.passes(
+                    r.item.size_bytes.max(0) as u64,
+                    r.item.triangles.map(|t| t.max(0) as u32),
+                    None,
+                    &r.traits,
+                    (false, false),
+                    r.item.favorite,
+                    &self.tiers,
+                )
+            })
             .filter(|r| needle.is_empty() || hit(r))
             .collect();
 
@@ -668,6 +789,28 @@ impl Library {
     }
 }
 
+/// A facet id, taken from the type's **own** serde name rather than a string written out again
+/// here. The popover posts these ids straight back inside a `ContentFilter`, so deriving them from
+/// the same impl that parses them is what makes a round-trip impossible to get wrong.
+fn serde_id<T: Serialize>(v: &T) -> String {
+    serde_json::to_value(v)
+        .ok()
+        .and_then(|j| j.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// `128 KB–1.0 MB` style range for a size tier chip.
+fn kb_range(lo_kb: u32, hi_kb: u32) -> String {
+    let one = |kb: u32| {
+        if kb >= 1024 {
+            format!("{:.1} MB", kb as f64 / 1024.0)
+        } else {
+            format!("{kb} KB")
+        }
+    };
+    format!("{}–{}", one(lo_kb), one(hi_kb))
+}
+
 /// Build a grid row from a hydrated catalog entry, whatever storage class it came from.
 ///
 /// `package` is `Some` for assets that live inside a pack — those have no local path, so the
@@ -694,6 +837,7 @@ fn row_from(
         duration_ms: e.metrics.duration_ms,
         source: Some(source.to_string()),
         locator: None,
+        traits: Vec::new(),
         item: GridItem {
             asset_id: e.asset_id,
             name,
@@ -729,6 +873,7 @@ mod tests {
                 source: None,
                 locator: None,
                 trashed: false,
+                traits: Vec::new(),
                 item: GridItem {
                     asset_id: 0,
                     name: (*n).into(),
@@ -751,6 +896,7 @@ mod tests {
             sources: Vec::new(),
             rows,
             paths: HashMap::new(),
+            tiers: SizeTiers::default(),
         }
     }
 
@@ -1070,6 +1216,119 @@ mod tests {
             1,
             "the audio favourite is excluded by the tab"
         );
+    }
+
+    /// The trait facet, which is the whole point of the popover: a chip narrows to the assets
+    /// carrying that tag, and chips within a group OR together (UI-SPEC §2.3).
+    #[test]
+    fn the_trait_facet_narrows_to_assets_carrying_the_tag() {
+        let mut l = lib(&[("a", "model_3d"), ("b", "model_3d"), ("c", "model_3d")]);
+        l.rows[0].traits = vec!["stylized".into()];
+        l.rows[1].traits = vec!["stylized".into(), "medieval".into()];
+        let with = |names: &[&str]| GridQuery {
+            filter: ContentFilter {
+                traits: names.iter().map(|s| (*s).to_string()).collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(l.page(&with(&["stylized"])).total, 2);
+        assert_eq!(l.page(&with(&["medieval"])).total, 1);
+        assert_eq!(
+            l.page(&with(&["stylized", "medieval"])).total,
+            2,
+            "chips inside a group OR together"
+        );
+    }
+
+    /// Facets AND across groups. Getting this backwards (OR) turns every extra chip into a
+    /// *wider* result, which reads as the filter being broken.
+    #[test]
+    fn facet_groups_and_together() {
+        let mut l = lib(&[("a", "model_3d"), ("b", "model_3d")]);
+        for r in &mut l.rows {
+            r.traits = vec!["stylized".into()];
+        }
+        l.rows[0].item.triangles = Some(500); // ≤1k
+        l.rows[1].item.triangles = Some(9_000); // 6k+
+        let p = l.page(&GridQuery {
+            filter: ContentFilter {
+                traits: ["stylized".to_string()].into_iter().collect(),
+                tri_buckets: [TriBucket::Le1k].into_iter().collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(p.total, 1, "trait AND bucket, not trait OR bucket");
+        assert_eq!(p.items[0].name, "a");
+    }
+
+    /// An asset with no triangle count is **excluded** when any triangle bucket is selected
+    /// (design §3) — a texture is not a 0-triangle model, and filing it under `≤ 1k` would put
+    /// every image in the library in front of someone filtering for low-poly meshes.
+    #[test]
+    fn assets_without_a_tri_count_are_excluded_by_a_tri_bucket() {
+        let mut l = lib(&[("mesh", "model_3d"), ("png", "image")]);
+        l.rows[0].item.triangles = Some(400);
+        let p = l.page(&GridQuery {
+            filter: ContentFilter {
+                tri_buckets: [TriBucket::Le1k].into_iter().collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(p.total, 1);
+        assert_eq!(p.items[0].name, "mesh");
+    }
+
+    /// The **wire contract**: the ids `facets()` publishes are exactly the ids a `ContentFilter`
+    /// parses back. A popover posting `"le1k"` at a filter expecting `"Le1k"` silently matches
+    /// nothing — the grid empties and nothing anywhere says why, so this round-trips every id
+    /// through real JSON rather than comparing two Rust values.
+    #[test]
+    fn every_facet_id_round_trips_back_into_a_filter_that_matches() {
+        let mut l = lib(&[("small", "model_3d"), ("big", "model_3d")]);
+        l.rows[0].item.triangles = Some(500);
+        l.rows[1].item.triangles = Some(9_000);
+        l.rows[0].item.size_bytes = 1_024; // 1 KB — tier S under any legal boundary set
+        l.rows[1].item.size_bytes = 64 * 1024 * 1024; // 64 MB — XL
+
+        let f = l.facets();
+        let parse = |json: String| -> ContentFilter {
+            serde_json::from_str(&json).expect("facet ids must parse back into a ContentFilter")
+        };
+
+        let smallest = &f.tri_buckets[0].id;
+        let p = l.page(&GridQuery {
+            filter: parse(format!(r#"{{"tri_buckets":["{smallest}"]}}"#)),
+            ..Default::default()
+        });
+        assert_eq!(p.total, 1, "the ≤1k chip must select the ≤1k asset");
+        assert_eq!(p.items[0].name, "small");
+
+        let largest = &f.sizes[3].id;
+        let p = l.page(&GridQuery {
+            filter: parse(format!(r#"{{"sizes":["{largest}"]}}"#)),
+            ..Default::default()
+        });
+        assert_eq!(p.total, 1, "the XL chip must select the XL asset");
+        assert_eq!(p.items[0].name, "big");
+    }
+
+    /// The cloud is ordered by how many assets carry each trait, and counts only the live library
+    /// — a trait whose every asset is in the Trash is a chip that selects an empty grid.
+    #[test]
+    fn the_trait_cloud_counts_live_rows_most_used_first() {
+        let mut l = lib(&[("a", "model_3d"), ("b", "model_3d"), ("c", "model_3d")]);
+        l.rows[0].traits = vec!["common".into()];
+        l.rows[1].traits = vec!["common".into()];
+        l.rows[2].traits = vec!["binned".into()];
+        l.rows[2].trashed = true;
+
+        let f = l.facets();
+        assert_eq!(f.traits.len(), 1, "the trashed row's trait is not offered");
+        assert_eq!(f.traits[0].name, "common");
+        assert_eq!(f.traits[0].count, 2);
     }
 
     #[test]

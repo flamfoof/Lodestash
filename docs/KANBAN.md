@@ -311,10 +311,26 @@ until B7.
       **Not covered by an automated test:** the blacklist write itself, because `AppConfig::load`
       resolves a fixed path and a test would have to write the developer's real config. The trash
       half of Remove is covered; the exclude half is manual.
-- [ ] **B3 remainder — Folders view, facet filters, Ctrl-K palette, drag-in.** Note
-      `build_pack_dir_tree`, `folder_children`, `ancestors_expanded`, `seed_expanded` and
-      `ContentFilter::passes` are all already written and tested in `lodestash-app` — this is
-      mostly wiring.
+- [~] **B3 remainder — Folders view, facet filters, Ctrl-K palette, drag-in.** Note
+      `build_pack_dir_tree`, `folder_children`, `ancestors_expanded` and `seed_expanded` are
+      already written and tested in `lodestash-app` — that part is mostly wiring.
+
+      **Facet filters shipped 2026-08-03.** The ⚑ popover (UI-SPEC §2.3): TRAIT cloud with search,
+      TRIANGLES buckets, FILE SIZE tiers, gold count badge, Clear all. `ContentFilter` **is the
+      wire type** — it gained serde and rides inside `GridQuery`, so `ContentFilter::passes` stays
+      the one definition of what passing means and a facet cannot mean two things in two
+      frontends. The chips come from a new `filter_facets` command rather than a TS list: their
+      ids are the Rust enums' own serde names (`library::serde_id`), and the size labels carry the
+      user's own §11.4 boundaries, which a TypeScript copy would get wrong for anyone who has
+      edited them.
+
+      *Not on this popover:* CATEGORY (needs the mapping library), the dependency-link chips
+      (`filter.link` is always `None`, so `passes` gets `(false, false)` — wiring them is two more
+      bulk queries at hydrate and belongs with the chips that use them), and rating (parked,
+      [`DATA-MODEL.md`](DATA-MODEL.md) §12). **The trait cloud is nearly empty on a fresh library**
+      — only 24 of 8,237 assets here carry a tag — so it says so rather than rendering a blank box.
+
+      *Remaining:* Folders view, Ctrl-K palette, drag-in.
 - [ ] **B6 — remaining screens.** Packages + pack browser, Unity Assets, Traits, Stats, Duplicates,
       Trash, Collections, Identify, Onboarding.
 - [ ] **B1.5 — `lodestash-cli`.** Headless `scan|index|tag|export`; gives the port a smoke test

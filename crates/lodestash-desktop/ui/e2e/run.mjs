@@ -206,6 +206,90 @@ try {
     await page.waitForTimeout(500);
   });
 
+  // The facet ids are a contract between two crates and a TypeScript popover. A chip whose id the
+  // backend does not parse fails the *whole* `grid_page` command, so the grid stops responding
+  // entirely — this asserts every published id survives the round trip it was minted for.
+  await check("every facet id filter_facets publishes is one grid_page accepts", async () => {
+    const f = await invoke("filter_facets");
+    assert.ok(f.tri_buckets.length === 4, `expected 4 triangle buckets, got ${f.tri_buckets.length}`);
+    assert.ok(f.sizes.length === 4, `expected 4 size tiers, got ${f.sizes.length}`);
+    const base = { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+                   page: 0, page_size: 1 };
+    const all = (await invoke("grid_page", { query: base })).total;
+
+    let triSum = 0;
+    for (const b of f.tri_buckets) {
+      const q = { ...base, filter: { traits: [], tri_buckets: [b.id], sizes: [] } };
+      triSum += (await invoke("grid_page", { query: q })).total;
+    }
+    const everyBucket = await invoke("grid_page", {
+      query: { ...base, filter: { traits: [], tri_buckets: f.tri_buckets.map((b) => b.id), sizes: [] } },
+    });
+    assert.equal(triSum, everyBucket.total, "the buckets must partition the assets that have a mesh");
+    assert.ok(everyBucket.total > 0, "this library has models — some bucket must match");
+    assert.ok(everyBucket.total < all, "assets with no triangle count must be excluded");
+
+    // Size tiers partition the *whole* library: every file has a size, so nothing falls out.
+    let sizeSum = 0;
+    for (const s of f.sizes) {
+      const q = { ...base, filter: { traits: [], tri_buckets: [], sizes: [s.id] } };
+      sizeSum += (await invoke("grid_page", { query: q })).total;
+    }
+    assert.equal(sizeSum, all, "S+M+L+XL must add up to the library");
+  });
+
+  // The check above talks to Rust directly, so it passes even if the popover never sends what it
+  // collected. This one drives the chips: open ⚑, click a size tier, and require the grid to
+  // actually narrow — then require Clear all to give it back.
+  await check("the Filters popover narrows the grid and Clear all restores it", async () => {
+    // Assert on the **result total**, not the card count: the grid pages at 100, so a filter that
+    // cuts the library in half still renders a full page and card count proves nothing.
+    const total = () =>
+      page.getByTestId("result-count").textContent().then((t) => Number(t.replace(/\D/g, "")));
+    try {
+      await page.fill('input[type="text"]', "");
+      await page.waitForTimeout(500);
+      const before = await total();
+      assert.ok(before > 100, `need a real library, got ${before}`);
+
+      await page.getByTestId("filters-button").click();
+      await page.waitForSelector('[data-testid="filters-popover"]', { timeout: 5000 });
+      await page.locator('[data-testid^="facet-size-"]').first().click();
+      await page.waitForFunction(
+        (n) => Number(
+          document.querySelector('[data-testid="result-count"]')?.textContent?.replace(/\D/g, ""),
+        ) !== n,
+        before,
+        { timeout: 5000 },
+      );
+      const badge = await page.getByTestId("filters-badge").textContent();
+      assert.equal(badge?.trim(), "1", "one chip on must show a count of 1");
+      const filtered = await total();
+      assert.ok(filtered > 0 && filtered < before, `filtered to ${filtered} of ${before}`);
+
+      await page.getByTestId("filters-clear").click();
+      await page.waitForFunction(
+        (n) => Number(
+          document.querySelector('[data-testid="result-count"]')?.textContent?.replace(/\D/g, ""),
+        ) === n,
+        before,
+        { timeout: 5000 },
+      );
+      assert.equal(await page.getByTestId("filters-badge").count(), 0, "cleared shows no badge");
+    } finally {
+      // Leave the shell as it was found. A filter left on narrows every later check's grid, and
+      // an open popover swallows their first click — which turns one failure into eight.
+      if ((await page.getByTestId("filters-badge").count()) > 0) {
+        if ((await page.getByTestId("filters-popover").count()) === 0) {
+          await page.getByTestId("filters-button").click();
+        }
+        await page.getByTestId("filters-clear").click();
+      }
+      await page.evaluate(() => document.body.click());
+      await page.waitForTimeout(400);
+    }
+  });
+
   // Both view modes must render the same result set — a list that quietly shows a different
   // number of rows than the grid means one of them is filtering on its own.
   await check("list view shows the same assets as the grid", async () => {

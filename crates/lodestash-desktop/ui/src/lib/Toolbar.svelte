@@ -1,10 +1,19 @@
 <script lang="ts">
   import Icon from "./Icon.svelte";
+  import Filters from "./Filters.svelte";
   import { SORTS, STATUSES, DENSITIES } from "./api";
   import { view } from "./nav.svelte";
 
   let { total }: { total: number } = $props();
 </script>
+
+<svelte:window
+  onclick={(e) => {
+    // Click-away closes it. Scoped to the wrapper rather than a full-screen scrim: a filter
+    // popover is not modal, and a scrim would swallow the first click on every card behind it.
+    if (view.filtersOpen && !(e.target as HTMLElement).closest(".filters")) view.filtersOpen = false;
+  }}
+/>
 
 <div class="toolbar">
   <div class="group" role="group" aria-label="Status">
@@ -15,7 +24,7 @@
     {/each}
   </div>
 
-  <span class="count num">{total.toLocaleString()}</span>
+  <span class="count num" data-testid="result-count">{total.toLocaleString()}</span>
 
   <div class="right">
     <label class="sort">
@@ -34,6 +43,24 @@
     >
       {view.sortAsc ? "↑" : "↓"}
     </button>
+
+    <div class="filters">
+      <button
+        class="flag"
+        class:on={view.filtersOpen || view.filterCount > 0}
+        onclick={() => (view.filtersOpen = !view.filtersOpen)}
+        aria-expanded={view.filtersOpen}
+        data-testid="filters-button"
+      >
+        ⚑ Filters
+        {#if view.filterCount > 0}
+          <span class="badge num" data-testid="filters-badge">{view.filterCount}</span>
+        {/if}
+      </button>
+      {#if view.filtersOpen}
+        <Filters onclose={() => (view.filtersOpen = false)} />
+      {/if}
+    </div>
 
     <div class="group" role="group" aria-label="View mode">
       <button
@@ -152,6 +179,35 @@
   .dir:hover {
     border-color: var(--ls-gold);
     color: var(--ls-text);
+  }
+
+  .filters {
+    position: relative;
+  }
+  .flag {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-1);
+    height: var(--control-h);
+    padding: 0 var(--sp-2);
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-md);
+    color: var(--ls-text-dim);
+    font-size: var(--fs-sm);
+  }
+  .flag:hover,
+  .flag.on {
+    border-color: var(--ls-gold);
+    color: var(--ls-text);
+  }
+  .badge {
+    min-width: 16px;
+    padding: 0 4px;
+    border-radius: var(--r-pill);
+    background: var(--ls-gold);
+    color: var(--ls-bg);
+    font-size: var(--fs-xs);
+    text-align: center;
   }
 
   .icon-btn {
