@@ -344,7 +344,18 @@ until B7.
       exists to prevent. In-pack assets are 72% of this library, so excluding them was not an
       option. The e2e asserts the collapse cannot happen.
 
-      *Remaining:* Ctrl-K palette, drag-in.
+      **Ctrl-K palette shipped 2026-08-03.** One box over both planes: live asset search (BM25,
+      top 8, debounced 120 ms) above the app's own navigation — screens, category tabs, the three
+      browse views, inspector toggle, clear filters. Assets lead because "find the one asset I
+      need" is what the product is for. Enter on an asset **reveals** it (library route + search +
+      selection) rather than opening it, so the grid, Inspector and Quick Look are all one
+      keystroke further on; the e2e asserts the Inspector ends up describing it, not merely that
+      the palette closed. Commands match on substring — a fuzzy scorer is a nice-to-have when
+      three letters already reach every one of them. This lands the palette half of P7's
+      "batch ops; command palette (Ctrl-K)" card early, because the shell needed the keyboard path.
+
+      *Remaining:* drag-in — needs an ingest command this shell does not have (the write path is
+      catalog-only today), so it is a real slice rather than wiring.
 - [ ] **B6 — remaining screens.** Packages + pack browser, Unity Assets, Traits, Stats, Duplicates,
       Trash, Collections, Identify, Onboarding.
 - [ ] **B1.5 — `lodestash-cli`.** Headless `scan|index|tag|export`; gives the port a smoke test

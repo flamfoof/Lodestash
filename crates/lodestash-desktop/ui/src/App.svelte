@@ -7,6 +7,7 @@
   import { SCREENS } from "./lib/routes";
   import { view } from "./lib/nav.svelte";
   import ConfirmDelete from "./lib/ConfirmDelete.svelte";
+  import Palette from "./lib/Palette.svelte";
   import {
     libraryStatus,
     reloadLibrary,
@@ -79,6 +80,19 @@
     }
   }
 
+  let paletteOpen = $state(false);
+
+  /**
+   * Ctrl/Cmd-K opens the palette from anywhere — including from inside the search box, which is
+   * the one place a global shortcut usually stops working and the one place people press it.
+   */
+  function onkeydown(e: KeyboardEvent) {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+      paletteOpen = !paletteOpen;
+      e.preventDefault();
+    }
+  }
+
   function afterRemoval() {
     // The asset just left this view; keeping it selected would leave the Inspector describing
     // something the grid no longer shows.
@@ -86,6 +100,8 @@
     confirming = false;
   }
 </script>
+
+<svelte:window on:keydown={onkeydown} />
 
 <div class="frame">
   <TopBar engineReady={status?.open ?? false} />
@@ -124,6 +140,10 @@
       onremove={() => write(() => removeFromLibrary([selectedDetail!.asset_id])).then(afterRemoval)}
       oncancel={() => (confirming = false)}
     />
+  {/if}
+
+  {#if paletteOpen}
+    <Palette onclose={() => (paletteOpen = false)} />
   {/if}
 
   {#if actionError}

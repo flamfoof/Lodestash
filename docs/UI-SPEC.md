@@ -144,8 +144,10 @@ A **Favorites screen** sits second in the nav (§0.2), header `★ Favorites` + 
 | `Backspace` | Folders view | up one level |
 | `Ctrl/Cmd-A` | grid | select all in current filter |
 | `Ctrl/Cmd-Z / Shift-Z` | catalog mutations | undo / redo (DESIGN-GUIDELINES §7) |
+| `Ctrl/Cmd-K` | anywhere | open the command palette: asset search + navigation (ROADMAP P7) |
 
-Keys never fire while an input/textarea has focus.
+Keys never fire while an input/textarea has focus — **except `Ctrl/Cmd-K`**, since the search
+box is where people press it.
 
 ---
 

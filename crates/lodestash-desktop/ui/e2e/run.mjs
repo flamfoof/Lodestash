@@ -290,6 +290,49 @@ try {
     }
   });
 
+  await check("Ctrl-K opens the palette, and Enter on an asset reveals it", async () => {
+    try {
+      await page.fill('input[type="text"]', "");
+      await page.waitForTimeout(400);
+      await page.keyboard.press("Control+k");
+      await page.waitForSelector('[data-testid="palette-input"]', { timeout: 5000 });
+
+      // Commands are reachable with no query at all — an empty palette that shows nothing is a
+      // box you have to already know the contents of.
+      const idle = await page.locator('[data-testid="palette-results"] .row').count();
+      assert.ok(idle > 0, "the palette must offer commands before anything is typed");
+
+      await page.getByTestId("palette-input").fill("Stairs");
+      await page.waitForFunction(
+        () =>
+          [...document.querySelectorAll('[data-testid="palette-results"] .hint')].some(
+            (e) => e.textContent?.trim() === "model_3d",
+          ),
+        undefined,
+        { timeout: 5000 },
+      );
+      const name = await page
+        .locator('[data-testid="palette-results"] .row')
+        .first()
+        .locator(".name")
+        .textContent();
+      await page.keyboard.press("Enter");
+
+      // Revealing means the grid is showing it and the Inspector is describing it — not merely
+      // that the palette closed.
+      await page.waitForSelector('[data-testid="palette"]', { state: "detached", timeout: 5000 });
+      await page.waitForFunction(
+        (n) => document.querySelector('[data-testid="inspector-name"]')?.textContent?.trim() === n,
+        name?.trim(),
+        { timeout: 5000 },
+      );
+    } finally {
+      await page.keyboard.press("Escape");
+      await page.fill('input[type="text"]', "");
+      await page.waitForTimeout(400);
+    }
+  });
+
   // The defect this exists to catch is invisible by inspection: every `.unitypackage` lays its
   // assets out under `Assets/…`, so browsing by `rel_path` alone merges every pack in a source
   // into one folder holding thousands of files from unrelated products. In-pack assets are the
