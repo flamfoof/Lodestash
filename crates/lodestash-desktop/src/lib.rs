@@ -9,6 +9,7 @@ pub mod library;
 pub mod protocol;
 pub mod writer;
 
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use serde::Serialize;
@@ -235,6 +236,40 @@ fn delete_from_disk(
     })
 }
 
+/// **Add a folder to the library and index it** — what drag-and-drop drops into.
+///
+/// Three steps, in the only order that respects the single-writer rule: crawl the folder on this
+/// command's own pool thread (a read), hand the finished records to the writer thread (the write),
+/// then re-read. The crawl never runs on the writer, because a disk walk of a real source takes
+/// minutes and everything else — favouriting, trashing — would queue behind it.
+///
+/// **Synchronous.** The command does not return until the folder is indexed, so the frontend shows
+/// a spinner rather than a progress bar. Real progress needs the job tray, which needs the pump
+/// (B2b); a fake bar that jumps 0 → 100 is worse than an honest spinner.
+#[tauri::command]
+fn add_source(state: tauri::State<'_, AppState>, path: String) -> Result<WriteResult, String> {
+    let root = PathBuf::from(&path);
+    if !root.is_dir() {
+        // Dropping a *file* is a different feature (import one asset) and pretending otherwise
+        // would index its whole parent folder, which is not what anyone meant by dropping a file.
+        return Err(format!("{path} is not a folder"));
+    }
+    let crawled = lodestash_app::scan::crawl_source(0, &root, &[]);
+    if crawled.entries.is_empty() && crawled.pending_packages.is_empty() {
+        return Err(format!("nothing indexable in {path}"));
+    }
+    let records = lodestash_app::persist::crawl_records(crawled.entries.iter().map(|(_, f)| f));
+    let batch = lodestash_app::types::PersistBatch {
+        root: root.to_string_lossy().into_owned(),
+        name: lodestash_app::config::stem_name(&root),
+        excludes_json: None,
+        records,
+    };
+    let result = state.write(Op::PersistScan { batches: vec![batch] })?;
+    tracing::info!(%path, indexed = result.changed, packs = crawled.pending_packages.len(), "source added");
+    Ok(result)
+}
+
 /// Re-read the catalog. The egui app writes it, so a scan there shows up here on request —
 /// there is no change notification until the pump thread exists.
 #[tauri::command]
@@ -296,7 +331,8 @@ pub fn run() {
             set_favorite,
             set_trashed,
             remove_from_library,
-            delete_from_disk
+            delete_from_disk,
+            add_source
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lodestash");

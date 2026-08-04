@@ -12,6 +12,7 @@
   import DuplicatesScreen from "./lib/DuplicatesScreen.svelte";
   import PackagesScreen from "./lib/PackagesScreen.svelte";
   import TraitsScreen from "./lib/TraitsScreen.svelte";
+  import DropZone from "./lib/DropZone.svelte";
   import {
     libraryStatus,
     reloadLibrary,
@@ -153,6 +154,8 @@
       oncancel={() => (confirming = false)}
     />
   {/if}
+
+  <DropZone onindexed={async () => (status = await libraryStatus())} />
 
   {#if paletteOpen}
     <Palette onclose={() => (paletteOpen = false)} />

@@ -290,6 +290,31 @@ try {
     }
   });
 
+  // `add_source` is exercised **only** through its refusals here, and deliberately so: a
+  // successful call writes a permanent source row into the developer's real catalog, and there is
+  // no remove-source op to take it back. The refusals are the part worth guarding anyway — both
+  // happen before any write, so a green run leaves the catalog exactly as it found it. The
+  // success path is covered where it is safe: `lodestash_app::scan`, over a temp dir it owns.
+  await check("add_source refuses what it cannot index, without touching the catalog", async () => {
+    const before = await invoke("library_status");
+
+    // A *file* is a different feature (import one asset); indexing its parent folder instead is
+    // not what anyone meant by dropping a file on the window.
+    await assert.rejects(
+      () => invoke("add_source", { path: before.catalog_path }),
+      /not a folder/,
+      "dropping a file must be refused, not silently widened to its folder",
+    );
+    await assert.rejects(
+      () => invoke("add_source", { path: "G:\\definitely\\not\\here" }),
+      /not a folder/,
+    );
+
+    const after = await invoke("library_status");
+    assert.equal(after.sources.length, before.sources.length, "a refusal must add no source");
+    assert.equal(after.total_assets, before.total_assets, "…and index nothing");
+  });
+
   // The vocabulary and the ⚑ trait cloud are two views of the same tags. If they disagree, one of
   // them is reading a different table — and the symptom is a trait row whose Browse lands on an
   // empty grid, which reads as "that tag has no assets" rather than as a bug.

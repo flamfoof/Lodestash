@@ -151,6 +151,14 @@ export type VocabRow = {
 
 export const vocabulary = () => invoke<VocabRow[]>("vocabulary");
 
+/**
+ * Index a folder and add it as a library source — what drag-and-drop drops into.
+ *
+ * Synchronous: it does not resolve until the folder is crawled and written, which on a real
+ * source is minutes. Show a spinner, not a progress bar — real progress needs the job tray.
+ */
+export const addSource = (path: string) => invoke<WriteResult>("add_source", { path });
+
 export const libraryStats = () => invoke<Stats>("library_stats");
 export const duplicateGroups = () => invoke<DupGroup[]>("duplicate_groups");
 

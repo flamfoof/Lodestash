@@ -11,7 +11,10 @@ use egui::{Key, RichText, ScrollArea, TextureHandle, Ui, Vec2};
 use lodestash_core::catalog::{Catalog, HydratedAsset, PackageEntryRecord, StatusCounts};
 use lodestash_core::types::{AssetStatus, MediaType};
 use lodestash_ingest::asset_store::{self, AssetStorePackage};
-use lodestash_ingest::crawler::{self, CrawledFile};
+use lodestash_ingest::crawler::CrawledFile;
+// The crawl and its classify rules moved to `lodestash_app::scan` (B1); imported by name so the
+// call sites below read the same as they did.
+use lodestash_app::scan::{is_browseable, is_unitypackage, package_display_name};
 use lodestash_ingest::{detect, thumb, unitypackage};
 
 use crate::audio::AudioPlayer;
@@ -842,31 +845,23 @@ impl LodestashApp {
         self.scan_job = Some(self.jobs.start(scan_label, Arc::default(), true));
         let generation = self.scan_generation;
         let tx = self.scan_tx.clone();
+        // The crawl itself lives in `lodestash_app::scan` (B1) — this thread is only the part
+        // that keeps a frame responsive: spawn it, tag the result with the generation, send it back.
+        let sources: Vec<lodestash_app::scan::Source> = roots
+            .iter()
+            .enumerate()
+            .map(|(i, root)| lodestash_app::scan::Source {
+                root: root.clone(),
+                excludes: excludes[i].clone(),
+                pack_only: pack_only[i],
+            })
+            .collect();
         std::thread::spawn(move || {
-            let mut entries: Vec<(usize, CrawledFile)> = Vec::new();
-            let mut pending_packages = Vec::new();
-            for (source_idx, root) in roots.iter().enumerate() {
-                if pack_only[source_idx] {
-                    continue; // tracked container; its packs hydrate as in-pack libraries
-                }
-                for file in crawler::crawl(root, &excludes[source_idx]) {
-                    if is_unitypackage(&file.abs_path) {
-                        // Don't surface the raw archive; offer an Extract action instead (PR #8).
-                        if let Some(pkg) = resolve_pending_package(source_idx, &file) {
-                            pending_packages.push(pkg);
-                        }
-                        continue;
-                    }
-                    if !is_browseable(&file) {
-                        continue;
-                    }
-                    entries.push((source_idx, file));
-                }
-            }
+            let crawled = lodestash_app::scan::crawl_sources(&sources);
             let _ = tx.send(ScanDone {
                 generation,
-                entries,
-                pending_packages,
+                entries: crawled.entries,
+                pending_packages: crawled.pending_packages,
                 partial: None,
             });
         });
@@ -984,24 +979,11 @@ impl LodestashApp {
         let generation = self.scan_generation;
         let tx = self.scan_tx.clone();
         std::thread::spawn(move || {
-            let mut entries = Vec::new();
-            let mut pending_packages = Vec::new();
-            for file in crawler::crawl(&root, &excludes) {
-                if is_unitypackage(&file.abs_path) {
-                    if let Some(pkg) = resolve_pending_package(source_idx, &file) {
-                        pending_packages.push(pkg);
-                    }
-                    continue;
-                }
-                if !is_browseable(&file) {
-                    continue;
-                }
-                entries.push((source_idx, file));
-            }
+            let crawled = lodestash_app::scan::crawl_source(source_idx, &root, &excludes);
             let _ = tx.send(ScanDone {
                 generation,
-                entries,
-                pending_packages,
+                entries: crawled.entries,
+                pending_packages: crawled.pending_packages,
                 partial: Some(source_idx),
             });
         });
@@ -11299,20 +11281,6 @@ fn size_tiers_editor(ui: &mut Ui, tiers: &mut SizeTiers) -> bool {
 
 // ── .unitypackage discovery & extraction ──────────────────────────────────────
 
-/// Is this file a game asset the library should show?
-///
-/// The catalog only ever stored classified files (`asset.media_type_id` is NOT NULL), so an
-/// unclassified one — a `.url` shortcut, a `.pdf` readme, a `.prefab`, a `.cs` script — could
-/// only ever be a grid-only ghost: no status, no facets, no embedding, nothing an agent could
-/// retrieve. Dropping them at the crawl makes the grid and the catalog agree
-/// (INGESTION §3 "non-content", DATA-MODEL §2 media_type).
-///
-/// ponytail: extension-only, matching `detect::by_extension`. A real asset with an unknown
-/// extension is dropped too — wire the magic-byte fallback in if that shows up in practice.
-fn is_browseable(file: &CrawledFile) -> bool {
-    file.media_type.is_some()
-}
-
 /// The Asset Store cache lays packs out as `<root>/<publisher>/<category>/<pack>.unitypackage`
 /// (INGESTION §2). Read those two levels off the path when they're there; a plain folder of
 /// packs has neither, and inventing them would be a claim the layout doesn't make.
@@ -11334,11 +11302,6 @@ fn store_publisher_category(
     )
 }
 
-fn is_unitypackage(path: &std::path::Path) -> bool {
-    path.extension()
-        .map(|e| e.eq_ignore_ascii_case("unitypackage"))
-        .unwrap_or(false)
-}
 
 /// Normalized pack-name key for the §5.6 duplicate check: lowercased, a trailing `.unitypackage`
 /// dropped, and internal/surrounding whitespace collapsed to single spaces. Two candidates that
@@ -11363,55 +11326,6 @@ fn duplicate_pack_name(candidate: &str, existing: &[&str]) -> Option<String> {
         .map(|e| e.to_string())
 }
 
-/// Display name for a package: the file stem of its path (extension and directories stripped).
-fn package_display_name(path: &std::path::Path) -> String {
-    path.file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string_lossy().into_owned())
-}
-
-/// Browse a freshly-crawled `.unitypackage` (cheap manifest read, no extraction) and turn it into
-/// a `PendingPackage` ready for the user to act on. Runs on the background crawl thread, so a
-/// large package's manifest read (still O(file size) to decompress, just O(1) memory) never
-/// blocks the UI. Returns `None` if the archive can't be read (corrupt/unsupported) — silently
-/// skipped rather than surfaced as an error card, matching INGESTION.md §8's "don't promise 100%."
-fn resolve_pending_package(source_idx: usize, file: &CrawledFile) -> Option<PendingPackage> {
-    let manifest = unitypackage::read_manifest(&file.abs_path).ok()?;
-    let nested = unitypackage::nested_package_candidates(&manifest);
-    let chosen_variant = unitypackage::preferred_variant_index(&nested);
-    let nested_candidates = nested
-        .iter()
-        .filter_map(|e| {
-            e.pathname
-                .clone()
-                .map(|p| (package_display_name(std::path::Path::new(&p)), p))
-        })
-        .collect();
-
-    let entries = manifest
-        .iter()
-        .map(|e| PackageEntryRecord {
-            guid: e.guid.clone(),
-            pathname: e.pathname.clone(),
-            tar_offset: e.asset_offset.map(|o| o as i64),
-            size_bytes: e.asset_size.map(|s| s as i64),
-        })
-        .collect();
-
-    Some(PendingPackage {
-        source_idx,
-        abs_path: file.abs_path.clone(),
-        display_name: package_display_name(&file.rel_path),
-        nested_candidates,
-        chosen_variant,
-        extracting: false,
-        progress: Arc::default(),
-        entries,
-        job: None,
-        browsing: false,
-        picked: std::collections::BTreeSet::new(),
-    })
-}
 
 /// Extract `path` into `workspace_dir` and convert the payloads into crawlable entries, virtually
 /// namespaced under `display_name` (`rel_path` becomes `{display_name}/{original pathname}`) so
@@ -14342,6 +14256,7 @@ fn type_label_char(mt: Option<MediaType>) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use lodestash_app::scan::resolve_pending_package;
     use super::*;
 
     /// The TRAIT chips filter on tag *values*, and an asset with no tags must fail the filter

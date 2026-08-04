@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 
+use lodestash_app::types::PersistBatch;
 use lodestash_core::catalog::Catalog;
 use lodestash_core::types::{Exclude, ExcludeKind};
 
@@ -44,6 +45,13 @@ pub enum Op {
     RemoveFromLibrary { targets: Vec<Target>, project: Option<String> },
     /// **Delete from disk** — the one irreversible action in this product.
     DeleteFromDisk { targets: Vec<Target>, roots: Vec<PathBuf>, workspace: Option<PathBuf> },
+    /// Record a finished crawl: upsert the source and reconcile its assets (INGESTION §1).
+    ///
+    /// The **crawl** does not happen here. It is a disk walk that can take minutes, and the writer
+    /// is a shared resource every other action queues behind — so the caller walks the disk on its
+    /// own thread and sends the finished records. This is only the part that must be serialised,
+    /// because it is the part that writes.
+    PersistScan { batches: Vec<PersistBatch> },
 }
 
 /// What a write did, in the terms the frontend reports to the user.
@@ -90,7 +98,7 @@ impl Writer {
                     }
                 };
                 for job in rx {
-                    let _ = job.reply.send(run(&catalog, job.op));
+                    let _ = job.reply.send(run(&catalog, &db_path, job.op));
                 }
                 tracing::debug!("writer: channel closed, thread exiting");
             })
@@ -109,7 +117,7 @@ impl Writer {
     }
 }
 
-fn run(catalog: &Catalog, op: Op) -> Result<WriteResult, String> {
+fn run(catalog: &Catalog, db_path: &Path, op: Op) -> Result<WriteResult, String> {
     match op {
         Op::SetFavorite { ids, on } => catalog
             .set_favorite(&ids, on)
@@ -125,6 +133,15 @@ fn run(catalog: &Catalog, op: Op) -> Result<WriteResult, String> {
 
         Op::DeleteFromDisk { targets, roots, workspace } => {
             delete_from_disk(catalog, targets, &roots, workspace.as_deref())
+        }
+
+        // `persist_to_catalog` opens its **own** connection, which would be a second writer
+        // anywhere else. Running it on this thread is what keeps the rule true: this thread's own
+        // connection sits idle for the duration, and no other job can interleave with it.
+        Op::PersistScan { batches } => {
+            let changed = batches.iter().map(|b| b.records.len()).sum();
+            lodestash_app::persist::persist_to_catalog(db_path, &batches)
+                .map(|_| WriteResult { changed, ..Default::default() })
         }
     }
 }

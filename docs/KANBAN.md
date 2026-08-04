@@ -275,10 +275,19 @@ until B7.
 
 ### Then — bigger, each wants its own session
 
-- [ ] **B1 — finish the `lodestash-app` extraction.** `config`, `drains`, `persist`, `thumbs`,
-      `grid`, `paths`, `types` and `audio` have moved; **`app.rs` is still 15,628 lines** and
-      `Engine` itself has not been split from the egui `LodestashApp`. Splitting ~120 fields on
-      *does a background thread write it?* is judgement per field, not a mechanical move.
+- [~] **B1 — finish the `lodestash-app` extraction.** *First slice 2026-08-04: the crawl.*
+      `lodestash_app::scan` now owns walking the sources and classifying what turns up —
+      `crawl_sources` / `crawl_source`, plus `is_browseable`, `is_unitypackage`,
+      `package_display_name`, `resolve_pending_package`. Chosen as the first piece to move because
+      it has no UI in it at all: paths in, data out, a background thread in both frontends. The
+      egui shell had the same loop written out twice (full scan and partial rescan) and now calls
+      the shared one. It is also what made **drag-in** possible in the Tauri shell — which is the
+      point of the extraction, not a side effect of it.
+
+      *Still ahead:* `config`, `drains`, `persist`, `thumbs`, `grid`, `paths`, `types` and `audio`
+      had already moved, but **`app.rs` is 15,543 lines** and `Engine` itself has not been split
+      from the egui `LodestashApp`. Splitting ~144 fields on *does a background thread write it?*
+      is judgement per field, not a mechanical move.
 - [ ] **B2b remainder — `Engine` + pump.** `Arc<Mutex<Engine>>` and the 33 ms pump running the
       drain order **verbatim** from `app.rs:9533` (that order encodes the `database is locked`
       fix). Blocked on B1. Until then the shell reads the catalog directly, which is sound because
@@ -354,8 +363,21 @@ until B7.
       three letters already reach every one of them. This lands the palette half of P7's
       "batch ops; command palette (Ctrl-K)" card early, because the shell needed the keyboard path.
 
-      *Remaining:* drag-in — needs an ingest command this shell does not have (the write path is
-      catalog-only today), so it is a real slice rather than wiring.
+      **Drag-in shipped 2026-08-04**, on the back of the first B1 extraction. Drop a folder on the
+      window to add it as a source and index it: full-window overlay, gold dashed border, spinner
+      while it runs. Handled through Tauri's `onDragDropEvent`, **not** the DOM's — a WebView drop
+      gives a `File` with no path, and the path is the whole point when the catalog references
+      originals in place.
+
+      The order is the single-writer rule made concrete: **crawl on the command's own thread**
+      (a read), hand the finished records to the writer as `Op::PersistScan` (the write), reload.
+      The crawl never runs on the writer — a disk walk of a real source takes minutes and
+      favouriting would queue behind it. Synchronous, so the UI shows a spinner rather than a
+      progress bar: real progress needs the job tray, which needs the pump (B2b), and a bar that
+      jumps 0 → 100 is a worse lie than a spinner. Dropping a **file** is refused rather than
+      silently widened to its parent folder.
+
+      **B3 is complete.**
 - [~] **B6 — remaining screens.** *Stats + Duplicates shipped 2026-08-03.*
 
       **Stats** (UI-SPEC §8.1) — tiles, size by type, disk weight by pack, heaviest assets,
