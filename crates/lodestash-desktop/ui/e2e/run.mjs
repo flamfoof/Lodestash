@@ -315,6 +315,12 @@ try {
     assert.equal(after.total_assets, before.total_assets, "…and index nothing");
   });
 
+  // Not covered here: that the indexing status card is non-modal. The card only exists while
+  // `add_source` is in flight, and this suite must not run a real one (see above) — and Svelte's
+  // scoped styles mean a synthetic `.toast` div gets none of its CSS, so probing one asserts
+  // nothing about the real element. It is a structural property of `DropZone.svelte`: the
+  // full-window overlay renders on `over` only, the corner card on `busy`.
+
   // The vocabulary and the ⚑ trait cloud are two views of the same tags. If they disagree, one of
   // them is reading a different table — and the symptom is a trait row whose Browse lands on an
   // empty grid, which reads as "that tag has no assets" rather than as a bug.

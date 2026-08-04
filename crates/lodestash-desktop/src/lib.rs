@@ -254,7 +254,26 @@ fn add_source(state: tauri::State<'_, AppState>, path: String) -> Result<WriteRe
         // would index its whole parent folder, which is not what anyone meant by dropping a file.
         return Err(format!("{path} is not a folder"));
     }
-    let crawled = lodestash_app::scan::crawl_source(0, &root, &[]);
+    // The source's blacklist, or **Remove from library** is a lie: it writes an `Exclude` into
+    // the app config precisely so a later scan does not re-offer the asset (B5), and a crawl that
+    // ignores it resurrects everything the user removed the moment they re-add the folder.
+    // Pack-only sources are honoured for the same reason — the user already said what they want
+    // from that folder.
+    let config = lodestash_app::config::AppConfig::load();
+    let (excludes, pack_only) = match config.last_project_name.as_deref() {
+        Some(project) => (
+            config.source_excludes(project, &root),
+            config.is_pack_only(project, &root),
+        ),
+        // No open project means no per-source rules exist to honour yet.
+        None => (Vec::new(), false),
+    };
+    if pack_only {
+        return Err(format!(
+            "{path} is marked pack-only — its packs are indexed from their archives, not by walking it"
+        ));
+    }
+    let crawled = lodestash_app::scan::crawl_source(0, &root, &excludes);
     if crawled.entries.is_empty() && crawled.pending_packages.is_empty() {
         return Err(format!("nothing indexable in {path}"));
     }

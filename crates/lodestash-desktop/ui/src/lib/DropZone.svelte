@@ -3,13 +3,24 @@
    * Drag-in (DESIGN-GUIDELINES §7 "Drag & drop"): drop a folder on the window to add it as a
    * source and index it. Full-window overlay with a gold dashed border while a drag is over.
    *
+   * **A dropped source is indexed, not enriched.** `persist_to_catalog` records path, size, mtime
+   * and media type; content hashes, triangle counts, image dimensions and vector previews all come
+   * from drains that live in the egui pump (B2b). Until that lands, a folder added here browses
+   * and searches but stays out of Duplicates, is excluded by the triangle facet, and shows a type
+   * icon rather than a preview for models. The card says so, rather than leaving the user to infer
+   * it from a half-populated Inspector.
+   *
    * The drop is handled by Tauri's own `onDragDropEvent`, not the DOM's drag events: a WebView
    * `drop` gives you a `File` with no path, and the whole point here is the path — the catalog
    * references originals in place and never copies them (the non-destructive invariant).
    *
-   * Indexing runs to completion before the command returns, so this shows a spinner and the
-   * folder's name. A progress bar would need the job tray, which needs the pump (B2b); one that
-   * jumps 0 → 100 is a worse lie than an honest spinner.
+   * **The overlay is only for the drag.** Once indexing starts it shrinks to a corner card, because
+   * a full-window scrim over a minutes-long scan blocks every click while claiming the window is
+   * usable. Browsing is a read on a separate connection, so it genuinely keeps working while the
+   * writer thread persists — the UI should not pretend otherwise in either direction.
+   *
+   * No progress bar: honest progress needs the job tray, which needs the pump (B2b), and a bar
+   * that jumps 0 → 100 is a worse lie than a spinner.
    */
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { addSource } from "./api";
@@ -64,21 +75,33 @@
   }
 </script>
 
-{#if over || busy || error}
-  <div class="overlay" class:armed={over} data-testid="dropzone">
+{#if over}
+  <div class="overlay" data-testid="dropzone">
     <div class="panel">
-      {#if busy}
-        <span class="spinner" aria-hidden="true"></span>
-        <p>Indexing <span class="path">{busy}</span>…</p>
-        <p class="hint">Large folders take a while. The window stays usable.</p>
-      {:else if error}
-        <p class="danger" data-testid="drop-error">{error}</p>
-        <button onclick={() => (error = null)}>Dismiss</button>
-      {:else}
-        <p>Drop a folder to add it to your library</p>
-        <p class="hint">Files stay where they are — Lodestash only references them.</p>
-      {/if}
+      <p>Drop a folder to add it to your library</p>
+      <p class="hint">Files stay where they are — Lodestash only references them.</p>
     </div>
+  </div>
+{/if}
+
+{#if busy || error}
+  <!-- Deliberately not modal: indexing takes minutes and the rest of the app still works. -->
+  <div class="toast" class:danger={!!error} data-testid="drop-status" role="status">
+    {#if busy}
+      <span class="spinner" aria-hidden="true"></span>
+      <div>
+        <p>Indexing <span class="path">{busy}</span>…</p>
+        <p class="hint">
+          Large folders take a while. Browsing keeps working; new assets appear when it finishes.
+          They start Unidentified, with no duplicate check or model preview until enrichment runs.
+        </p>
+      </div>
+    {:else}
+      <div>
+        <p data-testid="drop-error">{error}</p>
+      </div>
+      <button onclick={() => (error = null)}>Dismiss</button>
+    {/if}
   </div>
 {/if}
 
@@ -90,9 +113,29 @@
     display: grid;
     place-items: center;
     background: rgb(0 0 0 / 0.55);
-  }
-  .overlay.armed {
     border: 3px dashed var(--ls-gold);
+  }
+  .toast {
+    position: fixed;
+    right: var(--sp-4);
+    bottom: var(--sp-5);
+    z-index: 110;
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+    max-width: min(420px, 90vw);
+    padding: var(--sp-3);
+    background: var(--ls-surface);
+    border: 1px solid var(--ls-border-strong);
+    border-radius: var(--r-lg);
+    box-shadow: 0 8px 24px rgb(0 0 0 / 0.4);
+  }
+  .toast.danger {
+    border-color: var(--ls-danger);
+    color: var(--ls-danger);
+  }
+  .toast .path {
+    overflow-wrap: anywhere;
   }
   .panel {
     display: flex;

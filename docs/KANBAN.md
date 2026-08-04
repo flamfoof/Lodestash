@@ -377,6 +377,22 @@ until B7.
       jumps 0 → 100 is a worse lie than a spinner. Dropping a **file** is refused rather than
       silently widened to its parent folder.
 
+      **Three limits, owner-reviewed 2026-08-04.** The crawl honours the source's `Exclude` list
+      and `is_pack_only` from the app config — without it, re-dropping a folder resurrects every
+      asset **Remove from library** was asked to keep out, which is the one promise that action
+      makes. The drop overlay is modal only while dragging; indexing shows a **corner card**,
+      because a full-window scrim over a minutes-long scan locks the user out of the library while
+      claiming browsing still works (it does — reads use a separate connection). And a dropped
+      source is **indexed, not enriched**: hashes, triangle counts, dimensions and vector previews
+      all come from drains that live in the pump, so those assets stay out of Duplicates, are
+      excluded by the triangle facet, and show a type icon for models until B2b lands. The card
+      says so rather than leaving it to be inferred from a half-empty Inspector.
+
+      Real progress and cancel were **deliberately deferred**: `crawler::crawl` returns a `Vec`
+      with no callback, so both need a signature change through `lodestash-ingest`, and the job
+      tray is where progress belongs. Building a one-off progress channel now means throwing it
+      away at cutover.
+
       **B3 is complete.**
 - [~] **B6 — remaining screens.** *Stats + Duplicates shipped 2026-08-03.*
 
