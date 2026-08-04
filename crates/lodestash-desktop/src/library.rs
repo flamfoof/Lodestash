@@ -227,6 +227,65 @@ pub struct FolderPage {
     pub total: usize,
 }
 
+/// The Stats overview (UI-SPEC §8.1).
+///
+/// Every number here is derived from the rows already in memory — there is no stats query. The
+/// library is ~10k small structs the shell holds anyway, and a second set of `COUNT(*)`s over the
+/// same data is how a summary screen comes to disagree with the grid it is summarising.
+#[derive(Debug, Serialize)]
+pub struct Stats {
+    pub total_assets: usize,
+    pub sources: usize,
+    /// Distinct packs the live assets came out of.
+    pub packs: usize,
+    pub bytes_total: i64,
+    pub triangles_total: i64,
+    pub models: usize,
+    pub unidentified: usize,
+    pub by_type: Vec<TypeStat>,
+    /// Heaviest packs first — the "disk weight by pack" bars.
+    pub by_pack: Vec<PackStat>,
+    /// Top 5 by size.
+    pub heaviest: Vec<GridItem>,
+    /// Exact-duplicate groups, for the insight row that links to the Duplicates screen.
+    pub duplicate_groups: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TypeStat {
+    /// `media_type.code`, so the frontend reuses its existing colour and icon maps.
+    pub media_type: String,
+    pub count: usize,
+    pub bytes: i64,
+    pub triangles: i64,
+    pub duration_ms: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PackStat {
+    pub name: String,
+    pub count: usize,
+    pub bytes: i64,
+}
+
+/// One exact-duplicate group (UI-SPEC §5). **Never auto-resolved** — this is a review queue.
+#[derive(Debug, Serialize)]
+pub struct DupGroup {
+    /// BLAKE3 of the shared bytes. Shown truncated; it is also the group's identity.
+    pub hash: String,
+    pub size_bytes: i64,
+    /// Members, keeper first.
+    pub items: Vec<GridItem>,
+    /// Which member is the keeper: highest status, ties broken by lowest asset id (earliest
+    /// indexed). Always index 0 after sorting — carried explicitly so the frontend does not have
+    /// to re-derive a rule that lives here.
+    pub keeper: i64,
+    /// `true` when the members come from different packs, which is the interesting case: the same
+    /// rock shipped in three Synty packs is disk you can reclaim; two copies inside one pack is
+    /// how that pack was built.
+    pub cross_pack: bool,
+}
+
 /// What the ⚑ Filters popover needs to draw itself (UI-SPEC §2.3).
 ///
 /// Sent from Rust rather than hardcoded in TypeScript because every id and label here is a wire
@@ -297,6 +356,9 @@ struct Row {
     status: AssetStatus,
     /// Tag names, filled in one bulk pass (`mark_traits`) — the trait facet needs them per row.
     traits: Vec<String>,
+    /// BLAKE3 of the primary file — the exact-duplicate key. `None` until the hash drain has
+    /// reached this asset, which is most of a freshly scanned library.
+    content_hash: Option<String>,
     /// The path the Folders view browses by: `rel_path` for a loose file, but
     /// `<pack>/<rel_path>` for an in-pack asset.
     ///
@@ -691,6 +753,130 @@ impl Library {
         }
     }
 
+    /// The Stats overview, derived from the rows in memory (UI-SPEC §8.1).
+    pub fn stats(&self) -> Stats {
+        use std::collections::BTreeMap;
+        let mut by_type: BTreeMap<u8, (String, TypeStat)> = BTreeMap::new();
+        let mut by_pack: HashMap<&str, (usize, i64)> = HashMap::new();
+        let mut bytes_total = 0i64;
+        let mut triangles_total = 0i64;
+        let mut models = 0usize;
+        let mut unidentified = 0usize;
+
+        for r in self.live() {
+            bytes_total += r.item.size_bytes.max(0);
+            triangles_total += r.item.triangles.unwrap_or(0).max(0);
+            if r.media_type == Some(MediaType::Model3d) {
+                models += 1;
+            }
+            if !matches!(r.status, AssetStatus::Identified | AssetStatus::Confirmed) {
+                unidentified += 1;
+            }
+            if let Some(p) = r.item.package.as_deref() {
+                let e = by_pack.entry(p).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += r.item.size_bytes.max(0);
+            }
+            // Keyed on the enum's own order so the rows read in the same order as the Type sort.
+            let e = by_type
+                .entry(grid::media_key(r.media_type))
+                .or_insert_with(|| {
+                    (
+                        r.item.media_type.clone(),
+                        TypeStat {
+                            media_type: r.item.media_type.clone(),
+                            count: 0,
+                            bytes: 0,
+                            triangles: 0,
+                            duration_ms: 0,
+                        },
+                    )
+                });
+            e.1.count += 1;
+            e.1.bytes += r.item.size_bytes.max(0);
+            e.1.triangles += r.item.triangles.unwrap_or(0).max(0);
+            e.1.duration_ms += r.duration_ms.unwrap_or(0).max(0);
+        }
+
+        let mut packs: Vec<PackStat> = by_pack
+            .into_iter()
+            .map(|(name, (count, bytes))| PackStat {
+                name: name.to_string(),
+                count,
+                bytes,
+            })
+            .collect();
+        packs.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
+
+        let mut heaviest: Vec<&Row> = self.live().collect();
+        heaviest.sort_by(|a, b| {
+            b.item
+                .size_bytes
+                .cmp(&a.item.size_bytes)
+                .then_with(|| a.item.asset_id.cmp(&b.item.asset_id))
+        });
+
+        Stats {
+            total_assets: self.live().count(),
+            sources: self.sources.len(),
+            packs: packs.len(),
+            bytes_total,
+            triangles_total,
+            models,
+            unidentified,
+            by_type: by_type.into_values().map(|(_, s)| s).collect(),
+            by_pack: packs.into_iter().take(12).collect(),
+            heaviest: heaviest.iter().take(5).map(|r| r.item.clone()).collect(),
+            duplicate_groups: self.duplicates().len(),
+        }
+    }
+
+    /// Exact-duplicate groups: live assets sharing a BLAKE3 (DATA-MODEL §5).
+    ///
+    /// **Exact, not perceptual.** UI-SPEC §5 describes near-duplicate review; the only similarity
+    /// signal in the catalog today is the content hash, so this ships the half that is backed by
+    /// data and says so on screen. Perceptual grouping arrives with the embeddings, and the
+    /// screen's shape does not change when it does — only the reason line.
+    ///
+    /// ponytail: whole-library group-by on every call, over rows already in memory. It runs when a
+    /// screen opens, not per keystroke; cache it behind the reload if a profile ever says to.
+    pub fn duplicates(&self) -> Vec<DupGroup> {
+        let mut by_hash: HashMap<&str, Vec<&Row>> = HashMap::new();
+        for r in self.live() {
+            // A missing hash is "not yet hashed", not "hashes to nothing" — grouping those
+            // together would present the entire un-drained backlog as one giant duplicate set.
+            if let Some(h) = r.content_hash.as_deref() {
+                by_hash.entry(h).or_default().push(r);
+            }
+        }
+        let mut groups: Vec<DupGroup> = by_hash
+            .into_iter()
+            .filter(|(_, rows)| rows.len() > 1)
+            .map(|(hash, mut rows)| {
+                // Keeper: highest status wins, ties to the earliest indexed (lowest id).
+                rows.sort_by_key(|r| (std::cmp::Reverse(status_rank(r.status)), r.item.asset_id));
+                let first_pack = rows[0].item.package.as_deref();
+                DupGroup {
+                    hash: hash.to_string(),
+                    size_bytes: rows[0].item.size_bytes,
+                    keeper: rows[0].item.asset_id,
+                    cross_pack: rows
+                        .iter()
+                        .any(|r| r.item.package.as_deref() != first_pack),
+                    items: rows.iter().map(|r| r.item.clone()).collect(),
+                }
+            })
+            .collect();
+        // Biggest reclaimable bytes first: a group of six 40 MB textures is the one worth opening.
+        groups.sort_by(|a, b| {
+            let waste = |g: &DupGroup| g.size_bytes * (g.items.len() as i64 - 1);
+            waste(b)
+                .cmp(&waste(a))
+                .then_with(|| a.hash.cmp(&b.hash))
+        });
+        groups
+    }
+
     /// One level of the Folders view.
     ///
     /// Shares every non-folder facet with [`Self::page`] through [`Self::keeps`], so a tab or a
@@ -928,6 +1114,17 @@ impl Library {
     }
 }
 
+/// Lifecycle order, for picking a duplicate group's keeper: the most-appraised copy is the one
+/// worth keeping, because it carries the work someone already did on it (DATA-MODEL §8).
+fn status_rank(s: AssetStatus) -> u8 {
+    match s {
+        AssetStatus::Confirmed => 3,
+        AssetStatus::Identified => 2,
+        AssetStatus::Indexed => 1,
+        AssetStatus::Discovered => 0,
+    }
+}
+
 /// A facet id, taken from the type's **own** serde name rather than a string written out again
 /// here. The popover posts these ids straight back inside a `ContentFilter`, so deriving them from
 /// the same impl that parses them is what makes a round-trip impossible to get wrong.
@@ -968,6 +1165,7 @@ fn row_from(
         None => PathBuf::from(&e.rel_path),
     };
     Row {
+        content_hash: e.content_hash.clone(),
         browse_path,
         search_key: name.to_lowercase(),
         trashed: e.trashed,
@@ -1018,6 +1216,7 @@ mod tests {
                 locator: None,
                 trashed: false,
                 traits: Vec::new(),
+                content_hash: None,
                 browse_path: PathBuf::from(format!("{n}.x")),
                 item: GridItem {
                     asset_id: 0,
@@ -1646,6 +1845,122 @@ mod tests {
         });
         assert_eq!(p.items.len(), 1);
         assert_eq!(p.items[0].name, "kept");
+    }
+
+    /// Stats summarise the **live** library, or the overview disagrees with the grid it is
+    /// summarising — a screen that says 8,237 assets over a grid showing 8,236 is a bug report
+    /// nobody can act on.
+    #[test]
+    fn stats_count_the_live_library_and_bucket_by_type() {
+        let mut l = lib(&[
+            ("a", "model_3d"),
+            ("b", "model_3d"),
+            ("c", "audio"),
+            ("gone", "model_3d"),
+        ]);
+        l.rows[3].trashed = true;
+        for (i, r) in l.rows.iter_mut().enumerate() {
+            r.item.asset_id = i as i64 + 1;
+            r.item.size_bytes = 100;
+        }
+        l.rows[0].item.triangles = Some(900);
+        l.rows[1].status = AssetStatus::Identified;
+
+        let s = l.stats();
+        assert_eq!(s.total_assets, 3, "the trashed asset is not part of the library");
+        assert_eq!(s.bytes_total, 300, "…nor of its size on disk");
+        assert_eq!(s.models, 2);
+        assert_eq!(s.triangles_total, 900);
+        assert_eq!(s.unidentified, 2, "discovered and indexed both read Unidentified");
+
+        let models = s
+            .by_type
+            .iter()
+            .find(|t| t.media_type == "model_3d")
+            .expect("a model bucket");
+        assert_eq!(models.count, 2);
+        assert_eq!(models.bytes, 200);
+    }
+
+    /// Duplicates group on the content hash. **A missing hash is not a hash**: rows the hash drain
+    /// has not reached yet would otherwise collect into one enormous "duplicate" group containing
+    /// most of a freshly scanned library.
+    #[test]
+    fn unhashed_assets_never_group_as_duplicates() {
+        let mut l = lib(&[("a", "model_3d"), ("b", "model_3d"), ("c", "model_3d")]);
+        for (i, r) in l.rows.iter_mut().enumerate() {
+            r.item.asset_id = i as i64 + 1;
+        }
+        assert!(l.duplicates().is_empty(), "three unhashed rows are not a group");
+
+        l.rows[0].content_hash = Some("beef".into());
+        l.rows[1].content_hash = Some("beef".into());
+        let g = l.duplicates();
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].items.len(), 2);
+    }
+
+    /// The keeper is the copy carrying the most work: highest status, ties to the earliest
+    /// indexed. Getting it backwards proposes trashing the identified copy and keeping the
+    /// unappraised one — a destructive suggestion that looks reasonable on screen.
+    #[test]
+    fn the_keeper_is_the_most_appraised_copy() {
+        let mut l = lib(&[("first", "model_3d"), ("second", "model_3d"), ("third", "model_3d")]);
+        for (i, r) in l.rows.iter_mut().enumerate() {
+            r.item.asset_id = i as i64 + 1;
+            r.content_hash = Some("same".into());
+        }
+        l.rows[2].status = AssetStatus::Confirmed;
+
+        let g = l.duplicates();
+        assert_eq!(g[0].keeper, 3, "the confirmed copy keeps, not the earliest");
+        assert_eq!(g[0].items[0].asset_id, 3, "keeper leads the member list");
+
+        // With no status to separate them, the earliest indexed wins.
+        l.rows[2].status = AssetStatus::Indexed;
+        assert_eq!(l.duplicates()[0].keeper, 1);
+    }
+
+    /// Groups lead with the most reclaimable bytes — six copies of a 40 MB texture before two
+    /// copies of a 2 KB one, whatever order the hash map happened to yield.
+    #[test]
+    fn duplicate_groups_lead_with_the_most_reclaimable_bytes() {
+        let mut l = lib(&[
+            ("small_a", "texture"),
+            ("small_b", "texture"),
+            ("big_a", "texture"),
+            ("big_b", "texture"),
+        ]);
+        for (i, r) in l.rows.iter_mut().enumerate() {
+            r.item.asset_id = i as i64 + 1;
+        }
+        l.rows[0].content_hash = Some("small".into());
+        l.rows[1].content_hash = Some("small".into());
+        l.rows[2].content_hash = Some("big".into());
+        l.rows[3].content_hash = Some("big".into());
+        l.rows[0].item.size_bytes = 1_000;
+        l.rows[1].item.size_bytes = 1_000;
+        l.rows[2].item.size_bytes = 5_000_000;
+        l.rows[3].item.size_bytes = 5_000_000;
+
+        let g = l.duplicates();
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].hash, "big", "the heavy group leads");
+    }
+
+    /// Same bytes in two different packs is disk you can reclaim; twice inside one pack is how
+    /// that pack was built. The screen leads with the first, so the flag has to be right.
+    #[test]
+    fn cross_pack_duplicates_are_flagged_as_such() {
+        let mut l = lib(&[("a", "texture"), ("b", "texture"), ("c", "texture")]);
+        for (i, r) in l.rows.iter_mut().enumerate() {
+            r.item.asset_id = i as i64 + 1;
+            r.content_hash = Some("h".into());
+            r.item.package = Some("PolygonCity".into());
+        }
+        assert!(!l.duplicates()[0].cross_pack, "all three came from one pack");
+        l.rows[2].item.package = Some("PolygonFarm".into());
+        assert!(l.duplicates()[0].cross_pack);
     }
 
     #[test]

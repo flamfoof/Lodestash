@@ -90,6 +90,41 @@ export type FolderPage = { tiles: FolderTile[]; items: GridItem[]; total: number
 
 export const folderPage = (query: FolderQuery) => invoke<FolderPage>("folder_page", { query });
 
+/** UI-SPEC §8.1 overview. Every number is derived from the rows the shell already holds. */
+export type TypeStat = {
+  media_type: string;
+  count: number;
+  bytes: number;
+  triangles: number;
+  duration_ms: number;
+};
+export type PackStat = { name: string; count: number; bytes: number };
+export type Stats = {
+  total_assets: number;
+  sources: number;
+  packs: number;
+  bytes_total: number;
+  triangles_total: number;
+  models: number;
+  unidentified: number;
+  by_type: TypeStat[];
+  by_pack: PackStat[];
+  heaviest: GridItem[];
+  duplicate_groups: number;
+};
+
+/** One exact-duplicate group (UI-SPEC §5). A review queue — nothing resolves itself. */
+export type DupGroup = {
+  hash: string;
+  size_bytes: number;
+  items: GridItem[];
+  keeper: number;
+  cross_pack: boolean;
+};
+
+export const libraryStats = () => invoke<Stats>("library_stats");
+export const duplicateGroups = () => invoke<DupGroup[]>("duplicate_groups");
+
 export type AssetDetail = {
   asset_id: number;
   name: string;

@@ -8,6 +8,8 @@
   import { view } from "./lib/nav.svelte";
   import ConfirmDelete from "./lib/ConfirmDelete.svelte";
   import Palette from "./lib/Palette.svelte";
+  import StatsScreen from "./lib/StatsScreen.svelte";
+  import DuplicatesScreen from "./lib/DuplicatesScreen.svelte";
   import {
     libraryStatus,
     reloadLibrary,
@@ -108,7 +110,11 @@
   <div class="body">
     <Sidebar />
     <main>
-      {#if onLibrary}
+      {#if view.route === "stats"}
+        <StatsScreen />
+      {:else if view.route === "dups"}
+        <DuplicatesScreen ontrash={(ids) => write(() => setTrashed(ids, true))} />
+      {:else if onLibrary}
         <LibraryScreen
           {status}
           {favoritesOnly}

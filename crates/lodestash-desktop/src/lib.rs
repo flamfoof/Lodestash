@@ -15,7 +15,8 @@ use serde::Serialize;
 use tauri::Manager;
 
 use crate::library::{
-    AssetDetail, Facets, FolderPage, FolderQuery, GridPage, GridQuery, Library, LibraryStatus,
+    AssetDetail, DupGroup, Facets, FolderPage, FolderQuery, GridPage, GridQuery, Library,
+    LibraryStatus, Stats,
 };
 use crate::writer::{Op, WriteResult, Writer};
 
@@ -93,6 +94,26 @@ fn grid_page(state: tauri::State<'_, AppState>, query: GridQuery) -> Result<Grid
         .library
         .lock()
         .map(|l| l.page(&query))
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
+/// The Stats overview (UI-SPEC §8.1), derived from rows already in memory — no stats query.
+#[tauri::command]
+fn library_stats(state: tauri::State<'_, AppState>) -> Result<Stats, String> {
+    state
+        .library
+        .lock()
+        .map(|l| l.stats())
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
+/// Exact-duplicate groups (UI-SPEC §5). A review queue — nothing here resolves itself.
+#[tauri::command]
+fn duplicate_groups(state: tauri::State<'_, AppState>) -> Result<Vec<DupGroup>, String> {
+    state
+        .library
+        .lock()
+        .map(|l| l.duplicates())
         .map_err(|_| "library lock poisoned".to_string())
 }
 
@@ -245,6 +266,8 @@ pub fn run() {
             grid_page,
             filter_facets,
             folder_page,
+            library_stats,
+            duplicate_groups,
             asset_detail,
             reload_library,
             set_favorite,

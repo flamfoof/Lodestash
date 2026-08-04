@@ -290,6 +290,55 @@ try {
     }
   });
 
+  // Stats derives everything from the rows the shell already holds rather than running its own
+  // COUNT(*)s — so the one thing worth asserting is that it still agrees with the library it is
+  // summarising. A summary screen that says 8,237 over a grid showing 8,236 is unactionable.
+  await check("Stats agrees with the library it summarises", async () => {
+    const [s, st] = await Promise.all([invoke("library_stats"), invoke("library_status")]);
+    assert.equal(s.total_assets, st.total_assets, "stats and status must count the same library");
+    assert.equal(s.sources, st.sources.length);
+    const byType = s.by_type.reduce((a, t) => a + t.count, 0);
+    assert.equal(byType, s.total_assets, "the type buckets must partition the library");
+    const bytes = s.by_type.reduce((a, t) => a + t.bytes, 0);
+    assert.equal(bytes, s.bytes_total, "…and so must their sizes");
+    assert.ok(s.heaviest.length > 0 && s.heaviest[0].size_bytes >= s.heaviest.at(-1).size_bytes);
+
+    await page.getByRole("button", { name: "Stats" }).click();
+    await page.waitForSelector('[data-testid="stat-tiles"]', { timeout: 5000 });
+    const shown = await page.locator('[data-testid="stat-tiles"] .value').first().textContent();
+    assert.equal(
+      Number(shown.replace(/\D/g, "")),
+      s.total_assets,
+      "the first tile must show the asset count the backend reported",
+    );
+  });
+
+  // Exact duplicates only. The failure worth catching is the one that looks like a working
+  // screen: grouping rows whose hash is *absent* collects the entire un-drained backlog into one
+  // enormous "duplicate" group.
+  await check("Duplicates groups only hashed assets, keeper first", async () => {
+    const groups = await invoke("duplicate_groups");
+    for (const g of groups) {
+      assert.ok(g.hash.length > 0, "a group must be identified by a real hash");
+      assert.ok(g.items.length > 1, "a group of one is not a duplicate");
+      assert.equal(g.items[0].asset_id, g.keeper, "the keeper leads its group");
+      assert.ok(
+        new Set(g.items.map((i) => i.asset_id)).size === g.items.length,
+        "an asset cannot duplicate itself",
+      );
+    }
+    const s = await invoke("library_stats");
+    assert.equal(s.duplicate_groups, groups.length, "Stats and the screen must agree on the count");
+
+    await page.getByRole("button", { name: "Duplicates" }).click();
+    await page.waitForSelector(
+      groups.length > 0 ? '[data-testid="dup-groups"]' : '[data-testid="empty"]',
+      { timeout: 5000 },
+    );
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.waitForSelector(".card", { timeout: 5000 });
+  });
+
   await check("Ctrl-K opens the palette, and Enter on an asset reveals it", async () => {
     try {
       await page.fill('input[type="text"]', "");

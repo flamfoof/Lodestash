@@ -356,8 +356,26 @@ until B7.
 
       *Remaining:* drag-in — needs an ingest command this shell does not have (the write path is
       catalog-only today), so it is a real slice rather than wiring.
-- [ ] **B6 — remaining screens.** Packages + pack browser, Unity Assets, Traits, Stats, Duplicates,
-      Trash, Collections, Identify, Onboarding.
+- [~] **B6 — remaining screens.** *Stats + Duplicates shipped 2026-08-03.*
+
+      **Stats** (UI-SPEC §8.1) — tiles, size by type, disk weight by pack, heaviest assets,
+      insight rows. **Derived entirely from the rows the shell already holds**: no stats query, no
+      second set of `COUNT(*)`s over the same data, which is how a summary screen comes to
+      disagree with the grid it summarises. The e2e asserts that agreement directly. The §8.2 Tag
+      Graph is **not** built — a force-directed canvas over the identified library, and 24 of
+      8,237 assets here carry a tag, so it would render an empty field and read as broken.
+
+      **Duplicates** (UI-SPEC §5) — **exact** duplicates only. The sole similarity signal in the
+      catalog today is the BLAKE3 hash; the spec's perceptual near-dup review arrives with the
+      embeddings, and only the reason line changes when it does. A **missing** hash is never a
+      group key — rows the hash drain has not reached would otherwise collect into one enormous
+      "duplicate" group holding most of a fresh library. Keeper = highest status, ties to earliest
+      indexed, because that copy carries the appraisal work. Groups lead with the most reclaimable
+      bytes. The only catalog action is **Move to Trash** (soft, reversible); delete-from-disk is
+      deliberately absent — six near-identical thumbnails is where a mis-click is most likely.
+
+      *Remaining:* Packages + pack browser, Unity Assets, Traits, Collections, Identify,
+      Onboarding, and the Stats Tag Graph.
 - [ ] **B1.5 — `lodestash-cli`.** Headless `scan|index|tag|export`; gives the port a smoke test
       needing no window.
 - [ ] **B7 — cutover.** `[[bin]] lodestash` moves to `lodestash-desktop`, **preserving the `--mcp`
