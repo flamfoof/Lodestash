@@ -12,6 +12,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import fs from "node:fs";
 import path from "node:path";
 import { chromium } from "playwright-core";
 
@@ -63,11 +64,53 @@ async function reachable(url, ms) {
 }
 
 /**
+ * Refuse to run against a binary older than the Rust it is supposed to be testing.
+ *
+ * Vite is rebuilt (or served live) every run, but `BIN` is whatever `cargo build` last produced —
+ * so a Rust change lands in the frontend's *types* while the running app still serves the old
+ * shape. The failure is vicious: a command returns JSON missing a field the UI now reads, the
+ * component that reads it throws mid-render, and the DOM freezes half-updated. What you see is a
+ * stale grid next to a correct result count, which reads like a caching bug anywhere but here.
+ *
+ * Cheap mtime comparison, not a build: the suite should say what is wrong, not silently take
+ * minutes to fix it.
+ */
+function assertBinaryIsCurrent() {
+  if (!fs.existsSync(BIN)) {
+    throw new Error(`no ${BIN} — run: cargo build -p lodestash-desktop --bin lodestash-desktop`);
+  }
+  const built = fs.statSync(BIN).mtimeMs;
+  const srcDirs = ["lodestash-desktop", "lodestash-app", "lodestash-core"].map((c) =>
+    path.join(REPO, "crates", c, "src"),
+  );
+  let newest = 0;
+  let newestPath = "";
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.name.endsWith(".rs")) {
+        const m = fs.statSync(p).mtimeMs;
+        if (m > newest) [newest, newestPath] = [m, p];
+      }
+    }
+  };
+  for (const d of srcDirs) if (fs.existsSync(d)) walk(d);
+  if (newest > built) {
+    throw new Error(
+      `${path.relative(REPO, newestPath)} is newer than the built binary — the app would serve ` +
+        `the old command shapes. Run: cargo build -p lodestash-desktop --bin lodestash-desktop`,
+    );
+  }
+}
+
+/**
  * Start Vite (unless already running) and the app, then attach.
  * Returns `{ page, close }`; always call `close`.
  */
 export async function launch() {
   const spawned = [];
+  assertBinaryIsCurrent();
 
   if (!(await reachable(VITE_URL, 1000))) {
     // A debug build loads devUrl, so the dev server has to be up before the window opens.

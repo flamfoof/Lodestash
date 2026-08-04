@@ -482,14 +482,35 @@ until B7.
         (`lodestash-app/src/types.rs:122–269`) are written and unit-tested but **unreachable from
         the desktop crate** — they need one `pack_dir_tree` command. `content_third_col`
         (`grid.rs:236`) already computes the list's third column.
-        Two smaller conformance gaps ride along: the **sidebar has no STATUS or LIBRARIES facet
-        groups** and no `+ Add source…` (UI-SPEC §0.2) — and `App.svelte` renders `<Sidebar />`
-        with **no `counts` prop at all**, so the unidentified / duplicates / trashed badges can
-        never appear even though `LibraryStatus` carries every number. The toolbar is also missing
-        the result label, the ★ Favorites toggle with its gold count pill, and the source filter.
+        ~~Two smaller conformance gaps ride along: the sidebar facet groups and the `counts`
+        prop.~~ **Done 2026-08-04 — see B8d.** Still open here: the toolbar is missing the result
+        label and the ★ Favorites toggle with its gold count pill.
         `view.viewMode` is one tri-state (`grid | list | folders`), which collapses two independent
         axes the design keeps apart: **browse view** (Flat · Folders) × **row style** (Grid · List).
         Splitting it is what lets Folders have a list mode at all. Neither axis is persisted.
+
+  - [x] **B8d — the card, and the facet rail.** *Shipped 2026-08-04.* The two things a user looks at
+        first, taken from three elements to nine and from nav-only to a working rail.
+        **Card** (UI-SPEC/FEATURES §1.1): trait chips with a `+N` overflow, the **S/M/L/XL size
+        badge** over the artwork, the status corner (`✓`/`?`) beside the star — which moved to the
+        **right**, per spec — a media-type diamond bullet, and a meta line that now **leads with the
+        pack** rather than the size, because "which pack is this from" is the question a grid of 8k
+        near-identical Synty props actually raises. `???` moved off the artwork into the tag row,
+        where a reader looks for what an asset *is*. `GridItem` gained `traits` and `size_tier`,
+        both filled by whole-library passes (`mark_traits`, `mark_tiers`) rather than per page —
+        `folder_page`, `stats().heaviest` and the Inspector clone the same item.
+        **Rail** (UI-SPEC §0.2): STATUS and LIBRARIES groups with live counts and a dashed
+        `+ Add source…`, collapsing away from Library/Identify as the spec says rather than
+        vanishing. `LibraryStatus` gained `unidentified` / `identified` / `confirmed` /
+        `duplicate_groups`, folded through the **same `StatusFilter::matches` the grid uses** so a
+        facet count can never disagree with the number of cards clicking it produces — that one
+        object feeds both the rail badges and the facet numbers, so there is no second source to
+        drift. `Sidebar` takes `status` and derives both; the never-passed `counts` prop is gone.
+        `GridQuery` gained `source`, because without it the LIBRARIES facet was a button that
+        set frontend state and changed nothing.
+        *Not done:* per-trait chip colour (needs B8a's widened `VocabRow`), the multi-select box,
+        `⤢` and `+ stage` on the card, and `+ Add source…` is a label, not the §7.4 chooser (B2b).
+        43 Rust tests (2 new, both mutation-checked), 47/47 e2e.
 
 - [ ] **B1.5 — `lodestash-cli`.** Headless `scan|index|tag|export`; gives the port a smoke test
       needing no window.
@@ -508,11 +529,34 @@ until B7.
   last ~12.6k characters (the `psTop` / pack-stats helpers) were never compared; and the project
   also holds a **stale top-level revision** of the prototype and an older `support.js` runtime —
   that copy has `Unity Assets` / `Import Unity packages` / `Add a source` screens and no Favorites,
-  and must not be mistaken for the newer one.
-- **`docs/design/` is untracked in git.** `git ls-files docs/design/` is empty: 437 KB of the
-  stated source of truth — the prototype, the icon sprite, `tokens.css` the webview reads — exists
-  only on this machine. A clone of this repo cannot build the UI's design language from what is
-  committed.
+  and must not be mistaken for the newer one. **Corrected 2026-08-04:** an earlier note here claimed
+  `docs/design/` was untracked in git. It is not — 62 files, committed in `093e285`, tree clean.
+- **The design bundle is three generations that disagree with each other (2026-08-04).** Precedence,
+  newest first — now written into `docs/design/README.md` so it does not have to be re-derived:
+  1. **`FEATURES.md`** — the arbiter. Eleven nav rows *including* **Unity Assets**, dated revision
+     notes (§5.3's content-derived categories, 2026-07-30).
+  2. **`Lodestash Prototype.dc.html`** (Jul 23) — its `navItems` array holds **ten** rows and
+     **no Unity row at all**: `grep` finds neither `Unity Assets` nor `Unity Libraries` in the file.
+     Favorites is present. Building the Unity screen off the prototype would build the wrong thing.
+  3. **`screenshots/`** — older still; every shot has a Unity row and no Favorites.
+
+  The prefixes on the screenshots are **frame numbers inside a named sequence, not revisions**:
+  `01-grid`, `01-pin`, `01-remove` and `01-rm` are byte-identical (same md5), because frame 1 of
+  four different flows is the same untouched library screen. The *last* frame is the interesting
+  one — `05-grid` shows the pack-scoped library with `Add all → N to project` and the §5.6
+  duplicate-on-import toast.
+- **Only 7 of ~64 screenshots were mirrored, on purpose.** `DesignSync.get_file` returns base64
+  **inline** for anything under ~50 KB and only persists larger payloads to disk, so a bulk pull
+  spends the reader's context on image bytes — three of ten in one batch came back inline. Pull
+  them individually by name when a specific screen is being built. See
+  `docs/design/screenshots/README.md`.
+- **The e2e harness ran against a stale binary, and said nothing.** `harness.mjs` launches
+  `target/debug/lodestash-desktop.exe` and never builds it, while Vite is rebuilt every run — so a
+  Rust change reaches the frontend's *types* while the app still serves the old JSON. The symptom is
+  vicious: the component reading the new field throws mid-render, the DOM freezes half-patched, and
+  you get a **stale 100-card grid next to a correct result count of 2**, which reads like a caching
+  bug anywhere but here. Cost three full suite runs to find. `launch()` now mtime-checks the binary
+  against `crates/*/src/**.rs` and refuses to start, naming the file and the build command.
 
 - **546 orphaned package rows (dev catalog, 2026-08-02).** Live assets carrying a `package_id`
   but *neither* `workspace_rel` nor `package_entry_id` — no locator of any kind. No hydrate query

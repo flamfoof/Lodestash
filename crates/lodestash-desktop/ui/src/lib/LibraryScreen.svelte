@@ -52,7 +52,7 @@
     `${view.tab} ${view.search} ${view.status} ${view.sortBy} ${view.sortAsc} ${trashedOnly}` +
       // The ⚑ filter belongs in the reset key for the same reason the search does: narrowing
       // the result while the pager sits on page 9 shows an empty grid.
-      ` ${JSON.stringify(view.filter)} ${view.packageFilter}`,
+      ` ${JSON.stringify(view.filter)} ${view.packageFilter} ${view.source}`,
   );
   let lastKey = "";
   $effect(() => {
@@ -76,6 +76,9 @@
       trashed_only: trashedOnly,
       filter: view.filter,
       package: view.packageFilter,
+      // Shared with the Folders view, where it means "which source am I inside". Same answer
+      // either way: the grid shows one library's assets.
+      source: view.source,
       page,
       page_size: pageSize,
     })

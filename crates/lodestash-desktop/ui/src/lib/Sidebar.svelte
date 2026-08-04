@@ -3,8 +3,52 @@
   import { NAV } from "./routes";
   import { view } from "./nav.svelte";
 
-  /** Badge counts come from the Engine once it is wired; zero means "no badge". */
-  let { counts = {} }: { counts?: Partial<Record<string, number>> } = $props();
+  import type { LibraryStatus } from "./api";
+
+  /**
+   * The rail reads its badges *and* its facet counts off one status object rather than a separate
+   * `counts` map: two sources for the same number is how a badge comes to disagree with the facet
+   * directly under it.
+   */
+  let { status = null }: { status?: LibraryStatus | null } = $props();
+
+  let counts = $derived<Partial<Record<string, number>>>({
+    unidentified: status?.unidentified ?? 0,
+    dups: status?.duplicate_groups ?? 0,
+    trashed: status?.trashed ?? 0,
+  });
+
+  /**
+   * UI-SPEC §0.2: the groups **collapse** away from Library/Identify — "they still render; they are
+   * Library filters". Keeping the headers means the rail's shape does not jump as you move between
+   * screens, and the facets stay discoverable from anywhere.
+   */
+  let expanded = $derived(view.route === "library" || view.route === "identify");
+
+  const STATUSES = [
+    { id: "all", label: "All", tint: "var(--ls-gold)" },
+    { id: "unidentified", label: "Unidentified", tint: "var(--ls-status-unidentified)" },
+    { id: "identified", label: "Identified", tint: "var(--ls-status-identified)" },
+    { id: "confirmed", label: "Confirmed", tint: "var(--ls-status-confirmed)" },
+  ] as const;
+
+  let statusCounts = $derived<Record<string, number>>({
+    all: status?.total_assets ?? 0,
+    unidentified: status?.unidentified ?? 0,
+    identified: status?.identified ?? 0,
+    confirmed: status?.confirmed ?? 0,
+  });
+
+  function pickStatus(id: string) {
+    view.route = "library";
+    view.status = id;
+  }
+
+  function pickSource(name: string | null) {
+    view.route = "library";
+    view.source = name;
+    view.dir = "";
+  }
 </script>
 
 <aside class="sidebar">
@@ -25,6 +69,54 @@
       </button>
     {/each}
   </nav>
+
+  <div class="group">
+    <h2>Status</h2>
+    {#if expanded}
+      {#each STATUSES as s (s.id)}
+        <button
+          class="facet"
+          class:on={view.status === s.id}
+          aria-pressed={view.status === s.id}
+          onclick={() => pickStatus(s.id)}
+        >
+          <i class="dot" style="--dot: {s.tint}" aria-hidden="true"></i>
+          <span class="label">{s.label}</span>
+          <span class="count num">{statusCounts[s.id]}</span>
+        </button>
+      {/each}
+    {/if}
+  </div>
+
+  <div class="group">
+    <h2>Libraries</h2>
+    {#if expanded}
+      <button
+        class="facet"
+        class:on={view.source === null}
+        aria-pressed={view.source === null}
+        onclick={() => pickSource(null)}
+      >
+        <span class="label">All libraries</span>
+        <span class="count num">{status?.total_assets ?? 0}</span>
+      </button>
+      {#each status?.sources ?? [] as src (src.id)}
+        <button
+          class="facet"
+          class:on={view.source === src.name}
+          aria-pressed={view.source === src.name}
+          onclick={() => pickSource(src.name)}
+          title={src.root_path}
+        >
+          <span class="label">{src.name}</span>
+          <span class="count num">{src.asset_count}</span>
+        </button>
+      {/each}
+      <!-- ponytail: the chooser (FEATURES §7.4) is B2b's; until then the drop target is the only
+           way in, and saying so beats a button that opens nothing. -->
+      <div class="add" title="Drop a folder on the window to add it">+ Add source…</div>
+    {/if}
+  </div>
 </aside>
 
 <style>
@@ -82,5 +174,60 @@
     background: var(--ls-gold);
     border-radius: var(--r-pill);
     padding: 1px 7px;
+  }
+
+  .group {
+    margin-top: var(--sp-4);
+  }
+  .group h2 {
+    margin: 0 0 var(--sp-1);
+    padding: 0 var(--sp-2);
+    font-size: var(--fs-xs);
+    font-weight: 600;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--ls-text-dim);
+  }
+  .facet {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    width: 100%;
+    height: var(--row-h);
+    padding: 0 var(--sp-2);
+    border-radius: var(--r-md);
+    /* Same reserved 2px as .row, for the same reason: selecting must not nudge the label. */
+    border-left: 2px solid transparent;
+    color: var(--ls-text-muted);
+    text-align: left;
+  }
+  .facet:hover {
+    background: var(--ls-overlay);
+    color: var(--ls-text);
+  }
+  .facet.on {
+    background: var(--ls-surface-raised);
+    border-left-color: var(--ls-gold);
+    color: var(--ls-text);
+  }
+  .dot {
+    flex: none;
+    width: 7px;
+    height: 7px;
+    background: var(--dot);
+    transform: rotate(45deg);
+  }
+  .count {
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+  }
+  .add {
+    margin-top: var(--sp-1);
+    padding: var(--sp-1) var(--sp-2);
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+    border: 1px dashed var(--ls-border-strong);
+    border-radius: var(--r-md);
+    text-align: center;
   }
 </style>

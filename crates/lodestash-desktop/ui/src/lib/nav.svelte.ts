@@ -53,6 +53,8 @@ class ViewState {
     this.tab = "all";
     this.status = "all";
     this.packageFilter = null;
+    this.source = null;
+    this.dir = "";
     this.clearFilter();
   }
 

@@ -30,6 +30,24 @@
     item.has_preview ? previewUrl(item.asset_id) : canRaster ? thumbUrl(item.asset_id) : null,
   );
   let unidentified = $derived(item.status === "discovered" || item.status === "indexed");
+
+  // FEATURES §1.1: the meta line leads with the pack, because "which pack is this from" is the
+  // question a grid of 8k near-identical Synty props actually raises. Size moved to the tier chip.
+  let sub = $derived(
+    [
+      item.package,
+      item.triangles ? `${item.triangles.toLocaleString()} tris` : null,
+      fmtSize(item.size_bytes),
+    ]
+      .filter(Boolean)
+      .join(" · "),
+  );
+
+  // Three chips then a count. Showing every trait makes card height depend on how well-tagged an
+  // asset happens to be, which turns the grid ragged for no gain.
+  const SHOWN = 3;
+  let chips = $derived(item.traits.slice(0, SHOWN));
+  let overflow = $derived(Math.max(0, item.traits.length - SHOWN));
 </script>
 
 <button
@@ -47,18 +65,39 @@
     {:else}
       <Icon name={typeIcon(item.media_type)} size={28} />
     {/if}
-    {#if unidentified}
-      <span class="gem" title="Unidentified">???</span>
-    {/if}
-    {#if item.favorite}
-      <span class="star" title="Favourite" aria-label="Favourite">★</span>
+    <span class="corner">
+      {#if item.favorite}
+        <span class="star" title="Favourite" aria-label="Favourite">★</span>
+      {/if}
+      <span
+        class="state"
+        class:unknown={unidentified}
+        title={unidentified ? "Unidentified" : item.status}
+      >
+        {unidentified ? "?" : "✓"}
+      </span>
+    </span>
+    {#if item.size_tier}
+      <span class="tier num t{item.size_tier}">{item.size_tier} · {fmtSize(item.size_bytes)}</span>
     {/if}
   </div>
   <div class="meta">
-    <span class="name">{item.name}</span>
-    <span class="sub num">
-      {fmtSize(item.size_bytes)}{#if item.triangles} · {item.triangles.toLocaleString()} tri{/if}
-    </span>
+    <span class="name"><i class="bullet" aria-hidden="true"></i>{item.name}</span>
+    <span class="sub num">{sub}</span>
+  </div>
+  <div class="tags">
+    {#if unidentified}
+      <!-- The tag row is where a reader looks for what an asset *is*; an unidentified one says so
+           there rather than hiding a marker on the artwork. -->
+      <span class="unknown-tags">???</span>
+    {:else}
+      {#each chips as t (t)}
+        <span class="tag">{t}<i class="dash" aria-hidden="true"></i></span>
+      {/each}
+      {#if overflow > 0}
+        <span class="tag more" title={item.traits.slice(SHOWN).join(", ")}>+{overflow}</span>
+      {/if}
+    {/if}
   </div>
 </button>
 
@@ -101,22 +140,59 @@
     object-fit: contain;
   }
 
-  .gem {
+  /* Star and status share the top-right corner (FEATURES §1.1) so the artwork's top-left stays
+     clear for the multi-select box a later slice adds. */
+  .corner {
     position: absolute;
     top: var(--sp-1);
     right: var(--sp-1);
+    display: flex;
+    align-items: center;
+    gap: var(--sp-1);
+  }
+  .state {
+    display: grid;
+    place-items: center;
+    width: 16px;
+    height: 16px;
     font-size: var(--fs-xs);
-    letter-spacing: 0.06em;
-    color: var(--ls-status-unidentified);
+    line-height: 1;
+    color: var(--ls-status-identified);
     background: color-mix(in srgb, var(--ls-bg) 80%, transparent);
     border-radius: var(--r-pill);
-    padding: 0 6px;
+  }
+  .state.unknown {
+    color: var(--ls-status-unidentified);
+  }
+
+  /* The size badge sits *on* the artwork, bottom-left, so the letter reads against a constant
+     backdrop rather than whatever colour the meta row happens to be. */
+  .tier {
+    position: absolute;
+    left: var(--sp-1);
+    bottom: var(--sp-1);
+    padding: 1px 6px;
+    font-size: var(--fs-xs);
+    line-height: 1.4;
+    color: var(--tier-fg, var(--ls-text-muted));
+    background: color-mix(in srgb, var(--ls-bg) 82%, transparent);
+    border: 1px solid color-mix(in srgb, var(--tier-fg, var(--ls-border)) 40%, transparent);
+    border-radius: var(--r-sm);
+  }
+  .tS {
+    --tier-fg: var(--ls-success);
+  }
+  .tM {
+    --tier-fg: var(--ls-info);
+  }
+  .tL {
+    --tier-fg: var(--ls-gold);
+  }
+  .tXL {
+    --tier-fg: var(--ls-danger);
   }
 
   .star {
-    position: absolute;
-    top: var(--sp-1);
-    left: var(--sp-1);
     font-size: var(--fs-sm);
     line-height: 1;
     color: var(--ls-gold);
@@ -129,14 +205,71 @@
     min-width: 0;
   }
   .name {
+    display: flex;
+    align-items: center;
+    gap: 6px;
     font-size: var(--fs-sm);
     color: var(--ls-text);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  /* Rotated square, not a glyph: the media-type mark has to read at 7px, and every dingbat that
+     renders as a diamond in one font falls back to a box in another. */
+  .bullet {
+    flex: none;
+    width: 7px;
+    height: 7px;
+    background: var(--tint);
+    transform: rotate(45deg);
+  }
   .sub {
     font-size: var(--fs-xs);
     color: var(--ls-text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Fixed height for one row of chips: card height must not depend on how well-tagged an asset
+     is, or the grid goes ragged and every row reflows as tags land. */
+  .tags {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-1);
+    height: 18px;
+    overflow: hidden;
+  }
+  .tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    max-width: 100%;
+    padding: 1px 6px;
+    font-size: var(--fs-xs);
+    line-height: 1.4;
+    color: var(--ls-text-muted);
+    background: var(--ls-overlay);
+    border-radius: var(--r-pill);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* ponytail: one accent for every chip. Per-trait colour lives on the trait row in the catalog
+     (`color`/`icon`), which the read model does not carry yet — B8a widens it. */
+  .dash {
+    flex: none;
+    width: 10px;
+    height: 2px;
+    background: var(--tint);
+    border-radius: var(--r-pill);
+  }
+  .more {
+    color: var(--ls-text-dim);
+  }
+  .unknown-tags {
+    font-size: var(--fs-xs);
+    letter-spacing: 0.08em;
+    color: var(--ls-status-unidentified);
   }
 </style>

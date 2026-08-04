@@ -111,7 +111,7 @@
 <div class="frame">
   <TopBar engineReady={status?.open ?? false} />
   <div class="body">
-    <Sidebar />
+    <Sidebar {status} />
     <main>
       {#if view.route === "traits"}
         <TraitsScreen />

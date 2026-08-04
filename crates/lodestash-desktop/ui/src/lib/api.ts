@@ -12,6 +12,10 @@ export type GridItem = {
   in_pack: boolean;
   package: string | null;
   triangles: number | null;
+  /** Tag values, drawn as chips under the meta line (FEATURES §1.1). */
+  traits: string[];
+  /** `S` / `M` / `L` / `XL` from the user's own thresholds — never recompute it here. */
+  size_tier: string;
 };
 
 export type GridPage = { items: GridItem[]; total: number; page: number; pages: number };
@@ -27,6 +31,10 @@ export type LibraryStatus = {
   favorites: number;
   with_preview: number;
   trashed: number;
+  unidentified: number;
+  identified: number;
+  confirmed: number;
+  duplicate_groups: number;
 };
 
 /**
@@ -69,6 +77,8 @@ export type GridQuery = {
   filter: ContentFilter;
   /** Restrict to one pack — what Packages' Browse → sets. */
   package?: string | null;
+  /** Restrict to one source library — the sidebar's LIBRARIES facet. Not the same as `package`. */
+  source?: string | null;
   page: number;
   page_size: number;
 };

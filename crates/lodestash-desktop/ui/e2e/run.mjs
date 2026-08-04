@@ -569,6 +569,11 @@ try {
       );
     } finally {
       await page.getByRole("button", { name: "Grid view" }).click();
+      // Walking into a source sets `view.source`, which the sidebar's LIBRARIES facet and the flat
+      // grid *also* read — so leaving Folders in Synty leaves the grid scoped to Synty, and every
+      // later check that searches for an asset in another library finds nothing. Reset the way a
+      // user does: the Library nav row is the documented reset-to-everything (UI-SPEC §0.2).
+      await page.getByRole("button", { name: "Library", exact: true }).click();
       await page.waitForSelector(".card", { timeout: 5000 });
     }
   });

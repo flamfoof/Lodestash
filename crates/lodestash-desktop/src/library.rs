@@ -38,6 +38,12 @@ pub struct GridItem {
     /// Owning pack name, for in-pack assets.
     pub package: Option<String>,
     pub triangles: Option<i64>,
+    /// Tag values on this asset — the chips under the card's meta line (FEATURES §1.1). Filled by
+    /// [`Library::mark_traits`] in one query for the whole library, not one per card.
+    pub traits: Vec<String>,
+    /// `S` / `M` / `L` / `XL`, from the user's own thresholds rather than a fixed scale, so the
+    /// badge means what Settings says it means (FEATURES §5.3).
+    pub size_tier: String,
 }
 
 /// One grid request from the frontend.
@@ -71,6 +77,10 @@ pub struct GridQuery {
     /// a clearable chip above the grid: a filter you cannot see is a library that has quietly gone
     /// missing.
     pub package: Option<String>,
+    /// Restrict to one **source library** — the sidebar's LIBRARIES facet (FEATURES §1.2).
+    /// Distinct from `package`: a source is a watched root on disk, a package is one
+    /// `.unitypackage` inside it, and a source usually holds many.
+    pub source: Option<String>,
     pub page: usize,
     pub page_size: usize,
 }
@@ -87,6 +97,7 @@ impl Default for GridQuery {
             trashed_only: false,
             filter: ContentFilter::default(),
             package: None,
+            source: None,
             page: 0,
             page_size: 100,
         }
@@ -179,6 +190,16 @@ pub struct LibraryStatus {
     pub with_preview: usize,
     /// Soft-deleted assets waiting in the Trash. Drives the nav count.
     pub trashed: usize,
+    /// The STATUS facet group's counts (FEATURES §0.3 / §1.2) and the Identify rail badge.
+    ///
+    /// Folded through the **same** [`StatusFilter::matches`] the grid applies, so the number on a
+    /// facet can never disagree with the number of cards clicking it produces.
+    pub unidentified: usize,
+    pub identified: usize,
+    pub confirmed: usize,
+    /// Groups, not assets: the Duplicates rail badge counts *sets* of matching files, so two
+    /// copies of one texture is one badge, not two.
+    pub duplicate_groups: usize,
 }
 
 /// One level of the Folders view (DESIGN-GUIDELINES §7 "Browse views").
@@ -543,6 +564,20 @@ impl Library {
         self.mark_previews();
         self.mark_favorites();
         self.mark_traits();
+        self.mark_tiers();
+    }
+
+    /// Stamp the S/M/L/XL badge onto every card.
+    ///
+    /// Done once here rather than in `grid_page`, because `folder_page`, `stats().heaviest` and the
+    /// Inspector all clone the same `GridItem` — computing it per page would leave whichever screen
+    /// someone forgot to touch showing a blank badge.
+    fn mark_tiers(&mut self) {
+        let tiers = self.tiers;
+        for r in &mut self.rows {
+            let bytes = r.item.size_bytes.max(0) as u64;
+            r.item.size_tier = tiers.tier_of(bytes).letter().to_string();
+        }
     }
 
     /// Attach tag names to rows, in one query rather than one per row.
@@ -562,6 +597,9 @@ impl Library {
                 // The facet matches on the tag's **value**; its namespace is a grouping for the
                 // Traits screen, not part of the chip's identity.
                 r.traits = t.into_iter().map(|a| a.value).collect();
+                // The card draws the same list, so it rides along on the serialised item rather
+                // than costing a second round-trip per card.
+                r.item.traits = r.traits.clone();
             }
         }
     }
@@ -667,7 +705,17 @@ impl Library {
             favorites: self.live().filter(|r| r.item.favorite).count(),
             with_preview: self.live().filter(|r| r.item.has_preview).count(),
             trashed: self.rows.iter().filter(|r| r.trashed).count(),
+            unidentified: self.count_status(StatusFilter::Unidentified),
+            identified: self.count_status(StatusFilter::Identified),
+            confirmed: self.count_status(StatusFilter::Confirmed),
+            duplicate_groups: self.duplicates().len(),
         }
+    }
+
+    /// Live rows passing one status facet. Shares the fold with the grid on purpose — see
+    /// [`LibraryStatus::unidentified`].
+    fn count_status(&self, f: StatusFilter) -> usize {
+        self.live().filter(|r| f.matches(r.status)).count()
     }
 
     /// The facets both browse views share: tab, status and the ⚑ filter. Trash and favourites are
@@ -721,6 +769,10 @@ impl Library {
             .filter(|r| !q.favorites_only || r.item.favorite)
             .filter(|r| match &q.package {
                 Some(p) => r.item.package.as_deref() == Some(p.as_str()),
+                None => true,
+            })
+            .filter(|r| match &q.source {
+                Some(s) => r.source.as_deref() == Some(s.as_str()),
                 None => true,
             })
             .filter(|r| needle.is_empty() || self.hits(r, &needle, ranks))
@@ -1327,6 +1379,10 @@ fn row_from(
             in_pack: package.is_some(),
             package,
             triangles: e.metrics.tri_count,
+            // Both are filled by a whole-library pass after every row exists (`mark_traits`,
+            // `mark_tiers`) — neither is knowable from a single catalog row.
+            traits: Vec::new(),
+            size_tier: String::new(),
         },
     }
 }
@@ -1364,6 +1420,8 @@ mod tests {
                     in_pack: false,
                     package: None,
                     triangles: None,
+                    traits: Vec::new(),
+                    size_tier: String::new(),
                 },
             })
             .collect();
@@ -1376,6 +1434,50 @@ mod tests {
             paths: HashMap::new(),
             tiers: SizeTiers::default(),
         }
+    }
+
+    /// The badge is the user's thresholds applied to the card, not a fixed scale. Boundaries are
+    /// exclusive-below (`S < m_kb ≤ M`), so the assertions sit *on* each boundary — an off-by-one
+    /// in `tier_of`'s comparison shows up there and nowhere else, and a card mislabelled `M` when
+    /// Settings says `L` is invisible until someone measures a file by hand.
+    #[test]
+    fn the_size_badge_follows_the_configured_thresholds() {
+        // Defaults (FEATURES §5.3): S < 1 MB, M < 4 MB, L < 8 MB, XL ≥ 8 MB.
+        let mut l = lib(&[("a", "model_3d"), ("b", "model_3d"), ("c", "model_3d"), ("d", "model_3d")]);
+        let kb = 1024;
+        for (i, bytes) in [1023 * kb, 1024 * kb, 4096 * kb, 8192 * kb].iter().enumerate() {
+            l.rows[i].item.size_bytes = *bytes;
+        }
+        l.mark_tiers();
+        let letters: Vec<&str> = l.rows.iter().map(|r| r.item.size_tier.as_str()).collect();
+        assert_eq!(letters, ["S", "M", "L", "XL"]);
+
+        // Mutation check: the thresholds are read, not hardcoded. Push M's boundary past the
+        // second row and it must fall back to S.
+        l.tiers.m_kb = 2048;
+        l.mark_tiers();
+        assert_eq!(l.rows[1].item.size_tier, "S", "the badge must track SizeTiers, not a fixed scale");
+    }
+
+    /// The sidebar's LIBRARIES facet is a button that claims to scope the grid. Before this the
+    /// query had no `source` field at all, so the click set frontend state and the grid ignored
+    /// it — the failure mode is a facet that looks selected and changes nothing.
+    #[test]
+    fn the_library_facet_scopes_the_grid_to_one_source() {
+        let mut l = lib(&[("a", "model_3d"), ("b", "model_3d"), ("c", "model_3d")]);
+        l.rows[0].source = Some("Synty".into());
+        l.rows[1].source = Some("Synty".into());
+        l.rows[2].source = Some("Humble".into());
+
+        let q = |s: Option<&str>| GridQuery {
+            source: s.map(str::to_string),
+            ..Default::default()
+        };
+        assert_eq!(l.page(&q(None)).total, 3, "no source means every library");
+        assert_eq!(l.page(&q(Some("Synty"))).total, 2);
+        assert_eq!(l.page(&q(Some("Humble"))).total, 1);
+        // Mutation check: the match is on the source, not a substring or a always-true fallback.
+        assert_eq!(l.page(&q(Some("synty"))).total, 0, "source match is exact");
     }
 
     /// The bucket rule itself lives in `lodestash_app::types` and is tested there. What this
