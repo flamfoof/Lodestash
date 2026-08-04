@@ -8,11 +8,29 @@
 > the detected-GPU chip (the bundle hardcodes `RTX 4070`); the MCP section's real tool names
 > (`search_assets`/`find_similar` — the bundle invents `tag_trait`/`search_library`); Unity libraries
 > living in the catalog as `package.pinned` rather than a `UnityLib` config vec; the audio transport's
-> seek timeline and global volume; the Traits screen hosting the Mapping tab; the ten nav
+> seek timeline and global volume; the Traits screen hosting the Mapping tab; the eleven nav
 > destinations; favourites (§1.1, §1.4, §10); the LINKS filter section; and the delete-from-disk
 > exception to the non-destructive rule (§9).
 >
 > Per `CLAUDE.md` the governing `docs/` files win over this bundle wherever they disagree.
+
+> **Precedence inside this folder (2026-08-04).** The bundle is not one snapshot — it is three
+> generations that disagree with each other. Newest wins:
+>
+> 1. **`FEATURES.md`** — reconciled forward, carries dated revision notes (e.g. §5.3's content-derived
+>    categories, 2026-07-30). **The arbiter.** Eleven nav rows: Library, Favorites, Identify,
+>    Collections, Packages, **Unity Assets**, Traits, Stats, Duplicates, Trash, Settings.
+> 2. **`Lodestash Prototype.dc.html`** — the Jul-23 prototype. Its `navItems` array has **ten** rows
+>    and **no Unity Assets** (`grep` finds neither that string nor `Unity Libraries`). Favorites is
+>    present. Build against `FEATURES.md`, not this file, wherever the two differ.
+> 3. **`screenshots/`** — older still: every shot has a Unity nav row and **no Favorites**, so all of
+>    them predate the prototype. Useful as a pixel-level reference for the Unity landing, Settings and
+>    the filter panel — never as a naming or nav authority. Only a partial set is mirrored locally;
+>    see `screenshots/README.md` for the numbering scheme and what was left in the remote.
+>
+> The Claude Design project also holds a **stale top-level revision** (`Lodestash Prototype.dc.html`
+> and `support.js` at the project root, outside `design_handoff_settings_and_library/`) with a Unity
+> row and no Favorites. It is older than everything above; do not mistake it for newer.
 
 
 ## Overview
