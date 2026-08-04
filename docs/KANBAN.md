@@ -438,12 +438,81 @@ until B7.
       the two counts only reconcile once summed by name, which is what the e2e now asserts.
 
       *Remaining:* Unity Assets, Collections, Identify, Onboarding, and the Stats Tag Graph.
+
+- [ ] **B8 — design conformance.** *Audited 2026-08-04 against the handoff bundle.* The shipped
+      screens are structurally right but thin: several are read-only where the design is a working
+      surface, and the two navigation chromes the design leans on — the sidebar facet groups and the
+      pack directory tree — do not exist at all. Split into three cards below so they can land
+      independently. **Nothing here needs `Engine`**; everything marked *reuse* is a thin command
+      over a catalog function that already exists and is already tested.
+
+  - [ ] **B8a — Traits, from read-only to a working screen** (UI-SPEC §9, FEATURES §4.6).
+        `Library::vocabulary` maps `VocabTrait` → `VocabRow` and **drops `id`, `is_trait`, `scope`,
+        `usage_note`, `color`, `icon`** — exactly the six fields every remaining feature needs, and
+        `list_vocabulary` already selects all of them (`catalog.rs:3421`). Widen the row, then add
+        four writer ops as passthroughs over functions that already exist:
+        `upsert_trait` (`catalog.rs:3482`), `unpromote_trait` (`:3514`), `set_trait_teach` (`:3527`),
+        `set_trait_style` (`:3538`). That buys the NEW TRAIT card, the ✦ **promote existing tags**
+        strip (`is_trait = false` rows are already in the result), the teaching toggle, per-trait
+        colour/glyph, and the chip contract the ⚑ cloud shares. egui reference: `vocabulary_screen`
+        (`app.rs:6331`), `apply_vocab_action` (`:6527`).
+        **The Mapping tab is not in this card** — taxonomy/category/alias/rule authoring has no
+        public catalog surface (only `list_rules` `:3087` and `apply_mapping` `:3133`), so it is a
+        core slice first. egui: `mapping_tab` (`:6587`).
+
+  - [ ] **B8b — Unity Assets, and the pack surfaces Packages is missing** (UI-SPEC §4/§15,
+        FEATURES §5). The `unity` route exists in `routes.ts` and the sidebar row renders, but
+        `App.svelte` has **no branch for it**, so it falls through to the "not built yet" stub.
+        Four thin commands unlock most of the card: a `unity_packages` listing (wrap
+        `list_packages`, mirror `reload_unity_packages` `app.rs:5328`), `set_package_pinned`
+        (`catalog.rs:2045` — `PackageRow.pinned` already reaches the frontend and is **fetched and
+        never rendered**), `list_package_entries` (`:2022`, browse a pack without unpacking), and a
+        `pack_stats` command for the §15 modal (`pack_stats` `app.rs:13500` is pure and unit-tested
+        at `:14825`, but over the egui `AssetEntry` — port it over `library::Row`). Sort reuses
+        `UnitySort` (`types.rs:164`).
+        *Stays blocked on B2b:* per-pack Extract, the tick-box batch queue, the §5.2 import dialog
+        and the §5.6 duplicate-pack check — all ride the `PendingPackage` extraction path and the
+        job tray.
+
+  - [ ] **B8c — browsing: the directory tree, history, and the facet sidebar.** The Folders view
+        matches the *generic* spec but not PACK-DIRECTORY-NAV, which is a **three-pane** layout
+        (244 · 1fr · 268) with a persistent left DIRECTORY tree, ← → ↑ history, a **pack-rooted**
+        breadcrumb, and a folders-first list with a `Name · Size · Items` header.
+        `build_pack_dir_tree`, `DirNode`, `seed_expanded` and `ancestors_expanded`
+        (`lodestash-app/src/types.rs:122–269`) are written and unit-tested but **unreachable from
+        the desktop crate** — they need one `pack_dir_tree` command. `content_third_col`
+        (`grid.rs:236`) already computes the list's third column.
+        Two smaller conformance gaps ride along: the **sidebar has no STATUS or LIBRARIES facet
+        groups** and no `+ Add source…` (UI-SPEC §0.2) — and `App.svelte` renders `<Sidebar />`
+        with **no `counts` prop at all**, so the unidentified / duplicates / trashed badges can
+        never appear even though `LibraryStatus` carries every number. The toolbar is also missing
+        the result label, the ★ Favorites toggle with its gold count pill, and the source filter.
+        `view.viewMode` is one tri-state (`grid | list | folders`), which collapses two independent
+        axes the design keeps apart: **browse view** (Flat · Folders) × **row style** (Grid · List).
+        Splitting it is what lets Folders have a list mode at all. Neither axis is persisted.
+
 - [ ] **B1.5 — `lodestash-cli`.** Headless `scan|index|tag|export`; gives the port a smoke test
       needing no window.
 - [ ] **B7 — cutover.** `[[bin]] lodestash` moves to `lodestash-desktop`, **preserving the `--mcp`
       stdio branch verbatim**; delete `crates/lodestash-ui`; update every doc naming egui.
 
 ## 🔍 Findings — not bugs, but worth knowing
+
+- **The design bundle and the repo copies were reconciled 2026-08-04** against the Claude Design
+  project `f1fd4bce-f7bc-4b33-b099-d74b78f31998` ("LodeStash"). Verdict: **nothing to import.**
+  `Lodestash Prototype.dc.html` and `support.js` are byte-identical to
+  `design_handoff_settings_and_library/`; `FEATURES.md` and `README.md` are **ahead** of the remote
+  bundle (Favorites, the Mapping tab, `package.pinned`, `asset.favorite`, the corrected MCP tool
+  names), which is what the provenance blockquote at the top of `docs/design/README.md` already
+  claims. Two caveats worth keeping: the prototype fetch **truncated at the 256 KiB cap**, so the
+  last ~12.6k characters (the `psTop` / pack-stats helpers) were never compared; and the project
+  also holds a **stale top-level revision** of the prototype and an older `support.js` runtime —
+  that copy has `Unity Assets` / `Import Unity packages` / `Add a source` screens and no Favorites,
+  and must not be mistaken for the newer one.
+- **`docs/design/` is untracked in git.** `git ls-files docs/design/` is empty: 437 KB of the
+  stated source of truth — the prototype, the icon sprite, `tokens.css` the webview reads — exists
+  only on this machine. A clone of this repo cannot build the UI's design language from what is
+  committed.
 
 - **546 orphaned package rows (dev catalog, 2026-08-02).** Live assets carrying a `package_id`
   but *neither* `workspace_rel` nor `package_entry_id` — no locator of any kind. No hydrate query
