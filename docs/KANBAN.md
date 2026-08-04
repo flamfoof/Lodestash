@@ -374,8 +374,21 @@ until B7.
       bytes. The only catalog action is **Move to Trash** (soft, reversible); delete-from-disk is
       deliberately absent — six near-identical thumbnails is where a mis-click is most likely.
 
-      *Remaining:* Packages + pack browser, Unity Assets, Traits, Collections, Identify,
-      Onboarding, and the Stats Tag Graph.
+      **Packages** (UI-SPEC §4) — publisher → pack, with counts derived from the **indexed rows**
+      rather than `package.asset_count`, which is populated for **1 of 87 packs** on this cache;
+      trusting the column would print a wall of blanks beside packs that plainly contain things.
+      The number shown is the number **Browse →** lands on, and the e2e asserts exactly that.
+      Packs with nothing indexed are kept, showing `0` — most of a download cache is archives
+      nobody has opened, and hiding them would claim the library holds six packs when it holds 87.
+      Browse → sets `GridQuery::package`, shown as a clearable gold chip: a filter you cannot see
+      is a library that has quietly gone missing. The sidebar's Library row is now the
+      reset-to-everything affordance §0.2 describes (`view.goLibrary`), kept separate from
+      `go("library")` so Browse → can land on Library and keep the filter it just set.
+
+      *Not here:* per-pack **Extract** and the batch extract queue — they need the ingest path
+      this shell does not have (B2b), so the screen browses and does not unpack.
+
+      *Remaining:* Unity Assets, Traits, Collections, Identify, Onboarding, and the Stats Tag Graph.
 - [ ] **B1.5 — `lodestash-cli`.** Headless `scan|index|tag|export`; gives the port a smoke test
       needing no window.
 - [ ] **B7 — cutover.** `[[bin]] lodestash` moves to `lodestash-desktop`, **preserving the `--mcp`

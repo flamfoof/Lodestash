@@ -67,6 +67,10 @@ pub struct GridQuery {
     /// The ⚑ Filters popover (UI-SPEC §2.3): traits, triangle buckets, size tiers. The **shared**
     /// type, so `ContentFilter::passes` is the one definition of what passing means.
     pub filter: ContentFilter,
+    /// Restrict to one pack — what the Packages screen's **Browse →** sets (UI-SPEC §4). Shown as
+    /// a clearable chip above the grid: a filter you cannot see is a library that has quietly gone
+    /// missing.
+    pub package: Option<String>,
     pub page: usize,
     pub page_size: usize,
 }
@@ -82,6 +86,7 @@ impl Default for GridQuery {
             favorites_only: false,
             trashed_only: false,
             filter: ContentFilter::default(),
+            package: None,
             page: 0,
             page_size: 100,
         }
@@ -225,6 +230,26 @@ pub struct FolderPage {
     pub items: Vec<GridItem>,
     /// Everything under this level, tiles included — the "N assets" the breadcrumb reports.
     pub total: usize,
+}
+
+/// One pack on the Packages screen (UI-SPEC §4), publisher → pack.
+#[derive(Debug, Serialize)]
+pub struct PackageRow {
+    pub id: i64,
+    pub name: String,
+    pub publisher: String,
+    pub category: Option<String>,
+    /// Indexed assets **actually in the catalog** for this pack, not the manifest's claim.
+    ///
+    /// `package.asset_count` is populated for 1 of 87 packs here, so trusting it would show a
+    /// library of blanks. Counting the rows we hold is the number the Browse → link will land on,
+    /// which is the only count worth printing next to it.
+    pub count: usize,
+    pub unidentified: usize,
+    pub bytes: i64,
+    pub pinned: bool,
+    /// The pack has been unpacked to the workspace at some point (DATA-MODEL §7).
+    pub extracted: bool,
 }
 
 /// The Stats overview (UI-SPEC §8.1).
@@ -680,6 +705,10 @@ impl Library {
             .filter(|r| self.keeps(r, q.tab, q.status, &q.filter))
             .filter(|r| r.trashed == q.trashed_only)
             .filter(|r| !q.favorites_only || r.item.favorite)
+            .filter(|r| match &q.package {
+                Some(p) => r.item.package.as_deref() == Some(p.as_str()),
+                None => true,
+            })
             .filter(|r| needle.is_empty() || self.hits(r, &needle, ranks))
             .collect();
 
@@ -751,6 +780,57 @@ impl Library {
             page,
             pages,
         }
+    }
+
+    /// Every pack, publisher-then-name ordered, with the counts derived from the rows we hold
+    /// (UI-SPEC §4).
+    ///
+    /// Packs with **no indexed assets are kept**, showing `0`. Most of this catalog's 87 packs are
+    /// still archives nobody has opened, and hiding them would make the screen claim the library
+    /// holds a handful of packs when the Asset Store cache holds eighty-six.
+    pub fn packages(&self) -> Vec<PackageRow> {
+        let Some(cat) = self.catalog.as_ref() else {
+            return Vec::new();
+        };
+        let listings = match cat.list_packages() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(%e, "list_packages failed");
+                return Vec::new();
+            }
+        };
+        // name -> (indexed, unidentified, bytes), over the live rows.
+        let mut counts: HashMap<&str, (usize, usize, i64)> = HashMap::new();
+        for r in self.live() {
+            if let Some(p) = r.item.package.as_deref() {
+                let e = counts.entry(p).or_insert((0, 0, 0));
+                e.0 += 1;
+                if !matches!(r.status, AssetStatus::Identified | AssetStatus::Confirmed) {
+                    e.1 += 1;
+                }
+                e.2 += r.item.size_bytes.max(0);
+            }
+        }
+        listings
+            .into_iter()
+            .map(|p| {
+                let (count, unidentified, bytes) =
+                    counts.get(p.name.as_str()).copied().unwrap_or((0, 0, 0));
+                PackageRow {
+                    id: p.id,
+                    name: p.name,
+                    // Every pack in this catalog has one, but the column is nullable and an
+                    // unlabelled pack still has to land somewhere the user can find it.
+                    publisher: p.publisher.unwrap_or_else(|| "Unknown publisher".into()),
+                    category: p.category,
+                    count,
+                    unidentified,
+                    bytes,
+                    pinned: p.pinned,
+                    extracted: p.unpacked_at.is_some(),
+                }
+            })
+            .collect()
     }
 
     /// The Stats overview, derived from the rows in memory (UI-SPEC §8.1).
@@ -1961,6 +2041,34 @@ mod tests {
         assert!(!l.duplicates()[0].cross_pack, "all three came from one pack");
         l.rows[2].item.package = Some("PolygonFarm".into());
         assert!(l.duplicates()[0].cross_pack);
+    }
+
+    /// Browse → is only honest if the pack filter composes with everything else; a pack view that
+    /// silently ignored the tab would show a count the toolbar disagrees with.
+    #[test]
+    fn the_pack_filter_narrows_and_composes() {
+        let mut l = lib(&[("a", "model_3d"), ("b", "audio"), ("c", "model_3d")]);
+        l.rows[0].item.package = Some("PolygonCity".into());
+        l.rows[1].item.package = Some("PolygonCity".into());
+        l.rows[2].item.package = Some("PolygonFarm".into());
+
+        let q = |pack: &str, tab| GridQuery {
+            package: Some(pack.into()),
+            tab,
+            ..Default::default()
+        };
+        assert_eq!(l.page(&q("PolygonCity", Category::All)).total, 2);
+        assert_eq!(l.page(&q("PolygonFarm", Category::All)).total, 1);
+        assert_eq!(
+            l.page(&q("PolygonCity", Category::Models)).total,
+            1,
+            "the tab still applies inside a pack"
+        );
+        assert_eq!(
+            l.page(&GridQuery::default()).total,
+            3,
+            "no pack means no constraint"
+        );
     }
 
     #[test]

@@ -67,6 +67,8 @@ export type GridQuery = {
   /** Show the Trash instead of the library — not a facet you combine with the others. */
   trashed_only: boolean;
   filter: ContentFilter;
+  /** Restrict to one pack — what Packages' Browse → sets. */
+  package?: string | null;
   page: number;
   page_size: number;
 };
@@ -121,6 +123,21 @@ export type DupGroup = {
   keeper: number;
   cross_pack: boolean;
 };
+
+/** One pack on the Packages screen (UI-SPEC §4). `count` is indexed rows, not the manifest claim. */
+export type PackageRow = {
+  id: number;
+  name: string;
+  publisher: string;
+  category: string | null;
+  count: number;
+  unidentified: number;
+  bytes: number;
+  pinned: boolean;
+  extracted: boolean;
+};
+
+export const packages = () => invoke<PackageRow[]>("packages");
 
 export const libraryStats = () => invoke<Stats>("library_stats");
 export const duplicateGroups = () => invoke<DupGroup[]>("duplicate_groups");

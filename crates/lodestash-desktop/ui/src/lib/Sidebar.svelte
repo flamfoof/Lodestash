@@ -15,7 +15,7 @@
         class="row"
         class:on={view.route === item.route}
         aria-current={view.route === item.route ? "page" : undefined}
-        onclick={() => view.go(item.route)}
+        onclick={() => (item.route === "library" ? view.goLibrary() : view.go(item.route))}
       >
         <Icon name={item.icon} size={18} />
         <span class="label">{item.label}</span>

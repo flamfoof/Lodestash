@@ -26,6 +26,8 @@ class ViewState {
   /** The ⚑ popover's selection, and whether it is open. Transient — never persisted (design §3). */
   filter = $state<ContentFilter>(emptyFilter());
   filtersOpen = $state(false);
+  /** Active pack filter, set by Packages' Browse → and shown as a clearable chip. */
+  packageFilter = $state<string | null>(null);
   /**
    * Bumped after every catalog write. Screens depend on it, so a mutation re-runs their query.
    *
@@ -38,6 +40,20 @@ class ViewState {
 
   go(route: Route) {
     this.route = route;
+  }
+
+  /**
+   * The sidebar's Library row is the reset-to-everything affordance (UI-SPEC §0.2): it clears the
+   * query, the facets, the ⚑ filter and the pack chip. Kept separate from `go("library")` because
+   * Packages' Browse → also lands on Library and must keep the filter it just set.
+   */
+  goLibrary() {
+    this.route = "library";
+    this.search = "";
+    this.tab = "all";
+    this.status = "all";
+    this.packageFilter = null;
+    this.clearFilter();
   }
 
   /** How many chips are on — the gold badge on the ⚑ button. */

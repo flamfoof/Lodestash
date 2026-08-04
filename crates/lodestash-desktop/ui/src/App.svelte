@@ -10,6 +10,7 @@
   import Palette from "./lib/Palette.svelte";
   import StatsScreen from "./lib/StatsScreen.svelte";
   import DuplicatesScreen from "./lib/DuplicatesScreen.svelte";
+  import PackagesScreen from "./lib/PackagesScreen.svelte";
   import {
     libraryStatus,
     reloadLibrary,
@@ -110,7 +111,9 @@
   <div class="body">
     <Sidebar />
     <main>
-      {#if view.route === "stats"}
+      {#if view.route === "packages"}
+        <PackagesScreen />
+      {:else if view.route === "stats"}
         <StatsScreen />
       {:else if view.route === "dups"}
         <DuplicatesScreen ontrash={(ids) => write(() => setTrashed(ids, true))} />

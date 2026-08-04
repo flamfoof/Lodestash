@@ -16,7 +16,7 @@ use tauri::Manager;
 
 use crate::library::{
     AssetDetail, DupGroup, Facets, FolderPage, FolderQuery, GridPage, GridQuery, Library,
-    LibraryStatus, Stats,
+    LibraryStatus, PackageRow, Stats,
 };
 use crate::writer::{Op, WriteResult, Writer};
 
@@ -94,6 +94,17 @@ fn grid_page(state: tauri::State<'_, AppState>, query: GridQuery) -> Result<Grid
         .library
         .lock()
         .map(|l| l.page(&query))
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
+/// Every pack, publisher → pack (UI-SPEC §4). Counts come from the indexed rows, not from
+/// `package.asset_count`, which is populated for 1 of 87 packs on a real cache.
+#[tauri::command]
+fn packages(state: tauri::State<'_, AppState>) -> Result<Vec<PackageRow>, String> {
+    state
+        .library
+        .lock()
+        .map(|l| l.packages())
         .map_err(|_| "library lock poisoned".to_string())
 }
 
@@ -266,6 +277,7 @@ pub fn run() {
             grid_page,
             filter_facets,
             folder_page,
+            packages,
             library_stats,
             duplicate_groups,
             asset_detail,

@@ -52,7 +52,7 @@
     `${view.tab} ${view.search} ${view.status} ${view.sortBy} ${view.sortAsc} ${trashedOnly}` +
       // The ⚑ filter belongs in the reset key for the same reason the search does: narrowing
       // the result while the pager sits on page 9 shows an empty grid.
-      ` ${JSON.stringify(view.filter)}`,
+      ` ${JSON.stringify(view.filter)} ${view.packageFilter}`,
   );
   let lastKey = "";
   $effect(() => {
@@ -75,6 +75,7 @@
       favorites_only: favoritesOnly,
       trashed_only: trashedOnly,
       filter: view.filter,
+      package: view.packageFilter,
       page,
       page_size: pageSize,
     })
@@ -99,6 +100,15 @@
   </header>
 
   <Toolbar total={result?.total ?? 0} />
+
+  {#if view.packageFilter}
+    <!-- A filter you cannot see is a library that has quietly gone missing. -->
+    <div class="chips">
+      <button class="chip" onclick={() => (view.packageFilter = null)} data-testid="pack-chip">
+        pack: {view.packageFilter} ✕
+      </button>
+    </div>
+  {/if}
 
   <div class="body">
     {#if view.viewMode === "folders"}
@@ -188,6 +198,21 @@
     grid-template-columns: repeat(auto-fill, minmax(var(--card), 1fr));
     gap: var(--sp-3);
   }
+  .chips {
+    flex: none;
+    padding: var(--sp-2) var(--sp-5) 0;
+  }
+  .chip {
+    padding: 2px var(--sp-2);
+    border: 1px solid var(--ls-gold);
+    border-radius: var(--r-pill);
+    background: none;
+    color: var(--ls-gold);
+    font: inherit;
+    font-size: var(--fs-sm);
+    cursor: pointer;
+  }
+
   .msg {
     color: var(--ls-text-dim);
   }

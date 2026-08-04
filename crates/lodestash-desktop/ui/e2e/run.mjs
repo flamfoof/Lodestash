@@ -290,6 +290,68 @@ try {
     }
   });
 
+  // Counts here come from the indexed rows, not from `package.asset_count` — which is populated
+  // for 1 of 87 packs on this cache, so a screen that trusted it would be a wall of blanks next
+  // to packs that plainly contain things.
+  await check("Packages counts match what Browse → actually lands on", async () => {
+    const packs = await invoke("packages");
+    assert.ok(packs.length > 1, `expected a real pack list, got ${packs.length}`);
+    assert.ok(
+      packs.some((p) => p.count > 0),
+      "no pack reports a single indexed asset — the count join is not matching",
+    );
+    // The count printed next to a pack must be the number of assets its Browse → shows.
+    const sample = packs.filter((p) => p.count > 0).slice(0, 3);
+    for (const p of sample) {
+      const page = await invoke("grid_page", {
+        query: {
+          tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+          package: p.name, page: 0, page_size: 1,
+        },
+      });
+      assert.equal(page.total, p.count, `${p.name}: screen says ${p.count}, grid says ${page.total}`);
+    }
+  });
+
+  await check("Browse → filters the library, and the chip clears it", async () => {
+    try {
+      await page.getByRole("button", { name: "Packages" }).click();
+      await page.waitForSelector('[data-testid="publishers"]', { timeout: 5000 });
+      await page.getByTestId("pack-browse").first().click();
+      await page.waitForSelector('[data-testid="pack-chip"]', { timeout: 5000 });
+
+      const all = await invoke("library_status").then((s) => s.total_assets);
+      // The chip renders from view state the instant it is set; the grid behind it is still
+      // fetching, and `total` reads 0 until that lands. Waiting on the chip alone asserts nothing.
+      await page.waitForFunction(
+        () => {
+          const t = document.querySelector('[data-testid="result-count"]')?.textContent;
+          return !!t && Number(t.replace(/\D/g, "")) > 0;
+        },
+        undefined,
+        { timeout: 5000 },
+      );
+      const filtered = await page
+        .getByTestId("result-count")
+        .textContent()
+        .then((t) => Number(t.replace(/\D/g, "")));
+      assert.ok(filtered > 0 && filtered < all, `pack view showed ${filtered} of ${all}`);
+
+      await page.getByTestId("pack-chip").click();
+      await page.waitForFunction(
+        (n) => Number(
+          document.querySelector('[data-testid="result-count"]')?.textContent?.replace(/\D/g, ""),
+        ) === n,
+        all,
+        { timeout: 5000 },
+      );
+    } finally {
+      // The sidebar's Library row is the reset-to-everything affordance, so this also proves it.
+      await page.getByRole("button", { name: "Library", exact: true }).click();
+      await page.waitForSelector(".card", { timeout: 5000 });
+    }
+  });
+
   // Stats derives everything from the rows the shell already holds rather than running its own
   // COUNT(*)s — so the one thing worth asserting is that it still agrees with the library it is
   // summarising. A summary screen that says 8,237 over a grid showing 8,236 is unactionable.
