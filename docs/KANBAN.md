@@ -388,7 +388,18 @@ until B7.
       *Not here:* per-pack **Extract** and the batch extract queue — they need the ingest path
       this shell does not have (B2b), so the screen browses and does not unpack.
 
-      *Remaining:* Unity Assets, Traits, Collections, Identify, Onboarding, and the Stats Tag Graph.
+      **Traits** (UI-SPEC §9) — the vocabulary by namespace, most-used first, with the manual/AI
+      split and a click through to the library filtered to that trait (the ⚑ trait facet, not a
+      text search). **Read-only**: authoring — create, rename, merge, teach — writes to `tag`, and
+      the writer thread has no op for it; that is its own slice with its own undo story.
+
+      Building it surfaced that a **tag name is not unique**: this catalog holds `free` twice, in
+      the `free` and `mood` namespaces. The vocabulary lists one row per tag id, while the ⚑ cloud
+      and `ContentFilter::passes` key on the name and merge them into one chip. That split is
+      correct — the filter is what a user types, the vocabulary is what the taxonomy holds — but
+      the two counts only reconcile once summed by name, which is what the e2e now asserts.
+
+      *Remaining:* Unity Assets, Collections, Identify, Onboarding, and the Stats Tag Graph.
 - [ ] **B1.5 — `lodestash-cli`.** Headless `scan|index|tag|export`; gives the port a smoke test
       needing no window.
 - [ ] **B7 — cutover.** `[[bin]] lodestash` moves to `lodestash-desktop`, **preserving the `--mcp`

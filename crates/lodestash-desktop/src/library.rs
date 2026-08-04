@@ -232,6 +232,20 @@ pub struct FolderPage {
     pub total: usize,
 }
 
+/// One row of the trait vocabulary (UI-SPEC §9).
+#[derive(Debug, Serialize)]
+pub struct VocabRow {
+    pub namespace: String,
+    pub value: String,
+    /// Assets carrying it, and the manual/AI split — which is the honest way to show how much of
+    /// the vocabulary a human wrote versus how much a model guessed.
+    pub usage_count: i64,
+    pub manual_count: i64,
+    pub ai_count: i64,
+    /// Taught to the identifier (DATA-MODEL §4), rather than merely observed.
+    pub teach: bool,
+}
+
 /// One pack on the Packages screen (UI-SPEC §4), publisher → pack.
 #[derive(Debug, Serialize)]
 pub struct PackageRow {
@@ -780,6 +794,46 @@ impl Library {
             page,
             pages,
         }
+    }
+
+    /// The trait vocabulary, most-used first (UI-SPEC §9).
+    ///
+    /// One row per **tag id**, which is not one row per name: this catalog holds `free` twice,
+    /// once in the `free` namespace and once in `mood`. The ⚑ trait cloud and
+    /// `ContentFilter::passes` both key on the *name*, so those two rows are one chip there and
+    /// two rows here. That split is right — the filter is what a user types, the vocabulary is
+    /// what the taxonomy holds — but it means the counts only reconcile once summed by name.
+    ///
+    /// Read-only. Authoring — create, rename, merge, teach — is a write against `tag`, and the
+    /// writer thread has no ops for it; adding them is its own slice with its own undo story.
+    pub fn vocabulary(&self) -> Vec<VocabRow> {
+        let Some(cat) = self.catalog.as_ref() else {
+            return Vec::new();
+        };
+        let mut rows: Vec<VocabRow> = match cat.list_vocabulary() {
+            Ok(v) => v
+                .into_iter()
+                .map(|t| VocabRow {
+                    namespace: t.namespace,
+                    value: t.value,
+                    usage_count: t.usage_count,
+                    manual_count: t.manual_count,
+                    ai_count: t.ai_count,
+                    teach: t.teach,
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(%e, "list_vocabulary failed");
+                return Vec::new();
+            }
+        };
+        rows.sort_by(|a, b| {
+            b.usage_count
+                .cmp(&a.usage_count)
+                .then_with(|| a.namespace.cmp(&b.namespace))
+                .then_with(|| a.value.cmp(&b.value))
+        });
+        rows
     }
 
     /// Every pack, publisher-then-name ordered, with the counts derived from the rows we hold

@@ -11,6 +11,7 @@
   import StatsScreen from "./lib/StatsScreen.svelte";
   import DuplicatesScreen from "./lib/DuplicatesScreen.svelte";
   import PackagesScreen from "./lib/PackagesScreen.svelte";
+  import TraitsScreen from "./lib/TraitsScreen.svelte";
   import {
     libraryStatus,
     reloadLibrary,
@@ -111,7 +112,9 @@
   <div class="body">
     <Sidebar />
     <main>
-      {#if view.route === "packages"}
+      {#if view.route === "traits"}
+        <TraitsScreen />
+      {:else if view.route === "packages"}
         <PackagesScreen />
       {:else if view.route === "stats"}
         <StatsScreen />

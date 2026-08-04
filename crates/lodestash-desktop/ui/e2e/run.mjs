@@ -290,6 +290,40 @@ try {
     }
   });
 
+  // The vocabulary and the ⚑ trait cloud are two views of the same tags. If they disagree, one of
+  // them is reading a different table — and the symptom is a trait row whose Browse lands on an
+  // empty grid, which reads as "that tag has no assets" rather than as a bug.
+  await check("the trait vocabulary agrees with the filter's trait cloud", async () => {
+    const [vocab, facets] = await Promise.all([invoke("vocabulary"), invoke("filter_facets")]);
+    const cloud = new Map(facets.traits.map((t) => [t.name, t.count]));
+
+    // A tag **name is not unique** — this catalog holds `free` twice, once in the `free`
+    // namespace and once in `mood`. The vocabulary lists a row per tag id; the ⚑ cloud and
+    // `ContentFilter::passes` both key on the name, so those rows merge into one chip. Comparing
+    // per-row would fail on exactly that, which is how this was found.
+    const byName = new Map();
+    for (const v of vocab) byName.set(v.value, (byName.get(v.value) ?? 0) + v.usage_count);
+
+    for (const [name, usage] of [...byName].filter(([, u]) => u > 0).slice(0, 20)) {
+      // The cloud counts live rows; the vocabulary counts every undeleted asset, trashed
+      // included — so the cloud may be smaller, never larger.
+      const c = cloud.get(name) ?? 0;
+      assert.ok(c <= usage, `${name}: cloud says ${c}, vocabulary says ${usage}`);
+    }
+    assert.ok(
+      vocab.every((v) => v.manual_count + v.ai_count <= v.usage_count),
+      "the manual/AI split cannot exceed the usage it splits",
+    );
+
+    await page.getByRole("button", { name: "Traits" }).click();
+    await page.waitForSelector(
+      vocab.length > 0 ? '[data-testid="vocab"]' : '[data-testid="empty"]',
+      { timeout: 5000 },
+    );
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.waitForSelector(".card", { timeout: 5000 });
+  });
+
   // Counts here come from the indexed rows, not from `package.asset_count` — which is populated
   // for 1 of 87 packs on this cache, so a screen that trusted it would be a wall of blanks next
   // to packs that plainly contain things.

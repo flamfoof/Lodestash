@@ -16,7 +16,7 @@ use tauri::Manager;
 
 use crate::library::{
     AssetDetail, DupGroup, Facets, FolderPage, FolderQuery, GridPage, GridQuery, Library,
-    LibraryStatus, PackageRow, Stats,
+    LibraryStatus, PackageRow, Stats, VocabRow,
 };
 use crate::writer::{Op, WriteResult, Writer};
 
@@ -94,6 +94,16 @@ fn grid_page(state: tauri::State<'_, AppState>, query: GridQuery) -> Result<Grid
         .library
         .lock()
         .map(|l| l.page(&query))
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
+/// The trait vocabulary (UI-SPEC §9). Read-only — authoring is a write this shell has no op for.
+#[tauri::command]
+fn vocabulary(state: tauri::State<'_, AppState>) -> Result<Vec<VocabRow>, String> {
+    state
+        .library
+        .lock()
+        .map(|l| l.vocabulary())
         .map_err(|_| "library lock poisoned".to_string())
 }
 
@@ -278,6 +288,7 @@ pub fn run() {
             filter_facets,
             folder_page,
             packages,
+            vocabulary,
             library_stats,
             duplicate_groups,
             asset_detail,

@@ -139,6 +139,18 @@ export type PackageRow = {
 
 export const packages = () => invoke<PackageRow[]>("packages");
 
+/** One row of the trait vocabulary (UI-SPEC §9). Read-only — authoring is not wired. */
+export type VocabRow = {
+  namespace: string;
+  value: string;
+  usage_count: number;
+  manual_count: number;
+  ai_count: number;
+  teach: boolean;
+};
+
+export const vocabulary = () => invoke<VocabRow[]>("vocabulary");
+
 export const libraryStats = () => invoke<Stats>("library_stats");
 export const duplicateGroups = () => invoke<DupGroup[]>("duplicate_groups");
 
