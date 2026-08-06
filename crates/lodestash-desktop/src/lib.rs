@@ -11,9 +11,15 @@ pub mod writer;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::Manager;
+use tauri_plugin_window_state::AppHandleExt;
+
+/// Throttle for the geometry save on Moved/Resized (see the `on_window_event` in [`run`]) —
+/// shared across every event so a drag writes at most every 300ms.
+static LAST_GEOMETRY_SAVE: Mutex<Option<Instant>> = Mutex::new(None);
 
 use crate::library::{
     AssetDetail, DupGroup, Facets, FolderPage, FolderQuery, GridPage, GridQuery, Library,
@@ -698,6 +704,28 @@ pub fn run() {
         // before the window is shown — the window opens where the user left it instead of
         // re-applying the launch defaults and jumping. State file lives in the app config dir.
         .plugin(tauri_plugin_window_state::Builder::default().build())
+        // The plugin writes the state file only on a graceful exit (`RunEvent::Exit`). A
+        // killed process — dev Ctrl+C, the e2e harness's taskkill — never reaches it, so the
+        // last move/resize is lost and the next launch restores a stale geometry. Persist on
+        // Moved/Resized too, throttled to ~3 writes/sec so a drag doesn't hammer the disk.
+        .on_window_event(|window, event| {
+            if matches!(
+                event,
+                tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)
+            ) {
+                let mut last = LAST_GEOMETRY_SAVE.lock().unwrap();
+                if last
+                    .map(|t| t.elapsed() >= Duration::from_millis(300))
+                    .unwrap_or(true)
+                {
+                    *last = Some(Instant::now());
+                    drop(last);
+                    let _ = window
+                        .app_handle()
+                        .save_window_state(tauri_plugin_window_state::StateFlags::all());
+                }
+            }
+        })
         .manage(AppState {
             library: Mutex::new(library),
             writer,
