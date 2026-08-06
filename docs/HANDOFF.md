@@ -128,7 +128,7 @@ assets (Unity `.unitypackage` + loose files) — 3D/audio/image — with Rust co
 catalog + AI, `lodestash-app` persist/grid/types, `lodestash-ingest` crawl/thumbnails) and **two
 frontends**: the legacy egui app (`lodestash-ui`, retired at the B7 cutover) and the **current
 app** — `lodestash-desktop`, a Tauri 2 shell hosting a Svelte 5 frontend (no component/CSS/state
-libraries — four npm deps, deliberate). The webview talks to the Rust backend over
+libraries — four bun deps, deliberate). The webview talks to the Rust backend over
 `#[tauri::command]`s; every catalog write goes through one `Writer` thread (`writer.rs` `Op`).
 Design docs in `docs/` + the bundle in `docs/design/` are the source of truth
 (CLAUDE.md conformance rule); `docs/design/ALIGNMENT-AUDIT.md` (new this session) is the map.
@@ -198,7 +198,7 @@ Read it before touching anything.
   `.ps1` files and run with `powershell -File`, or stick to the file tools
   (read_file/edit_file/grep) over shell text munging.
 - **e2e launch requirements**: rebuild the binary first (`cargo build -p lodestash-desktop`) —
-  the harness mtime-guards against stale binaries; the vite build must be current (`npm run
+  the harness mtime-guards against stale binaries; the vite build must be current (`bun run
   build` in `ui/`); onboarding covers the window on first run — the suite dismisses it (first
   check), and any NEW overlay must do the same or every DOM interaction times out.
 - **One writer**: every catalog write goes through the `Writer` thread (`writer.rs` `Op`) — never
@@ -218,7 +218,7 @@ Read it before touching anything.
 
 `cargo test -p lodestash-core --lib` && `cargo test -p lodestash-app --lib` &&
 `cargo test -p lodestash-desktop --lib` (150/150), then in `crates/lodestash-desktop/ui`:
-`npm run check` (0/0), `npm run build`, `npm run e2e` (48/48). Full sanity per §1:
+`bun run check` (0/0), `bun run build`, `bun run e2e` (50/50). Full sanity per §1:
 `cargo test --workspace`, `cargo clippy --workspace --tests`, `cargo fmt --all`.
 
 ## 2. Where the build is
