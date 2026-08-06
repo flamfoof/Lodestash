@@ -6987,3 +6987,101 @@ mod tests {
         assert!(result.is_err(), "FK violation should be rejected");
     }
 }
+
+/// One row of the Collections screen (DATA-MODEL §9): a pinned loadout and its live member
+/// count. The staging tray (`is_staging = 1`) is the shortlist and never appears here.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CollectionRow {
+    pub id: i64,
+    pub name: String,
+    pub asset_count: i64,
+}
+
+impl Catalog {
+    /// Every non-staging collection, name-ordered, with its member count (UI-SPEC §6).
+    pub fn list_collections(&self) -> Result<Vec<CollectionRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT c.id, c.name, COUNT(ca.asset_id) AS n
+                 FROM collection c
+                 LEFT JOIN collection_asset ca ON ca.collection_id = c.id
+                 WHERE c.is_staging = 0
+                 GROUP BY c.id
+                 ORDER BY c.name COLLATE NOCASE",
+            )
+            .map_err(|e| CoreError::Catalog(format!("list_collections: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(CollectionRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    asset_count: r.get(2)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("list_collections: {e}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("list_collections: {e}")))
+    }
+
+    /// Create a named collection; returns its id (UI-SPEC §6 inline create).
+    pub fn create_collection(&self, name: &str) -> Result<i64> {
+        self.conn
+            .execute(
+                "INSERT INTO collection (uuid, name) VALUES (lower(hex(randomblob(16))), ?1)",
+                params![name],
+            )
+            .map_err(|e| CoreError::Catalog(format!("create_collection: {e}")))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Delete a collection; its membership rows cascade. The staging tray is protected — it
+    /// is the shortlist, not a loadout.
+    pub fn delete_collection(&self, id: i64) -> Result<()> {
+        let n = self
+            .conn
+            .execute(
+                "DELETE FROM collection WHERE id = ?1 AND is_staging = 0",
+                params![id],
+            )
+            .map_err(|e| CoreError::Catalog(format!("delete_collection: {e}")))?;
+        if n == 0 {
+            return Err(CoreError::Catalog("no such collection".into()));
+        }
+        Ok(())
+    }
+
+    /// The member ids of one collection — what a collection-filtered grid matches on.
+    pub fn collection_members(&self, id: i64) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT asset_id FROM collection_asset WHERE collection_id = ?1")
+            .map_err(|e| CoreError::Catalog(format!("collection_members: {e}")))?;
+        let rows = stmt
+            .query_map(params![id], |r| r.get::<_, i64>(0))
+            .map_err(|e| CoreError::Catalog(format!("collection_members: {e}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("collection_members: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod collection_tests {
+    use super::*;
+
+    #[test]
+    fn collections_list_create_delete_round_trip_and_skip_staging() {
+        let c = Catalog::open_in_memory().expect("open");
+        let id = c.create_collection("Terrain").expect("create");
+        let rows = c.list_collections().expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "Terrain");
+        assert_eq!(rows[0].asset_count, 0);
+
+        c.delete_collection(id).expect("delete");
+        assert!(c.list_collections().expect("list").is_empty());
+
+        // The staging tray is never listable or deletable as a user collection.
+        assert!(c.delete_collection(0).is_err(), "no such collection");
+    }
+}

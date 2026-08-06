@@ -81,6 +81,9 @@ pub struct GridQuery {
     /// Distinct from `package`: a source is a watched root on disk, a package is one
     /// `.unitypackage` inside it, and a source usually holds many.
     pub source: Option<String>,
+    /// Restrict to one collection's members — what the Collections screen's **Browse →** sets
+    /// (UI-SPEC §6), shown as a clearable chip like the pack filter.
+    pub collection: Option<i64>,
     pub page: usize,
     pub page_size: usize,
 }
@@ -98,6 +101,7 @@ impl Default for GridQuery {
             filter: ContentFilter::default(),
             package: None,
             source: None,
+            collection: None,
             page: 0,
             page_size: 100,
         }
@@ -172,6 +176,9 @@ pub struct SourceSummary {
     pub name: String,
     pub root_path: String,
     pub asset_count: i64,
+    /// Whether this source is being watched for changes (UI-SPEC §11.1) — drives the
+    /// pause/resume toggle on the Settings screen.
+    pub watch_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -200,6 +207,17 @@ pub struct LibraryStatus {
     /// Groups, not assets: the Duplicates rail badge counts *sets* of matching files, so two
     /// copies of one texture is one badge, not two.
     pub duplicate_groups: usize,
+    /// The type-tab row's counts (UI-SPEC §0.3), derived with the same [`Category::matches`] the
+    /// grid applies — a tab's count is the number of cards clicking it produces. `All` equals
+    /// `total_assets`; a bucket with zero hides its tab in the top bar.
+    pub tab_counts: Vec<TabCount>,
+}
+
+/// One type-tab count (UI-SPEC §0.3). `id` is the frontend tab id — `Category::id()`.
+#[derive(Debug, Serialize)]
+pub struct TabCount {
+    pub id: String,
+    pub count: usize,
 }
 
 /// One level of the Folders view (DESIGN-GUIDELINES §7 "Browse views").
@@ -220,6 +238,10 @@ pub struct FolderQuery {
     pub source: Option<String>,
     /// Source-root-relative directory, `/`-separated. Empty is the source's root.
     pub dir: String,
+    /// When set, the Folders tree is **rooted at this pack** (PACK-DIRECTORY-NAV): `dir` is then
+    /// relative to the pack's top folder and only that pack's assets are browsed. The pack's own
+    /// name never appears as a breadcrumb segment — the pack *is* the root.
+    pub package: Option<String>,
 }
 
 impl Default for FolderQuery {
@@ -231,6 +253,7 @@ impl Default for FolderQuery {
             filter: ContentFilter::default(),
             source: None,
             dir: String::new(),
+            package: None,
         }
     }
 }
@@ -243,12 +266,104 @@ pub struct FolderTileOut {
     pub recursive: usize,
 }
 
+/// The Settings screen's payload (UI-SPEC §11, design README §5). A whole-object snapshot: the
+/// frontend edits it and writes it back through `set_settings`, mirroring how `WebPrefs` works.
+/// Strings are used where the frontend's own ids are the vocabulary ("low"/"medium"/"high").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Settings {
+    /// Size-tier boundaries in KB (UI-SPEC §11.4): S < m < l < xl < cap, 128 KB minimum gap.
+    pub m_kb: u32,
+    pub l_kb: u32,
+    pub xl_kb: u32,
+    pub cap_kb: u32,
+    /// Grid-only preview render quality (UI-SPEC §11.3). Quick Look is always full detail.
+    pub preview_quality: String,
+    /// Inverted by the UI: "Show first-run onboarding on launch" (§11.7/§1).
+    pub skip_onboarding: bool,
+    pub watch_sources: bool,
+    pub auto_identify: bool,
+    /// Keep extracted packs cached (UI-SPEC §11.6).
+    pub cache_extracted: bool,
+    pub preview_cache_cap_gb: u32,
+    pub auto_purge_preview_cache: bool,
+    /// The MCP allow-list, stored as the disabled half (UI-SPEC §11.5, MCP↔REST 1:1).
+    pub mcp_disabled_tools: Vec<String>,
+}
+
+impl Settings {
+    pub fn from_config(c: &lodestash_app::config::AppConfig) -> Self {
+        use lodestash_app::config::PreviewQuality;
+        Self {
+            m_kb: c.size_tiers.m_kb,
+            l_kb: c.size_tiers.l_kb,
+            xl_kb: c.size_tiers.xl_kb,
+            cap_kb: c.size_tiers.cap_kb,
+            preview_quality: match c.preview_quality {
+                PreviewQuality::Low => "low",
+                PreviewQuality::Medium => "medium",
+                PreviewQuality::High => "high",
+            }
+            .into(),
+            skip_onboarding: c.skip_onboarding,
+            watch_sources: c.watch_sources,
+            auto_identify: c.auto_identify,
+            cache_extracted: c.cache_extracted,
+            preview_cache_cap_gb: c.preview_cache_cap_gb,
+            auto_purge_preview_cache: c.auto_purge_preview_cache,
+            mcp_disabled_tools: c.mcp_disabled_tools.clone(),
+        }
+    }
+
+    pub fn apply(self, c: &mut lodestash_app::config::AppConfig) {
+        use lodestash_app::config::PreviewQuality;
+        c.size_tiers = lodestash_app::config::SizeTiers {
+            m_kb: self.m_kb,
+            l_kb: self.l_kb,
+            xl_kb: self.xl_kb,
+            cap_kb: self.cap_kb,
+        }
+        .normalized();
+        c.preview_quality = match self.preview_quality.as_str() {
+            "medium" => PreviewQuality::Medium,
+            "high" => PreviewQuality::High,
+            _ => PreviewQuality::Low,
+        };
+        c.skip_onboarding = self.skip_onboarding;
+        c.watch_sources = self.watch_sources;
+        c.auto_identify = self.auto_identify;
+        c.cache_extracted = self.cache_extracted;
+        c.preview_cache_cap_gb = self.preview_cache_cap_gb;
+        c.auto_purge_preview_cache = self.auto_purge_preview_cache;
+        c.mcp_disabled_tools = self.mcp_disabled_tools;
+    }
+}
+
+/// One folder in the pack browser's left tree (PACK-DIRECTORY-NAV §5).
+#[derive(Debug, Clone, Serialize)]
+pub struct PackDirNode {
+    /// Pack-relative path, `/`-separated — the value the browse `dir` is set to on click.
+    pub path: String,
+    /// Last path segment — what the row reads.
+    pub name: String,
+    /// 1-based depth; the top folders of the pack are depth 1.
+    pub depth: usize,
+    /// Assets whose parent folder is this one.
+    pub direct: usize,
+    /// Everything at or under this folder.
+    pub recursive: usize,
+    /// True when some other folder nests under this one (shows the expand chevron).
+    pub has_children: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct FolderPage {
     pub tiles: Vec<FolderTileOut>,
     /// The assets living **directly** in this folder. Not paged: a single directory holding more
     /// than a screenful is the exception, and the tiles above it are the navigation.
     pub items: Vec<GridItem>,
+    /// The list view's third column per item (PACK-DIRECTORY-NAV §6): duration for audio,
+    /// dimensions for images, `—` otherwise — aligned 1:1 with `items`.
+    pub third: Vec<String>,
     /// Everything under this level, tiles included — the "N assets" the breadcrumb reports.
     pub total: usize,
 }
@@ -256,8 +371,15 @@ pub struct FolderPage {
 /// One row of the trait vocabulary (UI-SPEC §9).
 #[derive(Debug, Serialize)]
 pub struct VocabRow {
+    /// The `tag` row's id — what the authoring commands address (upsert_trait & co).
+    pub id: i64,
     pub namespace: String,
     pub value: String,
+    /// False for a plain tag — the row the "promote" strip shows (B8a: `is_trait = false` rows
+    /// are already in `list_vocabulary`'s result).
+    pub is_trait: bool,
+    pub scope: Option<String>,
+    pub usage_note: Option<String>,
     /// Assets carrying it, and the manual/AI split — which is the honest way to show how much of
     /// the vocabulary a human wrote versus how much a model guessed.
     pub usage_count: i64,
@@ -265,6 +387,9 @@ pub struct VocabRow {
     pub ai_count: i64,
     /// Taught to the identifier (DATA-MODEL §4), rather than merely observed.
     pub teach: bool,
+    /// The trait's chip style (set_trait_style): a CSS token or hex colour, and an icon id.
+    pub color: Option<String>,
+    pub icon: Option<String>,
 }
 
 /// One pack on the Packages screen (UI-SPEC §4), publisher → pack.
@@ -475,6 +600,10 @@ impl Library {
 
     /// Re-read sources and their assets from the catalog.
     pub fn reload(&mut self) {
+        // Size tiers feed the S/M/L/XL badges and the ⚑ size facet; they come from config, which
+        // Settings edits — re-read here so a change lands without a restart (the grid never holds
+        // a second copy to go stale).
+        self.tiers = lodestash_app::config::AppConfig::load().size_tiers.normalized();
         let Some(cat) = self.catalog.as_ref() else {
             return;
         };
@@ -554,6 +683,7 @@ impl Library {
                 name: info.name.clone(),
                 root_path: info.root_path.clone(),
                 asset_count: info.asset_count,
+                watch_enabled: info.watch_enabled,
             });
         }
 
@@ -709,6 +839,13 @@ impl Library {
             identified: self.count_status(StatusFilter::Identified),
             confirmed: self.count_status(StatusFilter::Confirmed),
             duplicate_groups: self.duplicates().len(),
+            tab_counts: Category::TABS
+                .iter()
+                .map(|(cat, _)| TabCount {
+                    id: cat.id().to_string(),
+                    count: self.live().filter(|r| cat.matches(r.media_type)).count(),
+                })
+                .collect(),
         }
     }
 
@@ -761,6 +898,17 @@ impl Library {
     /// union rule and the relevance order can be tested without standing up an FTS index.
     fn page_with_ranks(&self, q: &GridQuery, ranks: Option<&HashMap<i64, usize>>) -> GridPage {
         let needle = q.search.trim().to_lowercase();
+        // Collection filter (UI-SPEC §6 Browse →): the grid matches the collection's members.
+        // A missing catalog or unknown id filters to nothing rather than erroring — a deleted
+        // collection is an empty grid until the chip is cleared.
+        let members: Option<std::collections::HashSet<i64>> = match q.collection {
+            Some(id) => self
+                .catalog
+                .as_ref()
+                .and_then(|cat| cat.collection_members(id).ok())
+                .map(|v| v.into_iter().collect()),
+            None => None,
+        };
         let mut matched: Vec<&Row> = self
             .rows
             .iter()
@@ -773,6 +921,10 @@ impl Library {
             })
             .filter(|r| match &q.source {
                 Some(s) => r.source.as_deref() == Some(s.as_str()),
+                None => true,
+            })
+            .filter(|r| match &members {
+                Some(m) => m.contains(&r.item.asset_id),
                 None => true,
             })
             .filter(|r| needle.is_empty() || self.hits(r, &needle, ranks))
@@ -866,12 +1018,18 @@ impl Library {
             Ok(v) => v
                 .into_iter()
                 .map(|t| VocabRow {
+                    id: t.id,
                     namespace: t.namespace,
                     value: t.value,
+                    is_trait: t.is_trait,
+                    scope: t.scope,
+                    usage_note: t.usage_note,
                     usage_count: t.usage_count,
                     manual_count: t.manual_count,
                     ai_count: t.ai_count,
                     teach: t.teach,
+                    color: t.color,
+                    icon: t.icon,
                 })
                 .collect(),
             Err(e) => {
@@ -1086,7 +1244,8 @@ impl Library {
 
         // The top level: one tile per source, not per folder. A single-source library is descended
         // automatically by the frontend, so nobody meets a screen with one tile on it.
-        if q.source.is_none() {
+        // A pack-rooted browse (PACK-DIRECTORY-NAV) never shows this level: the pack *is* the root.
+        if q.source.is_none() && q.package.is_none() {
             let mut per_source: std::collections::BTreeMap<&str, usize> =
                 std::collections::BTreeMap::new();
             for r in &scoped {
@@ -1107,23 +1266,57 @@ impl Library {
                     })
                     .collect(),
                 items: Vec::new(),
+                third: Vec::new(),
             };
         }
 
         let dir = PathBuf::from(q.dir.replace('\\', "/"));
-        let (idxs, tiles) = grid::folder_level(
-            scoped
+        // Pack-rooted browsing strips the leading pack segment from every path, so the pack's own
+        // name is the tree root rather than a folder inside the source (PACK-DIRECTORY-NAV §4/§5).
+        let (idxs, tiles) = if let Some(pkg) = q.package.as_deref() {
+            let scoped: Vec<(usize, &Path, Option<MediaType>)> = scoped
                 .iter()
                 .enumerate()
-                .map(|(i, r)| (i, r.browse_path.as_path(), r.media_type)),
-            &dir,
-            q.tab,
-        );
+                .filter(|(_, r)| r.item.package.as_deref() == Some(pkg))
+                .filter_map(|(i, r)| {
+                    r.browse_path
+                        .strip_prefix(pkg)
+                        .ok()
+                        .map(|p| (i, p, r.media_type))
+                })
+                .collect();
+            grid::folder_level(scoped.iter().map(|(i, p, mt)| (*i, *p, *mt)), &dir, q.tab)
+        } else {
+            let scoped: Vec<(usize, &Path, Option<MediaType>)> = scoped
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (i, r.browse_path.as_path(), r.media_type))
+                .collect();
+            grid::folder_level(scoped.iter().map(|(i, p, mt)| (*i, *p, *mt)), &dir, q.tab)
+        };
         // Everything at or under this folder, which is what the header counts — the files here
         // plus everything the tiles lead to.
         let total = idxs.len() + tiles.iter().map(|t| t.recursive).sum::<usize>();
-        let mut items: Vec<GridItem> = idxs.iter().map(|&i| scoped[i].item.clone()).collect();
-        items.sort_by_key(|i| i.name.to_lowercase());
+        // Sort once, then derive both the items and their third column from the same order so the
+        // list view's columns can never disagree with each other (PACK-DIRECTORY-NAV §6).
+        let mut idxs: Vec<usize> = idxs.into_iter().collect();
+        idxs.sort_by_key(|&i| scoped[i].item.name.to_lowercase());
+        let items: Vec<GridItem> = idxs.iter().map(|&i| scoped[i].item.clone()).collect();
+        let third: Vec<String> = idxs
+            .iter()
+            .map(|&i| {
+                let r = &scoped[i];
+                grid::content_third_col(
+                    r.media_type,
+                    &lodestash_core::catalog::AssetMetrics {
+                        tri_count: r.item.triangles,
+                        width_px: r.width_px,
+                        height_px: r.height_px,
+                        duration_ms: r.duration_ms,
+                    },
+                )
+            })
+            .collect();
         FolderPage {
             tiles: tiles
                 .into_iter()
@@ -1134,8 +1327,92 @@ impl Library {
                 })
                 .collect(),
             items,
+            third,
             total,
         }
+    }
+
+    /// Every non-staging collection with its member count (UI-SPEC §6).
+    pub fn collections(&self) -> Vec<lodestash_core::catalog::CollectionRow> {
+        let Some(cat) = self.catalog.as_ref() else {
+            return Vec::new();
+        };
+        match cat.list_collections() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(%e, "list_collections failed");
+                Vec::new()
+            }
+        }
+    }
+
+    /// The pack browser's left tree (PACK-DIRECTORY-NAV §5): every folder inside one package with
+    /// its `direct (recursive)` counts, derived from the in-memory rows — no query, no new data.
+    ///
+    /// `path` is pack-relative (`Assets/Characters`), `depth` is 1-based, `direct` counts assets
+    /// whose parent is this folder, `recursive` counts everything at or under it. The pack root
+    /// itself is not a node: the tree renders the pack's top folders, and the breadcrumb's gold
+    /// pill *is* the root.
+    pub fn pack_tree(&self, package: &str) -> Vec<PackDirNode> {
+        use std::collections::BTreeMap;
+        let mut direct: BTreeMap<String, usize> = BTreeMap::new();
+        let mut recursive: BTreeMap<String, usize> = BTreeMap::new();
+        for r in self
+            .rows
+            .iter()
+            .filter(|r| !r.trashed && r.item.package.as_deref() == Some(package))
+        {
+            let Ok(rel) = r.browse_path.strip_prefix(package) else {
+                continue;
+            };
+            let rel = rel.to_string_lossy();
+            // The file's own name is never a node — only the directories it lives under are.
+            let Some(parent) = Path::new(&*rel).parent() else {
+                continue;
+            };
+            if parent.as_os_str().is_empty() {
+                continue; // a pack-root file (e.g. readme.txt) is shown by the contents list
+            }
+            // Every ancestor directory of this file — the dirs the tree can navigate to.
+            let mut acc = String::new();
+            for comp in parent.components() {
+                let std::path::Component::Normal(c) = comp else {
+                    continue;
+                };
+                if !acc.is_empty() {
+                    acc.push('/');
+                }
+                acc.push_str(&c.to_string_lossy());
+                *recursive.entry(acc.clone()).or_insert(0) += 1;
+            }
+            // Direct: this file's own parent directory.
+            *direct
+                .entry(parent.to_string_lossy().into_owned())
+                .or_insert(0) += 1;
+        }
+        let mut paths: Vec<String> = direct.keys().chain(recursive.keys()).cloned().collect();
+        paths.sort();
+        paths.dedup();
+        paths
+            .into_iter()
+            .map(|path| {
+                let depth = path.matches('/').count() + 1;
+                let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+                let has_children = recursive
+                    .keys()
+                    .any(|p| p.starts_with(&format!("{path}/")));
+                let direct = *direct.get(&path).unwrap_or(&0);
+                let recursive_count = *recursive.get(&path).unwrap_or(&0);
+                PackDirNode {
+                    path,
+                    name,
+                    depth,
+                    direct,
+                    recursive: recursive_count,
+                    has_children,
+                }
+            })
+            .collect()
     }
 
     /// Everything the Inspector needs for one asset.
@@ -2009,6 +2286,77 @@ mod tests {
         });
         assert_eq!(inside.items.len(), 1);
         assert_eq!(inside.items[0].name, "city");
+    }
+
+    /// The pack browser's left tree (PACK-DIRECTORY-NAV §5): one node per folder, with the
+    /// `direct (recursive)` counts the tree and the contents list both show, and the chevron flag.
+    #[test]
+    fn pack_tree_lists_folders_with_direct_and_recursive_counts() {
+        let l = foldered(&[
+            ("rock", "model_3d", Some("PolygonCity"), "Assets/Props/rock.fbx"),
+            ("tree", "model_3d", Some("PolygonCity"), "Assets/Props/tree.fbx"),
+            ("sky", "texture", Some("PolygonCity"), "Assets/Env/sky.png"),
+            ("readme", "image", Some("PolygonCity"), "readme.txt"),
+        ]);
+        let tree = l.pack_tree("PolygonCity");
+        let nodes: Vec<(&str, usize, usize, usize, bool)> = tree
+            .iter()
+            .map(|n| (n.name.as_str(), n.depth, n.direct, n.recursive, n.has_children))
+            .collect();
+        assert_eq!(
+            nodes,
+            [
+                ("Assets", 1, 0, 3, true),
+                ("Env", 2, 1, 1, false),
+                ("Props", 2, 2, 2, false),
+            ],
+            "folders, their direct (recursive) counts, and whether a chevron shows"
+        );
+        assert_eq!(tree[0].path, "Assets", "the path is pack-relative");
+        assert!(
+            l.pack_tree("PolygonFarm").is_empty(),
+            "another pack's tree is its own"
+        );
+    }
+
+    /// Pack-rooted browsing (PACK-DIRECTORY-NAV): with `package` set, `dir` is relative to the
+    /// pack, only that pack's assets are browsed, and the top level is the pack's folders — not
+    /// the sources. The list's third column arrives with the items (duration for audio).
+    #[test]
+    fn a_pack_rooted_folder_page_browses_only_that_pack() {
+        let mut l = foldered(&[
+            ("rock", "model_3d", Some("PolygonCity"), "Assets/Props/rock.fbx"),
+            ("city", "model_3d", Some("PolygonCity"), "Assets/city.fbx"),
+            ("hum", "audio", Some("PolygonCity"), "Assets/hum.wav"),
+            ("farm", "model_3d", Some("PolygonFarm"), "Assets/farm.fbx"),
+        ]);
+        for r in &mut l.rows {
+            if r.item.name == "hum" {
+                r.duration_ms = Some(161_000);
+            }
+        }
+
+        let root = l.folder_page(&FolderQuery {
+            package: Some("PolygonCity".into()),
+            ..Default::default()
+        });
+        let names: Vec<&str> = root.tiles.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["Assets"], "the pack's own top folders, not every source's");
+        assert!(root.items.is_empty(), "nothing lives directly in the pack root");
+
+        let inside = l.folder_page(&FolderQuery {
+            package: Some("PolygonCity".into()),
+            dir: "Assets".into(),
+            ..Default::default()
+        });
+        let item_names: Vec<&str> = inside.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(item_names, ["city", "hum"], "PolygonFarm's assets never appear");
+        assert_eq!(inside.third, ["—", "2:41"], "third column: dimensions/duration or —");
+        assert_eq!(inside.tiles.len(), 1);
+        assert_eq!(inside.tiles[0].name, "Props");
+        assert_eq!(inside.tiles[0].direct, 1);
+        assert_eq!(inside.tiles[0].recursive, 1);
+        assert_eq!(inside.total, 3, "the header counts everything under this pack folder");
     }
 
     /// Search inside Folders narrows the **subtree**, tile counts included — a tile promising 40

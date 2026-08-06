@@ -17,7 +17,7 @@ use tauri::Manager;
 
 use crate::library::{
     AssetDetail, DupGroup, Facets, FolderPage, FolderQuery, GridPage, GridQuery, Library,
-    LibraryStatus, PackageRow, Stats, VocabRow,
+    LibraryStatus, PackDirNode, PackageRow, Settings, Stats, VocabRow,
 };
 use crate::writer::{Op, WriteResult, Writer};
 
@@ -301,6 +301,129 @@ fn reload_library(state: tauri::State<'_, AppState>) -> Result<LibraryStatus, St
     Ok(lib.status())
 }
 
+/// The pack browser's left tree (PACK-DIRECTORY-NAV §5). Rooted at one package — derived from
+/// the in-memory rows, so it always agrees with the contents pane.
+#[tauri::command]
+fn pack_dir_tree(state: tauri::State<'_, AppState>, package: String) -> Result<Vec<PackDirNode>, String> {
+    state
+        .library
+        .lock()
+        .map(|l| l.pack_tree(&package))
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
+/// The Svelte shell's persisted view prefs (FEATURES §10). Read once at startup; the frontend
+/// keeps its own copy and saves it back through `set_web_prefs` on every change.
+#[tauri::command]
+fn get_web_prefs() -> lodestash_app::config::WebPrefs {
+    lodestash_app::config::AppConfig::load().web
+}
+
+/// Persist the Svelte shell's view prefs. All-or-nothing write of the whole group — the
+/// frontend is the only writer, and a partial patch would leave fields silently stale.
+#[tauri::command]
+fn set_web_prefs(prefs: lodestash_app::config::WebPrefs) -> Result<(), String> {
+    let mut config = lodestash_app::config::AppConfig::load();
+    config.web = prefs;
+    config.save();
+    Ok(())
+}
+
+/// Trait-library authoring (UI-SPEC §9, B8a). Create or promote a trait; an existing tag keeps
+/// its assignments and gains first-class status. Each op runs on the writer thread like every
+/// other catalog write — one writer, one order.
+#[tauri::command]
+fn upsert_trait(
+    state: tauri::State<'_, AppState>,
+    namespace: String,
+    value: String,
+    scope: Option<String>,
+    usage_note: Option<String>,
+    teach: bool,
+) -> Result<WriteResult, String> {
+    state.write(Op::UpsertTrait {
+        namespace,
+        value,
+        scope,
+        usage_note,
+        teach,
+    })
+}
+
+#[tauri::command]
+fn unpromote_trait(state: tauri::State<'_, AppState>, tag_id: i64) -> Result<WriteResult, String> {
+    state.write(Op::UnpromoteTrait { tag_id })
+}
+
+#[tauri::command]
+fn set_trait_teach(state: tauri::State<'_, AppState>, tag_id: i64, teach: bool) -> Result<WriteResult, String> {
+    state.write(Op::SetTraitTeach { tag_id, teach })
+}
+
+#[tauri::command]
+fn set_trait_style(
+    state: tauri::State<'_, AppState>,
+    tag_id: i64,
+    color: Option<String>,
+    icon: Option<String>,
+) -> Result<WriteResult, String> {
+    state.write(Op::SetTraitStyle { tag_id, color, icon })
+}
+
+/// The Settings screen's snapshot (UI-SPEC §11). Read once; the frontend writes it back whole.
+#[tauri::command]
+fn get_settings() -> Settings {
+    Settings::from_config(&lodestash_app::config::AppConfig::load())
+}
+
+/// Persist the Settings snapshot and re-read the library so the size tiers and source rows the
+/// grid draws follow immediately (badges, ⚑ size facet, watch toggles).
+#[tauri::command]
+fn set_settings(state: tauri::State<'_, AppState>, settings: Settings) -> Result<(), String> {
+    let mut config = lodestash_app::config::AppConfig::load();
+    settings.apply(&mut config);
+    config.save();
+    state
+        .library
+        .lock()
+        .map_err(|_| "library lock poisoned".to_string())?
+        .reload();
+    Ok(())
+}
+
+/// Pause/resume watching one source (UI-SPEC §11.1). Goes through the writer like every catalog
+/// write; the library reload after it refreshes the Sources rows.
+#[tauri::command]
+fn set_source_watch(state: tauri::State<'_, AppState>, id: i64, watch: bool) -> Result<WriteResult, String> {
+    state.write(Op::SetSourceWatch { id, watch })
+}
+
+/// Every non-staging collection with its member count (UI-SPEC §6).
+#[tauri::command]
+fn collections(state: tauri::State<'_, AppState>) -> Result<Vec<lodestash_core::catalog::CollectionRow>, String> {
+    state
+        .library
+        .lock()
+        .map(|l| l.collections())
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
+#[tauri::command]
+fn create_collection(state: tauri::State<'_, AppState>, name: String) -> Result<WriteResult, String> {
+    state.write(Op::CreateCollection { name })
+}
+
+#[tauri::command]
+fn delete_collection(state: tauri::State<'_, AppState>, id: i64) -> Result<WriteResult, String> {
+    state.write(Op::DeleteCollection { id })
+}
+
+/// Pin/unpin a `.unitypackage` as a library (FEATURES §5.4) — the Unity Assets screen's ⬢.
+#[tauri::command]
+fn set_package_pinned(state: tauri::State<'_, AppState>, id: i64, pinned: bool) -> Result<WriteResult, String> {
+    state.write(Op::SetPackagePinned { id, pinned })
+}
+
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -351,7 +474,21 @@ pub fn run() {
             set_trashed,
             remove_from_library,
             delete_from_disk,
-            add_source
+            add_source,
+            get_web_prefs,
+            set_web_prefs,
+            pack_dir_tree,
+            upsert_trait,
+            unpromote_trait,
+            set_trait_teach,
+            set_trait_style,
+            get_settings,
+            set_settings,
+            set_source_watch,
+            collections,
+            create_collection,
+            delete_collection,
+            set_package_pinned
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lodestash");

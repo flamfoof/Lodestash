@@ -52,6 +52,34 @@ pub enum Op {
     /// own thread and sends the finished records. This is only the part that must be serialised,
     /// because it is the part that writes.
     PersistScan { batches: Vec<PersistBatch> },
+    /// Trait-library authoring (UI-SPEC §9, B8a): create or promote a trait — an existing tag
+    /// keeps its assignments and gains first-class status.
+    UpsertTrait {
+        namespace: String,
+        value: String,
+        scope: Option<String>,
+        usage_note: Option<String>,
+        teach: bool,
+    },
+    /// Demote a trait back to a plain tag; its assignments survive (never touches `asset_tag`).
+    UnpromoteTrait { tag_id: i64 },
+    /// Toggle a trait's teaching flag.
+    SetTraitTeach { tag_id: i64, teach: bool },
+    /// Set a trait's chip style — colour (CSS token or hex) + optional icon id. `None` clears.
+    SetTraitStyle {
+        tag_id: i64,
+        color: Option<String>,
+        icon: Option<String>,
+    },
+    /// Pause/resume watching one source (UI-SPEC §11.1). Paused sources stay cataloged.
+    SetSourceWatch { id: i64, watch: bool },
+    /// Create a named collection (UI-SPEC §6).
+    CreateCollection { name: String },
+    /// Delete a collection; memberships cascade (UI-SPEC §6).
+    DeleteCollection { id: i64 },
+    /// Pin/unpin a `.unitypackage` as a library (FEATURES §5.4) — pinned packs surface in the
+    /// sidebar's LIBRARIES facet and get the "Add all to project" affordance.
+    SetPackagePinned { id: i64, pinned: bool },
 }
 
 /// What a write did, in the terms the frontend reports to the user.
@@ -143,6 +171,46 @@ fn run(catalog: &Catalog, db_path: &Path, op: Op) -> Result<WriteResult, String>
             lodestash_app::persist::persist_to_catalog(db_path, &batches)
                 .map(|_| WriteResult { changed, ..Default::default() })
         }
+
+        Op::UpsertTrait { namespace, value, scope, usage_note, teach } => catalog
+            .upsert_trait(&namespace, &value, scope.as_deref(), usage_note.as_deref(), teach)
+            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map_err(|e| e.to_string()),
+
+        Op::UnpromoteTrait { tag_id } => catalog
+            .unpromote_trait(tag_id)
+            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map_err(|e| e.to_string()),
+
+        Op::SetTraitTeach { tag_id, teach } => catalog
+            .set_trait_teach(tag_id, teach)
+            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map_err(|e| e.to_string()),
+
+        Op::SetTraitStyle { tag_id, color, icon } => catalog
+            .set_trait_style(tag_id, color.as_deref(), icon.as_deref())
+            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map_err(|e| e.to_string()),
+
+        Op::SetSourceWatch { id, watch } => catalog
+            .set_source_watch(id, watch)
+            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map_err(|e| e.to_string()),
+
+        Op::CreateCollection { name } => catalog
+            .create_collection(&name)
+            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map_err(|e| e.to_string()),
+
+        Op::DeleteCollection { id } => catalog
+            .delete_collection(id)
+            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map_err(|e| e.to_string()),
+
+        Op::SetPackagePinned { id, pinned } => catalog
+            .set_package_pinned(id, pinned)
+            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map_err(|e| e.to_string()),
     }
 }
 

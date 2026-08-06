@@ -172,6 +172,41 @@ impl Default for ViewPrefs {
     }
 }
 
+// ── Svelte shell prefs ─────────────────────────────────────────────────────────
+
+/// The Svelte shell's own persisted view state (FEATURES §10 / design README "State
+/// Management"). Kept apart from the egui `ViewPrefs` until the B7 cutover retires it; the
+/// egui build never reads this group.
+///
+/// B8c: the design keeps two independent axes the egui tri-state `ViewMode` collapsed —
+/// **browse view** (Flat · Folders) × **row style** (Grid · List) — so both are stored here
+/// as their own fields, alongside the density stop and the sort.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebPrefs {
+    /// "flat" | "folders" — browse view (DESIGN-GUIDELINES §7 "Browse views").
+    pub browse: String,
+    /// "grid" | "list" — row style.
+    pub row_style: String,
+    /// "compact" | "cozy" | "large" — the 3-stop grid density (UI-SPEC §20.10).
+    pub density: String,
+    /// Sort key — `SortBy`'s serde name, which is what the frontend `SORTS` ids are.
+    pub sort_by: SortBy,
+    pub sort_asc: bool,
+}
+
+impl Default for WebPrefs {
+    fn default() -> Self {
+        Self {
+            browse: "flat".into(),
+            row_style: "grid".into(),
+            density: "cozy".into(),
+            sort_by: SortBy::Name,
+            sort_asc: true,
+        }
+    }
+}
+
 // ── File-size tier labels ──────────────────────────────────────────────────────
 
 /// The S / M / L / XL size badge tier shown on every thumbnail and used by the File-size filter.
@@ -364,6 +399,10 @@ pub struct AppConfig {
     pub projects: Vec<LibraryProject>,
     /// Persisted view preferences (zoom, sort).
     pub view: ViewPrefs,
+    /// The Svelte shell's persisted view state (WebPrefs above). `#[serde(default)]` so a
+    /// config.json written by the egui build loads unchanged.
+    #[serde(default)]
+    pub web: WebPrefs,
     /// File-size badge thresholds + editable cap (§5.3).
     #[serde(default)]
     pub size_tiers: SizeTiers,
@@ -511,6 +550,7 @@ impl Default for AppConfig {
             recent_roots: Vec::new(),
             projects: Vec::new(),
             view: ViewPrefs::default(),
+            web: WebPrefs::default(),
             size_tiers: SizeTiers::default(),
             preview_quality: PreviewQuality::default(),
             skip_onboarding: false,
