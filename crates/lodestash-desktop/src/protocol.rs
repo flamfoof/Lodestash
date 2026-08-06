@@ -82,9 +82,87 @@ fn preview(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
             // frontend re-reads the id list on reload, so a cached body is never stale in a way
             // the client cannot see.
             .header("Cache-Control", "max-age=3600")
-            .body(svg.into_bytes())
+            .body(fit_preview_to_content(&svg).into_bytes())
             .unwrap_or_else(|_| status(StatusCode::INTERNAL_SERVER_ERROR, "preview: build")),
         None => status(StatusCode::NOT_FOUND, "no preview for that asset"),
+    }
+}
+
+/// Fit a traced-contour preview to its own content so every card renders the artwork at the
+/// same apparent size.
+///
+/// The stored SVGs are a fixed `256×256` canvas, and the silhouette sits wherever the source
+/// render happened to place it — across a real catalog that is 43% to 81% of the width, which
+/// is exactly the "3D cards smaller than audio cards, and some models smaller than others"
+/// look. The tracer emits only absolute `M/L/Z` polygon rings, so a coordinate scan gives the
+/// exact content box; rewrite the viewBox to that box (square, 4% margin) and the card's
+/// square artwork box is filled the same way for every asset — no regeneration needed.
+fn fit_preview_to_content(svg: &str) -> String {
+    // Collect every absolute M/L coordinate pair across all views.
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut found = false;
+    let mut search_from = 0usize;
+    while let Some(rel) = svg[search_from..].find("d=\"") {
+        let start = search_from + rel + 3;
+        let Some(end) = svg[start..].find('"') else { break };
+        let d = &svg[start..start + end];
+        search_from = start + end + 1;
+        let bytes = d.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                // The tracer writes absolute `M x y L x y … Z` — no relative commands, no
+                // curves, no commas. Anything else just leaves the bounds untouched.
+                b'M' | b'L' => {
+                    let rest = &d[i + 1..];
+                    let mut nums = rest.split_whitespace();
+                    if let (Some(xs), Some(ys)) = (nums.next(), nums.next()) {
+                        if let (Ok(x), Ok(y)) = (xs.parse::<f64>(), ys.parse::<f64>()) {
+                            min_x = min_x.min(x);
+                            min_y = min_y.min(y);
+                            max_x = max_x.max(x);
+                            max_y = max_y.max(y);
+                            found = true;
+                        }
+                    }
+                    // Jump past this pair to the next command letter.
+                    let jump = rest.find(['M', 'L', 'Z']).map(|p| p + 1).unwrap_or(rest.len());
+                    i += 1 + jump;
+                }
+                _ => i += 1,
+            }
+        }
+    }
+    if !found || !(max_x > min_x && max_y > min_y) {
+        return svg.to_string(); // degenerate or non-contour content — serve as stored
+    }
+    let side = (max_x - min_x).max(max_y - min_y);
+    let pad = side * 0.04;
+    let cx = (min_x + max_x) / 2.0;
+    let cy = (min_y + max_y) / 2.0;
+    let half = side / 2.0 + pad;
+    let view = format!(
+        "viewBox=\"{:.1} {:.1} {:.1} {:.1}\"",
+        cx - half,
+        cy - half,
+        half * 2.0,
+        half * 2.0
+    );
+    const KEY: &str = "viewBox=";
+    match svg.find(KEY) {
+        Some(pos) => {
+            let after = &svg[pos + KEY.len()..];
+            let Some(q) = after.find('"') else { return svg.to_string() };
+            let close = after[q + 1..].find('"').map(|e| q + 1 + e);
+            match close {
+                Some(end) => format!("{}{}{}", &svg[..pos], view, &after[end + 1..]),
+                None => svg.to_string(),
+            }
+        }
+        None => svg.to_string(),
     }
 }
 
@@ -515,5 +593,34 @@ mod tests {
         assert_eq!(parse_range("bytes=abc-", 100), None, "not a number");
         assert_eq!(parse_range("bytes=0-1,5-6", 100), None, "multi-range");
         assert_eq!(parse_range("bytes=0-", 0), None, "empty file");
+    }
+
+    #[test]
+    fn preview_fit_centers_and_scales_the_content_to_fill() {
+        // A small silhouette at the top-left of the 256 canvas — the "model looks tiny" case.
+        let svg = concat!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">"#,
+            r#"<g id="v0"><path d="M30.0 20.0 L70.0 20.0 L70.0 60.0 L30.0 60.0 Z"/></g>"#,
+            "</svg>",
+        );
+        let out = fit_preview_to_content(svg);
+        // Content box 30..70 in x and y → side 40, pad 1.6, centre (50, 40).
+        assert!(
+            out.contains(r#"viewBox="28.4 18.4 43.2 43.2""#),
+            "unexpected viewBox: {out}"
+        );
+        // Only the viewBox changed; the document and path are untouched.
+        assert!(out.contains(r#"d="M30.0 20.0 L70.0 20.0 L70.0 60.0 L30.0 60.0 Z""#));
+        assert!(out.starts_with(r#"<svg xmlns="http://www.w3.org/2000/svg" "#));
+    }
+
+    #[test]
+    fn preview_fit_leaves_degenerate_or_unparseable_svg_alone() {
+        assert_eq!(
+            fit_preview_to_content(r#"<svg viewBox="0 0 256 256"></svg>"#),
+            r#"<svg viewBox="0 0 256 256"></svg>"#
+        );
+        let curve = r#"<svg viewBox="0 0 256 256"><path d="M10 10 C20 20 30 20 40 10 Z"/></svg>"#;
+        assert_eq!(fit_preview_to_content(curve), curve);
     }
 }
