@@ -52,7 +52,7 @@
     `${view.tab} ${view.search} ${view.status} ${view.sortBy} ${view.sortAsc} ${trashedOnly}` +
       // The ⚑ filter belongs in the reset key for the same reason the search does: narrowing
       // the result while the pager sits on page 9 shows an empty grid.
-      ` ${JSON.stringify(view.filter)} ${view.packageFilter} ${view.source}`,
+      ` ${JSON.stringify(view.filter)} ${view.packageFilter} ${view.collectionFilter?.id ?? ""} ${view.source}`,
   );
   let lastKey = "";
   $effect(() => {
@@ -65,7 +65,7 @@
     view.dataVersion;
     // Folders runs its own query; asking for a page of 100 cards nobody is looking at is a
     // whole-library sort per keystroke for nothing.
-    if (view.viewMode === "folders") return;
+    if (view.browse === "folders") return;
     gridPage({
       tab: view.tab,
       search: view.search,
@@ -76,6 +76,7 @@
       trashed_only: trashedOnly,
       filter: view.filter,
       package: view.packageFilter,
+      collection: view.collectionFilter?.id ?? null,
       // Shared with the Folders view, where it means "which source am I inside". Same answer
       // either way: the grid shows one library's assets.
       source: view.source,
@@ -102,19 +103,30 @@
     {/if}
   </header>
 
-  <Toolbar total={result?.total ?? 0} />
+  <Toolbar total={result?.total ?? 0} favorites={status?.favorites ?? 0} />
 
-  {#if view.packageFilter}
+  {#if view.packageFilter || view.collectionFilter}
     <!-- A filter you cannot see is a library that has quietly gone missing. -->
     <div class="chips">
-      <button class="chip" onclick={() => (view.packageFilter = null)} data-testid="pack-chip">
-        pack: {view.packageFilter} ✕
-      </button>
+      {#if view.packageFilter}
+        <button class="chip" onclick={() => (view.packageFilter = null)} data-testid="pack-chip">
+          pack: {view.packageFilter} ✕
+        </button>
+      {/if}
+      {#if view.collectionFilter}
+        <button
+          class="chip"
+          onclick={() => (view.collectionFilter = null)}
+          data-testid="collection-chip"
+        >
+          collection: {view.collectionFilter.name} ✕
+        </button>
+      {/if}
     </div>
   {/if}
 
   <div class="body">
-    {#if view.viewMode === "folders"}
+    {#if view.browse === "folders"}
       <FoldersView onopen={(id) => (quickLook = id)} />
     {:else if error}
       <p class="msg danger">{error}</p>
@@ -134,7 +146,7 @@
           Nothing in this category.
         {/if}
       </p>
-    {:else if view.viewMode === "list"}
+    {:else if view.rowStyle === "list"}
       <AssetList
         items={result.items}
         selected={view.selected}
@@ -155,7 +167,7 @@
     {/if}
   </div>
 
-  {#if result && result.pages > 1 && view.viewMode !== "folders"}
+  {#if result && result.pages > 1 && view.browse !== "folders"}
     <footer class="pager">
       <button disabled={page === 0} onclick={() => (page = Math.max(0, page - 1))}>‹ Prev</button>
       <span class="num" data-testid="pager">Page {result.page + 1} of {result.pages}</span>

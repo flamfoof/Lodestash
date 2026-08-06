@@ -12,6 +12,10 @@
   import DuplicatesScreen from "./lib/DuplicatesScreen.svelte";
   import PackagesScreen from "./lib/PackagesScreen.svelte";
   import TraitsScreen from "./lib/TraitsScreen.svelte";
+  import SettingsScreen from "./lib/SettingsScreen.svelte";
+  import IdentifyScreen from "./lib/IdentifyScreen.svelte";
+  import CollectionsScreen from "./lib/CollectionsScreen.svelte";
+  import UnityAssetsScreen from "./lib/UnityAssetsScreen.svelte";
   import DropZone from "./lib/DropZone.svelte";
   import {
     libraryStatus,
@@ -21,9 +25,14 @@
     setTrashed,
     removeFromLibrary,
     deleteFromDisk,
+    getWebPrefs,
+    setWebPrefs,
+    getSettings,
     type AssetDetail,
     type LibraryStatus,
   } from "./lib/api";
+  import { refreshTraitColors } from "./lib/traits.svelte";
+  import Onboarding from "./lib/Onboarding.svelte";
 
   let status = $state<LibraryStatus | null>(null);
   let reloading = $state(false);
@@ -31,6 +40,28 @@
   libraryStatus()
     .then((s) => (status = s))
     .catch(() => {});
+  // Chip colours for styled traits (B8a) — loaded once, refreshed after every vocabulary write.
+  refreshTraitColors();
+
+  // First-run onboarding (FEATURES §8): over the live library, unless the user said skip it.
+  let onboardingOpen = $state(false);
+  getSettings()
+    .then((s) => {
+      if (!s.skip_onboarding) onboardingOpen = true;
+    })
+    .catch(() => {});
+
+  // Persisted view prefs (FEATURES §10): hydrate once at startup, then write the whole object
+  // back on any change. The save effect re-fires after hydration with the loaded values — an
+  // idempotent no-op write, not a loop.
+  $effect(() => {
+    getWebPrefs()
+      .then((p) => view.hydrate(p))
+      .catch(() => {});
+  });
+  $effect(() => {
+    setWebPrefs(view.snapshot()).catch(() => {});
+  });
 
   async function reload() {
     reloading = true;
@@ -80,6 +111,8 @@
       await run();
       view.dataVersion += 1;
       status = await libraryStatus();
+      // A write may have styled/demoted a trait — chips across the app should follow.
+      refreshTraitColors();
     } catch (e) {
       actionError = String(e);
     }
@@ -109,12 +142,20 @@
 <svelte:window on:keydown={onkeydown} />
 
 <div class="frame">
-  <TopBar engineReady={status?.open ?? false} />
+  <TopBar engineReady={status?.open ?? false} {status} />
   <div class="body">
     <Sidebar {status} />
     <main>
       {#if view.route === "traits"}
         <TraitsScreen />
+      {:else if view.route === "unity"}
+        <UnityAssetsScreen />
+      {:else if view.route === "collections"}
+        <CollectionsScreen />
+      {:else if view.route === "identify"}
+        <IdentifyScreen />
+      {:else if view.route === "settings"}
+        <SettingsScreen />
       {:else if view.route === "packages"}
         <PackagesScreen />
       {:else if view.route === "stats"}
@@ -159,6 +200,10 @@
 
   {#if paletteOpen}
     <Palette onclose={() => (paletteOpen = false)} />
+  {/if}
+
+  {#if onboardingOpen}
+    <Onboarding onclose={() => (onboardingOpen = false)} />
   {/if}
 
   {#if actionError}

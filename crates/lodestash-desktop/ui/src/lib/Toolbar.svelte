@@ -4,7 +4,7 @@
   import { SORTS, STATUSES, DENSITIES } from "./api";
   import { view } from "./nav.svelte";
 
-  let { total }: { total: number } = $props();
+  let { total, favorites = 0 }: { total: number; favorites?: number } = $props();
 </script>
 
 <svelte:window
@@ -24,8 +24,17 @@
     {/each}
   </div>
 
-  {#if view.viewMode !== "folders"}
-    <span class="count num" data-testid="result-count">{total.toLocaleString()}</span>
+  {#if view.browse !== "folders"}
+    <!-- Result label (FEATURES §1.3). Search keeps the plain form: AI-ranked ✦ results need
+         the semantic search the shell does not have yet, and a label that claims ranking that
+         never happened is the kind of fake the repo does not ship. -->
+    <span class="count num" data-testid="result-count">
+      {#if view.search}
+        {total.toLocaleString()} matches for “{view.search}”
+      {:else}
+        {total.toLocaleString()} assets · {view.source ?? "All libraries"}
+      {/if}
+    </span>
   {/if}
 
   <div class="right">
@@ -49,6 +58,21 @@
     <div class="filters">
       <button
         class="flag"
+        class:on={view.route === "favorites"}
+        onclick={() => (view.route === "favorites" ? view.go("library") : view.go("favorites"))}
+        aria-pressed={view.route === "favorites"}
+        data-testid="fav-toggle"
+        title="Show only starred assets"
+      >
+        <Icon name="ls-nav-favorites" size={14} />
+        Favorites
+        {#if favorites > 0}
+          <span class="badge num" data-testid="fav-badge">{favorites}</span>
+        {/if}
+      </button>
+
+      <button
+        class="flag"
         class:on={view.filtersOpen || view.filterCount > 0}
         onclick={() => (view.filtersOpen = !view.filtersOpen)}
         aria-expanded={view.filtersOpen}
@@ -67,8 +91,11 @@
     <div class="group" role="group" aria-label="View mode">
       <button
         class="icon-btn"
-        class:on={view.viewMode === "grid"}
-        onclick={() => (view.viewMode = "grid")}
+        class:on={view.browse === "flat" && view.rowStyle === "grid"}
+        onclick={() => {
+          view.browse = "flat";
+          view.rowStyle = "grid";
+        }}
         title="Grid"
         aria-label="Grid view"
       >
@@ -76,8 +103,11 @@
       </button>
       <button
         class="icon-btn"
-        class:on={view.viewMode === "list"}
-        onclick={() => (view.viewMode = "list")}
+        class:on={view.browse === "flat" && view.rowStyle === "list"}
+        onclick={() => {
+          view.browse = "flat";
+          view.rowStyle = "list";
+        }}
         title="List"
         aria-label="List view"
       >
@@ -85,8 +115,11 @@
       </button>
       <button
         class="icon-btn"
-        class:on={view.viewMode === "folders"}
-        onclick={() => (view.viewMode = "folders")}
+        class:on={view.browse === "folders"}
+        onclick={() => {
+          view.browse = "folders";
+          view.rowStyle = "grid";
+        }}
         title="Folders"
         aria-label="Folders view"
       >
@@ -94,7 +127,7 @@
       </button>
     </div>
 
-    {#if view.viewMode === "grid"}
+    {#if view.rowStyle === "grid"}
     <div class="group" role="group" aria-label="Density">
       {#each DENSITIES as d (d.id)}
         <button

@@ -31,9 +31,9 @@
         view.tab = t.id;
       },
     })),
-    { label: "Grid view", hint: "View", run: () => (view.viewMode = "grid") },
-    { label: "List view", hint: "View", run: () => (view.viewMode = "list") },
-    { label: "Folders view", hint: "View", run: () => (view.viewMode = "folders") },
+    { label: "Grid view", hint: "View", run: () => { view.browse = "flat"; view.rowStyle = "grid"; } },
+    { label: "List view", hint: "View", run: () => { view.browse = "flat"; view.rowStyle = "list"; } },
+    { label: "Folders view", hint: "View", run: () => { view.browse = "folders"; view.rowStyle = "grid"; } },
     { label: "Toggle inspector", hint: "View", run: () => (view.inspectorOpen = !view.inspectorOpen) },
     { label: "Clear filters", hint: "Filter", run: () => view.clearFilter() },
   ];

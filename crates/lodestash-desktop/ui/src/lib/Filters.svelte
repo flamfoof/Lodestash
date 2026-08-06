@@ -9,6 +9,7 @@
    * not constants that go stale the moment someone edits them.
    */
   import { filterFacets, type Facets, type ContentFilter } from "./api";
+  import { traitColor } from "./traits.svelte";
   import { view } from "./nav.svelte";
 
   let { onclose }: { onclose: () => void } = $props();
@@ -44,7 +45,7 @@
 
 <div class="popover" data-testid="filters-popover">
   <header>
-    <h2>Filters</h2>
+    <h2>FILTER LIBRARY</h2>
     <button
       class="clear"
       onclick={() => view.clearFilter()}
@@ -69,6 +70,7 @@
             <button
               class="chip"
               class:on={on("traits", t.name)}
+              style={traitColor.has(t.name) ? `--chip: var(${traitColor.get(t.name)})` : ""}
               onclick={() => view.toggleFacet("traits", t.name)}
             >
               {t.name}<span class="count num">{t.count}</span>
@@ -138,7 +140,9 @@
     gap: var(--sp-2);
   }
   h2 {
-    font-size: var(--fs-md);
+    font-size: var(--fs-xs);
+    letter-spacing: 0.08em;
+    color: var(--ls-text-dim);
     margin: 0;
   }
   h3 {
@@ -184,10 +188,10 @@
     align-items: center;
     gap: var(--sp-1);
     padding: 2px var(--sp-2);
-    border: 1px solid var(--ls-border);
+    border: 1px solid var(--chip, var(--ls-border));
     border-radius: var(--r-pill);
     background: var(--ls-bg);
-    color: var(--ls-text-dim);
+    color: var(--chip, var(--ls-text-dim));
     font: inherit;
     font-size: var(--fs-sm);
     cursor: pointer;

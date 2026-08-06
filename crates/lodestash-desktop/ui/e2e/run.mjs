@@ -29,6 +29,20 @@ const { page, invoke } = app;
 console.log(`\ndriving ${page.url()}\n`);
 
 try {
+  // First-run onboarding (FEATURES §8) covers the window on a fresh config. Every DOM
+  // interaction below needs it gone — and dismissing it is itself the behaviour under test:
+  // the modal must never trap the library behind it. A returning user (skip_onboarding set)
+  // never sees it, which this check also tolerates.
+  await check("onboarding is dismissed, and the library stays reachable", async () => {
+    const box = page.locator('[data-testid="onboarding"]');
+    if ((await box.count()) > 0) {
+      await page.locator('[data-testid="onboarding-go"]').click();
+      await box.waitFor({ state: "detached", timeout: 5000 });
+    }
+    const s = await invoke("library_status");
+    assert.equal(s.open, true, "no catalog open — run a scan in the egui build first");
+  });
+
   await check("the shell opens a real catalog", async () => {
     const s = await invoke("library_status");
     assert.equal(s.open, true, "no catalog open — run a scan in the egui build first");
@@ -188,7 +202,12 @@ try {
   await check("clicking Favorites in the nav shows only starred cards", async () => {
     await page.fill('input[type="text"]', "");
     const s = await invoke("library_status");
-    await page.getByRole("button", { name: "Favorites" }).click();
+    // The toolbar's ★ Favorites toggle is also a "Favorites" button now — scope to the sidebar
+    // row, which is the route this check exists to pin down.
+    await page
+      .getByRole("navigation", { name: "Main" })
+      .getByRole("button", { name: "Favorites" })
+      .click();
     await page.waitForFunction(
       (n) => document.querySelector("h1")?.textContent?.trim() === "Favorites" &&
              (document.querySelectorAll(".card").length === n ||

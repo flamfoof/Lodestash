@@ -35,9 +35,7 @@ export type NavItem = {
 /** Sidebar order per FEATURES §0.3 — Favorites sits second, directly under Library. */
 export const NAV: NavItem[] = [
   { route: "library", label: "Library", icon: "ls-nav-library" },
-  // ponytail: the sprite has no star glyph; the gold "confirmed" gem stands in until one
-  // is drawn. Swap the id here, not in the component, when docs/design/icons/ gains it.
-  { route: "favorites", label: "Favorites", icon: "ls-status-confirmed" },
+  { route: "favorites", label: "Favorites", icon: "ls-nav-favorites" },
   { route: "identify", label: "Identify", icon: "ls-nav-identify", badge: "unidentified" },
   { route: "collections", label: "Collections", icon: "ls-nav-collections" },
   { route: "packages", label: "Packages", icon: "ls-nav-packages" },
@@ -71,11 +69,11 @@ export const SCREENS: Record<Route, { title: string; milestone: string }> = {
 
 /** Category tabs (FEATURES §0.2) — a presentation grouping over the 7-value media_type enum. */
 export const TABS = [
-  { id: "all", label: "All", icon: "ls-type-all", media: [] },
-  { id: "models", label: "Models", icon: "ls-type-model", media: ["model_3d"] },
-  { id: "materials", label: "Materials", icon: "ls-type-material", media: ["material"] },
-  { id: "sounds", label: "Sounds", icon: "ls-type-sound", media: ["audio"] },
-  { id: "images", label: "Images", icon: "ls-type-image", media: ["image", "texture", "sprite", "font"] },
+  { id: "all", label: "All", icon: "ls-type-all", token: "--ls-gold", media: [] },
+  { id: "models", label: "Models", icon: "ls-type-model", token: "--ls-type-model", media: ["model_3d"] },
+  { id: "materials", label: "Materials", icon: "ls-type-material", token: "--ls-type-material", media: ["material"] },
+  { id: "sounds", label: "Sounds", icon: "ls-type-sound", token: "--ls-type-sound", media: ["audio"] },
+  { id: "images", label: "Images", icon: "ls-type-image", token: "--ls-type-image", media: ["image", "texture", "sprite", "font"] },
 ] as const;
 
 export type TabId = (typeof TABS)[number]["id"];

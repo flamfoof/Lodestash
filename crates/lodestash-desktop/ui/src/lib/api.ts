@@ -20,7 +20,14 @@ export type GridItem = {
 
 export type GridPage = { items: GridItem[]; total: number; page: number; pages: number };
 
-export type SourceSummary = { id: number; name: string; root_path: string; asset_count: number };
+export type SourceSummary = {
+  id: number;
+  name: string;
+  root_path: string;
+  asset_count: number;
+  /** Whether the source is being watched (UI-SPEC §11.1) — the Settings pause/resume toggle. */
+  watch_enabled: boolean;
+};
 
 export type LibraryStatus = {
   open: boolean;
@@ -35,7 +42,11 @@ export type LibraryStatus = {
   identified: number;
   confirmed: number;
   duplicate_groups: number;
+  /** Type-tab counts (UI-SPEC §0.3) — what each category tab's number reads, and which hide. */
+  tab_counts: TabCount[];
 };
+
+export type TabCount = { id: string; count: number };
 
 /**
  * The ⚑ Filters popover's selection (UI-SPEC §2.3), sent as one object because it deserializes
@@ -79,6 +90,8 @@ export type GridQuery = {
   package?: string | null;
   /** Restrict to one source library — the sidebar's LIBRARIES facet. Not the same as `package`. */
   source?: string | null;
+  /** Restrict to one collection's members — what Collections' Browse → sets (UI-SPEC §6). */
+  collection?: number | null;
   page: number;
   page_size: number;
 };
@@ -95,12 +108,27 @@ export type FolderQuery = {
   filter: ContentFilter;
   source: string | null;
   dir: string;
+  /** Pack-rooted browse (PACK-DIRECTORY-NAV): `dir` is relative to the pack, only its assets show. */
+  package?: string | null;
 };
 
 export type FolderTile = { name: string; direct: number; recursive: number };
-export type FolderPage = { tiles: FolderTile[]; items: GridItem[]; total: number };
+export type FolderPage = { tiles: FolderTile[]; items: GridItem[]; third: string[]; total: number };
 
 export const folderPage = (query: FolderQuery) => invoke<FolderPage>("folder_page", { query });
+
+/** One folder in the pack browser's left tree (PACK-DIRECTORY-NAV §5). */
+export type PackDirNode = {
+  path: string;
+  name: string;
+  depth: number;
+  direct: number;
+  recursive: number;
+  has_children: boolean;
+};
+
+export const packDirTree = (packageName: string) =>
+  invoke<PackDirNode[]>("pack_dir_tree", { package: packageName });
 
 /** UI-SPEC §8.1 overview. Every number is derived from the rows the shell already holds. */
 export type TypeStat = {
@@ -149,17 +177,73 @@ export type PackageRow = {
 
 export const packages = () => invoke<PackageRow[]>("packages");
 
-/** One row of the trait vocabulary (UI-SPEC §9). Read-only — authoring is not wired. */
+/** One row of the trait vocabulary (UI-SPEC §9). Authoring is wired through the writer ops below. */
 export type VocabRow = {
+  /** The `tag` row's id — what the authoring commands address. */
+  id: number;
   namespace: string;
   value: string;
+  /** False for a plain tag — the row the promote strip shows. */
+  is_trait: boolean;
+  scope: string | null;
+  usage_note: string | null;
   usage_count: number;
   manual_count: number;
   ai_count: number;
   teach: boolean;
+  /** The trait's chip style — a CSS token or hex colour, and an icon id. */
+  color: string | null;
+  icon: string | null;
 };
 
 export const vocabulary = () => invoke<VocabRow[]>("vocabulary");
+
+/** Create or promote a trait — an existing tag keeps its assignments and gains trait status. */
+export const upsertTrait = (args: {
+  namespace: string;
+  value: string;
+  scope?: string | null;
+  /** camelCase on purpose — Tauri v2 maps it to the command's snake_case `usage_note` param. */
+  usageNote?: string | null;
+  teach?: boolean;
+}) => invoke<{ changed: number }>("upsert_trait", args);
+
+export const unpromoteTrait = (tagId: number) => invoke("unpromote_trait", { tagId });
+export const setTraitTeach = (tagId: number, teach: boolean) => invoke("set_trait_teach", { tagId, teach });
+export const setTraitStyle = (tagId: number, color: string | null, icon?: string | null) =>
+  invoke("set_trait_style", { tagId, color, icon });
+
+/**
+ * The Settings screen's snapshot (UI-SPEC §11) — size tiers, preview quality, the first-run
+ * flag, watch/auto-identify, MCP allow-list and storage caps. Whole-object read/write.
+ */
+export type Settings = {
+  m_kb: number;
+  l_kb: number;
+  xl_kb: number;
+  cap_kb: number;
+  preview_quality: "low" | "medium" | "high";
+  skip_onboarding: boolean;
+  watch_sources: boolean;
+  auto_identify: boolean;
+  cache_extracted: boolean;
+  preview_cache_cap_gb: number;
+  auto_purge_preview_cache: boolean;
+  mcp_disabled_tools: string[];
+};
+
+export const getSettings = () => invoke<Settings>("get_settings");
+export const setSettings = (settings: Settings) => invoke<void>("set_settings", { settings });
+export const setSourceWatch = (id: number, watch: boolean) => invoke("set_source_watch", { id, watch });
+
+/** One row of the Collections screen (UI-SPEC §6). */
+export type CollectionRow = { id: number; name: string; asset_count: number };
+
+export const collections = () => invoke<CollectionRow[]>("collections");
+export const createCollection = (name: string) => invoke<{ changed: number }>("create_collection", { name });
+export const deleteCollection = (id: number) => invoke<{ changed: number }>("delete_collection", { id });
+export const setPackagePinned = (id: number, pinned: boolean) =>
+  invoke<{ changed: number }>("set_package_pinned", { id, pinned });
 
 /**
  * Index a folder and add it as a library source — what drag-and-drop drops into.
@@ -214,11 +298,11 @@ export const STATUSES = [
   { id: "confirmed", label: "Confirmed" },
 ] as const;
 
-/** Grid density stops (DESIGN-GUIDELINES §4) — card min-width in px. */
+/** Grid density stops (UI-SPEC §20.10) — card min-widths 150 / 205 / 288px. */
 export const DENSITIES = [
-  { id: "compact", label: "Compact", icon: "ls-grid-compact", px: 118 },
-  { id: "cozy", label: "Cozy", icon: "ls-grid-cozy", px: 148 },
-  { id: "large", label: "Large", icon: "ls-grid-large", px: 200 },
+  { id: "compact", label: "Compact", icon: "ls-grid-compact", px: 150 },
+  { id: "cozy", label: "Cozy", icon: "ls-grid-cozy", px: 205 },
+  { id: "large", label: "Large", icon: "ls-grid-large", px: 288 },
 ] as const;
 
 /** What a write actually did. `refused` + `failed` are the parts worth telling the user about. */
@@ -250,6 +334,21 @@ export const gridPage = (query: GridQuery) => invoke<GridPage>("grid_page", { qu
 export const reloadLibrary = () => invoke<LibraryStatus>("reload_library");
 export const assetDetail = (assetId: number) =>
   invoke<AssetDetail | null>("asset_detail", { assetId });
+
+/**
+ * The Svelte shell's persisted view prefs (FEATURES §10) — browse view × row style, density,
+ * sort. Hydrated once at startup; the whole object is written back on any change.
+ */
+export type WebPrefs = {
+  browse: "flat" | "folders";
+  row_style: "grid" | "list";
+  density: string;
+  sort_by: string;
+  sort_asc: boolean;
+};
+
+export const getWebPrefs = () => invoke<WebPrefs>("get_web_prefs");
+export const setWebPrefs = (prefs: WebPrefs) => invoke<void>("set_web_prefs", { prefs });
 
 /**
  * Base for the custom scheme.
@@ -315,6 +414,10 @@ export function typeIcon(mediaType: string): string {
       return "ls-type-sound";
     case "texture":
       return "ls-type-texture";
+    case "sprite":
+      return "ls-type-sprite";
+    case "font":
+      return "ls-type-font";
     default:
       return "ls-type-image";
   }

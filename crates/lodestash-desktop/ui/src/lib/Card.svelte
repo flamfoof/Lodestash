@@ -1,6 +1,7 @@
 <script lang="ts">
   import Icon from "./Icon.svelte";
   import { type GridItem, previewUrl, thumbUrl, typeToken, typeIcon, fmtSize } from "./api";
+  import { traitColor } from "./traits.svelte";
 
   let {
     item,
@@ -92,7 +93,10 @@
       <span class="unknown-tags">???</span>
     {:else}
       {#each chips as t (t)}
-        <span class="tag">{t}<i class="dash" aria-hidden="true"></i></span>
+        <span
+          class="tag"
+          style={traitColor.has(t) ? `--chip: var(${traitColor.get(t)})` : ""}
+        >{t}<i class="dash" aria-hidden="true"></i></span>
       {/each}
       {#if overflow > 0}
         <span class="tag more" title={item.traits.slice(SHOWN).join(", ")}>+{overflow}</span>
@@ -248,15 +252,16 @@
     padding: 1px 6px;
     font-size: var(--fs-xs);
     line-height: 1.4;
-    color: var(--ls-text-muted);
+    color: var(--chip, var(--ls-text-muted));
     background: var(--ls-overlay);
+    border: 1px solid color-mix(in srgb, var(--chip, var(--ls-overlay)) 55%, transparent);
     border-radius: var(--r-pill);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* ponytail: one accent for every chip. Per-trait colour lives on the trait row in the catalog
-     (`color`/`icon`), which the read model does not carry yet — B8a widens it. */
+  /* Per-trait chip colour (B8a): a styled trait sets `--chip`; unstyled chips keep the muted
+     default. The dash stays the type colour either way — one glance still says type + trait. */
   .dash {
     flex: none;
     width: 10px;
