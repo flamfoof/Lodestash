@@ -174,6 +174,27 @@ impl Default for ViewPrefs {
 
 // ── Svelte shell prefs ─────────────────────────────────────────────────────────
 
+/// Serialize config.json read-modify-write cycles. Several writers (the web-prefs and
+/// settings commands, and now the writer thread's blacklist→config sync) each
+/// load→modify→save the whole file; without this a racing pair can clobber each other's
+/// fields. `AppConfig::save()` is a direct `fs::write` (not atomic), so reads lock too —
+/// a reader must never meet a half-written file. Lock order is always CONFIG_LOCK before
+/// anything else; nothing ever takes a second lock while holding it.
+static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Load config, apply `f` to it, and save — the whole cycle under one lock. The one
+/// sanctioned way to mutate config.json; every caller (desktop commands and the writer
+/// thread's blacklist sync) must go through it so no two writers interleave.
+pub fn edit_config<T>(f: impl FnOnce(&mut AppConfig) -> T) -> Result<T, String> {
+    let _g = CONFIG_LOCK.lock().map_err(|_| "config lock poisoned".to_string())?;
+    let mut config = AppConfig::load();
+    let out = f(&mut config);
+    config.save();
+    Ok(out)
+}
+
+// ── Svelte shell prefs ─────────────────────────────────────────────────────────
+
 /// The Svelte shell's own persisted view state (FEATURES §10 / design README "State
 /// Management"). Kept apart from the egui `ViewPrefs` until the B7 cutover retires it; the
 /// egui build never reads this group.

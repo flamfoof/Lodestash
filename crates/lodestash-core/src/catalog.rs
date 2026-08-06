@@ -260,6 +260,7 @@ impl Catalog {
             (13, MIGRATION_13_ONE_PACKAGE_PER_PATH),
             (14, MIGRATION_14_IN_PACK_ASSETS),
             (15, MIGRATION_15_VECTOR_PREVIEWS),
+            (16, MIGRATION_16_OP_LOG),
         ];
 
         for (version, sql) in migrations {
@@ -1665,7 +1666,7 @@ CREATE INDEX IF NOT EXISTS idx_asset_metrics_dirty ON asset(metrics_dirty) WHERE
 /// One row of the inspector's LINKED FILES panel (UI-SPEC §13.6): an edge seen from the selected
 /// asset. `asset_id`/`name`/`media_code` are `None` for an outbound edge whose target isn't in the
 /// library — the `missing` case the panel calls out.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RelatedAsset {
     /// True: the selected asset *uses* this one. False: this one uses the selected asset.
     pub outbound: bool,
@@ -1739,6 +1740,21 @@ CREATE TABLE IF NOT EXISTS asset_preview (
   source_key   TEXT    NOT NULL,
   generated_at TEXT    NOT NULL
 );
+";
+
+/// M16 — undo op-log (UI-SPEC §2 "Ctrl/Cmd-Z" + DESIGN-GUIDELINES §7 "Trash & restore", L5).
+/// A durable, append-only ledger of catalog mutations the UI can revert. Each row names the
+/// operation and carries its pre-image (or the id needed to invert it) as JSON — see the
+/// `revert_*` family on `Catalog`. `created_at` is unix seconds; `recent_ops`/`delete_ops`
+/// manage the tail.
+const MIGRATION_16_OP_LOG: &str = "
+CREATE TABLE IF NOT EXISTS op_log (
+  id           INTEGER PRIMARY KEY,
+  op_kind      TEXT    NOT NULL,        -- 'set_tags' | 'set_trashed' | 'create_collection' | ...
+  payload_json TEXT    NOT NULL,
+  created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_oplog_created ON op_log(created_at);
 ";
 
 const MIGRATION_12_FAVORITES: &str = "
@@ -2579,6 +2595,53 @@ impl Catalog {
         tx.commit()
             .map_err(|e| CoreError::Catalog(format!("reject commit: {e}")))?;
         Ok(n)
+    }
+
+    /// Add one tag to an asset without touching its other tags (the bulk-bar / inspector
+    /// quick-add path, D9/G4). Unlike [`Self::set_tags`] — which replaces the whole per-source
+    /// set — this appends: adding "shiny" must never delete the asset's other manual tags.
+    /// Already-present tags are a no-op (ON CONFLICT DO NOTHING, confidence untouched).
+    /// Returns the number of rows actually inserted. Re-indexes FTS like every tag write.
+    pub fn add_asset_tag(
+        &mut self,
+        asset_id: i64,
+        source: &str,
+        namespace: &str,
+        value: &str,
+    ) -> Result<usize> {
+        let Some((norm, display)) = normalize_tag(namespace, value) else {
+            return Ok(0); // an empty or punctuation-only value never became a tag
+        };
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| CoreError::Catalog(format!("tag add begin: {e}")))?;
+        let old_concat = tags_concat_in(&tx, asset_id)?;
+        tx.execute(
+            "INSERT INTO tag (name, norm_name, namespace) VALUES (?1, ?2, ?3)
+             ON CONFLICT(norm_name) DO NOTHING",
+            params![display, norm, namespace],
+        )
+        .map_err(|e| CoreError::Catalog(format!("tag upsert: {e}")))?;
+        let tag_id: i64 = tx
+            .query_row(
+                "SELECT id FROM tag WHERE norm_name = ?1",
+                params![norm],
+                |r| r.get(0),
+            )
+            .map_err(|e| CoreError::Catalog(format!("tag lookup: {e}")))?;
+        let written = tx
+            .execute(
+                "INSERT INTO asset_tag (asset_id, tag_id, source, confidence, model_id, created_at)
+                 VALUES (?1, ?2, ?3, NULL, NULL, ?4)
+                 ON CONFLICT(asset_id, tag_id, source) DO NOTHING",
+                params![asset_id, tag_id, source, unix_now()],
+            )
+            .map_err(|e| CoreError::Catalog(format!("asset_tag insert: {e}")))?;
+        refresh_fts(&tx, asset_id, &old_concat)?;
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("tag add commit: {e}")))?;
+        Ok(written)
     }
 
     /// Mark an asset **confirmed** (human-reviewed tags → trusted, DATA-MODEL §8), or clear that
@@ -4301,7 +4364,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 15, "all 15 migrations should have run");
+        assert_eq!(version, 16, "all 16 migrations should have run");
     }
 
     /// The viewer's texture lookup must walk **both** hops. Stopping at the first lands on the
@@ -7153,5 +7216,1420 @@ mod collection_tests {
 
         // The staging tray is never listable or deletable as a user collection.
         assert!(c.delete_collection(0).is_err(), "no such collection");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stats Tag Graph (UI-SPEC §8.2), LINKS edge set (DATA-MODEL §10), per-source
+// blacklist (UI-SPEC §11.1 / DATA-MODEL §10), Mapping-tab authoring (UI-SPEC §9.2),
+// undo op-log (UI-SPEC §2 / DESIGN-GUIDELINES §7, L5) and the collection membership
+// toggle (UI-SPEC §6).
+// ---------------------------------------------------------------------------
+
+/// One node of the Stats Tag Graph (UI-SPEC §8.2): a tag with its usage count. The
+/// force-directed canvas draws a gold node per entry, radius ∝ `usage_count`, labeled.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TagGraphNode {
+    pub tag_id: i64,
+    pub namespace: String,
+    pub value: String,
+    pub usage_count: i64,
+}
+
+/// One co-occurrence edge of the Stats Tag Graph (UI-SPEC §8.2): two tags that appear
+/// together on at least one asset, `weight` = the number of assets bearing both.
+/// `tag_a < tag_b` (by tag id), so each unordered pair appears exactly once.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TagGraphEdge {
+    pub tag_a: i64,
+    pub tag_b: i64,
+    pub weight: i64,
+}
+
+/// The full Stats Tag Graph payload (UI-SPEC §8.2): tag nodes, tag↔tag co-occurrence
+/// edges, and the header's `tags · links · assets` counts. `asset_count` is the number
+/// of live assets carrying at least one tag (the identified library the canvas draws as
+/// small asset nodes); `link_count` is the number of resolved `asset_relationship`
+/// edges between live assets — the dashed arcane edges rendered on top.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TagGraph {
+    pub nodes: Vec<TagGraphNode>,
+    pub edges: Vec<TagGraphEdge>,
+    pub asset_count: i64,
+    pub link_count: i64,
+}
+
+impl Catalog {
+    /// The Stats Tag Graph (UI-SPEC §8.2): every tag in use on live assets with its node
+    /// count, every tag pair co-occurring on the same asset with its edge weight, plus
+    /// the `tags · links · assets` header counts. Soft-deleted assets are excluded, so
+    /// the graph matches the Library's identified set. The UI draws the tag nodes and
+    /// co-occurrence edges itself and overlays the dependency arcs from
+    /// [`Self::asset_edges`].
+    pub fn tag_graph(&self) -> Result<TagGraph> {
+        let mut nodes_stmt = self
+            .conn
+            .prepare(
+                "SELECT t.id, COALESCE(t.namespace, 'free'), t.name, COUNT(DISTINCT at.asset_id) AS n
+                   FROM tag t
+                   JOIN asset_tag at ON at.tag_id = t.id
+                   JOIN asset a      ON a.id = at.asset_id AND a.deleted_at IS NULL
+                  GROUP BY t.id
+                  ORDER BY n DESC, t.name",
+            )
+            .map_err(|e| CoreError::Catalog(format!("tag graph nodes prep: {e}")))?;
+        let nodes = nodes_stmt
+            .query_map([], |r| {
+                Ok(TagGraphNode {
+                    tag_id: r.get(0)?,
+                    namespace: r.get(1)?,
+                    value: r.get(2)?,
+                    usage_count: r.get(3)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("tag graph nodes query: {e}")))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("tag graph nodes row: {e}")))?;
+
+        let mut edges_stmt = self
+            .conn
+            .prepare(
+                "SELECT at1.tag_id, at2.tag_id, COUNT(DISTINCT at1.asset_id) AS w
+                   FROM asset_tag at1
+                   JOIN asset_tag at2 ON at2.asset_id = at1.asset_id AND at2.tag_id > at1.tag_id
+                   JOIN asset a       ON a.id = at1.asset_id AND a.deleted_at IS NULL
+                  GROUP BY at1.tag_id, at2.tag_id
+                  ORDER BY w DESC, at1.tag_id, at2.tag_id",
+            )
+            .map_err(|e| CoreError::Catalog(format!("tag graph edges prep: {e}")))?;
+        let edges = edges_stmt
+            .query_map([], |r| {
+                Ok(TagGraphEdge {
+                    tag_a: r.get(0)?,
+                    tag_b: r.get(1)?,
+                    weight: r.get(2)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("tag graph edges query: {e}")))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("tag graph edges row: {e}")))?;
+
+        let asset_count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT at.asset_id) FROM asset_tag at
+                   JOIN asset a ON a.id = at.asset_id AND a.deleted_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| CoreError::Catalog(format!("tag graph asset count: {e}")))?;
+        let link_count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset_relationship r
+                   JOIN asset f ON f.id = r.from_asset_id AND f.deleted_at IS NULL
+                   JOIN asset t ON t.id = r.to_asset_id   AND t.deleted_at IS NULL
+                  WHERE r.to_asset_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| CoreError::Catalog(format!("tag graph link count: {e}")))?;
+
+        Ok(TagGraph {
+            nodes,
+            edges,
+            asset_count,
+            link_count,
+        })
+    }
+}
+
+/// One resolved asset→asset edge (DATA-MODEL §10) — the rows behind the ⚑ Filters LINKS
+/// chips and the Stats Tag Graph's dashed arcane dependency arcs (UI-SPEC §8.2).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AssetEdge {
+    pub from: i64,
+    pub to: i64,
+    pub kind: String,
+    pub source: String,
+}
+
+impl Catalog {
+    /// Every resolved asset→asset edge between live assets, ordered by kind then endpoint —
+    /// the full edge set behind the LINKS filter (`has_dependencies` / `has_dependents`,
+    /// DATA-MODEL §10) and the tag graph's dependency arcs (UI-SPEC §8.2). Unresolved
+    /// (`to_asset_id NULL`) and missing-endpoint edges are excluded; the inspector's
+    /// per-asset view is [`Self::related_assets`].
+    pub fn asset_edges(&self) -> Result<Vec<AssetEdge>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT r.from_asset_id, r.to_asset_id, r.kind, r.source
+                   FROM asset_relationship r
+                   JOIN asset f ON f.id = r.from_asset_id AND f.deleted_at IS NULL
+                   JOIN asset t ON t.id = r.to_asset_id   AND t.deleted_at IS NULL
+                  ORDER BY r.kind, r.from_asset_id, r.to_asset_id",
+            )
+            .map_err(|e| CoreError::Catalog(format!("asset edges prep: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(AssetEdge {
+                    from: r.get(0)?,
+                    to: r.get(1)?,
+                    kind: r.get(2)?,
+                    source: r.get(3)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("asset edges query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("asset edges row: {e}")))
+    }
+}
+
+/// One per-source blacklist entry (DATA-MODEL §10, UI-SPEC §11.1): `kind` is `folder`
+/// (the crawler prunes that source-relative subtree) or `asset` (it drops that single
+/// source-relative path / bare file name). Stored as JSON in `import_source.blacklist`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceExclude {
+    pub kind: String,
+    pub value: String,
+}
+
+/// The `import_source.blacklist` column as a decoded list — `None`/empty means no
+/// exclusions (a fresh source has no blacklist at all).
+fn source_excludes_in(conn: &Connection, source_id: i64) -> Result<Vec<SourceExclude>> {
+    // `blacklist` starts NULL on a fresh source — read Option<String> and flatten, so both
+    // "no row" and "NULL column" come back as an empty list.
+    let raw: Option<Option<String>> = conn
+        .query_row(
+            "SELECT blacklist FROM import_source WHERE id = ?1",
+            params![source_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| CoreError::Catalog(format!("source blacklist read: {e}")))?;
+    match raw.flatten() {
+        None => Ok(Vec::new()),
+        Some(s) if s.trim().is_empty() => Ok(Vec::new()),
+        Some(s) => serde_json::from_str(&s)
+            .map_err(|e| CoreError::Catalog(format!("source blacklist parse: {e}"))),
+    }
+}
+
+/// Persist a source's full exclusion list as the JSON column.
+fn write_source_excludes(conn: &Connection, source_id: i64, list: &[SourceExclude]) -> Result<()> {
+    let json = serde_json::to_string(list)?;
+    conn.execute(
+        "UPDATE import_source SET blacklist = ?2 WHERE id = ?1",
+        params![source_id, json],
+    )
+    .map_err(|e| CoreError::Catalog(format!("source blacklist write: {e}")))?;
+    // An UPDATE against a missing source_id touches zero rows — surface it as an error
+    // instead of silently pretending the blacklist was written.
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM import_source WHERE id = ?1",
+            params![source_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| CoreError::Catalog(format!("source check: {e}")))?;
+    if exists.is_none() {
+        return Err(CoreError::Catalog(format!(
+            "write_source_excludes: no such source {source_id}"
+        )));
+    }
+    Ok(())
+}
+
+/// The absolute root of one source, for syncing a blacklist edit into the app config the
+/// crawler actually honours. `None` when the source id doesn't exist.
+fn source_root_in(conn: &Connection, source_id: i64) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT root_path FROM import_source WHERE id = ?1",
+        params![source_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(|e| CoreError::Catalog(format!("source root read: {e}")))
+}
+
+impl Catalog {
+    /// The per-source blacklist (UI-SPEC §11.1 expanded panel): every `{kind, value}`
+    /// exclusion the crawler will skip for this source (DATA-MODEL §10). Empty when the
+    /// source has no blacklist yet.
+    pub fn list_source_excludes(&self, source_id: i64) -> Result<Vec<SourceExclude>> {
+        source_excludes_in(&self.conn, source_id)
+    }
+
+    /// The absolute root of one source — the key the crawler's config-side blacklist is
+    /// stored under. `None` when the source id doesn't exist.
+    pub fn source_root(&self, source_id: i64) -> Result<Option<String>> {
+        source_root_in(&self.conn, source_id)
+    }
+
+    /// Add one `{kind, value}` exclusion to a source's blacklist (UI-SPEC §11.1 ⊘ folder /
+    /// ⊘ asset add buttons). `kind` must be `folder` or `asset`; an exact duplicate is a
+    /// no-op (the set is idempotent). Non-destructive — only cataloguing is affected.
+    pub fn add_source_exclude(&self, source_id: i64, kind: &str, value: &str) -> Result<()> {
+        if kind != "folder" && kind != "asset" {
+            return Err(CoreError::Catalog(format!(
+                "add_source_exclude: kind must be 'folder' or 'asset', got {kind:?}"
+            )));
+        }
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(CoreError::Catalog("add_source_exclude: empty value".into()));
+        }
+        let mut list = source_excludes_in(&self.conn, source_id)?;
+        if list.iter().any(|e| e.kind == kind && e.value == value) {
+            return Ok(()); // already excluded — idempotent
+        }
+        list.push(SourceExclude {
+            kind: kind.to_string(),
+            value: value.to_string(),
+        });
+        write_source_excludes(&self.conn, source_id, &list)
+    }
+
+    /// Remove one `{kind, value}` exclusion from a source's blacklist (UI-SPEC §11.1 chip ✕).
+    /// Returns `true` if an entry was removed, `false` if it wasn't there.
+    pub fn remove_source_exclude(&self, source_id: i64, kind: &str, value: &str) -> Result<bool> {
+        let mut list = source_excludes_in(&self.conn, source_id)?;
+        let before = list.len();
+        list.retain(|e| !(e.kind == kind && e.value == value));
+        if list.len() == before {
+            return Ok(false);
+        }
+        write_source_excludes(&self.conn, source_id, &list)?;
+        Ok(true)
+    }
+}
+
+/// One row of the Mapping tab's taxonomy switcher (UI-SPEC §9.2): a mapping library, its
+/// version (`v<version>` readout), and whether it is the active one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TaxonomyRow {
+    pub id: i64,
+    pub name: String,
+    pub version: i64,
+    pub is_active: bool,
+}
+
+/// One alias chip of a category's detail card (UI-SPEC §9.2 ALIASES).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CategoryAliasRow {
+    pub id: i64,
+    pub alias: String,
+}
+
+impl Catalog {
+    /// Every taxonomy for the Mapping tab's switcher (UI-SPEC §9.2), active first then
+    /// name — with the `v<version>` readout and the `● active` marker built in.
+    pub fn list_taxonomies(&self) -> Result<Vec<TaxonomyRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, name, version, is_active FROM taxonomy
+                  ORDER BY is_active DESC, name COLLATE NOCASE",
+            )
+            .map_err(|e| CoreError::Catalog(format!("list_taxonomies prep: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(TaxonomyRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    version: r.get(2)?,
+                    is_active: r.get::<_, i64>(3)? != 0,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("list_taxonomies query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("list_taxonomies row: {e}")))
+    }
+
+    /// Make `taxonomy_id` the single active taxonomy (UI-SPEC §9.2 `● active` marker);
+    /// every other taxonomy is deactivated. Errors when the id doesn't exist.
+    pub fn set_active_taxonomy(&mut self, taxonomy_id: i64) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| CoreError::Catalog(format!("activate begin: {e}")))?;
+        tx.execute("UPDATE taxonomy SET is_active = 0", [])
+            .map_err(|e| CoreError::Catalog(format!("taxonomy deactivate: {e}")))?;
+        let n = tx
+            .execute(
+                "UPDATE taxonomy SET is_active = 1 WHERE id = ?1",
+                params![taxonomy_id],
+            )
+            .map_err(|e| CoreError::Catalog(format!("taxonomy activate: {e}")))?;
+        if n == 0 {
+            return Err(CoreError::Catalog(format!("no such taxonomy {taxonomy_id}")));
+        }
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("taxonomy activate commit: {e}")))?;
+        Ok(())
+    }
+
+    /// Delete a taxonomy and everything under it (UI-SPEC §9.2): its categories (deepest
+    /// first, so the `category.parent_id` FK never trips) and — via FK cascade — their
+    /// aliases, mapping rules and `asset_category` assignments. Returns the number of
+    /// rows removed (categories + the taxonomy row).
+    pub fn delete_taxonomy(&mut self, taxonomy_id: i64) -> Result<usize> {
+        let ids = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "WITH RECURSIVE subtree(id, depth) AS (
+                         SELECT c.id, 0 FROM category c WHERE c.taxonomy_id = ?1
+                         UNION ALL
+                         SELECT c.id, s.depth + 1 FROM category c JOIN subtree s ON c.parent_id = s.id
+                     )
+                     SELECT id FROM subtree ORDER BY depth DESC",
+                )
+                .map_err(|e| CoreError::Catalog(format!("taxonomy subtree prep: {e}")))?;
+            let rows = stmt
+                .query_map(params![taxonomy_id], |r| r.get::<_, i64>(0))
+                .map_err(|e| CoreError::Catalog(format!("taxonomy subtree query: {e}")))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| CoreError::Catalog(format!("taxonomy subtree row: {e}")))?
+        };
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| CoreError::Catalog(format!("delete taxonomy begin: {e}")))?;
+        let mut removed = 0usize;
+        for id in ids {
+            tx.execute("DELETE FROM category WHERE id = ?1", params![id])
+                .map_err(|e| CoreError::Catalog(format!("delete category {id}: {e}")))?;
+            removed += 1;
+        }
+        let n = tx
+            .execute("DELETE FROM taxonomy WHERE id = ?1", params![taxonomy_id])
+            .map_err(|e| CoreError::Catalog(format!("delete taxonomy: {e}")))?;
+        if n == 0 {
+            return Err(CoreError::Catalog(format!("no such taxonomy {taxonomy_id}")));
+        }
+        removed += 1;
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("delete taxonomy commit: {e}")))?;
+        Ok(removed)
+    }
+
+    /// Rename a category (UI-SPEC §9.2 row rename): sets `pref_label` and rewrites the
+    /// materialized `path` — and every descendant's path — in one transaction, keeping
+    /// the `UNIQUE(taxonomy_id, path)` invariant. A same-label rename is a no-op; an
+    /// empty label is rejected.
+    pub fn rename_category(&mut self, category_id: i64, new_label: &str) -> Result<()> {
+        let label = new_label.trim();
+        if label.is_empty() {
+            return Err(CoreError::Catalog("rename_category: empty label".into()));
+        }
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| CoreError::Catalog(format!("rename begin: {e}")))?;
+        let (parent_id, old_path): (Option<i64>, String) = tx
+            .query_row(
+                "SELECT parent_id, path FROM category WHERE id = ?1",
+                params![category_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| CoreError::Catalog(format!("rename lookup: {e}")))?
+            .ok_or_else(|| CoreError::Catalog(format!("no such category {category_id}")))?;
+        let parent_path: String = match parent_id {
+            Some(pid) => tx
+                .query_row(
+                    "SELECT path FROM category WHERE id = ?1",
+                    params![pid],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| CoreError::Catalog(format!("rename parent path: {e}")))?
+                .unwrap_or_default(),
+            None => String::new(),
+        };
+        let new_path = if parent_path.is_empty() {
+            label.to_string()
+        } else {
+            format!("{parent_path}/{label}")
+        };
+        if new_path == old_path {
+            return Ok(()); // same label — nothing to change
+        }
+        tx.execute(
+            "UPDATE category SET pref_label = ?2, path = ?3 WHERE id = ?1",
+            params![category_id, label, new_path],
+        )
+        .map_err(|e| CoreError::Catalog(format!("rename category: {e}")))?;
+        // Rewrite every descendant's path prefix in place (exact-prefix match, so a label
+        // containing LIKE metacharacters is safe).
+        tx.execute(
+            "UPDATE category SET path = ?2 || substr(path, length(?3) + 1)
+              WHERE id IN (
+                    WITH RECURSIVE subtree(id) AS (
+                        SELECT ?1
+                        UNION ALL
+                        SELECT c.id FROM category c JOIN subtree s ON c.parent_id = s.id
+                    )
+                    SELECT id FROM subtree WHERE id <> ?1)
+                AND length(path) > length(?3)
+                AND substr(path, 1, length(?3)) = ?3",
+            params![category_id, new_path, old_path],
+        )
+        .map_err(|e| CoreError::Catalog(format!("rename descendants: {e}")))?;
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("rename commit: {e}")))?;
+        Ok(())
+    }
+
+    /// Delete a category and its whole subtree (UI-SPEC §9.2 row delete — "assignments
+    /// cascade"). Aliases, rules and `asset_category` rows cascade via FK; children are
+    /// removed deepest-first so the `category.parent_id` FK never blocks. Returns the
+    /// number of category rows removed.
+    pub fn delete_category(&mut self, category_id: i64) -> Result<usize> {
+        let ids = self.category_subtree(category_id)?;
+        if ids.is_empty() {
+            return Err(CoreError::Catalog(format!("no such category {category_id}")));
+        }
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| CoreError::Catalog(format!("delete category begin: {e}")))?;
+        let mut removed = 0usize;
+        for id in ids {
+            tx.execute("DELETE FROM category WHERE id = ?1", params![id])
+                .map_err(|e| CoreError::Catalog(format!("delete category {id}: {e}")))?;
+            removed += 1;
+        }
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("delete category commit: {e}")))?;
+        Ok(removed)
+    }
+
+    /// A category's aliases (UI-SPEC §9.2 ALIASES chips), alphabetical.
+    pub fn list_category_aliases(&self, category_id: i64) -> Result<Vec<CategoryAliasRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, alias FROM category_alias WHERE category_id = ?1 ORDER BY alias COLLATE NOCASE",
+            )
+            .map_err(|e| CoreError::Catalog(format!("aliases prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![category_id], |r| {
+                Ok(CategoryAliasRow {
+                    id: r.get(0)?,
+                    alias: r.get(1)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("aliases query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("aliases row: {e}")))
+    }
+
+    /// Add an alias to a category (UI-SPEC §9.2 ALIASES add field). Normalized
+    /// case-insensitively (`norm_alias`), so `Barrel` and `barrel` are the same alias —
+    /// adding an existing one is a no-op that returns its row id. An empty alias is
+    /// rejected.
+    pub fn add_category_alias(&self, category_id: i64, alias: &str) -> Result<i64> {
+        let alias = alias.trim();
+        if alias.is_empty() {
+            return Err(CoreError::Catalog("add_category_alias: empty alias".into()));
+        }
+        let norm = alias.to_lowercase();
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO category_alias (category_id, alias, norm_alias)
+                 VALUES (?1, ?2, ?3)",
+                params![category_id, alias, norm],
+            )
+            .map_err(|e| CoreError::Catalog(format!("alias insert: {e}")))?;
+        self.conn
+            .query_row(
+                "SELECT id FROM category_alias WHERE category_id = ?1 AND norm_alias = ?2",
+                params![category_id, norm],
+                |r| r.get(0),
+            )
+            .map_err(|e| CoreError::Catalog(format!("alias lookup: {e}")))
+    }
+
+    /// Remove an alias chip (UI-SPEC §9.2 ALIASES ✕).
+    pub fn remove_category_alias(&self, alias_id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM category_alias WHERE id = ?1", params![alias_id])
+            .map(|_| ())
+            .map_err(|e| CoreError::Catalog(format!("alias remove: {e}")))
+    }
+
+    /// Flip a mapping rule's enable toggle (UI-SPEC §9.2 RULES enable toggle). A disabled
+    /// rule is skipped by [`Self::apply_mapping`] (`enabled = 0`).
+    pub fn set_rule_enabled(&self, rule_id: i64, enabled: bool) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE mapping_rule SET enabled = ?2 WHERE id = ?1",
+                params![rule_id, enabled as i64],
+            )
+            .map(|_| ())
+            .map_err(|e| CoreError::Catalog(format!("rule enable: {e}")))
+    }
+
+    /// The ids of a category's subtree (itself included), deepest first — the order a
+    /// delete must remove them so `category.parent_id` never dangles.
+    fn category_subtree(&self, root_id: i64) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "WITH RECURSIVE subtree(id, depth) AS (
+                     SELECT c.id, 0 FROM category c WHERE c.id = ?1
+                     UNION ALL
+                     SELECT c.id, s.depth + 1 FROM category c JOIN subtree s ON c.parent_id = s.id
+                 )
+                 SELECT id FROM subtree ORDER BY depth DESC",
+            )
+            .map_err(|e| CoreError::Catalog(format!("subtree prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![root_id], |r| r.get::<_, i64>(0))
+            .map_err(|e| CoreError::Catalog(format!("subtree query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("subtree row: {e}")))
+    }
+}
+
+/// One undo-log row (UI-SPEC §2 "Ctrl/Cmd-Z" / DESIGN-GUIDELINES §7, L5): the op kind plus
+/// the JSON payload — a pre-image or the id needed to invert — that the corresponding
+/// revert consumes. Ordered by `id` (append order); the tail is managed by
+/// [`Catalog::recent_ops`] / [`Catalog::delete_ops`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct OpLogRow {
+    pub id: i64,
+    pub op_kind: String,
+    pub payload_json: String,
+    pub created_at: i64,
+}
+
+impl Catalog {
+    /// Append an operation to the undo log. `op_kind` names the mutation (`set_tags`,
+    /// `set_trashed`, `create_collection`, …); `payload_json` carries whatever its revert
+    /// needs (see the `revert_*` family and the `record_*_op` helpers). Returns the new
+    /// op's id.
+    pub fn record_op(&self, op_kind: &str, payload_json: &str) -> Result<i64> {
+        self.conn
+            .execute(
+                "INSERT INTO op_log (op_kind, payload_json, created_at) VALUES (?1, ?2, ?3)",
+                params![op_kind, payload_json, unix_now()],
+            )
+            .map_err(|e| CoreError::Catalog(format!("record_op: {e}")))?;
+        // The log is a recent-actions tail, not a history — cap it so a 10k-asset bulk write
+        // cannot grow the file forever. The oldest rows go first.
+        let _ = self.conn.execute(
+            "DELETE FROM op_log WHERE id NOT IN (
+                 SELECT id FROM op_log ORDER BY id DESC LIMIT 200)",
+            [],
+        );
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// The newest undo-log rows, newest first, capped at `limit`.
+    pub fn recent_ops(&self, limit: usize) -> Result<Vec<OpLogRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, op_kind, payload_json, created_at FROM op_log
+                  ORDER BY id DESC LIMIT ?1",
+            )
+            .map_err(|e| CoreError::Catalog(format!("recent_ops prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(OpLogRow {
+                    id: r.get(0)?,
+                    op_kind: r.get(1)?,
+                    payload_json: r.get(2)?,
+                    created_at: r.get(3)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("recent_ops query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("recent_ops row: {e}")))
+    }
+
+    /// Delete undo-log rows by id — after a revert, or when the user clears history.
+    /// Returns the number removed.
+    pub fn delete_ops(&self, ids: &[i64]) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        // Ids are i64s we produced — safe to inline (rusqlite has no array binds).
+        let id_list = ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("DELETE FROM op_log WHERE id IN ({id_list})");
+        self.conn
+            .execute(&sql, [])
+            .map_err(|e| CoreError::Catalog(format!("delete_ops: {e}")))
+    }
+
+    /// Record a `set_tags` op with the asset's **current** per-source tags snapshotted
+    /// into the payload — call this *before* [`Self::set_tags`] mutates, so
+    /// [`Self::revert_op`] can restore the exact prior set.
+    pub fn record_set_tags_op(&self, asset_id: i64, source: &str) -> Result<i64> {
+        let prior = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT COALESCE(t.namespace, 'free'), t.name, at.confidence
+                       FROM asset_tag at JOIN tag t ON t.id = at.tag_id
+                      WHERE at.asset_id = ?1 AND at.source = ?2
+                      ORDER BY t.name",
+                )
+                .map_err(|e| CoreError::Catalog(format!("set_tags snapshot prep: {e}")))?;
+            let rows = stmt
+                .query_map(params![asset_id, source], |r| {
+                    Ok(TagAssignment {
+                        namespace: r.get(0)?,
+                        value: r.get(1)?,
+                        confidence: r.get(2)?,
+                    })
+                })
+                .map_err(|e| CoreError::Catalog(format!("set_tags snapshot query: {e}")))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| CoreError::Catalog(format!("set_tags snapshot row: {e}")))?
+        };
+        let payload = serde_json::json!({
+            "asset_id": asset_id,
+            "source": source,
+            "tags": prior.into_iter().map(|t| serde_json::json!({
+                "namespace": t.namespace,
+                "value": t.value,
+                "confidence": t.confidence,
+            })).collect::<Vec<_>>(),
+        })
+        .to_string();
+        self.record_op("set_tags", &payload)
+    }
+
+    /// Record a trash/untrash op (the direction passed to [`Self::set_trashed`]) so the
+    /// toggle can be reverted. Call before mutating.
+    pub fn record_trash_op(&self, asset_ids: &[i64], trashed: bool) -> Result<i64> {
+        let payload = serde_json::json!({
+            "asset_ids": asset_ids,
+            "trashed": trashed,
+        })
+        .to_string();
+        self.record_op("set_trashed", &payload)
+    }
+
+    /// Record a collection-create op (id + name) so the created collection can be deleted
+    /// on undo. Call after [`Self::create_collection`] returns its id.
+    pub fn record_collection_create_op(&self, collection_id: i64, name: &str) -> Result<i64> {
+        let payload = serde_json::json!({
+            "collection_id": collection_id,
+            "name": name,
+        })
+        .to_string();
+        self.record_op("create_collection", &payload)
+    }
+
+    /// Record one bulk-tag op for the assets that actually changed (a no-op add on an
+    /// already-tagged asset is not recorded — its revert would wrongly remove a pre-existing
+    /// tag). One row per batch, so undoing a 5-asset bulk edit reverts all five.
+    pub fn record_bulk_tag_op(
+        &self,
+        asset_ids: &[i64],
+        namespace: &str,
+        value: &str,
+        on: bool,
+    ) -> Result<i64> {
+        let payload = serde_json::json!({
+            "asset_ids": asset_ids,
+            "namespace": namespace,
+            "value": value,
+            "on": on,
+        })
+        .to_string();
+        self.record_op("bulk_tag", &payload)
+    }
+
+    /// Undo the operation recorded as `op_id`, then remove the op from the log (a
+    /// reverted op is gone — re-undo would double-apply). Dispatches on `op_kind`:
+    /// - `set_tags` → restores the snapshotted per-source tag set (reuses
+    ///   [`Self::set_tags`]);
+    /// - `set_trashed` → re-applies [`Self::set_trashed`] with the opposite direction (an
+    ///   untrash is undone by trashing again and vice versa);
+    /// - `create_collection` → deletes the created collection;
+    /// - `bulk_tag` → applies the exact inverse per asset (add ⇄ remove of the same tag).
+    pub fn revert_op(&mut self, op_id: i64) -> Result<()> {
+        let (kind, _) = self.op_payload(op_id)?;
+        match kind.as_str() {
+            "set_tags" => self.revert_set_tags(op_id),
+            "set_trashed" => self.revert_set_trashed(op_id),
+            "create_collection" => self.revert_create_collection(op_id),
+            "bulk_tag" => self.revert_bulk_tag(op_id),
+            other => Err(CoreError::Catalog(format!(
+                "revert_op: no revert registered for op kind {other:?}"
+            ))),
+        }
+    }
+
+    /// Undo a `bulk_tag` op: apply the exact inverse per recorded asset (an add is undone by
+    /// removing that tag, a removal by re-adding it), then drop the op. Only the assets that
+    /// actually changed are in the payload, so a no-op never gets its pre-existing tag yanked.
+    pub fn revert_bulk_tag(&mut self, op_id: i64) -> Result<()> {
+        let (kind, payload) = self.op_payload(op_id)?;
+        debug_assert_eq!(kind, "bulk_tag");
+        let p: serde_json::Value = serde_json::from_str(&payload)
+            .map_err(|e| CoreError::Catalog(format!("revert_bulk_tag payload: {e}")))?;
+        let ids: Vec<i64> = p["asset_ids"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+            .unwrap_or_default();
+        let namespace = p["namespace"].as_str().unwrap_or("free");
+        let value = p["value"].as_str().unwrap_or_default();
+        let on = p["on"].as_bool().unwrap_or(true);
+        if ids.is_empty() {
+            return Err(CoreError::Catalog("revert_bulk_tag: empty payload".into()));
+        }
+        for id in &ids {
+            if on {
+                self.remove_asset_tag(*id, namespace, value)?;
+            } else {
+                self.add_asset_tag(*id, "manual", namespace, value)?;
+            }
+        }
+        self.conn
+            .execute("DELETE FROM op_log WHERE id = ?1", params![op_id])
+            .map_err(|e| CoreError::Catalog(format!("revert_bulk_tag delete: {e}")))?;
+        Ok(())
+    }
+
+    /// Undo a `set_tags` op: write the snapshotted prior tag set back for the recorded
+    /// asset + source, then drop the op.
+    pub fn revert_set_tags(&mut self, op_id: i64) -> Result<()> {
+        let (kind, payload) = self.op_payload(op_id)?;
+        if kind != "set_tags" {
+            return Err(CoreError::Catalog(format!(
+                "revert_set_tags: op {op_id} is {kind:?}, not set_tags"
+            )));
+        }
+        let v: serde_json::Value = serde_json::from_str(&payload)?;
+        let asset_id = v["asset_id"]
+            .as_i64()
+            .ok_or_else(|| CoreError::Catalog("set_tags op payload: missing asset_id".into()))?;
+        let source = v["source"]
+            .as_str()
+            .ok_or_else(|| CoreError::Catalog("set_tags op payload: missing source".into()))?;
+        let mut tags = Vec::new();
+        for t in v["tags"]
+            .as_array()
+            .ok_or_else(|| CoreError::Catalog("set_tags op payload: missing tags".into()))?
+        {
+            tags.push(TagAssignment {
+                namespace: t["namespace"].as_str().unwrap_or("free").to_string(),
+                value: t["value"]
+                    .as_str()
+                    .ok_or_else(|| CoreError::Catalog("set_tags op payload: tag without value".into()))?
+                    .to_string(),
+                confidence: t["confidence"].as_f64(),
+            });
+        }
+        self.set_tags(asset_id, source, None, &tags)?;
+        self.delete_ops(&[op_id])?;
+        Ok(())
+    }
+
+    /// Undo a `set_trashed` op: re-run [`Self::set_trashed`] with the opposite direction
+    /// (an untrash is undone by trashing again and vice versa), then drop the op.
+    pub fn revert_set_trashed(&self, op_id: i64) -> Result<()> {
+        let (kind, payload) = self.op_payload(op_id)?;
+        if kind != "set_trashed" {
+            return Err(CoreError::Catalog(format!(
+                "revert_set_trashed: op {op_id} is {kind:?}, not set_trashed"
+            )));
+        }
+        let v: serde_json::Value = serde_json::from_str(&payload)?;
+        let trashed = v["trashed"]
+            .as_bool()
+            .ok_or_else(|| CoreError::Catalog("set_trashed op payload: missing trashed".into()))?;
+        let ids: Vec<i64> = v["asset_ids"]
+            .as_array()
+            .ok_or_else(|| CoreError::Catalog("set_trashed op payload: missing asset_ids".into()))?
+            .iter()
+            .filter_map(|x| x.as_i64())
+            .collect();
+        self.set_trashed(&ids, !trashed)?;
+        self.delete_ops(&[op_id])?;
+        Ok(())
+    }
+
+    /// Undo a `create_collection` op: delete the collection the op created (reuses
+    /// [`Self::delete_collection`]), then drop the op.
+    pub fn revert_create_collection(&self, op_id: i64) -> Result<()> {
+        let (kind, payload) = self.op_payload(op_id)?;
+        if kind != "create_collection" {
+            return Err(CoreError::Catalog(format!(
+                "revert_create_collection: op {op_id} is {kind:?}, not create_collection"
+            )));
+        }
+        let v: serde_json::Value = serde_json::from_str(&payload)?;
+        let collection_id = v["collection_id"].as_i64().ok_or_else(|| {
+            CoreError::Catalog("create_collection op payload: missing collection_id".into())
+        })?;
+        self.delete_collection(collection_id)?;
+        self.delete_ops(&[op_id])?;
+        Ok(())
+    }
+
+    /// Read one op's `(op_kind, payload_json)`.
+    fn op_payload(&self, op_id: i64) -> Result<(String, String)> {
+        self.conn
+            .query_row(
+                "SELECT op_kind, payload_json FROM op_log WHERE id = ?1",
+                params![op_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| CoreError::Catalog(format!("op_payload: {e}")))?
+            .ok_or_else(|| CoreError::Catalog(format!("no such op {op_id}")))
+    }
+}
+
+impl Catalog {
+    /// Add an asset to a collection (UI-SPEC §6 — membership is toggled from the asset
+    /// inspector, §13.5). Idempotent: adding an already-present member is a no-op.
+    pub fn collection_add_asset(&self, collection_id: i64, asset_id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO collection_asset (collection_id, asset_id, added_at)
+                 VALUES (?1, ?2, ?3)",
+                params![collection_id, asset_id, unix_now()],
+            )
+            .map_err(|e| CoreError::Catalog(format!("collection_add_asset: {e}")))?;
+        Ok(())
+    }
+
+    /// Remove an asset from a collection (UI-SPEC §6 membership toggle). Removing an
+    /// absent member is a no-op.
+    pub fn collection_remove_asset(&self, collection_id: i64, asset_id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM collection_asset WHERE collection_id = ?1 AND asset_id = ?2",
+                params![collection_id, asset_id],
+            )
+            .map_err(|e| CoreError::Catalog(format!("collection_remove_asset: {e}")))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod l5_slices_tests {
+    use super::*;
+
+    fn rec(rel: &str, mt: &str) -> CrawlRecord {
+        CrawlRecord {
+            workspace_rel: None,
+            rel_path: rel.to_string(),
+            name: rel.rsplit('/').next().unwrap_or(rel).to_string(),
+            media_type: mt.to_string(),
+            size_bytes: 1,
+            mtime: 1,
+        }
+    }
+
+    fn asset_id(c: &Catalog, rel: &str) -> i64 {
+        c.conn
+            .query_row(
+                "SELECT a.id FROM asset a JOIN asset_file af ON af.id = a.primary_file_id
+                  WHERE af.rel_path = ?1",
+                params![rel],
+                |r| r.get::<_, i64>(0),
+            )
+            .expect("asset id")
+    }
+
+    fn is_trashed(c: &Catalog, id: i64) -> bool {
+        c.conn
+            .query_row(
+                "SELECT deleted_at IS NOT NULL FROM asset WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, bool>(0),
+            )
+            .expect("trash flag")
+    }
+
+    fn tagged_catalog(rels: &[(&str, &str)]) -> (Catalog, Vec<i64>) {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let src = c.upsert_import_source("Lib", "C:/lib", "folder").expect("src");
+        let records: Vec<CrawlRecord> = rels.iter().map(|(r, m)| rec(r, m)).collect();
+        c.record_crawl(src, None, &records).expect("crawl");
+        let ids = rels.iter().map(|(r, _)| asset_id(&c, r)).collect();
+        (c, ids)
+    }
+
+    #[test]
+    fn tag_graph_reports_nodes_edges_and_header_counts() {
+        let (mut c, ids) = tagged_catalog(&[("a.fbx", "model_3d"), ("b.png", "image"), ("c.wav", "audio")]);
+        let (a, b, cc) = (ids[0], ids[1], ids[2]);
+        // rock on two assets; rpg on one; music+ambient co-occur on the third.
+        c.set_tags(
+            a,
+            "manual",
+            None,
+            &[
+                TagAssignment::exact("subject", "rock"),
+                TagAssignment::exact("style", "rpg"),
+            ],
+        )
+        .expect("tags a");
+        c.set_tags(b, "manual", None, &[TagAssignment::exact("subject", "rock")])
+            .expect("tags b");
+        c.set_tags(
+            cc,
+            "manual",
+            None,
+            &[
+                TagAssignment::exact("usage", "music"),
+                TagAssignment::exact("mood", "ambient"),
+            ],
+        )
+        .expect("tags c");
+
+        let g = c.tag_graph().expect("graph");
+        assert_eq!(g.asset_count, 3, "all three live tagged assets");
+        assert_eq!(g.link_count, 0, "no relationship edges yet");
+        assert_eq!(g.nodes.len(), 4);
+        let rock = g.nodes.iter().find(|n| n.value == "rock").expect("rock node");
+        assert_eq!(rock.usage_count, 2, "rock is on two assets");
+        assert_eq!(g.edges.len(), 2, "rock↔rpg on a, music↔ambient on c");
+        let pair = |x: i64, y: i64| (x.min(y), x.max(y));
+        let edges: HashSet<(i64, i64)> = g.edges.iter().map(|e| pair(e.tag_a, e.tag_b)).collect();
+        let rock_id = rock.tag_id;
+        let rpg_id = g.nodes.iter().find(|n| n.value == "rpg").unwrap().tag_id;
+        let music_id = g.nodes.iter().find(|n| n.value == "music").unwrap().tag_id;
+        let ambient_id = g.nodes.iter().find(|n| n.value == "ambient").unwrap().tag_id;
+        assert!(edges.contains(&pair(rock_id, rpg_id)));
+        assert!(edges.contains(&pair(music_id, ambient_id)));
+        for e in &g.edges {
+            assert_eq!(e.weight, 1);
+        }
+
+        // A resolved relationship edge feeds link_count; an unresolved one does not.
+        c.conn
+            .execute(
+                "INSERT INTO asset_relationship (from_asset_id, to_asset_id, kind, source, state)
+                 VALUES (?1, ?2, 'uses_texture', 'inferred', 'resolved')",
+                params![a, b],
+            )
+            .expect("edge");
+        assert_eq!(c.tag_graph().expect("graph").link_count, 1);
+        c.conn
+            .execute(
+                "INSERT INTO asset_relationship (from_asset_id, to_asset_id, kind, source, state)
+                 VALUES (?1, NULL, 'uses_material', 'unity_meta', 'missing')",
+                params![a],
+            )
+            .expect("missing edge");
+        assert_eq!(c.tag_graph().expect("graph").link_count, 1);
+
+        // Trashed assets leave the graph: rock drops to one asset, rpg disappears entirely.
+        c.set_trashed(&[a], true).expect("trash");
+        let g = c.tag_graph().expect("graph");
+        assert_eq!(g.asset_count, 2);
+        let rock = g.nodes.iter().find(|n| n.value == "rock").expect("rock node");
+        assert_eq!(rock.usage_count, 1);
+        assert!(g.nodes.iter().all(|n| n.value != "rpg"));
+        assert_eq!(g.edges.len(), 1, "only music↔ambient remains");
+    }
+
+    #[test]
+    fn asset_edges_lists_only_resolved_edges_between_live_assets() {
+        let (c, ids) = tagged_catalog(&[("a.fbx", "model_3d"), ("b.png", "image"), ("c.wav", "audio")]);
+        let (a, b, cc) = (ids[0], ids[1], ids[2]);
+        let edge = |from: i64, to: Option<i64>| {
+            c.conn
+                .execute(
+                    "INSERT INTO asset_relationship (from_asset_id, to_asset_id, kind, source, state)
+                     VALUES (?1, ?2, 'uses_texture', 'inferred', ?3)",
+                    params![from, to, if to.is_some() { "resolved" } else { "missing" }],
+                )
+                .expect("edge");
+        };
+        edge(a, Some(b));
+        edge(a, Some(cc));
+        edge(b, None); // unresolved — excluded
+
+        let edges = c.asset_edges().expect("edges");
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().all(|e| e.kind == "uses_texture"));
+        assert!(edges.iter().any(|e| e.from == a && e.to == b));
+        assert!(edges.iter().any(|e| e.from == a && e.to == cc));
+
+        // Trashing one endpoint removes the edge.
+        c.set_trashed(&[b], true).expect("trash");
+        let edges = c.asset_edges().expect("edges");
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].to, cc);
+    }
+
+    #[test]
+    fn source_blacklist_add_list_remove_round_trip() {
+        let c = Catalog::open_in_memory().expect("open");
+        let src = c.upsert_import_source("Lib", "C:/lib", "folder").expect("src");
+        assert!(c.list_source_excludes(src).expect("empty").is_empty());
+
+        c.add_source_exclude(src, "folder", "Assets/Editor").expect("add folder");
+        c.add_source_exclude(src, "asset", "junk.fbx").expect("add asset");
+        let list = c.list_source_excludes(src).expect("list");
+        assert_eq!(list.len(), 2);
+        assert!(list.contains(&SourceExclude {
+            kind: "folder".into(),
+            value: "Assets/Editor".into()
+        }));
+        assert!(list.contains(&SourceExclude {
+            kind: "asset".into(),
+            value: "junk.fbx".into()
+        }));
+
+        // An exact duplicate is a no-op.
+        c.add_source_exclude(src, "folder", "Assets/Editor").expect("dup");
+        assert_eq!(c.list_source_excludes(src).expect("list").len(), 2);
+
+        assert!(c
+            .remove_source_exclude(src, "folder", "Assets/Editor")
+            .expect("removed"));
+        assert!(
+            !c.remove_source_exclude(src, "folder", "Assets/Editor")
+                .expect("second"),
+            "already gone"
+        );
+        let list = c.list_source_excludes(src).expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].kind, "asset");
+
+        // Sources are independent — a second source has its own (empty) blacklist.
+        let src2 = c.upsert_import_source("Other", "D:/other", "folder").expect("src2");
+        assert!(c.list_source_excludes(src2).expect("empty").is_empty());
+    }
+
+    #[test]
+    fn source_blacklist_rejects_unknown_kind_and_empty_value() {
+        let c = Catalog::open_in_memory().expect("open");
+        let src = c.upsert_import_source("Lib", "C:/lib", "folder").expect("src");
+        assert!(c.add_source_exclude(src, "file", "x").is_err(), "kind must be folder|asset");
+        assert!(c.add_source_exclude(src, "folder", "   ").is_err(), "empty value rejected");
+        assert!(c.list_source_excludes(src).expect("list").is_empty());
+    }
+
+    #[test]
+    fn taxonomy_switcher_list_activate_and_delete() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        let t1 = c.create_taxonomy("Game", false).expect("t1");
+        let t2 = c.create_taxonomy("Worldbuilding", true).expect("t2");
+        let rows = c.list_taxonomies().expect("list");
+        assert_eq!(rows.len(), 2);
+        let active = rows.iter().find(|r| r.is_active).expect("active row");
+        assert_eq!(active.id, t2);
+        assert_eq!(active.name, "Worldbuilding");
+        assert_eq!(active.version, 1);
+
+        c.set_active_taxonomy(t1).expect("activate");
+        let rows = c.list_taxonomies().expect("list");
+        assert_eq!(rows.iter().filter(|r| r.is_active).count(), 1, "one active");
+        assert!(rows.iter().find(|r| r.id == t1).unwrap().is_active);
+        assert!(!rows.iter().find(|r| r.id == t2).unwrap().is_active);
+
+        // Deleting a taxonomy takes its categories, rules and aliases with it.
+        let cat = c.add_category(t1, None, "Props", "Props").expect("cat");
+        c.add_rule(t1, cat, "exact_tag", "subject:barrel", 10).expect("rule");
+        c.add_category_alias(cat, "junk").expect("alias");
+        let n = c.delete_taxonomy(t1).expect("delete");
+        assert_eq!(n, 2, "category + taxonomy row");
+        assert!(c.list_categories(t1).expect("cats").is_empty());
+        assert!(c.list_category_aliases(cat).expect("aliases").is_empty());
+        assert_eq!(c.list_taxonomies().expect("list").len(), 1);
+
+        assert!(c.set_active_taxonomy(999).is_err(), "unknown taxonomy");
+        assert!(c.delete_taxonomy(999).is_err(), "unknown taxonomy");
+    }
+
+    #[test]
+    fn rename_category_rewrites_descendant_paths() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        let tax = c.create_taxonomy("Default", true).expect("tax");
+        let env = c.add_category(tax, None, "Environment", "Environment").expect("env");
+        let foil = c
+            .add_category(tax, Some(env), "Foliage", "Environment/Foliage")
+            .expect("foil");
+        c.add_category(tax, Some(foil), "Trees", "Environment/Foliage/Trees")
+            .expect("trees");
+
+        c.rename_category(env, "World").expect("rename");
+        let paths: HashSet<String> = c
+            .list_categories(tax)
+            .expect("cats")
+            .into_iter()
+            .map(|(_, _, p)| p)
+            .collect();
+        assert_eq!(
+            paths,
+            ["World", "World/Foliage", "World/Foliage/Trees"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        );
+        assert!(c
+            .list_categories(tax)
+            .expect("cats")
+            .iter()
+            .any(|(_, label, _)| label == "World"));
+
+        // Same label is a no-op, empty label is rejected.
+        c.rename_category(env, "World").expect("no-op rename");
+        assert!(c.rename_category(env, "   ").is_err(), "empty label rejected");
+    }
+
+    #[test]
+    fn delete_category_removes_subtree_and_cascades_assignments() {
+        let (mut c, ids) = tagged_catalog(&[("barrel.png", "image")]);
+        let asset = ids[0];
+        let tax = c.create_taxonomy("Default", true).expect("tax");
+        let root = c.add_category(tax, None, "Root", "Root").expect("root");
+        let child = c
+            .add_category(tax, Some(root), "Child", "Root/Child")
+            .expect("child");
+        c.add_rule(tax, child, "exact_tag", "subject:barrel", 10)
+            .expect("rule");
+        c.add_category_alias(child, "crate").expect("alias");
+        c.assign_category_manual(asset, child, tax).expect("assign");
+
+        assert_eq!(c.delete_category(root).expect("delete"), 2, "root + child");
+        assert!(c.list_categories(tax).expect("cats").is_empty());
+        assert!(c.categories_of(asset, tax).expect("cats").is_empty(), "assignments cascade");
+        let rules: i64 = c
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM mapping_rule WHERE taxonomy_id = ?1",
+                params![tax],
+                |r| r.get(0),
+            )
+            .expect("rules");
+        assert_eq!(rules, 0, "rules cascade");
+        assert!(c.delete_category(999).is_err(), "unknown category");
+    }
+
+    #[test]
+    fn aliases_round_trip_normalize_and_remove() {
+        let c = Catalog::open_in_memory().expect("open");
+        let tax = c.create_taxonomy("Default", true).expect("tax");
+        let cat = c.add_category(tax, None, "Props", "Props").expect("cat");
+        let id1 = c.add_category_alias(cat, "Barrel").expect("add");
+        let id2 = c.add_category_alias(cat, "barrel").expect("add again");
+        assert_eq!(id1, id2, "case-insensitive norm makes them the same alias");
+        assert!(c.add_category_alias(cat, "  ").is_err(), "empty alias rejected");
+
+        let rows = c.list_category_aliases(cat).expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].alias, "Barrel");
+
+        c.remove_category_alias(rows[0].id).expect("remove");
+        assert!(c.list_category_aliases(cat).expect("list").is_empty());
+    }
+
+    #[test]
+    fn disabled_rule_is_skipped_by_apply_mapping() {
+        let (mut c, ids) = tagged_catalog(&[("barrel.png", "image")]);
+        let asset = ids[0];
+        c.set_tags(asset, "manual", None, &[TagAssignment::exact("subject", "barrel")])
+            .expect("tag");
+        let tax = c.create_taxonomy("Default", true).expect("tax");
+        let cat = c.add_category(tax, None, "Props", "Props").expect("cat");
+        let rule = c.add_rule(tax, cat, "exact_tag", "subject:barrel", 10).expect("rule");
+
+        assert_eq!(c.apply_mapping(tax).expect("apply"), 1);
+        assert_eq!(c.categories_of(asset, tax).expect("cats").len(), 1);
+
+        c.set_rule_enabled(rule, false).expect("disable");
+        // Re-apply drops the non-pinned rows; the disabled rule produces nothing.
+        assert_eq!(c.apply_mapping(tax).expect("apply"), 0);
+        assert!(c.categories_of(asset, tax).expect("cats").is_empty());
+    }
+
+    #[test]
+    fn op_log_record_recent_delete_manage_the_tail() {
+        let c = Catalog::open_in_memory().expect("open");
+        let a = c.record_op("set_trashed", r#"{"asset_ids":[1],"trashed":true}"#).expect("op1");
+        let b = c.record_op("create_collection", r#"{"collection_id":9,"name":"x"}"#).expect("op2");
+        let cc = c.record_op("set_tags", "{}").expect("op3");
+
+        let recent = c.recent_ops(2).expect("recent");
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].id, cc, "newest first");
+        assert_eq!(recent[0].op_kind, "set_tags");
+        assert_eq!(recent[1].id, b);
+
+        let full = c.recent_ops(100).expect("full");
+        assert_eq!(full.len(), 3);
+        assert!(full[0].id > full[1].id && full[1].id > full[2].id, "append order");
+
+        assert_eq!(c.delete_ops(&[a, b]).expect("delete"), 2);
+        let remaining = c.recent_ops(10).expect("remaining");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, cc);
+        assert_eq!(c.delete_ops(&[]).expect("no-op"), 0);
+    }
+
+    #[test]
+    fn revert_set_tags_restores_the_snapshotted_prior_set() {
+        let (mut c, ids) = tagged_catalog(&[("a.fbx", "model_3d")]);
+        let asset = ids[0];
+        let a1 = TagAssignment::exact("subject", "rock");
+        let a2 = TagAssignment::exact("style", "rpg");
+        c.set_tags(asset, "manual", None, &[a1.clone(), a2.clone()])
+            .expect("initial");
+
+        let op = c.record_set_tags_op(asset, "manual").expect("snapshot");
+        c.set_tags(asset, "manual", None, &[TagAssignment::exact("subject", "changed")])
+            .expect("mutate");
+        assert_eq!(c.tags_for_asset(asset).expect("tags").len(), 1, "now the new tag only");
+
+        c.revert_op(op).expect("revert");
+        let tags = c.tags_for_asset(asset).expect("tags");
+        assert_eq!(tags.len(), 2);
+        assert!(tags.contains(&a1));
+        assert!(tags.contains(&a2));
+        assert!(c.recent_ops(10).expect("recent").is_empty(), "reverted op is consumed");
+    }
+
+    /// `add_asset_tag` appends — adding one manual tag must not delete the asset's other
+    /// manual tags (the set_tags replace-per-source trap the bulk bar used to fall into).
+    #[test]
+    fn add_asset_tag_merges_without_touching_the_existing_set() {
+        let (mut c, ids) = tagged_catalog(&[("a.fbx", "model_3d")]);
+        let asset = ids[0];
+        c.set_tags(
+            asset,
+            "manual",
+            None,
+            &[TagAssignment::exact("subject", "rock"), TagAssignment::exact("style", "rpg")],
+        )
+        .expect("initial");
+
+        let n = c.add_asset_tag(asset, "manual", "subject", "shiny").expect("add");
+        assert_eq!(n, 1, "one row inserted");
+        let tags = c.tags_for_asset(asset).expect("tags");
+        assert_eq!(tags.len(), 3, "rock + rpg survive, shiny joins");
+        assert!(tags.contains(&TagAssignment::exact("subject", "shiny")));
+
+        // Adding the same tag again is a no-op — and records nothing (the writer only logs
+        // affected ids, so a revert can never yank a pre-existing tag).
+        let again = c.add_asset_tag(asset, "manual", "subject", "shiny").expect("again");
+        assert_eq!(again, 0, "duplicate insert is a no-op");
+    }
+
+    /// Bulk-tag undo is the exact inverse per asset: an add is undone by removing that tag
+    /// only; a removal by re-adding it. One op row covers the whole batch.
+    #[test]
+    fn bulk_tag_revert_is_the_exact_inverse_per_asset() {
+        let (mut c, ids) = tagged_catalog(&[("a.fbx", "model_3d"), ("b.png", "image")]);
+        let (a, b) = (ids[0], ids[1]);
+
+        // Add one tag to both, record the affected pair, then revert.
+        assert_eq!(c.add_asset_tag(a, "manual", "subject", "shiny").expect("a"), 1);
+        assert_eq!(c.add_asset_tag(b, "manual", "subject", "shiny").expect("b"), 1);
+        let op = c
+            .record_bulk_tag_op(&[a, b], "subject", "shiny", true)
+            .expect("record");
+        c.revert_op(op).expect("revert");
+        assert!(
+            c.tags_for_asset(a).expect("tags").is_empty() && c.tags_for_asset(b).expect("tags").is_empty(),
+            "revert removed the added tag from both assets"
+        );
+
+        // Remove-then-revert re-adds it.
+        assert_eq!(c.add_asset_tag(a, "manual", "subject", "dull").expect("a2"), 1);
+        let op2 = c
+            .record_bulk_tag_op(&[a], "subject", "dull", false)
+            .expect("record");
+        c.remove_asset_tag(a, "subject", "dull").expect("remove");
+        assert!(c.tags_for_asset(a).expect("tags").is_empty());
+        c.revert_op(op2).expect("revert2");
+        let tags = c.tags_for_asset(a).expect("tags");
+        assert_eq!(tags.len(), 1, "revert re-added the removed tag");
+        assert!(tags.contains(&TagAssignment::exact("subject", "dull")));
+    }
+
+    #[test]
+    fn revert_set_trashed_toggles_direction_in_both_ways() {
+        let (mut c, ids) = tagged_catalog(&[("a.fbx", "model_3d"), ("b.png", "image")]);
+        let (a, b) = (ids[0], ids[1]);
+
+        // Trash a, then undo the trash: the asset comes back.
+        let op = c.record_trash_op(&[a], true).expect("record trash");
+        assert_eq!(c.set_trashed(&[a], true).expect("trash"), 1);
+        assert!(is_trashed(&c, a));
+        c.revert_set_trashed(op).expect("revert");
+        assert!(!is_trashed(&c, a), "undo of a trash restores the asset");
+        assert!(c.recent_ops(10).expect("recent").is_empty());
+
+        // Untrash b (trashed first), then undo: it is trashed again.
+        c.set_trashed(&[b], true).expect("trash b");
+        let op = c.record_trash_op(&[b], false).expect("record untrash");
+        assert_eq!(c.set_trashed(&[b], false).expect("untrash"), 1);
+        assert!(!is_trashed(&c, b));
+        c.revert_op(op).expect("revert");
+        assert!(is_trashed(&c, b), "undo of an untrash re-trashes the asset");
+    }
+
+    #[test]
+    fn revert_create_collection_deletes_the_created_collection() {
+        let c = Catalog::open_in_memory().expect("open");
+        let id = c.create_collection("Temp").expect("create");
+        let op = c.record_collection_create_op(id, "Temp").expect("record");
+        assert_eq!(c.list_collections().expect("list").len(), 1);
+
+        c.revert_create_collection(op).expect("revert");
+        assert!(c.list_collections().expect("list").is_empty());
+        assert!(c.delete_collection(id).is_err(), "already deleted");
+    }
+
+    #[test]
+    fn revert_dispatches_and_rejects_unknown_kinds() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        let op = c.record_op("mystery", "{}").expect("record");
+        assert!(c.revert_op(op).is_err(), "no revert for unknown kind");
+        assert_eq!(c.recent_ops(10).expect("recent").len(), 1, "failed revert keeps the op");
+        assert!(c.revert_op(999).is_err(), "no such op");
+        assert!(c.revert_set_tags(op).is_err(), "wrong kind for the focused revert");
+    }
+
+    #[test]
+    fn collection_membership_add_remove_is_idempotent() {
+        let (c, ids) = tagged_catalog(&[("a.fbx", "model_3d"), ("b.png", "image")]);
+        let (a, b) = (ids[0], ids[1]);
+        let col = c.create_collection("Terrain").expect("create");
+
+        c.collection_add_asset(col, a).expect("add a");
+        c.collection_add_asset(col, b).expect("add b");
+        assert_eq!(c.collection_members(col).expect("members").len(), 2);
+
+        // Adding the same asset again is a no-op — membership is a set.
+        c.collection_add_asset(col, a).expect("add a again");
+        let members = c.collection_members(col).expect("members");
+        assert_eq!(members.len(), 2);
+        assert!(members.contains(&a));
+
+        c.collection_remove_asset(col, a).expect("remove a");
+        let members = c.collection_members(col).expect("members");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0], b);
+
+        // Removing an absent member is a no-op too.
+        c.collection_remove_asset(col, a).expect("remove absent");
+        assert_eq!(c.collection_members(col).expect("members").len(), 1);
+
+        // The Collections screen count reflects the live membership.
+        assert_eq!(c.list_collections().expect("list")[0].asset_count, 1);
     }
 }
