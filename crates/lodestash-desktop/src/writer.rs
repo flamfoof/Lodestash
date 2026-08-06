@@ -17,6 +17,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 
+use lodestash_app::config::AppConfig;
+use lodestash_app::drains::{drain_previews, PREVIEW_BACKFILL_BUDGET};
+use lodestash_app::paths::default_cache_dirs;
 use lodestash_app::types::PersistBatch;
 use lodestash_core::catalog::Catalog;
 use lodestash_core::types::{Exclude, ExcludeKind};
@@ -157,8 +160,33 @@ impl Writer {
                         return;
                     }
                 };
-                for job in rx {
-                    let _ = job.reply.send(run(&mut catalog, &db_path, job.op));
+                // Model preview backfill (M15) is time-boxed and durable, and the persist
+                // thread is the one place it may write (single-writer rule). The egui build
+                // drained it from its pump; without the same call here the desktop leaves
+                // `asset_preview` frozen at its initial coverage (6% of models on a real
+                // library) and every uncovered model card renders icon-only — the "3D cards
+                // look smaller than audio cards" symptom. Ops preempt it within a few
+                // seconds; the queue is durable, so it converges over idle moments.
+                let (cache_dir, workspace_dir) = default_cache_dirs();
+                let proxy = AppConfig::load().preview_quality.proxy_budget();
+                loop {
+                    match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                        Ok(job) => {
+                            let _ = job.reply.send(run(&mut catalog, &db_path, job.op));
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            // Idle — spend a few seconds backfilling previews, then re-check
+                            // the channel so a write never queues behind a long pass.
+                            drain_previews(
+                                &mut catalog,
+                                workspace_dir.as_deref(),
+                                cache_dir.as_deref(),
+                                proxy,
+                                PREVIEW_BACKFILL_BUDGET.min(std::time::Duration::from_secs(5)),
+                            );
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
                 }
                 tracing::debug!("writer: channel closed, thread exiting");
             })

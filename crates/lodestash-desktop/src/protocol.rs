@@ -78,10 +78,11 @@ fn preview(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
     match svg {
         Some(svg) => reply(StatusCode::OK)
             .header("Content-Type", "image/svg+xml")
-            // The preview is regenerated under a new source_key when the file changes, and the
-            // frontend re-reads the id list on reload, so a cached body is never stale in a way
-            // the client cannot see.
-            .header("Cache-Control", "max-age=3600")
+            // The body changes when a preview is first generated or re-fitted, and the URL is
+            // a bare asset id — a long max-age would serve the pre-fix/pre-generation body for
+            // an hour. 60s is short enough to pick changes up quickly and still skips the
+            // re-parse on every navigation.
+            .header("Cache-Control", "max-age=60")
             .body(fit_preview_to_content(&svg).into_bytes())
             .unwrap_or_else(|_| status(StatusCode::INTERNAL_SERVER_ERROR, "preview: build")),
         None => status(StatusCode::NOT_FOUND, "no preview for that asset"),
