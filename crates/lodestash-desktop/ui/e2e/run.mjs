@@ -1265,6 +1265,57 @@ try {
     });
     assert.equal(status, 404);
   });
+
+  // Regression: NEW TRAIT was dead — upsertTrait omitted the non-optional `teach`, so Tauri
+  // rejected every create with "missing required key" and only the error bar showed. The full
+  // UI path, verified through a separate read call, not the response.
+  await check("NEW TRAIT creates a trait through the screen", async () => {
+    const name = `e2e-trait-${Date.now()}`;
+    await page.getByRole("button", { name: "Traits" }).click();
+    await page.waitForSelector('[data-testid="new-trait"]', { timeout: 5000 });
+    await page.fill('[data-testid="new-trait-name"]', name);
+    await page.getByTestId("new-trait-go").click();
+    // The row appears in the list only if the write actually landed and the screen re-read.
+    await page.waitForFunction(
+      (n) =>
+        [...document.querySelectorAll('[data-testid="trait-row"]')].some((el) =>
+          el.textContent.includes(n),
+        ),
+      name,
+      { timeout: 5000 },
+    );
+    const vocab = await invoke("vocabulary");
+    const row = vocab.find((v) => v.value === name);
+    assert.ok(row, `trait ${name} never reached the vocabulary`);
+    assert.equal(row.is_trait, true, "created row must be a trait, not a plain tag");
+    assert.equal(row.teach, false, "a NEW TRAIT should default to not teaching");
+    // Cleanup: demote so repeated runs do not accumulate vocabulary.
+    await invoke("unpromote_trait", { tagId: row.id });
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.waitForSelector(".card", { timeout: 5000 });
+  });
+
+  // Regression: the tier inputs were one-way (`value=` with no bind), so a typed edit never
+  // reached state and blur saved the stale number. Verified through get_settings, not the
+  // blur handler's own response.
+  await check("editing a size tier persists", async () => {
+    const before = await invoke("get_settings");
+    const target = before.m_kb === 1000 ? 1400 : 1000;
+    await page.getByRole("button", { name: "Settings" }).click();
+    await page.waitForSelector('[data-testid="tier-m_kb"]', { timeout: 5000 });
+    await page.fill('[data-testid="tier-m_kb"]', String(target));
+    await page.keyboard.press("Enter"); // blur → fixBoundaries + save
+    let saved = null;
+    for (let i = 0; i < 20 && saved?.m_kb !== target; i++) {
+      await page.waitForTimeout(200);
+      saved = await invoke("get_settings");
+    }
+    assert.equal(saved?.m_kb, target, `tier edit did not persist (got ${saved?.m_kb})`);
+    // Restore the pre-test value so the library's badges keep their previous thresholds.
+    await invoke("set_settings", { settings: before });
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.waitForSelector(".card", { timeout: 5000 });
+  });
 } finally {
   await app.close();
 }
