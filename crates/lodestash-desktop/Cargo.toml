@@ -23,6 +23,9 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+# Window geometry persistence: remember size/position/maximized across launches and restore
+# before the window shows (no resize flash). Persists to the app config dir, keyed by window.
+tauri-plugin-window-state = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

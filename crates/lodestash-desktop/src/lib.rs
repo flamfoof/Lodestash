@@ -450,6 +450,10 @@ pub fn run() {
         .map(Writer::spawn);
 
     tauri::Builder::default()
+        // Window geometry (size/position/maximized) is remembered across launches and restored
+        // before the window is shown — the window opens where the user left it instead of
+        // re-applying the launch defaults and jumping. State file lives in the app config dir.
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(AppState {
             library: Mutex::new(library),
             writer,
