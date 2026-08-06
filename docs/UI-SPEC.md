@@ -101,8 +101,9 @@ One vertical panel, three stacked groups:
    select, navigates to Library. Below the rows: a dashed **`+ Add source…`** button (same action as
    Settings → Sources → Add).
 
-Facet groups collapse when a screen other than Library/Identify is active (they still render; they
-are Library filters). Sidebar scrolls as one column.
+Facet groups stay expanded on **every** screen — owner call 2026-08-06: the sidebar's
+navigation must not vanish when a screen other than Library/Identify is active (they are Library
+filters, and every facet click still navigates to Library). Sidebar scrolls as one column.
 
 ### 0.3 Type tab row
 

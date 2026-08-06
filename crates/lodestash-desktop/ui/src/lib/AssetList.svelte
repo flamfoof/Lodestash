@@ -129,8 +129,11 @@
   }
   .thumb {
     flex: none;
-    width: 22px;
-    height: 22px;
+    /* Tracks the density-driven row height (DESIGN-GUIDELINES §4: --row-h 32/36/40px) with
+       a fixed 6px breathing margin — a fixed 22px thumb sat oddly in a 40px cozy row and
+       shrunk relative to the grid cards when density changed. */
+    width: calc(var(--row-h) - 12px);
+    height: calc(var(--row-h) - 12px);
     display: grid;
     place-items: center;
     background: var(--ls-bg);

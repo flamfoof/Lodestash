@@ -19,11 +19,11 @@
   });
 
   /**
-   * UI-SPEC §0.2: the groups **collapse** away from Library/Identify — "they still render; they are
-   * Library filters". Keeping the headers means the rail's shape does not jump as you move between
-   * screens, and the facets stay discoverable from anywhere.
+   * UI-SPEC §0.2: the facet groups are Library filters, and per the 2026-08-06 owner call
+   * they stay expanded on **every** route — the sidebar's navigation must not vanish when a
+   * screen other than Library/Identify is active. Headers and rows render always; clicking a
+   * facet still routes to the Library with that filter applied.
    */
-  let expanded = $derived(view.route === "library" || view.route === "identify");
 
   const STATUSES = [
     { id: "all", label: "All", tint: "var(--ls-gold)" },
@@ -72,8 +72,7 @@
 
   <div class="group">
     <h2>Status</h2>
-    {#if expanded}
-      {#each STATUSES as s (s.id)}
+    {#each STATUSES as s (s.id)}
         <button
           class="facet"
           class:on={view.status === s.id}
@@ -85,13 +84,11 @@
           <span class="count num">{statusCounts[s.id]}</span>
         </button>
       {/each}
-    {/if}
   </div>
 
   <div class="group">
     <h2>Libraries</h2>
-    {#if expanded}
-      <button
+    <button
         class="facet"
         class:on={view.source === null}
         aria-pressed={view.source === null}
@@ -115,7 +112,6 @@
       <!-- ponytail: the chooser (FEATURES §7.4) is B2b's; until then the drop target is the only
            way in, and saying so beats a button that opens nothing. -->
       <div class="add" title="Drop a folder on the window to add it">+ Add source…</div>
-    {/if}
   </div>
 </aside>
 

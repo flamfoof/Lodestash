@@ -43,6 +43,25 @@
   let status = $state<LibraryStatus | null>(null);
   let reloading = $state(false);
 
+  // List-row height per density stop (DESIGN-GUIDELINES §4: 32px compact, +4 per step).
+  // Defined once on the frame so AssetList / FoldersView / Sidebar / Traits rows all agree.
+  const ROW_H: Record<string, number> = { compact: 32, cozy: 36, large: 40 };
+  let rowH = $derived(ROW_H[view.density] ?? 36);
+
+  // Re-ask the sidebar's facet counts whenever the route changes — a mutation made on
+  // Traits / Collections / Settings / Inspector refreshes app status only when it went
+  // through the top-level write(); navigating is the cheap catch-all.
+  $effect(() => {
+    view.route;
+    let stale = false;
+    libraryStatus().then((s) => {
+      if (!stale) status = s;
+    });
+    return () => {
+      stale = true;
+    };
+  });
+
   libraryStatus()
     .then((s) => (status = s))
     .catch(() => {});
@@ -203,7 +222,7 @@
 
 <svelte:window on:keydown={onkeydown} />
 
-<div class="frame">
+<div class="frame" style="--row-h: {rowH}px">
   <TopBar engineReady={status?.open ?? false} {status} />
   <div class="body">
     <Sidebar {status} />
