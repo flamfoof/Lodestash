@@ -4,8 +4,9 @@ Working notes for whoever (or whatever) continues the build. Unlike the rest of 
 is **not** a design spec — it's the state of play, the decisions already settled, and the traps.
 The design docs still win on any question of what the software *should* do.
 
-Last updated: **2026-08-04** — §1.6 is the current handoff (the whole session is uncommitted on
-`main`); the §1.5 "B5 writes" block below it is historical and already shipped.
+Last updated: **2026-08-04** — §1.6 is the current handoff; the B8 session it describes is now
+**committed on `main`** (five commits, `e1c0160`…`cdde6c0`), and the §1.5 "B5 writes" block below
+it is historical and already shipped.
 
 ---
 
@@ -86,9 +87,11 @@ the Svelte side does not have yet.
 ## 1.6 Next session: review the conformance remediation, close the board, then the follow-ups (2026-08-04)
 
 **This session did a full design-conformance audit + remediation of the Svelte/Tauri app
-(`crates/lodestash-desktop/ui` + the desktop crate). The entire session is UNCOMMITTED on `main`:
-27 modified + 8 untracked files (see `git status`).** Verified state at handoff: e2e **48/48**,
-Rust **150/150** (core 77, app 28, desktop 45), svelte-check **0/0**, vite build green.
+(`crates/lodestash-desktop/ui` + the desktop crate). Since this handoff was written the session has
+been **committed on `main`** in five logical commits (`e1c0160` backend commands+ops, `ef7e2d7`
+audit docs + board close, `82495f1` icons+tokens, `1e7d186` the conformance UI, `cdde6c0` window
+geometry).** Verified state at handoff: e2e **48/48**, Rust **150/150** (core 77, app 28, desktop
+45), svelte-check **0/0**, vite build green.
 
 **Orientation (one paragraph).** Lodestash is a local-first desktop app that catalogues game
 assets (Unity `.unitypackage` + loose files) — 3D/audio/image — with Rust core (`lodestash-core`
