@@ -238,7 +238,7 @@
                 type="number"
                 min={128}
                 max={10_240}
-                value={s[f.key]}
+                bind:value={s[f.key]}
                 onblur={() => {
                   fixBoundaries();
                   save();
@@ -256,7 +256,7 @@
               type="number"
               min={512}
               max={10_240}
-              value={s.cap_kb}
+              bind:value={s.cap_kb}
               onblur={() => {
                 fixBoundaries();
                 save();

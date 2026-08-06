@@ -52,14 +52,23 @@
     .catch(() => {});
 
   // Persisted view prefs (FEATURES §10): hydrate once at startup, then write the whole object
-  // back on any change. The save effect re-fires after hydration with the loaded values — an
-  // idempotent no-op write, not a loop.
+  // back on any change. The save effect is gated on `hydrated` — without the gate it would fire
+  // on mount with *defaults* and clobber the stored prefs before hydration resolves, and every
+  // launch would write config twice.
+  let hydrated = $state(false);
   $effect(() => {
     getWebPrefs()
-      .then((p) => view.hydrate(p))
-      .catch(() => {});
+      .then((p) => {
+        view.hydrate(p);
+        hydrated = true;
+      })
+      .catch(() => {
+        // Load failed — still allow saves; nothing was clobbered because none were sent.
+        hydrated = true;
+      });
   });
   $effect(() => {
+    if (!hydrated) return;
     setWebPrefs(view.snapshot()).catch(() => {});
   });
 

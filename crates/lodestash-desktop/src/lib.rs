@@ -312,17 +312,27 @@ fn pack_dir_tree(state: tauri::State<'_, AppState>, package: String) -> Result<V
         .map_err(|_| "library lock poisoned".to_string())
 }
 
+/// Serialize config.json read-modify-write cycles. `set_web_prefs` and `set_settings` (and the
+/// onboarding path, which is `set_settings`) each load→modify→save the whole file; without this
+/// a racing pair can clobber each other's fields. `AppConfig::save()` is a direct `fs::write`
+/// (not atomic), so reads take the lock too — a reader must never meet a half-written file.
+/// Held only inside these four commands; `Library::reload` reads config without the lock, so
+/// there is no second lock order to invert (order is always CONFIG_LOCK → library lock).
+static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The Svelte shell's persisted view prefs (FEATURES §10). Read once at startup; the frontend
 /// keeps its own copy and saves it back through `set_web_prefs` on every change.
 #[tauri::command]
-fn get_web_prefs() -> lodestash_app::config::WebPrefs {
-    lodestash_app::config::AppConfig::load().web
+fn get_web_prefs() -> Result<lodestash_app::config::WebPrefs, String> {
+    let _g = CONFIG_LOCK.lock().map_err(|_| "config lock poisoned".to_string())?;
+    Ok(lodestash_app::config::AppConfig::load().web)
 }
 
 /// Persist the Svelte shell's view prefs. All-or-nothing write of the whole group — the
 /// frontend is the only writer, and a partial patch would leave fields silently stale.
 #[tauri::command]
 fn set_web_prefs(prefs: lodestash_app::config::WebPrefs) -> Result<(), String> {
+    let _g = CONFIG_LOCK.lock().map_err(|_| "config lock poisoned".to_string())?;
     let mut config = lodestash_app::config::AppConfig::load();
     config.web = prefs;
     config.save();
@@ -372,14 +382,16 @@ fn set_trait_style(
 
 /// The Settings screen's snapshot (UI-SPEC §11). Read once; the frontend writes it back whole.
 #[tauri::command]
-fn get_settings() -> Settings {
-    Settings::from_config(&lodestash_app::config::AppConfig::load())
+fn get_settings() -> Result<Settings, String> {
+    let _g = CONFIG_LOCK.lock().map_err(|_| "config lock poisoned".to_string())?;
+    Ok(Settings::from_config(&lodestash_app::config::AppConfig::load()))
 }
 
 /// Persist the Settings snapshot and re-read the library so the size tiers and source rows the
 /// grid draws follow immediately (badges, ⚑ size facet, watch toggles).
 #[tauri::command]
 fn set_settings(state: tauri::State<'_, AppState>, settings: Settings) -> Result<(), String> {
+    let _g = CONFIG_LOCK.lock().map_err(|_| "config lock poisoned".to_string())?;
     let mut config = lodestash_app::config::AppConfig::load();
     settings.apply(&mut config);
     config.save();

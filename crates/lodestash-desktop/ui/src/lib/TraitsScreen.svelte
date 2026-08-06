@@ -88,7 +88,7 @@
     const name = ntName.trim();
     const namespace = ntNamespace.trim() || "trait";
     if (!name) return;
-    await write(() => upsertTrait({ namespace, value: name }));
+    await write(() => upsertTrait({ namespace, value: name, teach: false }));
     ntName = "";
   }
 </script>
