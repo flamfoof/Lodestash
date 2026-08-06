@@ -92,6 +92,11 @@ export type GridQuery = {
   source?: string | null;
   /** Restrict to one collection's members — what Collections' Browse → sets (UI-SPEC §6). */
   collection?: number | null;
+  /**
+   * Restrict to assets sharing an `asset_relationship` edge with this one — the ⚑ Filters LINKS
+   * section (FEATURES §1.4). The selected asset's id; the grid shows only its linked neighbours.
+   */
+  links?: number | null;
   page: number;
   page_size: number;
 };
@@ -244,6 +249,128 @@ export const createCollection = (name: string) => invoke<{ changed: number }>("c
 export const deleteCollection = (id: number) => invoke<{ changed: number }>("delete_collection", { id });
 export const setPackagePinned = (id: number, pinned: boolean) =>
   invoke<{ changed: number }>("set_package_pinned", { id, pinned });
+
+/** One related asset (DATA-MODEL §10): a dependency edge endpoint from the inspector's view. */
+export type RelatedAsset = {
+  outbound: boolean;
+  kind: string;
+  state: string;
+  declared_path: string | null;
+  asset_id: number | null;
+  name: string | null;
+};
+
+export const relatedAssets = (assetId: number) => invoke<RelatedAsset[]>("related_assets", { assetId });
+
+/** The staging tray (I6) — in-memory ids, order-preserving. */
+export const stage = (ids: number[]) => invoke<number>("stage", { ids });
+export const unstage = (ids: number[]) => invoke<number>("unstage", { ids });
+export const clearStaged = () => invoke<void>("clear_staged");
+export const staged = () => invoke<number[]>("staged");
+
+/** The Mapping tab (UI-SPEC §9.2). */
+export type MappingRuleRow = {
+  id: number;
+  category_id: number;
+  category_path: string;
+  match_type: string;
+  pattern: string;
+  priority: number;
+  enabled: boolean;
+};
+
+export const listRules = (taxonomyId: number) => invoke<MappingRuleRow[]>("list_rules", { taxonomyId });
+export const applyMapping = (taxonomyId: number) => invoke<{ changed: number }>("apply_mapping", { taxonomyId });
+export const addCategory = (
+  taxonomyId: number,
+  parentId: number | null,
+  prefLabel: string,
+  path: string,
+) => invoke<{ changed: number }>("add_category", { taxonomyId, parentId, prefLabel, path });
+
+/** One node of the Stats Tag Graph (UI-SPEC §8.2): a tag with its usage count. */
+export type TagGraphNode = {
+  tag_id: number;
+  namespace: string;
+  value: string;
+  usage_count: number;
+};
+
+/** One co-occurrence edge of the Stats Tag Graph (UI-SPEC §8.2): two tags on the same asset. */
+export type TagGraphEdge = {
+  tag_a: number;
+  tag_b: number;
+  /** The number of assets bearing both tags. */
+  weight: number;
+};
+
+/** The full Stats Tag Graph payload (UI-SPEC §8.2), including the `tags · links · assets` counts. */
+export type TagGraph = {
+  nodes: TagGraphNode[];
+  edges: TagGraphEdge[];
+  asset_count: number;
+  link_count: number;
+};
+
+export const tagGraph = () => invoke<TagGraph>("tag_graph");
+
+/** One resolved asset→asset edge (DATA-MODEL §10) — behind the LINKS filter and the graph arcs. */
+export type AssetEdge = {
+  from: number;
+  to: number;
+  kind: string;
+  source: string;
+};
+
+export const assetEdges = () => invoke<AssetEdge[]>("asset_edges");
+
+/** One per-source blacklist entry (UI-SPEC §11.1): `kind` is `folder` or `asset`. */
+export type SourceExclude = {
+  kind: string;
+  value: string;
+};
+
+export const sourceExcludes = (sourceId: number) =>
+  invoke<SourceExclude[]>("source_excludes", { sourceId });
+export const addSourceExclude = (sourceId: number, kind: string, value: string) =>
+  invoke<WriteResult>("add_source_exclude", { sourceId, kind, value });
+export const removeSourceExclude = (sourceId: number, kind: string, value: string) =>
+  invoke<WriteResult>("remove_source_exclude", { sourceId, kind, value });
+
+/** One row of the Mapping tab's taxonomy switcher (UI-SPEC §9.2). */
+export type TaxonomyRow = {
+  id: number;
+  name: string;
+  version: number;
+  is_active: boolean;
+};
+
+export const taxonomies = () => invoke<TaxonomyRow[]>("taxonomies");
+export const setActiveTaxonomy = (id: number) => invoke<WriteResult>("set_active_taxonomy", { id });
+export const deleteTaxonomy = (id: number) => invoke<WriteResult>("delete_taxonomy", { id });
+export const renameCategory = (id: number, label: string) =>
+  invoke<WriteResult>("rename_category", { id, label });
+export const deleteCategory = (id: number) => invoke<WriteResult>("delete_category", { id });
+
+/** One undo-log row (UI-SPEC §2 Ctrl/Cmd-Z / L5) — the payload is opaque JSON to the frontend. */
+export type OpLogRow = {
+  id: number;
+  op_kind: string;
+  payload_json: string;
+  created_at: number;
+};
+
+export const recentOps = (limit: number) => invoke<OpLogRow[]>("recent_ops", { limit });
+export const undo = (opId: number) => invoke<WriteResult>("undo", { opId });
+
+export const collectionAddAsset = (collectionId: number, assetId: number) =>
+  invoke<WriteResult>("collection_add_asset", { collectionId, assetId });
+export const collectionRemoveAsset = (collectionId: number, assetId: number) =>
+  invoke<WriteResult>("collection_remove_asset", { collectionId, assetId });
+
+/** Bulk-bar tag edit (KANBAN B9d): add/remove one tag on many assets; each is undoable. */
+export const bulkTag = (assetIds: number[], namespace: string, value: string, on: boolean) =>
+  invoke<WriteResult>("bulk_tag", { assetIds, namespace, value, on });
 
 /**
  * Index a folder and add it as a library source — what drag-and-drop drops into.

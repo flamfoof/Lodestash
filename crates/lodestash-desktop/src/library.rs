@@ -84,6 +84,10 @@ pub struct GridQuery {
     /// Restrict to one collection's members — what the Collections screen's **Browse →** sets
     /// (UI-SPEC §6), shown as a clearable chip like the pack filter.
     pub collection: Option<i64>,
+    /// Restrict to assets sharing an `asset_relationship` edge with this one — the ⚑ Filters
+    /// LINKS section (FEATURES §1.4 / DATA-MODEL §10). Set to the selected asset's id; the grid
+    /// then shows only its linked neighbours in both directions. `None` means no link filter.
+    pub links: Option<i64>,
     pub page: usize,
     pub page_size: usize,
 }
@@ -102,6 +106,7 @@ impl Default for GridQuery {
             package: None,
             source: None,
             collection: None,
+            links: None,
             page: 0,
             page_size: 100,
         }
@@ -517,6 +522,9 @@ pub struct Library {
     /// The user's S/M/L/XL boundaries (§11.4), read from the same config the egui build writes —
     /// so the size badge on a card and the size facet in the popover agree with each other.
     tiers: SizeTiers,
+    /// Assets staged in the tray (I6). In-memory only — the tray is transient design state;
+    /// the commit-to-project half rides the engine build (B9e keeps the collect side).
+    staged: Vec<i64>,
 }
 
 struct Row {
@@ -575,6 +583,7 @@ impl Library {
                     rows: Vec::new(),
                     paths: HashMap::new(),
                     tiers: lodestash_app::config::AppConfig::load().size_tiers.normalized(),
+                    staged: Vec::new(),
                 };
                 lib.reload();
                 lib
@@ -595,6 +604,7 @@ impl Library {
             rows: Vec::new(),
             paths: HashMap::new(),
             tiers: SizeTiers::default(),
+            staged: Vec::new(),
         }
     }
 
@@ -909,6 +919,28 @@ impl Library {
                 .map(|v| v.into_iter().collect()),
             None => None,
         };
+        // LINKS filter (FEATURES §1.4 / DATA-MODEL §10): show only assets sharing an
+        // `asset_relationship` edge with the selected id, computed once per query rather than
+        // one edge query per row. An empty neighbour set — the selected asset has no edges, or
+        // the catalog is missing — means **zero rows**: filtering by a link that doesn't exist
+        // must show nothing, not everything.
+        let linked: Option<std::collections::HashSet<i64>> = match q.links {
+            Some(id) => Some(
+                self.catalog
+                    .as_ref()
+                    .and_then(|cat| cat.asset_edges().ok())
+                    .map(|edges| {
+                        edges
+                            .iter()
+                            .filter(|e| e.from == id || e.to == id)
+                            .flat_map(|e| [e.from, e.to])
+                            .filter(|&x| x != id)
+                            .collect::<std::collections::HashSet<_>>()
+                    })
+                    .unwrap_or_default(),
+            ),
+            None => None,
+        };
         let mut matched: Vec<&Row> = self
             .rows
             .iter()
@@ -925,6 +957,10 @@ impl Library {
             })
             .filter(|r| match &members {
                 Some(m) => m.contains(&r.item.asset_id),
+                None => true,
+            })
+            .filter(|r| match &linked {
+                Some(set) => set.contains(&r.item.asset_id),
                 None => true,
             })
             .filter(|r| needle.is_empty() || self.hits(r, &needle, ranks))
@@ -1346,6 +1382,140 @@ impl Library {
         }
     }
 
+    /// The Stats Tag Graph (UI-SPEC §8.2): tag nodes, tag↔tag co-occurrence edges and the
+    /// `tags · links · assets` header counts. Empty graph when the catalog is missing or the
+    /// query fails — the canvas draws nothing rather than breaking.
+    pub fn tag_graph(&self) -> lodestash_core::catalog::TagGraph {
+        let Some(cat) = self.catalog.as_ref() else {
+            return empty_tag_graph();
+        };
+        match cat.tag_graph() {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(%e, "tag_graph failed");
+                empty_tag_graph()
+            }
+        }
+    }
+
+    /// Every resolved asset→asset edge (DATA-MODEL §10) — the set behind the LINKS filter and
+    /// the tag graph's dashed dependency arcs. Empty when the catalog is missing.
+    pub fn asset_edges(&self) -> Vec<lodestash_core::catalog::AssetEdge> {
+        let Some(cat) = self.catalog.as_ref() else {
+            return Vec::new();
+        };
+        match cat.asset_edges() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(%e, "asset_edges failed");
+                Vec::new()
+            }
+        }
+    }
+
+    /// One source's blacklist (UI-SPEC §11.1 expanded panel): every `{kind, value}` exclusion
+    /// the crawler will skip for this source (DATA-MODEL §10).
+    pub fn source_excludes(&self, source_id: i64) -> Vec<lodestash_core::catalog::SourceExclude> {
+        let Some(cat) = self.catalog.as_ref() else {
+            return Vec::new();
+        };
+        match cat.list_source_excludes(source_id) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(%e, source = source_id, "list_source_excludes failed");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Every taxonomy for the Mapping tab's switcher (UI-SPEC §9.2), active first, with the
+    /// `v<version>` readout and `is_active` marker.
+    pub fn taxonomies(&self) -> Vec<lodestash_core::catalog::TaxonomyRow> {
+        let Some(cat) = self.catalog.as_ref() else {
+            return Vec::new();
+        };
+        match cat.list_taxonomies() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(%e, "list_taxonomies failed");
+                Vec::new()
+            }
+        }
+    }
+
+    /// The newest undo-log rows, newest first, capped at `limit` (UI-SPEC §2 / L5).
+    pub fn recent_ops(&self, limit: usize) -> Vec<lodestash_core::catalog::OpLogRow> {
+        let Some(cat) = self.catalog.as_ref() else {
+            return Vec::new();
+        };
+        match cat.recent_ops(limit) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(%e, "recent_ops failed");
+                Vec::new()
+            }
+        }
+    }
+
+    /// The assets related to `asset_id` through dependency edges (DATA-MODEL §10) — the
+    /// inspector's LINKED FILES / SIMILAR slices. `outbound` marks which way the edge points.
+    pub fn related_assets(&self, asset_id: i64) -> Vec<lodestash_core::catalog::RelatedAsset> {
+        let Some(cat) = self.catalog.as_ref() else {
+            return Vec::new();
+        };
+        match cat.related_assets(asset_id) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(%e, "related_assets failed");
+                Vec::new()
+            }
+        }
+    }
+
+    /// One taxonomy's mapping rules, priority-ordered (UI-SPEC §9.2).
+    pub fn list_rules(&self, taxonomy_id: i64) -> Vec<lodestash_core::catalog::MappingRuleRow> {
+        let Some(cat) = self.catalog.as_ref() else {
+            return Vec::new();
+        };
+        match cat.list_rules(taxonomy_id) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(%e, "list_rules failed");
+                Vec::new()
+            }
+        }
+    }
+
+    // ── Staging tray (I6) ──────────────────────────────────────────────────────
+
+    /// Stage `ids` into the tray (dedup, order-preserving). Returns how many were new.
+    pub fn stage(&mut self, ids: &[i64]) -> usize {
+        let mut n = 0;
+        for id in ids {
+            if !self.staged.contains(id) {
+                self.staged.push(*id);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Remove `ids` from the tray. Returns how many were present.
+    pub fn unstage(&mut self, ids: &[i64]) -> usize {
+        let before = self.staged.len();
+        self.staged.retain(|id| !ids.contains(id));
+        before - self.staged.len()
+    }
+
+    pub fn clear_staged(&mut self) {
+        self.staged.clear();
+    }
+
+    /// The staged asset ids, in the order they were staged.
+    pub fn staged_ids(&self) -> Vec<i64> {
+        self.staged.clone()
+    }
+
     /// The pack browser's left tree (PACK-DIRECTORY-NAV §5): every folder inside one package with
     /// its `direct (recursive)` counts, derived from the in-memory rows — no query, no new data.
     ///
@@ -1577,6 +1747,17 @@ impl Library {
     }
 }
 
+/// An empty Stats Tag Graph — what `Library::tag_graph` returns when there is no catalog or
+/// the query failed. The canvas renders nothing instead of crashing or stalling on a half object.
+fn empty_tag_graph() -> lodestash_core::catalog::TagGraph {
+    lodestash_core::catalog::TagGraph {
+        nodes: Vec::new(),
+        edges: Vec::new(),
+        asset_count: 0,
+        link_count: 0,
+    }
+}
+
 /// Lifecycle order, for picking a duplicate group's keeper: the most-appraised copy is the one
 /// worth keeping, because it carries the work someone already did on it (DATA-MODEL §8).
 fn status_rank(s: AssetStatus) -> u8 {
@@ -1710,6 +1891,7 @@ mod tests {
             rows,
             paths: HashMap::new(),
             tiers: SizeTiers::default(),
+            staged: Vec::new(),
         }
     }
 

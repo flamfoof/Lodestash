@@ -312,31 +312,18 @@ fn pack_dir_tree(state: tauri::State<'_, AppState>, package: String) -> Result<V
         .map_err(|_| "library lock poisoned".to_string())
 }
 
-/// Serialize config.json read-modify-write cycles. `set_web_prefs` and `set_settings` (and the
-/// onboarding path, which is `set_settings`) each load→modify→save the whole file; without this
-/// a racing pair can clobber each other's fields. `AppConfig::save()` is a direct `fs::write`
-/// (not atomic), so reads take the lock too — a reader must never meet a half-written file.
-/// Held only inside these four commands; `Library::reload` reads config without the lock, so
-/// there is no second lock order to invert (order is always CONFIG_LOCK → library lock).
-static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// The Svelte shell's persisted view prefs (FEATURES §10). Read once at startup; the frontend
 /// keeps its own copy and saves it back through `set_web_prefs` on every change.
 #[tauri::command]
 fn get_web_prefs() -> Result<lodestash_app::config::WebPrefs, String> {
-    let _g = CONFIG_LOCK.lock().map_err(|_| "config lock poisoned".to_string())?;
-    Ok(lodestash_app::config::AppConfig::load().web)
+    lodestash_app::config::edit_config(|c| c.web.clone())
 }
 
 /// Persist the Svelte shell's view prefs. All-or-nothing write of the whole group — the
 /// frontend is the only writer, and a partial patch would leave fields silently stale.
 #[tauri::command]
 fn set_web_prefs(prefs: lodestash_app::config::WebPrefs) -> Result<(), String> {
-    let _g = CONFIG_LOCK.lock().map_err(|_| "config lock poisoned".to_string())?;
-    let mut config = lodestash_app::config::AppConfig::load();
-    config.web = prefs;
-    config.save();
-    Ok(())
+    lodestash_app::config::edit_config(|c| c.web = prefs)
 }
 
 /// Trait-library authoring (UI-SPEC §9, B8a). Create or promote a trait; an existing tag keeps
@@ -383,18 +370,14 @@ fn set_trait_style(
 /// The Settings screen's snapshot (UI-SPEC §11). Read once; the frontend writes it back whole.
 #[tauri::command]
 fn get_settings() -> Result<Settings, String> {
-    let _g = CONFIG_LOCK.lock().map_err(|_| "config lock poisoned".to_string())?;
-    Ok(Settings::from_config(&lodestash_app::config::AppConfig::load()))
+    lodestash_app::config::edit_config(|c| Settings::from_config(c))
 }
 
 /// Persist the Settings snapshot and re-read the library so the size tiers and source rows the
 /// grid draws follow immediately (badges, ⚑ size facet, watch toggles).
 #[tauri::command]
 fn set_settings(state: tauri::State<'_, AppState>, settings: Settings) -> Result<(), String> {
-    let _g = CONFIG_LOCK.lock().map_err(|_| "config lock poisoned".to_string())?;
-    let mut config = lodestash_app::config::AppConfig::load();
-    settings.apply(&mut config);
-    config.save();
+    lodestash_app::config::edit_config(|c| settings.apply(c))?;
     state
         .library
         .lock()
@@ -434,6 +417,255 @@ fn delete_collection(state: tauri::State<'_, AppState>, id: i64) -> Result<Write
 #[tauri::command]
 fn set_package_pinned(state: tauri::State<'_, AppState>, id: i64, pinned: bool) -> Result<WriteResult, String> {
     state.write(Op::SetPackagePinned { id, pinned })
+}
+
+/// The assets related to `asset_id` through dependency edges (DATA-MODEL §10) — the
+/// inspector's LINKED FILES / SIMILAR slices.
+#[tauri::command]
+fn related_assets(
+    state: tauri::State<'_, AppState>,
+    asset_id: i64,
+) -> Result<Vec<lodestash_core::catalog::RelatedAsset>, String> {
+    state
+        .library
+        .lock()
+        .map(|l| l.related_assets(asset_id))
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
+/// Stage asset ids into the tray (I6). In-memory only; the commit half rides the engine.
+#[tauri::command]
+fn stage(state: tauri::State<'_, AppState>, ids: Vec<i64>) -> Result<usize, String> {
+    state
+        .library
+        .lock()
+        .map(|mut l| l.stage(&ids))
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
+#[tauri::command]
+fn unstage(state: tauri::State<'_, AppState>, ids: Vec<i64>) -> Result<usize, String> {
+    state
+        .library
+        .lock()
+        .map(|mut l| l.unstage(&ids))
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
+#[tauri::command]
+fn clear_staged(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state
+        .library
+        .lock()
+        .map(|mut l| l.clear_staged())
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
+#[tauri::command]
+fn staged(state: tauri::State<'_, AppState>) -> Result<Vec<i64>, String> {
+    state
+        .library
+        .lock()
+        .map(|l| l.staged_ids())
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
+/// The Stats Tag Graph (UI-SPEC §8.2): tag nodes, tag↔tag co-occurrence edges and the
+/// `tags · links · assets` header counts. Read-only.
+#[tauri::command]
+fn tag_graph(state: tauri::State<'_, AppState>) -> Result<lodestash_core::catalog::TagGraph, String> {
+    state
+        .library
+        .lock()
+        .map(|l| l.tag_graph())
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
+/// Every resolved asset→asset edge (DATA-MODEL §10) — the set behind the LINKS filter and the
+/// tag graph's dashed dependency arcs. Read-only.
+#[tauri::command]
+fn asset_edges(state: tauri::State<'_, AppState>) -> Result<Vec<lodestash_core::catalog::AssetEdge>, String> {
+    state
+        .library
+        .lock()
+        .map(|l| l.asset_edges())
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
+/// One source's blacklist (UI-SPEC §11.1): every `{kind, value}` exclusion the crawler skips.
+#[tauri::command]
+fn source_excludes(
+    state: tauri::State<'_, AppState>,
+    source_id: i64,
+) -> Result<Vec<lodestash_core::catalog::SourceExclude>, String> {
+    state
+        .library
+        .lock()
+        .map(|l| l.source_excludes(source_id))
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
+/// Add one `{kind, value}` exclusion to a source's blacklist (UI-SPEC §11.1 ⊘ add buttons).
+#[tauri::command]
+fn add_source_exclude(
+    state: tauri::State<'_, AppState>,
+    source_id: i64,
+    kind: String,
+    value: String,
+) -> Result<WriteResult, String> {
+    state.write(Op::AddSourceExclude {
+        source_id,
+        kind,
+        value,
+    })
+}
+
+/// Remove one `{kind, value}` exclusion from a source's blacklist (UI-SPEC §11.1 chip ✕).
+#[tauri::command]
+fn remove_source_exclude(
+    state: tauri::State<'_, AppState>,
+    source_id: i64,
+    kind: String,
+    value: String,
+) -> Result<WriteResult, String> {
+    state.write(Op::RemoveSourceExclude {
+        source_id,
+        kind,
+        value,
+    })
+}
+
+/// Every taxonomy for the Mapping tab's switcher (UI-SPEC §9.2), active first.
+#[tauri::command]
+fn taxonomies(state: tauri::State<'_, AppState>) -> Result<Vec<lodestash_core::catalog::TaxonomyRow>, String> {
+    state
+        .library
+        .lock()
+        .map(|l| l.taxonomies())
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
+/// Make `id` the single active taxonomy (UI-SPEC §9.2 `● active` marker).
+#[tauri::command]
+fn set_active_taxonomy(state: tauri::State<'_, AppState>, id: i64) -> Result<WriteResult, String> {
+    state.write(Op::SetActiveTaxonomy { id })
+}
+
+/// Delete a taxonomy and everything under it (UI-SPEC §9.2).
+#[tauri::command]
+fn delete_taxonomy(state: tauri::State<'_, AppState>, id: i64) -> Result<WriteResult, String> {
+    state.write(Op::DeleteTaxonomy { id })
+}
+
+/// Rename a category (UI-SPEC §9.2 row rename) — rewrites descendant paths in one transaction.
+#[tauri::command]
+fn rename_category(state: tauri::State<'_, AppState>, id: i64, label: String) -> Result<WriteResult, String> {
+    state.write(Op::RenameCategory { id, label })
+}
+
+/// Delete a category and its whole subtree (UI-SPEC §9.2 row delete — assignments cascade).
+#[tauri::command]
+fn delete_category(state: tauri::State<'_, AppState>, id: i64) -> Result<WriteResult, String> {
+    state.write(Op::DeleteCategory { id })
+}
+
+/// Add a category under `parent_id` (or the taxonomy root) with a display label and full path
+/// (UI-SPEC §9.2). `path` is the materialized `Taxonomy/Category/…` chain the mapping matches on.
+#[tauri::command]
+fn add_category(
+    state: tauri::State<'_, AppState>,
+    taxonomy_id: i64,
+    parent_id: Option<i64>,
+    pref_label: String,
+    path: String,
+) -> Result<WriteResult, String> {
+    state.write(Op::AddCategory {
+        taxonomy_id,
+        parent_id,
+        pref_label,
+        path,
+    })
+}
+
+/// The mapping rules of one taxonomy, ordered by priority (UI-SPEC §9.2). Read-only.
+#[tauri::command]
+fn list_rules(
+    state: tauri::State<'_, AppState>,
+    taxonomy_id: i64,
+) -> Result<Vec<lodestash_core::catalog::MappingRuleRow>, String> {
+    state
+        .library
+        .lock()
+        .map(|l| l.list_rules(taxonomy_id))
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
+/// Run the deterministic mapping engine over one taxonomy (UI-SPEC §9.2 ⚙ Apply). Returns the
+/// number of assets whose category changed. On the writer thread like every catalog write.
+#[tauri::command]
+fn apply_mapping(state: tauri::State<'_, AppState>, taxonomy_id: i64) -> Result<WriteResult, String> {
+    state.write(Op::ApplyMapping { taxonomy_id })
+}
+
+/// The newest undo-log rows, newest first, capped at `limit` (UI-SPEC §2 Ctrl/Cmd-Z / L5).
+#[tauri::command]
+fn recent_ops(state: tauri::State<'_, AppState>, limit: usize) -> Result<Vec<lodestash_core::catalog::OpLogRow>, String> {
+    state
+        .library
+        .lock()
+        .map(|l| l.recent_ops(limit))
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
+/// Undo the logged operation `op_id` (UI-SPEC §2 / DESIGN-GUIDELINES §7 L5). Runs on the writer
+/// thread like every catalog mutation; a reverted op is removed from the log.
+#[tauri::command]
+fn undo(state: tauri::State<'_, AppState>, op_id: i64) -> Result<WriteResult, String> {
+    state.write(Op::RevertOp { op_id })
+}
+
+/// Toggle one asset's membership in a collection (UI-SPEC §6 / §13.5). Both directions go
+/// through the writer so they can never interleave with another mutation.
+#[tauri::command]
+fn collection_add_asset(
+    state: tauri::State<'_, AppState>,
+    collection_id: i64,
+    asset_id: i64,
+) -> Result<WriteResult, String> {
+    state.write(Op::CollectionAddAsset {
+        collection_id,
+        asset_id,
+    })
+}
+
+#[tauri::command]
+fn collection_remove_asset(
+    state: tauri::State<'_, AppState>,
+    collection_id: i64,
+    asset_id: i64,
+) -> Result<WriteResult, String> {
+    state.write(Op::CollectionRemoveAsset {
+        collection_id,
+        asset_id,
+    })
+}
+
+/// Bulk-bar tag edit (KANBAN B9d): add/remove one `(namespace, value)` tag on many assets at
+/// once. Each asset's prior state is snapshotted to the undo log before the write.
+#[tauri::command]
+fn bulk_tag(
+    state: tauri::State<'_, AppState>,
+    asset_ids: Vec<i64>,
+    namespace: String,
+    value: String,
+    on: bool,
+) -> Result<WriteResult, String> {
+    state.write(Op::BulkTag {
+        asset_ids,
+        namespace,
+        value,
+        on,
+    })
 }
 
 pub fn run() {
@@ -504,7 +736,30 @@ pub fn run() {
             collections,
             create_collection,
             delete_collection,
-            set_package_pinned
+            set_package_pinned,
+            tag_graph,
+            asset_edges,
+            source_excludes,
+            add_source_exclude,
+            remove_source_exclude,
+            taxonomies,
+            set_active_taxonomy,
+            delete_taxonomy,
+            rename_category,
+            delete_category,
+            recent_ops,
+            undo,
+            collection_add_asset,
+            collection_remove_asset,
+            bulk_tag,
+            related_assets,
+            stage,
+            unstage,
+            clear_staged,
+            staged,
+            add_category,
+            list_rules,
+            apply_mapping
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lodestash");

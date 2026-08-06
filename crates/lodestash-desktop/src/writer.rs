@@ -80,6 +80,38 @@ pub enum Op {
     /// Pin/unpin a `.unitypackage` as a library (FEATURES §5.4) — pinned packs surface in the
     /// sidebar's LIBRARIES facet and get the "Add all to project" affordance.
     SetPackagePinned { id: i64, pinned: bool },
+    /// The per-source blacklist editor (UI-SPEC §11.1): add/remove one `{kind, value}`
+    /// exclusion. `kind` is `folder` or `asset` (DATA-MODEL §10).
+    AddSourceExclude { source_id: i64, kind: String, value: String },
+    RemoveSourceExclude { source_id: i64, kind: String, value: String },
+    /// The Mapping tab's taxonomy switcher / authoring (UI-SPEC §9.2).
+    SetActiveTaxonomy { id: i64 },
+    DeleteTaxonomy { id: i64 },
+    /// Add a category under a parent (or the root) with its materialized path.
+    AddCategory {
+        taxonomy_id: i64,
+        parent_id: Option<i64>,
+        pref_label: String,
+        path: String,
+    },
+    /// Run the deterministic mapping engine over one taxonomy.
+    ApplyMapping { taxonomy_id: i64 },
+    RenameCategory { id: i64, label: String },
+    DeleteCategory { id: i64 },
+    /// Undo one logged mutation (UI-SPEC §2 Ctrl/Cmd-Z, DESIGN-GUIDELINES §7 L5).
+    RevertOp { op_id: i64 },
+    /// Toggle one asset's membership in a collection (UI-SPEC §6, §13.5).
+    CollectionAddAsset { collection_id: i64, asset_id: i64 },
+    CollectionRemoveAsset { collection_id: i64, asset_id: i64 },
+    /// Bulk-bar tag edit (KANBAN B9d): add/remove one `(namespace, value)` tag on many
+    /// assets. Each asset gets its own undo-log entry snapshotted before the write, so
+    /// `revert_op` restores the exact prior per-source tag set.
+    BulkTag {
+        asset_ids: Vec<i64>,
+        namespace: String,
+        value: String,
+        on: bool,
+    },
 }
 
 /// What a write did, in the terms the frontend reports to the user.
@@ -114,7 +146,7 @@ impl Writer {
             .spawn(move || {
                 // Opened once and held for the process's life: reopening per job would be a new
                 // writer each time, which is the thing the rule forbids.
-                let catalog = match Catalog::open(&db_path) {
+                let mut catalog = match Catalog::open(&db_path) {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::error!(%e, "writer: catalog open failed; writes will be refused");
@@ -126,7 +158,7 @@ impl Writer {
                     }
                 };
                 for job in rx {
-                    let _ = job.reply.send(run(&catalog, &db_path, job.op));
+                    let _ = job.reply.send(run(&mut catalog, &db_path, job.op));
                 }
                 tracing::debug!("writer: channel closed, thread exiting");
             })
@@ -145,17 +177,23 @@ impl Writer {
     }
 }
 
-fn run(catalog: &Catalog, db_path: &Path, op: Op) -> Result<WriteResult, String> {
+fn run(catalog: &mut Catalog, db_path: &Path, op: Op) -> Result<WriteResult, String> {
     match op {
         Op::SetFavorite { ids, on } => catalog
             .set_favorite(&ids, on)
             .map(|changed| WriteResult { changed, ..Default::default() })
             .map_err(|e| e.to_string()),
 
-        Op::SetTrashed { ids, trashed } => catalog
-            .set_trashed(&ids, trashed)
-            .map(|changed| WriteResult { changed, ..Default::default() })
-            .map_err(|e| e.to_string()),
+        // Undo (UI-SPEC §2 / DESIGN-GUIDELINES §7 L5): log the trash toggle so Ctrl/Cmd-Z can
+        // flip it back. Only a toggle that actually changed rows is worth undoing — logging a
+        // no-op would let a revert flip assets that were never touched.
+        Op::SetTrashed { ids, trashed } => {
+            let changed = catalog.set_trashed(&ids, trashed).map_err(|e| e.to_string())?;
+            if changed > 0 {
+                catalog.record_trash_op(&ids, trashed).map_err(|e| e.to_string())?;
+            }
+            Ok(WriteResult { changed, ..Default::default() })
+        }
 
         Op::RemoveFromLibrary { targets, project } => remove_from_library(catalog, targets, project),
 
@@ -197,10 +235,15 @@ fn run(catalog: &Catalog, db_path: &Path, op: Op) -> Result<WriteResult, String>
             .map(|_| WriteResult { changed: 1, ..Default::default() })
             .map_err(|e| e.to_string()),
 
-        Op::CreateCollection { name } => catalog
-            .create_collection(&name)
-            .map(|_| WriteResult { changed: 1, ..Default::default() })
-            .map_err(|e| e.to_string()),
+        // Log the create (id + name) after the row exists so undo can delete exactly the
+        // collection this op created (UI-SPEC §2 / DESIGN-GUIDELINES §7 L5).
+        Op::CreateCollection { name } => {
+            let id = catalog.create_collection(&name).map_err(|e| e.to_string())?;
+            catalog
+                .record_collection_create_op(id, &name)
+                .map_err(|e| e.to_string())?;
+            Ok(WriteResult { changed: 1, ..Default::default() })
+        }
 
         Op::DeleteCollection { id } => catalog
             .delete_collection(id)
@@ -211,6 +254,113 @@ fn run(catalog: &Catalog, db_path: &Path, op: Op) -> Result<WriteResult, String>
             .set_package_pinned(id, pinned)
             .map(|_| WriteResult { changed: 1, ..Default::default() })
             .map_err(|e| e.to_string()),
+
+        Op::AddSourceExclude { source_id, kind, value } => {
+            catalog
+                .add_source_exclude(source_id, &kind, &value)
+                .map_err(|e| e.to_string())?;
+            sync_source_exclude_to_config(catalog, source_id, &kind, &value, true)?;
+            Ok(WriteResult { changed: 1, ..Default::default() })
+        }
+
+        Op::RemoveSourceExclude { source_id, kind, value } => {
+            let removed = catalog
+                .remove_source_exclude(source_id, &kind, &value)
+                .map_err(|e| e.to_string())?;
+            sync_source_exclude_to_config(catalog, source_id, &kind, &value, false)?;
+            Ok(WriteResult {
+                changed: usize::from(removed),
+                ..Default::default()
+            })
+        }
+
+        Op::SetActiveTaxonomy { id } => catalog
+            .set_active_taxonomy(id)
+            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map_err(|e| e.to_string()),
+
+        Op::DeleteTaxonomy { id } => catalog
+            .delete_taxonomy(id)
+            .map(|removed| WriteResult { changed: removed, ..Default::default() })
+            .map_err(|e| e.to_string()),
+
+        Op::AddCategory { taxonomy_id, parent_id, pref_label, path } => catalog
+            .add_category(taxonomy_id, parent_id, &pref_label, &path)
+            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map_err(|e| e.to_string()),
+
+        Op::ApplyMapping { taxonomy_id } => catalog
+            .apply_mapping(taxonomy_id)
+            .map(|changed| WriteResult { changed, ..Default::default() })
+            .map_err(|e| e.to_string()),
+
+        Op::RenameCategory { id, label } => catalog
+            .rename_category(id, &label)
+            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map_err(|e| e.to_string()),
+
+        Op::DeleteCategory { id } => catalog
+            .delete_category(id)
+            .map(|removed| WriteResult { changed: removed, ..Default::default() })
+            .map_err(|e| e.to_string()),
+
+        // Undo: the writer thread is the one place a revert may run — it is a catalog mutation
+        // and every catalog mutation belongs here, one order (ARCHITECTURE §5).
+        Op::RevertOp { op_id } => catalog
+            .revert_op(op_id)
+            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map_err(|e| e.to_string()),
+
+        Op::CollectionAddAsset { collection_id, asset_id } => catalog
+            .collection_add_asset(collection_id, asset_id)
+            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map_err(|e| e.to_string()),
+
+        Op::CollectionRemoveAsset { collection_id, asset_id } => catalog
+            .collection_remove_asset(collection_id, asset_id)
+            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map_err(|e| e.to_string()),
+
+        // Bulk-bar tag edit (KANBAN B9d). Tag writes replace per **source** (`set_tags`
+        // re-writes everything that source contributed), so this adds/removes the tag under
+        // the `manual` source — the established source for user-set tags (set_tags docs). Each
+        // asset's prior `manual` set is snapshotted into its own undo-log entry first, which
+        // is exactly the payload `revert_set_tags` restores on undo.
+        Op::BulkTag { asset_ids, namespace, value, on } => {
+            const SOURCE: &str = "manual";
+            let mut changed = 0usize;
+            // Only the assets that actually changed go into the undo row — a no-op add on an
+            // already-tagged asset must not be recorded, or its revert would wrongly yank a
+            // pre-existing tag.
+            let mut affected = Vec::new();
+            for asset_id in asset_ids {
+                if on {
+                    // Append, never replace: add_asset_tag leaves the asset's other manual
+                    // tags alone (set_tags would delete-and-insert the whole source set).
+                    let n = catalog
+                        .add_asset_tag(asset_id, SOURCE, &namespace, &value)
+                        .map_err(|e| e.to_string())?;
+                    if n > 0 {
+                        affected.push(asset_id);
+                    }
+                    changed += n;
+                } else {
+                    let n = catalog
+                        .remove_asset_tag(asset_id, &namespace, &value)
+                        .map_err(|e| e.to_string())?;
+                    if n > 0 {
+                        affected.push(asset_id);
+                    }
+                    changed += n;
+                }
+            }
+            if !affected.is_empty() {
+                catalog
+                    .record_bulk_tag_op(&affected, &namespace, &value, on)
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(WriteResult { changed, ..Default::default() })
+        }
     }
 }
 
@@ -255,6 +405,42 @@ fn remove_from_library(
     }
     tracing::info!(rows = changed, excluded, "removed from library");
     Ok(WriteResult { changed, ..Default::default() })
+}
+
+/// Mirror a blacklist edit into the app config the crawler actually reads (UI-SPEC §11.1).
+/// `import_source.blacklist` is catalog storage; `crawl` is fed from
+/// `AppConfig.source_excludes(project, root)` — write both, or the Settings editor changes
+/// nothing and the next scan resurrects every "removed" asset. The config write goes through
+/// `edit_config` (the one shared CONFIG_LOCK), so it cannot interleave with the web-prefs /
+/// settings commands; the writer holds no other lock here, so there is no lock-order cycle.
+fn sync_source_exclude_to_config(
+    catalog: &Catalog,
+    source_id: i64,
+    kind: &str,
+    value: &str,
+    add: bool,
+) -> Result<(), String> {
+    let Some(root) = catalog.source_root(source_id).map_err(|e| e.to_string())? else {
+        return Err(format!("sync_source_exclude: no such source {source_id}"));
+    };
+    let exclude = Exclude {
+        kind: match kind {
+            "folder" => ExcludeKind::Folder,
+            "asset" => ExcludeKind::Asset,
+            other => return Err(format!("sync_source_exclude: bad kind {other:?}")),
+        },
+        value: value.to_string(),
+    };
+    lodestash_app::config::edit_config(|config| {
+        let Some(project) = config.last_project_name.clone() else {
+            return;
+        };
+        if add {
+            config.add_source_exclude(&project, std::path::Path::new(&root), exclude);
+        } else {
+            config.remove_source_exclude(&project, std::path::Path::new(&root), &exclude);
+        }
+    })
 }
 
 /// May this target's file be deleted?
