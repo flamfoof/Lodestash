@@ -437,16 +437,20 @@ until B7.
       correct — the filter is what a user types, the vocabulary is what the taxonomy holds — but
       the two counts only reconcile once summed by name, which is what the e2e now asserts.
 
-      *Remaining:* Unity Assets, Collections, Identify, Onboarding, and the Stats Tag Graph.
+      *Remaining:* the Stats Tag Graph. Unity Assets, Collections, Identify and Onboarding
+      shipped **2026-08-04** (this session — see ALIGNMENT-AUDIT.md's remediation log).
 
-- [ ] **B8 — design conformance.** *Audited 2026-08-04 against the handoff bundle.* The shipped
+- [x] **B8 — design conformance.** *Shipped 2026-08-04 — all four sub-cards (B8a/b/c/d) done,
+      audit + remediation recorded in `docs/design/ALIGNMENT-AUDIT.md`; e2e 48/48, Rust 150/150.*
+      The shipped
       screens are structurally right but thin: several are read-only where the design is a working
       surface, and the two navigation chromes the design leans on — the sidebar facet groups and the
       pack directory tree — do not exist at all. Split into three cards below so they can land
       independently. **Nothing here needs `Engine`**; everything marked *reuse* is a thin command
       over a catalog function that already exists and is already tested.
 
-  - [ ] **B8a — Traits, from read-only to a working screen** (UI-SPEC §9, FEATURES §4.6).
+  - [x] **B8a — Traits, from read-only to a working screen** (UI-SPEC §9, FEATURES §4.6). *Shipped
+        2026-08-04 — see the shipped note at the end of this card.*
         `Library::vocabulary` maps `VocabTrait` → `VocabRow` and **drops `id`, `is_trait`, `scope`,
         `usage_note`, `color`, `icon`** — exactly the six fields every remaining feature needs, and
         `list_vocabulary` already selects all of them (`catalog.rs:3421`). Widen the row, then add
@@ -459,9 +463,16 @@ until B7.
         **The Mapping tab is not in this card** — taxonomy/category/alias/rule authoring has no
         public catalog surface (only `list_rules` `:3087` and `apply_mapping` `:3133`), so it is a
         core slice first. egui: `mapping_tab` (`:6587`).
+        **Shipped 2026-08-04**: `VocabRow` widened (id/is_trait/scope/usage_note/color/icon); four
+        writer ops + commands (`upsert_trait`/`unpromote_trait`/`set_trait_teach`/
+        `set_trait_style`) on the single writer thread; TraitsScreen is working — NEW TRAIT card,
+        ✦ promote-existing-tags strip, teaching toggle, 6-swatch style palette, demote; per-trait
+        chip colour flows to the card tag rows and the ⚑ trait cloud via the shared
+        `traits.svelte.ts` `traitColor` store. The Mapping tab stays out (core slice, as scoped).
 
-  - [ ] **B8b — Unity Assets, and the pack surfaces Packages is missing** (UI-SPEC §4/§15,
-        FEATURES §5). The `unity` route exists in `routes.ts` and the sidebar row renders, but
+  - [x] **B8b — Unity Assets, and the pack surfaces Packages is missing** (UI-SPEC §4/§15,
+        FEATURES §5). *Shipped 2026-08-04 — see the shipped note at the end of this card.*
+        The `unity` route exists in `routes.ts` and the sidebar row renders, but
         `App.svelte` has **no branch for it**, so it falls through to the "not built yet" stub.
         Four thin commands unlock most of the card: a `unity_packages` listing (wrap
         `list_packages`, mirror `reload_unity_packages` `app.rs:5328`), `set_package_pinned`
@@ -473,8 +484,15 @@ until B7.
         *Stays blocked on B2b:* per-pack Extract, the tick-box batch queue, the §5.2 import dialog
         and the §5.6 duplicate-pack check — all ride the `PendingPackage` extraction path and the
         job tray.
+        **Shipped 2026-08-04**: the `unity` route renders a real screen — publisher → pack
+        listing, ⬢ pin/unpin (`SetPackagePinned` writer op + command; the `pinned` flag was
+        already fetched, now rendered), a pinned-only filter, and **Open →** into the three-pane
+        pack browser (packageFilter + folders browse + list row style, rooted at the pack, see
+        B8c). Browsing a pack walks the in-memory rows via the pack-rooted `folder_page` — the
+        pack segment stripped from each `browse_path` — not `list_package_entries` (see B8c). The §15 pack-stats modal and per-pack Extract remain B2b/§15 slices.
 
-  - [ ] **B8c — browsing: the directory tree, history, and the facet sidebar.** The Folders view
+  - [x] **B8c — browsing: the directory tree, history, and the facet sidebar.** *Shipped 2026-08-04 —
+        the three-pane pack browser; see the shipped note at the end of this card.* The Folders view
         matches the *generic* spec but not PACK-DIRECTORY-NAV, which is a **three-pane** layout
         (244 · 1fr · 268) with a persistent left DIRECTORY tree, ← → ↑ history, a **pack-rooted**
         breadcrumb, and a folders-first list with a `Name · Size · Items` header.
@@ -488,6 +506,17 @@ until B7.
         `view.viewMode` is one tri-state (`grid | list | folders`), which collapses two independent
         axes the design keeps apart: **browse view** (Flat · Folders) × **row style** (Grid · List).
         Splitting it is what lets Folders have a list mode at all. Neither axis is persisted.
+        **Shipped 2026-08-04**: `pack_dir_tree` command (`PackDirNode`: path/depth/direct/recursive/
+        has_children) over the in-memory rows; `folder_page` gained pack-rooted browsing
+        (package-relative `dir`, only that pack's assets) + a per-item third column (duration/
+        dimensions, `content_third_col`); FoldersView is three-pane under a pack filter — 244px
+        DIRECTORY tree with gold-rail selection and `direct · recursive` counts, ← → ↑ history
+        (`view.navDir/back/fwd`), the pack name as a gold pill in the breadcrumb, and a
+        folders-first `Name · Size · Items` list in list mode. The viewMode split also shipped:
+        **browse × row style** are separate state fields, both persisted via `WebPrefs`
+        (`config.json`), and the toolbar carries the result label + ★ Favorites toggle + gold pill.
+        The sidebar facet groups shipped with B8d. Still open: the *generic* (non-pack) Folders
+        view stays tiles+grid (the three-pane is the pack target per PACK-DIRECTORY-NAV).
 
   - [x] **B8d — the card, and the facet rail.** *Shipped 2026-08-04.* The two things a user looks at
         first, taken from three elements to nine and from nav-only to a working rail.

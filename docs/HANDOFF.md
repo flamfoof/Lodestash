@@ -4,7 +4,8 @@ Working notes for whoever (or whatever) continues the build. Unlike the rest of 
 is **not** a design spec — it's the state of play, the decisions already settled, and the traps.
 The design docs still win on any question of what the software *should* do.
 
-Last updated: **2026-08-01**, at `afadc97`.
+Last updated: **2026-08-04** — §1.6 is the current handoff (the whole session is uncommitted on
+`main`); the §1.5 "B5 writes" block below it is historical and already shipped.
 
 ---
 
@@ -81,6 +82,111 @@ narrowed rather than dissolved — `file` and `mesh` serve whole assets and neve
 write lands only in our own cache, so non-destructive holds. **`warm_thumbnails` is still the better
 end state** (user-visible, cancellable, batchable into one skip-scan); it wants the job tray, which
 the Svelte side does not have yet.
+
+## 1.6 Next session: review the conformance remediation, close the board, then the follow-ups (2026-08-04)
+
+**This session did a full design-conformance audit + remediation of the Svelte/Tauri app
+(`crates/lodestash-desktop/ui` + the desktop crate). The entire session is UNCOMMITTED on `main`:
+27 modified + 8 untracked files (see `git status`).** Verified state at handoff: e2e **48/48**,
+Rust **150/150** (core 77, app 28, desktop 45), svelte-check **0/0**, vite build green.
+
+**Orientation (one paragraph).** Lodestash is a local-first desktop app that catalogues game
+assets (Unity `.unitypackage` + loose files) — 3D/audio/image — with Rust core (`lodestash-core`
+catalog + AI, `lodestash-app` persist/grid/types, `lodestash-ingest` crawl/thumbnails) and **two
+frontends**: the legacy egui app (`lodestash-ui`, retired at the B7 cutover) and the **current
+app** — `lodestash-desktop`, a Tauri 2 shell hosting a Svelte 5 frontend (no component/CSS/state
+libraries — four npm deps, deliberate). The webview talks to the Rust backend over
+`#[tauri::command]`s; every catalog write goes through one `Writer` thread (`writer.rs` `Op`).
+Design docs in `docs/` + the bundle in `docs/design/` are the source of truth
+(CLAUDE.md conformance rule); `docs/design/ALIGNMENT-AUDIT.md` (new this session) is the map.
+
+### The audit
+
+`docs/design/ALIGNMENT-AUDIT.md` is the deliverable: the A–M conformance matrix (each item with
+its spec citation + `file:line` evidence), the remediation log, and the remaining-gaps list.
+Read it before touching anything.
+
+### What shipped (all verified, all uncommitted)
+
+- **Icons** — sprite gained `ls-type-font`, `ls-type-sprite`, `ls-nav-favorites` (gold ★);
+  `typeIcon()` has the sprite/font cases; both sprites + DESIGN-GUIDELINES §5 table in sync.
+- **Tokens/top bar** — density stops 150/205/288 (UI-SPEC §20.10), gold/arcane glows in the
+  spec'd corners, search 400px + per-mode accent/placeholder, category tabs with live counts +
+  2px token underline + zero-hide (`LibraryStatus.tab_counts`, `Category::id()`).
+- **Toolbar** — result label (`N assets · <library>`), ★ Favorites toggle + gold count pill,
+  viewMode split into **browse (flat|folders) × row style (grid|list)**, persisted via new
+  `WebPrefs` in `AppConfig` + `get_web_prefs`/`set_web_prefs`.
+- **Pack browser (B8c)** — `pack_dir_tree` command + pack-rooted `folder_page` (package-relative
+  dir; third column duration/dimensions); FoldersView is three-pane under a pack filter (244px
+  DIRECTORY tree, ← → ↑ history via `view.navDir/back/fwd`, pack gold-pill breadcrumb,
+  folders-first Name·Size·Items list). +2 Rust tests.
+- **Traits (B8a)** — `VocabRow` widened (id/is_trait/scope/usage_note/color/icon); 4 writer ops +
+  commands (`upsert_trait`, `unpromote_trait`, `set_trait_teach`, `set_trait_style`); TraitsScreen
+  is working (NEW TRAIT, ✦ promote strip, teach toggle, 6-swatch palette, demote); per-trait chip
+  colour via the shared `traits.svelte.ts` `traitColor` store → card tags + ⚑ cloud.
+- **Settings (J11)** — full §11 screen (Sources watch/pause via `set_source_watch`, Identify
+  profile, On-screen quality, File-size labels with the 128 KB-gap clamp, MCP allow-list, Storage
+  caps, Engine bridge, FIRST RUN); whole-object `get_settings`/`set_settings` snapshot; size
+  tiers re-read on every `Library::reload()`.
+- **Identify (J3)** — Appraise the Backlog workbench; ✦ Identify all honestly disabled (the
+  appraiser engine is the B7 engine build).
+- **Collections (J6)** — real catalog CRUD (`list_collections`/`create_collection`/
+  `delete_collection`/`collection_members`, staging tray protected; +1 core test), writer ops +
+  commands, screen with Browse → driving `GridQuery.collection` (clearable chip).
+- **Unity Assets (J5)** — publisher → pack listing, ⬢ pin/unpin (`SetPackagePinned`; the `pinned`
+  flag was already fetched, now rendered), pinned-only filter, Open → into the three-pane browser.
+- **Onboarding (I1)** — first-run panel over the live library; `skip_onboarding` shared with
+  Settings › FIRST RUN.
+- **Window geometry** — `tauri-plugin-window-state` (new dep; TECH-STACK updated) persists
+  size/position/maximized to `.window-state.json` and restores **before** show — this fixed the
+  launch-resize that was breaking e2e launches. Also killed leaked app/vite processes from killed
+  runs that were double-launching the app and corrupting config.json (the "page closed" e2e crash).
+
+### Next tasks, in order
+
+1. **Review + commit.** The whole session is uncommitted. Review the diff (review skill), then
+   commit with the `Co-Authored-By` trailer per CLAUDE.md — suggest logical commits (audit docs /
+   icons+tokens / toolbar / pack browser / traits / screens / window-state).
+2. **Board: already closed** — B8a/B8b/B8c moved to Done (with shipped notes) and the B6
+   remaining list shrunk to the Stats Tag Graph; B8's parent card marked shipped. Double-check
+   the notes read correctly in `docs/KANBAN.md`.
+3. **Doc follow-up** — `Glyph Catalog.dc.html`'s nav list still shows the 10-row prototype; add a
+   Favorites ★ row (UI-SPEC §0.2's table was already fixed this session).
+4. **The remaining-gaps list in ALIGNMENT-AUDIT.md** is the next real-work backlog — it separates
+   backend-blocked (Identify engine, B2b ingest path, staging tray/project switcher/import, Stats
+   Tag Graph, Mapping tab, LINKS filter, per-source blacklist editor, inspector tag-editing slice)
+   from small visual/keyboard follow-ups (B6 health meter, Space → Quick Look, toasts, nudge
+   banner, card status border, pack-stats modal, model hover-spin, pinned libs in the sidebar
+   facet, `preview_quality` render-path wiring).
+
+### Traps (learned this session — read before building)
+
+- **The shell here is cmd**, and the outer runner strips `$var` before PowerShell sees it — write
+  `.ps1` files and run with `powershell -File`, or stick to the file tools
+  (read_file/edit_file/grep) over shell text munging.
+- **e2e launch requirements**: rebuild the binary first (`cargo build -p lodestash-desktop`) —
+  the harness mtime-guards against stale binaries; the vite build must be current (`npm run
+  build` in `ui/`); onboarding covers the window on first run — the suite dismisses it (first
+  check), and any NEW overlay must do the same or every DOM interaction times out.
+- **One writer**: every catalog write goes through the `Writer` thread (`writer.rs` `Op`) — never
+  write on the command thread. New screens wanting writes: add an `Op` + a command that calls
+  `state.write(...)`; re-read via `view.dataVersion`.
+- **Persistence pattern**: whole-object `get_*`/`set_*` snapshots over `AppConfig` (see
+  `WebPrefs`, `Settings`); `#[serde(default)]` on every new config field so old config.json files
+  load; `Library::reload()` re-reads `size_tiers` so Settings changes land without a restart.
+- **`GridQuery`/`FolderQuery` have manual `Default` impls** — a new field must be added there too,
+  or the build fails with E0063.
+- **Playwright strict mode**: a new button whose accessible name collides with an existing one
+  breaks e2e selectors — scope with `getByRole("navigation", { name: "Main" })` etc.
+- **MSRV/edition**: no let-chains (crate edition < 2024); `serde::Serialize` must be fully
+  qualified in `catalog.rs` (it is not imported there).
+
+### How to verify
+
+`cargo test -p lodestash-core --lib` && `cargo test -p lodestash-app --lib` &&
+`cargo test -p lodestash-desktop --lib` (150/150), then in `crates/lodestash-desktop/ui`:
+`npm run check` (0/0), `npm run build`, `npm run e2e` (48/48). Full sanity per §1:
+`cargo test --workspace`, `cargo clippy --workspace --tests`, `cargo fmt --all`.
 
 ## 2. Where the build is
 

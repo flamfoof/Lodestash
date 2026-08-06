@@ -74,6 +74,7 @@ One vertical panel, three stacked groups:
    | Destination | Icon (`ls-*`) | Badge |
    |---|---|---|
    | Library | `nav-library` | — |
+   | Favorites | `nav-favorites` | — |
    | Identify | `nav-identify` | Unidentified count |
    | Collections | `nav-collections` | — |
    | Packages | `nav-packages` | — |
