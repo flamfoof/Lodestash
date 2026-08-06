@@ -3,16 +3,27 @@
    * Stats → Overview (UI-SPEC §8.1): stat tiles, size by type, disk weight by pack, heaviest
    * assets, insights.
    *
-   * The Tag Graph tab (§8.2) is not here. It is a force-directed canvas over the identified
-   * library, and 24 of 8,237 assets here carry a tag — it would render an empty field and read as
-   * broken. It lands when identification has run.
+   * Stats → Tag Graph (UI-SPEC §8.2): the tag↔tag co-occurrence graph of the identified library —
+   * gold nodes on a deterministic ring (radius ∝ usage count), edges with stroke-opacity ∝ weight,
+   * and the `tags · links · assets` header counts. Ring layout only — no physics, no deps.
    */
   import Icon from "./Icon.svelte";
-  import { libraryStats, fmtSize, fmtDuration, typeToken, typeIcon, type Stats } from "./api";
+  import {
+    libraryStats,
+    tagGraph,
+    fmtSize,
+    fmtDuration,
+    typeToken,
+    typeIcon,
+    type Stats,
+    type TagGraph,
+  } from "./api";
   import { view } from "./nav.svelte";
 
   let stats = $state<Stats | null>(null);
   let error = $state<string | null>(null);
+  let graph = $state<TagGraph | null>(null);
+  let graphError = $state<string | null>(null);
 
   $effect(() => {
     view.dataVersion;
@@ -22,6 +33,12 @@
         error = null;
       })
       .catch((e) => (error = String(e)));
+    tagGraph()
+      .then((g) => {
+        graph = g;
+        graphError = null;
+      })
+      .catch((e) => (graphError = String(e)));
   });
 
   let identified = $derived(
@@ -34,6 +51,87 @@
       ? Math.round((stats.by_pack[0].bytes / stats.bytes_total) * 100)
       : 0,
   );
+
+  // --- Tag Graph layout (UI-SPEC §8.2) ------------------------------------------
+  // Deterministic ring: tags walk clockwise from 12 o'clock in backend order (usage-desc), each
+  // node's radius scaled to its usage count, co-occurrence edges drawn beneath with opacity scaled
+  // to their weight. No physics engine, no dependencies.
+  const GRAPH_W = 1000;
+  const GRAPH_H = 520;
+  const NODE_R_MIN = 6;
+  const NODE_R_MAX = 24;
+  const LABEL_MAX = 22;
+
+  type GraphPos = {
+    id: number;
+    x: number;
+    y: number;
+    r: number;
+    label: string;
+    title: string;
+    anchor: "start" | "end";
+    labelX: number;
+    labelY: number;
+  };
+  type GraphEdgePos = {
+    x1: number;
+    y1: number;
+    x2: number;
+    y2: number;
+    opacity: number;
+  };
+  type GraphLayout = { nodes: GraphPos[]; edges: GraphEdgePos[] };
+
+  function layoutTagGraph(g: TagGraph): GraphLayout {
+    const cx = GRAPH_W / 2;
+    const cy = GRAPH_H / 2;
+    const maxUsage = g.nodes.reduce((m, n) => Math.max(m, n.usage_count), 0);
+    const maxWeight = g.edges.reduce((m, e) => Math.max(m, e.weight), 0);
+    const ring = Math.min(GRAPH_W, GRAPH_H) / 2 - NODE_R_MAX - 84;
+    const byId = new Map<number, GraphPos>();
+    const nodes = g.nodes.map((n, i) => {
+      const r =
+        maxUsage > 0
+          ? NODE_R_MIN + (n.usage_count / maxUsage) * (NODE_R_MAX - NODE_R_MIN)
+          : NODE_R_MIN;
+      const a = (i / Math.max(1, g.nodes.length)) * Math.PI * 2 - Math.PI / 2;
+      const x = cx + Math.cos(a) * ring;
+      const y = cy + Math.sin(a) * ring;
+      const dir = Math.cos(a) >= 0 ? 1 : -1;
+      const label = n.value.length > LABEL_MAX ? n.value.slice(0, LABEL_MAX - 1) + "…" : n.value;
+      const pos: GraphPos = {
+        id: n.tag_id,
+        x,
+        y,
+        r,
+        label,
+        title: `${n.namespace}/${n.value} · ${n.usage_count} ${
+          n.usage_count === 1 ? "asset" : "assets"
+        }`,
+        anchor: dir >= 0 ? "start" : "end",
+        labelX: Math.max(6, Math.min(GRAPH_W - 6, x + dir * (r + 6))),
+        labelY: y,
+      };
+      byId.set(n.tag_id, pos);
+      return pos;
+    });
+    const edges: GraphEdgePos[] = [];
+    for (const e of g.edges) {
+      const a = byId.get(e.tag_a);
+      const b = byId.get(e.tag_b);
+      if (!a || !b) continue;
+      edges.push({
+        x1: a.x,
+        y1: a.y,
+        x2: b.x,
+        y2: b.y,
+        opacity: maxWeight > 0 ? 0.08 + (e.weight / maxWeight) * 0.55 : 0.08,
+      });
+    }
+    return { nodes, edges };
+  }
+
+  let layout: GraphLayout = $derived(graph ? layoutTagGraph(graph) : { nodes: [], edges: [] });
 
   /** Reveal an asset in the library, the same move the palette makes. */
   function reveal(id: number, name: string) {
@@ -156,6 +254,72 @@
           </li>
         {/if}
       </ul>
+
+      <h2>Tag graph</h2>
+      <div class="graph-counts num" data-testid="tag-graph-counts">
+        {graph ? graph.nodes.length : "—"} tags · {graph ? graph.link_count : "—"} links · {graph
+          ? graph.asset_count
+          : "—"} assets
+      </div>
+
+      {#if graphError}
+        <p class="msg danger">{graphError}</p>
+      {:else if !graph}
+        <p class="msg">Loading…</p>
+      {:else if graph.nodes.length === 0}
+        <div class="graph-empty" data-testid="tag-graph-empty">
+          <p class="line">No tags yet.</p>
+          <p class="sub">
+            Assets you tag — or the identifier emits on scan — appear here as gold nodes; the wider
+            a node, the more assets carry that tag.
+          </p>
+        </div>
+      {:else}
+        <svg
+          class="tag-graph"
+          data-testid="tag-graph"
+          viewBox="0 0 {GRAPH_W} {GRAPH_H}"
+          role="img"
+          aria-label="Tag co-occurrence graph"
+        >
+          <g class="edges">
+            {#each layout.edges as e (`${e.x1}:${e.y1}:${e.x2}:${e.y2}`)}
+              <line
+                class="edge"
+                x1={e.x1}
+                y1={e.y1}
+                x2={e.x2}
+                y2={e.y2}
+                stroke-opacity={e.opacity}
+              />
+            {/each}
+          </g>
+          <g class="nodes">
+            {#each layout.nodes as p (p.id)}
+              <g class="node" transform="translate({p.x} {p.y})">
+                <title>{p.title}</title>
+                <circle r={p.r} />
+                <text
+                  class="label"
+                  x={p.labelX - p.x}
+                  y={p.labelY - p.y}
+                  text-anchor={p.anchor}
+                  dy="0.35em"
+                >
+                  {p.label}
+                </text>
+              </g>
+            {/each}
+          </g>
+        </svg>
+      {/if}
+
+      {#if stats.unidentified > 0}
+        <p class="msg amber" data-testid="tag-graph-unidentified-note">
+          ? {stats.unidentified.toLocaleString()} Unidentified assets have no tags yet — they're
+          not in the graph.
+        </p>
+      {/if}
     {/if}
   </div>
 </section>
@@ -343,5 +507,55 @@
     font-size: var(--fs-sm);
     cursor: pointer;
     text-decoration: underline;
+  }
+
+  /* Tag Graph (§8.2) */
+  .graph-counts {
+    font-size: var(--fs-xs);
+    color: var(--ls-text-muted);
+    margin-bottom: var(--sp-2);
+  }
+  .tag-graph {
+    display: block;
+    width: 100%;
+    height: auto;
+    background: var(--ls-surface);
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-md);
+  }
+  .tag-graph .edge {
+    stroke: var(--ls-text-dim);
+    stroke-width: 1;
+  }
+  .tag-graph .node circle {
+    fill: var(--ls-gold);
+    stroke: color-mix(in srgb, var(--ls-gold) 55%, var(--ls-bg));
+    stroke-width: 1;
+  }
+  .tag-graph .node .label {
+    fill: var(--ls-text-dim);
+    font-family: var(--ff-ui);
+    font-size: var(--fs-xs);
+    pointer-events: none;
+  }
+  .graph-empty {
+    padding: var(--sp-4) var(--sp-3);
+    background: var(--ls-surface);
+    border: 1px dashed var(--ls-border-strong);
+    border-radius: var(--r-md);
+    text-align: center;
+  }
+  .graph-empty .line {
+    margin: 0;
+    font-size: var(--fs-sm);
+    color: var(--ls-text);
+  }
+  .graph-empty .sub {
+    margin: var(--sp-1) 0 0;
+    font-size: var(--fs-xs);
+    color: var(--ls-text-muted);
+  }
+  .msg.amber {
+    color: var(--ls-warning);
   }
 </style>

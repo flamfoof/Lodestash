@@ -4,7 +4,7 @@
   import QuickLook from "./QuickLook.svelte";
   import AssetList from "./AssetList.svelte";
   import FoldersView from "./FoldersView.svelte";
-  import { gridPage, DENSITIES, type GridPage, type LibraryStatus } from "./api";
+  import { gridPage, DENSITIES, bulkTag, type GridPage, type LibraryStatus } from "./api";
   import { view } from "./nav.svelte";
 
   let {
@@ -24,6 +24,31 @@
   let result = $state<GridPage | null>(null);
   let error = $state<string | null>(null);
   let quickLook = $state<number | null>(null);
+
+  // ---- Bulk-bar tag edits (KANBAN B9d) -----------------------------------
+  // The tag value input, in the default `free` namespace. `bulkBusy` guards the writer thread
+  // against overlapping writes; the selection survives an error so the user can fix and retry.
+  let tagValue = $state("");
+  let bulkBusy = $state(false);
+  let bulkError = $state<string | null>(null);
+
+  async function bulkEdit(on: boolean) {
+    const value = tagValue.trim();
+    if (!value || view.selectedIds.length === 0 || bulkBusy) return;
+    bulkBusy = true;
+    bulkError = null;
+    try {
+      await bulkTag(view.selectedIds, "free", value, on);
+      view.clearSelection();
+      tagValue = "";
+      // The writer re-read the catalog; re-ask every screen so the added/removed chips land.
+      view.dataVersion += 1;
+    } catch (e) {
+      bulkError = String(e);
+    } finally {
+      bulkBusy = false;
+    }
+  }
 
   /// Walk the *current page* rather than the whole result: paging inside the viewer would need
   /// to fetch and re-anchor, and the page is what the user can see behind the scrim anyway.
@@ -75,6 +100,9 @@
       favorites_only: favoritesOnly,
       trashed_only: trashedOnly,
       filter: view.filter,
+      // The LINKS chip rides on `filter.links` in the store, but the backend field is
+      // top-level on GridQuery — forward it here or serde silently drops it.
+      links: (view.filter as { links?: number | null }).links ?? null,
       package: view.packageFilter,
       collection: view.collectionFilter?.id ?? null,
       // Shared with the Folders view, where it means "which source am I inside". Same answer
@@ -125,6 +153,43 @@
     </div>
   {/if}
 
+  {#if view.selectedIds.length > 0}
+    <!-- Bulk bar (B9d): appears whenever cards are multi-selected, above the scroll area so it
+         stays put while the grid underneath pages and scrolls. Tags land in the `free` namespace. -->
+    <div class="bulkbar" role="toolbar" aria-label="Bulk tag">
+      <span class="count num" data-testid="bulk-count">{view.selectedIds.length} selected</span>
+      <input
+        class="tagval"
+        placeholder="tag · free"
+        aria-label="Tag value"
+        bind:value={tagValue}
+        data-testid="bulk-tag-input"
+        onkeydown={(e) => e.key === "Enter" && bulkEdit(true)}
+      />
+      <button
+        class="gold"
+        onclick={() => bulkEdit(true)}
+        disabled={bulkBusy || !tagValue.trim()}
+        data-testid="bulk-add"
+      >
+        + Add
+      </button>
+      <button
+        onclick={() => bulkEdit(false)}
+        disabled={bulkBusy || !tagValue.trim()}
+        data-testid="bulk-remove"
+      >
+        − Remove
+      </button>
+      <button onclick={() => view.clearSelection()} disabled={bulkBusy} data-testid="bulk-clear">
+        Clear
+      </button>
+      {#if bulkError}
+        <span class="msg danger" data-testid="bulk-error">{bulkError}</span>
+      {/if}
+    </div>
+  {/if}
+
   <div class="body">
     {#if view.browse === "folders"}
       <FoldersView onopen={(id) => (quickLook = id)} />
@@ -156,12 +221,38 @@
     {:else}
       <div class="grid" style="--card: {cardPx}px">
         {#each result.items as item (item.asset_id)}
-          <Card
-            {item}
-            selected={view.selected === item.asset_id}
-            onselect={(id) => (view.selected = id)}
-            onopen={(id) => (quickLook = id)}
-          />
+          <!-- The multi-select box (B9d) is a sibling overlaid on the card's artwork top-left —
+               the Card root is a <button>, so nesting a real control inside it would be invalid
+               HTML. Hover reveals it; a picked id keeps it lit. Clicks hit the box, never the card,
+               so single-click / Quick Look flows below are untouched. -->
+          <div class="cell">
+            <Card
+              {item}
+              selected={view.selected === item.asset_id}
+              onselect={(id) => (view.selected = id)}
+              onopen={(id) => (quickLook = id)}
+            />
+            <span
+              class="sel"
+              class:on={view.selectedIds.includes(item.asset_id)}
+              role="checkbox"
+              tabindex="0"
+              aria-checked={view.selectedIds.includes(item.asset_id)}
+              aria-label={`Select ${item.name}`}
+              data-testid="card-select"
+              onclick={(e) => {
+                e.stopPropagation();
+                view.toggleSelect(item.asset_id);
+              }}
+              onkeydown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  view.toggleSelect(item.asset_id);
+                }
+              }}
+            >✓</span>
+          </div>
         {/each}
       </div>
     {/if}
@@ -213,6 +304,40 @@
     grid-template-columns: repeat(auto-fill, minmax(var(--card), 1fr));
     gap: var(--sp-3);
   }
+  /* One grid cell wraps one card; the multi-select box positions against it, not the grid. */
+  .cell {
+    position: relative;
+  }
+  /* The multi-select box (B9d): a hover-revealed sibling pinned to the card artwork's top-left,
+     which Card.svelte deliberately leaves clear. Mirrors the card's own hover-reveal rhythm. */
+  .sel {
+    position: absolute;
+    top: var(--sp-2);
+    left: var(--sp-2);
+    z-index: 2;
+    display: grid;
+    place-items: center;
+    width: 18px;
+    height: 18px;
+    font-size: var(--fs-xs);
+    line-height: 1;
+    color: var(--ls-gold);
+    background: color-mix(in srgb, var(--ls-bg) 85%, transparent);
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-sm);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 120ms ease;
+  }
+  .cell:hover .sel,
+  .sel:focus-visible,
+  .sel.on {
+    opacity: 1;
+  }
+  .sel.on {
+    border-color: var(--ls-gold);
+    background: var(--ls-overlay);
+  }
   .chips {
     flex: none;
     padding: var(--sp-2) var(--sp-5) 0;
@@ -233,6 +358,57 @@
   }
   .msg.danger {
     color: var(--ls-danger);
+  }
+
+  /* Bulk bar (B9d): a flex-none row above the scroll area, so it stays put while the grid
+     underneath scrolls. Gold-bordered like the selection it reflects. */
+  .bulkbar {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    flex-wrap: wrap;
+    margin: 0 var(--sp-5) var(--sp-2);
+    padding: var(--sp-2) var(--sp-3);
+    background: var(--ls-surface-raised);
+    border: 1px solid var(--ls-gold);
+    border-radius: var(--r-md);
+  }
+  .bulkbar .count {
+    font-size: var(--fs-sm);
+    color: var(--ls-gold);
+  }
+  .bulkbar input.tagval {
+    flex: 1;
+    min-width: 140px;
+    max-width: 240px;
+    padding: 3px var(--sp-2);
+    background: var(--ls-bg);
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-sm);
+    color: var(--ls-text);
+    font: inherit;
+    font-size: var(--fs-sm);
+  }
+  .bulkbar button {
+    padding: 3px var(--sp-3);
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-md);
+    font: inherit;
+    font-size: var(--fs-sm);
+    color: var(--ls-text);
+  }
+  .bulkbar button:hover:not(:disabled) {
+    border-color: var(--ls-gold);
+    color: var(--ls-gold-bright);
+  }
+  .bulkbar button.gold {
+    border-color: var(--ls-gold);
+    color: var(--ls-gold-bright);
+  }
+  .bulkbar button:disabled {
+    opacity: 0.45;
+    cursor: default;
   }
 
   .pager {

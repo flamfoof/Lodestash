@@ -1,6 +1,7 @@
 <script lang="ts">
+  import { getContext } from "svelte";
   import Icon from "./Icon.svelte";
-  import { type GridItem, previewUrl, thumbUrl, typeToken, typeIcon, fmtSize } from "./api";
+  import { type GridItem, previewUrl, thumbUrl, typeToken, typeIcon, fmtSize, stage } from "./api";
   import { traitColor } from "./traits.svelte";
 
   let {
@@ -14,6 +15,24 @@
     onselect?: (id: number) => void;
     onopen?: (id: number) => void;
   } = $props();
+
+  /**
+   * Stage affordance (I6): the app shell owns the staging state and exposes it via Svelte context
+   * (App.svelte `setContext("ls:staging", …)`), so a card can toggle membership without every
+   * intermediate screen threading a callback through its props. Rendered outside the shell (no
+   * context), the card stages directly — the button stays alive, the tray just isn't wired up.
+   */
+  const staging = getContext<{
+    isStaged?: (id: number) => boolean;
+    toggleStage?: (id: number) => void;
+  }>("ls:staging");
+
+  let staged = $derived(staging?.isStaged?.(item.asset_id) ?? false);
+
+  function onStageClick() {
+    if (staging?.toggleStage) staging.toggleStage(item.asset_id);
+    else void stage([item.asset_id]);
+  }
 
   let tint = $derived(`var(${typeToken(item.media_type)})`);
   // Vector preview if the model has one, else a raster thumbnail, else the type mark. `thumbFailed`
@@ -81,6 +100,30 @@
     {#if item.size_tier}
       <span class="tier num t{item.size_tier}">{item.size_tier} · {fmtSize(item.size_bytes)}</span>
     {/if}
+    <!-- The stage affordance (I6) is a hover-revealed quick action, bottom-right on the artwork so
+         it never collides with the corner's status gem or the tier badge. A span, not a button:
+         the card root is already a <button>, and nesting a real button inside one is invalid HTML. -->
+    <span
+      class="stage-btn"
+      class:on={staged}
+      role="button"
+      tabindex="0"
+      title={staged ? "Staged — click to remove from the tray" : "Stage for import"}
+      aria-label={staged ? `Unstage ${item.name}` : `Stage ${item.name}`}
+      aria-pressed={staged}
+      data-testid="card-stage"
+      onclick={(e) => {
+        e.stopPropagation();
+        onStageClick();
+      }}
+      onkeydown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          e.stopPropagation();
+          onStageClick();
+        }
+      }}
+    >⧉</span>
   </div>
   <div class="meta">
     <span class="name"><i class="bullet" aria-hidden="true"></i>{item.name}</span>
@@ -194,6 +237,40 @@
   }
   .tXL {
     --tier-fg: var(--ls-danger);
+  }
+
+  /* Hover-revealed stage quick action (I6). Sits bottom-right on the artwork, opposite the tier
+     badge, so the two never overlap; the card's hover also reveals it (hovering the button itself
+     keeps `.card:hover` true). */
+  .stage-btn {
+    position: absolute;
+    right: var(--sp-1);
+    bottom: var(--sp-1);
+    display: grid;
+    place-items: center;
+    width: 20px;
+    height: 20px;
+    font-size: var(--fs-sm);
+    line-height: 1;
+    color: var(--ls-gold);
+    background: color-mix(in srgb, var(--ls-bg) 85%, transparent);
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-sm);
+    opacity: 0;
+    transition: opacity 120ms ease;
+  }
+  .card:hover .stage-btn,
+  .stage-btn:focus-visible {
+    opacity: 1;
+  }
+  .stage-btn:hover {
+    border-color: var(--ls-gold);
+    color: var(--ls-gold-bright);
+  }
+  .stage-btn.on {
+    opacity: 1;
+    border-color: var(--ls-gold);
+    background: var(--ls-overlay);
   }
 
   .star {

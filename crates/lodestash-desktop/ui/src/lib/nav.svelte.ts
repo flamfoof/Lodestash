@@ -29,6 +29,13 @@ class ViewState {
   /** Lead selection, as an asset id. Selection is view state: no worker writes it. */
   selected = $state<number | null>(null);
   /**
+   * Bulk-bar multi-select (KANBAN B9d): ids picked with the card checkboxes. Deliberately apart
+   * from `selected` — the lead drives single-click / Quick Look, while this is a working list the
+   * bulk bar tags at once. It lives in the view store because it must survive re-renders: the
+   * grid owns the checkboxes, but a selection outlives any one page's row set (and paging).
+   */
+  selectedIds = $state<number[]>([]);
+  /**
    * Browse history for the pack browser (PACK-DIRECTORY-NAV §4): stacks of `dir` strings behind
    * the ← → buttons. Scoped to pack browsing — the generic Folders view breadcrumb jumps directly.
    */
@@ -121,6 +128,22 @@ class ViewState {
 
   clearFilter() {
     this.filter = emptyFilter();
+  }
+
+  /**
+   * Toggle one id in the bulk multi-select (B9d). Reassigns the array rather than mutating it in
+   * place — `$state` tracks the property, so a screen deriving `selectedIds.includes(id)` from
+   * the current array would otherwise not re-render.
+   */
+  toggleSelect(id: number) {
+    this.selectedIds = this.selectedIds.includes(id)
+      ? this.selectedIds.filter((x) => x !== id)
+      : [...this.selectedIds, id];
+  }
+
+  /** Empty the bulk multi-select — the bulk bar's Clear, and after every bulk tag write. */
+  clearSelection() {
+    this.selectedIds = [];
   }
 
   /**

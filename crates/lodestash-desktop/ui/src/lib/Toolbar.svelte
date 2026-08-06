@@ -1,10 +1,62 @@
 <script lang="ts">
   import Icon from "./Icon.svelte";
   import Filters from "./Filters.svelte";
-  import { SORTS, STATUSES, DENSITIES } from "./api";
+  import { SORTS, STATUSES, DENSITIES, recentOps, undo, type OpLogRow } from "./api";
   import { view } from "./nav.svelte";
 
   let { total, favorites = 0 }: { total: number; favorites?: number } = $props();
+
+  // ---- Undo (L5) ---------------------------------------------------------
+  // The newest undo-log row. The effect re-fetches on every `view.dataVersion` change — i.e. after
+  // any catalog write — so the button tracks the log's head, and an undo itself bumps the version
+  // to advance to the next op (a reverted op is removed from the log).
+  let lastOp = $state<OpLogRow | null>(null);
+  let undoBusy = $state(false);
+  $effect(() => {
+    view.dataVersion;
+    let stale = false;
+    recentOps(1)
+      .then((rows) => {
+        if (!stale) lastOp = rows[0] ?? null;
+      })
+      .catch(() => {});
+    return () => {
+      stale = true;
+    };
+  });
+
+  /** The op kinds that actually land in the log (catalog.rs), as plain words for the tooltip. */
+  function opLabel(kind: string): string {
+    switch (kind) {
+      case "set_tags":
+      case "bulk_tag":
+        return "tag edit";
+      case "set_trashed":
+        return "move to trash";
+      case "set_favorite":
+        return "favorite change";
+      case "create_collection":
+        return "collection create";
+      default:
+        return kind.replace(/_/g, " ");
+    }
+  }
+
+  async function onUndo() {
+    const op = lastOp;
+    if (!op || undoBusy) return;
+    undoBusy = true;
+    try {
+      await undo(op.id);
+      // The reverted op is gone from the log; bumping the version re-reads the head and re-asks
+      // every screen, so the undo lands visibly.
+      view.dataVersion += 1;
+    } catch {
+      // Leave dataVersion untouched — nothing changed, and the log still holds the op.
+    } finally {
+      undoBusy = false;
+    }
+  }
 </script>
 
 <svelte:window
@@ -145,6 +197,18 @@
 
     <button
       class="icon-btn"
+      class:on={!!lastOp}
+      disabled={!lastOp || undoBusy}
+      onclick={onUndo}
+      title={lastOp ? `Undo ${opLabel(lastOp.op_kind)}` : "Nothing to undo"}
+      aria-label={lastOp ? `Undo ${opLabel(lastOp.op_kind)}` : "Nothing to undo"}
+      data-testid="undo-button"
+    >
+      ↶
+    </button>
+
+    <button
+      class="icon-btn"
       class:on={view.inspectorOpen}
       onclick={() => (view.inspectorOpen = !view.inspectorOpen)}
       title="Inspector"
@@ -268,5 +332,14 @@
   .icon-btn.on {
     background: var(--ls-overlay);
     opacity: 1;
+  }
+  /* The undo button dims hard when the log is empty or an undo is in flight; hover must not
+     re-brighten a button that cannot act. */
+  .icon-btn:disabled {
+    opacity: 0.25;
+    cursor: default;
+  }
+  .icon-btn:disabled:hover {
+    opacity: 0.25;
   }
 </style>

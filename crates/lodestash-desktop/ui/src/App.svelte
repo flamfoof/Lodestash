@@ -1,9 +1,11 @@
 <script lang="ts">
+  import { setContext } from "svelte";
   import TopBar from "./lib/TopBar.svelte";
   import Sidebar from "./lib/Sidebar.svelte";
   import Screen from "./lib/Screen.svelte";
   import Inspector from "./lib/Inspector.svelte";
   import LibraryScreen from "./lib/LibraryScreen.svelte";
+  import StagingTray from "./lib/StagingTray.svelte";
   import { SCREENS } from "./lib/routes";
   import { view } from "./lib/nav.svelte";
   import ConfirmDelete from "./lib/ConfirmDelete.svelte";
@@ -28,6 +30,10 @@
     getWebPrefs,
     setWebPrefs,
     getSettings,
+    staged,
+    stage,
+    unstage,
+    clearStaged,
     type AssetDetail,
     type LibraryStatus,
   } from "./lib/api";
@@ -127,6 +133,53 @@
     }
   }
 
+  // ---- Staging tray (I6) -------------------------------------------------
+  // The tray's ids live here, loaded from the backend once and re-read after every mutation.
+  // Cards reach in through Svelte context (set below) rather than a prop chain that would have to
+  // thread LibraryScreen → Card; the tray itself gets ids + handlers as plain props.
+  const STAGING_CTX = "ls:staging";
+  let stagedIds = $state<number[]>([]);
+  staged()
+    .then((ids) => (stagedIds = ids))
+    .catch(() => {});
+
+  /** Toggle one asset in/out of the tray, then re-read the authoritative list. */
+  async function toggleStage(id: number) {
+    const on = stagedIds.includes(id);
+    try {
+      if (on) await unstage([id]);
+      else await stage([id]);
+      stagedIds = await staged();
+    } catch (e) {
+      actionError = String(e);
+    }
+  }
+
+  async function unstageOne(id: number) {
+    try {
+      await unstage([id]);
+      stagedIds = await staged();
+    } catch (e) {
+      actionError = String(e);
+    }
+  }
+
+  async function clearTray() {
+    try {
+      await clearStaged();
+      stagedIds = await staged();
+    } catch (e) {
+      actionError = String(e);
+    }
+  }
+
+  setContext<{ isStaged: (id: number) => boolean; toggleStage: (id: number) => void }>(STAGING_CTX, {
+    // Reads `stagedIds` at call time; a `$state` read during a card's render is reactive, so the
+    // card's ⧉ reflects tray membership without any extra prop wiring.
+    isStaged: (id) => stagedIds.includes(id),
+    toggleStage,
+  });
+
   let paletteOpen = $state(false);
 
   /**
@@ -195,6 +248,9 @@
       />
     {/if}
   </div>
+
+  <StagingTray ids={stagedIds} onunstage={unstageOne} onclear={clearTray} />
+
   {#if confirming && selectedDetail}
     <ConfirmDelete
       names={[selectedDetail.name]}

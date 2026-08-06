@@ -9,8 +9,17 @@
     fmtSize,
     fmtDuration,
     statusLabel,
+    bulkTag,
+    relatedAssets,
+    collections,
+    collectionAddAsset,
+    collectionRemoveAsset,
     type AssetDetail,
+    type RelatedAsset,
+    type CollectionRow,
   } from "./api";
+  import { view } from "./nav.svelte";
+  import { traitColor } from "./traits.svelte";
 
   let {
     assetId,
@@ -56,6 +65,113 @@
   const hideBroken = (e: Event) => ((e.currentTarget as HTMLImageElement).style.display = "none");
 
   let tint = $derived(detail ? `var(${typeToken(detail.media_type)})` : "var(--ls-text-dim)");
+
+  // ── Tag-editing slice (G4–G9) ──────────────────────────────────────────────────
+  // TRAITS (G4): the quick-add write path. The desktop shell has no per-asset tag
+  // read (AssetDetail carries no traits), so the chips below are the tags touched in
+  // this session — the grid card still draws the asset's real tag set. `bulkTag` with
+  // a single id is the same writer the bulk bar (B9d) uses, so the op is undoable.
+  let sessionTags = $state<string[]>([]);
+  let tagValue = $state("");
+  let tagBusy = $state(false);
+  let tagMsg = $state<string | null>(null);
+
+  // LINKED FILES (G5) / SIMILAR (G7): both draw the same `related_assets` edges —
+  // one fetch, two views of it. `null` while loading so the panels can say so.
+  let related = $state<RelatedAsset[] | null>(null);
+
+  // COLLECTIONS (G6): the rows come from `collections()`; membership has no read
+  // command in the desktop shell (no `collection_members` wrapper), so it is tracked
+  // locally here and toggled through the writer ops. A fresh session cannot know
+  // which collections already hold the asset — noted as a gap in the audit report.
+  let collectionsRows = $state<CollectionRow[]>([]);
+  let membership = $state<Record<number, boolean>>({});
+
+  // Per-asset state resets with the selection. Kept apart from the fetch effect so a
+  // `dataVersion` bump (e.g. the collection toggle the user just made) re-asks the
+  // data without wiping the local membership guess.
+  $effect(() => {
+    const id = assetId;
+    related = null;
+    collectionsRows = [];
+    sessionTags = [];
+    membership = {};
+    if (id == null) return;
+  });
+
+  // Fetch the sections' data per selection; re-ask after any catalog write so edges
+  // added elsewhere land here too. Stale-guarded like `detail` above.
+  $effect(() => {
+    const id = assetId;
+    view.dataVersion;
+    if (id == null) return;
+    let stale = false;
+    relatedAssets(id)
+      .then((r) => {
+        if (!stale) related = r;
+      })
+      .catch(() => {
+        if (!stale) related = null;
+      });
+    collections()
+      .then((cs) => {
+        if (!stale) collectionsRows = cs;
+      })
+      .catch(() => {});
+    return () => {
+      stale = true;
+    };
+  });
+
+  /** Quick-add / remove one `free`-namespace tag on the selected asset. */
+  async function applyTag(on: boolean) {
+    const id = detail?.asset_id;
+    const value = tagValue.trim();
+    if (id == null || !value || tagBusy) return;
+    tagBusy = true;
+    tagMsg = null;
+    try {
+      await bulkTag([id], "free", value, on);
+      sessionTags = on
+        ? sessionTags.includes(value)
+          ? sessionTags
+          : [...sessionTags, value]
+        : sessionTags.filter((v) => v !== value);
+      tagValue = "";
+      view.dataVersion += 1;
+    } catch (e) {
+      tagMsg = String(e);
+    } finally {
+      tagBusy = false;
+    }
+  }
+
+  /** Toggle one collection's membership, tracking state locally (G6). */
+  async function toggleCollection(c: CollectionRow) {
+    const id = detail?.asset_id;
+    if (id == null) return;
+    const prev = membership;
+    const on = !membership[c.id];
+    membership = { ...membership, [c.id]: on };
+    try {
+      if (on) await collectionAddAsset(c.id, id);
+      else await collectionRemoveAsset(c.id, id);
+      view.dataVersion += 1;
+    } catch (e) {
+      membership = prev;
+      tagMsg = String(e);
+    }
+  }
+
+  /** Select a related asset — the same lead selection the grid cards use. */
+  function pick(id: number | null) {
+    if (id != null) view.selected = id;
+  }
+
+  /** Resolved edges show their name; unresolved ones show what was declared. */
+  function relLabel(r: RelatedAsset): string {
+    return r.name ?? r.declared_path ?? "(unresolved)";
+  }
 </script>
 
 <aside class="inspector" style="--tint: {tint}">
@@ -103,6 +219,115 @@
         <dd>{detail.source}</dd>
       {/if}
     </dl>
+
+    <section class="panel" data-testid="inspector-traits">
+      <h3>TRAITS</h3>
+      {#if sessionTags.length === 0}
+        <p class="hint">No tags edited this session — add one below.</p>
+      {:else}
+        <div class="tagchips">
+          {#each sessionTags as t (t)}
+            <span
+              class="tag"
+              style={traitColor.has(t) ? `--chip: var(${traitColor.get(t)})` : ""}
+              title="tagged this session"
+            >{t}</span>
+          {/each}
+        </div>
+      {/if}
+      <div class="quickadd">
+        <input
+          bind:value={tagValue}
+          placeholder="tag · free"
+          aria-label="Tag value"
+          data-testid="inspector-tag-input"
+          onkeydown={(e) => e.key === "Enter" && applyTag(true)}
+        />
+        <button
+          onclick={() => applyTag(true)}
+          disabled={tagBusy || !tagValue.trim()}
+          data-testid="inspector-tag-add"
+        >+ Add</button>
+        <button
+          onclick={() => applyTag(false)}
+          disabled={tagBusy || !tagValue.trim()}
+          data-testid="inspector-tag-remove"
+        >− Remove</button>
+      </div>
+      {#if tagMsg}
+        <p class="msg danger">{tagMsg}</p>
+      {/if}
+    </section>
+
+    <section class="panel" data-testid="inspector-links">
+      <h3>LINKED FILES</h3>
+      {#if related === null}
+        <p class="hint">…</p>
+      {:else if related.length === 0}
+        <p class="hint">no linked files</p>
+      {:else}
+        <ul class="links">
+          {#each related as r, i (i)}
+            <li>
+              <button
+                class="link"
+                onclick={() => pick(r.asset_id)}
+                disabled={r.asset_id == null}
+                title={`${r.outbound ? "uses" : "used by"} · ${r.kind} · ${r.state}`}
+                data-testid="inspector-link-{i}"
+              >
+                <span class="dir" class:out={r.outbound} aria-hidden="true">{r.outbound ? "→" : "←"}</span>
+                <span class="nm">{relLabel(r)}</span>
+                {#if r.asset_id == null}<span class="missing">✕ missing</span>{/if}
+              </button>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </section>
+
+    <section class="panel" data-testid="inspector-collections">
+      <h3>COLLECTIONS</h3>
+      {#if collectionsRows.length === 0}
+        <p class="hint">no collections yet</p>
+      {:else}
+        <div class="colchips">
+          {#each collectionsRows as c (c.id)}
+            <button
+              class="colchip"
+              class:on={membership[c.id]}
+              onclick={() => toggleCollection(c)}
+              title="{c.asset_count} assets"
+              data-testid="collection-toggle-{c.id}"
+            >
+              {membership[c.id] ? "✓ " : "+ "}{c.name}
+            </button>
+          {/each}
+        </div>
+      {/if}
+    </section>
+
+    {#if related && related.length > 0}
+      <section class="panel" data-testid="inspector-similar">
+        <h3>SIMILAR</h3>
+        <ul class="links">
+          {#each related as r, i (i)}
+            <li>
+              <button
+                class="link"
+                onclick={() => pick(r.asset_id)}
+                disabled={r.asset_id == null}
+                title={`${r.kind} · ${r.state}`}
+                data-testid="inspector-similar-{i}"
+              >
+                <span class="nm">{relLabel(r)}</span>
+                {#if r.asset_id == null}<span class="missing">✕ missing</span>{/if}
+              </button>
+            </li>
+          {/each}
+        </ul>
+      </section>
+    {/if}
 
     <!--
       Three removal actions, deliberately not equal-weight (KANBAN B5). Remove is the safe one and
@@ -280,5 +505,168 @@
     text-align: right;
     overflow-wrap: anywhere;
     user-select: text;
+  }
+
+  /* Tag-editing slice (G4–G9): one bordered panel per section, captioned like the
+     design's uppercase labels. Inserted between the stat block and the actions, so
+     the destructive actions keep their last position. */
+  .panel {
+    margin-top: var(--sp-4);
+    padding-top: var(--sp-3);
+    border-top: 1px solid var(--ls-border);
+  }
+  .panel h3 {
+    margin: 0 0 var(--sp-2);
+    font-family: var(--ff-ui);
+    font-size: var(--fs-xs);
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ls-text-dim);
+  }
+  .hint {
+    margin: 0;
+    font-size: var(--fs-sm);
+    color: var(--ls-text-dim);
+  }
+  .msg {
+    margin: var(--sp-2) 0 0;
+    font-size: var(--fs-xs);
+  }
+  .msg.danger {
+    color: var(--ls-danger);
+  }
+
+  /* TRAITS — session chips, styled like the grid card's tag chips. */
+  .tagchips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--sp-1);
+    margin-bottom: var(--sp-2);
+  }
+  .tag {
+    max-width: 100%;
+    padding: 1px var(--sp-2);
+    font-size: var(--fs-xs);
+    color: var(--chip, var(--ls-text-muted));
+    background: var(--ls-overlay);
+    border: 1px solid color-mix(in srgb, var(--chip, var(--ls-overlay)) 55%, transparent);
+    border-radius: var(--r-pill);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .quickadd {
+    display: flex;
+    gap: var(--sp-1);
+  }
+  .quickadd input {
+    flex: 1;
+    min-width: 0;
+    padding: 3px var(--sp-2);
+    background: var(--ls-bg);
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-sm);
+    color: var(--ls-text);
+    font: inherit;
+    font-size: var(--fs-sm);
+  }
+  .quickadd button {
+    flex: none;
+    padding: 3px var(--sp-2);
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-sm);
+    font: inherit;
+    font-size: var(--fs-sm);
+    color: var(--ls-text);
+    background: var(--ls-surface);
+    cursor: pointer;
+  }
+  .quickadd button:hover:not(:disabled) {
+    border-color: var(--ls-gold);
+  }
+  .quickadd button:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+
+  /* LINKED FILES / SIMILAR — one row per edge; resolved edges click through to the
+     asset, unresolved ones show ✕ missing and are inert. */
+  .links {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-1);
+  }
+  .link {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    width: 100%;
+    padding: 3px var(--sp-2);
+    text-align: left;
+    font: inherit;
+    font-size: var(--fs-sm);
+    color: var(--ls-text);
+    background: var(--ls-overlay);
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-sm);
+    cursor: pointer;
+  }
+  .link:hover:not(:disabled) {
+    border-color: var(--ls-gold);
+  }
+  .link:disabled {
+    cursor: default;
+    opacity: 0.75;
+  }
+  .link .dir {
+    flex: none;
+    color: var(--ls-text-dim);
+  }
+  .link .dir.out {
+    color: var(--tint);
+  }
+  .link .nm {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .link .missing {
+    flex: none;
+    font-size: var(--fs-xs);
+    color: var(--ls-danger);
+  }
+
+  /* COLLECTIONS — `+ name` / `✓ name` toggle chips, gold when the asset is in. */
+  .colchips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--sp-1);
+  }
+  .colchip {
+    max-width: 100%;
+    padding: 1px var(--sp-2);
+    font: inherit;
+    font-size: var(--fs-xs);
+    color: var(--ls-text-muted);
+    background: none;
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-pill);
+    cursor: pointer;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .colchip:hover {
+    border-color: var(--ls-gold);
+  }
+  .colchip.on {
+    color: var(--ls-gold);
+    border-color: var(--ls-gold);
   }
 </style>

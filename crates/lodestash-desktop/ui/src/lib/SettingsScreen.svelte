@@ -8,7 +8,18 @@
    * the engine bridge and Clear-cache actions bind when this shell hosts the engine; the
    * per-source blacklist panel needs the Sources-manager slice (documented in ALIGNMENT-AUDIT).
    */
-  import { getSettings, setSettings, setSourceWatch, libraryStatus, type Settings, type LibraryStatus } from "./api";
+  import {
+    getSettings,
+    setSettings,
+    setSourceWatch,
+    libraryStatus,
+    sourceExcludes as fetchSourceExcludes,
+    addSourceExclude,
+    removeSourceExclude,
+    type Settings,
+    type LibraryStatus,
+    type SourceExclude,
+  } from "./api";
   import { view } from "./nav.svelte";
 
   const DEFAULTS: Settings = {
@@ -66,7 +77,13 @@
       })
       .catch((e) => (error = String(e)));
     libraryStatus()
-      .then((st) => (status = st))
+      .then((st) => {
+        status = st;
+        for (const src of st.sources) {
+          draftOf(src.id);
+          loadExcludes(src.id);
+        }
+      })
       .catch(() => {});
   });
 
@@ -109,6 +126,55 @@
 
   let sourceBusy = $state<number | null>(null);
 
+  /* Per-source blacklist (UI-SPEC §11.1 / design README §5.1): each source owns an independent
+     exclusion list. Loaded eagerly on mount so the ⊘ chip can show its live count; the expanded
+     panel renders the same list. */
+  let excludesBySource = $state<Record<number, SourceExclude[]>>({});
+  let excludesError = $state<Record<number, string>>({});
+  let excludeBusy = $state<Record<number, boolean>>({});
+  let blacklistOpen = $state<Record<number, boolean>>({});
+  let excludeDraft = $state<Record<number, { kind: string; value: string }>>({});
+
+  function draftOf(id: number) {
+    return (excludeDraft[id] ??= { kind: "folder", value: "" });
+  }
+
+  async function loadExcludes(id: number) {
+    try {
+      excludesBySource[id] = await fetchSourceExcludes(id);
+      delete excludesError[id];
+    } catch (e) {
+      excludesError[id] = String(e);
+    }
+  }
+
+  async function addExclude(id: number, kind: string, value: string) {
+    const v = value.trim();
+    if (!v) return;
+    excludeBusy[id] = true;
+    try {
+      await addSourceExclude(id, kind, v);
+      draftOf(id).value = "";
+      await loadExcludes(id);
+    } catch (e) {
+      error = String(e);
+    } finally {
+      excludeBusy[id] = false;
+    }
+  }
+
+  async function removeExclude(id: number, kind: string, value: string) {
+    excludeBusy[id] = true;
+    try {
+      await removeSourceExclude(id, kind, value);
+      await loadExcludes(id);
+    } catch (e) {
+      error = String(e);
+    } finally {
+      excludeBusy[id] = false;
+    }
+  }
+
   async function toggleWatch(id: number, watch: boolean) {
     sourceBusy = id;
     try {
@@ -149,23 +215,101 @@
         </p>
         <ul class="sources" data-testid="sources">
           {#each status?.sources ?? [] as src (src.id)}
+            {@const excl = excludesBySource[src.id]}
             <li class="src">
-              <span class="dot" class:paused={!src.watch_enabled} aria-hidden="true"></span>
-              <div class="meta">
-                <span class="name">{src.name}</span>
-                <span class="path mono" title={src.root_path}>{src.root_path}</span>
-                <span class="stat mono">{src.asset_count.toLocaleString()} assets</span>
+              <div class="src-row">
+                <span class="dot" class:paused={!src.watch_enabled} aria-hidden="true"></span>
+                <div class="meta">
+                  <span class="name">{src.name}</span>
+                  <span class="path mono" title={src.root_path}>{src.root_path}</span>
+                  <span class="stat mono">{src.asset_count.toLocaleString()} assets</span>
+                </div>
+                <button
+                  class="chip blacklist"
+                  class:on={blacklistOpen[src.id]}
+                  class:nonempty={(excl?.length ?? 0) > 0}
+                  aria-expanded={blacklistOpen[src.id]}
+                  onclick={() => (blacklistOpen[src.id] = !blacklistOpen[src.id])}
+                  data-testid="excludes-toggle-{src.id}"
+                >
+                  ⊘ {excl === undefined ? "…" : `${excl.length} excluded`}
+                </button>
+                <button
+                  class="toggle"
+                  class:on={src.watch_enabled}
+                  disabled={sourceBusy === src.id}
+                  onclick={() => toggleWatch(src.id, !src.watch_enabled)}
+                  aria-pressed={src.watch_enabled}
+                  data-testid="src-watch-{src.id}"
+                >
+                  {src.watch_enabled ? "watching" : "paused"}
+                </button>
               </div>
-              <button
-                class="toggle"
-                class:on={src.watch_enabled}
-                disabled={sourceBusy === src.id}
-                onclick={() => toggleWatch(src.id, !src.watch_enabled)}
-                aria-pressed={src.watch_enabled}
-                data-testid="src-watch-{src.id}"
-              >
-                {src.watch_enabled ? "watching" : "paused"}
-              </button>
+              {#if blacklistOpen[src.id]}
+                {@const draft = draftOf(src.id)}
+                <div class="blacklist" data-testid="excludes-{src.id}">
+                  {#if excludesError[src.id]}
+                    <p class="msg danger">{excludesError[src.id]}</p>
+                  {:else if excl === undefined}
+                    <p class="msg">Loading…</p>
+                  {:else if excl.length === 0}
+                    <p class="msg">Nothing excluded — everything under this source is indexed.</p>
+                  {:else}
+                    <ul class="excl-chips">
+                      {#each excl as ex (ex.kind + "|" + ex.value)}
+                        <li
+                          class="excl-chip"
+                          class:folder={ex.kind === "folder"}
+                          class:asset={ex.kind !== "folder"}
+                        >
+                          <span class="kind mono">{ex.kind}</span>
+                          <span class="value mono">{ex.value}</span>
+                          <button
+                            class="rm"
+                            aria-label="Remove {ex.kind} exclusion {ex.value}"
+                            title="Remove"
+                            disabled={excludeBusy[src.id]}
+                            onclick={() => removeExclude(src.id, ex.kind, ex.value)}
+                            data-testid="exclude-remove-{src.id}"
+                          >
+                            ✕
+                          </button>
+                        </li>
+                      {/each}
+                    </ul>
+                  {/if}
+                  <div class="add-row">
+                    <select
+                      class="kind mono"
+                      aria-label="Exclusion kind"
+                      bind:value={draft.kind}
+                      data-testid="exclude-kind-{src.id}"
+                    >
+                      <option value="folder">folder</option>
+                      <option value="asset">asset</option>
+                    </select>
+                    <input
+                      class="value mono"
+                      type="text"
+                      placeholder="Source-relative path or file name"
+                      aria-label="Exclusion value"
+                      bind:value={draft.value}
+                      onkeydown={(e) => {
+                        if (e.key === "Enter") addExclude(src.id, draft.kind, draft.value);
+                      }}
+                      data-testid="exclude-value-{src.id}"
+                    />
+                    <button
+                      class="add"
+                      disabled={excludeBusy[src.id] || !draft.value.trim()}
+                      onclick={() => addExclude(src.id, draft.kind, draft.value)}
+                      data-testid="exclude-add-{src.id}"
+                    >
+                      Add
+                    </button>
+                  </div>
+                </div>
+              {/if}
             </li>
           {/each}
         </ul>
@@ -441,12 +585,156 @@
   }
   .src {
     display: flex;
-    align-items: center;
-    gap: var(--sp-3);
+    flex-direction: column;
+    gap: var(--sp-2);
     padding: var(--sp-2);
     border: 1px solid var(--ls-border);
     border-radius: var(--r-md);
     background: var(--ls-bg);
+  }
+  .src-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+  }
+  .chip.blacklist {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-1);
+    padding: 3px var(--sp-3);
+    background: none;
+    border: 1px solid var(--ls-border-strong);
+    border-radius: var(--r-pill);
+    color: var(--ls-text-dim);
+    font: inherit;
+    font-size: var(--fs-xs);
+    cursor: pointer;
+  }
+  .chip.blacklist:hover,
+  .chip.blacklist.on {
+    border-color: var(--ls-gold);
+    color: var(--ls-text);
+  }
+  .chip.blacklist.nonempty {
+    color: var(--ls-warning);
+    border-color: color-mix(in srgb, var(--ls-warning) 50%, transparent);
+  }
+  .chip.blacklist.nonempty.on {
+    border-color: var(--ls-warning);
+  }
+  .blacklist {
+    border-top: 1px solid var(--ls-border);
+    padding-top: var(--sp-2);
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+  }
+  .excl-chips {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--sp-1);
+  }
+  .excl-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-1);
+    max-width: 100%;
+    padding: 2px var(--sp-2);
+    border: 1px solid var(--ls-border-strong);
+    border-radius: var(--r-pill);
+    background: var(--ls-surface);
+    font-size: var(--fs-xs);
+  }
+  .excl-chip .kind {
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 9px;
+    padding: 1px var(--sp-1);
+    border-radius: var(--r-sm);
+  }
+  .excl-chip.folder .kind {
+    color: var(--ls-warning);
+    border: 1px solid color-mix(in srgb, var(--ls-warning) 55%, transparent);
+  }
+  .excl-chip.asset .kind {
+    color: var(--ls-danger);
+    border: 1px solid color-mix(in srgb, var(--ls-danger) 55%, transparent);
+  }
+  .excl-chip .value {
+    color: var(--ls-text);
+    max-width: 260px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .excl-chip .rm {
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--ls-text-dim);
+    font: inherit;
+    font-size: var(--fs-xs);
+    line-height: 1;
+    cursor: pointer;
+  }
+  .excl-chip .rm:hover:not(:disabled) {
+    color: var(--ls-danger);
+  }
+  .excl-chip .rm:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+  .add-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+  }
+  .add-row .kind {
+    height: var(--control-h);
+    padding: 0 var(--sp-1);
+    background: var(--ls-bg);
+    border: 1px solid var(--ls-border-strong);
+    border-radius: var(--r-md);
+    color: var(--ls-text);
+    font-size: var(--fs-xs);
+  }
+  .add-row .value {
+    flex: 1;
+    min-width: 0;
+    height: var(--control-h);
+    padding: 0 var(--sp-2);
+    background: var(--ls-bg);
+    border: 1px solid var(--ls-border-strong);
+    border-radius: var(--r-md);
+    color: var(--ls-text);
+    font-size: var(--fs-xs);
+  }
+  .add-row .value:focus {
+    outline: none;
+    border-color: var(--ls-gold);
+  }
+  .add-row .add {
+    flex: none;
+    padding: 3px var(--sp-3);
+    background: none;
+    border: 1px solid var(--ls-border-strong);
+    border-radius: var(--r-pill);
+    color: var(--ls-text-dim);
+    font: inherit;
+    font-size: var(--fs-xs);
+    cursor: pointer;
+  }
+  .add-row .add:hover:not(:disabled) {
+    border-color: var(--ls-gold);
+    color: var(--ls-text);
+  }
+  .add-row .add:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
   .dot {
     width: 8px;

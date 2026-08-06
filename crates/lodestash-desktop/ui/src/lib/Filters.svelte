@@ -1,7 +1,8 @@
 <script lang="ts">
   /**
-   * The ⚑ content-filter popover (UI-SPEC §2.3): TRAIT cloud, TRIANGLES buckets, FILE SIZE tiers.
-   * Multi-select — OR within a group, AND across groups.
+   * The ⚑ content-filter popover (UI-SPEC §2.3): TRAIT cloud, TRIANGLES buckets, FILE SIZE tiers,
+   * and the LINKS single-select. Multi-select — OR within a group, AND across groups (LINKS is the
+   * one single-select switch).
    *
    * Every chip is drawn from `filter_facets`, never from a list written out here: the ids are the
    * Rust enums' own serde names, so a chip cannot come to mean something the backend does not
@@ -24,6 +25,20 @@
   });
 
   const on = (group: keyof ContentFilter, id: string) => view.filter[group].includes(id);
+
+  /// LINKS (FEATURES §1.4 / design E5): one single-select chip — "Linked to selection". The anchor
+  /// asset id rides on `view.filter.links`, an extra runtime key on the popover's own ContentFilter,
+  /// so ⚑ Clear all wipes it with the rest; LibraryScreen forwards it as `GridQuery.links`.
+  type FilterWithLinks = ContentFilter & { links?: number | null };
+  const linksOf = (): number | null => (view.filter as FilterWithLinks).links ?? null;
+  /** The links filter is live when it is anchored on the currently selected asset. */
+  const linksOn = $derived(view.selected !== null && linksOf() === view.selected);
+  /** Toggle: anchor the grid to the selection, or drop the anchor (single-select, §1.4). */
+  function toggleLinks() {
+    const sel = view.selected;
+    if (sel === null) return;
+    view.filter = { ...view.filter, links: linksOf() === sel ? null : sel } as ContentFilter;
+  }
 
   // The cloud is long on a tagged library; the search box is what makes it usable. Capped so an
   // untyped popover cannot render nine hundred chips.
@@ -49,7 +64,7 @@
     <button
       class="clear"
       onclick={() => view.clearFilter()}
-      disabled={view.filterCount === 0}
+      disabled={view.filterCount === 0 && linksOf() === null}
       data-testid="filters-clear">Clear all</button
     >
   </header>
@@ -111,6 +126,26 @@
           </button>
         {/each}
       </div>
+    </section>
+
+    <section>
+      <h3>Links</h3>
+      <div class="cloud">
+        <button
+          class="chip"
+          class:on={linksOn}
+          disabled={view.selected === null}
+          onclick={toggleLinks}
+          data-testid="facet-links"
+        >
+          Linked to selection
+        </button>
+      </div>
+      {#if view.selected === null}
+        <p class="hint">
+          Select an asset first — the grid then narrows to assets sharing a dependency edge with it.
+        </p>
+      {/if}
     </section>
   {/if}
 </div>
@@ -198,6 +233,13 @@
   }
   .chip:hover {
     color: var(--ls-text);
+  }
+  .chip:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .chip:disabled:hover {
+    color: var(--chip, var(--ls-text-dim));
   }
   /* Selected state is arcane, per DESIGN-GUIDELINES §7 — gold is reserved for the primary action. */
   .chip.on {
