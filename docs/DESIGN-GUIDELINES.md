@@ -161,8 +161,9 @@ Line-height: 1.45 body, 1.2 headings. Weight: 400 body, 500 labels, 600 headings
 | id | Meaning | | id | Meaning |
 |---|---|---|---|---|
 | `ls-nav-library` | Library | | `ls-type-all` | All types |
-| `ls-nav-identify` | Identify mode (appraise) | | `ls-type-model` | Models (3D) |
+| `ls-nav-favorites` | Favorites ★ | | | |
 | `ls-nav-collections` | Collections | | `ls-type-sound` | Sounds |
+| `ls-nav-identify` | Identify mode (appraise) | | `ls-type-model` | Models (3D) |
 | `ls-nav-packages` | Packages | | `ls-type-image` | Images |
 | `ls-nav-traits` | Traits | | `ls-type-texture` | Textures |
 | `ls-nav-stats` | Stats | | `ls-type-material` | Material (sphere) |

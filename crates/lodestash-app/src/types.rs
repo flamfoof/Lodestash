@@ -75,6 +75,18 @@ impl Category {
             Category::Images => "--ls-type-image",
         }
     }
+
+    /// The frontend's tab id — must match the serde snake_case name above, which is what
+    /// `GridQuery.tab` round-trips through. One literal, two callers, so a rename cannot drift.
+    pub fn id(self) -> &'static str {
+        match self {
+            Category::All => "all",
+            Category::Models => "models",
+            Category::Materials => "materials",
+            Category::Sounds => "sounds",
+            Category::Images => "images",
+        }
+    }
 }
 
 /// `--ls-type-model` as CSS hex. Vector previews carry it on the SVG root so the stored artifact
