@@ -159,6 +159,13 @@
     border-radius: var(--r-lg);
     text-align: left;
     overflow: hidden;
+    /* A <button> computes width: auto as fit-content, not fill — so a card sized to its
+       content instead of its grid track: measured 224px next to a 428px card in the same
+       row (long unbroken names like SM_Env_Entrance_Crypt_01_Collision), overflowing the
+       cell and making the gaps ragged. width: 100% pins every card to its track; the
+       ellipsizing name/sub lines clip inside it. */
+    width: 100%;
+    min-width: 0;
   }
   .card:hover {
     border-color: var(--tint);

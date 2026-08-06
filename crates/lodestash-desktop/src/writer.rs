@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 
 use lodestash_app::config::AppConfig;
-use lodestash_app::drains::{drain_previews, PREVIEW_BACKFILL_BUDGET};
+use lodestash_app::drains::drain_previews;
 use lodestash_app::paths::default_cache_dirs;
 use lodestash_app::types::PersistBatch;
 use lodestash_core::catalog::Catalog;
@@ -169,20 +169,34 @@ impl Writer {
                 // seconds; the queue is durable, so it converges over idle moments.
                 let (cache_dir, workspace_dir) = default_cache_dirs();
                 let proxy = AppConfig::load().preview_quality.proxy_budget();
+                // Test/CI escape hatch: the preview backfill is CPU-heavy (each model render
+                // is a decimate + 4-view raster), and an e2e run that launches the app dozens
+                // of times would otherwise grind the machine. LODESTASH_NO_PREVIEW_DRAIN=1
+                // skips it; the grid then shows type marks for models without previews.
+                let drain_enabled = std::env::var("LODESTASH_NO_PREVIEW_DRAIN").is_err();
                 loop {
                     match rx.recv_timeout(std::time::Duration::from_secs(1)) {
                         Ok(job) => {
                             let _ = job.reply.send(run(&mut catalog, &db_path, job.op));
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            // Idle — spend a few seconds backfilling previews, then re-check
-                            // the channel so a write never queues behind a long pass.
+                            // Quiet for a second. Backfill previews in short slices, and only
+                            // when nothing is queued — a long pass would make every write wait
+                            // for it (measured: a 5s slice pushed a tag-create past the UI's
+                            // own timeouts). 1s slices keep op latency under ~1.2s while still
+                            // filling most idle time; the queue is durable, so it converges.
+                            if !drain_enabled {
+                                continue;
+                            }
+                            if rx.recv_timeout(std::time::Duration::ZERO).is_ok() {
+                                continue; // an op is waiting — let the loop pick it up
+                            }
                             drain_previews(
                                 &mut catalog,
                                 workspace_dir.as_deref(),
                                 cache_dir.as_deref(),
                                 proxy,
-                                PREVIEW_BACKFILL_BUDGET.min(std::time::Duration::from_secs(5)),
+                                std::time::Duration::from_secs(1),
                             );
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,

@@ -131,6 +131,10 @@ export async function launch() {
     env: {
       ...process.env,
       WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${CDP_PORT}`,
+      // The preview backfill is CPU-heavy (decimate + 4-view raster per model); a suite that
+      // launches the app dozens of times would grind the machine into click timeouts. The
+      // drain still runs for real users — this only skips it under e2e.
+      LODESTASH_NO_PREVIEW_DRAIN: "1",
     },
   });
   spawned.push(app);
