@@ -262,25 +262,26 @@ Spec citation → app evidence. `ui/` = `crates/lodestash-desktop/ui`.
 
 ## Open gaps — remaining (post-remediation)
 
-The remediation log above fixed every remediable item in this audit. What remains is the
-documented backend-blocked set plus a handful of small, honest follow-ups — none of them a stub,
-none of them a visual divergence.
+The remediation log above fixed every remediable item in this audit, and the **B9 pass
+(2026-08-06, KANBAN B9a–g)** shipped the non-engine slices: Stats Tag Graph, Mapping tab,
+per-source blacklist editor (now fed to the crawler via the config sync), LINKS filter +
+bulk-bar tag edits, the staging tray's collect side, the Inspector tag-editing slice, and undo
+for tag/collection/trash. What remains below is the genuinely engine-blocked set.
 
 ### Backend-blocked (board already tracks; not remediated here)
 - **Identify engine**: ✦ Identify all, per-asset Identify now, the appraise shimmer (UI-SPEC §3)
   — the tagger/embeddings/job pump is the B7 engine build; the screen shows the backlog honestly.
 - **B2b ingest path**: per-pack Extract, the §5.2 import dialog, the job tray, `+ Add source…`
   folder chooser, the DropZone's post-import flow — all ride the crawl/pump.
-- **Staging tray** (I6), **project switcher + Connect wizard** (I8), import/export actions,
-  undo (L5) — ENGINE-API/engine-project work.
-- **Stats Tag Graph** (§8.2) and the **Mapping tab** (§9.2) — need core slices.
-- **LINKS filter** (E5) and **bulk-bar tag edits** (D9) — need the dependency graph / tag ops +
-  multi-select.
-- **Per-source blacklist editing** (UI-SPEC §11.1) — the data model field exists; the
-  read/write slice is the Sources-manager card.
-- **Inspector** (G4–G9): TRAITS quick-add, LINKED FILES, COLLECTIONS toggle chips, SIMILAR —
-  the inspector's tag-editing slice (catalog `related_assets`/`set_tags` exist and are tested,
-  so this is wiring, not engine).
+- **Project switcher + Connect wizard** (I8), import/export actions, and the **staging tray's
+  commit-to-project half** — ENGINE-API/engine-project work. (Undo L5 and the tray's collect side
+  shipped in B9.)
+- **LINKS dependency *graph* harvest** — `GridQuery.links` filters the one-hop edges that exist;
+  harvesting GUID relationships from `.unitypackage` contents is ingest work.
+- **Mapping rule authoring** — the B9b tab lists rules and applies the engine; create/edit
+  rules is a later slice over `list_rules`/`apply_mapping`.
+- **Inspector collection membership read** — the B9f chips toggle but track membership locally;
+  a `collection_members` read command is the next slice.
 
 ### Small follow-ups (visual/keyboard, not stubs)
 - **B6 health meter** in the top bar (UI-SPEC §0.1.5) — counts already flow to `LibraryStatus`.
@@ -300,3 +301,4 @@ none of them a visual divergence.
   the app implements it); add the row so the two specs agree.
 - DESIGN-GUIDELINES §5's sprite table was updated with `ls-nav-favorites`; the Glyph Catalog's
   nav list still reflects the pre-Favorites 10-row prototype — add a Favorites ★ row.
+  *(Both shipped with the B8 commit 2026-08-06.)*

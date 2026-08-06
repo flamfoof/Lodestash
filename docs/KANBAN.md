@@ -541,6 +541,45 @@ until B7.
         `⤢` and `+ stage` on the card, and `+ Add source…` is a label, not the §7.4 chooser (B2b).
         43 Rust tests (2 new, both mutation-checked), 47/47 e2e.
 
+- [x] **B9 — the remaining-gaps pass (2026-08-06).** *All seven sub-cards shipped 2026-08-06 —
+      see each card's note. e2e 50/50, Rust 95 core, svelte-check 0/0.* The ALIGNMENT-AUDIT §Open-gaps list minus the
+      engine-blocked set. One card per slice; backend first (catalog → commands), then the screens.
+      Engine-blocked and NOT in this card: the Identify engine, the B2b ingest path (job tray,
+      per-pack Extract, §5.2 import), the Connect wizard / project switcher, LINKS' dependency
+      *graph* harvest, and the B1.5/B7 cutover — all ride the B7 engine build.
+  - [x] **B9a — Stats Tag Graph** (UI-SPEC §8.2). *Shipped 2026-08-06.* `tag_graph` (co-occurrence
+        edges + weights + node counts) + `asset_edges`; StatsScreen renders a deterministic ring
+        layout (gold nodes ∝ usage, edge opacity ∝ weight, tags·links·assets header, honest empty
+        state + Unidentified footnote). Testids: `tag-graph`, `tag-graph-empty`, `tag-graph-counts`.
+  - [x] **B9b — Mapping tab** (UI-SPEC §9.2). *Shipped 2026-08-06.* Taxonomy switcher
+        (activate/delete), category tree CRUD (create/rename/delete with confirm, descendant
+        paths rewritten in one tx), rules list, ⚙ Apply (changed count). Rules authoring stays
+        read-only — the rule editor is a later slice over `list_rules`/`apply_mapping`.
+  - [x] **B9c — per-source blacklist editor** (UI-SPEC §11.1). *Shipped 2026-08-06.* Source-scoped
+        list/add/remove over `import_source.blacklist` **and** mirrored into the app config the
+        crawler actually reads (`edit_config`) — the editor changes real behavior. Writes fail on
+        a missing source instead of silently touching nothing.
+  - [x] **B9d — LINKS filter + bulk-bar tag edits** (E5, D9). *Shipped 2026-08-06.* `GridQuery.links`
+        narrows the grid to the one-hop edge neighbourhood (computed once per query from
+        `asset_edges`); ⚑ LINKS chip enabled with a selection. Multi-select checkboxes + sticky
+        bulk bar (Add/Remove tag, Clear) over `bulkTag` — which **appends** (`add_asset_tag`), so a
+        bulk add never deletes the asset's other manual tags. The dependency *graph harvest*
+        stays engine-blocked.
+  - [x] **B9e — staging tray** (I6). *Shipped 2026-08-06 (collect side).* Stage/unstage/clear
+        (in-memory, order-preserving) + card affordance + bottom tray with unstage/clear; the
+        commit-to-project button exists and is disabled with an honest title — that half rides
+        the engine build.
+  - [x] **B9f — Inspector tag-editing slice** (G4–G9). *Shipped 2026-08-06.* TRAITS quick-add
+        (append via bulkTag), LINKED FILES (relatedAssets, direction marked), COLLECTIONS toggle
+        chips, SIMILAR. *Gap:* collection membership state is tracked locally — no
+        membership-read command exists yet (next slice).
+  - [x] **B9g — undo (L5).** *Shipped 2026-08-06 (tag/collection/trash).* `op_log` tail (capped
+        200) + `recent_ops` + `undo`; reverts: set_tags (snapshot restore), set_trashed
+        (direction flip), create_collection (delete), bulk_tag (exact inverse per asset — one
+        row per batch, no-op adds never logged so undo can't yank a pre-existing tag). Toolbar
+        ↶ button. Ingest and imports excluded per the card; mapping-rule and trait edits are
+        not yet logged.
+
 - [ ] **B1.5 — `lodestash-cli`.** Headless `scan|index|tag|export`; gives the port a smoke test
       needing no window.
 - [ ] **B7 — cutover.** `[[bin]] lodestash` moves to `lodestash-desktop`, **preserving the `--mcp`

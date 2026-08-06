@@ -4,8 +4,9 @@ Working notes for whoever (or whatever) continues the build. Unlike the rest of 
 is **not** a design spec — it's the state of play, the decisions already settled, and the traps.
 The design docs still win on any question of what the software *should* do.
 
-Last updated: **2026-08-04** — §1.6 is the current handoff; the B8 session it describes is now
-**committed on `main`** (five commits, `e1c0160`…`cdde6c0`), and the §1.5 "B5 writes" block below
+Last updated: **2026-08-06** — §1.7 is the current handoff (the B9 pass, committed on `main` as
+`fe5bd4d`…`65f842f`); the §1.6 B8 block below it is committed and shipped, and the §1.5 "B5
+writes" block is historical.
 it is historical and already shipped.
 
 ---
@@ -83,6 +84,35 @@ narrowed rather than dissolved — `file` and `mesh` serve whole assets and neve
 write lands only in our own cache, so non-destructive holds. **`warm_thumbnails` is still the better
 end state** (user-visible, cancellable, batchable into one skip-scan); it wants the job tray, which
 the Svelte side does not have yet.
+
+## 1.7 Next session: the B9 pass shipped — the remaining backlog is the engine build (2026-08-06)
+
+**B9 (KANBAN B9a–g) shipped all seven non-engine slices of the ALIGNMENT-AUDIT gap list,
+committed on `main`:** `fe5bd4d` core slices (tag graph, asset edges, taxonomy/mapping,
+source blacklist, undo op-log, `add_asset_tag` append, collection membership, `edit_config`),
+`fbad784` desktop backend (20+ commands, BulkTag append + single-row undo, blacklist→config
+sync, `GridQuery.links`, staging), `65f842f` the UI (tag graph, Mapping tab, blacklist editor,
+LINKS chip, bulk bar, Inspector slices, staging tray, undo button). Verified: Rust 95 core /
+45 desktop / 28 app all green, svelte-check 0/0, vite build, e2e 50/50.
+
+**What is genuinely left (all engine-blocked — the B7 build, not slices):**
+- **Identify engine** — ✦ Identify all / per-asset Identify / appraise shimmer: the
+  tagger+embeddings+pump. The egui build already runs this (`app.rs` drain); porting it is the
+  engine task.
+- **B2b ingest** — per-pack Extract, §5.2 import dialog, job tray, `+ Add source…` chooser,
+  DropZone post-import flow.
+- **Project switcher / Connect wizard (I8)**, import/export, and the **staging tray's commit
+  half** (the collect side shipped in B9e).
+- **LINKS graph harvest** — the filter works over edges; harvesting GUID relationships from
+  pack contents is ingest work.
+- **Mapping rule authoring** and an **Inspector `collection_members` read** — the two small
+  B9 follow-ups, listed on the B9f/B9b cards.
+
+**Traps carried forward:** single-writer rule (every catalog write via `writer.rs` `Op`; the
+writer now also owns the blacklist→config sync — config writes go through the shared
+`edit_config` lock, never a second `CONFIG_LOCK`); `set_tags` **replaces** the per-source set,
+so the UI uses `add_asset_tag` for appends — do not "simplify" the bulk path back to
+`set_tags`; undo rows are capped at 200 and bulk ops log only the assets that changed.
 
 ## 1.6 Next session: review the conformance remediation, close the board, then the follow-ups (2026-08-04)
 
