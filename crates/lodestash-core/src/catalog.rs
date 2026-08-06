@@ -3541,6 +3541,32 @@ impl Catalog {
         color: Option<&str>,
         icon: Option<&str>,
     ) -> Result<()> {
+        // `tag.color` is later interpolated into a CSS `var()` on the card — a hand-edited
+        // payload could smuggle arbitrary CSS through it, so the server accepts only the six
+        // palette tokens the UI offers (TraitsScreen's swatches) or a strict `#RRGGBB` hex
+        // (the legacy egui build sends hex; it degrades to the default chip in the Svelte
+        // render, where `var(#rrggbb)` is inert). Anything else is a reject, not a storage.
+        const TRAIT_COLOR_TOKENS: &[&str] = &[
+            "--ls-type-model",
+            "--ls-type-sound",
+            "--ls-type-image",
+            "--ls-type-material",
+            "--ls-type-sprite",
+            "--ls-type-font",
+        ];
+        let valid = |c: &str| {
+            TRAIT_COLOR_TOKENS.contains(&c)
+                || (c.len() == 7
+                    && c.starts_with('#')
+                    && c[1..].chars().all(|ch| ch.is_ascii_hexdigit()))
+        };
+        if let Some(c) = color {
+            if !valid(c) {
+                return Err(CoreError::Catalog(format!(
+                    "set_trait_style: unknown colour token {c:?} — the six-swatch palette or #RRGGBB is the contract"
+                )));
+            }
+        }
         self.conn
             .execute(
                 "UPDATE tag SET color = ?2, icon = ?3 WHERE id = ?1 AND is_trait = 1",
@@ -5779,6 +5805,50 @@ mod tests {
         let row = vocab.iter().find(|v| v.id == tid).unwrap();
         assert!(!row.is_trait);
         assert_eq!(row.usage_count, 1, "un-promote never drops assignments");
+    }
+
+    /// `set_trait_style` interpolates `color` into CSS `var()` on the card — the server must
+    /// reject anything that is not a palette token or a strict hex, so a hand-edited payload
+    /// cannot smuggle CSS through it.
+    #[test]
+    fn trait_style_rejects_anything_but_the_palette_or_strict_hex() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let tid = c
+            .upsert_trait("trait", "shiny", None, None, true)
+            .expect("trait");
+
+        // The six palette tokens pass.
+        for tok in [
+            "--ls-type-model",
+            "--ls-type-sound",
+            "--ls-type-image",
+            "--ls-type-material",
+            "--ls-type-sprite",
+            "--ls-type-font",
+        ] {
+            c.set_trait_style(tid, Some(tok), None).expect("token ok");
+        }
+        // Strict hex passes (the legacy egui build sends it).
+        c.set_trait_style(tid, Some("#AABBCC"), None).expect("hex ok");
+        // Clearing passes.
+        c.set_trait_style(tid, None, None).expect("clear ok");
+
+        // Everything else is rejected, not stored — injection attempts included.
+        for bad in [
+            "red; } body { display: none }",
+            "url(javascript:alert(1))",
+            "--ls-gold; color: red",
+            "RED",
+            "#GGHHII",
+            "#fff",
+            "--ls-type",
+        ] {
+            assert!(
+                c.set_trait_style(tid, Some(bad), None).is_err(),
+                "must reject {bad:?}"
+            );
+        }
     }
 
     /// An `alias` rule pattern is user text, so LIKE metacharacters must be literals. Note `_`

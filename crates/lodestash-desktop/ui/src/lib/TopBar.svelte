@@ -46,8 +46,9 @@
   <nav class="tabs" aria-label="Category">
     {#each TABS as tab (tab.id)}
       {@const count = tabCounts.get(tab.id) ?? 0}
-      <!-- UI-SPEC §0.3: `All` never hides; a bucket with a zero count hides. -->
-      {#if tab.id === "all" || count > 0}
+      <!-- UI-SPEC §0.3: `All` never hides; a bucket with a zero count hides — unless it is the
+           active tab, which must stay visible or the grid silently filters by an invisible tab. -->
+      {#if tab.id === "all" || count > 0 || view.tab === tab.id}
         <button
           class:on={view.tab === tab.id}
           style="--tab: var({tab.token})"

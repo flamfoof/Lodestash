@@ -13,6 +13,7 @@
   import { view } from "./nav.svelte";
 
   let items = $state<GridItem[]>([]);
+  let total = $state(0);
   let error = $state<string | null>(null);
 
   $effect(() => {
@@ -31,6 +32,8 @@
     })
       .then((r) => {
         items = r.items;
+        // The page is capped at 200 — the header must count the whole backlog, not the page.
+        total = r.total;
         error = null;
       })
       .catch((e) => (error = String(e)));
@@ -47,7 +50,7 @@
       </p>
     </div>
     <div class="right">
-      <span class="count mono">{items.length.toLocaleString()}</span>
+      <span class="count mono">{total.toLocaleString()}</span>
       <span class="count-label">unidentified</span>
       <button
         class="identify"
@@ -55,7 +58,7 @@
         title="The appraiser engine binds with the B7 cutover — this shell shows the backlog, it does not appraise."
         data-testid="identify-all"
       >
-        ✦ Identify all ({items.length.toLocaleString()})
+        ✦ Identify all ({total.toLocaleString()})
       </button>
       <p class="offline">
         The appraiser (local AI tagger + embeddings) ships with the engine build — this shell

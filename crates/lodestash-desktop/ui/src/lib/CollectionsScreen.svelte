@@ -51,6 +51,10 @@
     view.collectionFilter = { id: c.id, name: c.name };
     view.go("library");
   }
+
+  /** Two-step delete: first click arms the ✕ ("Sure?"), second deletes. Assets are never
+   *  touched — only the group row and its memberships go. */
+  let armed = $state<number | null>(null);
 </script>
 
 <section class="screen">
@@ -100,11 +104,23 @@
               </button>
               <button
                 class="del"
-                title="Delete collection — assets are untouched"
-                onclick={() => remove(c.id)}
+                class:armed={armed === c.id}
+                title={
+                  armed === c.id
+                    ? "Click again to delete — assets are untouched"
+                    : "Delete collection — assets are untouched"
+                }
+                onclick={() => {
+                  if (armed === c.id) {
+                    armed = null;
+                    remove(c.id);
+                  } else {
+                    armed = c.id;
+                  }
+                }}
                 data-testid="collection-delete-{c.id}"
               >
-                ✕
+                {armed === c.id ? "Sure?" : "✕"}
               </button>
             </footer>
           </article>
@@ -254,6 +270,13 @@
   }
   .del:hover {
     color: var(--ls-danger);
+  }
+  .del.armed {
+    color: var(--ls-danger);
+    border: 1px solid var(--ls-danger);
+    border-radius: 6px;
+    padding: 1px 8px;
+    margin-right: -8px;
   }
   .msg {
     color: var(--ls-text-dim);
