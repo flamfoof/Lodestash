@@ -38,6 +38,9 @@ pub struct AppInfo {
 
 struct AppState {
     library: Mutex<Library>,
+    /// Raised while the writer thread runs an appraise pass (B11d) — the ✦ controls and any
+    /// progress surface read it instead of racing the writer on timing guesses.
+    pump: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// `None` when there is no catalog on disk yet — every write then reports why instead of
     /// pretending to succeed.
     writer: Option<Writer>,
@@ -253,8 +256,7 @@ fn delete_from_disk(
 /// a spinner rather than a progress bar. Real progress needs the job tray, which needs the pump
 /// (B2b); a fake bar that jumps 0 → 100 is worse than an honest spinner.
 #[tauri::command]
-fn add_source(state: tauri::State<'_, AppState>, path: String) -> Result<WriteResult, String> {
-    let root = PathBuf::from(&path);
+fn add_source(state: tauri::State<'_, AppState>, path: String) -> Result<WriteResult, String> {    let root = PathBuf::from(&path);
     if !root.is_dir() {
         // Dropping a *file* is a different feature (import one asset) and pretending otherwise
         // would index its whole parent folder, which is not what anyone meant by dropping a file.
@@ -293,6 +295,37 @@ fn add_source(state: tauri::State<'_, AppState>, path: String) -> Result<WriteRe
     let result = state.write(Op::PersistScan { batches: vec![batch] })?;
     tracing::info!(%path, indexed = result.changed, packs = crawled.pending_packages.len(), "source added");
     Ok(result)
+}
+
+/// The sidebar's "+ Add source…" chooser (B2b): a native folder dialog, then the same
+/// import path as dropping the folder. `None` = the user cancelled. Runs on the persist
+/// thread via `add_source`'s write; the dialog itself lives on the main thread.
+#[tauri::command]
+fn add_source_dialog(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<Option<WriteResult>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.dialog()
+        .file()
+        .set_title("Add a library source")
+        .pick_folder(move |path| {
+            let _ = tx.send(path.map(|p| match p {
+                tauri_plugin_dialog::FilePath::Path(p) => p,
+                // Folders are never URLs; if one somehow arrives, treat it as a cancel.
+                tauri_plugin_dialog::FilePath::Url(_) => PathBuf::new(),
+            }));
+        });
+    match rx
+        .recv()
+        .map_err(|_| "folder dialog closed".to_string())?
+    {
+        Some(path) if !path.as_os_str().is_empty() => {
+            add_source(state, path.to_string_lossy().into_owned()).map(Some)
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Re-read the catalog. The egui app writes it, so a scan there shows up here on request —
@@ -632,6 +665,27 @@ fn identify_all(state: tauri::State<'_, AppState>) -> Result<WriteResult, String
     state.write(Op::IdentifyAll)
 }
 
+/// ✦ Identify one asset (B11b) — flags it dirty and runs one bounded appraise pass, so the
+/// per-card ✦ on a fresh/duplicated asset produces its tags and thumbnail now.
+#[tauri::command]
+fn identify_asset(state: tauri::State<'_, AppState>, asset_id: i64) -> Result<WriteResult, String> {
+    state.write(Op::IdentifyOne { asset_id })
+}
+
+/// True while the writer thread is inside an appraise pass (B11d). The ✦ controls and the
+/// Identify screen poll it; nothing races the writer on timing guesses.
+#[tauri::command]
+fn pump_active(state: tauri::State<'_, AppState>) -> bool {
+    state.pump.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Per-pack Extract (B2b slice) — unpack the archive into the workspace and reconcile its
+/// payloads into the catalog, on the persist thread like every write.
+#[tauri::command]
+fn extract_package(state: tauri::State<'_, AppState>, package_id: i64) -> Result<WriteResult, String> {
+    state.write(Op::ExtractPackage { package_id })
+}
+
 /// Add a mapping rule to a taxonomy (UI-SPEC §9.2). `match_type` is one of the shared
 /// `MAPPING_MATCH_TYPES`; `priority` lower wins. On the writer thread like every catalog write.
 #[tauri::command]
@@ -740,15 +794,18 @@ pub fn run() {
     );
 
     // One writer for the process (ARCHITECTURE §5), spawned before any command can run.
+    let pump = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let writer = lodestash_app::paths::catalog_db_path()
         .filter(|p| p.exists())
-        .map(Writer::spawn);
+        .map(|p| Writer::spawn(p, pump.clone()));
 
     tauri::Builder::default()
         // Window geometry (size/position/maximized) is remembered across launches and restored
         // before the window is shown — the window opens where the user left it instead of
         // re-applying the launch defaults and jumping. State file lives in the app config dir.
         .plugin(tauri_plugin_window_state::Builder::default().build())
+        // Native dialogs (B2b): the sidebar's "+ Add source…" folder chooser opens from Rust.
+        .plugin(tauri_plugin_dialog::init())
         // The plugin writes the state file only on a graceful exit (`RunEvent::Exit`). A
         // killed process — dev Ctrl+C, the e2e harness's taskkill — never reaches it, so the
         // last move/resize is lost and the next launch restores a stale geometry. Persist on
@@ -774,6 +831,7 @@ pub fn run() {
         .manage(AppState {
             library: Mutex::new(library),
             writer,
+            pump,
         })
         .register_uri_scheme_protocol("lodestash", |ctx, req| {
             let state = ctx.app_handle().state::<AppState>();
@@ -796,6 +854,7 @@ pub fn run() {
             remove_from_library,
             delete_from_disk,
             add_source,
+            add_source_dialog,
             get_web_prefs,
             set_web_prefs,
             pack_dir_tree,
@@ -836,7 +895,10 @@ pub fn run() {
             apply_mapping,
             add_rule,
             delete_rule,
-            identify_all
+            identify_all,
+            identify_asset,
+            pump_active,
+            extract_package
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lodestash");

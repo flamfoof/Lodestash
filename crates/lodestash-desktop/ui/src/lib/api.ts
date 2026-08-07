@@ -285,6 +285,14 @@ export const listRules = (taxonomyId: number) => invoke<MappingRuleRow[]>("list_
 export const applyMapping = (taxonomyId: number) => invoke<{ changed: number }>("apply_mapping", { taxonomyId });
 /** ✦ Identify all — one bounded appraise pass on the persist thread (B11). */
 export const identifyAll = () => invoke<WriteResult>("identify_all");
+/** ✦ Identify one asset (B11b) — flags it dirty and appraises it in one bounded pass. */
+export const identifyAsset = (assetId: number) =>
+  invoke<WriteResult>("identify_asset", { assetId });
+/** True while the persist thread is inside an appraise pass (B11d). */
+export const pumpActive = () => invoke<boolean>("pump_active");
+/** Per-pack Extract (B2b slice) — unpack into the workspace + reconcile the payloads. */
+export const extractPackage = (packageId: number) =>
+  invoke<WriteResult>("extract_package", { packageId });
 export const addCategory = (
   taxonomyId: number,
   parentId: number | null,
@@ -391,6 +399,9 @@ export const bulkTag = (assetIds: number[], namespace: string, value: string, on
  * source is minutes. Show a spinner, not a progress bar — real progress needs the job tray.
  */
 export const addSource = (path: string) => invoke<WriteResult>("add_source", { path });
+/** Native folder chooser for the sidebar's "+ Add source…" (B2b). `null` = cancelled. */
+export const addSourceDialog = () =>
+  invoke<WriteResult | null>("add_source_dialog");
 
 export const libraryStats = () => invoke<Stats>("library_stats");
 export const duplicateGroups = () => invoke<DupGroup[]>("duplicate_groups");

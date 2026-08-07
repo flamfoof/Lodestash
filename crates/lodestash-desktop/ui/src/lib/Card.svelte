@@ -1,7 +1,16 @@
 <script lang="ts">
   import { getContext } from "svelte";
   import Icon from "./Icon.svelte";
-  import { type GridItem, previewUrl, thumbUrl, typeToken, typeIcon, fmtSize, stage } from "./api";
+  import {
+    type GridItem,
+    previewUrl,
+    thumbUrl,
+    typeToken,
+    typeIcon,
+    fmtSize,
+    stage,
+    identifyAsset,
+  } from "./api";
   import { traitColor } from "./traits.svelte";
 
   let {
@@ -9,11 +18,15 @@
     selected = false,
     onselect,
     onopen,
+    onidentified,
   }: {
     item: GridItem;
     selected?: boolean;
     onselect?: (id: number) => void;
     onopen?: (id: number) => void;
+    /** After a ✦ identify completes (B11b) — lets the grid bump its page so the new
+     *  preview/tags render. */
+    onidentified?: (id: number) => void;
   } = $props();
 
   /**
@@ -28,6 +41,23 @@
   }>("ls:staging");
 
   let staged = $derived(staging?.isStaged?.(item.asset_id) ?? false);
+
+  // ✦ Identify now (B11b): one bounded appraise pass on the persist thread. The card stays
+  // interactive; the ✦ spins until the kick resolves, then the grid bumps its page so the
+  // new preview/tags appear.
+  let identifying = $state(false);
+  async function runIdentify() {
+    if (identifying) return;
+    identifying = true;
+    try {
+      await identifyAsset(item.asset_id);
+      onidentified?.(item.asset_id);
+    } catch (e) {
+      console.error("identify failed", e);
+    } finally {
+      identifying = false;
+    }
+  }
 
   function onStageClick() {
     if (staging?.toggleStage) staging.toggleStage(item.asset_id);
@@ -105,6 +135,26 @@
     <!-- The stage affordance (I6) is a hover-revealed quick action, bottom-right on the artwork so
          it never collides with the corner's status gem or the tier badge. A span, not a button:
          the card root is already a <button>, and nesting a real button inside one is invalid HTML. -->
+    <span
+      class="id-btn"
+      class:busy={identifying}
+      role="button"
+      tabindex="0"
+      title={identifying ? "Identifying…" : "Identify now — embed and tag this asset"}
+      aria-label={identifying ? `Identifying ${item.name}` : `Identify ${item.name}`}
+      data-testid="card-identify"
+      onclick={(e) => {
+        e.stopPropagation();
+        runIdentify();
+      }}
+      onkeydown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          e.stopPropagation();
+          runIdentify();
+        }
+      }}
+    >✦</span>
     <span
       class="stage-btn"
       class:on={staged}
@@ -300,6 +350,43 @@
     opacity: 1;
     border-color: var(--ls-gold);
     background: var(--ls-overlay);
+  }
+
+  /* ✦ Identify now (B11b): hover-revealed like the stage button, pinned to the artwork's
+     top-right corner — the status gem owns the top-left. Spins while the bounded pass runs. */
+  .id-btn {
+    position: absolute;
+    top: var(--sp-1);
+    right: var(--sp-1);
+    display: grid;
+    place-items: center;
+    width: 20px;
+    height: 20px;
+    font-size: var(--fs-sm);
+    line-height: 1;
+    color: var(--ls-gold);
+    background: color-mix(in srgb, var(--ls-bg) 85%, transparent);
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-sm);
+    opacity: 0;
+    transition: opacity 120ms ease;
+  }
+  .card:hover .id-btn,
+  .id-btn:focus-visible {
+    opacity: 1;
+  }
+  .id-btn:hover {
+    border-color: var(--ls-gold);
+    color: var(--ls-gold-bright);
+  }
+  .id-btn.busy {
+    opacity: 1;
+    animation: idspin 900ms linear infinite;
+  }
+  @keyframes idspin {
+    to {
+      transform: rotate(360deg);
+    }
   }
 
   .star {

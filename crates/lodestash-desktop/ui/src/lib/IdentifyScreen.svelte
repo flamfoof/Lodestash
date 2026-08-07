@@ -9,7 +9,7 @@
    * action, present but off, saying exactly why it is off instead of pretending to run.
    */
   import Card from "./Card.svelte";
-  import { gridPage, identifyAll, type GridItem } from "./api";
+  import { gridPage, identifyAll, pumpActive, type GridItem } from "./api";
   import { view } from "./nav.svelte";
 
   let items = $state<GridItem[]>([]);
@@ -17,6 +17,22 @@
   let error = $state<string | null>(null);
   let running = $state(false);
   let outcome = $state<string | null>(null);
+  // B11d: the persist thread may be appraising on its own (auto-identify idle pass) — the
+  // header reflects it instead of claiming idle while a pass is running.
+  let pumpBusy = $state(false);
+  let pumpPoll: ReturnType<typeof setInterval> | null = null;
+  $effect(() => {
+    view.route;
+    if (view.route !== "identify") return;
+    pumpPoll ??= setInterval(async () => {
+      pumpBusy = await pumpActive();
+    }, 2000);
+    return () => {
+      clearInterval(pumpPoll!);
+      pumpPoll = null;
+      pumpBusy = false;
+    };
+  });
 
   // ✦ Identify all (B11): one bounded appraise pass on the persist thread; the backlog count
   // shrinks as assets get embeddings + tags, and the grid re-reads on completion.
@@ -78,13 +94,15 @@
         disabled={running}
         onclick={appraise}
         title={
-          running
+          running || pumpBusy
             ? "Appraising… this pass runs up to ~20s on the persist thread."
             : "Run one appraise pass — local AI tags + embeddings for the unidentified backlog."
         }
         data-testid="identify-all"
       >
-        {running ? "✦ Appraising…" : `✦ Identify all (${total.toLocaleString()})`}
+        {running || pumpBusy
+          ? "✦ Appraising…"
+          : `✦ Identify all (${total.toLocaleString()})`}
       </button>
       {#if outcome}
         <p class="offline" data-testid="identify-outcome">{outcome}</p>

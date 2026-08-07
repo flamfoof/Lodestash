@@ -3,7 +3,7 @@
   import { NAV } from "./routes";
   import { view } from "./nav.svelte";
 
-  import { packages, type LibraryStatus, type PackageRow } from "./api";
+  import { packages, addSourceDialog, type LibraryStatus, type PackageRow } from "./api";
 
   /**
    * The rail reads its badges *and* its facet counts off one status object rather than a separate
@@ -70,6 +70,21 @@
     view.route = "library";
     view.source = name;
     view.dir = "";
+  }
+
+  // "+ Add source…" (B2b): native folder dialog; on a pick, the same import path as a drop.
+  // The status re-read happens in App.svelte (it re-asks on dataVersion bumps), so the new
+  // source appears in the facet list as soon as the write lands.
+  let addError = $state<string | null>(null);
+  async function pickSourceDialog() {
+    addError = null;
+    try {
+      const r = await addSourceDialog();
+      if (r === null) return; // cancelled
+      view.dataVersion += 1;
+    } catch (e) {
+      addError = String(e);
+    }
   }
 </script>
 
@@ -145,9 +160,14 @@
           <span class="count num">{src.asset_count}</span>
         </button>
       {/each}
-      <!-- ponytail: the chooser (FEATURES §7.4) is B2b's; until then the drop target is the only
-           way in, and saying so beats a button that opens nothing. -->
-      <div class="add" title="Drop a folder on the window to add it">+ Add source…</div>
+      <!-- B2b: the "+ Add source…" chooser is real now — a native folder dialog (Rust-side),
+           then the same import path as dropping a folder on the window. -->
+      <button class="add" onclick={pickSourceDialog} data-testid="add-source">
+        + Add source…
+      </button>
+      {#if addError}
+        <p class="add-error">{addError}</p>
+      {/if}
   </div>
 </aside>
 
@@ -269,5 +289,17 @@
     border: 1px dashed var(--ls-border-strong);
     border-radius: var(--r-md);
     text-align: center;
+    background: none;
+    cursor: pointer;
+    width: 100%;
+  }
+  .add:hover {
+    color: var(--ls-text);
+    border-color: var(--ls-gold);
+  }
+  .add-error {
+    margin-top: var(--sp-1);
+    font-size: var(--fs-xs);
+    color: var(--ls-danger);
   }
 </style>

@@ -15,16 +15,22 @@
 //! reader and a writer concurrent), so browsing never waits behind a write.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
 
 use lodestash_app::config::AppConfig;
 use lodestash_app::drains::{
     drain_promote_resync, drain_previews, resolve_audio_embedder, resolve_embedder,
 };
 use lodestash_app::paths::default_cache_dirs;
+use lodestash_app::persist::crawl_records;
 use lodestash_app::types::PersistBatch;
 use lodestash_core::catalog::Catalog;
 use lodestash_core::types::{Exclude, ExcludeKind};
+use lodestash_ingest::crawler::CrawledFile;
+use lodestash_ingest::detect;
+use lodestash_ingest::unitypackage::extract_to_workspace;
 
 /// One asset the write path needs to act on, resolved from the library while its lock is held so
 /// the writer thread never reaches back into it.
@@ -118,6 +124,14 @@ pub enum Op {
     IdentifyAll,
     RenameCategory { id: i64, label: String },
     DeleteCategory { id: i64 },
+    /// Manual appraise kick for one asset (per-card ✦, KANBAN B11b): flags the asset for
+    /// re-embed + re-tag, then runs one bounded pass so it actually happens now.
+    IdentifyOne { asset_id: i64 },
+    /// Per-pack Extract (B2b slice): unpack the archive into the workspace, then reconcile
+    /// the payloads into the catalog like a crawl. Explicit and on-demand (UI-SPEC §11.6) —
+    /// browsing never unpacks; `lodestash://file` answers 503 until this runs.
+    ExtractPackage { package_id: i64 },
+
     /// Undo one logged mutation (UI-SPEC §2 Ctrl/Cmd-Z, DESIGN-GUIDELINES §7 L5).
     RevertOp { op_id: i64 },
     /// Toggle one asset's membership in a collection (UI-SPEC §6, §13.5).
@@ -159,7 +173,7 @@ pub struct Writer {
 impl Writer {
     /// Spawn the writer over `db_path`. The connection is opened **on the thread that owns it**,
     /// never handed across, because that is the whole point of the rule.
-    pub fn spawn(db_path: PathBuf) -> Self {
+    pub fn spawn(db_path: PathBuf, pump: Arc<AtomicBool>) -> Self {
         let (tx, rx) = mpsc::channel::<Job>();
         std::thread::Builder::new()
             .name("lodestash-writer".into())
@@ -186,6 +200,17 @@ impl Writer {
                 // seconds; the queue is durable, so it converges over idle moments.
                 let (cache_dir, workspace_dir) = default_cache_dirs();
                 let proxy = AppConfig::load().preview_quality.proxy_budget();
+                // B11c: when auto-identify is on and the local models are present, the idle
+                // pass appraises (metrics → previews → deps → embeddings → promote) instead
+                // of only backfilling previews. The embedders are resolved once here — model
+                // files load at startup only when the user opted in — and borrowed per slice.
+                let auto = AppConfig::load().auto_identify;
+                let (idle_embedder, idle_audio) = if auto {
+                    (resolve_embedder(), resolve_audio_embedder())
+                } else {
+                    (None, None)
+                };
+                let idle_appraises = auto && (idle_embedder.is_some() || idle_audio.is_some());
                 // Test/CI escape hatch: the preview backfill is CPU-heavy (each model render
                 // is a decimate + 4-view raster), and an e2e run that launches the app dozens
                 // of times would otherwise grind the machine. LODESTASH_NO_PREVIEW_DRAIN=1
@@ -194,7 +219,18 @@ impl Writer {
                 loop {
                     match rx.recv_timeout(std::time::Duration::from_secs(1)) {
                         Ok(job) => {
-                            let _ = job.reply.send(run(&mut catalog, &db_path, job.op));
+                            // Only the appraise kicks are slow enough to count as "the pump is
+                            // running" — everything else is a quick write the frontend already
+                            // waits on synchronously.
+                            let appraising = matches!(job.op, Op::IdentifyAll | Op::IdentifyOne { .. });
+                            if appraising {
+                                pump.store(true, Ordering::Relaxed);
+                            }
+                            let result = run(&mut catalog, &db_path, job.op);
+                            if appraising {
+                                pump.store(false, Ordering::Relaxed);
+                            }
+                            let _ = job.reply.send(result);
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                             // Quiet for a second. Backfill previews in short slices, and only
@@ -208,13 +244,24 @@ impl Writer {
                             if rx.recv_timeout(std::time::Duration::ZERO).is_ok() {
                                 continue; // an op is waiting — let the loop pick it up
                             }
-                            drain_previews(
-                                &mut catalog,
-                                workspace_dir.as_deref(),
-                                cache_dir.as_deref(),
-                                proxy,
-                                std::time::Duration::from_secs(1),
-                            );
+                            if idle_appraises {
+                                pump.store(true, Ordering::Relaxed);
+                                let _ = appraise_pass(
+                                    &mut catalog,
+                                    idle_embedder.clone(),
+                                    idle_audio.clone(),
+                                    std::time::Duration::from_secs(1),
+                                );
+                                pump.store(false, Ordering::Relaxed);
+                            } else {
+                                drain_previews(
+                                    &mut catalog,
+                                    workspace_dir.as_deref(),
+                                    cache_dir.as_deref(),
+                                    proxy,
+                                    std::time::Duration::from_secs(1),
+                                );
+                            }
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     }
@@ -236,8 +283,48 @@ impl Writer {
     }
 }
 
-fn run(catalog: &mut Catalog, db_path: &Path, op: Op) -> Result<WriteResult, String> {
-    match op {
+/// One bounded appraise pass (metrics → previews → deps → embeddings → promote) on the
+/// writer thread. Shared by the ✦ kicks and the auto-identify idle pass (B11a–c): embedders
+/// are resolved by the caller (the idle pass resolved them once at startup), everything else
+/// is re-derived here because it can change between passes.
+fn appraise_pass(
+    catalog: &mut Catalog,
+    embedder: Option<std::sync::Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
+    audio_embedder: Option<std::sync::Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
+    budget: std::time::Duration,
+) -> Result<WriteResult, String> {
+    let (cache_dir, workspace_dir) = default_cache_dirs();
+    let proxy = AppConfig::load().preview_quality.proxy_budget();
+    let roots = catalog
+        .source_infos()
+        .map(|infos| {
+            infos
+                .into_iter()
+                .map(|i| (i.name, i.root_path))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let (counts, _assets) = drain_promote_resync(
+        catalog,
+        embedder,
+        audio_embedder,
+        workspace_dir.as_deref(),
+        cache_dir.as_deref(),
+        proxy,
+        &roots,
+        Some(budget),
+    );
+    // changed = the appraised backlog size the pass reconciled; when counts are None
+    // (nothing moved) report 1 so the frontend toasts a real kick, not a silent no-op.
+    Ok(WriteResult {
+        changed: counts
+            .map(|c| c.identified + c.unidentified)
+            .unwrap_or(1),
+        ..Default::default()
+    })
+}
+
+fn run(catalog: &mut Catalog, db_path: &Path, op: Op) -> Result<WriteResult, String> {    match op {
         Op::SetFavorite { ids, on } => catalog
             .set_favorite(&ids, on)
             .map(|changed| WriteResult { changed, ..Default::default() })
@@ -373,33 +460,77 @@ fn run(catalog: &mut Catalog, db_path: &Path, op: Op) -> Result<WriteResult, Str
             if embedder.is_none() && audio_embedder.is_none() {
                 tracing::warn!("Identify all: no local embedder models — nothing can be appraised");
             }
-            let (cache_dir, workspace_dir) = default_cache_dirs();
-            let proxy = AppConfig::load().preview_quality.proxy_budget();
-            let roots = catalog
-                .source_infos()
-                .map(|infos| {
-                    infos
-                        .into_iter()
-                        .map(|i| (i.name, i.root_path))
-                        .collect::<Vec<_>>()
+            appraise_pass(catalog, embedder, audio_embedder, std::time::Duration::from_secs(20))
+        }
+
+        Op::IdentifyOne { asset_id } => {
+            // Per-card ✦ (B11b): the asset is flagged dirty, so the bounded pass picks it up
+            // (and whatever else was already pending — the pass reconciles the whole backlog,
+            // which is what "identify now" means honestly). No embedders → the flags still
+            // get set, so a later pass (or auto-identify) completes the appraise.
+            catalog.mark_for_identify(asset_id).map_err(|e| e.to_string())?;
+            let embedder = resolve_embedder();
+            let audio_embedder = resolve_audio_embedder();
+            if embedder.is_none() && audio_embedder.is_none() {
+                tracing::warn!("Identify asset {asset_id}: no local embedder models — flagged for a later pass");
+            }
+            appraise_pass(catalog, embedder, audio_embedder, std::time::Duration::from_secs(20))
+        }
+
+        Op::ExtractPackage { package_id } => {
+            // Per-pack Extract (B2b slice): unpack to the workspace, reconcile the payloads
+            // as a crawl under the pack's name. Payloads carry their archive-relative pathname
+            // (or the GUID when the pack didn't record one), so they re-resolve across
+            // re-extracts; Unity .meta sidecars are bookkeeping and never grid assets.
+            let pkg = catalog
+                .list_packages()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|p| p.id == package_id)
+                .ok_or_else(|| format!("package {package_id} not found"))?;
+            let workspace_dir = default_cache_dirs()
+                .1
+                .ok_or_else(|| "no workspace directory configured".to_string())?;
+            let extracted = extract_to_workspace(Path::new(&pkg.package_path), &workspace_dir)
+                .map_err(|e| format!("extract {}: {e}", pkg.name))?;
+            let crawled: Vec<CrawledFile> = extracted
+                .into_iter()
+                .filter(|a| {
+                    !a.pathname
+                        .as_deref()
+                        .is_some_and(|p| p.to_ascii_lowercase().ends_with(".meta"))
                 })
-                .unwrap_or_default();
-            let (counts, _assets) = drain_promote_resync(
-                catalog,
-                embedder,
-                audio_embedder,
-                workspace_dir.as_deref(),
-                cache_dir.as_deref(),
-                proxy,
-                &roots,
-                Some(std::time::Duration::from_secs(20)),
-            );
-            // changed = the appraised backlog size the pass reconciled; when counts are None
-            // (nothing moved) report 1 so the frontend toasts a real kick, not a silent no-op.
+                .map(|a| {
+                    let rel_suffix = a.pathname.clone().unwrap_or_else(|| a.guid.clone());
+                    let rel_path = PathBuf::from(&pkg.name).join(rel_suffix);
+                    let media_type = detect::by_extension(&rel_path);
+                    let mtime = std::fs::metadata(&a.workspace_path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    CrawledFile {
+                        abs_path: a.workspace_path,
+                        rel_path,
+                        size_bytes: a.size_bytes,
+                        mtime,
+                        media_type,
+                    }
+                })
+                .collect();
+            let source_id = catalog
+                .package_source_root(package_id)
+                .map_err(|e| e.to_string())?
+                .and_then(|root| catalog.source_info_by_root(&root).ok().flatten())
+                .map(|i| i.id)
+                .ok_or_else(|| "the pack has no library source — add its folder first".to_string())?;
+            let records = crawl_records(crawled.iter());
+            let stats = catalog
+                .record_crawl(source_id, Some(package_id), &records)
+                .map_err(|e| e.to_string())?;
             Ok(WriteResult {
-                changed: counts
-                    .map(|c| c.identified + c.unidentified)
-                    .unwrap_or(1),
+                changed: stats.inserted + stats.updated,
                 ..Default::default()
             })
         }

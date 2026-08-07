@@ -10,7 +10,7 @@
    * says so rather than inventing it.
    */
   import Icon from "./Icon.svelte";
-  import { packages, setPackagePinned, fmtSize, type PackageRow } from "./api";
+  import { packages, setPackagePinned, extractPackage, fmtSize, type PackageRow } from "./api";
   import { view } from "./nav.svelte";
 
   let rows = $state<PackageRow[] | null>(null);
@@ -81,6 +81,24 @@
       view.dataVersion += 1;
     } catch (e) {
       error = String(e);
+    }
+  }
+
+  // Per-pack Extract (B2b slice): unpack into the workspace + reconcile the payloads. Runs on
+  // the persist thread; the row's button shows a spinner until the write returns.
+  let extracting = $state<Set<number>>(new Set());
+  async function extract(p: PackageRow) {
+    if (extracting.has(p.id)) return;
+    extracting = new Set(extracting).add(p.id);
+    try {
+      await extractPackage(p.id);
+      view.dataVersion += 1;
+    } catch (e) {
+      error = String(e);
+    } finally {
+      const next = new Set(extracting);
+      next.delete(p.id);
+      extracting = next;
     }
   }
 
@@ -156,6 +174,15 @@
                       data-testid="pin-{p.id}"
                     >
                       ⬢
+                    </button>
+                    <button
+                      class="open"
+                      class:busy={extracting.has(p.id)}
+                      disabled={extracting.has(p.id)}
+                      onclick={() => extract(p)}
+                      data-testid="extract-{p.id}"
+                    >
+                      {extracting.has(p.id) ? "Extracting…" : "Extract"}
                     </button>
                     <button class="open" onclick={() => (statsRow = p)} data-testid="stats-{p.id}">
                       Stats

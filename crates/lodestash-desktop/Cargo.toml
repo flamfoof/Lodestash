@@ -26,6 +26,7 @@ tauri = { version = "2", features = [] }
 # Window geometry persistence: remember size/position/maximized across launches and restore
 # before the window shows (no resize flash). Persists to the app config dir, keyed by window.
 tauri-plugin-window-state = "2"
+tauri-plugin-dialog = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -36,6 +37,7 @@ lodestash-core = { workspace = true }
 lodestash-app = { workspace = true }
 # Mesh parse + decimation for the Quick Look viewer (lodestash://mesh).
 lodestash-ingest = { workspace = true }
+lodestash-ai = { workspace = true }
 
 [dev-dependencies]
 # Real files under a real root, for the delete fence — the guard is about paths on disk, so a

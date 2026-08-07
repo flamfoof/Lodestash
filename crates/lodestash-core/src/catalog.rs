@@ -324,10 +324,23 @@ impl Catalog {
         Ok(updated)
     }
 
+    /// Flag one live asset for re-identification — the per-card ✦ (KANBAN B11b). The next
+    /// appraise pass that sees it (a kicked Identify pass, or auto-identify) re-embeds and
+    /// re-tags it and promotes the result.
+    pub fn mark_for_identify(&self, asset_id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE asset SET embedding_dirty = 1, tags_dirty = 1, updated_at = ?2
+                 WHERE id = ?1 AND deleted_at IS NULL",
+                params![asset_id, unix_now()],
+            )
+            .map_err(|e| CoreError::Catalog(format!("mark_for_identify: {e}")))?;
+        Ok(())
+    }
+
     /// Find-or-create an `import_source` by `root_path`; returns its id. The name is
     /// only set on insert (renames are a user action, not a scan side effect).
-    pub fn upsert_import_source(&self, name: &str, root_path: &str, kind: &str) -> Result<i64> {
-        let existing: Option<i64> = self
+    pub fn upsert_import_source(&self, name: &str, root_path: &str, kind: &str) -> Result<i64> {        let existing: Option<i64> = self
             .conn
             .query_row(
                 "SELECT id FROM import_source WHERE root_path = ?1",

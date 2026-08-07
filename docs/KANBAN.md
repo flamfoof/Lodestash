@@ -608,6 +608,15 @@ until B7.
         local SigLIP/CLAP embedders when the models exist, graceful otherwise; embedding drains
         gained a time budget (None = egui pump's unbounded behavior); IdentifyScreen's ✦ button
         runs it with an appraising state + honest outcome.
+  - [x] **B11b — per-asset Identify now.** `mark_for_identify` (catalog dirty flags) +
+        `Op::IdentifyOne` / `identify_asset`; the grid card gained a hover ✦ (top-right, spins
+        while the pass runs) that flags + appraises the one asset and bumps the page.
+  - [x] **B11c — auto-identify opt-in honored.** The writer's idle pass resolves the embedders
+        once when `auto_identify` is on and appraises (bounded 1s slices) instead of only
+        backfilling previews; no models → no startup model-load, previews as before.
+  - [x] **B11d — pump progress surface.** `pump: Arc<AtomicBool>` on AppState, raised by the
+        writer around appraise passes; `pump_active()` command; IdentifyScreen polls it while
+        open and the ✦ header reflects an in-flight pass (e.g. auto-identify).
   - [ ] **B11b — per-asset Identify now (UI-SPEC §3)** — the card/row ✦ gesture embeds + tags one
         asset (needs a single-asset embed path).
   - [ ] **B11c — auto-identify opt-in (AI-PIPELINE §2)** — idle drain embeds when `auto_identify`

@@ -262,6 +262,7 @@
               selected={view.selected === item.asset_id}
               onselect={(id) => (view.selected = id)}
               onopen={(id) => (quickLook = id)}
+              onidentified={() => (view.dataVersion += 1)}
             />
             <span
               class="sel"
