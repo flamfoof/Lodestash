@@ -3,8 +3,8 @@
  *
  * DESIGN-GUIDELINES.md §2-§4 is the prose spec; this file is its executable form and the
  * two must not drift. The Svelte frontend imports this file directly (no build step, no
- * CSS-in-JS). `crates/lodestash-ui/src/theme.rs` mirrors these values by hand and is
- * retired at the B7 cutover.
+ * CSS-in-JS). The egui `theme.rs` mirror (`crates/lodestash-ui`) was retired at the B7
+ * cutover (2026-08-07).
  *
  * Dark mode is the only theme. The elevation rule is: surfaces get *lighter* as they rise
  * (bg -> surface -> raised -> overlay); shadows are reserved for modals.

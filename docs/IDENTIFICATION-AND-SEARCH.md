@@ -212,7 +212,7 @@ The filterable surface the parser (and `search_assets`) target — keep it small
 | Taggers/embedders, the §2 schema, `local`↔`api` | `lodestash-ai` ([`AI-PIPELINE.md`](AI-PIPELINE.md)) |
 | Facets/tags/embeddings storage, hybrid search, mapping | `lodestash-core` + SQLite ([`DATA-MODEL.md`](DATA-MODEL.md)) |
 | Query understanding (parser) | `lodestash-core` search service (local LLM or Haiku) |
-| Tags / AI / agent surfaces | GUI (`lodestash-ui`), MCP (`lodestash-mcp`), REST (`lodestash-api`) |
+| Tags / AI / agent surfaces | GUI (`lodestash-desktop`), MCP (`lodestash-mcp`), REST (`lodestash-api`) |
 | Which local models per GPU | [`AI-MODELS-BY-GPU.md`](AI-MODELS-BY-GPU.md) |
 
 **Bottom line:** one identification engine fills one faceted, embedded catalog; three surfaces read it.

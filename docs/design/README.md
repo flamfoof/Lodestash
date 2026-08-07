@@ -56,13 +56,14 @@ The file in this bundle — `Lodestash Prototype.dc.html` — is a **design refe
 It is a prototype that demonstrates the intended layout, states, and micro-interactions. **It is not
 production code and must not be shipped or ported line-for-line.**
 
-The Lodestash app is a **Rust + `egui`/`eframe` desktop application** (`crates/lodestash-ui`). The
-task is to **recreate these designs in that existing environment**, using its established patterns:
+The Lodestash app is a **Rust core + Tauri 2 / Svelte 5 desktop shell** (`crates/lodestash-desktop`;
+the egui build `crates/lodestash-ui` was retired at the B7 cutover, 2026-08-07). The
+task is to **recreate these designs in the Svelte shell**, using its established patterns:
 
-- Colours come **only** from `crates/lodestash-ui/src/theme.rs` constants — never inline hex. The
-  prototype's hex values were taken from those tokens; the mapping table below is exact.
-- Persisted UI state goes through `crates/lodestash-ui/src/config.rs` (`AppConfig` → `config.json`),
-  following the existing `ViewPrefs` pattern.
+- Colours come **only** from `docs/design/tokens.css` CSS variables (`--ls-*`) — never inline hex.
+  The prototype's hex values were taken from those tokens; the mapping table below is exact.
+- Persisted UI state goes through the Rust `AppConfig` (`config.json`) via the `#[tauri::command]`
+  surface (web prefs, settings), following the existing `WebPrefs` pattern.
 - **Per `CLAUDE.md`, the `docs/` files are the source of truth.** Where this design adds or changes
   behaviour, the governing doc must be updated in the same change (noted per-feature below). This
   README documents intent; it does not override the specs.
@@ -133,7 +134,7 @@ Extends the existing view/sort toolbar (`DESIGN-GUIDELINES.md` §7 "View / sort 
   filter sets.
 - **Filtering logic:** an asset passes if it matches the **selected traits (any)** AND **selected
   tri-buckets (any)** AND **selected size tiers (any)** — empty section = no constraint. This is a
-  pure predicate over the current asset list; keep it a testable function in `lodestash-ui` per
+  pure predicate over the current asset list; keep it a testable function in the Svelte shell per
   `TECH-STACK.md` §5.1 ("pure helpers only"). It composes **on top of** the sidebar facet selection
   and search — it does not replace them.
 - **Spec touch:** this is new UI behaviour → reflect it in `DESIGN-GUIDELINES.md` §7 (add a "Content
@@ -213,7 +214,7 @@ below and maps onto those.
   minimum); the XL range label and all segment fill percentages follow the live cap.
 - **Persist** these in `config.json` (new `ViewPrefs`-adjacent struct, e.g.
   `SizeTiers { m, l, xl }` + `cap` in KB).
-- **Keep it a pure function:** `size_tier_of(bytes, tiers) -> S|M|L|XL` in `lodestash-ui`, unit-tested
+- **Keep it a pure function:** `size_tier_of(bytes, tiers) -> S|M|L|XL` in the shell (`lodestash-desktop/ui`), unit-tested
   (`TECH-STACK.md` §5.1). The badge, the filter, and the label legend all call it.
 
 #### 5.4 MCP (new)
@@ -361,11 +362,11 @@ Transient (in-app, not persisted): active filter sets (`trait[]`, `tri_bucket[]`
 trait-search string, filter popover open state, expanded-source id.
 
 Keep the derived predicates (`size_tier_of`, the filter pass function, grid column math) as **pure,
-unit-tested functions** in `lodestash-ui` — the render loop stays thin (`TECH-STACK.md` §5.1).
+unit-tested functions** in the Svelte shell (`crates/lodestash-desktop/ui`) — the render loop stays thin (`TECH-STACK.md` §5.1).
 
 ## Design Tokens
 
-Use `crates/lodestash-ui/src/theme.rs` constants — **do not inline hex.** Prototype → token mapping:
+Use `docs/design/tokens.css` variables — **do not inline hex.** Prototype → token mapping:
 
 | Prototype hex | `theme.rs` const | Use in this work |
 |---|---|---|
@@ -405,8 +406,9 @@ introduced by this work.
 - **`Lodestash Prototype.dc.html`** (in this bundle) — the interactive design reference. Open it in a
   browser; navigate to Settings via the Settings nav glyph, and use the ⚑ Filters button in the
   library toolbar. Treat it as the behavioural spec, not code to copy.
-- **Target code to modify:** `crates/lodestash-ui/src/app.rs` (screens, toolbar, filter predicate,
-  nav reset), `crates/lodestash-ui/src/config.rs` (persisted settings), `crates/lodestash-ui/src/theme.rs`
+- **Target code to modify:** `crates/lodestash-desktop/ui/src/` (screens, toolbar, filter predicate,
+  nav reset), the Rust `config.rs` + `#[tauri::command]` surface (persisted settings),
+  `docs/design/tokens.css`
   (tokens only — reuse, don't add unless the design system gains a token).
 - **Governing docs to conform to / update** (per `CLAUDE.md`): `DESIGN-GUIDELINES.md` (§7 Settings,
   Sources, filters, Quick Look, view toolbar), `DATA-MODEL.md` §1 (per-source blacklist),

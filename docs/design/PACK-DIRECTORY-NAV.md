@@ -146,7 +146,8 @@ Left to right:
   nothing else is unpacked, browse writes no catalog rows (Add to Library / Add to project do).
 
 ## 10. Tokens
-Dark theme only, drawn from `crates/lodestash-ui/src/theme.rs` (mapping table in
+Dark theme only, drawn from `design/tokens.css` (the executable token file the Svelte frontend
+imports; mapping table in
 [`README.md`](README.md) "Design Tokens"): `BG`/`SURFACE`/`SURFACE_RAISED`/`OVERLAY`/`RECESS` for the
 pane stack, `BORDER`/`BORDER_STRONG` hairlines, `TEXT`/`TEXT_MUTED`/`TEXT_DIM` type, `GOLD`/
 `GOLD_BRIGHT` for the pack pill + selection rail + transport, `ARCANE` for copy actions + Add-to-

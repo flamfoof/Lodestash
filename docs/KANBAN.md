@@ -208,8 +208,7 @@ source → render-pipeline harvest (cheap now that `.mat` files are parsed).
 
 The egui build keeps drifting from the designs because the design source of truth is already web
 tech (CSS tokens, an SVG icon set, a runnable HTML prototype), so every screen costs a lossy hand
-translation. The port removes the translation. `lodestash-ui` stays buildable as the reference
-until B7.
+translation. The port removes the translation; the egui build stayed buildable as the reference until the B7 cutover (2026-08-07) retired it.
 
 ### Done
 
@@ -639,8 +638,13 @@ until B7.
 
 - [ ] **B1.5 — `lodestash-cli`.** Headless `scan|index|tag|export`; gives the port a smoke test
       needing no window.
-- [ ] **B7 — cutover.** `[[bin]] lodestash` moves to `lodestash-desktop`, **preserving the `--mcp`
-      stdio branch verbatim**; delete `crates/lodestash-ui`; update every doc naming egui.
+- [x] **B7 — cutover (2026-08-07).** `crates/lodestash-ui` (the egui app) is **deleted** — the
+      desktop shell (`lodestash-desktop` + Svelte) covers the app surface, and the docs that
+      named egui as the app are reconciled (ARCHITECTURE §3.4, TECH-STACK, HANDOFF,
+      DESIGN-GUIDELINES/design README, IDENTIFICATION-AND-SEARCH, ALIGNMENT-AUDIT). The
+      `--mcp` stdio branch and the engine-project work are unaffected (the MCP server is
+      `lodestash-mcp`, its own crate); the `[[bin]] lodestash` rename stays parked — the
+      desktop binary keeps its name until the engine-project build lands.
 
 ## 🔍 Findings — not bugs, but worth knowing
 

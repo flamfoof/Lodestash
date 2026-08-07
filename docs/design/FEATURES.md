@@ -5,9 +5,11 @@ This is the behavioural companion to `README.md` (which focuses on the Settings 
 work). Everything below is demonstrated live in the prototype — treat the prototype as the source of
 truth for interaction, and this doc as the written contract.
 
-**Target stack:** Rust + `egui`. UI in `crates/lodestash-ui/src/app.rs`; persistence in `config.rs`;
-tokens in `theme.rs`. Data/ingest in `lodestash-core` / `lodestash-ingest`; AI in `lodestash-ai`;
-serving in `lodestash-api` (REST) and `lodestash-mcp` (MCP) — **REST and MCP stay 1:1**.
+**Target stack:** Rust core + **Tauri 2 / Svelte 5 shell** (`crates/lodestash-desktop` — the egui
+build `crates/lodestash-ui` was retired at the B7 cutover, 2026-08-07). UI in
+`crates/lodestash-desktop/ui/src/`; persistence in `config.rs` (Rust) / `nav.svelte.ts` (UI);
+tokens in `design/tokens.css`. Data/ingest in `lodestash-core` / `lodestash-ingest`; AI in
+`lodestash-ai`; serving in `lodestash-api` (REST) and `lodestash-mcp` (MCP) — **REST and MCP stay 1:1**.
 
 **Colour tokens** are listed in `README.md → Design Tokens`; this doc names tokens, not hex.
 

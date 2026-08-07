@@ -1,6 +1,6 @@
 /*
  * Bundled fonts. These are the same three TTFs the egui build ships
- * (crates/lodestash-ui/assets/fonts/, OFL licences alongside them in public/fonts/).
+ * (the retired egui crate's assets/fonts/, OFL licences alongside them in public/fonts/).
  *
  * There is deliberately no webfont <link> anywhere in this app: the offline invariant
  * means a font must never be fetched at runtime. The CSP omits `font-src https:` so a

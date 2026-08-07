@@ -140,11 +140,14 @@ texture→PNG, audio→WAV/OGG), and thumbnail/preview generation. Detail in [`I
 chosen per modality via config. Embeddings always run locally to keep one consistent, offline index.
 Detail in [`AI-PIPELINE.md`](AI-PIPELINE.md).
 
-### 3.4 Desktop GUI (`lodestash-ui`)
-`egui`/`eframe` on wgpu. Virtualized thumbnail grid (10k+ items), faceted filter sidebar, search bar
-(keyword + semantic toggle), and a preview pane that switches between the **3D viewport** (three-d),
-**audio player + waveform** (rodio/symphonia), and **image viewer** (GPU texture). Tag editor with
-confidence chips and accept/reject. Mapping-library editor.
+### 3.4 Desktop GUI (`lodestash-desktop`)
+Tauri 2 shell hosting a Svelte 5 frontend (WebView2 on Windows — no bundled browser). Virtualized
+thumbnail grid (10k+ items), faceted filter sidebar, search bar (keyword + semantic), and a preview
+pane that switches between the **3D viewport** (SVG preview), **audio player** (waveform), and
+**image viewer**. Tag editor with confidence chips and accept/reject. Mapping-library editor.
+Ships the persist thread (single-writer rule, ARCHITECTURE §5), the `lodestash://` protocol, and
+the job tray; *the egui build (`crates/lodestash-ui`) was retired at the B7 cutover (2026-08-07).*
+Detail in [`docs/design/README.md`](../docs/design/README.md) and `crates/lodestash-desktop/`.
 
 ### 3.5 MCP server (`lodestash-mcp`)
 `rmcp`, in-process, **stdio** transport by default (optional Streamable HTTP). Exposes search,
@@ -247,7 +250,7 @@ lodestash/
 │  ├─ lodestash-ai/        # Tagger/Embedder traits + ONNX/Ollama/cloud impls
 │  ├─ lodestash-mcp/       # rmcp server over lodestash-core
 │  ├─ lodestash-api/       # loopback HTTP/JSON API over lodestash-core
-│  └─ lodestash-ui/        # egui/eframe app + 3D/audio/image preview
+│  └─ lodestash-desktop/  # Tauri 2 + Svelte shell — the current app (egui retired at B7)
 │                          #   (lodestash-cli — headless ops for power users & CI — is planned;
 │                          #    the crate lands with the first CLI command, not before)
 ├─ sidecar/

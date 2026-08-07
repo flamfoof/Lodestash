@@ -6,8 +6,8 @@
 > **Aligned · Partial · Missing · Divergent**, with the spec citation and the app's
 > `file:line` evidence.
 >
-> **Scope.** The Svelte app is the current app (Phase B port). `crates/lodestash-ui` (egui) is the
-> pre-cutover build, retired at the B7 cutover — referenced only as a behaviour source.
+> **Scope.** The Svelte app is the current app (Phase B port). `crates/lodestash-ui` (egui) was the
+> pre-cutover build, **deleted at the B7 cutover (2026-08-07)** — referenced only as a behaviour source.
 >
 > **Precedence** (per `docs/design/README.md` + `CLAUDE.md`): `FEATURES.md` is the bundle arbiter;
 > governing `docs/` files win over the bundle on conflict; `DESIGN-GUIDELINES.md` wins over pixel

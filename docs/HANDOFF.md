@@ -95,8 +95,9 @@ card-uniformity e2e regression. Verified: Rust green, svelte-check 0/0, e2e **51
 **Remaining is the engine build (B7), nothing else:** Identify engine (✦ Identify all /
 per-asset / shimmer — port the egui drain + tagger), B2b ingest (per-pack Extract, §5.2 import
 dialog, job tray, `+ Add source…` chooser, DropZone post-import), project switcher / Connect
-wizard, staging commit half, LINKS graph harvest, Mapping rule *engine*, B1.5 `lodestash-cli`,
-and the B7 cutover (retire `lodestash-ui`, preserve `--mcp`).
+wizard, staging commit half, LINKS graph harvest, Mapping rule *engine*, and B1.5 `lodestash-cli`;
+the B7 cutover landed 2026-08-07 (egui `lodestash-ui` deleted; `--mcp` untouched — the MCP
+server is `lodestash-mcp`, its own crate).
 
 **Traps carried forward:** single-writer rule; `set_tags` replaces per-source (UI uses
 `add_asset_tag` for appends); undo tail capped 200; config writes only via `edit_config`;
@@ -145,7 +146,7 @@ geometry).** Verified state at handoff: e2e **48/48**, Rust **150/150** (core 77
 **Orientation (one paragraph).** Lodestash is a local-first desktop app that catalogues game
 assets (Unity `.unitypackage` + loose files) — 3D/audio/image — with Rust core (`lodestash-core`
 catalog + AI, `lodestash-app` persist/grid/types, `lodestash-ingest` crawl/thumbnails) and **two
-frontends**: the legacy egui app (`lodestash-ui`, retired at the B7 cutover) and the **current
+frontends**: the legacy egui app (`lodestash-ui` — **retired/deleted at the B7 cutover**) and the **current
 app** — `lodestash-desktop`, a Tauri 2 shell hosting a Svelte 5 frontend (no component/CSS/state
 libraries — four bun deps, deliberate). The webview talks to the Rust backend over
 `#[tauri::command]`s; every catalog write goes through one `Writer` thread (`writer.rs` `Op`).
@@ -766,8 +767,8 @@ entirely, and a library catalogued before the models arrived would never encode.
 now runs them after a hydrate, taking the same writer slot. If you add a third path that opens the
 catalog for writing, it must respect that slot too.
 
-To get the artifacts: run the app and use **Settings ▸ AI ▸ Download** (sources are in
-`crates/lodestash-ui/src/models.rs`). They install to the OS data dir under
+To get the artifacts: run the app and use **Settings ▸ AI ▸ Download** (sources in the retired
+egui `crates/lodestash-ui/src/models.rs`, mirrored by `lodestash-ai`). They install to the OS data dir under
 `Lodestash/models/{siglip,clap}/` and `Lodestash/runtime/onnxruntime.dll`; the same layout works if you
 copy them in by hand, which is worth doing to avoid re-downloading ~645 MB.
 
@@ -844,8 +845,8 @@ fixture.
   `grep -c TEMP` and re-check the default screen line by number.
 - **`cargo build` fails with "Access is denied. (os error 5)"** when the app is running — it holds
   `lodestash.exe`. `Stop-Process -Name lodestash -Force` first. `cargo check` works regardless.
-- **You may not be the only writer in this tree.** A second agent lane edits `crates/lodestash-ui`
-  concurrently. Two rules: never run `git checkout <path>` on a file you have not read (that
+- **You may not be the only writer in this tree.** A second agent lane used to edit
+  `crates/lodestash-ui` concurrently (retired at B7). Two rules: never run `git checkout <path>` on a file you have not read (that
   discarded a live edit to `docs/design/FEATURES.md` — unstaged changes are unrecoverable), and
   prefer state that lives *beside* `AssetEntry` (a `HashSet`/`HashMap` refreshed per catalog sync)
   over new fields on it, which is what let favourites, tags and dependency edges merge cleanly
@@ -897,7 +898,7 @@ in, Ctrl-K palette, Quick Look as its own window) plus a real `lodestash-cli`. P
 above) ships on `main` first and the port inherits it.
 
 **Extraction started (2026-08-01, `cdd5c40`).** `crates/lodestash-app` exists and holds `jobs` +
-`models` (433 LOC out of `lodestash-ui`), aliased under their old `crate::jobs` / `crate::models`
+`models` (433 LOC out of the retired `lodestash-ui`), aliased under their old `crate::jobs` / `crate::models`
 paths in `main.rs` so no call site changed. **Beachhead only** — `config`, `drains`, `persist`,
 `thumbs`, `grid` and the ~900 lines of domain types at `app.rs:1-903` have **not** moved, and the
 four `app/*.rs` children still open with `use super::*` + `pub(super)`, which is the real work
