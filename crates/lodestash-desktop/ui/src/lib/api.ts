@@ -247,6 +247,8 @@ export type CollectionRow = { id: number; name: string; asset_count: number };
 export const collections = () => invoke<CollectionRow[]>("collections");
 export const createCollection = (name: string) => invoke<{ changed: number }>("create_collection", { name });
 export const deleteCollection = (id: number) => invoke<{ changed: number }>("delete_collection", { id });
+export const collectionMembers = (collectionId: number) =>
+  invoke<number[]>("collection_members", { collectionId });
 export const setPackagePinned = (id: number, pinned: boolean) =>
   invoke<{ changed: number }>("set_package_pinned", { id, pinned });
 
@@ -287,6 +289,14 @@ export const addCategory = (
   prefLabel: string,
   path: string,
 ) => invoke<{ changed: number }>("add_category", { taxonomyId, parentId, prefLabel, path });
+export const addRule = (args: {
+  taxonomyId: number;
+  categoryId: number;
+  matchType: string;
+  pattern: string;
+  priority: number;
+}) => invoke<WriteResult>("add_rule", args);
+export const deleteRule = (ruleId: number) => invoke<WriteResult>("delete_rule", { ruleId });
 
 /** One node of the Stats Tag Graph (UI-SPEC §8.2): a tag with its usage count. */
 export type TagGraphNode = {
@@ -498,7 +508,14 @@ export const fileUrl = (assetId: number) => `${LODESTASH_BASE}/file/${assetId}`;
  * Preferred over the type icon for everything without a vector preview — which is most of the
  * library. In-pack assets answer 503 and fall back to the icon.
  */
-export const thumbUrl = (assetId: number) => `${LODESTASH_BASE}/thumb/${assetId}.png`;
+/** Bumped when the Settings preview-quality changes — thumb URLs carry it as a cache-buster
+ *  (`?q=`). The backend reads the actual quality from config; the query exists so the webview
+ *  re-fetches instead of serving a stale-size PNG from its own cache. */
+export let thumbKey = "1";
+export const setThumbKey = (k: string) => {
+  thumbKey = k;
+};
+export const thumbUrl = (assetId: number) => `${LODESTASH_BASE}/thumb/${assetId}.png?q=${thumbKey}`;
 
 /** Decimated geometry as LSM1, for the WebGL viewer. */
 export const meshUrl = (assetId: number) => `${LODESTASH_BASE}/mesh/${assetId}`;

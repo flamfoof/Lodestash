@@ -1382,6 +1382,20 @@ impl Library {
         }
     }
 
+    /// The member ids of one collection — what a collection-filtered grid matches on (UI-SPEC §6).
+    pub fn collection_members(&self, collection_id: i64) -> Vec<i64> {
+        let Some(cat) = self.catalog.as_ref() else {
+            return Vec::new();
+        };
+        match cat.collection_members(collection_id) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(%e, collection = collection_id, "collection_members failed");
+                Vec::new()
+            }
+        }
+    }
+
     /// The Stats Tag Graph (UI-SPEC §8.2): tag nodes, tag↔tag co-occurrence edges and the
     /// `tags · links · assets` header counts. Empty graph when the catalog is missing or the
     /// query fails — the canvas draws nothing rather than breaking.

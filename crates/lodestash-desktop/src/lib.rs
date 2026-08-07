@@ -409,6 +409,16 @@ fn collections(state: tauri::State<'_, AppState>) -> Result<Vec<lodestash_core::
         .map_err(|_| "library lock poisoned".to_string())
 }
 
+/// The member ids of one collection — what a collection-filtered grid matches on (UI-SPEC §6).
+#[tauri::command]
+fn collection_members(state: tauri::State<'_, AppState>, collection_id: i64) -> Result<Vec<i64>, String> {
+    state
+        .library
+        .lock()
+        .map(|l| l.collection_members(collection_id))
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
 #[tauri::command]
 fn create_collection(state: tauri::State<'_, AppState>, name: String) -> Result<WriteResult, String> {
     state.write(Op::CreateCollection { name })
@@ -613,6 +623,32 @@ fn apply_mapping(state: tauri::State<'_, AppState>, taxonomy_id: i64) -> Result<
     state.write(Op::ApplyMapping { taxonomy_id })
 }
 
+/// Add a mapping rule to a taxonomy (UI-SPEC §9.2). `match_type` is one of the shared
+/// `MAPPING_MATCH_TYPES`; `priority` lower wins. On the writer thread like every catalog write.
+#[tauri::command]
+fn add_rule(
+    state: tauri::State<'_, AppState>,
+    taxonomy_id: i64,
+    category_id: i64,
+    match_type: String,
+    pattern: String,
+    priority: i64,
+) -> Result<WriteResult, String> {
+    state.write(Op::AddRule {
+        taxonomy_id,
+        category_id,
+        match_type,
+        pattern,
+        priority,
+    })
+}
+
+/// Delete a mapping rule (UI-SPEC §9.2 row delete). On the writer thread like every catalog write.
+#[tauri::command]
+fn delete_rule(state: tauri::State<'_, AppState>, rule_id: i64) -> Result<WriteResult, String> {
+    state.write(Op::DeleteRule { rule_id })
+}
+
 /// The newest undo-log rows, newest first, capped at `limit` (UI-SPEC §2 Ctrl/Cmd-Z / L5).
 #[tauri::command]
 fn recent_ops(state: tauri::State<'_, AppState>, limit: usize) -> Result<Vec<lodestash_core::catalog::OpLogRow>, String> {
@@ -762,6 +798,7 @@ pub fn run() {
             set_settings,
             set_source_watch,
             collections,
+            collection_members,
             create_collection,
             delete_collection,
             set_package_pinned,
@@ -787,7 +824,9 @@ pub fn run() {
             staged,
             add_category,
             list_rules,
-            apply_mapping
+            apply_mapping,
+            add_rule,
+            delete_rule
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lodestash");

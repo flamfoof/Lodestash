@@ -90,6 +90,17 @@ pub enum Op {
     /// The Mapping tab's taxonomy switcher / authoring (UI-SPEC §9.2).
     SetActiveTaxonomy { id: i64 },
     DeleteTaxonomy { id: i64 },
+    /// Add a mapping rule to a taxonomy (UI-SPEC §9.2). `match_type` is one of
+    /// `MAPPING_MATCH_TYPES`; `priority` lower wins.
+    AddRule {
+        taxonomy_id: i64,
+        category_id: i64,
+        match_type: String,
+        pattern: String,
+        priority: i64,
+    },
+    /// Delete a mapping rule (UI-SPEC §9.2 row delete).
+    DeleteRule { rule_id: i64 },
     /// Add a category under a parent (or the root) with its materialized path.
     AddCategory {
         taxonomy_id: i64,
@@ -318,6 +329,16 @@ fn run(catalog: &mut Catalog, db_path: &Path, op: Op) -> Result<WriteResult, Str
 
         Op::SetActiveTaxonomy { id } => catalog
             .set_active_taxonomy(id)
+            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map_err(|e| e.to_string()),
+
+        Op::AddRule { taxonomy_id, category_id, match_type, pattern, priority } => catalog
+            .add_rule(taxonomy_id, category_id, &match_type, &pattern, priority)
+            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map_err(|e| e.to_string()),
+
+        Op::DeleteRule { rule_id } => catalog
+            .delete_rule(rule_id)
             .map(|_| WriteResult { changed: 1, ..Default::default() })
             .map_err(|e| e.to_string()),
 

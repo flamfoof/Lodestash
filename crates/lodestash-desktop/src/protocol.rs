@@ -215,7 +215,20 @@ fn thumb(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
         },
     };
 
-    let params = lodestash_ingest::thumb::ThumbParams::default();
+    // Grid render quality comes from the persisted setting (UI-SPEC §11.3): `thumb_px()`
+    // (128/256/384). The mesh fidelity travels with it — same `proxy_budget()` the preview
+    // drain uses, so a grid thumb and a cached preview proxy agree on the triangle budget.
+    // The cache key carries width, height and the proxy tag, so a quality change re-caches
+    // at the new settings. The client URL carries `?q=` (see api.ts thumbUrl) purely as a
+    // cache-buster — a bare id URL with max-age would keep serving the old-size PNG after a
+    // Settings change.
+    let quality = lodestash_app::config::AppConfig::load().preview_quality;
+    let side = quality.thumb_px();
+    let params = lodestash_ingest::thumb::ThumbParams {
+        width: side,
+        height: side,
+        proxy: quality.proxy_budget(),
+    };
     let key = lodestash_ingest::thumb::meta_key(
         &path,
         std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
@@ -239,7 +252,9 @@ fn thumb(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
     match made.and_then(std::fs::read) {
         Ok(bytes) => reply(StatusCode::OK)
             .header("Content-Type", "image/png")
-            .header("Cache-Control", "max-age=3600")
+            // Short — the client re-keys on a quality change via `?q=`, and the body can
+            // legitimately change (fresh decode after a re-crawl).
+            .header("Cache-Control", "max-age=60")
             .header("Content-Length", bytes.len().to_string())
             .body(bytes)
             .unwrap_or_else(|_| status(StatusCode::INTERNAL_SERVER_ERROR, "thumb: build")),
