@@ -1547,10 +1547,11 @@ impl LodestashApp {
                             emb.as_ref(),
                             workspace_dir.as_deref(),
                             cache_dir.as_deref(),
+                            None,
                         );
                     }
                     if let Some(emb) = &audio_embedder {
-                        drain_audio_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref());
+                        drain_audio_embeddings(&mut cat, emb.as_ref(), workspace_dir.as_deref(), None);
                         // Audio zero-shot tags run before the VLM drain (which can't tag audio),
                         // so the audio queue is cleared with real tags, not empty.
                         if let Some(zs) = lodestash_ai::clap_tags::AudioZeroShot::new(emb.clone()) {
@@ -1683,6 +1684,7 @@ impl LodestashApp {
                     cache_dir.as_deref(),
                     proxy_budget,
                     &roots,
+                    None,
                 ),
                 Err(e) => {
                     tracing::warn!(%e, "backlog drain: catalog unavailable");
@@ -1771,6 +1773,7 @@ impl LodestashApp {
                     cache_dir.as_deref(),
                     proxy_budget,
                     &roots,
+                    None,
                 );
                 // Second message: the drain promoted rows, so the meter and STATUS facet
                 // are now stale. `drain_only` keeps a no-op quiet.
@@ -1878,6 +1881,7 @@ impl LodestashApp {
                     cache_dir.as_deref(),
                     proxy_budget,
                     &roots,
+                    None,
                 );
                 if counts.is_some() {
                     let _ = tx.send(CatalogSynced {

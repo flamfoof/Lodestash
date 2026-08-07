@@ -601,6 +601,20 @@ until B7.
   - [x] **B10j — Inspector collection_members read (B9f follow-up)** — real membership, not local state.
   - [x] **B10k — card-uniformity e2e regression** — every card within 1px of its cell width.
 
+- [ ] **B11 — Identify engine slice (2026-08-07).** The first desktop-side piece of the engine
+      build: the appraise kick is real (not a stub).
+  - [x] **B11a — ✦ Identify all kick.** One bounded appraise pass on the persist thread —
+        `drain_promote_resync` (metrics → previews → deps → **embeddings** → promote) with the
+        local SigLIP/CLAP embedders when the models exist, graceful otherwise; embedding drains
+        gained a time budget (None = egui pump's unbounded behavior); IdentifyScreen's ✦ button
+        runs it with an appraising state + honest outcome.
+  - [ ] **B11b — per-asset Identify now (UI-SPEC §3)** — the card/row ✦ gesture embeds + tags one
+        asset (needs a single-asset embed path).
+  - [ ] **B11c — auto-identify opt-in (AI-PIPELINE §2)** — idle drain embeds when `auto_identify`
+        is on; the Settings toggle exists (check) and must feed the writer's idle pass.
+  - [ ] **B11d — appraise progress surfacing** — the ✦ button + top bar reflect a running pass
+        (pump-active flag shared from the writer), instead of the current button-local state.
+
 - [ ] **B1.5 — `lodestash-cli`.** Headless `scan|index|tag|export`; gives the port a smoke test
       needing no window.
 - [ ] **B7 — cutover.** `[[bin]] lodestash` moves to `lodestash-desktop`, **preserving the `--mcp`

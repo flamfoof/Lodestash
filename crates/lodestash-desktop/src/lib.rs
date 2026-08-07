@@ -623,6 +623,15 @@ fn apply_mapping(state: tauri::State<'_, AppState>, taxonomy_id: i64) -> Result<
     state.write(Op::ApplyMapping { taxonomy_id })
 }
 
+/// ✦ Identify all — one bounded appraise pass on the persist thread (B11). Resolves the local
+/// embedders (SigLIP/CLAP) when the models exist; with none, the pass runs the cheap drains
+/// and the button's toast says nothing was appraised. Returns when the bounded pass finishes
+/// (up to ~20s) — the frontend shows the appraise state meanwhile.
+#[tauri::command]
+fn identify_all(state: tauri::State<'_, AppState>) -> Result<WriteResult, String> {
+    state.write(Op::IdentifyAll)
+}
+
 /// Add a mapping rule to a taxonomy (UI-SPEC §9.2). `match_type` is one of the shared
 /// `MAPPING_MATCH_TYPES`; `priority` lower wins. On the writer thread like every catalog write.
 #[tauri::command]
@@ -826,7 +835,8 @@ pub fn run() {
             list_rules,
             apply_mapping,
             add_rule,
-            delete_rule
+            delete_rule,
+            identify_all
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lodestash");

@@ -9,12 +9,33 @@
    * action, present but off, saying exactly why it is off instead of pretending to run.
    */
   import Card from "./Card.svelte";
-  import { gridPage, type GridItem } from "./api";
+  import { gridPage, identifyAll, type GridItem } from "./api";
   import { view } from "./nav.svelte";
 
   let items = $state<GridItem[]>([]);
   let total = $state(0);
   let error = $state<string | null>(null);
+  let running = $state(false);
+  let outcome = $state<string | null>(null);
+
+  // ✦ Identify all (B11): one bounded appraise pass on the persist thread; the backlog count
+  // shrinks as assets get embeddings + tags, and the grid re-reads on completion.
+  async function appraise() {
+    if (running) return;
+    running = true;
+    outcome = null;
+    try {
+      const r = await identifyAll();
+      outcome = r.changed > 1
+        ? `Appraised ${r.changed.toLocaleString()} assets — reload to see the backlog shrink.`
+        : "No local embedder models — install SigLIP/CLAP (Settings → AI) to appraise.";
+    } catch (e) {
+      outcome = `Appraise failed: ${String(e)}`;
+    } finally {
+      running = false;
+      view.dataVersion += 1; // re-read the backlog
+    }
+  }
 
   $effect(() => {
     view.dataVersion;
@@ -54,16 +75,25 @@
       <span class="count-label">unidentified</span>
       <button
         class="identify"
-        disabled
-        title="The appraiser engine binds with the B7 cutover — this shell shows the backlog, it does not appraise."
+        disabled={running}
+        onclick={appraise}
+        title={
+          running
+            ? "Appraising… this pass runs up to ~20s on the persist thread."
+            : "Run one appraise pass — local AI tags + embeddings for the unidentified backlog."
+        }
         data-testid="identify-all"
       >
-        ✦ Identify all ({total.toLocaleString()})
+        {running ? "✦ Appraising…" : `✦ Identify all (${total.toLocaleString()})`}
       </button>
-      <p class="offline">
-        The appraiser (local AI tagger + embeddings) ships with the engine build — this shell
-        shows the backlog honestly until then.
-      </p>
+      {#if outcome}
+        <p class="offline" data-testid="identify-outcome">{outcome}</p>
+      {:else}
+        <p class="offline">
+          Appraises with the local AI tagger + embeddings (SigLIP/CLAP) when those models are
+          installed — with none, this pass still reconciles statuses and previews.
+        </p>
+      {/if}
     </div>
   </header>
 

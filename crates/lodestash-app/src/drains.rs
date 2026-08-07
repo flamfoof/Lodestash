@@ -156,9 +156,11 @@ pub fn drain_audio_embeddings(
     cat: &mut Catalog,
     emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync),
     workspace_dir: Option<&std::path::Path>,
+    budget: Option<std::time::Duration>,
 ) {
     const BATCH: usize = 32;
     let mut total = 0usize;
+    let deadline = budget.map(|b| std::time::Instant::now() + b);
     loop {
         let jobs = match cat.audio_assets_needing_embedding(BATCH) {
             Ok(j) => j,
@@ -199,6 +201,10 @@ pub fn drain_audio_embeddings(
                 return;
             }
             total += 1;
+        }
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            tracing::debug!(embedded = total, "audio embed pass hit its time budget");
+            break;
         }
         if n < BATCH {
             break;
@@ -934,6 +940,9 @@ pub fn drain_promote_resync(
     cache_dir: Option<&std::path::Path>,
     proxy: lodestash_ingest::decimate::Budget,
     roots: &[(String, String)],
+    // Bounds one embedding pass (`None` = drain until the queue is empty — the egui pump's
+    // behavior). The desktop writer passes a cap so a long Identify-all never blocks writes.
+    budget: Option<std::time::Duration>,
 ) -> (Option<StatusCounts>, AssetIdentityMaps) {
     drain_metrics(cat, workspace_dir, cache_dir, proxy);
     // Backfill previews for models the metrics drain will never revisit — anything indexed before
@@ -949,10 +958,10 @@ pub fn drain_promote_resync(
     );
     drain_dependencies(cat, workspace_dir);
     if let Some(emb) = embedder {
-        drain_image_embeddings(cat, emb.as_ref(), workspace_dir, cache_dir);
+        drain_image_embeddings(cat, emb.as_ref(), workspace_dir, cache_dir, budget);
     }
     if let Some(emb) = audio_embedder {
-        drain_audio_embeddings(cat, emb.as_ref(), workspace_dir);
+        drain_audio_embeddings(cat, emb.as_ref(), workspace_dir, budget);
     }
     match cat.promote_statuses() {
         Ok(0) => return (None, Vec::new()), // nothing moved — nothing to re-read
@@ -1263,9 +1272,11 @@ pub fn drain_image_embeddings(
     emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync),
     workspace_dir: Option<&std::path::Path>,
     cache_dir: Option<&std::path::Path>,
+    budget: Option<std::time::Duration>,
 ) {
     const BATCH: usize = 64;
     let mut total = 0usize;
+    let deadline = budget.map(|b| std::time::Instant::now() + b);
     // A material's albedo lives on the `uses_texture` edges, not on the job row, so it takes one
     // whole-library read up front — trivial next to a single encoder pass, and materials without a
     // resolved edge simply render flat.
@@ -1323,6 +1334,10 @@ pub fn drain_image_embeddings(
                 return;
             }
             total += 1;
+        }
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            tracing::debug!(embedded = total, "visual embed pass hit its time budget");
+            break;
         }
         if n < BATCH {
             break;

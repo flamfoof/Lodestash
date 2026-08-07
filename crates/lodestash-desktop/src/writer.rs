@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 
 use lodestash_app::config::AppConfig;
-use lodestash_app::drains::drain_previews;
+use lodestash_app::drains::{
+    drain_promote_resync, drain_previews, resolve_audio_embedder, resolve_embedder,
+};
 use lodestash_app::paths::default_cache_dirs;
 use lodestash_app::types::PersistBatch;
 use lodestash_core::catalog::Catalog;
@@ -110,6 +112,10 @@ pub enum Op {
     },
     /// Run the deterministic mapping engine over one taxonomy.
     ApplyMapping { taxonomy_id: i64 },
+    /// ✦ Identify all — one bounded appraise pass (embeddings → tags → promote) on the
+    /// persist thread, so the catalog stays single-writer. Manual, like the egui build's
+    /// Identify button (AI-PIPELINE §2); auto-identify stays a config opt-in.
+    IdentifyAll,
     RenameCategory { id: i64, label: String },
     DeleteCategory { id: i64 },
     /// Undo one logged mutation (UI-SPEC §2 Ctrl/Cmd-Z, DESIGN-GUIDELINES §7 L5).
@@ -356,6 +362,47 @@ fn run(catalog: &mut Catalog, db_path: &Path, op: Op) -> Result<WriteResult, Str
             .apply_mapping(taxonomy_id)
             .map(|changed| WriteResult { changed, ..Default::default() })
             .map_err(|e| e.to_string()),
+
+        Op::IdentifyAll => {
+            // Manual appraise kick (✦ Identify all): resolve the embedders even when
+            // auto-identify is off — the user explicitly asked. No local models (SigLIP/CLAP
+            // absent) means nothing can be appraised; the pass still runs metrics/previews/
+            // promote and reports honestly. Bounded so a long pass never blocks writes.
+            let embedder = resolve_embedder();
+            let audio_embedder = resolve_audio_embedder();
+            if embedder.is_none() && audio_embedder.is_none() {
+                tracing::warn!("Identify all: no local embedder models — nothing can be appraised");
+            }
+            let (cache_dir, workspace_dir) = default_cache_dirs();
+            let proxy = AppConfig::load().preview_quality.proxy_budget();
+            let roots = catalog
+                .source_infos()
+                .map(|infos| {
+                    infos
+                        .into_iter()
+                        .map(|i| (i.name, i.root_path))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let (counts, _assets) = drain_promote_resync(
+                catalog,
+                embedder,
+                audio_embedder,
+                workspace_dir.as_deref(),
+                cache_dir.as_deref(),
+                proxy,
+                &roots,
+                Some(std::time::Duration::from_secs(20)),
+            );
+            // changed = the appraised backlog size the pass reconciled; when counts are None
+            // (nothing moved) report 1 so the frontend toasts a real kick, not a silent no-op.
+            Ok(WriteResult {
+                changed: counts
+                    .map(|c| c.identified + c.unidentified)
+                    .unwrap_or(1),
+                ..Default::default()
+            })
+        }
 
         Op::RenameCategory { id, label } => catalog
             .rename_category(id, &label)

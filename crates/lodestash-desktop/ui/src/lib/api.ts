@@ -283,6 +283,8 @@ export type MappingRuleRow = {
 
 export const listRules = (taxonomyId: number) => invoke<MappingRuleRow[]>("list_rules", { taxonomyId });
 export const applyMapping = (taxonomyId: number) => invoke<{ changed: number }>("apply_mapping", { taxonomyId });
+/** ✦ Identify all — one bounded appraise pass on the persist thread (B11). */
+export const identifyAll = () => invoke<WriteResult>("identify_all");
 export const addCategory = (
   taxonomyId: number,
   parentId: number | null,
