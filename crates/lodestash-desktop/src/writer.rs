@@ -14,8 +14,9 @@
 //! **The reads stay where they are.** `Library` keeps its own read-only connection (WAL makes a
 //! reader and a writer concurrent), so browsing never waits behind a write.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 
@@ -30,7 +31,7 @@ use lodestash_core::catalog::Catalog;
 use lodestash_core::types::{Exclude, ExcludeKind};
 use lodestash_ingest::crawler::CrawledFile;
 use lodestash_ingest::detect;
-use lodestash_ingest::unitypackage::extract_to_workspace;
+use lodestash_ingest::unitypackage::{extract_to_workspace_with_progress, ExtractedAsset};
 
 /// One asset the write path needs to act on, resolved from the library while its lock is held so
 /// the writer thread never reaches back into it.
@@ -164,17 +165,189 @@ pub struct Job {
     pub reply: Sender<Result<WriteResult, String>>,
 }
 
+/// What the writer thread's channel carries: an external op (with its reply), or an extract
+/// worker reporting back so the reconcile runs on the writer thread (single-writer rule).
+enum WriterMsg {
+    Op(Job),
+    ExtractDone {
+        job_id: u64,
+        package_id: i64,
+        reply: Sender<Result<WriteResult, String>>,
+        outcome: Result<Vec<ExtractedAsset>, String>,
+        cancelled: bool,
+    },
+}
+
+// ── Job tray (B2b) ─────────────────────────────────────────────────────────────────────────
+
+/// Shared tray state: active jobs (progress + cooperative cancel) and a session ring of
+/// finished ones. The writer thread owns the mutations; commands read snapshots.
+#[derive(Clone, Default)]
+pub struct JobRegistry {
+    inner: std::sync::Arc<std::sync::Mutex<JobState>>,
+}
+
+#[derive(Default)]
+struct JobState {
+    next_id: u64,
+    active: Vec<ActiveJob>,
+    recent: VecDeque<RecentJob>,
+}
+
+/// Extract byte progress, read by the tray without taking the registry lock.
+#[derive(Default)]
+struct JobProgress {
+    done: AtomicU64,
+    total: AtomicU64,
+}
+
+struct ActiveJob {
+    id: u64,
+    label: String,
+    kind: String,
+    cancel: Arc<AtomicBool>,
+    progress: Option<Arc<JobProgress>>,
+}
+
+/// Handles a caller holds after `start`, without touching the registry lock again.
+struct JobHandles {
+    id: u64,
+    cancel: Arc<AtomicBool>,
+    progress: Option<Arc<JobProgress>>,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct JobSnapshot {
+    pub id: u64,
+    pub label: String,
+    pub kind: String,
+    /// `(done, total)` bytes for extract; `None` = indeterminate (spinner).
+    pub progress: Option<(u64, u64)>,
+    pub cancellable: bool,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct RecentJob {
+    pub id: u64,
+    pub label: String,
+    pub kind: String,
+    pub ok: bool,
+    pub cancelled: bool,
+    pub changed: usize,
+    pub at_unix: i64,
+}
+
+#[derive(Default, serde::Serialize)]
+pub struct JobsView {
+    pub active: Vec<JobSnapshot>,
+    pub recent: Vec<RecentJob>,
+}
+
+const RECENT_CAP: usize = 20;
+
+impl JobRegistry {
+    /// Register an active job; returns the handles the worker uses for progress/cancel.
+    fn start(&self, label: String, kind: &str, cancellable: bool) -> JobHandles {
+        let mut state = self.inner.lock().expect("job registry lock");
+        let id = state.next_id;
+        state.next_id += 1;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = cancellable.then(|| Arc::new(JobProgress::default()));
+        state.active.push(ActiveJob {
+            id,
+            label,
+            kind: kind.to_string(),
+            cancel: cancel.clone(),
+            progress: progress.clone(),
+        });
+        JobHandles {
+            id,
+            cancel,
+            progress,
+        }
+    }
+
+    /// Move an active job to the session ring. `changed` is what the tray reports.
+    fn finish(&self, id: u64, ok: bool, cancelled: bool, changed: usize) {
+        let mut state = self.inner.lock().expect("job registry lock");
+        let Some(pos) = state.active.iter().position(|j| j.id == id) else {
+            return;
+        };
+        let job = state.active.remove(pos);
+        state.recent.push_front(RecentJob {
+            id: job.id,
+            label: job.label,
+            kind: job.kind,
+            ok,
+            cancelled,
+            changed,
+            at_unix: unix_now(),
+        });
+        state.recent.truncate(RECENT_CAP);
+    }
+
+    fn has_active_extract(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("job registry lock")
+            .active
+            .iter()
+            .any(|j| j.kind == "extract")
+    }
+
+    /// Request cancellation. The extract worker checks the flag between reads; everything
+    /// else finishes on its own and ignores it.
+    pub fn cancel(&self, id: u64) -> bool {
+        let state = self.inner.lock().expect("job registry lock");
+        match state.active.iter().find(|j| j.id == id) {
+            Some(j) => {
+                j.cancel.store(true, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn snapshot(&self) -> JobsView {
+        let state = self.inner.lock().expect("job registry lock");
+        JobsView {
+            active: state
+                .active
+                .iter()
+                .map(|j| JobSnapshot {
+                    id: j.id,
+                    label: j.label.clone(),
+                    kind: j.kind.clone(),
+                    progress: j.progress.as_ref().map(|p| {
+                        (p.done.load(Ordering::Relaxed), p.total.load(Ordering::Relaxed))
+                    }),
+                    cancellable: j.progress.is_some(),
+                })
+                .collect(),
+            recent: state.recent.iter().cloned().collect(),
+        }
+    }
+}
+
 /// Handle to the writer thread. Cloneable, `Send`, holds no connection of its own.
 #[derive(Clone)]
 pub struct Writer {
-    tx: Sender<Job>,
+    tx: Sender<WriterMsg>,
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 impl Writer {
     /// Spawn the writer over `db_path`. The connection is opened **on the thread that owns it**,
     /// never handed across, because that is the whole point of the rule.
-    pub fn spawn(db_path: PathBuf, pump: Arc<AtomicBool>) -> Self {
-        let (tx, rx) = mpsc::channel::<Job>();
+    pub fn spawn(db_path: PathBuf, pump: Arc<AtomicBool>, jobs: JobRegistry) -> Self {
+        let (tx, rx) = mpsc::channel::<WriterMsg>();
+        let writer_tx = tx.clone();
         std::thread::Builder::new()
             .name("lodestash-writer".into())
             .spawn(move || {
@@ -185,8 +358,10 @@ impl Writer {
                     Err(e) => {
                         tracing::error!(%e, "writer: catalog open failed; writes will be refused");
                         // Drain and refuse rather than hanging every caller forever.
-                        for job in rx {
-                            let _ = job.reply.send(Err(format!("catalog unavailable: {e}")));
+                        for msg in rx {
+                            if let WriterMsg::Op(job) = msg {
+                                let _ = job.reply.send(Err(format!("catalog unavailable: {e}")));
+                            }
                         }
                         return;
                     }
@@ -216,9 +391,23 @@ impl Writer {
                 // of times would otherwise grind the machine. LODESTASH_NO_PREVIEW_DRAIN=1
                 // skips it; the grid then shows type marks for models without previews.
                 let drain_enabled = std::env::var("LODESTASH_NO_PREVIEW_DRAIN").is_err();
+                // UI-SPEC §5: ticked packs unpack **one at a time**. An ExtractPackage op that
+                // arrives while a worker is running (or already queued) waits here; each op's
+                // reply resolves to the real outcome when its reconcile runs.
+                let mut extract_queue: VecDeque<Job> = VecDeque::new();
                 loop {
                     match rx.recv_timeout(std::time::Duration::from_secs(1)) {
-                        Ok(job) => {
+                        Ok(WriterMsg::Op(job)) => {
+                            if matches!(job.op, Op::ExtractPackage { .. }) {
+                                if extract_queue.is_empty() && !jobs.has_active_extract() {
+                                    let result = run(&mut catalog, &db_path, job.op, &writer_tx, &jobs, &job.reply);
+                                    let _ = job.reply.send(result);
+                                } else {
+                                    // A pack is unpacking (or queued) — join the queue.
+                                    extract_queue.push_back(job);
+                                }
+                                continue;
+                            }
                             // Only the appraise kicks are slow enough to count as "the pump is
                             // running" — everything else is a quick write the frontend already
                             // waits on synchronously.
@@ -226,11 +415,30 @@ impl Writer {
                             if appraising {
                                 pump.store(true, Ordering::Relaxed);
                             }
-                            let result = run(&mut catalog, &db_path, job.op);
+                            let result = run(&mut catalog, &db_path, job.op, &writer_tx, &jobs, &job.reply);
                             if appraising {
                                 pump.store(false, Ordering::Relaxed);
                             }
                             let _ = job.reply.send(result);
+                        }
+                        Ok(WriterMsg::ExtractDone {
+                            job_id,
+                            package_id,
+                            reply,
+                            outcome,
+                            cancelled,
+                        }) => {
+                            // The unpack finished off-thread; reconcile it here — the catalog
+                            // stays single-writer. Then the next queued pack gets its worker.
+                            let result = reconcile_extract(&mut catalog, package_id, outcome);
+                            let ok = result.is_ok();
+                            let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
+                            jobs.finish(job_id, ok, cancelled, changed);
+                            let _ = reply.send(result);
+                            if let Some(next) = extract_queue.pop_front() {
+                                let r = run(&mut catalog, &db_path, next.op, &writer_tx, &jobs, &next.reply);
+                                let _ = next.reply.send(r);
+                            }
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                             // Quiet for a second. Backfill previews in short slices, and only
@@ -276,7 +484,7 @@ impl Writer {
     pub fn run(&self, op: Op) -> Result<WriteResult, String> {
         let (reply, wait) = mpsc::channel();
         self.tx
-            .send(Job { op, reply })
+            .send(WriterMsg::Op(Job { op, reply }))
             .map_err(|_| "writer thread is gone".to_string())?;
         wait.recv()
             .map_err(|_| "writer thread dropped the job".to_string())?
@@ -324,7 +532,15 @@ fn appraise_pass(
     })
 }
 
-fn run(catalog: &mut Catalog, db_path: &Path, op: Op) -> Result<WriteResult, String> {    match op {
+fn run(
+    catalog: &mut Catalog,
+    db_path: &Path,
+    op: Op,
+    tx: &Sender<WriterMsg>,
+    jobs: &JobRegistry,
+    reply: &Sender<Result<WriteResult, String>>,
+) -> Result<WriteResult, String> {
+    match op {
         Op::SetFavorite { ids, on } => catalog
             .set_favorite(&ids, on)
             .map(|changed| WriteResult { changed, ..Default::default() })
@@ -352,8 +568,16 @@ fn run(catalog: &mut Catalog, db_path: &Path, op: Op) -> Result<WriteResult, Str
         // connection sits idle for the duration, and no other job can interleave with it.
         Op::PersistScan { batches } => {
             let changed = batches.iter().map(|b| b.records.len()).sum();
-            lodestash_app::persist::persist_to_catalog(db_path, &batches)
-                .map(|_| WriteResult { changed, ..Default::default() })
+            let label = batches
+                .first()
+                .map(|b| format!("Import {}", b.name))
+                .unwrap_or_else(|| "Import".to_string());
+            let job = jobs.start(label, "import", false);
+            let result = lodestash_app::persist::persist_to_catalog(db_path, &batches)
+                .map(|_| WriteResult { changed, ..Default::default() });
+            let ok = result.is_ok();
+            jobs.finish(job.id, ok, false, changed);
+            result
         }
 
         Op::UpsertTrait { namespace, value, scope, usage_note, teach } => catalog
@@ -455,12 +679,21 @@ fn run(catalog: &mut Catalog, db_path: &Path, op: Op) -> Result<WriteResult, Str
             // auto-identify is off — the user explicitly asked. No local models (SigLIP/CLAP
             // absent) means nothing can be appraised; the pass still runs metrics/previews/
             // promote and reports honestly. Bounded so a long pass never blocks writes.
+            let job = jobs.start("Identify all".into(), "appraise", false);
             let embedder = resolve_embedder();
             let audio_embedder = resolve_audio_embedder();
             if embedder.is_none() && audio_embedder.is_none() {
                 tracing::warn!("Identify all: no local embedder models — nothing can be appraised");
             }
-            appraise_pass(catalog, embedder, audio_embedder, std::time::Duration::from_secs(20))
+            let result = appraise_pass(
+                catalog,
+                embedder,
+                audio_embedder,
+                std::time::Duration::from_secs(20),
+            );
+            let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
+            jobs.finish(job.id, result.is_ok(), false, changed);
+            result
         }
 
         Op::IdentifyOne { asset_id } => {
@@ -469,19 +702,28 @@ fn run(catalog: &mut Catalog, db_path: &Path, op: Op) -> Result<WriteResult, Str
             // which is what "identify now" means honestly). No embedders → the flags still
             // get set, so a later pass (or auto-identify) completes the appraise.
             catalog.mark_for_identify(asset_id).map_err(|e| e.to_string())?;
+            let job = jobs.start(format!("Identify asset {asset_id}"), "appraise", false);
             let embedder = resolve_embedder();
             let audio_embedder = resolve_audio_embedder();
             if embedder.is_none() && audio_embedder.is_none() {
                 tracing::warn!("Identify asset {asset_id}: no local embedder models — flagged for a later pass");
             }
-            appraise_pass(catalog, embedder, audio_embedder, std::time::Duration::from_secs(20))
+            let result = appraise_pass(
+                catalog,
+                embedder,
+                audio_embedder,
+                std::time::Duration::from_secs(20),
+            );
+            let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
+            jobs.finish(job.id, result.is_ok(), false, changed);
+            result
         }
 
         Op::ExtractPackage { package_id } => {
-            // Per-pack Extract (B2b slice): unpack to the workspace, reconcile the payloads
-            // as a crawl under the pack's name. Payloads carry their archive-relative pathname
-            // (or the GUID when the pack didn't record one), so they re-resolve across
-            // re-extracts; Unity .meta sidecars are bookkeeping and never grid assets.
+            // Per-pack Extract (B2b): resolve the pack on the writer thread, then hand the
+            // CPU/IO-heavy, cancellable unpack to a worker. The reconcile runs back here via
+            // WriterMsg::ExtractDone (single-writer rule). This command returns "queued"
+            // (changed: 0) immediately; the job tray owns the real progress and outcome.
             let pkg = catalog
                 .list_packages()
                 .map_err(|e| e.to_string())?
@@ -491,50 +733,46 @@ fn run(catalog: &mut Catalog, db_path: &Path, op: Op) -> Result<WriteResult, Str
             let workspace_dir = default_cache_dirs()
                 .1
                 .ok_or_else(|| "no workspace directory configured".to_string())?;
-            let extracted = extract_to_workspace(Path::new(&pkg.package_path), &workspace_dir)
-                .map_err(|e| format!("extract {}: {e}", pkg.name))?;
-            let crawled: Vec<CrawledFile> = extracted
-                .into_iter()
-                .filter(|a| {
-                    !a.pathname
-                        .as_deref()
-                        .is_some_and(|p| p.to_ascii_lowercase().ends_with(".meta"))
+            let handles = jobs.start(format!("Extract {}", pkg.name), "extract", true);
+            let wtx = tx.clone();
+            let wreply = reply.clone();
+            let wcancel = handles.cancel;
+            let wprogress = handles.progress.expect("extract jobs carry progress");
+            let wpath = PathBuf::from(&pkg.package_path);
+            let wworkspace = workspace_dir;
+            std::thread::Builder::new()
+                .name("extract-worker".into())
+                .spawn(move || {
+                    let report_cancel = wcancel.clone();
+                    let report = move |done: u64, total: u64| {
+                        wprogress.done.store(done, Ordering::Relaxed);
+                        wprogress.total.store(total, Ordering::Relaxed);
+                        !report_cancel.load(Ordering::Relaxed)
+                    };
+                    let outcome = extract_to_workspace_with_progress(&wpath, &wworkspace, &report)
+                        .map_err(|e| e.to_string())
+                        .and_then(|a| {
+                            if a.is_empty() {
+                                Err("the pack extracted no assets".to_string())
+                            } else {
+                                Ok(a)
+                            }
+                        });
+                    let cancelled = wcancel.load(Ordering::Relaxed);
+                    let _ = wtx.send(WriterMsg::ExtractDone {
+                        job_id: handles.id,
+                        package_id,
+                        reply: wreply,
+                        outcome,
+                        cancelled,
+                    });
                 })
-                .map(|a| {
-                    let rel_suffix = a.pathname.clone().unwrap_or_else(|| a.guid.clone());
-                    let rel_path = PathBuf::from(&pkg.name).join(rel_suffix);
-                    let media_type = detect::by_extension(&rel_path);
-                    let mtime = std::fs::metadata(&a.workspace_path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    CrawledFile {
-                        abs_path: a.workspace_path,
-                        rel_path,
-                        size_bytes: a.size_bytes,
-                        mtime,
-                        media_type,
-                    }
-                })
-                .collect();
-            let source_id = catalog
-                .package_source_root(package_id)
-                .map_err(|e| e.to_string())?
-                .and_then(|root| catalog.source_info_by_root(&root).ok().flatten())
-                .map(|i| i.id)
-                .ok_or_else(|| "the pack has no library source — add its folder first".to_string())?;
-            let records = crawl_records(crawled.iter());
-            let stats = catalog
-                .record_crawl(source_id, Some(package_id), &records)
-                .map_err(|e| e.to_string())?;
+                .expect("extract worker spawns");
             Ok(WriteResult {
-                changed: stats.inserted + stats.updated,
+                changed: 0, // queued — the tray reports the real changed count
                 ..Default::default()
             })
         }
-
         Op::RenameCategory { id, label } => catalog
             .rename_category(id, &label)
             .map(|_| WriteResult { changed: 1, ..Default::default() })
@@ -603,6 +841,63 @@ fn run(catalog: &mut Catalog, db_path: &Path, op: Op) -> Result<WriteResult, Str
             Ok(WriteResult { changed, ..Default::default() })
         }
     }
+}
+
+/// Reconcile an extract worker's payloads into the catalog — the writer-thread half of
+/// per-pack Extract. Payloads are crawled under the pack's name (virtual rel_path), Unity
+/// `.meta` sidecars skipped; the pack's source id is resolved from the catalog.
+fn reconcile_extract(
+    catalog: &mut Catalog,
+    package_id: i64,
+    outcome: Result<Vec<ExtractedAsset>, String>,
+) -> Result<WriteResult, String> {
+    let extracted = outcome?;
+    let pkg = catalog
+        .list_packages()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|p| p.id == package_id)
+        .ok_or_else(|| format!("package {package_id} not found"))?;
+    let crawled: Vec<CrawledFile> = extracted
+        .into_iter()
+        .filter(|a| {
+            !a.pathname
+                .as_deref()
+                .is_some_and(|p| p.to_ascii_lowercase().ends_with(".meta"))
+        })
+        .map(|a| {
+            let rel_suffix = a.pathname.clone().unwrap_or_else(|| a.guid.clone());
+            let rel_path = PathBuf::from(&pkg.name).join(rel_suffix);
+            let media_type = detect::by_extension(&rel_path);
+            let mtime = std::fs::metadata(&a.workspace_path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            CrawledFile {
+                abs_path: a.workspace_path,
+                rel_path,
+                size_bytes: a.size_bytes,
+                mtime,
+                media_type,
+            }
+        })
+        .collect();
+    let source_id = catalog
+        .package_source_root(package_id)
+        .map_err(|e| e.to_string())?
+        .and_then(|root| catalog.source_info_by_root(&root).ok().flatten())
+        .map(|i| i.id)
+        .ok_or_else(|| "the pack has no library source — add its folder first".to_string())?;
+    let records = crawl_records(crawled.iter());
+    let stats = catalog
+        .record_crawl(source_id, Some(package_id), &records)
+        .map_err(|e| e.to_string())?;
+    Ok(WriteResult {
+        changed: stats.inserted + stats.updated,
+        ..Default::default()
+    })
 }
 
 /// Soft-delete the rows **and** blacklist each asset in its source.

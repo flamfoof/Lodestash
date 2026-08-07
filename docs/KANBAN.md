@@ -288,10 +288,16 @@ until B7.
       had already moved, but **`app.rs` is 15,543 lines** and `Engine` itself has not been split
       from the egui `LodestashApp`. Splitting ~144 fields on *does a background thread write it?*
       is judgement per field, not a mechanical move.
-- [ ] **B2b remainder — `Engine` + pump.** `Arc<Mutex<Engine>>` and the 33 ms pump running the
+- [~] **B2b remainder — `Engine` + pump.** `Arc<Mutex<Engine>>` and the 33 ms pump running the
       drain order **verbatim** from `app.rs:9533` (that order encodes the `database is locked`
       fix). Blocked on B1. Until then the shell reads the catalog directly, which is sound because
       browsing is a read.
+      **Ingest slices shipped 2026-08-07:** per-pack **Extract** (worker thread with byte progress
+      + cooperative cancel, writer-thread reconcile — the writer's own serialization keeps packs
+      unpacking **one at a time** per UI-SPEC §5), the **`+ Add source…`** native folder chooser
+      (`tauri-plugin-dialog`), and the **job tray** (bottom-left: active jobs with progress +
+      per-job ✕ cancel, session ring of finished jobs; UnityAssets gained tick boxes +
+      "▶ Extract selected (N)" + Cancel queue). Still on B1: the 33 ms `Engine` pump itself.
 - [~] **B5 — writes.** *First slice shipped 2026-08-03.* Favourite, Move to Trash / Restore,
       **Remove from library**, delete-from-disk with its confirm dialog, and a Trash view.
       **Rating is out of scope** (parked — [`DATA-MODEL.md`](DATA-MODEL.md) §12).

@@ -293,6 +293,34 @@ export const pumpActive = () => invoke<boolean>("pump_active");
 /** Per-pack Extract (B2b slice) — unpack into the workspace + reconcile the payloads. */
 export const extractPackage = (packageId: number) =>
   invoke<WriteResult>("extract_package", { packageId });
+
+// ── Job tray (B2b) ─────────────────────────────────────────────────────────────────────────
+
+export interface JobSnapshot {
+  id: number;
+  label: string;
+  kind: string;
+  /** `(done, total)` bytes for extract; `null` = indeterminate (spinner). */
+  progress: [number, number] | null;
+  cancellable: boolean;
+}
+export interface RecentJob {
+  id: number;
+  label: string;
+  kind: string;
+  ok: boolean;
+  cancelled: boolean;
+  changed: number;
+  at_unix: number;
+}
+export interface JobsView {
+  active: JobSnapshot[];
+  recent: RecentJob[];
+}
+
+export const jobs = () => invoke<JobsView>("jobs");
+/** Ask one active job to stop (extract workers cancel between reads). */
+export const cancelJob = (jobId: number) => invoke<boolean>("cancel_job", { jobId });
 export const addCategory = (
   taxonomyId: number,
   parentId: number | null,

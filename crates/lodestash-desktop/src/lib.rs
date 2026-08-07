@@ -41,6 +41,8 @@ struct AppState {
     /// Raised while the writer thread runs an appraise pass (B11d) — the ✦ controls and any
     /// progress surface read it instead of racing the writer on timing guesses.
     pump: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The job tray (B2b): active jobs + the session ring, owned by the writer thread.
+    jobs: crate::writer::JobRegistry,
     /// `None` when there is no catalog on disk yet — every write then reports why instead of
     /// pretending to succeed.
     writer: Option<Writer>,
@@ -686,6 +688,18 @@ fn extract_package(state: tauri::State<'_, AppState>, package_id: i64) -> Result
     state.write(Op::ExtractPackage { package_id })
 }
 
+/// The job tray (B2b): active jobs (progress, cancellable) + the session ring of finished ones.
+#[tauri::command]
+fn jobs(state: tauri::State<'_, AppState>) -> crate::writer::JobsView {
+    state.jobs.snapshot()
+}
+
+/// Ask one active job to stop (extract workers cancel between reads; the rest ignore it).
+#[tauri::command]
+fn cancel_job(state: tauri::State<'_, AppState>, job_id: u64) -> bool {
+    state.jobs.cancel(job_id)
+}
+
 /// Add a mapping rule to a taxonomy (UI-SPEC §9.2). `match_type` is one of the shared
 /// `MAPPING_MATCH_TYPES`; `priority` lower wins. On the writer thread like every catalog write.
 #[tauri::command]
@@ -795,9 +809,10 @@ pub fn run() {
 
     // One writer for the process (ARCHITECTURE §5), spawned before any command can run.
     let pump = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let job_registry = crate::writer::JobRegistry::default();
     let writer = lodestash_app::paths::catalog_db_path()
         .filter(|p| p.exists())
-        .map(|p| Writer::spawn(p, pump.clone()));
+        .map(|p| Writer::spawn(p, pump.clone(), job_registry.clone()));
 
     tauri::Builder::default()
         // Window geometry (size/position/maximized) is remembered across launches and restored
@@ -832,6 +847,7 @@ pub fn run() {
             library: Mutex::new(library),
             writer,
             pump,
+            jobs: job_registry,
         })
         .register_uri_scheme_protocol("lodestash", |ctx, req| {
             let state = ctx.app_handle().state::<AppState>();
@@ -898,7 +914,9 @@ pub fn run() {
             identify_all,
             identify_asset,
             pump_active,
-            extract_package
+            extract_package,
+            jobs,
+            cancel_job
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lodestash");

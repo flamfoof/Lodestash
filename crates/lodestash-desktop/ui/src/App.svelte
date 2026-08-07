@@ -6,6 +6,7 @@
   import Inspector from "./lib/Inspector.svelte";
   import LibraryScreen from "./lib/LibraryScreen.svelte";
   import StagingTray from "./lib/StagingTray.svelte";
+import JobTray from "./lib/JobTray.svelte";
   import { SCREENS } from "./lib/routes";
   import { view } from "./lib/nav.svelte";
   import ConfirmDelete from "./lib/ConfirmDelete.svelte";
@@ -297,6 +298,7 @@
   </div>
 
   <StagingTray ids={stagedIds} onunstage={unstageOne} onclear={clearTray} />
+  <JobTray />
 
   {#if confirming && selectedDetail}
     <ConfirmDelete

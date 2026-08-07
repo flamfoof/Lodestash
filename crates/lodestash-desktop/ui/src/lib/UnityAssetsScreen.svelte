@@ -10,7 +10,7 @@
    * says so rather than inventing it.
    */
   import Icon from "./Icon.svelte";
-  import { packages, setPackagePinned, extractPackage, fmtSize, type PackageRow } from "./api";
+  import { packages, setPackagePinned, extractPackage, jobs, cancelJob, fmtSize, type PackageRow } from "./api";
   import { view } from "./nav.svelte";
 
   let rows = $state<PackageRow[] | null>(null);
@@ -102,6 +102,68 @@
     }
   }
 
+  // Batch Extract (UI-SPEC §5): ticked packs unpack **one at a time** — the frontend serializes
+  // the kicks, the writer serializes whatever arrives concurrently. Cancel queue stops the
+  // not-yet-started packs and asks the active extract job to stop.
+  let ticked = $state<Set<number>>(new Set());
+  let queued = $state<Set<number>>(new Set());
+  let runningNow = $state<Set<number>>(new Set());
+  let cancelQueue = $state(false);
+  let queueError = $state<string | null>(null);
+
+  function toggleTick(id: number) {
+    const next = new Set(ticked);
+    if (next.has(id)) {
+      next.delete(id);
+    } else {
+      next.add(id);
+    }
+    ticked = next;
+  }
+
+  async function extractSelected() {
+    if (ticked.size === 0) return;
+    queueError = null;
+    const ids = [...ticked];
+    queued = new Set(ids);
+    for (const id of ids) {
+      if (cancelQueue) break;
+      const nextQueue = new Set(queued);
+      nextQueue.delete(id);
+      queued = nextQueue;
+      const run = new Set(runningNow);
+      run.add(id);
+      runningNow = run;
+      try {
+        await extractPackage(id);
+        view.dataVersion += 1;
+      } catch (e) {
+        queueError = String(e);
+      } finally {
+        const run2 = new Set(runningNow);
+        run2.delete(id);
+        runningNow = run2;
+      }
+    }
+    cancelQueue = false;
+    ticked = new Set();
+  }
+
+  async function cancelQueueFn() {
+    cancelQueue = true;
+    // The active extract (if any) cooperates through the tray's job row.
+    try {
+      const jv = await jobs();
+      for (const j of jv.active) {
+        if (j.kind === "extract" && j.cancellable) await cancelJob(j.id);
+      }
+    } catch {
+      /* the tray reports errors; the queue stop is the important part */
+    }
+  }
+
+  const queuedCount = $derived(queued.size + runningNow.size);
+
   /** Open the pack in the three-pane browser, rooted at the pack's top folder. */
   function open(p: PackageRow) {
     view.packageFilter = p.name;
@@ -146,6 +208,24 @@
         {/if}
       </p>
     {:else}
+      {#if ticked.size > 0 || queuedCount > 0}
+        <div class="batch" data-testid="extract-batch">
+          <span class="batch-label num">
+            {ticked.size} selected · {queuedCount} queued/extracting
+          </span>
+          <button class="open primary" onclick={extractSelected} data-testid="extract-selected">
+            ▶ Extract selected ({ticked.size})
+          </button>
+          {#if queuedCount > 0}
+            <button class="open" onclick={cancelQueueFn} data-testid="cancel-queue">
+              Cancel queue
+            </button>
+          {/if}
+          {#if queueError}
+            <span class="err">{queueError}</span>
+          {/if}
+        </div>
+      {/if}
       <div class="publishers" data-testid="unity-packs">
         {#each byPublisher as group (group.publisher)}
           <section class="publisher">
@@ -157,6 +237,15 @@
             <ul>
               {#each group.packs as p (p.id)}
                 <li class="pack" class:pinned={p.pinned}>
+                  <input
+                    type="checkbox"
+                    class="tick"
+                    checked={ticked.has(p.id) || runningNow.has(p.id)}
+                    disabled={runningNow.has(p.id)}
+                    aria-label={`Queue ${p.name} for extraction`}
+                    data-testid="tick-{p.id}"
+                    onchange={() => toggleTick(p.id)}
+                  />
                   <span class="name" title={p.category ?? ""}>{p.name}</span>
                   {#if p.pinned}
                     <span class="pill pin">⬢ pinned</span>
@@ -356,6 +445,31 @@
   }
   .pack:last-child {
     border-bottom: none;
+  }
+  .tick {
+    accent-color: var(--ls-gold);
+    flex: none;
+    cursor: pointer;
+  }
+  .tick:disabled {
+    cursor: wait;
+  }
+  .batch {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    padding: var(--sp-1) var(--sp-3);
+    background: var(--ls-overlay);
+    border: 1px solid var(--ls-border-strong);
+    border-radius: var(--r-md);
+    margin-bottom: var(--sp-2);
+  }
+  .batch-label {
+    flex: 1;
+    color: var(--ls-text-dim);
+  }
+  .err {
+    color: var(--ls-danger);
   }
   .pack.pinned {
     background: color-mix(in srgb, var(--ls-gold) 6%, var(--ls-surface));

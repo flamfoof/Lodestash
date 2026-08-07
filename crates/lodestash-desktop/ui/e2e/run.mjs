@@ -1336,6 +1336,26 @@ try {
     const offTrack = widths.filter((w) => w.cell !== null && Math.abs(w.card - w.cell) >= 1);
     assert.equal(offTrack.length, 0, "a card is wider than the grid cell that wraps it");
   });
+
+  // B2b: the Unity Assets batch bar. Ticking a pack must surface "▶ Extract selected (N)" —
+  // the queue the job tray shows while packs unpack one at a time (UI-SPEC §5).
+  await check("ticking a pack arms the batch extract bar", async () => {
+    await page.getByRole("button", { name: "Unity Assets" }).click();
+    await page.waitForSelector('[data-testid="unity-packs"]', { timeout: 5000 });
+    const packs = await page.locator(".pack").count();
+    if (packs === 0) return; // no packs in this catalog — nothing to arm
+    await page.locator('[data-testid^="tick-"]').first().click();
+    await page.waitForSelector('[data-testid="extract-batch"]', { timeout: 3000 });
+    const label = await page.locator('[data-testid="extract-selected"]').textContent();
+    assert.ok(label?.includes("Extract selected (1)"), `batch bar says: ${label}`);
+    await page.locator('[data-testid^="tick-"]').first().click(); // untick — no side effects
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="extract-batch"]') === null,
+      { timeout: 3000 },
+    );
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.waitForSelector(".card", { timeout: 5000 });
+  });
 } finally {
   await app.close();
 }
