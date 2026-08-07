@@ -294,8 +294,26 @@ fn add_source(state: tauri::State<'_, AppState>, path: String) -> Result<WriteRe
         excludes_json: None,
         records,
     };
-    let result = state.write(Op::PersistScan { batches: vec![batch] })?;
-    tracing::info!(%path, indexed = result.changed, packs = crawled.pending_packages.len(), "source added");
+    // Browse persistence (INGESTION §2): the crawl captured each `.unitypackage`'s manifest
+    // locators — hand them to the writer so the packs become browsable + surgically
+    // extractable rows without ever re-reading the archive.
+    let packs: Vec<crate::writer::DiscoveredPack> = crawled
+        .pending_packages
+        .into_iter()
+        .filter(|p| p.source_idx == 0)
+        .map(|p| crate::writer::DiscoveredPack {
+            root: root.to_string_lossy().into_owned(),
+            abs_path: p.abs_path.to_string_lossy().into_owned(),
+            display_name: p.display_name,
+            entries: p.entries,
+        })
+        .collect();
+    let discovered_packs = packs.len();
+    let result = state.write(Op::PersistScan {
+        batches: vec![batch],
+        packs,
+    })?;
+    tracing::info!(%path, indexed = result.changed, packs = discovered_packs, "source added");
     Ok(result)
 }
 

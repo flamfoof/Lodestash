@@ -25,13 +25,12 @@ use lodestash_app::drains::{
     drain_promote_resync, drain_previews, resolve_audio_embedder, resolve_embedder,
 };
 use lodestash_app::paths::default_cache_dirs;
-use lodestash_app::persist::crawl_records;
 use lodestash_app::types::PersistBatch;
-use lodestash_core::catalog::Catalog;
+use lodestash_core::catalog::{Catalog, PackageEntryRecord};
 use lodestash_core::types::{Exclude, ExcludeKind};
-use lodestash_ingest::crawler::CrawledFile;
-use lodestash_ingest::detect;
-use lodestash_ingest::unitypackage::{extract_to_workspace_with_progress, ExtractedAsset};
+use lodestash_ingest::unitypackage::{
+    extract_at_offsets_with_progress, read_manifest_with_progress, EntryLocator, ExtractedAsset,
+};
 
 /// One asset the write path needs to act on, resolved from the library while its lock is held so
 /// the writer thread never reaches back into it.
@@ -63,7 +62,13 @@ pub enum Op {
     /// is a shared resource every other action queues behind — so the caller walks the disk on its
     /// own thread and sends the finished records. This is only the part that must be serialised,
     /// because it is the part that writes.
-    PersistScan { batches: Vec<PersistBatch> },
+    PersistScan {
+        batches: Vec<PersistBatch>,
+        /// `.unitypackage`s the crawl surfaced (browse persistence, INGESTION §2): upsert a
+        /// `package` row + record the manifest locators so the pack is browsable and
+        /// extractable without re-scanning the archive.
+        packs: Vec<DiscoveredPack>,
+    },
     /// Trait-library authoring (UI-SPEC §9, B8a): create or promote a trait — an existing tag
     /// keeps its assignments and gains first-class status.
     UpsertTrait {
@@ -167,10 +172,19 @@ pub struct Job {
     pub reply: Sender<Result<WriteResult, String>>,
 }
 
-/// What the writer thread's channel carries: an external op (with its reply), or an extract
-/// worker reporting back so the reconcile runs on the writer thread (single-writer rule).
+/// What the writer thread's channel carries: an external op (with its reply), or a worker
+/// reporting back so the catalog half runs on the writer thread (single-writer rule).
 enum WriterMsg {
     Op(Job),
+    /// A manifest worker finished reading the archive (surgical indexing, M14) — the writer
+    /// records the locators + mints in-pack assets, then spawns the extract worker.
+    ManifestDone {
+        job_id: u64,
+        package_id: i64,
+        reply: Sender<Result<WriteResult, String>>,
+        entries: Result<Vec<PackageEntryRecord>, String>,
+        cancelled: bool,
+    },
     ExtractDone {
         job_id: u64,
         package_id: i64,
@@ -178,6 +192,17 @@ enum WriterMsg {
         outcome: Result<Vec<ExtractedAsset>, String>,
         cancelled: bool,
     },
+}
+
+/// A `.unitypackage` a crawl surfaced, with its browse-time manifest locators
+/// (INGESTION.md §2) — persisted as `package` + `package_entry` rows so the pack is
+/// browsable and extractable without ever re-scanning the archive.
+pub struct DiscoveredPack {
+    /// The source root that contained the archive (matches a `PersistBatch.root`).
+    pub root: String,
+    pub abs_path: String,
+    pub display_name: String,
+    pub entries: Vec<PackageEntryRecord>,
 }
 
 // ── Job tray (B2b) ─────────────────────────────────────────────────────────────────────────
@@ -447,9 +472,10 @@ impl Writer {
                             outcome,
                             cancelled,
                         }) => {
-                            // The unpack finished off-thread; reconcile it here — the catalog
-                            // stays single-writer. Then the next queued pack gets its worker.
-                            let result = reconcile_extract(&mut catalog, package_id, outcome);
+                            // The payloads landed on disk off-thread; materialize them here —
+                            // the catalog stays single-writer. Then the next queued pack gets
+                            // its worker.
+                            let result = materialize_extract(&mut catalog, package_id, outcome);
                             let ok = result.is_ok();
                             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
                             jobs.finish(job_id, ok, cancelled, changed);
@@ -459,6 +485,57 @@ impl Writer {
                             if let Some(next) = extract_queue.pop_front() {
                                 let r = run(&mut catalog, &db_path, next.op, &writer_tx, &jobs, &next.reply, &app);
                                 let _ = next.reply.send(r);
+                            }
+                        }
+                        Ok(WriterMsg::ManifestDone {
+                            job_id,
+                            package_id,
+                            reply,
+                            entries,
+                            cancelled,
+                        }) => {
+                            // The archive's manifest is read; record the locators + mint the
+                            // in-pack assets (surgical indexing, M14), then spawn the extract
+                            // worker over the locators. The op's reply is answered by that
+                            // phase's ExtractDone — except when the manifest failed, which is
+                            // answered here so the caller never hangs.
+                            let result = (|| {
+                                let entries = entries?;
+                                let minted = mint_in_pack(&mut catalog, package_id, &entries)?;
+                                let pkg = catalog
+                                    .list_packages()
+                                    .map_err(|e| e.to_string())?
+                                    .into_iter()
+                                    .find(|p| p.id == package_id)
+                                    .ok_or_else(|| format!("package {package_id} not found"))?;
+                                let workspace_dir = default_cache_dirs()
+                                    .1
+                                    .ok_or_else(|| "no workspace directory configured".to_string())?;
+                                spawn_extract_worker(
+                                    &pkg,
+                                    &workspace_dir,
+                                    &entries,
+                                    &writer_tx,
+                                    &reply,
+                                    &jobs,
+                                    &app,
+                                )?;
+                                Ok(WriteResult {
+                                    changed: minted,
+                                    ..Default::default()
+                                })
+                            })();
+                            let ok = result.is_ok();
+                            let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
+                            jobs.finish(job_id, ok, cancelled, changed);
+                            emit_changed(&app, "catalog");
+                            emit_changed(&app, "jobs");
+                            if let Err(e) = result {
+                                let _ = reply.send(Err(e));
+                                if let Some(next) = extract_queue.pop_front() {
+                                    let r = run(&mut catalog, &db_path, next.op, &writer_tx, &jobs, &next.reply, &app);
+                                    let _ = next.reply.send(r);
+                                }
                             }
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -594,15 +671,38 @@ fn run(
         // `persist_to_catalog` opens its **own** connection, which would be a second writer
         // anywhere else. Running it on this thread is what keeps the rule true: this thread's own
         // connection sits idle for the duration, and no other job can interleave with it.
-        Op::PersistScan { batches } => {
+        // Browse persistence (INGESTION §2): the crawl already captured each `.unitypackage`'s
+        // manifest locators — upsert the `package` row + record them, so the pack appears on
+        // Unity Assets and extracts surgically without re-reading the archive.
+        Op::PersistScan { batches, packs } => {
             let changed = batches.iter().map(|b| b.records.len()).sum();
             let label = batches
                 .first()
                 .map(|b| format!("Import {}", b.name))
                 .unwrap_or_else(|| "Import".to_string());
             let job = jobs.start(label, "import", false);
-            let result = lodestash_app::persist::persist_to_catalog(db_path, &batches)
-                .map(|_| WriteResult { changed, ..Default::default() });
+            let result = (|| {
+                lodestash_app::persist::persist_to_catalog(db_path, &batches)
+                    .map_err(|e| e.to_string())?;
+                for pack in packs {
+                    let Some(source) = catalog
+                        .source_info_by_root(&pack.root)
+                        .map_err(|e| e.to_string())?
+                    else {
+                        continue;
+                    };
+                    let id = catalog
+                        .upsert_package(source.id, &pack.abs_path, &pack.display_name, None, None)
+                        .map_err(|e| e.to_string())?;
+                    catalog
+                        .record_package_entries(id, &pack.entries)
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(WriteResult {
+                    changed,
+                    ..Default::default()
+                })
+            })();
             let ok = result.is_ok();
             jobs.finish(job.id, ok, false, changed);
             result
@@ -748,10 +848,15 @@ fn run(
         }
 
         Op::ExtractPackage { package_id } => {
-            // Per-pack Extract (B2b): resolve the pack on the writer thread, then hand the
-            // CPU/IO-heavy, cancellable unpack to a worker. The reconcile runs back here via
-            // WriterMsg::ExtractDone (single-writer rule). This command returns "queued"
-            // (changed: 0) immediately; the job tray owns the real progress and outcome.
+            // Per-pack Extract (M14 surgical flow, INGESTION §2): if the manifest locators
+            // aren't recorded yet (no browse persistence for this pack), a manifest worker
+            // reads the archive once (progress + cancel through the tray) and the writer
+            // records the locators + **mints the in-pack assets** (surgical indexing) when it
+            // reports back. The extract worker then pulls only the wanted payloads with one
+            // gzip skip-scan (`extract_at_offsets`) and the writer **materializes** them
+            // (fills `workspace_rel`) — the rows hydrate from the workspace and render from
+            // cache. This command returns "queued" immediately; the op's reply resolves when
+            // the whole flow finishes.
             let pkg = catalog
                 .list_packages()
                 .map_err(|e| e.to_string())?
@@ -761,54 +866,73 @@ fn run(
             let workspace_dir = default_cache_dirs()
                 .1
                 .ok_or_else(|| "no workspace directory configured".to_string())?;
-            let handles = jobs.start(format!("Extract {}", pkg.name), "extract", true);
-            let wtx = tx.clone();
-            let wreply = reply.clone();
-            let wcancel = handles.cancel;
-            let wprogress = handles.progress.expect("extract jobs carry progress");
-            let wpath = PathBuf::from(&pkg.package_path);
-            let wworkspace = workspace_dir;
-            let wapp = app.clone();
-            std::thread::Builder::new()
-                .name("extract-worker".into())
-                .spawn(move || {
-                    let report_cancel = wcancel.clone();
-                    // Progress events, throttled to ~4/s — the tray bar moves without the UI
-                    // polling or the writer thread being involved at all. The report is a
-                    // `Fn`, so the throttle lives in an atomic, not a captured `Instant`.
-                    let last_progress = AtomicU64::new(0);
-                    let report = move |done: u64, total: u64| {
-                        wprogress.done.store(done, Ordering::Relaxed);
-                        wprogress.total.store(total, Ordering::Relaxed);
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-                        if now_ms.saturating_sub(last_progress.load(Ordering::Relaxed)) >= 250 {
-                            last_progress.store(now_ms, Ordering::Relaxed);
-                            emit_changed(&wapp, "jobs");
-                        }
-                        !report_cancel.load(Ordering::Relaxed)
-                    };
-                    let outcome = extract_to_workspace_with_progress(&wpath, &wworkspace, &report)
-                        .map_err(|e| e.to_string())
-                        .and_then(|a| {
-                            if a.is_empty() {
-                                Err("the pack extracted no assets".to_string())
-                            } else {
-                                Ok(a)
+            let entries = catalog
+                .list_package_entries(package_id)
+                .map_err(|e| e.to_string())?;
+            if entries.is_empty() {
+                // Phase 1: the manifest is unknown — read it on a worker (a big pack must
+                // inflate its whole tar.gz; never on the writer thread). The kind is
+                // "extract" so the one-at-a-time queue gates the whole flow.
+                let handles = jobs.start(format!("Analyze {}", pkg.name), "extract", true);
+                let wtx = tx.clone();
+                let wreply = reply.clone();
+                let wcancel = handles.cancel;
+                let wprogress = handles.progress.expect("manifest jobs carry progress");
+                let wpath = PathBuf::from(&pkg.package_path);
+                let wapp = app.clone();
+                std::thread::Builder::new()
+                    .name("manifest-worker".into())
+                    .spawn(move || {
+                        let report_cancel = wcancel.clone();
+                        let last_progress = AtomicU64::new(0);
+                        let report = move |done: u64, total: u64| {
+                            wprogress.done.store(done, Ordering::Relaxed);
+                            wprogress.total.store(total, Ordering::Relaxed);
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            if now_ms.saturating_sub(last_progress.load(Ordering::Relaxed)) >= 250
+                            {
+                                last_progress.store(now_ms, Ordering::Relaxed);
+                                emit_changed(&wapp, "jobs");
                             }
+                            !report_cancel.load(Ordering::Relaxed)
+                        };
+                        let outcome = read_manifest_with_progress(&wpath, &report)
+                            .map_err(|e| e.to_string())
+                            .map(|m| {
+                                m.iter()
+                                    .map(|e| PackageEntryRecord {
+                                        guid: e.guid.clone(),
+                                        pathname: e.pathname.clone(),
+                                        tar_offset: e.asset_offset.map(|o| o as i64),
+                                        size_bytes: e.asset_size.map(|s| s as i64),
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .and_then(|entries| {
+                                if entries.is_empty() {
+                                    Err("the pack has no manifest entries".to_string())
+                                } else {
+                                    Ok(entries)
+                                }
+                            });
+                        let cancelled = wcancel.load(Ordering::Relaxed);
+                        let _ = wtx.send(WriterMsg::ManifestDone {
+                            job_id: handles.id,
+                            package_id,
+                            reply: wreply,
+                            entries: outcome,
+                            cancelled,
                         });
-                    let cancelled = wcancel.load(Ordering::Relaxed);
-                    let _ = wtx.send(WriterMsg::ExtractDone {
-                        job_id: handles.id,
-                        package_id,
-                        reply: wreply,
-                        outcome,
-                        cancelled,
-                    });
-                })
-                .expect("extract worker spawns");
+                    })
+                    .expect("manifest worker spawns");
+            } else {
+                // Locators already recorded (browse persistence) — mint + extract right away.
+                mint_in_pack(catalog, package_id, &entries)?;
+                spawn_extract_worker(&pkg, &workspace_dir, &entries, tx, reply, jobs, app)?;
+            }
             Ok(WriteResult {
                 changed: 0, // queued — the tray reports the real changed count
                 ..Default::default()
@@ -889,59 +1013,124 @@ fn run(
     }
 }
 
-/// Reconcile an extract worker's payloads into the catalog — the writer-thread half of
-/// per-pack Extract. Payloads are crawled under the pack's name (virtual rel_path), Unity
-/// `.meta` sidecars skipped; the pack's source id is resolved from the catalog.
-fn reconcile_extract(
+/// Mint a pack's in-pack assets (M14 surgical indexing): classify the recorded locators by
+/// extension and create an `asset` + `asset_file` per classifiable entry, `package_entry_id`
+/// set, `workspace_rel` NULL — the bytes still live inside the archive, so identify/preview
+/// pull them one at a time through the ladder and nothing is materialized yet.
+fn mint_in_pack(
+    catalog: &mut Catalog,
+    package_id: i64,
+    entries: &[PackageEntryRecord],
+) -> Result<usize, String> {
+    let classified = lodestash_app::persist::classify_in_pack_entries(entries);
+    let stats = catalog
+        .mint_in_pack_assets(package_id, &classified)
+        .map_err(|e| e.to_string())?;
+    Ok(stats.inserted)
+}
+
+/// Spawn the extract worker for one pack (INGESTION §2 surgical extraction): pull **only** the
+/// payloads whose locators are recorded, with one gzip skip-scan over the archive, into the
+/// workspace. Progress + cooperative cancel ride the job tray; the writer materializes the
+/// results when the worker reports back (WriterMsg::ExtractDone).
+fn spawn_extract_worker(
+    pkg: &lodestash_core::catalog::PackageListing,
+    workspace_dir: &Path,
+    entries: &[PackageEntryRecord],
+    tx: &Sender<WriterMsg>,
+    reply: &Sender<Result<WriteResult, String>>,
+    jobs: &JobRegistry,
+    app: &Option<tauri::AppHandle>,
+) -> Result<(), String> {
+    let wanted: Vec<EntryLocator> = entries
+        .iter()
+        .filter_map(|e| {
+            Some(EntryLocator {
+                guid: e.guid.clone(),
+                pathname: e.pathname.clone(),
+                offset: e.tar_offset? as u64,
+                size: e.size_bytes? as u64,
+            })
+        })
+        .collect();
+    if wanted.is_empty() {
+        return Err("the pack has no extractable payloads".to_string());
+    }
+    let handles = jobs.start(format!("Extract {}", pkg.name), "extract", true);
+    let wtx = tx.clone();
+    let wreply = reply.clone();
+    let wcancel = handles.cancel;
+    let wprogress = handles.progress.expect("extract jobs carry progress");
+    let wpath = PathBuf::from(&pkg.package_path);
+    let wworkspace = workspace_dir.to_path_buf();
+    let wapp = app.clone();
+    let wpkg_id = pkg.id;
+    std::thread::Builder::new()
+        .name("extract-worker".into())
+        .spawn(move || {
+            let report_cancel = wcancel.clone();
+            let last_progress = AtomicU64::new(0);
+            let report = move |done: u64, total: u64| {
+                wprogress.done.store(done, Ordering::Relaxed);
+                wprogress.total.store(total, Ordering::Relaxed);
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                if now_ms.saturating_sub(last_progress.load(Ordering::Relaxed)) >= 250 {
+                    last_progress.store(now_ms, Ordering::Relaxed);
+                    emit_changed(&wapp, "jobs");
+                }
+                !report_cancel.load(Ordering::Relaxed)
+            };
+            let outcome = extract_at_offsets_with_progress(&wpath, &wworkspace, wanted, &report)
+                .map_err(|e| e.to_string())
+                .and_then(|a| {
+                    if a.is_empty() {
+                        Err("the pack extracted no assets".to_string())
+                    } else {
+                        Ok(a)
+                    }
+                });
+            let cancelled = wcancel.load(Ordering::Relaxed);
+            let _ = wtx.send(WriterMsg::ExtractDone {
+                job_id: handles.id,
+                package_id: wpkg_id,
+                reply: wreply,
+                outcome,
+                cancelled,
+            });
+        })
+        .expect("extract worker spawns");
+    Ok(())
+}
+
+/// Materialize an extract worker's payloads (M14): fill `workspace_rel` on the minted rows
+/// whose `package_entry.pathname` matched, then record the unpack. The rows hydrate from the
+/// workspace from here on (extracted → in-pack → on-disk ladder, DATA-MODEL §7).
+fn materialize_extract(
     catalog: &mut Catalog,
     package_id: i64,
     outcome: Result<Vec<ExtractedAsset>, String>,
 ) -> Result<WriteResult, String> {
     let extracted = outcome?;
-    let pkg = catalog
-        .list_packages()
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .find(|p| p.id == package_id)
-        .ok_or_else(|| format!("package {package_id} not found"))?;
-    let crawled: Vec<CrawledFile> = extracted
-        .into_iter()
-        .filter(|a| {
-            !a.pathname
-                .as_deref()
-                .is_some_and(|p| p.to_ascii_lowercase().ends_with(".meta"))
-        })
-        .map(|a| {
-            let rel_suffix = a.pathname.clone().unwrap_or_else(|| a.guid.clone());
-            let rel_path = PathBuf::from(&pkg.name).join(rel_suffix);
-            let media_type = detect::by_extension(&rel_path);
-            let mtime = std::fs::metadata(&a.workspace_path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            CrawledFile {
-                abs_path: a.workspace_path,
-                rel_path,
-                size_bytes: a.size_bytes,
-                mtime,
-                media_type,
-            }
+    let pairs: Vec<(String, String)> = extracted
+        .iter()
+        .filter_map(|a| {
+            a.pathname
+                .clone()
+                .map(|p| (p, a.workspace_path.to_string_lossy().into_owned()))
         })
         .collect();
-    let source_id = catalog
-        .package_source_root(package_id)
-        .map_err(|e| e.to_string())?
-        .and_then(|root| catalog.source_info_by_root(&root).ok().flatten())
-        .map(|i| i.id)
-        .ok_or_else(|| "the pack has no library source — add its folder first".to_string())?;
-    let records = crawl_records(crawled.iter());
-    let stats = catalog
-        .record_crawl(source_id, Some(package_id), &records)
+    let matched = catalog
+        .materialize_in_pack_assets(package_id, &pairs)
+        .map_err(|e| e.to_string())?;
+    let changed = matched.len();
+    catalog
+        .mark_package_unpacked(package_id, changed)
         .map_err(|e| e.to_string())?;
     Ok(WriteResult {
-        changed: stats.inserted + stats.updated,
+        changed,
         ..Default::default()
     })
 }
