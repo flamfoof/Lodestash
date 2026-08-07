@@ -1878,7 +1878,7 @@ pub struct PackageListing {
 
 /// A registered Unity editor (ENGINE-API §5.1 / DATA-MODEL §9). The plugin upserts its row on
 /// panel open and heartbeats `last_seen_at`; exactly one row is `is_active` at a time.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ProjectRow {
     pub id: i64,
     pub name: String,
@@ -2807,6 +2807,27 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("projects query: {e}")))?;
         rows.collect::<std::result::Result<_, _>>()
             .map_err(|e| CoreError::Catalog(format!("projects collect: {e}")))
+    }
+
+    /// Switch which registered Unity editor is active (ENGINE-API §5.1, UI-SPEC §16.1). The
+    /// partial unique index guarantees at most one active row — clear first, then set.
+    pub fn set_active_project(&self, project_id: i64) -> Result<()> {
+        self.conn
+            .execute("UPDATE project SET is_active = 0", [])
+            .map_err(|e| CoreError::Catalog(format!("project deactivate: {e}")))?;
+        let n = self
+            .conn
+            .execute(
+                "UPDATE project SET is_active = 1 WHERE id = ?1",
+                params![project_id],
+            )
+            .map_err(|e| CoreError::Catalog(format!("project activate: {e}")))?;
+        if n == 0 {
+            return Err(CoreError::Catalog(format!(
+                "no registered editor {project_id}"
+            )));
+        }
+        Ok(())
     }
 
     /// Which of `asset_ids` already have an `import_record` for `project_id` (ENGINE-API §5.4
@@ -4749,6 +4770,25 @@ mod tests {
             cross[0],
             ImportOutcome::Recorded { asset_id: 1, .. }
         ));
+    }
+
+    #[test]
+    fn set_active_project_switches_the_single_active_editor() {
+        let c = Catalog::open_in_memory().expect("open");
+        let p1 = c.register_project("C:/dev/GameA", None, None).unwrap();
+        let p2 = c.register_project("C:/dev/GameB", None, None).unwrap();
+        assert!(c.list_projects().unwrap().iter().find(|p| p.id == p2).unwrap().is_active);
+
+        c.set_active_project(p1).unwrap();
+        let projects = c.list_projects().unwrap();
+        let active: Vec<i64> = projects
+            .iter()
+            .filter(|p| p.is_active)
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(active, vec![p1], "exactly one active, switched back to p1");
+
+        assert!(c.set_active_project(999).is_err(), "unknown editor");
     }
 
     #[test]

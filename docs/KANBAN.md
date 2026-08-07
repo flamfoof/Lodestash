@@ -556,6 +556,10 @@ until B7.
       Engine-blocked and NOT in this card: the Identify engine, the B2b ingest path (job tray,
       per-pack Extract, §5.2 import), the Connect wizard / project switcher, LINKS' dependency
       *graph* harvest, and the B1.5/B7 cutover — all ride the B7 engine build.
+      **Connect wizard app half shipped 2026-08-07** (ENGINE-API §5.1): Settings → Unity Editors
+      lists registered editors (active badge, pipeline/version, last-seen), "Set active" switches
+      the single active row (`set_active_project` + writer op + test); the plugin-side
+      registration/heartbeat remains the engine-project build.
   - [x] **B9a — Stats Tag Graph** (UI-SPEC §8.2). *Shipped 2026-08-06.* `tag_graph` (co-occurrence
         edges + weights + node counts) + `asset_edges`; StatsScreen renders a deterministic ring
         layout (gold nodes ∝ usage, edge opacity ∝ weight, tags·links·assets header, honest empty

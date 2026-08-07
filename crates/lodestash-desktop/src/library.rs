@@ -1085,6 +1085,21 @@ impl Library {
     /// Every pack, publisher-then-name ordered, with the counts derived from the rows we hold
     /// (UI-SPEC §4).
     ///
+    /// Registered Unity editors, active first (ENGINE-API §5.1, UI-SPEC §16.1). Read-only list
+    /// for the Connect wizard's app half; switching the active editor is a write (writer thread).
+    pub fn projects(&self) -> Vec<lodestash_core::catalog::ProjectRow> {
+        let Some(cat) = self.catalog.as_ref() else {
+            return Vec::new();
+        };
+        match cat.list_projects() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(%e, "list_projects failed");
+                Vec::new()
+            }
+        }
+    }
+
     /// Packs with **no indexed assets are kept**, showing `0`. Most of this catalog's 87 packs are
     /// still archives nobody has opened, and hiding them would make the screen claim the library
     /// holds a handful of packs when the Asset Store cache holds eighty-six.
@@ -1092,8 +1107,7 @@ impl Library {
         let Some(cat) = self.catalog.as_ref() else {
             return Vec::new();
         };
-        let listings = match cat.list_packages() {
-            Ok(v) => v,
+        let listings = match cat.list_packages() {            Ok(v) => v,
             Err(e) => {
                 tracing::warn!(%e, "list_packages failed");
                 return Vec::new();
@@ -1136,8 +1150,7 @@ impl Library {
     /// The Stats overview, derived from the rows in memory (UI-SPEC §8.1).
     pub fn stats(&self) -> Stats {
         use std::collections::BTreeMap;
-        let mut by_type: BTreeMap<u8, (String, TypeStat)> = BTreeMap::new();
-        let mut by_pack: HashMap<&str, (usize, i64)> = HashMap::new();
+        let mut by_type: BTreeMap<u8, (String, TypeStat)> = BTreeMap::new();        let mut by_pack: HashMap<&str, (usize, i64)> = HashMap::new();
         let mut bytes_total = 0i64;
         let mut triangles_total = 0i64;
         let mut models = 0usize;

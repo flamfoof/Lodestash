@@ -132,6 +132,8 @@ pub enum Op {
     /// the payloads into the catalog like a crawl. Explicit and on-demand (UI-SPEC §11.6) —
     /// browsing never unpacks; `lodestash://file` answers 503 until this runs.
     ExtractPackage { package_id: i64 },
+    /// Switch which registered Unity editor is active (ENGINE-API §5.1, UI-SPEC §16.1).
+    SetActiveProject { project_id: i64 },
 
     /// Undo one logged mutation (UI-SPEC §2 Ctrl/Cmd-Z, DESIGN-GUIDELINES §7 L5).
     RevertOp { op_id: i64 },
@@ -814,6 +816,11 @@ fn run(
         }
         Op::RenameCategory { id, label } => catalog
             .rename_category(id, &label)
+            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map_err(|e| e.to_string()),
+
+        Op::SetActiveProject { project_id } => catalog
+            .set_active_project(project_id)
             .map(|_| WriteResult { changed: 1, ..Default::default() })
             .map_err(|e| e.to_string()),
 

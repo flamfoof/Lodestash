@@ -700,6 +700,19 @@ fn cancel_job(state: tauri::State<'_, AppState>, job_id: u64) -> bool {
     state.jobs.cancel(job_id)
 }
 
+/// Registered Unity editors, active first (ENGINE-API §5.1) — the Connect wizard's app half.
+#[tauri::command]
+fn projects(state: tauri::State<'_, AppState>) -> Vec<lodestash_core::catalog::ProjectRow> {
+    state.library.lock().map(|l| l.projects()).unwrap_or_default()
+}
+
+/// Switch which registered Unity editor is active (ENGINE-API §5.1, UI-SPEC §16.1). A write,
+/// so it goes through the writer thread with every other catalog mutation.
+#[tauri::command]
+fn set_active_project(state: tauri::State<'_, AppState>, project_id: i64) -> Result<WriteResult, String> {
+    state.write(Op::SetActiveProject { project_id })
+}
+
 /// Add a mapping rule to a taxonomy (UI-SPEC §9.2). `match_type` is one of the shared
 /// `MAPPING_MATCH_TYPES`; `priority` lower wins. On the writer thread like every catalog write.
 #[tauri::command]
@@ -922,7 +935,9 @@ pub fn run() {
             pump_active,
             extract_package,
             jobs,
-            cancel_job
+            cancel_job,
+            projects,
+            set_active_project
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lodestash");

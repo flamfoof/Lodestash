@@ -323,6 +323,23 @@ export const jobs = () => invoke<JobsView>("jobs");
 /** Ask one active job to stop (extract workers cancel between reads). */
 export const cancelJob = (jobId: number) => invoke<boolean>("cancel_job", { jobId });
 
+// ── Connect wizard app half (ENGINE-API §5) ─────────────────────────────────────────────────
+
+export interface ProjectRow {
+  id: number;
+  name: string;
+  project_path: string;
+  unity_version: string | null;
+  pipeline: string | null;
+  is_active: boolean;
+  last_seen_at: number | null;
+}
+
+export const projects = () => invoke<ProjectRow[]>("projects");
+/** Switch which registered Unity editor is active. */
+export const setActiveProject = (projectId: number) =>
+  invoke<WriteResult>("set_active_project", { projectId });
+
 // ── Pump events (B2b) ────────────────────────────────────────────────────────────────────────
 
 /**

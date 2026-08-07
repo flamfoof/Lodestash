@@ -17,9 +17,12 @@
     addSourceExclude,
     removeSourceExclude,
     setThumbKey,
+    projects,
+    setActiveProject,
     type Settings,
     type LibraryStatus,
     type SourceExclude,
+    type ProjectRow,
   } from "./api";
   import { view } from "./nav.svelte";
 
@@ -190,6 +193,38 @@
     } finally {
       sourceBusy = null;
     }
+  }
+
+  // Connect wizard, app half (ENGINE-API §5.1): list the registered Unity editors and switch
+  // which is active. The plugin registers/heartbeats rows when its panel opens in the editor —
+  // the app half only reads and flips the active flag.
+  let editors = $state<ProjectRow[] | null>(null);
+  let editorsError = $state<string | null>(null);
+  let editorBusy = $state<number | null>(null);
+  $effect(() => {
+    projects()
+      .then((p) => (editors = p))
+      .catch((e) => (editorsError = String(e)));
+  });
+  async function activateEditor(id: number) {
+    if (editorBusy !== null) return;
+    editorBusy = id;
+    try {
+      await setActiveProject(id);
+      editors = await projects();
+    } catch (e) {
+      editorsError = String(e);
+    } finally {
+      editorBusy = null;
+    }
+  }
+  function seenAt(atUnix: number | null): string {
+    if (atUnix === null) return "never seen";
+    const s = Math.max(0, Math.floor(Date.now() / 1000) - atUnix);
+    if (s < 60) return "seen now";
+    if (s < 3600) return `seen ${Math.floor(s / 60)}m ago`;
+    if (s < 86400) return `seen ${Math.floor(s / 3600)}h ago`;
+    return `seen ${Math.floor(s / 86400)}d ago`;
   }
 </script>
 
@@ -491,6 +526,49 @@
           <span class="dot paused" aria-hidden="true"></span> Bridge paused — the engine bridge
           ships with the B7 cutover.
         </p>
+      </section>
+
+      <section class="card">
+        <h2>UNITY EDITORS</h2>
+        <p class="hint">
+          Registered by the Lodestash plugin when its panel opens in the editor (ENGINE-API §5.1);
+          the active editor receives imports. The plugin side is the engine-project build — this
+          app half lists and switches.
+        </p>
+        {#if editorsError}
+          <p class="err">{editorsError}</p>
+        {:else if editors === null}
+          <p class="bridge">Loading…</p>
+        {:else if editors.length === 0}
+          <p class="bridge" data-testid="no-editors">
+            <span class="dot paused" aria-hidden="true"></span> No editor connected yet — open
+            the Lodestash panel in Unity to register it here.
+          </p>
+        {:else}
+          <ul class="editors" data-testid="editors">
+            {#each editors as e (e.id)}
+              <li class="editor" class:on={e.is_active} data-testid="editor-{e.id}">
+                <span class="e-name">{e.name}</span>
+                <span class="e-meta mono">
+                  {e.pipeline ?? "built-in"}{#if e.unity_version} · {e.unity_version}{/if} ·
+                  {seenAt(e.last_seen_at)}
+                </span>
+                {#if e.is_active}
+                  <span class="pill active" data-testid="active-editor">active</span>
+                {:else}
+                  <button
+                    class="open"
+                    disabled={editorBusy !== null}
+                    onclick={() => activateEditor(e.id)}
+                    data-testid="activate-{e.id}"
+                  >
+                    {editorBusy === e.id ? "Switching…" : "Set active"}
+                  </button>
+                {/if}
+              </li>
+            {/each}
+          </ul>
+        {/if}
       </section>
 
       <section class="card">
@@ -926,6 +1004,52 @@
   .bridge .dot {
     background: var(--ls-text-dim);
     box-shadow: none;
+  }
+
+  .editors {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-1);
+  }
+  .editor {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    padding: var(--sp-1) var(--sp-2);
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-md);
+    background: var(--ls-surface);
+  }
+  .editor.on {
+    border-color: var(--ls-gold);
+  }
+  .e-name {
+    font-weight: 600;
+    color: var(--ls-text);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .e-meta {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--ls-text-dim);
+    font-size: var(--fs-xs);
+  }
+  .pill.active {
+    color: var(--ls-gold);
+    border-color: var(--ls-gold);
+  }
+  .err {
+    color: var(--ls-danger);
+    font-size: var(--fs-sm);
   }
 
   .msg {
