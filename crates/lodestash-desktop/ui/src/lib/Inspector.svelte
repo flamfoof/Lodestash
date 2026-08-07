@@ -12,6 +12,7 @@
     bulkTag,
     relatedAssets,
     collections,
+    collectionMembers,
     collectionAddAsset,
     collectionRemoveAsset,
     type AssetDetail,
@@ -80,22 +81,21 @@
   // one fetch, two views of it. `null` while loading so the panels can say so.
   let related = $state<RelatedAsset[] | null>(null);
 
-  // COLLECTIONS (G6): the rows come from `collections()`; membership has no read
-  // command in the desktop shell (no `collection_members` wrapper), so it is tracked
-  // locally here and toggled through the writer ops. A fresh session cannot know
-  // which collections already hold the asset — noted as a gap in the audit report.
+  // COLLECTIONS (G6): the rows come from `collections()`; each collection's members come
+  // from `collectionMembers(c.id)` — one read per collection (collections are few). The
+  // chip on-state is `memberIds[c.id].includes(selectedId)`, so it is the real catalog.
   let collectionsRows = $state<CollectionRow[]>([]);
-  let membership = $state<Record<number, boolean>>({});
+  let memberIds = $state<Record<number, number[]>>({});
 
   // Per-asset state resets with the selection. Kept apart from the fetch effect so a
   // `dataVersion` bump (e.g. the collection toggle the user just made) re-asks the
-  // data without wiping the local membership guess.
+  // data without wiping what is already on screen.
   $effect(() => {
     const id = assetId;
     related = null;
     collectionsRows = [];
     sessionTags = [];
-    membership = {};
+    memberIds = {};
     if (id == null) return;
   });
 
@@ -116,6 +116,18 @@
     collections()
       .then((cs) => {
         if (!stale) collectionsRows = cs;
+        return cs;
+      })
+      .then((cs) => {
+        if (stale) return;
+        // One `collection_members` read per collection (B10j) — the chip draws from the ids.
+        for (const c of cs) {
+          collectionMembers(c.id)
+            .then((ids) => {
+              if (!stale) memberIds = { ...memberIds, [c.id]: ids };
+            })
+            .catch(() => {});
+        }
       })
       .catch(() => {});
     return () => {
@@ -146,21 +158,26 @@
     }
   }
 
-  /** Toggle one collection's membership, tracking state locally (G6). */
+  /** Toggle one collection's membership via the writer op, then re-read that collection. */
   async function toggleCollection(c: CollectionRow) {
     const id = detail?.asset_id;
     if (id == null) return;
-    const prev = membership;
-    const on = !membership[c.id];
-    membership = { ...membership, [c.id]: on };
+    const on = !(memberIds[c.id]?.includes(id) ?? false);
     try {
       if (on) await collectionAddAsset(c.id, id);
       else await collectionRemoveAsset(c.id, id);
       view.dataVersion += 1;
+      // Refresh this collection so the chip shows what the backend actually wrote.
+      memberIds = { ...memberIds, [c.id]: await collectionMembers(c.id) };
     } catch (e) {
-      membership = prev;
       tagMsg = String(e);
     }
+  }
+
+  /** Chip on-state: the selected asset is one of `c`'s members (B10j). */
+  function inCollection(c: CollectionRow): boolean {
+    if (detail == null) return false;
+    return memberIds[c.id]?.includes(detail.asset_id) ?? false;
   }
 
   /** Select a related asset — the same lead selection the grid cards use. */
@@ -295,12 +312,12 @@
           {#each collectionsRows as c (c.id)}
             <button
               class="colchip"
-              class:on={membership[c.id]}
+              class:on={inCollection(c)}
               onclick={() => toggleCollection(c)}
               title="{c.asset_count} assets"
               data-testid="collection-toggle-{c.id}"
             >
-              {membership[c.id] ? "✓ " : "+ "}{c.name}
+              {inCollection(c) ? "✓ " : "+ "}{c.name}
             </button>
           {/each}
         </div>

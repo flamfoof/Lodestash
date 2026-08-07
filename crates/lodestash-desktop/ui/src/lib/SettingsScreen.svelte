@@ -16,6 +16,7 @@
     sourceExcludes as fetchSourceExcludes,
     addSourceExclude,
     removeSourceExclude,
+    setThumbKey,
     type Settings,
     type LibraryStatus,
     type SourceExclude,
@@ -95,6 +96,9 @@
       setTimeout(() => (saved = false), 1500);
       // The size tiers feed the badges and the ⚑ size facet — re-ask so every screen follows.
       view.dataVersion += 1;
+      // The preview-quality change re-keys the thumb URLs (api.ts thumbKey) so the webview
+      // cache re-requests at the new size instead of serving the old PNGs.
+      setThumbKey(s.preview_quality);
     } catch (e) {
       error = String(e);
     }

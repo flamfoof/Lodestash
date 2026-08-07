@@ -10,7 +10,8 @@
    * (§9.2) — the taxonomy/category/rule editor. This build's slice is honest about what it can
    * do: a taxonomy switcher (● active marker, switch + delete, no create button in this slice), a
    * category tree built from the categories the rules target (add root/child, rename, delete with
-   * a confirm), a read-only rules list, and an ⚙ Apply button that reports the changed count.
+   * a confirm), a rule editor (add/delete — B10i), and an ⚙ Apply button that reports the changed
+   * count.
    * The tree is derived from `listRules` because that is the only category read this slice
    * exposes — a category shows up once a rule targets it.
    */
@@ -27,6 +28,8 @@
     renameCategory,
     deleteCategory,
     listRules,
+    addRule,
+    deleteRule,
     applyMapping,
     type VocabRow,
     type TaxonomyRow,
@@ -92,6 +95,25 @@
   let draft = $state("");
   let collapsed = $state<Set<number>>(new Set());
 
+  // ---- Rule editor (B10i) ---------------------------------------------------
+  // The engine's evaluated match types (DATA-MODEL §4): `regex`/`embedding_knn` are defined in
+  // the schema but `apply_mapping` skips them with a warning, so they're not offered here.
+  const MATCH_TYPES = ["exact_tag", "alias", "media_type", "glob_path"];
+  let nrCategory = $state<number | null>(null);
+  let nrMatchType = $state<string>("alias");
+  let nrPattern = $state("");
+  let nrPriority = $state<number>(100);
+
+  let patternHint = $derived(
+    nrMatchType === "media_type"
+      ? "audio | image | model_3d | …"
+      : nrMatchType === "glob_path"
+        ? "*/Props/*"
+        : nrMatchType === "alias"
+          ? "barrel"
+          : "subject:barrel",
+  );
+
   let activeTaxonomy = $derived(taxRows?.find((t) => t.is_active) ?? null);
 
   type MappingEdit =
@@ -100,7 +122,7 @@
     | { mode: "rename"; id: number };
   let edit = $state<MappingEdit | null>(null);
 
-  type MappingConfirm = { kind: "taxonomy" | "category"; name: string; run: () => Promise<void> };
+  type MappingConfirm = { kind: "taxonomy" | "category" | "rule"; name: string; run: () => Promise<void> };
   let confirm = $state<MappingConfirm | null>(null);
 
   async function loadMapping() {
@@ -155,6 +177,17 @@
       run: async () => {
         confirm = null;
         await mapWrite(() => deleteCategory(node.id));
+      },
+    };
+  }
+
+  function askRuleDelete(rule: MappingRuleRow) {
+    confirm = {
+      kind: "rule",
+      name: rule.pattern,
+      run: async () => {
+        confirm = null;
+        await mapWrite(() => deleteRule(rule.id));
       },
     };
   }
@@ -229,6 +262,25 @@
     return out;
   });
 
+  /** The categories the rule editor can target — the tree's rows, flattened (B10i). */
+  let catOptions = $derived.by(() => {
+    const out: { id: number; path: string }[] = [];
+    const walk = (nodes: CatNode[]) => {
+      for (const n of nodes) {
+        out.push({ id: n.id, path: n.path });
+        walk(n.children);
+      }
+    };
+    walk(catTree);
+    return out;
+  });
+
+  $effect(() => {
+    const opts = catOptions;
+    if (nrCategory != null && opts.some((c) => c.id === nrCategory)) return;
+    nrCategory = opts[0]?.id ?? null;
+  });
+
   function findNode(id: number): CatNode | undefined {
     const walk = (nodes: CatNode[]): CatNode | undefined => {
       for (const n of nodes) {
@@ -287,6 +339,23 @@
     await mapWrite(() => renameCategory(node.id, label));
     draft = "";
     edit = null;
+  }
+
+  async function addRuleSubmit() {
+    const taxId = activeTaxonomy?.id;
+    const pattern = nrPattern.trim();
+    if (taxId == null || nrCategory == null || !pattern) return;
+    const catId = nrCategory; // const — $state lets lose their narrowing inside the closure
+    await mapWrite(() =>
+      addRule({
+        taxonomyId: taxId,
+        categoryId: catId,
+        matchType: nrMatchType,
+        pattern,
+        priority: Math.round(Number(nrPriority ?? 100)),
+      }),
+    );
+    nrPattern = "";
   }
 
   function onConfirmGo() {
@@ -543,10 +612,10 @@
         <section class="card" data-testid="mapping-tree">
           <h2>Category tree</h2>
           <p class="hint">
-            Drawn from the rules below — a category appears once a rule targets it (rule
-            authoring is not in this build). Adding a category creates the row in the taxonomy;
-            renaming rewrites the paths of its whole subtree; deleting removes the subtree and
-            its mapped assignments, never the raw tags on your assets.
+            Drawn from the rules below — a category appears once a rule targets it. Adding a
+            category creates the row in the taxonomy; renaming rewrites the paths of its whole
+            subtree; deleting removes the subtree and its mapped assignments, never the raw tags
+            on your assets.
           </p>
           {#if !activeTaxonomy}
             <p class="msg">Pick an active taxonomy to manage its categories.</p>
@@ -663,26 +732,92 @@
         <section class="card" data-testid="mapping-rules">
           <h2>Rules</h2>
           <p class="hint">
-            Read-only in this build — rule authoring is not part of the slice. Rules run in
-            priority order (lower wins); the first match claims the asset.
+            Rules run in priority order (lower wins); the first match claims the asset.
+            <span class="pill match">exact_tag</span> matches a full tag like
+            <code>subject:barrel</code>, <span class="pill match">alias</span> a bare word or
+            phrase, <span class="pill match">media_type</span> the asset type, and
+            <span class="pill match">glob_path</span> the folder path.
           </p>
           {#if !activeTaxonomy}
-            <p class="msg">Pick an active taxonomy to see its rules.</p>
-          {:else if (rules ?? []).length === 0}
-            <p class="msg" data-testid="mapping-empty-rules">No rules in this taxonomy yet.</p>
+            <p class="msg">Pick an active taxonomy to manage its rules.</p>
           {:else}
-            <ul class="rules">
-              {#each rules as r (r.id)}
-                <li class="rule-row" class:off={!r.enabled} data-testid="rule-row-{r.id}">
-                  <span class="pill match">{r.match_type}</span>
-                  <span class="pattern num">{r.pattern}</span>
-                  <span class="arrow" aria-hidden="true">→</span>
-                  <span class="target">{r.category_path}</span>
-                  <span class="prio num">p{r.priority}</span>
-                  <span class="pill state">{r.enabled ? "on" : "off"}</span>
-                </li>
-              {/each}
-            </ul>
+            <div class="inline-form rule-form">
+              <select
+                bind:value={nrMatchType}
+                class="match-select"
+                aria-label="Match type"
+                data-testid="rule-add-match-type"
+              >
+                {#each MATCH_TYPES as m (m)}
+                  <option value={m}>{m}</option>
+                {/each}
+              </select>
+              <input
+                bind:value={nrPattern}
+                class="pattern-input"
+                placeholder={patternHint}
+                aria-label="Rule pattern"
+                data-testid="rule-add-pattern"
+                onkeydown={(e) => e.key === "Enter" && addRuleSubmit()}
+              />
+              <select
+                bind:value={nrCategory}
+                class="cat-select"
+                aria-label="Target category"
+                data-testid="rule-add-category"
+              >
+                {#each catOptions as c (c.id)}
+                  <option value={c.id}>{c.path}</option>
+                {/each}
+              </select>
+              <input
+                type="number"
+                bind:value={nrPriority}
+                class="prio-input"
+                aria-label="Rule priority"
+                placeholder="100"
+                data-testid="rule-add-priority"
+              />
+              <button
+                class="gold"
+                onclick={addRuleSubmit}
+                disabled={!activeTaxonomy || nrCategory == null || !nrPattern.trim()}
+                data-testid="rule-add-go"
+              >
+                ＋ Add rule
+              </button>
+            </div>
+            {#if catOptions.length === 0}
+              <p class="hint">
+                A rule needs a target category — add one in the category tree above (a category
+                appears there once a rule targets it).
+              </p>
+            {/if}
+            {#if (rules ?? []).length === 0}
+              <p class="msg" data-testid="mapping-empty-rules">No rules in this taxonomy yet.</p>
+            {:else}
+              <ul class="rules">
+                {#each rules as r (r.id)}
+                  <li class="rule-row" class:off={!r.enabled} data-testid="rule-row-{r.id}">
+                    <span class="pill match">{r.match_type}</span>
+                    <span class="pattern num">{r.pattern}</span>
+                    <span class="arrow" aria-hidden="true">→</span>
+                    <span class="target">{r.category_path}</span>
+                    <span class="prio num">p{r.priority}</span>
+                    <span class="pill state">{r.enabled ? "on" : "off"}</span>
+                    <button
+                      class="op danger-op"
+                      onclick={() => askRuleDelete(r)}
+                      title="Delete rule {r.pattern}"
+                      aria-label="Delete rule {r.pattern}"
+                      data-testid="rule-delete-{r.id}"
+                    >
+                      ✕
+                    </button>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
           {/if}
         </section>
 
@@ -727,15 +862,21 @@
               {#if confirm.kind === "taxonomy"}
                 Its categories, rules and mapped assignments are removed with it. Your assets'
                 raw tags are untouched.
-              {:else}
+              {:else if confirm.kind === "category"}
                 Its subtree, rules and mapped assignments are removed with it. Your assets' raw
                 tags are untouched.
+              {:else}
+                The rule stops mapping this pattern — no tags or assignments are touched.
               {/if}
             </p>
             <div class="confirm-ops">
               <button onclick={() => (confirm = null)} data-testid="mapping-confirm-cancel">Cancel</button>
               <button class="danger" onclick={onConfirmGo} data-testid="mapping-confirm-go">
-                {confirm.kind === "taxonomy" ? "Delete taxonomy" : "Delete category"}
+                {confirm.kind === "taxonomy"
+                  ? "Delete taxonomy"
+                  : confirm.kind === "category"
+                    ? "Delete category"
+                    : "Delete rule"}
               </button>
             </div>
           </div>
@@ -1192,6 +1333,39 @@
   .inline-form input:focus {
     outline: none;
     border-color: var(--ls-gold);
+  }
+  .rule-form {
+    flex-wrap: wrap;
+    margin-bottom: var(--sp-2);
+  }
+  .rule-form select,
+  .rule-form input {
+    height: var(--control-h);
+    padding: 0 var(--sp-2);
+    background: var(--ls-bg);
+    border: 1px solid var(--ls-border-strong);
+    border-radius: var(--r-md);
+    color: var(--ls-text);
+    font: inherit;
+    font-size: var(--fs-sm);
+  }
+  .rule-form select:focus,
+  .rule-form input:focus {
+    outline: none;
+    border-color: var(--ls-gold);
+  }
+  .rule-form .match-select {
+    min-width: 120px;
+  }
+  .rule-form .pattern-input {
+    min-width: 140px;
+  }
+  .rule-form .cat-select {
+    flex: 1;
+    min-width: 150px;
+  }
+  .rule-form .prio-input {
+    width: 76px;
   }
   .root-form {
     margin: var(--sp-2) 0 0;

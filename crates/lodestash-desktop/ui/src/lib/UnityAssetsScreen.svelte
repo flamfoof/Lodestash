@@ -5,7 +5,9 @@
    * and **Open →** into the three-pane pack browser (PACK-DIRECTORY-NAV) rooted at the pack.
    *
    * Per-pack Extract and the §5.2 import dialog ride the B2b ingest path and are documented as
-   * blocked; the ◉ Stats modal is the UI-SPEC §15 slice not yet ported.
+   * blocked; the ◉ Stats modal (UI-SPEC §15) opens per pack with the summary numbers the catalog
+   * exposes — the per-type CONTENTS/TAGS/HEAVIEST breakdown isn't in the web API, so the modal
+   * says so rather than inventing it.
    */
   import Icon from "./Icon.svelte";
   import { packages, setPackagePinned, fmtSize, type PackageRow } from "./api";
@@ -15,6 +17,22 @@
   let error = $state<string | null>(null);
   let q = $state("");
   let pinnedOnly = $state(false);
+
+  /** The pack whose stats modal is open, if any (UI-SPEC §15). */
+  let statsRow = $state<PackageRow | null>(null);
+  let sheetRef = $state<HTMLDivElement | null>(null);
+
+  // Focus the dialog when it opens so Tab/Escape work immediately (review B10e).
+  $effect(() => {
+    if (statsRow) sheetRef?.focus();
+  });
+
+  function onkeydown(e: KeyboardEvent) {
+    if (e.key === "Escape") {
+      statsRow = null;
+      e.preventDefault();
+    }
+  }
 
   async function load() {
     try {
@@ -76,6 +94,7 @@
   }
 </script>
 
+<svelte:window on:keydown={onkeydown} />
 <section class="screen">
   <header>
     <div class="title">
@@ -138,6 +157,9 @@
                     >
                       ⬢
                     </button>
+                    <button class="open" onclick={() => (statsRow = p)} data-testid="stats-{p.id}">
+                      Stats
+                    </button>
                     <button class="open" onclick={() => open(p)} data-testid="open-{p.id}">
                       Open →
                     </button>
@@ -150,6 +172,60 @@
       </div>
     {/if}
   </div>
+
+  {#if statsRow}
+    <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+    <div class="scrim" onclick={() => (statsRow = null)} data-testid="pack-stats">
+      <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+      <div
+        class="sheet"
+        onclick={(e) => e.stopPropagation()}
+        role="alertdialog"
+        tabindex="-1"
+        bind:this={sheetRef}
+        aria-modal="true"
+        aria-labelledby="pack-stats-title"
+      >
+        <div class="sheet-head">
+          <div class="sheet-title">
+            <h3 id="pack-stats-title">{statsRow.name}</h3>
+            <p class="meta">
+              {statsRow.publisher}
+              {#if statsRow.category}<span class="sep">·</span> {statsRow.category}{/if}
+            </p>
+          </div>
+          <button
+            class="close"
+            aria-label="Close pack stats"
+            onclick={() => (statsRow = null)}
+            data-testid="pack-stats-close"
+          >
+            ✕
+          </button>
+        </div>
+
+        <div class="grid" data-testid="pack-stats-grid">
+          <div class="tile">
+            <span class="num value">{statsRow.count.toLocaleString()}</span>
+            <span class="label">indexed assets</span>
+          </div>
+          <div class="tile" class:warn={statsRow.unidentified > 0}>
+            <span class="num value">{statsRow.unidentified.toLocaleString()}</span>
+            <span class="label">unidentified</span>
+          </div>
+          <div class="tile">
+            <span class="num value">{fmtSize(statsRow.bytes)}</span>
+            <span class="label">size</span>
+          </div>
+        </div>
+
+        <p class="note" data-testid="pack-stats-note">
+          Per-type contents breakdown isn't available in this build yet — the catalog only exposes
+          the totals above.
+        </p>
+      </div>
+    </div>
+  {/if}
 </section>
 
 <style>
@@ -322,5 +398,90 @@
   }
   .num {
     font-variant-numeric: tabular-nums;
+  }
+  .scrim {
+    position: fixed;
+    inset: 0;
+    background: rgb(0 0 0 / 0.6);
+    display: grid;
+    place-items: center;
+    z-index: 100;
+  }
+  .sheet {
+    width: min(420px, 92vw);
+    background: var(--ls-surface);
+    border: 1px solid var(--ls-border-strong);
+    border-radius: var(--r-lg);
+    padding: var(--sp-4);
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+  }
+  .sheet-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--sp-2);
+    padding: 0;
+    flex-wrap: nowrap;
+  }
+  .sheet h3 {
+    margin: 0;
+    font-size: var(--fs-lg);
+  }
+  .meta {
+    margin: var(--sp-1) 0 0;
+    font-size: var(--fs-sm);
+    color: var(--ls-text-muted);
+  }
+  .sep {
+    color: var(--ls-text-dim);
+  }
+  .close {
+    flex: none;
+    width: var(--control-h);
+    height: var(--control-h);
+    background: none;
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-sm);
+    color: var(--ls-text-dim);
+    font: inherit;
+    cursor: pointer;
+  }
+  .close:hover {
+    color: var(--ls-gold-bright);
+    border-color: var(--ls-gold);
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: var(--sp-2);
+  }
+  .tile {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-1);
+    padding: var(--sp-3);
+    background: var(--ls-bg);
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-md);
+  }
+  .tile .value {
+    font-size: var(--fs-xl);
+    font-weight: 700;
+  }
+  .tile.warn .value {
+    color: var(--ls-gold-bright);
+  }
+  .tile .label {
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .note {
+    margin: 0;
+    font-size: var(--fs-sm);
+    color: var(--ls-text-dim);
   }
 </style>

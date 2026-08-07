@@ -72,6 +72,8 @@
 
 <button
   class="card"
+  class:identified={!unidentified}
+  class:unidentified={unidentified}
   class:selected
   style="--tint: {tint}"
   onclick={() => onselect?.(item.asset_id)}
@@ -156,6 +158,9 @@
     padding: var(--sp-3);
     background: var(--ls-surface);
     border: 1px solid var(--ls-border);
+    /* F1: a 3px status rail on the left edge — gold when identified/confirmed, grey when
+       discovered/indexed. Kept as a width on the base so the rail never pops the layout. */
+    border-left-width: 3px;
     border-radius: var(--r-lg);
     text-align: left;
     overflow: hidden;
@@ -175,6 +180,16 @@
     border-color: var(--ls-gold);
     box-shadow: 0 0 0 1px var(--ls-gold);
   }
+  /* F1: the left rail carries identification status, scannable across a whole row at a glance
+     (the corner gem still carries the same fact on the artwork — the gem stays). Sits after
+     .card:hover/.card.selected so the rail keeps its status colour while the other sides tint
+     on hover; equal specificity means later wins here. */
+  .card.identified {
+    border-left-color: var(--ls-gold);
+  }
+  .card.unidentified {
+    border-left-color: var(--ls-status-unidentified);
+  }
 
   .thumb {
     position: relative;
@@ -192,6 +207,13 @@
     width: 100%;
     height: 100%;
     object-fit: contain;
+    /* F5 hover-spin: a slow, gentle lift-and-turn so previews feel alive on hover. `.thumb`'s
+       overflow:hidden keeps the rotated preview inside the rounded artwork box, and the stage
+       button / overlays are absolutely positioned above the image, so they stay put. */
+    transition: transform 0.8s ease;
+  }
+  .card:hover .thumb img {
+    transform: rotate(8deg) scale(1.05);
   }
 
   /* Star and status share the top-right corner (FEATURES §1.1) so the artwork's top-left stays

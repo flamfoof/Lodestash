@@ -39,6 +39,7 @@
   } from "./lib/api";
   import { refreshTraitColors } from "./lib/traits.svelte";
   import Onboarding from "./lib/Onboarding.svelte";
+  import { push, dismiss, toasts } from "./lib/toasts.svelte";
 
   let status = $state<LibraryStatus | null>(null);
   let reloading = $state(false);
@@ -138,15 +139,24 @@
   let confirming = $state(false);
   let actionError = $state<string | null>(null);
 
-  /** Run a write, surface any failure, and make every screen re-ask its question. */
-  async function write(run: () => Promise<unknown>) {
+  /**
+   * Run a write, surface any failure, and make every screen re-ask its question. On success,
+   * `ok` (when given) turns the result into a confirmation toast (B10c) — failures stay on the
+   * action-error bar, never a toast.
+   */
+  async function write(run: () => Promise<unknown>, ok?: (changed: number) => string | null) {
     actionError = null;
     try {
-      await run();
+      const res = (await run()) as { changed?: number } | null | undefined;
       view.dataVersion += 1;
       status = await libraryStatus();
       // A write may have styled/demoted a trait — chips across the app should follow.
       refreshTraitColors();
+      if (ok) {
+        const changed = typeof res?.changed === "number" ? res.changed : 1;
+        const msg = ok(changed);
+        if (msg) push(msg);
+      }
     } catch (e) {
       actionError = String(e);
     }
@@ -242,7 +252,13 @@
       {:else if view.route === "stats"}
         <StatsScreen />
       {:else if view.route === "dups"}
-        <DuplicatesScreen ontrash={(ids) => write(() => setTrashed(ids, true))} />
+        <DuplicatesScreen
+          ontrash={(ids) =>
+            write(() => setTrashed(ids, true), (n) =>
+              n === 1 ? "Moved to Trash" : `Moved ${n} assets to Trash`,
+            )
+          }
+        />
       {:else if onLibrary}
         <LibraryScreen
           {status}
@@ -259,10 +275,20 @@
         assetId={view.selected}
         favorite={selectedDetail?.favorite ?? false}
         trashed={selectedDetail?.trashed ?? false}
-        onfavorite={(on) => write(() => setFavorite([view.selected!], on))}
-        ontrash={() => write(() => setTrashed([view.selected!], true)).then(afterRemoval)}
-        onrestore={() => write(() => setTrashed([view.selected!], false)).then(afterRemoval)}
-        onremove={() => write(() => removeFromLibrary([view.selected!])).then(afterRemoval)}
+        onfavorite={(on) =>
+          write(() => setFavorite([view.selected!], on), () =>
+            on ? "Added to Favorites" : "Removed from Favorites",
+          )
+        }
+        ontrash={() =>
+          write(() => setTrashed([view.selected!], true), () => "Moved to Trash").then(afterRemoval)
+        }
+        onrestore={() =>
+          write(() => setTrashed([view.selected!], false), () => "Restored from Trash").then(afterRemoval)
+        }
+        onremove={() =>
+          write(() => removeFromLibrary([view.selected!]), () => "Removed from Library").then(afterRemoval)
+        }
         ondelete={() => (confirming = true)}
       />
     {/if}
@@ -274,8 +300,14 @@
     <ConfirmDelete
       names={[selectedDetail.name]}
       paths={[selectedDetail.abs_path]}
-      onconfirm={() => write(() => deleteFromDisk([selectedDetail!.asset_id])).then(afterRemoval)}
-      onremove={() => write(() => removeFromLibrary([selectedDetail!.asset_id])).then(afterRemoval)}
+      onconfirm={() =>
+        write(() => deleteFromDisk([selectedDetail!.asset_id]), (n) =>
+          n === 1 ? "Deleted from disk" : `Deleted ${n} files from disk`,
+        ).then(afterRemoval)
+      }
+      onremove={() =>
+        write(() => removeFromLibrary([selectedDetail!.asset_id]), () => "Removed from Library").then(afterRemoval)
+      }
       oncancel={() => (confirming = false)}
     />
   {/if}
@@ -288,6 +320,22 @@
 
   {#if onboardingOpen}
     <Onboarding onclose={() => (onboardingOpen = false)} />
+  {/if}
+
+  {#if toasts.length > 0}
+    <div class="toasts" data-testid="toast-host" aria-live="polite">
+      {#each toasts as t (t.id)}
+        <div class="toast {t.kind}" data-testid="toast" role="status">
+          <span class="msg">{t.msg}</span>
+          <button
+            class="dismiss"
+            data-testid="toast-dismiss"
+            aria-label="Dismiss notification"
+            onclick={() => dismiss(t.id)}
+          >✕</button>
+        </div>
+      {/each}
+    </div>
   {/if}
 
   {#if actionError}
@@ -327,6 +375,53 @@
     min-width: 0;
     background: var(--ls-bg);
   }
+  /* Toasts (I5/B10c): bottom-right, floating above the 24px statusbar (DESIGN-GUIDELINES §7 —
+     `--ls-overlay`, 1px accent left-border by type: ok → success, err → danger). */
+  .toasts {
+    position: fixed;
+    right: var(--sp-4);
+    bottom: calc(24px + var(--sp-4));
+    z-index: 80;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: var(--sp-2);
+    pointer-events: none;
+  }
+  .toast {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+    max-width: 340px;
+    padding: var(--sp-2) var(--sp-3);
+    background: var(--ls-overlay);
+    border: 1px solid var(--ls-border);
+    border-left: 3px solid var(--accent, var(--ls-success));
+    border-radius: var(--r-md);
+    font-size: var(--fs-sm);
+    color: var(--ls-text);
+    pointer-events: auto;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+  }
+  .toast.ok {
+    --accent: var(--ls-success);
+  }
+  .toast.err {
+    --accent: var(--ls-danger);
+  }
+  .toast .msg {
+    min-width: 0;
+  }
+  .toast .dismiss {
+    flex: none;
+    font-size: var(--fs-sm);
+    line-height: 1;
+    color: var(--ls-text-dim);
+  }
+  .toast .dismiss:hover {
+    color: var(--ls-text);
+  }
+
   /* A failed write is never silent: the frontend cannot know whether the catalog changed, so
      saying nothing would leave the user believing an action happened. */
   .action-error {

@@ -3,7 +3,7 @@
   import { NAV } from "./routes";
   import { view } from "./nav.svelte";
 
-  import type { LibraryStatus } from "./api";
+  import { packages, type LibraryStatus, type PackageRow } from "./api";
 
   /**
    * The rail reads its badges *and* its facet counts off one status object rather than a separate
@@ -16,6 +16,28 @@
     unidentified: status?.unidentified ?? 0,
     dups: status?.duplicate_groups ?? 0,
     trashed: status?.trashed ?? 0,
+  });
+
+  /**
+   * Pinned Unity packages (UI-SPEC §15), listed at the top of the LIBRARIES facet as shortcuts
+   * into the Unity Assets screen. Empty until `packages()` says otherwise — an empty pin set
+   * renders no section at all.
+   */
+  let pinned = $state<PackageRow[]>([]);
+
+  async function loadPinned() {
+    try {
+      pinned = (await packages()).filter((p) => p.pinned);
+    } catch {
+      pinned = [];
+    }
+  }
+
+  $effect(() => {
+    status;
+    view.route;
+    view.dataVersion;
+    loadPinned();
   });
 
   /**
@@ -88,6 +110,20 @@
 
   <div class="group">
     <h2>Libraries</h2>
+    {#if pinned.length > 0}
+      <h2 class="sub">Pinned</h2>
+      {#each pinned as p (p.id)}
+        <button
+          class="facet pinned"
+          onclick={() => view.go("unity")}
+          title="Open Unity Assets"
+          data-testid="pinned-{p.id}"
+        >
+          <span class="pin" aria-hidden="true">⬢</span>
+          <span class="label">{p.name}</span>
+        </button>
+      {/each}
+    {/if}
     <button
         class="facet"
         class:on={view.source === null}
@@ -216,6 +252,14 @@
   .count {
     font-size: var(--fs-xs);
     color: var(--ls-text-dim);
+  }
+  /* The Pinned sub-heading sits between the Libraries heading and the facet rows. */
+  .group h2.sub {
+    margin-top: var(--sp-3);
+  }
+  .pin {
+    flex: none;
+    color: var(--ls-gold-bright);
   }
   .add {
     margin-top: var(--sp-1);

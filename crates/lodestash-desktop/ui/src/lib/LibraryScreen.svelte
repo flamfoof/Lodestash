@@ -24,6 +24,8 @@
   let result = $state<GridPage | null>(null);
   let error = $state<string | null>(null);
   let quickLook = $state<number | null>(null);
+  /** Unidentified nudge (D8 / KANBAN B10d): ✕ hides it for the rest of the session. */
+  let nudgeDismissed = $state(false);
 
   // ---- Bulk-bar tag edits (KANBAN B9d) -----------------------------------
   // The tag value input, in the default `free` namespace. `bulkBusy` guards the writer thread
@@ -64,7 +66,16 @@
   function onkeydown(e: KeyboardEvent) {
     // Never steal keys from the search box.
     if (e.target instanceof HTMLInputElement) return;
-    if (e.key === "Enter" && quickLook === null && view.selected !== null) {
+    // Enter or Space opens Quick Look on the selection (UI-SPEC §0.4). Space is the native
+    // activation key for buttons — a focused bulk-bar button or nudge CTA must keep its
+    // Space, so only fire from a bare body/card position, never from a focused control.
+    if (e.target instanceof HTMLTextAreaElement) return;
+    if (e.target instanceof HTMLButtonElement || e.target instanceof HTMLSelectElement) return;
+    if (
+      (e.key === "Enter" || e.code === "Space") &&
+      quickLook === null &&
+      view.selected !== null
+    ) {
       quickLook = view.selected;
       e.preventDefault();
     }
@@ -132,6 +143,26 @@
   </header>
 
   <Toolbar total={result?.total ?? 0} favorites={status?.favorites ?? 0} />
+
+  {#if view.browse === "flat" && !nudgeDismissed && (status?.unidentified ?? 0) > 0}
+    <!-- Unidentified nudge (D8/B10d): flat browse only, session-dismissable, routes to Identify. -->
+    <div class="nudge" role="status" data-testid="unidentified-banner">
+      <span class="text">
+        ✦ <span class="num">{status!.unidentified}</span> assets still unidentified — run Identify
+      </span>
+      <button class="go" onclick={() => view.go("identify")} data-testid="unidentified-go">
+        Identify
+      </button>
+      <button
+        class="x"
+        aria-label="Dismiss unidentified nudge"
+        onclick={() => (nudgeDismissed = true)}
+        data-testid="unidentified-dismiss"
+      >
+        ✕
+      </button>
+    </div>
+  {/if}
 
   {#if view.packageFilter || view.collectionFilter}
     <!-- A filter you cannot see is a library that has quietly gone missing. -->
@@ -351,6 +382,50 @@
     font: inherit;
     font-size: var(--fs-sm);
     cursor: pointer;
+  }
+
+  /* Unidentified nudge (D8/B10d): slim amber banner above the grid, flat browse only. */
+  .nudge {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    flex-wrap: wrap;
+    margin: 0 var(--sp-5) var(--sp-2);
+    padding: var(--sp-1) var(--sp-3);
+    background: color-mix(in srgb, var(--ls-surface-raised) 85%, var(--ls-warning) 15%);
+    border: 1px solid color-mix(in srgb, var(--ls-warning) 45%, transparent);
+    border-radius: var(--r-md);
+    color: var(--ls-warning);
+  }
+  .nudge .text {
+    flex: 1;
+    min-width: 0;
+    font-size: var(--fs-sm);
+  }
+  .nudge .num {
+    color: var(--ls-gold-bright);
+  }
+  .nudge button {
+    padding: 2px var(--sp-3);
+    border: 1px solid transparent;
+    border-radius: var(--r-md);
+    font-size: var(--fs-sm);
+  }
+  .nudge button.go {
+    border-color: color-mix(in srgb, var(--ls-warning) 55%, transparent);
+    background: color-mix(in srgb, var(--ls-warning) 12%, transparent);
+    color: var(--ls-warning);
+  }
+  .nudge button.go:hover {
+    border-color: var(--ls-warning);
+    color: var(--ls-gold-bright);
+  }
+  .nudge button.x {
+    color: var(--ls-text-dim);
+  }
+  .nudge button.x:hover {
+    color: var(--ls-warning);
   }
 
   .msg {

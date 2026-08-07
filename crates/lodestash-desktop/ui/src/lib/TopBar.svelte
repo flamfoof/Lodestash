@@ -8,6 +8,22 @@
 
   /** Tab id → live count (UI-SPEC §0.3). Falls back to 0 so a missing payload renders counts of 0. */
   let tabCounts = $derived(new Map((status?.tab_counts ?? []).map((t) => [t.id, t.count])));
+
+  /**
+   * Health meter (UI-SPEC §0.1.5): the two-word status vocabulary maps to the same buckets as the
+   * STATUS facet — `identified` + `confirmed` read as Identified, everything else as Unidentified
+   * (see `STATUSES` / `statusLabel` in api.ts). The bar's denominator is the sum of those two
+   * buckets, not `total_assets`, so trashed/removed assets never skew the split.
+   */
+  let identified = $derived((status?.identified ?? 0) + (status?.confirmed ?? 0));
+  let unidentified = $derived(status?.unidentified ?? 0);
+  let identifiedPct = $derived((identified + unidentified) > 0 ? (identified / (identified + unidentified)) * 100 : 0);
+
+  /** Compact counts like the tab counters, but 12,400 → "12,4k" so the bar stays narrow. */
+  const fmtCount = (n: number) =>
+    n >= 1000
+      ? `${(n / 1000).toLocaleString(undefined, { maximumFractionDigits: 1 })}k`
+      : n.toLocaleString();
 </script>
 
 <header class="topbar">
@@ -62,6 +78,19 @@
       {/if}
     {/each}
   </nav>
+
+  {#if status}
+    <div class="health" role="group" title="Identified vs. unidentified assets" aria-label="Identified vs. unidentified" data-testid="health-meter">
+      <div class="health-bar" aria-hidden="true">
+        <span class="health-seg" style="--pct: {identifiedPct}%"></span>
+      </div>
+      <span class="health-text">
+        <span class="health-id num">{fmtCount(identified)} identified</span>
+        <span class="health-sep">·</span>
+        <span class="health-unid num">{fmtCount(unidentified)} unidentified</span>
+      </span>
+    </div>
+  {/if}
 
   <div class="chips">
     <span class="chip"><Icon name="ls-project" size={14} /> No project</span>
@@ -177,6 +206,44 @@
   .tabs {
     display: flex;
     gap: var(--sp-1);
+  }
+
+  .health {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    padding: 0 var(--sp-2);
+    white-space: nowrap;
+    flex: none;
+  }
+  .health-bar {
+    width: 56px;
+    height: 2px;
+    border-radius: var(--r-sm);
+    background: var(--ls-border-strong);
+    overflow: hidden;
+    flex: none;
+  }
+  .health-seg {
+    display: block;
+    height: 100%;
+    width: var(--pct, 0%);
+    background: var(--ls-gold);
+    border-radius: var(--r-sm);
+  }
+  .health-text {
+    display: flex;
+    align-items: baseline;
+    gap: var(--sp-1);
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+  }
+  .health-id {
+    color: var(--ls-gold);
+  }
+  .health-sep {
+    color: var(--ls-text-dim);
+    opacity: 0.6;
   }
 
   .chips {
