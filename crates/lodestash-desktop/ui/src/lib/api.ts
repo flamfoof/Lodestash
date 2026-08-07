@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 export type GridItem = {
   asset_id: number;
@@ -321,6 +322,20 @@ export interface JobsView {
 export const jobs = () => invoke<JobsView>("jobs");
 /** Ask one active job to stop (extract workers cancel between reads). */
 export const cancelJob = (jobId: number) => invoke<boolean>("cancel_job", { jobId });
+
+// ── Pump events (B2b) ────────────────────────────────────────────────────────────────────────
+
+/**
+ * Subscribe to writer-side change events (`ls:changed`). `kind` is "catalog" (re-read status
+ * + the current page) or "jobs" (refetch the tray). Returns an unsubscribe function.
+ */
+export function onChanged(kind: string, cb: () => void): () => void {
+  let unlisten: (() => void) | null = null;
+  listen<{ kind: string }>("ls:changed", (e) => {
+    if (e.payload.kind === kind) cb();
+  }).then((u) => (unlisten = u));
+  return () => unlisten?.();
+}
 export const addCategory = (
   taxonomyId: number,
   parentId: number | null,

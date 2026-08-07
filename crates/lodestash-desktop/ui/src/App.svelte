@@ -22,6 +22,7 @@ import JobTray from "./lib/JobTray.svelte";
   import DropZone from "./lib/DropZone.svelte";
   import {
     libraryStatus,
+    onChanged,
     reloadLibrary,
     assetDetail,
     setFavorite,
@@ -50,13 +51,11 @@ import JobTray from "./lib/JobTray.svelte";
   const ROW_H: Record<string, number> = { compact: 32, cozy: 36, large: 40 };
   let rowH = $derived(ROW_H[view.density] ?? 36);
 
-  // Re-ask the sidebar's facet counts whenever the route changes **or a dataVersion bump**
-  // signals a mutation (add-source, identify kicks, bulk edits) — a mutation made on
-  // Traits / Collections / Settings / Inspector refreshes app status only when it went
-  // through the top-level write(); the bump + navigation are the cheap catch-alls.
+  // Re-ask the sidebar's facet counts whenever the route changes — navigating is the cheap
+  // catch-all. Catalog mutations no longer poll here: the writer pushes `ls:changed` events
+  // (pump events, B2b) and `onCatalogChanged` below refreshes status + the grid page.
   $effect(() => {
     view.route;
-    view.dataVersion;
     let stale = false;
     libraryStatus().then((s) => {
       if (!stale) status = s;
@@ -64,6 +63,20 @@ import JobTray from "./lib/JobTray.svelte";
     return () => {
       stale = true;
     };
+  });
+
+  // Pump events (B2b): the writer's change notification. "catalog" = the library changed —
+  // refresh status and bump the page version so the current grid/list re-reads.
+  $effect(() => {
+    const off = onChanged("catalog", async () => {
+      try {
+        status = await libraryStatus();
+      } catch {
+        /* the next event or navigation re-asks */
+      }
+      view.dataVersion += 1;
+    });
+    return off;
   });
 
   libraryStatus()

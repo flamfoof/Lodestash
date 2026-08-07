@@ -4,23 +4,27 @@
    * extraction (with byte progress + per-job cancel), appraise kicks (spinner), imports.
    * Active rows keep the tray open; the session ring of finished jobs stays under a toggle.
    */
-  import { jobs, cancelJob, type JobsView } from "./api";
+  import { jobs, cancelJob, onChanged, type JobsView } from "./api";
 
   let view = $state<JobsView>({ active: [], recent: [] });
   let open = $state(false);
   let error = $state<string | null>(null);
 
-  // The writer owns the registry; the tray is a 1s poll. Cheap read (an Arc<Mutex> snapshot).
+  // The writer pushes `ls:changed` events when the tray changes (pump events, B2b) — no
+  // polling. The initial fetch covers whatever happened before this component mounted.
   $effect(() => {
-    const t = setInterval(async () => {
+    jobs()
+      .then((jv) => (view = jv))
+      .catch((e) => (error = String(e)));
+    const off = onChanged("jobs", async () => {
       try {
         view = await jobs();
         if (view.active.length > 0) open = true;
       } catch (e) {
         error = String(e);
       }
-    }, 1000);
-    return () => clearInterval(t);
+    });
+    return off;
   });
 
   async function cancel(jobId: number) {

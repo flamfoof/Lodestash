@@ -807,12 +807,10 @@ pub fn run() {
         "catalog"
     );
 
-    // One writer for the process (ARCHITECTURE §5), spawned before any command can run.
+    // One writer for the process (ARCHITECTURE §5), spawned in `setup` — it needs the
+    // AppHandle to push change events (pump events, B2b) to the Svelte shell.
     let pump = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let job_registry = crate::writer::JobRegistry::default();
-    let writer = lodestash_app::paths::catalog_db_path()
-        .filter(|p| p.exists())
-        .map(|p| Writer::spawn(p, pump.clone(), job_registry.clone()));
 
     tauri::Builder::default()
         // Window geometry (size/position/maximized) is remembered across launches and restored
@@ -843,17 +841,25 @@ pub fn run() {
                 }
             }
         })
-        .manage(AppState {
-            library: Mutex::new(library),
-            writer,
-            pump,
-            jobs: job_registry,
+        .setup(|app| {
+            // One writer for the process (ARCHITECTURE §5), spawned before any command can
+            // run — setup runs before the event loop. It carries the AppHandle so changes
+            // are pushed to the shell (pump events, B2b) instead of the UI polling.
+            let writer = lodestash_app::paths::catalog_db_path()
+                .filter(|p| p.exists())
+                .map(|p| Writer::spawn(p, pump.clone(), job_registry.clone(), Some(app.handle().clone())));
+            app.manage(AppState {
+                library: Mutex::new(library),
+                writer,
+                pump,
+                jobs: job_registry,
+            });
+            Ok(())
         })
         .register_uri_scheme_protocol("lodestash", |ctx, req| {
             let state = ctx.app_handle().state::<AppState>();
             protocol::handle(&state.library, &req)
-        })
-        .invoke_handler(tauri::generate_handler![
+        })        .invoke_handler(tauri::generate_handler![
             app_info,
             library_status,
             grid_page,

@@ -297,7 +297,10 @@ until B7.
       unpacking **one at a time** per UI-SPEC §5), the **`+ Add source…`** native folder chooser
       (`tauri-plugin-dialog`), and the **job tray** (bottom-left: active jobs with progress +
       per-job ✕ cancel, session ring of finished jobs; UnityAssets gained tick boxes +
-      "▶ Extract selected (N)" + Cancel queue). Still on B1: the 33 ms `Engine` pump itself.
+      "▶ Extract selected (N)" + Cancel queue). **Pump events shipped 2026-08-07:** the writer
+      pushes `ls:changed` (`catalog` | `jobs`) through the AppHandle — the UI stopped polling
+      status/tray; extract workers push throttled progress events. Still on B1: the 33 ms
+      `Engine` pump itself.
 - [~] **B5 — writes.** *First slice shipped 2026-08-03.* Favourite, Move to Trash / Restore,
       **Remove from library**, delete-from-disk with its confirm dialog, and a Trash view.
       **Rating is out of scope** (parked — [`DATA-MODEL.md`](DATA-MODEL.md) §12).

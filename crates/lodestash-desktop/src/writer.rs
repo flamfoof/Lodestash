@@ -335,6 +335,21 @@ pub struct Writer {
     tx: Sender<WriterMsg>,
 }
 
+/// One writer-side change, pushed to the Svelte shell (pump events, B2b) so the UI stops
+/// polling. `catalog` = the library changed (re-read status + the current page); `jobs` =
+/// the tray changed (refetch the snapshot).
+#[derive(Clone, serde::Serialize)]
+struct ChangedEvent {
+    kind: &'static str,
+}
+
+fn emit_changed(app: &Option<tauri::AppHandle>, kind: &'static str) {
+    if let Some(handle) = app {
+        use tauri::Emitter;
+        let _ = handle.emit("ls:changed", ChangedEvent { kind });
+    }
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -345,7 +360,7 @@ fn unix_now() -> i64 {
 impl Writer {
     /// Spawn the writer over `db_path`. The connection is opened **on the thread that owns it**,
     /// never handed across, because that is the whole point of the rule.
-    pub fn spawn(db_path: PathBuf, pump: Arc<AtomicBool>, jobs: JobRegistry) -> Self {
+    pub fn spawn(db_path: PathBuf, pump: Arc<AtomicBool>, jobs: JobRegistry, app: Option<tauri::AppHandle>) -> Self {
         let (tx, rx) = mpsc::channel::<WriterMsg>();
         let writer_tx = tx.clone();
         std::thread::Builder::new()
@@ -400,7 +415,7 @@ impl Writer {
                         Ok(WriterMsg::Op(job)) => {
                             if matches!(job.op, Op::ExtractPackage { .. }) {
                                 if extract_queue.is_empty() && !jobs.has_active_extract() {
-                                    let result = run(&mut catalog, &db_path, job.op, &writer_tx, &jobs, &job.reply);
+                                    let result = run(&mut catalog, &db_path, job.op, &writer_tx, &jobs, &job.reply, &app);
                                     let _ = job.reply.send(result);
                                 } else {
                                     // A pack is unpacking (or queued) — join the queue.
@@ -415,11 +430,13 @@ impl Writer {
                             if appraising {
                                 pump.store(true, Ordering::Relaxed);
                             }
-                            let result = run(&mut catalog, &db_path, job.op, &writer_tx, &jobs, &job.reply);
+                            let result = run(&mut catalog, &db_path, job.op, &writer_tx, &jobs, &job.reply, &app);
                             if appraising {
                                 pump.store(false, Ordering::Relaxed);
                             }
                             let _ = job.reply.send(result);
+                            emit_changed(&app, "catalog");
+                            emit_changed(&app, "jobs");
                         }
                         Ok(WriterMsg::ExtractDone {
                             job_id,
@@ -435,8 +452,10 @@ impl Writer {
                             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
                             jobs.finish(job_id, ok, cancelled, changed);
                             let _ = reply.send(result);
+                            emit_changed(&app, "catalog");
+                            emit_changed(&app, "jobs");
                             if let Some(next) = extract_queue.pop_front() {
-                                let r = run(&mut catalog, &db_path, next.op, &writer_tx, &jobs, &next.reply);
+                                let r = run(&mut catalog, &db_path, next.op, &writer_tx, &jobs, &next.reply, &app);
                                 let _ = next.reply.send(r);
                             }
                         }
@@ -454,21 +473,27 @@ impl Writer {
                             }
                             if idle_appraises {
                                 pump.store(true, Ordering::Relaxed);
-                                let _ = appraise_pass(
+                                let r = appraise_pass(
                                     &mut catalog,
                                     idle_embedder.clone(),
                                     idle_audio.clone(),
                                     std::time::Duration::from_secs(1),
                                 );
                                 pump.store(false, Ordering::Relaxed);
+                                if r.map(|w| w.changed > 0).unwrap_or(false) {
+                                    emit_changed(&app, "catalog");
+                                }
                             } else {
-                                drain_previews(
+                                let n = drain_previews(
                                     &mut catalog,
                                     workspace_dir.as_deref(),
                                     cache_dir.as_deref(),
                                     proxy,
                                     std::time::Duration::from_secs(1),
                                 );
+                                if n > 0 {
+                                    emit_changed(&app, "catalog");
+                                }
                             }
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -539,6 +564,7 @@ fn run(
     tx: &Sender<WriterMsg>,
     jobs: &JobRegistry,
     reply: &Sender<Result<WriteResult, String>>,
+    app: &Option<tauri::AppHandle>,
 ) -> Result<WriteResult, String> {
     match op {
         Op::SetFavorite { ids, on } => catalog
@@ -740,13 +766,26 @@ fn run(
             let wprogress = handles.progress.expect("extract jobs carry progress");
             let wpath = PathBuf::from(&pkg.package_path);
             let wworkspace = workspace_dir;
+            let wapp = app.clone();
             std::thread::Builder::new()
                 .name("extract-worker".into())
                 .spawn(move || {
                     let report_cancel = wcancel.clone();
+                    // Progress events, throttled to ~4/s — the tray bar moves without the UI
+                    // polling or the writer thread being involved at all. The report is a
+                    // `Fn`, so the throttle lives in an atomic, not a captured `Instant`.
+                    let last_progress = AtomicU64::new(0);
                     let report = move |done: u64, total: u64| {
                         wprogress.done.store(done, Ordering::Relaxed);
                         wprogress.total.store(total, Ordering::Relaxed);
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        if now_ms.saturating_sub(last_progress.load(Ordering::Relaxed)) >= 250 {
+                            last_progress.store(now_ms, Ordering::Relaxed);
+                            emit_changed(&wapp, "jobs");
+                        }
                         !report_cancel.load(Ordering::Relaxed)
                     };
                     let outcome = extract_to_workspace_with_progress(&wpath, &wworkspace, &report)
