@@ -580,6 +580,21 @@ until B7.
         ↶ button. Ingest and imports excluded per the card; mapping-rule and trait edits are
         not yet logged.
 
+- [ ] **B10 — small follow-ups pass (2026-08-06).** The audit's visual/keyboard follow-ups +
+      the two B9 leftovers, all doable without the engine. Card uniformity fixed in the parent
+      pass (`6714000`, measured 229.25px uniform).
+  - [ ] **B10a — B6 health meter** in the top bar (UI-SPEC §0.1.5) — counts already flow in `status`.
+  - [ ] **B10b — Space → Quick Look** (UI-SPEC §0.4) — Enter works; add Space.
+  - [ ] **B10c — toasts (I5)** — a toast host; mutations confirm via toast instead of the error bar.
+  - [ ] **B10d — unidentified nudge banner (D8)** + card status **left-border (F1)**.
+  - [ ] **B10e — pack stats modal (I7)** — the ◉ Stats button on pack rows.
+  - [ ] **B10f — pinned libraries in the sidebar LIBRARIES facet (C6)**.
+  - [ ] **B10g — preview_quality render-path wiring** — thumb route honors the setting (high → 512).
+  - [ ] **B10h — model hover-spin (F5)** on card previews.
+  - [ ] **B10i — Mapping rule authoring (B9b follow-up)** — add/delete rule commands + editor UI.
+  - [ ] **B10j — Inspector collection_members read (B9f follow-up)** — real membership instead of local state.
+  - [ ] **B10k — card-uniformity e2e regression** — pin the 229.25px fix.
+
 - [ ] **B1.5 — `lodestash-cli`.** Headless `scan|index|tag|export`; gives the port a smoke test
       needing no window.
 - [ ] **B7 — cutover.** `[[bin]] lodestash` moves to `lodestash-desktop`, **preserving the `--mcp`

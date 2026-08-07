@@ -1316,6 +1316,26 @@ try {
     await page.getByRole("button", { name: "Library", exact: true }).click();
     await page.waitForSelector(".card", { timeout: 5000 });
   });
+
+  // B10k: the grid pins its tracks at `--card` (229.25px), but a `.card` is a <button> and
+  // buttons default to `fit-content` — so a long asset name used to stretch that one card past
+  // its track and leave the row ragged. Every card must sit exactly in its grid track, and the
+  // track is the `.cell` that wraps it, so both are pinned here.
+  await check("every card is exactly its grid track", async () => {
+    await page.waitForSelector(".grid .card", { timeout: 5000 });
+    const widths = await page.evaluate(() =>
+      [...document.querySelectorAll(".grid .card")].map((c) => {
+        const cell = c.closest(".cell");
+        return { card: c.getBoundingClientRect().width, cell: cell?.getBoundingClientRect().width ?? null };
+      }),
+    );
+    assert.ok(widths.length > 0, "no cards on screen — nothing was exercised");
+    const cardWidths = widths.map((w) => w.card);
+    const spread = Math.max(...cardWidths) - Math.min(...cardWidths);
+    assert.ok(spread < 1, `cards span ${spread.toFixed(3)}px — a card is stretching past its track`);
+    const offTrack = widths.filter((w) => w.cell !== null && Math.abs(w.card - w.cell) >= 1);
+    assert.equal(offTrack.length, 0, "a card is wider than the grid cell that wraps it");
+  });
 } finally {
   await app.close();
 }
