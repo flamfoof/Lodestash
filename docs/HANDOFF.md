@@ -4,9 +4,8 @@ Working notes for whoever (or whatever) continues the build. Unlike the rest of 
 is **not** a design spec — it's the state of play, the decisions already settled, and the traps.
 The design docs still win on any question of what the software *should* do.
 
-Last updated: **2026-08-06** — §1.7 is the current handoff (the B9 pass, committed on `main` as
-`fe5bd4d`…`65f842f`); the §1.6 B8 block below it is committed and shipped, and the §1.5 "B5
-writes" block is historical.
+Last updated: **2026-08-06** — §1.8 is the current handoff (the B10 small-follow-ups pass,
+committed `1ae9175`…`7d49aca`); the §1.7/§1.6 blocks below are shipped, and §1.5 is historical.
 it is historical and already shipped.
 
 ---
@@ -84,6 +83,26 @@ narrowed rather than dissolved — `file` and `mesh` serve whole assets and neve
 write lands only in our own cache, so non-destructive holds. **`warm_thumbnails` is still the better
 end state** (user-visible, cancellable, batchable into one skip-scan); it wants the job tray, which
 the Svelte side does not have yet.
+
+## 1.8 Next session: B10 shipped — the backlog is now the engine build (2026-08-06)
+
+**The small follow-ups pass shipped** (KANBAN B10a–k, commits `1ae9175` backend / `c26aa84` UI /
+`7d49aca` e2e+board): health meter, toasts, Space→Quick Look, nudge banner, card status border,
+pack stats modal, pinned-libs facet, preview_quality wiring (thumb_px 128/256/384 + `?q=`
+cache-buster), hover-spin, Mapping rule authoring, Inspector membership read, and the
+card-uniformity e2e regression. Verified: Rust green, svelte-check 0/0, e2e **51/51**.
+
+**Remaining is the engine build (B7), nothing else:** Identify engine (✦ Identify all /
+per-asset / shimmer — port the egui drain + tagger), B2b ingest (per-pack Extract, §5.2 import
+dialog, job tray, `+ Add source…` chooser, DropZone post-import), project switcher / Connect
+wizard, staging commit half, LINKS graph harvest, Mapping rule *engine*, B1.5 `lodestash-cli`,
+and the B7 cutover (retire `lodestash-ui`, preserve `--mcp`).
+
+**Traps carried forward:** single-writer rule; `set_tags` replaces per-source (UI uses
+`add_asset_tag` for appends); undo tail capped 200; config writes only via `edit_config`;
+preview backfill runs on the persist thread idle in 1s slices — `LODESTASH_NO_PREVIEW_DRAIN=1`
+skips it (e2e sets this); the e2e harness taskkills the app, so geometry persists via the
+Moved/Resized save, not exit.
 
 ## 1.7 Next session: the B9 pass shipped — the remaining backlog is the engine build (2026-08-06)
 

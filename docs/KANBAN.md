@@ -580,20 +580,26 @@ until B7.
         ↶ button. Ingest and imports excluded per the card; mapping-rule and trait edits are
         not yet logged.
 
-- [ ] **B10 — small follow-ups pass (2026-08-06).** The audit's visual/keyboard follow-ups +
-      the two B9 leftovers, all doable without the engine. Card uniformity fixed in the parent
-      pass (`6714000`, measured 229.25px uniform).
-  - [ ] **B10a — B6 health meter** in the top bar (UI-SPEC §0.1.5) — counts already flow in `status`.
-  - [ ] **B10b — Space → Quick Look** (UI-SPEC §0.4) — Enter works; add Space.
-  - [ ] **B10c — toasts (I5)** — a toast host; mutations confirm via toast instead of the error bar.
-  - [ ] **B10d — unidentified nudge banner (D8)** + card status **left-border (F1)**.
-  - [ ] **B10e — pack stats modal (I7)** — the ◉ Stats button on pack rows.
-  - [ ] **B10f — pinned libraries in the sidebar LIBRARIES facet (C6)**.
-  - [ ] **B10g — preview_quality render-path wiring** — thumb route honors the setting (high → 512).
-  - [ ] **B10h — model hover-spin (F5)** on card previews.
-  - [ ] **B10i — Mapping rule authoring (B9b follow-up)** — add/delete rule commands + editor UI.
-  - [ ] **B10j — Inspector collection_members read (B9f follow-up)** — real membership instead of local state.
-  - [ ] **B10k — card-uniformity e2e regression** — pin the 229.25px fix.
+- [x] **B10 — small follow-ups pass (2026-08-06).** *All eleven sub-cards shipped 2026-08-06
+      (commits `1ae9175`, `c26aa84`, `7d49aca`); e2e 51/51, svelte-check 0/0.* The audit's
+      visual/keyboard follow-ups + the two B9 leftovers. Card uniformity was fixed in the parent
+      pass (`6714000`, measured 229.25px uniform) and is pinned by the B10k e2e check.
+  - [x] **B10a — B6 health meter** in the top bar (UI-SPEC §0.1.5) — identified/unidentified split bar + counts.
+  - [x] **B10b — Space → Quick Look** (UI-SPEC §0.4) — Space joins Enter on the library's own key
+        handler; never steals Space from a focused button/input/select.
+  - [x] **B10c — toasts (I5)** — `toasts.svelte.ts` store + host; successful mutations toast
+        (failures keep the action-error bar).
+  - [x] **B10d — unidentified nudge banner (D8)** (Identify CTA + dismiss) + card status
+        **left-border (F1)** (gold identified / grey unidentified).
+  - [x] **B10e — pack stats modal (I7)** — ◉ per pack row, focused on open, Esc/✕/scrim close.
+  - [x] **B10f — pinned libraries in the sidebar LIBRARIES facet (C6)**.
+  - [x] **B10g — preview_quality render-path wiring** — thumb route honors `thumb_px()`
+        (128/256/384) + `proxy_budget()`; `?q=` cache-buster on Settings save.
+  - [x] **B10h — model hover-spin (F5)** — subtle rotate+scale on card artwork hover.
+  - [x] **B10i — Mapping rule authoring (B9b follow-up)** — add-rule row + per-rule delete with
+        confirm (add_rule/delete_rule on the writer).
+  - [x] **B10j — Inspector collection_members read (B9f follow-up)** — real membership, not local state.
+  - [x] **B10k — card-uniformity e2e regression** — every card within 1px of its cell width.
 
 - [ ] **B1.5 — `lodestash-cli`.** Headless `scan|index|tag|export`; gives the port a smoke test
       needing no window.
