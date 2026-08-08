@@ -181,6 +181,8 @@ export type PackageRow = {
   count: number;
   unidentified: number;
   bytes: number;
+  triangles: number;
+  by_type: TypeStat[];
   pinned: boolean;
   extracted: boolean;
 };
@@ -483,6 +485,7 @@ export const bulkTag = (assetIds: number[], namespace: string, value: string, on
  * source is minutes. Show a spinner, not a progress bar — real progress needs the job tray.
  */
 export const addSource = (path: string) => invoke<WriteResult>("add_source", { path });
+export const syncUnityCache = () => invoke<WriteResult>("sync_unity_cache");
 /** Native folder chooser for the sidebar's "+ Add source…" (B2b). `null` = cancelled. */
 export const addSourceDialog = () =>
   invoke<WriteResult | null>("add_source_dialog");

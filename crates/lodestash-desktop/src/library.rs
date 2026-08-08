@@ -460,6 +460,10 @@ pub struct PackageRow {
     pub count: usize,
     pub unidentified: usize,
     pub bytes: i64,
+    /// Sum of the package's model triangle counts — the stats sheet's triangles tile.
+    pub triangles: i64,
+    /// Per-media-type breakdown, same shape as the Stats screen's `TypeStat`.
+    pub by_type: Vec<TypeStat>,
     pub pinned: bool,
     /// The pack has been unpacked to the workspace at some point (DATA-MODEL §7).
     pub extracted: bool,
@@ -1188,23 +1192,46 @@ impl Library {
                 return Vec::new();
             }
         };
-        // name -> (indexed, unidentified, bytes), over the live rows.
-        let mut counts: HashMap<&str, (usize, usize, i64)> = HashMap::new();
+        // name -> (indexed, unidentified, bytes, triangles), over the live rows.
+        let mut counts: HashMap<&str, (usize, usize, i64, i64)> = HashMap::new();
+        let mut by_type: HashMap<&str, HashMap<String, (usize, i64, i64)>> = HashMap::new();
         for r in self.live() {
             if let Some(p) = r.item.package.as_deref() {
-                let e = counts.entry(p).or_insert((0, 0, 0));
+                let e = counts.entry(p).or_insert((0, 0, 0, 0));
                 e.0 += 1;
                 if !matches!(r.status, AssetStatus::Identified | AssetStatus::Confirmed) {
                     e.1 += 1;
                 }
                 e.2 += r.item.size_bytes.max(0);
+                e.3 += r.item.triangles.unwrap_or(0);
+                let t = by_type
+                    .entry(p)
+                    .or_default()
+                    .entry(r.item.media_type.clone())
+                    .or_insert((0, 0, 0));
+                t.0 += 1;
+                t.1 += r.item.size_bytes.max(0);
+                t.2 += r.item.triangles.unwrap_or(0);
             }
         }
         listings
             .into_iter()
             .map(|p| {
-                let (count, unidentified, bytes) =
-                    counts.get(p.name.as_str()).copied().unwrap_or((0, 0, 0));
+                let (count, unidentified, bytes, triangles) =
+                    counts.get(p.name.as_str()).copied().unwrap_or((0, 0, 0, 0));
+                let mut types: Vec<TypeStat> = by_type
+                    .remove(p.name.as_str())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(media_type, (count, bytes, triangles))| TypeStat {
+                        media_type,
+                        count,
+                        bytes,
+                        triangles,
+                        duration_ms: 0,
+                    })
+                    .collect();
+                types.sort_by(|a, b| b.count.cmp(&a.count));
                 PackageRow {
                     id: p.id,
                     name: p.name,
@@ -1215,6 +1242,8 @@ impl Library {
                     count,
                     unidentified,
                     bytes,
+                    triangles,
+                    by_type: types,
                     pinned: p.pinned,
                     extracted: p.unpacked_at.is_some(),
                 }

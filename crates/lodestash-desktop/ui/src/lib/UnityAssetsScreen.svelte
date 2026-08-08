@@ -10,7 +10,7 @@
    * says so rather than inventing it.
    */
   import Icon from "./Icon.svelte";
-  import { packages, setPackagePinned, extractPackage, jobs, cancelJob, fmtSize, type PackageRow } from "./api";
+  import { packages, setPackagePinned, extractPackage, jobs, cancelJob, fmtSize, syncUnityCache, type PackageRow } from "./api";
   import { view } from "./nav.svelte";
 
   let rows = $state<PackageRow[] | null>(null);
@@ -51,6 +51,7 @@
   let shown = $derived(
     (rows ?? []).filter((p) => {
       if (pinnedOnly && !p.pinned) return false;
+      if (catFilter !== "all" && p.category !== catFilter) return false;
       const needle = q.trim().toLowerCase();
       return (
         needle === "" ||
@@ -59,6 +60,33 @@
       );
     }),
   );
+
+  // Content-derived filter tabs (FEATURES §5.3): the categories that actually exist in the
+  // cache, with an All tab first.
+  let categories = $derived([
+    "all",
+    ...[...new Set((rows ?? []).map((p) => p.category).filter((c): c is string => !!c))].sort(),
+  ]);
+  let catFilter = $state<string>("all");
+
+  // `↻ Sync` (FEATURES §5.3): re-crawl the Asset Store cache roots so new packs appear.
+  let syncBusy = $state(false);
+  let syncNote = $state<string | null>(null);
+  async function sync() {
+    if (syncBusy) return;
+    syncBusy = true;
+    syncNote = null;
+    try {
+      const r = await syncUnityCache();
+      syncNote = r.changed > 0 ? `Synced — ${r.changed.toLocaleString()} new assets indexed.` : "Up to date — nothing new to index.";
+      await load();
+      view.dataVersion += 1;
+    } catch (e) {
+      syncNote = String(e);
+    } finally {
+      syncBusy = false;
+    }
+  }
 
   let byPublisher = $derived.by(() => {
     const map = new Map<string, PackageRow[]>();
@@ -189,7 +217,29 @@
       <button class="pin-toggle" class:on={pinnedOnly} onclick={() => (pinnedOnly = !pinnedOnly)}>
         ⬢ pinned
       </button>
+      <button class="pin-toggle" onclick={sync} disabled={syncBusy} data-testid="sync-unity">
+        {syncBusy ? "Syncing…" : "↻ Sync"}
+      </button>
     </div>
+    {#if syncNote}
+      <p class="sync-note mono dim" data-testid="sync-note">{syncNote}</p>
+    {/if}
+    {#if categories.length > 1}
+      <div class="cats" role="tablist" aria-label="Pack categories">
+        {#each categories as c (c)}
+          <button
+            class="tab"
+            class:on={catFilter === c}
+            role="tab"
+            aria-selected={catFilter === c}
+            onclick={() => (catFilter = c)}
+            data-testid="cat-{c}"
+          >
+            {c}
+          </button>
+        {/each}
+      </div>
+    {/if}
   </header>
 
   <div class="body">
@@ -333,12 +383,26 @@
             <span class="num value">{fmtSize(statsRow.bytes)}</span>
             <span class="label">size</span>
           </div>
+          <div class="tile">
+            <span class="num value">{statsRow.triangles ? statsRow.triangles.toLocaleString() : "—"}</span>
+            <span class="label">triangles</span>
+          </div>
         </div>
 
-        <p class="note" data-testid="pack-stats-note">
-          Per-type contents breakdown isn't available in this build yet — the catalog only exposes
-          the totals above.
-        </p>
+        {#if statsRow.by_type.length > 0}
+          <div class="types" data-testid="pack-stats-types">
+            {#each statsRow.by_type as t (t.media_type)}
+              <div class="type-row">
+                <span class="type-name">{t.media_type}</span>
+                <span class="type-count mono">{t.count.toLocaleString()}</span>
+                <span class="type-bytes mono dim">{fmtSize(t.bytes)}</span>
+              </div>
+            {/each}
+          </div>
+        {:else}
+          <p class="note">No assets indexed from this pack yet — add its folder as a source to pull
+            the contents in.</p>
+        {/if}
       </div>
     </div>
   {/if}
@@ -378,6 +442,30 @@
   .tools {
     display: flex;
     gap: var(--sp-2);
+    align-items: center;
+  }
+  .cats {
+    display: flex;
+    gap: 4px;
+    margin-top: 10px;
+  }
+  .cats .tab {
+    border: 1px solid var(--ls-border);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--ls-text-dim);
+    font: inherit;
+    font-size: var(--fs-xs);
+    padding: 3px 10px;
+    cursor: default;
+  }
+  .cats .tab.on {
+    border-color: var(--ls-gold);
+    color: var(--ls-gold-bright);
+  }
+  .sync-note {
+    margin: 8px 0 0;
+    font-size: var(--fs-xs);
   }
   .search {
     width: 240px;
@@ -619,6 +707,26 @@
     color: var(--ls-text-dim);
     text-transform: uppercase;
     letter-spacing: 0.04em;
+  }
+  .types {
+    margin-top: 12px;
+    border-top: 1px solid var(--ls-border);
+    padding-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 220px;
+    overflow: auto;
+  }
+  .type-row {
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    gap: 12px;
+    align-items: baseline;
+    font-size: var(--fs-sm);
+  }
+  .type-name {
+    color: var(--ls-text);
   }
   .note {
     margin: 0;

@@ -44,6 +44,10 @@
   let q = $state("");
   let ntName = $state("");
   let ntNamespace = $state("trait");
+  // FEATURES §4.6 scope picker: null = applies to any media type; the enum mirrors the type tabs.
+  let ntScope = $state<string | null>(null);
+  let ntUsage = $state("");
+  let ntTeach = $state(false);
 
   const STYLE_SWATCHES = [
     "--ls-type-model",
@@ -395,8 +399,19 @@
     const name = ntName.trim();
     const namespace = ntNamespace.trim() || "trait";
     if (!name) return;
-    await write(() => upsertTrait({ namespace, value: name, teach: false }));
+    await write(() =>
+      upsertTrait({
+        namespace,
+        value: name,
+        scope: ntScope,
+        usageNote: ntUsage.trim() || null,
+        teach: ntTeach,
+      }),
+    );
     ntName = "";
+    ntUsage = "";
+    ntTeach = false;
+    ntScope = null;
   }
 </script>
 
@@ -455,9 +470,28 @@
             onkeydown={(e) => e.key === "Enter" && createTrait()}
           />
           <input placeholder="Namespace" bind:value={ntNamespace} aria-label="Namespace" />
+          <select bind:value={ntScope} aria-label="Scope" data-testid="new-trait-scope">
+            <option value={null}>Any media type</option>
+            <option value="model_3d">Models</option>
+            <option value="audio">Audio</option>
+            <option value="image">Images</option>
+          </select>
           <button class="gold" onclick={createTrait} disabled={!ntName.trim()} data-testid="new-trait-go">
             + Create
           </button>
+        </div>
+        <div class="fields second">
+          <input
+            class="usage"
+            placeholder="Usage note — what this trait means for a search"
+            bind:value={ntUsage}
+            data-testid="new-trait-usage"
+            onkeydown={(e) => e.key === "Enter" && createTrait()}
+          />
+          <label class="check">
+            <input type="checkbox" bind:checked={ntTeach} data-testid="new-trait-teach" />
+            Teach — used as a candidate label when tagging (AI-PIPELINE §6)
+          </label>
         </div>
       </section>
 

@@ -672,7 +672,15 @@ try {
       { timeout: 5000 },
     );
     const kind = await page.locator('[data-testid="ql-stage"]').getAttribute("data-kind");
-    assert.equal(kind, "not_local", "an in-pack asset must render the not_local explanation");
+    // FEATURES §5.4: an in-pack asset's Quick Look materializes the one payload (size-capped
+    // scratch) — the stage renders the content, not the old 503 explanation. Whole-pack
+    // extraction is still an explicit command; only a pull that actually fails (over the cap,
+    // vanished pack) falls back to `not_local`.
+    assert.notEqual(kind, "not_local", "an in-pack asset must render its content now");
+    assert.ok(
+      kind === "image" || kind === "audio" || kind === "model",
+      `in-pack Quick Look rendered unexpected kind ${kind}`,
+    );
     await page.keyboard.press("Escape");
     await page.fill('input[type="text"]', "");
     await page.waitForTimeout(400);

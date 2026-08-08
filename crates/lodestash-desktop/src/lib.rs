@@ -282,7 +282,15 @@ fn delete_from_disk(
 /// a spinner rather than a progress bar. Real progress needs the job tray, which needs the pump
 /// (B2b); a fake bar that jumps 0 → 100 is worse than an honest spinner.
 #[tauri::command]
-fn add_source(state: tauri::State<'_, AppState>, path: String) -> Result<WriteResult, String> {    let root = PathBuf::from(&path);
+fn add_source(state: tauri::State<'_, AppState>, path: String) -> Result<WriteResult, String> {
+    import_root(&state, &path)
+}
+
+/// Shared by `add_source` and the Unity Assets `↻ Sync`: crawl one folder (incrementally —
+/// unchanged files skip re-hashing), persist, and surface any `.unitypackage`s as browsable
+/// packs. `add_source` refuses pack-only roots; a sync skips them silently.
+fn import_root(state: &tauri::State<'_, AppState>, path: &str) -> Result<WriteResult, String> {
+    let root = PathBuf::from(path);
     if !root.is_dir() {
         // Dropping a *file* is a different feature (import one asset) and pretending otherwise
         // would index its whole parent folder, which is not what anyone meant by dropping a file.
@@ -348,6 +356,46 @@ fn add_source(state: tauri::State<'_, AppState>, path: String) -> Result<WriteRe
     })?;
     tracing::info!(%path, indexed = result.changed, packs = discovered_packs, "source added");
     Ok(result)
+}
+
+/// Unity Assets' `↻ Sync` (FEATURES §5.3): crawl every Asset Store cache root (the
+/// `ASSETSTORE_CACHE_PATH` override first, then the default) so packs that landed since launch
+/// show up without re-adding a folder by hand. Same incremental import as `add_source` — a
+/// re-scan skips unchanged files via `needs_rehash`. Pack-only roots and empty roots are
+/// skipped, not errors.
+#[tauri::command]
+fn sync_unity_cache(state: tauri::State<'_, AppState>) -> Result<WriteResult, String> {
+    let mut changed = 0usize;
+    let mut scanned = 0usize;
+    for root in lodestash_ingest::asset_store::candidate_roots() {
+        if !root.is_dir() {
+            continue;
+        }
+        let config = lodestash_app::config::AppConfig::load();
+        let pack_only = match config.last_project_name.as_deref() {
+            Some(project) => config.is_pack_only(project, &root),
+            None => false,
+        };
+        if pack_only {
+            continue;
+        }
+        match import_root(&state, &root.to_string_lossy()) {
+            Ok(r) => {
+                changed += r.changed;
+                scanned += 1;
+            }
+            Err(e) => tracing::info!(root = %root.display(), %e, "sync root skipped"),
+        }
+    }
+    if scanned == 0 {
+        return Err(
+            "no Unity Asset Store cache found — install Unity or set ASSETSTORE_CACHE_PATH".into(),
+        );
+    }
+    Ok(WriteResult {
+        changed,
+        ..Default::default()
+    })
 }
 
 /// The sidebar's "+ Add source…" chooser (B2b): a native folder dialog, then the same
@@ -1169,6 +1217,7 @@ pub fn run() {
             remove_from_library,
             delete_from_disk,
             add_source,
+            sync_unity_cache,
             add_source_dialog,
             get_web_prefs,
             set_web_prefs,

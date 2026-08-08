@@ -88,7 +88,10 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       (`CrawledFile.hash` → `CrawlRecord.content_hash` → `asset.content_hash` on insert) — the
       Duplicates screen's groups are real. `needs_rehash` (size/mtime-gated re-hash for
       watch-rescans) is the documented ponytail; perceptual near-dup still out of scope.
-- [ ] **Pack stats modal is a stub.** 3 tiles ("isn't available in this build"); no triangles tile,
+- [x] **Pack stats modal (2026-08-08).** Four tiles (indexed, unidentified, size, triangles)
+      + a live per-media-type breakdown — `PackageRow.by_type` reuses the Stats screen's
+      `TypeStat` shape, so colours/icons map for free. The "isn't available in this build"
+      note is gone.
       no per-type contents/tags/heaviest. Packages screen rows have **no ◉ Stats** button at all.
 - [x] **Keyboard map (2026-08-08).** Ctrl/Cmd-Z undoes the newest op; **Shift-Z / Ctrl/Cmd-Y
       redo** (op log now carries forward payloads, migration 17 — see the redo card); Space
@@ -116,9 +119,14 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
 - [x] **In-pack Quick Look pulls the one payload (2026-08-08, FEATURES §5.4).** `lodestash://file`
       now materializes a known in-pack asset through the size-capped scratch (same path the thumb
       route uses) instead of answering `503 not_local`; whole-pack extraction stays a command.
-- [ ] **Trait create form is under-specified** vs FEATURES §4.6 — no scope picker (any/model/sound/
+- [x] **Trait create form (2026-08-08, FEATURES §4.6).** Scope picker (any/model/audio/image),
+      usage-note field, teach checkbox — all already supported by the `upsert_trait` command,
+      now surfaced. Usage-note *editing* on existing traits is the remaining gap.
       image), no usage-description field, defaults `teach:false`; no usage-note editing.
-- [ ] **Unity Assets landing lacks `↻ Sync` + content-derived filter tabs** (§5.3) — only a text box
+- [x] **Unity Assets landing (2026-08-08, §5.3).** `↻ Sync` re-crawls every Asset Store cache
+      root (incremental, skips unchanged files; env override honoured; pack-only/empty roots
+      skipped) and content-derived category tabs filter the pack list — the search box is no
+      longer the only tool.
       + pinned toggle. Pack-browser tree has **no user-collapsible state** (expansion derives from
       the current path) and no responsive fallback below ~900px (PACK-DIRECTORY-NAV §2/§5/§9).
 
