@@ -17,7 +17,7 @@ M0–M6 are the path to v1; **Extra Wins** are opt-in bonuses scheduled *after* 
 | **M5** | **Unity Retrieval (v1)** | P5 | Loopback API + MCP server + Unity plugin: selective import (asset + deps) into the open project, from the GUI **and** from Claude. *Exit:* the v1 "Definition of done" in ROADMAP. | MCP-AND-ENGINES, ENGINE-API |
 | **M6** | **More Engines & Polish** | P6 | Godot + Unreal (best-effort), packaging/installer, auto-update, first-run setup. | INGESTION, MCP-AND-ENGINES, TECH-STACK |
 
-> **v1 ships at M5** (Unity end-to-end, local-first). M6 broadens engines and hardens distribution.
+> **v1 ships at M5** (Unity end-to-end, local-first) — *as of 2026-08-07 the desktop shell covers M0–M4's app surface (B-series port); M5's server + plugin halves are the open engine-project work.* M6 broadens engines and hardens distribution.
 >
 > **M1.5 (Browser QoL)** is a cross-cutting UX lane, not a gate — pull its cards (the `[QoL]` tag in
 > [`KANBAN.md`](KANBAN.md)) alongside M1–M3 as the library grows; the genuinely-new interactions are

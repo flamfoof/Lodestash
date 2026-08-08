@@ -46,10 +46,8 @@ import JobTray from "./lib/JobTray.svelte";
   let status = $state<LibraryStatus | null>(null);
   let reloading = $state(false);
 
-  // List-row height per density stop (DESIGN-GUIDELINES §4: 32px compact, +4 per step).
-  // Defined once on the frame so AssetList / FoldersView / Sidebar / Traits rows all agree.
-  const ROW_H: Record<string, number> = { compact: 32, cozy: 36, large: 40 };
-  let rowH = $derived(ROW_H[view.density] ?? 36);
+  // List-row height is token-driven: the frame sets `data-density`, tokens.css maps it to
+  // `--row-h` / `--control-h` (32 / 36 / 40 per DESIGN-GUIDELINES §4) — one source of truth.
 
   // Re-ask the sidebar's facet counts whenever the route changes — navigating is the cheap
   // catch-all. Catalog mutations no longer poll here: the writer pushes `ls:changed` events
@@ -248,7 +246,7 @@ import JobTray from "./lib/JobTray.svelte";
 
 <svelte:window on:keydown={onkeydown} />
 
-<div class="frame" style="--row-h: {rowH}px">
+<div class="frame" data-density={view.density}>
   <TopBar engineReady={status?.open ?? false} {status} />
   <div class="body">
     <Sidebar {status} />

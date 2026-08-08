@@ -81,7 +81,7 @@
   --r-lg: 10px;
   --r-pill: 999px;
 
-  /* ---- Density: compact default; [data-density="comfortable"] adds 4px (§4, a11y) ---- */
+  /* ---- Density: compact default; [data-density="cozy"] = +4px, [data-density="large"] = +8px (§4) ---- */
   --row-h: 32px;
   --control-h: 30px;
 
@@ -95,7 +95,12 @@
   --inspector-w: 300px;
 }
 
-:root[data-density="comfortable"] {
+:root[data-density="cozy"] {
   --row-h: 36px;
   --control-h: 34px;
+}
+
+:root[data-density="large"] {
+  --row-h: 40px;
+  --control-h: 38px;
 }

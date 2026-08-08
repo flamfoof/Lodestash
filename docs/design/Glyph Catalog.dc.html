@@ -107,6 +107,20 @@
 
     <div style="margin-top:20px;padding-top:12px;border-top:1px solid #DADDE3;font-size:11px;color:#8A909C">Real icon source of truth: <code>docs/design/icons.svg</code> (see <code>DESIGN-GUIDELINES.md</code> §5). Colors: map each swatch to the <code>theme.rs</code> token named in the main handoff README's token table.</div>
 
+    <!-- SECTION: file explorer -->
+    <div style="font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:1.5px;color:#8A6720;font-weight:600;margin:6px 0 10px">07 · FILE EXPLORER GLYPHS (PACK-DIRECTORY-NAV §3)</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:22px">
+      <sc-for list="{{ explorer }}" as="g" hint-placeholder-count="3">
+        <div style="display:flex;align-items:center;gap:13px;border:1px solid #DADDE3;border-radius:8px;padding:9px 12px;break-inside:avoid">
+          <div style="width:38px;height:38px;flex-shrink:0;border-radius:7px;background:#12151C;display:flex;align-items:center;justify-content:center;font-size:19px;color:{{ g.color }}">{{ g.glyph }}</div>
+          <div style="min-width:0">
+            <div style="font-size:13px;font-weight:600">{{ g.name }}</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#8A909C">{{ g.code }} · {{ g.usage }}</div>
+          </div>
+        </div>
+      </sc-for>
+    </div>
+
   </div>
 </x-import>
 </x-dc>
@@ -159,6 +173,11 @@ class Component extends DCLogic {
         { glyph: '\u2304', name: 'Expander closed', code: 'U+2304', usage: 'source row collapsed', color: MUT },
         { glyph: '\u2726', name: 'AI sieve', code: 'U+2726', usage: 'semantic search / thinking', color: C },
         { glyph: '\u2691', name: 'Filters', code: 'U+2691', usage: 'open filter popover', color: GOLD }
+      ],
+      explorer: [
+        { glyph: '\u25A8', name: 'Folder', code: 'SVG \u00b7 ls-folder', usage: 'closed folder \u2014 pack-browser tree + folder rows (PACK-DIRECTORY-NAV \u00a73)', color: MUT },
+        { glyph: '\u25A4', name: 'Folder open', code: 'SVG \u00b7 ls-folder-open', usage: 'open folder, gold \u2014 the current path', color: GOLD },
+        { glyph: '\u25A1', name: 'File', code: 'SVG \u00b7 ls-file', usage: 'generic file glyph', color: MUT }
       ]
     };
   }

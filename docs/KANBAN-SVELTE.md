@@ -1,0 +1,193 @@
+# Lodestash — Svelte re-write board (B-series status)
+
+Status board compiled 2026-08-07 from a six-way audit (UI-SPEC / DATA-MODEL / ENGINE-API+MCP /
+INGESTION / AI-PIPELINE / KANBAN truth-check) against the live code. The egui crate
+(`crates/lodestash-ui`) was deleted at the B7 cutover — the Svelte shell +
+`lodestash-desktop`/`lodestash-app` are the app. **Card state = verified in code, not comments.**
+
+Lanes: 🟢 Done · 🟡 Partial (delta named) · 🔴 Missing · ⚪ Built but inert (needs wiring) ·
+🟠 Visual conformance & doc drift · 🔵 Engine-project / deferred. The main board
+([`KANBAN.md`](KANBAN.md)) holds the full history; the card titles here match the main board's
+B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-desktop/`.
+
+---
+
+## 🟢 Done — the Svelte re-write surface
+
+- [x] **Shell & frame.** Top bar (logo, health meter, type tabs), sidebar nav (11 destinations) +
+      STATUS/LIBRARIES facets + real `+ Add source…` (native dialog), 12 routes, onboarding explainer,
+      DropZone, ConfirmDelete, palette (Ctrl-K), window-state persistence.
+- [x] **Library grid + list.** Real catalog (three storage classes), density, sort, bulk bar
+      (multi-select + Add/Remove tag), per-card ✦ Identify now, stage/star chips, size tiers, source
+      label, link-chain mark; track-pinned cards (e2e-pinned, 229.25 px).
+- [x] **Favorites screen.** Second in nav, gold count pill, toolbar toggle.
+- [x] **Collections screen.** List/create/delete, members via the grid (staging trays excluded).
+- [x] **Identify screen.** Backlog with counts, ✦ Identify all + per-asset kicks (B11a–d), appraising
+      states, pump-active polling. *(Tagging itself is 🟡 below — rows stall at `indexed`.)*
+- [x] **Duplicates screen (exact).** Hash-based groups, keeper first.
+- [x] **Stats overview.** Facet counts, size tiers, Tag Graph ring (tags·links·assets header, empty
+      state). *(Interaction is 🟡.)*
+- [x] **Traits + Mapping tabs.** Trait CRUD (upsert/promote/teach/style), Mapping rules/categories
+      (add/delete/apply).
+- [x] **Unity Assets.** Pins → sidebar rows, browse, per-pack Extract/Stats/Open→, batch
+      Extract-selected queue + Cancel, **M14 surgical flow wired end-to-end** (B2c): browse
+      persistence → manifest worker → mint in-pack rows → surgical `extract_at_offsets` →
+      materialize → render from workspace cache.
+- [x] **Settings.** Sources + per-source blacklist editor, AI tier ↔ quality, size tiers, watch +
+      auto-identify toggles, thumb cache, **Unity Editors (Connect wizard app half)**, danger flow
+      (confirm-gated delete-from-disk). *(CLOUD card is 🔴.)*
+- [x] **Inspector.** Identity, stats, source, related, stage/import, trash/delete/fav, links.
+      *(TRAITS shows no real tags — 🟡.)*
+- [x] **Quick Look.** 3D WebGL2 viewer (`viewer3d.ts`, no dep), audio player + waveform, image.
+- [x] **Job tray + pump events.** Bottom-left tray (progress bars, per-job ✕ cancel, session ring),
+      `ls:changed` events — the UI doesn't poll.
+- [x] **File-explorer iconset + tree wiring (B12).** `ls-folder` / `ls-folder-open` (gold) /
+      `ls-file` glyphs designed (24×24, stroke 1.8) in `docs/design/icons/` + both sprites (56
+      symbols), Glyph Catalog §07, DG §5 table; FoldersView tree rows now use the sprite chevrons
+      (`ls-action-expand-open/closed`) + folder glyphs (open = current path), folder list + tiles
+      rows use `ls-folder` (PACK-DIRECTORY-NAV §3).
+- [x] **Backend live in the shell.** M1–M16 migrations, catalog functions, drains (metrics →
+      previews → deps → embeddings → promote), persist/scan, single-writer thread, `lodestash://`
+      protocol (`preview`/`file`/`mesh`, Range-capable, in-pack thumbnails via scratch).
+- [x] **QA.** e2e 52/52 over the real binary (CDP), svelte-check 0/0, `cargo test` green; name-level
+      REST↔MCP parity test (test-only — see ⚪).
+
+## 🟡 Partial — working, delta named
+
+- [ ] **Identify: the tagging half (B11 tail).** Embeddings + previews + promote run; **no tagger is
+      resolved** — `drain_tags` / `drain_api_tags` / `drain_audio_tags` have zero call sites
+      (`writer.rs appraise_pass`), `mark_for_identify` sets `tags_dirty` nothing drains. Without a
+      tag, the lifecycle rule blocks `identified` — rows stop at `indexed`.
+      - [ ] Wire a tagger resolver (Ollama/local ONNX WD) into `appraise_pass`; run `drain_tags`.
+- [ ] **AI search toggle is cosmetic.** ⟨Tags⟩/⟨AI⟩ (`TopBar.svelte:46-59`) changes styling only; the grid ranks FTS-only (`Toolbar.svelte:79-90`). `hybrid_search` exists in core but is reachable only via the ⚪ servers. Wire RRF hybrid into `gridPage`/`search_assets` behind `mode=ai`.
+- [ ] **Identify UI polish.** No progress bar (done/total appraised), no session set (identified
+      assets vanish from the backlog), no inspector "Identify now" / per-asset Re-identify.
+- [ ] **Inspector TRAITS are blank.** `AssetDetail` carries no traits; no accept/reject chips,
+      confidence underbars, or trait quick-add.
+- [ ] **Inspector gaps.** No dependency **relink** interaction (edges render, nothing re-resolves a
+      `missing` edge); no in-archive provenance block (Path-in-package / Package ⧉-copy rows);
+      card ★ is display-only (only the inspector toggles favourites).
+- [ ] **Duplicates — exact only.** No perceptual near-dup (hash wiring is ⚪/🔴), no "Merge tags".
+- [ ] **Pack stats modal is a stub.** 3 tiles ("isn't available in this build"); no triangles tile,
+      no per-type contents/tags/heaviest. Packages screen rows have **no ◉ Stats** button at all.
+- [ ] **Keyboard map incomplete.** No Ctrl/Cmd-A, no Ctrl/Cmd-Z / Shift-Z redo (button only), no `F`,
+      Space opens Quick Look but doesn't close it. No right-click / context menu anywhere (FEATURES
+      §1.1 + M1.5 imply one; zero `contextmenu` handlers in the shell).
+- [ ] **Trash renders the ordinary grid.** Spec'd table (per-row Restore, library·pack mono line)
+      missing.
+- [ ] **Onboarding is a static explainer.** No two-step source/scan flow.
+- [ ] **Tag Graph is static.** No zoom/drag, no click-through, no dependency arcs.
+- [ ] **Settings gaps.** No CLOUD card, no model-download button, no MCP endpoint/token UI, no
+      clear-cache/usage bar, no confirm-before-trash toggle; ENGINE BRIDGE says "Bridge paused".
+- [ ] **Staging is in-memory only.** Tray rows exist; `batch_id` recorded but no Recent-exports list
+      and no batch undo in the UI. Top-bar "No project" chip is static — **no project switcher
+      popover** (recent exports · ↩ undo · Connect wizard, FEATURES §7.1).
+- [ ] **In-pack Quick Look never pulls the one payload** (FEATURES §5.4). Thumbnails pull via
+      scratch; the viewer short-circuits in-pack to `not_local` (`QuickLook.svelte:49`). Board's 🔴
+      full-res card covers `lodestash://file`; this is the UI behavior.
+- [ ] **Trait create form is under-specified** vs FEATURES §4.6 — no scope picker (any/model/sound/
+      image), no usage-description field, defaults `teach:false`; no usage-note editing.
+- [ ] **Unity Assets landing lacks `↻ Sync` + content-derived filter tabs** (§5.3) — only a text box
+      + pinned toggle. Pack-browser tree has **no user-collapsible state** (expansion derives from
+      the current path) and no responsive fallback below ~900px (PACK-DIRECTORY-NAV §2/§5/§9).
+
+## 🔴 Missing — not built at all
+
+- [ ] **Perceptual near-dup.** pHash/Chromaprint: `asset_file.perceptual_hash` is DDL-only, no
+      implementation.
+- [ ] **Variants + color search.** `variant_group_id` / `dominant_color` DDL-only; no clustering, no
+      grid collapse, no color facet.
+- [ ] **Compiled bundles + UnityPy sidecar.** No implementation; detect is extension-only.
+- [ ] **Format normalization table.** No glTF artifact, no texture→PNG (KTX/ASTC/ETC…), no FSB5→WAV,
+      no Aseprite/KRA/.blend/font specimens (INGESTION §4).
+- [ ] **Render-pipeline harvest.** `package.pipeline` never written ⇒ `pipeline_mismatch` advisory
+      (ENGINE-API §5.4) has no data.
+- [ ] **License/attribution harvest.** Columns exist, no setter; `.meta` `labels:` parsed but never
+      seeded into tags.
+- [ ] **Smart collections / `embedding_meta`.** DDL-only, never written.
+- [ ] **Trait-vocabulary teaching.** `teach=1` machinery exists; nothing feeds it to a tagger.
+- [ ] **Full-res in-pack file pulls.** `lodestash://file` answers 503 for in-pack (thumbnails fine);
+      per-entry "Extract selected" page-batching (lift the 256 MB `IN_PACK_THUMB_MAX_BYTES` cap).
+- [ ] **Import dialog (§5.2).** Folder → discovered-package list (group/select-all, category badge +
+      tabs, version disclosure, "import as libraries") — `add_source_dialog` is a plain folder
+      picker today.
+- [ ] **`⇢ Add to project` / `⇢ Add all N to project` affordances.** Absent everywhere (FEATURES
+      §5.4/§5.5, PACK-DIRECTORY-NAV §7) — the engine write path doesn't exist in the shell.
+
+## ⚪ Built but inert — wire into the shell
+
+- [ ] **REST + MCP servers never start.** `api::serve` + `mcp::serve_stdio` zero callers; no `--mcp`
+      branch; handshake `engine.json` never written; Settings says "Bridge paused". All 13 ops are
+      test-only (name-level parity test exists).
+- [ ] **10 doc'd agent ops absent on both planes.** `list_tags`, `add_tag`, `list_collections`,
+      `apply_mapping`, `identify_asset`, `suggest_tags`, `unpack_package`, staging group
+      (ENGINE-API §2).
+- [ ] **Hash/dedup dead for loose files.** `crawler::hash_file` never called ⇒ `content_hash` NULL ⇒
+      Duplicates empty on real libraries, no move/rename detection.
+- [ ] **Magic-byte detection.** Crawl is extension-only; unknown-ext real assets dropped.
+- [ ] **Filesystem watch.** `watch_roots` zero callers; Settings toggles only store a flag.
+- [ ] **Eviction / keep-extracted.** `unmaterialize_package` zero callers; `cache_extracted` not
+      honored; workspace cap/7-day retention not enforced.
+- [ ] **Non-content classification.** `detect::is_content` zero callers; `is_content`/`content_kind`
+      never set.
+- [ ] **Model manager / cloud config.** Downloads + cloud API keys unreachable — no UI, no config
+      readers (cloud AI stays opt-in per invariant, but the opt-in surface is missing).
+
+## 🟠 Visual conformance & doc drift (DESIGN-GUIDELINES audit)
+
+**Real bugs (UI violates the executable token file):**
+
+- [ ] **Undefined `--fs-2xs`** — `JobTray.svelte:232` uses `var(--fs-2xs, 11px)`; tokens.css has no
+      such token (scale starts at `--fs-xs`). The fallback hides the typo. Fix: `var(--fs-xs)`.
+- [ ] **Undefined 40px row stop** — `App.svelte:51` `ROW_H = {compact:32, cozy:36, large:40}`;
+      tokens.css defines only 32/36. Either add the 40px stop to tokens.css or drop large to 36.
+- [ ] **Dead density mechanism** — `:root[data-density="comfortable"]` (tokens.css:98-101) is never
+      set by any component (0 hits); `--control-h` stays 30px at every density; App.svelte:251
+      bypasses it with an inline `--row-h`. Wire the attribute or delete the block.
+- [ ] **Density default is cozy, not compact** — `nav.svelte.ts:17` defaults `"cozy"` (36px rows);
+      DG §4 says default **compact** (32px) with Comfortable as opt-in.
+- [ ] **Status gems unused** — the card renders colored text `?`/`✓` (`Card.svelte:124-130`); the
+      sprite's `ls-status-{unidentified,identified,confirmed}` gems (incl. the gold ★) are never
+      referenced. Confirmed never shows ★.
+- [ ] **Card status rail** — 3px wide, gold for every non-unidentified status; DG §6 says 1px,
+      Identified **verdant** vs Confirmed **gold**.
+- [ ] **Toasts** — left border 3px (DG: 1px); only `ok|err` kinds exist (no warn/info).
+- [ ] **Icon sizes diverge** — nav 18 (DG 24), toolbar 14–16 (DG 20), type marks 28–40 (DG 32).
+- [ ] **Sort options** — SORTS = Relevance/Name/Type/Size; DG: Name · Date added · Date modified ·
+      Size · Type · Status.
+- [ ] **No `prefers-reduced-motion` policy** beyond one DropZone gate; no shimmer on
+      Unidentified→Identified (≤400ms, reduced-motion-gated).
+
+**Doc drift (docs name things that no longer exist — fix per CLAUDE.md "docs are source of truth"):**
+
+- [ ] **DESIGN-GUIDELINES §5** — "individual files not yet folded into the sprite" list is fully
+      folded (16/16 in both sprites); the "Unicode glyph stand-ins until SVG rendering lands"
+      caveat is obsolete (and names the deleted egui `theme.rs`).
+- [ ] **ALIGNMENT-AUDIT.md** — rows it marks Missing (toasts, staging tray, Identify, Settings) are
+      now built.
+- [ ] **ROADMAP.md** — "egui/eframe on wgpu" shell (Phase 0), "three-d on shared wgpu" + Tauri-as-
+      fallback tables, "normalize-to-glTF on import / runtime only sees glTF" — all superseded by
+      the Tauri 2 + Svelte 5 + WebGL2 shell (the former fallback shipped).
+- [ ] **MILESTONES.md** — "v1 ships at M5" scope note + M1.5 ratings are stale vs the board.
+- [ ] **PACK-DIRECTORY-NAV.md §1** — status table references deleted egui components.
+- [ ] **USER-GUIDE.md** — the core loop (auto-discovery → cache watch → identify flips to
+      Identified → AI search → Unity/MCP import) cannot complete today; the guide should mark the
+      blocked steps or the board should become the guide's status reference.
+
+## 🔵 Engine-project / deferred
+
+- [ ] **UPM C# Unity plugin.** handshake → register/heartbeat → browse → selective import w/ deps →
+      main-thread `AssetDatabase` → ack. (Needs a Unity install to verify.)
+- [ ] **Connect wizard plugin half.** App half done (Settings → Unity Editors); the plugin side
+      registers/heartbeats.
+- [ ] **Staging-commit half + batch undo.** Import enqueue → queue poll → ack → `import_record` →
+      Recent exports / batch undo (REST-only transport endpoints exist).
+- [ ] **LINKS full graph harvest.** prefab `uses_mesh`/`uses_audio`/`uses_script`; prefabs inside an
+      extracted pack workspace.
+- [ ] **The 33 ms Engine pump (B1).** Writer idle pass + pump events cover the spirit; the full
+      `Engine` actor stays B1-blocked.
+- [ ] **Unreal plugin + CUE4Parse sidecar** (planned phase).
+- [ ] **Python sidecar (UnityPy)** for compiled bundles (planned).
+- [ ] **B1.5 `lodestash-cli`** (planned; crate lands with the first real command).
+- [ ] **Parked by design (not open work):** rating UI (column stays), `sqlite-vec`/LanceDB (behind
+      the `VectorIndex` seam when brute force stops being comfortable), Unreal (later phase).

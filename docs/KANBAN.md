@@ -12,6 +12,10 @@ hard part is judgment (cross-crate architecture, concurrency, migrations/data in
 absent spec), **opus** where the spec already made the decisions (build-to-spec). Borderline cards
 start on opus and escalate if they stall.
 
+> **Svelte re-write status board:** [`KANBAN-SVELTE.md`](KANBAN-SVELTE.md) — the verified state of
+> the desktop shell (Done / Partial / Missing / Built-but-inert / Engine-project), compiled
+> 2026-08-07 from a six-way docs-vs-code audit.
+
 ---
 
 ## ▶ Next up (as of 2026-07-22, after `ab4a063`)
@@ -639,6 +643,13 @@ translation. The port removes the translation; the egui build stayed buildable a
 
 - [ ] **B1.5 — `lodestash-cli`.** Headless `scan|index|tag|export`; gives the port a smoke test
       needing no window.
+- [x] **B12 — file-explorer iconset + tree wiring (2026-08-07).** The pack browser's folder
+      glyphs were the missing design asset: `ls-folder` / `ls-folder-open` (gold = current path) /
+      `ls-file` added to `docs/design/icons/` + both sprites (56 symbols), the Glyph Catalog (§07)
+      and DESIGN-GUIDELINES §5 table; FoldersView tree rows now render the sprite chevrons
+      (`ls-action-expand-open/closed` — previously unused) + folder glyphs, and the folder list/tiles
+      use `ls-folder` instead of the packages glyph (PACK-DIRECTORY-NAV §3). Verified: svelte-check
+      0/0, e2e 52/52.
 - [x] **B7 — cutover (2026-08-07).** `crates/lodestash-ui` (the egui app) is **deleted** — the
       desktop shell (`lodestash-desktop` + Svelte) covers the app surface, and the docs that
       named egui as the app are reconciled (ARCHITECTURE §3.4, TECH-STACK, HANDOFF,

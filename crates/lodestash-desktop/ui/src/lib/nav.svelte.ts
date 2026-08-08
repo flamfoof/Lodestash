@@ -14,7 +14,7 @@ class ViewState {
   status = $state("all");
   sortBy = $state("name");
   sortAsc = $state(true);
-  density = $state<"compact" | "cozy" | "large">("cozy");
+  density = $state<"compact" | "cozy" | "large">("compact");
   /**
    * B8c: the two independent axes the design keeps apart — **browse view** (Flat · Folders) ×
    * **row style** (Grid · List). The toolbar's three stops map onto them; both persist via

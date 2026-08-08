@@ -207,10 +207,10 @@ Spec citation → app evidence. `ui/` = `crates/lodestash-desktop/ui`.
 | I2 | Confirm-delete danger modal | A | DESIGN-GUIDELINES §7 | `ConfirmDelete.svelte` — names paths, remove-alternative, Cancel-focused |
 | I3 | Command palette Ctrl/Cmd-K | A | UI-SPEC §0.4 | `App.svelte:94-99`, `Palette.svelte` |
 | I4 | Drag-in drop overlay, gold dashed | A | DESIGN-GUIDELINES §7 | `DropZone.svelte:78-85` |
-| I5 | Toasts (bottom-right, accent border, auto-dismiss) | M | FEATURES §0.4, UI-SPEC §18 | absent — only `actionError` bar (`App.svelte:164-166`) + DropZone status card |
-| I6 | Staging tray | M | FEATURES §7.6, UI-SPEC §16.2 | absent (B: ENGINE-API §6) |
-| I7 | Pack stats modal | M | UI-SPEC §15 | absent; `PackagesScreen.svelte` rows have **no Stats button** (spec §15 says one ships on pack rows) |
-| I8 | Project switcher + Connect wizard | M | UI-SPEC §16.1/§17 | absent (B) |
+| I5 | Toasts (bottom-right, accent border, auto-dismiss) | P | FEATURES §0.4, UI-SPEC §18 | built (`toasts.svelte.ts` + `App.svelte:397-428`, z-80) — border 3px vs 1px, only ok/err kinds (DG §7) |
+| I6 | Staging tray | P | FEATURES §7.6, UI-SPEC §16.2 | built (`StagingTray.svelte`, bottom-right) — in-memory only, no per-project durability/batch-commit (B: ENGINE-API §6) |
+| I7 | Pack stats modal | P | UI-SPEC §15 | built on Unity Assets rows (`UnityAssetsScreen.svelte` stats modal) — 3-tile stub; PackagesScreen rows still lack a Stats button |
+| I8 | Project switcher + Connect wizard | P | UI-SPEC §16.1/§17 | Connect wizard **app half** shipped (Settings → Unity Editors, `projects`/`set_active_project`); switcher popover + plugin half open (B) |
 
 ### J. Screens — UI-SPEC per-screen
 
@@ -218,7 +218,7 @@ Spec citation → app evidence. `ui/` = `crates/lodestash-desktop/ui`.
 |---|---|---|---|
 | J1 | Library | P | core built (grid/list/folders/pager/empty states); gaps D1/D5/D8/D9/D10/F1/F4/F5 |
 | J2 | Favorites | P | filter over library; FEATURES §4.7 wants Cinzel `★ Favorites` header + strap + mono count + diamond-☆ empty state with Browse Library →; app has plain h1 + text-only empty state |
-| J3 | Identify | M | **stub** (`Screen.svelte`); UI-SPEC §3 (Appraise the Backlog, session set, Identify all, empty state) |
+| J3 | Identify | P | UI-SPEC §3 | backlog + ✦ Identify all/one (B11a–d), pump-active states — progress bar + session set still open; tagger unreachable (rows stall at indexed) |
 | J4 | Packages | P | publisher→pack, unid pill, Browse→ ✓; ◉ Stats → pack-stats **missing** (I7) |
 | J5 | Unity Assets | M | **stub**; FEATURES §5 + PACK-DIRECTORY-NAV + UI-SPEC §15 |
 | J6 | Collections | M | **stub**; FEATURES §4.2, UI-SPEC §6 |

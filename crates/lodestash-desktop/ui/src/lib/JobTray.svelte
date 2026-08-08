@@ -229,7 +229,7 @@
     }
   }
   .when {
-    font-size: var(--fs-2xs, 11px);
+    font-size: var(--fs-xs);
   }
   .none {
     padding: var(--sp-1) 0;

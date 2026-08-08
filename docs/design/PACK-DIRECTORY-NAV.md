@@ -10,7 +10,7 @@
 > `https://claude.ai/code/artifact/357c39f4-0809-4f06-adc2-53c1d3be95b0` ("Lodestash — Package
 > Directory Navigation"), stored 2026-07-28. Shown against a real pack, **Total Music Collection**.
 > Single dark theme **by intent** — it matches the app's committed look. Palette + glyphs are the
-> existing Lodestash design system; recreate through `theme.rs` tokens, never inline hex.
+> existing Lodestash design system; recreate through `docs/design/tokens.css` variables (the `theme.rs` mirror was retired at the B7 cutover), never inline hex.
 
 Opening a `.unitypackage` drops you into its directory, **indexed in place** — files are pulled on
 demand, never fully unpacked (DATA-MODEL §7 / M14). This design replaces the bolted-on horizontal
@@ -80,6 +80,9 @@ Left to right:
 ## 5. Left pane — directory tree (`A`)
 - Header **DIRECTORY** (mono, dim, letter-spaced, uppercase).
 - Rows: `[chevron] [folder glyph] [name] [count]`.
+  **Iconography (shipped 2026-08-07):** the chevron is the sprite's `ls-action-expand-open/closed`;
+  the folder glyph is `ls-folder` (closed, dim) or `ls-folder-open` (open, gold — the current path),
+  both in `docs/design/icons/` + the `icons.svg` sprite (Glyph Catalog §07).
   - **Chevron** `▾` expanded / `▸ ` collapsed / blank for a leaf.
   - **Folder glyph** 📂; **name** ellipsizes.
   - **Count** = mono, dim, tabular — the node's **recursive** asset count (a leaf that is the

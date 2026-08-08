@@ -13,7 +13,7 @@ Principle: **the search/retrieve loop must work end-to-end before polishing any 
 - Cargo workspace + crate layout (`lodestash-core/ingest/ai/mcp/api/ui/cli`).
 - SQLite (WAL) catalog with the base schema; `import_source`, `asset`, `asset_file`, `media_type`.
 - Folder crawler + magic-byte detection + BLAKE3 hashing; incremental `(size, mtime)` diff.
-- egui/eframe shell on wgpu; virtualized thumbnail grid with placeholders.
+- **Tauri 2 + Svelte 5 shell** (WebView2) — supersedes the egui/wgpu shell (B2a–B7, 2026-08); virtualized thumbnail grid with placeholders.
 - Image thumbnailing (the easy modality) into the on-disk cache.
 
 **Exit criteria:** point at a folder of images → they appear in a searchable-by-name grid.
@@ -23,7 +23,7 @@ Principle: **the search/retrieve loop must work end-to-end before polishing any 
 ## Phase 1 — View everything
 **Goal:** all three media types preview/play.
 
-- 3D viewport (`three-d` on shared wgpu) + **normalize-to-glTF on import** (Assimp/FBX2glTF cache).
+- 3D viewport (hand-rolled WebGL2 `viewer3d.ts`, TECH-STACK §5.3) — the egui `three-d`/wgpu viewer and normalize-to-glTF were retired at the B7 cutover; previews are SVG/proxy based.
 - Audio: `symphonia` decode + `rodio` playback + waveform.
 - Image/texture viewer: `image` + `image_dds` (BCn) + `psd`; HDR/EXR tone-map; channel toggles.
 - Offscreen 3D thumbnail render-to-texture; audio waveform thumbnails.
@@ -180,8 +180,8 @@ Higher-leverage features that build directly on the architecture already in plac
 | Layer | Primary | Notes / alternatives |
 |---|---|---|
 | Language (core) | **Rust** | + optional bundled **Python sidecar** (UnityPy; later CUE4Parse/PyTorch) |
-| GUI | **egui/eframe** (wgpu) | Slint 1.12 (polish) · Tauri+three.js (fallback) |
-| 3D | **three-d** on shared wgpu | normalize→glTF (Assimp/FBX2glTF) |
+| GUI | **Tauri 2 + Svelte 5** (shipped B2a–B7) | Slint 1.12 (polish) — the egui/wgpu shell and the Tauri fallback are history |
+| 3D | **WebGL2 viewer3d.ts** (TECH-STACK §5.3) | normalize→glTF (Assimp/FBX2glTF) — egui three-d retired |
 | Audio | **symphonia** + **rodio** | kira for advanced scrubbing |
 | Images | **image** + **image_dds** + **psd** | + texture2ddecoder/decrunch (Unity-compressed) |
 | DB | **SQLite (WAL)** + **FTS5** + **sqlite-vec** | LanceDB upgrade seam |
@@ -204,7 +204,7 @@ Higher-leverage features that build directly on the architecture already in plac
 | Compressed-texture long tail (rare ASTC/Crunch) fails | "Unsupported format" fallback; don't promise 100%. |
 | 3D tagging is shallow (category only) | Pair multiview→SigLIP with file-derived structured tags; OpenShape later. |
 | PBR map channels invisible to vision models | Tag albedo; classify other maps by filename/hue; group as material. |
-| FBX is proprietary | Normalize→glTF on import via Assimp/FBX2glTF; runtime only sees glTF. |
+| FBX is proprietary | ufbx parses FBX in-process; decimate → cached preview proxies (render3d/decimate, 2026-08-01). glTF normalization was the egui path, retired at B7. |
 | Windows packaging pain | Rust single static binary sidesteps it; sidecar bundled, optional. |
 | Vector search outgrows brute force | `VectorIndex` trait → swap sqlite-vec for LanceDB past ~500k–1M. |
 | Cloud-AI privacy concerns | Local-first default; API strictly opt-in, per-modality. |

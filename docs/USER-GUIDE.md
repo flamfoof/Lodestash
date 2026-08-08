@@ -4,6 +4,12 @@ Lodestash is your **local asset hub**: it catalogs everything you own, lets you 
 plain-language description**, preview it, and **pull just what you need into Unity** — without
 ever importing whole asset packs into your project. (Unreal support is planned for a later phase.)
 
+> **Status note (2026-08-07):** Steps 1–5's shell flows work today. Step 3's identification is
+> **partially wired** — local embeddings run, but the tagging step isn't reachable yet, so assets
+> stay *Indexed* rather than flipping to *Identified*, and AI search isn't live in the shell.
+> Step 6 (the Unity bridge) and the MCP path are **engine-project work, not yet runnable**. The
+> board (`KANBAN-SVELTE.md` 🟡/⚪/🔵) tracks the exact deltas.
+
 Follow these steps in order. **Step 3 (run identification) matters most — do it before you search.**
 
 ---

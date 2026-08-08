@@ -151,9 +151,9 @@ Line-height: 1.45 body, 1.2 headings. Weight: 400 body, 500 labels, 600 headings
   no viewer context to inherit from); an icon that must follow the surrounding text color swaps the
   baked hex for `currentColor` at the point of use.
 - **Delivery (current):** the SVG set is the source of truth — `docs/design/icons/` holds one file
-  per icon plus the **`icons.svg` sprite** (symbol ids below) and an `index.html` preview. The app
-  still renders **Unicode glyph** stand-ins (see the design bundle's **Glyph Catalog** for the
-  codepoint + `theme.rs` token per glyph) until SVG rendering lands in the UI.
+  per icon plus the **`icons.svg` sprite** (symbol ids below) and an `index.html` preview. The Svelte
+  shell renders the sprite directly (`<use href="/icons.svg#ls-…">`); the retired egui `theme.rs`
+  glyph map was the pre-cutover fallback.
 
 **In the sprite** (`docs/design/icons/icons.svg` — reference by `<use href="icons.svg#ls-…">`):
 
@@ -175,11 +175,14 @@ Line-height: 1.45 body, 1.2 headings. Weight: 400 body, 500 labels, 600 headings
 | `ls-action-stage` | Staging tray / shortlist | | `ls-action-clear` | Clear (✕) |
 | `ls-action-copy` | Copy | | `ls-action-regenerate` | Regenerate thumbnail |
 | `ls-action-exclude` | Exclude / blacklist (⊘) | | `ls-action-expand-open/closed` | Expander chevrons |
-| `ls-action-ai-sieve` | AI sieve | | | |
+| `ls-action-ai-sieve` | AI sieve | | `ls-folder` | Folder (closed) — pack-browser tree/folder rows |
+| `ls-folder-open` | Folder (open, gold — current path) | | `ls-file` | File (generic) |
 
 **Individual files only** (drawn in `docs/design/icons/` as standalone SVGs, not yet folded into
 the sprite): `logo`, `nav-mapping`, `search`, `search-ai`, `search-tags`, `project`, `import`,
-`download`, `play`/`pause`, `tag-add`, `dependency`, `non-content`, `color`, `variants`, `similar`.
+`download`, `play`/`pause`, `tag-add`, `dependency`, `non-content`, `color`, `variants`, `similar`
+*(all 16 are in the sprite — this list is historical; the "promote when first referenced" step
+already happened).*
 When any of these is first referenced in code, promote it into `icons.svg` under its `ls-*` id.
 
 ---

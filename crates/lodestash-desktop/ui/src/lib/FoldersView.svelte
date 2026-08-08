@@ -195,9 +195,11 @@
               title={node.path}
             >
               <span class="chev" aria-hidden="true">
-                {node.has_children ? (expanded(node.path) ? "▾" : "▸") : ""}
+                {#if node.has_children}
+                  <Icon name={expanded(node.path) ? "ls-action-expand-open" : "ls-action-expand-closed"} size={12} />
+                {/if}
               </span>
-              <Icon name="ls-nav-packages" size={13} />
+              <Icon name={expanded(node.path) ? "ls-folder-open" : "ls-folder"} size={13} />
               <span class="tname">{node.name}</span>
               <span class="tcount num">
                 {node.direct} · {node.recursive}
@@ -220,7 +222,7 @@
           {#each result.tiles as t (t.name)}
             <button class="frow folder" role="row" onclick={() => enter(t.name)}>
               <span class="gdot" aria-hidden="true"></span>
-              <Icon name="ls-nav-packages" size={14} />
+              <Icon name="ls-folder" size={14} />
               <span class="fname">{t.name}</span>
               <span class="num dim" role="cell">—</span>
               <span class="num dim" role="cell">{t.direct} ({t.recursive})</span>
@@ -247,7 +249,7 @@
           <div class="tiles" data-testid="folder-tiles">
             {#each result.tiles as t (t.name)}
               <button class="tile" ondblclick={() => enter(t.name)} onclick={() => enter(t.name)}>
-                <Icon name="ls-nav-packages" size={22} />
+                <Icon name="ls-folder" size={22} />
                 <span class="name">{t.name}</span>
                 <span class="count num">
                   {t.recursive.toLocaleString()}
