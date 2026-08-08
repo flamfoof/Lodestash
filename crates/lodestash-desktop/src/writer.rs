@@ -455,6 +455,15 @@ impl Writer {
                 // arrives while a worker is running (or already queued) waits here; each op's
                 // reply resolves to the real outcome when its reconcile runs.
                 let mut extract_queue: VecDeque<Job> = VecDeque::new();
+                // DATA-MODEL §6 watch: live notify over the watched source roots, debounced by
+                // the ingest helper. A signal means "something changed, rescan when convenient"
+                // — the rescan is the incremental crawl (needs_rehash skips unchanged files), so
+                // it is cheap. Skipped under the e2e escape hatch like every other idle pass.
+                let mut watch = if drain_enabled && AppConfig::load().watch_sources {
+                    rebuild_watch(&catalog)
+                } else {
+                    None
+                };
                 loop {
                     match rx.recv_timeout(std::time::Duration::from_secs(1)) {
                         Ok(WriterMsg::Op(job)) => {
@@ -484,6 +493,8 @@ impl Writer {
                             if appraising {
                                 pump.store(true, Ordering::Relaxed);
                             }
+                            let source_set_changed =
+                                matches!(job.op, Op::PersistScan { .. } | Op::SetSourceWatch { .. });
                             let result = run(
                                 &mut catalog,
                                 &db_path,
@@ -500,6 +511,15 @@ impl Writer {
                             let _ = job.reply.send(result);
                             emit_changed(&app, "catalog");
                             emit_changed(&app, "jobs");
+                            // A source set (or its watch flags) changed — re-arm the watch so
+                            // new roots are covered and unwatched ones stop firing.
+                            if source_set_changed {
+                                watch = if drain_enabled && AppConfig::load().watch_sources {
+                                    rebuild_watch(&catalog)
+                                } else {
+                                    None
+                                };
+                            }
                         }
                         Ok(WriterMsg::ExtractDone {
                             job_id,
@@ -604,6 +624,15 @@ impl Writer {
                             if rx.recv_timeout(std::time::Duration::ZERO).is_ok() {
                                 continue; // an op is waiting — let the loop pick it up
                             }
+                            // Watch signal (debounced upstream): rescan every watched source with
+                            // the incremental crawl. The writer is idle here by construction.
+                            if let Some(w) = &watch {
+                                if w.rx.recv_timeout(std::time::Duration::ZERO).is_ok() {
+                                    if rescan_watched(&mut catalog, &db_path, &app) {
+                                        emit_changed(&app, "catalog");
+                                    }
+                                }
+                            }
                             if idle_appraises {
                                 pump.store(true, Ordering::Relaxed);
                                 let r = appraise_pass(
@@ -650,8 +679,74 @@ impl Writer {
     }
 }
 
-/// One bounded appraise pass (metrics → previews → deps → embeddings → promote) on the
-/// writer thread. Shared by the ✦ kicks and the auto-identify idle pass (B11a–c): embedders
+/// (Re)build the notify watch over the catalog's watched source roots (DATA-MODEL §6). `None`
+/// when nothing is watchable — watching is an optimisation, so a failure degrades to manual
+/// rescan rather than an error the user has to dismiss.
+fn rebuild_watch(catalog: &Catalog) -> Option<lodestash_ingest::watch::RootWatcher> {
+    let roots: Vec<PathBuf> = catalog
+        .source_infos()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|i| i.watch_enabled)
+        .map(|i| PathBuf::from(i.root_path))
+        .collect();
+    if roots.is_empty() {
+        return None;
+    }
+    lodestash_ingest::watch::watch_roots(&roots, std::time::Duration::from_secs(2))
+}
+
+/// One watch-driven rescan of every watched source: the incremental crawl (unchanged files skip
+/// BLAKE3 via `needs_rehash`), then the standard persist on this thread (single-writer rule —
+/// `persist_to_catalog` opens its own connection here exactly as `Op::PersistScan` does).
+/// Returns whether anything actually changed, so the UI only reloads when it did.
+fn rescan_watched(catalog: &mut Catalog, db_path: &Path, app: &Option<tauri::AppHandle>) -> bool {
+    let cfg = AppConfig::load();
+    let project = cfg.last_project_name.as_deref();
+    let mut changed = false;
+    for info in catalog.source_infos().unwrap_or_default() {
+        if !info.watch_enabled {
+            continue;
+        }
+        let root = PathBuf::from(&info.root_path);
+        let excludes = project
+            .map(|p| cfg.source_excludes(p, &root))
+            .unwrap_or_default();
+        let known = catalog
+            .known_sizes_for_source(&info.root_path)
+            .unwrap_or_default();
+        let crawled = lodestash_app::scan::crawl_source(0, &root, &excludes, &known);
+        if crawled.entries.is_empty() && crawled.pending_packages.is_empty() {
+            continue;
+        }
+        let records =
+            lodestash_app::persist::crawl_records(crawled.entries.iter().map(|(_, f)| f));
+        // Cheap in-memory diff against the catalog's last-known (size, mtime): nothing moved on
+        // disk means nothing to persist (and no spurious `last_scanned_at` write + UI reload).
+        let same = records.len() == known.len()
+            && records.iter().all(|r| {
+                known
+                    .get(&r.rel_path)
+                    .is_some_and(|&(s, m)| s == r.size_bytes as u64 && m == r.mtime)
+            });
+        if same {
+            continue;
+        }
+        let batch = lodestash_app::types::PersistBatch {
+            root: info.root_path.clone(),
+            name: info.name.clone(),
+            excludes_json: None,
+            records,
+        };
+        match lodestash_app::persist::persist_to_catalog(db_path, &[batch]) {
+            Ok(_) => changed = true,
+            Err(e) => tracing::warn!(%e, root = %info.root_path, "watch rescan failed"),
+        }
+    }
+    changed
+}
+
+/// One bounded appraise pass (metrics → previews → deps → embeddings → promote) on the/// writer thread. Shared by the ✦ kicks and the auto-identify idle pass (B11a–c): embedders
 /// are resolved by the caller (the idle pass resolved them once at startup), everything else
 /// is re-derived here because it can change between passes. `progress` is the shared
 /// B11d surface the Identify screen polls — reset at pass start, filled by the tag/embed

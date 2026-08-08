@@ -3987,6 +3987,84 @@ impl Catalog {
         Ok(())
     }
 
+    /// Store the primary file's perceptual hash (dHash, DATA-MODEL §5) — the near-duplicate key.
+    /// Hex-encoded 64 bits; `None` clears it (e.g. the file changed and re-decoding failed).
+    pub fn set_perceptual_hash(&self, asset_id: i64, hash: Option<[u8; 8]>) -> Result<()> {
+        let hex = hash.map(|h| h.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        self.conn
+            .execute(
+                "UPDATE asset_file SET perceptual_hash = ?2
+                 WHERE id = (SELECT primary_file_id FROM asset WHERE id = ?1)",
+                params![asset_id, hex],
+            )
+            .map_err(|e| CoreError::Catalog(format!("perceptual hash: {e}")))?;
+        Ok(())
+    }
+
+    /// All perceptual hashes, keyed by asset id (DATA-MODEL §5) — the near-duplicate review reads
+    /// these once per library load, like every other facet.
+    pub fn perceptual_hashes(&self) -> Result<std::collections::HashMap<i64, [u8; 8]>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT a.id, af.perceptual_hash
+                 FROM asset a JOIN asset_file af ON af.id = a.primary_file_id
+                 WHERE af.perceptual_hash IS NOT NULL",
+            )
+            .map_err(|e| CoreError::Catalog(format!("phash prep: {e}")))?;
+        let mapped = stmt
+            .query_map([], |r| {
+                let hex: String = r.get(1)?;
+                let bytes: [u8; 8] = hex
+                    .as_bytes()
+                    .chunks_exact(2)
+                    .map(|c| {
+                        std::str::from_utf8(c)
+                            .ok()
+                            .and_then(|s| u8::from_str_radix(s, 16).ok())
+                            .unwrap_or(0)
+                    })
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap_or([0u8; 8]);
+                Ok((r.get(0)?, bytes))
+            })
+            .map_err(|e| CoreError::Catalog(format!("phash query: {e}")))?;
+        mapped
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| CoreError::Catalog(format!("phash row: {e}")))
+    }
+
+    /// The catalog's last-known (size, mtime) per loose-file rel_path for one source root — the
+    /// crawl's incremental diff (`crawler::needs_rehash`, DATA-MODEL §6). The writer uses this
+    /// for watch-rescans and the desktop for re-adding a folder: unchanged files skip BLAKE3.
+    pub fn known_sizes_for_source(
+        &self,
+        root: &str,
+    ) -> Result<std::collections::HashMap<String, (u64, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT af.rel_path, af.size_bytes, af.mtime
+                 FROM asset_file af
+                 JOIN asset a ON a.id = af.asset_id
+                 JOIN import_source s ON s.id = a.source_id
+                 WHERE s.root_path = ?1 AND a.package_id IS NULL AND a.status != 'trashed'",
+            )
+            .map_err(|e| CoreError::Catalog(format!("known sizes prep: {e}")))?;
+        let mapped = stmt
+            .query_map(params![root], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)?),
+                ))
+            })
+            .map_err(|e| CoreError::Catalog(format!("known sizes query: {e}")))?;
+        mapped
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| CoreError::Catalog(format!("known sizes row: {e}")))
+    }
+
     /// Store an asset's traced vector preview (M15). `source_key` is the mesh cache key it was
     /// generated from, so a later scan can tell a stale preview from a current one without
     /// re-rendering. Replaces any existing row — one preview per asset, always the current one.

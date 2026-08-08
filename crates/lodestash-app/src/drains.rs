@@ -748,6 +748,17 @@ pub fn drain_metrics(
                 tracing::warn!(%e, "set_metrics failed; stopping metrics drain");
                 return;
             }
+            // Perceptual hash (dHash, DATA-MODEL §5) for near-duplicate review: only raster
+            // media get one, and it rides the same decode the metrics just did. In-pack scratch
+            // pulls are fine — the hash is content-derived, not path-derived.
+            if matches!(job.media_code.as_str(), "image" | "texture" | "sprite") {
+                let ph = path
+                    .as_deref()
+                    .and_then(lodestash_ingest::metrics::perceptual_hash);
+                if let Err(e) = cat.set_perceptual_hash(job.asset_id, ph) {
+                    tracing::warn!(%e, "perceptual hash failed; retries next scan");
+                }
+            }
             // The mesh is parsed and cached right here, so this is the one place that can produce
             // the vector preview without a second parse — and it is already the persist thread, so
             // the write respects the single-writer rule (ARCHITECTURE §5).

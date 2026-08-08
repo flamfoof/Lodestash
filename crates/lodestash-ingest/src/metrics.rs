@@ -48,6 +48,29 @@ pub fn triangle_count(path: &Path, cache_dir: Option<&Path>) -> Option<i64> {
 
 /// Pixel dimensions. Tries the header-only path first (`image` reads a few bytes); DDS/PSD/TGA and
 /// anything else exotic fall back to the shared decode seam, which costs a full decode.
+///
+/// Perceptual hash (dHash, DATA-MODEL §5): downscale to 9×8 grayscale and take the 64-bit
+/// row-difference hash. Hamming distance ≤ ~6 bits = visually near-identical — the signal for
+/// "same image, re-encoded / re-sized" that BLAKE3 (byte-exact) cannot see. Dependency-free: rides
+/// the existing decode seam.
+pub fn perceptual_hash(path: &Path) -> Option<[u8; 8]> {
+    let img = crate::raster::decode(path).ok()?;
+    let gray = img
+        .grayscale()
+        .resize_exact(9, 8, image::imageops::FilterType::Triangle);
+    let luma = gray.to_luma8();
+    let mut out = [0u8; 8];
+    for row in 0..8 {
+        let mut bits = 0u8;
+        for col in 0..8 {
+            let left = luma.get_pixel(col, row).0[0];
+            let right = luma.get_pixel(col + 1, row).0[0];
+            bits = (bits << 1) | u8::from(left > right);
+        }
+        out[row as usize] = bits;
+    }
+    Some(out)
+}
 pub fn dimensions(path: &Path) -> Option<(i64, i64)> {
     if let Ok((w, h)) = image::image_dimensions(path) {
         return Some((w as i64, h as i64));
@@ -59,6 +82,66 @@ pub fn dimensions(path: &Path) -> Option<(i64, i64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{Rgb, RgbImage};
+
+    /// A deterministic gradient — the pattern (not solid colour) is what dHash keys on.
+    fn gradient(w: u32, h: u32) -> RgbImage {
+        let mut img = RgbImage::new(w, h);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            *p = Rgb([
+                (x * 7 + y * 3) as u8,
+                (x * 5) as u8,
+                (y * 11) as u8,
+            ]);
+        }
+        img
+    }
+
+    fn hamming(a: [u8; 8], b: [u8; 8]) -> u32 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x ^ y).count_ones())
+            .sum()
+    }
+
+    #[test]
+    fn perceptual_hash_is_stable_and_sensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, img: &RgbImage| {
+            let p = dir.path().join(name);
+            img.save(&p).unwrap();
+            p
+        };
+
+        // The same picture re-saved (a re-encode/re-size analog) is a near-dup: ≤ 6 bits.
+        let a = write("a.png", &gradient(64, 64));
+        let b = write("b.png", &gradient(63, 65)); // one-pixel re-size
+        let c = write("c.png", &gradient(64, 64)); // byte-identical re-save
+        let (ha, hb, hc) = (
+            perceptual_hash(&a).unwrap(),
+            perceptual_hash(&b).unwrap(),
+            perceptual_hash(&c).unwrap(),
+        );
+        assert_eq!(ha, hc, "the same pixels must hash identically");
+        assert!(hamming(ha, hb) <= 6, "a 1px re-size is a near-dup, got {}", hamming(ha, hb));
+
+        // A different picture is far: > 6 bits.
+        let mut other = RgbImage::new(64, 64);
+        for (x, y, p) in other.enumerate_pixels_mut() {
+            *p = if (x / 4 + y / 4) % 2 == 0 {
+                Rgb([200, 30, 30])
+            } else {
+                Rgb([20, 20, 180])
+            };
+        }
+        let d = write("d.png", &other);
+        let hd = perceptual_hash(&d).unwrap();
+        assert!(
+            hamming(ha, hd) > 6,
+            "a checkerboard must not be a near-dup of a gradient, got {}",
+            hamming(ha, hd)
+        );
+    }
 
     #[test]
     fn image_dimensions_come_from_the_header() {

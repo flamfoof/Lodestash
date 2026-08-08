@@ -484,6 +484,7 @@ export const addSourceDialog = () =>
 
 export const libraryStats = () => invoke<Stats>("library_stats");
 export const duplicateGroups = () => invoke<DupGroup[]>("duplicate_groups");
+export const nearDuplicateGroups = () => invoke<DupGroup[]>("near_duplicate_groups");
 
 export type AssetDetail = {
   asset_id: number;

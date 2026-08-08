@@ -591,6 +591,9 @@ struct Row {
     /// BLAKE3 of the primary file — the exact-duplicate key. `None` until the hash drain has
     /// reached this asset, which is most of a freshly scanned library.
     content_hash: Option<String>,
+    /// dHash of the primary file (DATA-MODEL §5) — the near-duplicate key: same picture,
+    /// different bytes (re-encoded / re-sized). `None` until the metrics drain decoded it.
+    perceptual_hash: Option<[u8; 8]>,
     /// The path the Folders view browses by: `rel_path` for a loose file, but
     /// `<pack>/<rel_path>` for an in-pack asset.
     ///
@@ -739,6 +742,12 @@ impl Library {
         }
 
         rows.sort_by(|a, b| a.search_key.cmp(&b.search_key));
+        // Near-duplicate review (DATA-MODEL §5) reads the perceptual hashes once per load.
+        if let Ok(phashes) = cat.perceptual_hashes() {
+            for row in &mut rows {
+                row.perceptual_hash = phashes.get(&row.item.asset_id).copied();
+            }
+        }
         self.rows = rows;
         self.paths = paths;
         self.sources = sources;
@@ -1292,28 +1301,69 @@ impl Library {
         let mut groups: Vec<DupGroup> = by_hash
             .into_iter()
             .filter(|(_, rows)| rows.len() > 1)
-            .map(|(hash, mut rows)| {
-                // Keeper: highest status wins, ties to the earliest indexed (lowest id).
-                rows.sort_by_key(|r| (std::cmp::Reverse(status_rank(r.status)), r.item.asset_id));
-                let first_pack = rows[0].item.package.as_deref();
-                DupGroup {
-                    hash: hash.to_string(),
-                    size_bytes: rows[0].item.size_bytes,
-                    keeper: rows[0].item.asset_id,
-                    cross_pack: rows
-                        .iter()
-                        .any(|r| r.item.package.as_deref() != first_pack),
-                    items: rows.iter().map(|r| r.item.clone()).collect(),
+            .map(|(hash, rows)| dup_group(hash.to_string(), rows))
+            .collect();
+        sort_groups(&mut groups);
+        groups
+    }
+
+    /// Near-duplicate groups (DATA-MODEL §5): the same picture in different bytes — a re-encode
+    /// or re-size — so BLAKE3 (byte-exact) misses it but the dHash does not. Members whose 64-bit
+    /// perceptual hashes differ by ≤ 6 bits (Hamming) join one group, union-find style.
+    ///
+    /// Bounded to the first `PERCEPTUAL_COMPARE_CAP` hashed rows: the pairwise comparison is n²,
+    /// and the review screen already pages — a cap is the honest shape, not a silent omission.
+    pub fn near_duplicates(&self) -> Vec<DupGroup> {
+        const HAMMING: u32 = 6;
+        const CAP: usize = 4_000;
+        let rows: Vec<&Row> = self
+            .live()
+            .filter(|r| r.perceptual_hash.is_some())
+            .take(CAP)
+            .collect();
+        if rows.len() < 2 {
+            return Vec::new();
+        }
+        let mut parent: Vec<usize> = (0..rows.len()).collect();
+        for i in 0..rows.len() {
+            let a = rows[i].perceptual_hash.unwrap();
+            for j in (i + 1)..rows.len() {
+                let b = rows[j].perceptual_hash.unwrap();
+                let d = a
+                    .iter()
+                    .zip(b.iter())
+                    .map(|(x, y)| (x ^ y).count_ones())
+                    .sum::<u32>();
+                if d <= HAMMING {
+                    let (mut ri, mut rj) = (i, j);
+                    while parent[ri] != ri {
+                        ri = parent[ri];
+                    }
+                    while parent[rj] != rj {
+                        rj = parent[rj];
+                    }
+                    parent[ri] = rj;
                 }
+            }
+        }
+        let mut by_root: HashMap<usize, Vec<&Row>> = HashMap::new();
+        for (i, row) in rows.iter().enumerate() {
+            let mut r = i;
+            while parent[r] != r {
+                r = parent[r];
+            }
+            by_root.entry(r).or_default().push(row);
+        }
+        let mut groups: Vec<DupGroup> = by_root
+            .into_values()
+            .filter(|members| members.len() > 1)
+            .map(|members| {
+                let h = members[0].perceptual_hash.unwrap();
+                let hash = h.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                dup_group(hash, members)
             })
             .collect();
-        // Biggest reclaimable bytes first: a group of six 40 MB textures is the one worth opening.
-        groups.sort_by(|a, b| {
-            let waste = |g: &DupGroup| g.size_bytes * (g.items.len() as i64 - 1);
-            waste(b)
-                .cmp(&waste(a))
-                .then_with(|| a.hash.cmp(&b.hash))
-        });
+        sort_groups(&mut groups);
         groups
     }
 
@@ -1887,7 +1937,32 @@ fn status_rank(s: AssetStatus) -> u8 {
         AssetStatus::Identified => 2,
         AssetStatus::Indexed => 1,
         AssetStatus::Discovered => 0,
+    }}
+
+/// Build one duplicate group from its members: keeper first (highest status, ties to earliest
+/// indexed), the reclaimable bytes, and whether the members span packs (the interesting case).
+fn dup_group(hash: String, mut rows: Vec<&Row>) -> DupGroup {
+    rows.sort_by_key(|r| (std::cmp::Reverse(status_rank(r.status)), r.item.asset_id));
+    let first_pack = rows[0].item.package.as_deref();
+    DupGroup {
+        hash,
+        size_bytes: rows[0].item.size_bytes,
+        keeper: rows[0].item.asset_id,
+        cross_pack: rows
+            .iter()
+            .any(|r| r.item.package.as_deref() != first_pack),
+        items: rows.iter().map(|r| r.item.clone()).collect(),
     }
+}
+
+/// Biggest reclaimable bytes first: a group of six 40 MB textures is the one worth opening.
+fn sort_groups(groups: &mut Vec<DupGroup>) {
+    groups.sort_by(|a, b| {
+        let waste = |g: &DupGroup| g.size_bytes * (g.items.len() as i64 - 1);
+        waste(b)
+            .cmp(&waste(a))
+            .then_with(|| a.hash.cmp(&b.hash))
+    });
 }
 
 /// A facet id, taken from the type's **own** serde name rather than a string written out again
@@ -1931,6 +2006,7 @@ fn row_from(
     };
     Row {
         content_hash: e.content_hash.clone(),
+        perceptual_hash: None,
         browse_path,
         search_key: name.to_lowercase(),
         trashed: e.trashed,
@@ -1986,6 +2062,7 @@ mod tests {
                 trashed: false,
                 traits: Vec::new(),
                 content_hash: None,
+                perceptual_hash: None,
                 browse_path: PathBuf::from(format!("{n}.x")),
                 item: GridItem {
                     asset_id: 0,

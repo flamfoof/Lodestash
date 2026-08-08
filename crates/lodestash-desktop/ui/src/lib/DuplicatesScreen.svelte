@@ -14,12 +14,13 @@
    * most likely and least recoverable.
    */
   import Card from "./Card.svelte";
-  import { duplicateGroups, fmtSize, type DupGroup } from "./api";
+  import { duplicateGroups, nearDuplicateGroups, fmtSize, type DupGroup } from "./api";
   import { view } from "./nav.svelte";
 
   let { ontrash }: { ontrash: (assetIds: number[]) => void } = $props();
 
   let groups = $state<DupGroup[] | null>(null);
+  let similar = $state<DupGroup[] | null>(null);
   let error = $state<string | null>(null);
   /** Groups the user has said are fine. Session-only — dismissing is not a catalog fact. */
   let dismissed = $state<Set<string>>(new Set());
@@ -32,12 +33,16 @@
         error = null;
       })
       .catch((e) => (error = String(e)));
+    nearDuplicateGroups()
+      .then((g) => (similar = g))
+      .catch(() => {});
   });
 
-  let shown = $derived((groups ?? []).filter((g) => !dismissed.has(g.hash)));
+  let shown = $derived((groups ?? []).filter((g) => !dismissed.has(`exact:${g.hash}`)));
+  let shownSimilar = $derived((similar ?? []).filter((g) => !dismissed.has(`similar:${g.hash}`)));
 
-  function keepBoth(hash: string) {
-    dismissed = new Set([...dismissed, hash]);
+  function keepBoth(hash: string, kind: "exact" | "similar") {
+    dismissed = new Set([...dismissed, `${kind}:${hash}`]);
   }
 
   /** Trash every member except the keeper. */
@@ -45,6 +50,43 @@
     ontrash(g.items.filter((i) => i.asset_id !== g.keeper).map((i) => i.asset_id));
   }
 </script>
+
+{#snippet groupCard(g: DupGroup, reason: string, kind: "exact" | "similar")}
+  <article class="group">
+    <div class="reason">
+      <span class="mono">{reason}</span>
+      {#if g.cross_pack}
+        <span class="pill">different packs</span>
+      {/if}
+    </div>
+
+    <div class="members">
+      {#each g.items as item (item.asset_id)}
+        <div class="member" class:keeper={item.asset_id === g.keeper}>
+          {#if item.asset_id === g.keeper}
+            <span class="ribbon">★ keeper</span>
+          {/if}
+          <Card
+            {item}
+            selected={view.selected === item.asset_id}
+            onselect={(id) => (view.selected = id)}
+            onopen={(id) => (view.selected = id)}
+          />
+          <span class="where">{item.package ?? "on disk"}</span>
+        </div>
+      {/each}
+    </div>
+
+    <div class="actions">
+      <button class="keep" onclick={() => keepBoth(g.hash, kind)} data-testid="keep-both">
+        Keep both
+      </button>
+      <button class="danger" onclick={() => trashOthers(g)} data-testid="trash-others">
+        Trash {g.items.length - 1} others
+      </button>
+    </div>
+  </article>
+{/snippet}
 
 <section class="screen">
   <header>
@@ -60,53 +102,42 @@
       <p class="msg danger">{error}</p>
     {:else if !groups}
       <p class="msg">Loading…</p>
-    {:else if shown.length === 0}
+    {:else if shown.length === 0 && shownSimilar.length === 0}
       <p class="msg" data-testid="empty">
         ⧉ No duplicates left to review.
-        {#if (groups?.length ?? 0) > 0}
-          ({groups.length} dismissed this session.)
+        {#if (groups?.length ?? 0) + (similar?.length ?? 0) > 0}
+          ({(groups?.length ?? 0) + (similar?.length ?? 0)} dismissed this session.)
         {/if}
       </p>
     {:else}
-      <div class="groups" data-testid="dup-groups">
-        {#each shown as g (g.hash)}
-          <article class="group">
-            <div class="reason">
-              <span class="mono">
-                identical bytes · blake3 {g.hash.slice(0, 12)} · {g.items.length} copies ·
-                {fmtSize(g.size_bytes * (g.items.length - 1))} reclaimable
-              </span>
-              {#if g.cross_pack}
-                <span class="pill">different packs</span>
-              {/if}
-            </div>
-
-            <div class="members">
-              {#each g.items as item (item.asset_id)}
-                <div class="member" class:keeper={item.asset_id === g.keeper}>
-                  {#if item.asset_id === g.keeper}
-                    <span class="ribbon">★ keeper</span>
-                  {/if}
-                  <Card
-                    {item}
-                    selected={view.selected === item.asset_id}
-                    onselect={(id) => (view.selected = id)}
-                    onopen={(id) => (view.selected = id)}
-                  />
-                  <span class="where">{item.package ?? "on disk"}</span>
-                </div>
-              {/each}
-            </div>
-
-            <div class="actions">
-              <button onclick={() => keepBoth(g.hash)} data-testid="dup-keep">Keep all</button>
-              <button class="danger" onclick={() => trashOthers(g)} data-testid="dup-trash">
-                Move {g.items.length - 1} duplicate{g.items.length > 2 ? "s" : ""} to Trash
-              </button>
-            </div>
-          </article>
-        {/each}
-      </div>
+      {#if shown.length > 0}
+        <h2 class="tier">Exact duplicates — identical bytes</h2>
+        <div class="groups" data-testid="dup-groups">
+          {#each shown as g (g.hash)}
+            {@render groupCard(
+              g,
+              `identical bytes · blake3 ${g.hash.slice(0, 12)} · ${g.items.length} copies · ${fmtSize(g.size_bytes * (g.items.length - 1))} reclaimable`,
+              "exact",
+            )}
+          {/each}
+        </div>
+      {/if}
+      {#if shownSimilar.length > 0}
+        <h2 class="tier">Similar — same picture, different bytes</h2>
+        <p class="tier-hint">
+          dHash within 6 bits: re-encoded, re-sized or re-compressed copies. Verify before
+          trashing — this is a visual signal, not a byte identity.
+        </p>
+        <div class="groups" data-testid="near-dup-groups">
+          {#each shownSimilar as g (g.hash)}
+            {@render groupCard(
+              g,
+              `similar picture · dhash ${g.hash.slice(0, 12)} · ${g.items.length} copies · ${fmtSize(g.size_bytes * (g.items.length - 1))} reclaimable`,
+              "similar",
+            )}
+          {/each}
+        </div>
+      {/if}
     {/if}
   </div>
 </section>
@@ -154,8 +185,18 @@
     border: 1px solid var(--ls-border);
     border-radius: var(--r-lg);
   }
-  .reason {
-    display: flex;
+  .tier {
+    margin: var(--sp-4) var(--sp-1) var(--sp-1);
+    font-size: var(--fs-sm);
+    letter-spacing: 0.06em;
+    color: var(--ls-text-muted);
+  }
+  .tier-hint {
+    margin: 0 var(--sp-1) var(--sp-2);
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+  }
+  .reason {    display: flex;
     align-items: center;
     gap: var(--sp-2);
     margin-bottom: var(--sp-2);

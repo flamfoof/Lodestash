@@ -164,6 +164,16 @@ fn duplicate_groups(state: tauri::State<'_, AppState>) -> Result<Vec<DupGroup>, 
         .map_err(|_| "library lock poisoned".to_string())
 }
 
+/// Near-duplicate review (DATA-MODEL §5): same picture, different bytes — dHash within 6 bits.
+#[tauri::command]
+fn near_duplicate_groups(state: tauri::State<'_, AppState>) -> Result<Vec<DupGroup>, String> {
+    state
+        .library
+        .lock()
+        .map(|l| l.near_duplicates())
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
 /// One level of the Folders view (DESIGN-GUIDELINES §7). `source: null` is the top level, where
 /// the tiles are the sources themselves.
 #[tauri::command]
@@ -945,6 +955,24 @@ fn build_engine_state() -> Option<(
     .ok()?;
     let state = std::sync::Arc::new(state);
     let allowed = apply_allow_list(&state);
+    // The REST/MCP semantic-search plane (ENGINE-API §2 `mode=ai`) needs the query embedder —
+    // the same local SigLIP the grid's AI mode uses, resolved lazily on the first ai search
+    // (model load is seconds; a startup resolve would slow every launch). `Vec::new()` from the
+    // fn means "no embedder" → the route answers `ai_unavailable` instead of degrading.
+    state.set_query_embedder(Box::new(|query: &str| {
+        static EMBEDDER: std::sync::OnceLock<
+            Option<std::sync::Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
+        > = std::sync::OnceLock::new();
+        let embedder = EMBEDDER.get_or_init(lodestash_app::drains::resolve_embedder);
+        let Some(e) = embedder else {
+            return Vec::new();
+        };
+        let v = e.embed_text(query);
+        if v.is_empty() {
+            return Vec::new(); // a stub embedder — no usable text space
+        }
+        vec![(e.model_id().to_string(), v)]
+    }));
     let token = state.token().to_string();
     Some((state, token, allowed))
 }
@@ -1102,6 +1130,7 @@ pub fn run() {
             vocabulary,
             library_stats,
             duplicate_groups,
+            near_duplicate_groups,
             asset_detail,
             reload_library,
             set_favorite,

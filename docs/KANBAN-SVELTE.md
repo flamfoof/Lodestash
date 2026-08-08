@@ -107,7 +107,12 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
 
 ## 🔴 Missing — not built at all
 
-- [ ] **Perceptual near-dup.** pHash/Chromaprint: `asset_file.perceptual_hash` is DDL-only, no
+- [x] **Perceptual near-dup — image pHash (2026-08-08).** `metrics::perceptual_hash` = 64-bit
+      dHash (downscale 9×8 grayscale, row-difference), stored by the metrics drain on
+      `asset_file.perceptual_hash`; `near_duplicate_groups` union-finds members within 6 bits
+      (bounded to the first 4k hashed rows) and the Duplicates screen gained a **Similar — same
+      picture, different bytes** tier with its own verify-before-trash hint. Audio Chromaprint
+      still deferred (needs a native dep).
       implementation.
 - [ ] **Variants + color search.** `variant_group_id` / `dominant_color` DDL-only; no clustering, no
       grid collapse, no color facet.
@@ -144,10 +149,16 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       detection shipped 2026-08-08** (`reconcile_moves`: vanished path + same hash ⇒ rel_path
       updated in place, asset_id/tags/embeddings preserved, trashed exempt — before record_crawl
       so no duplicate insert); **incremental re-hash** (crawl skips BLAKE3 over files known at the
-      same size/mtime via `needs_rehash` + `Library::known_sizes`). Perceptual near-dup still out
-      of scope.
+      same size/mtime via `needs_rehash` + `Library::known_sizes`). **Perceptual near-dup shipped
+      2026-08-08**: `metrics::perceptual_hash` (64-bit dHash over the shared decode seam) written
+      by the metrics drain (`set_perceptual_hash`), `near_duplicate_groups` (union-find, Hamming
+      ≤ 6 bits, capped pairwise) + the Duplicates screen's **Similar** tier.
 - [ ] **Magic-byte detection.** Crawl is extension-only; unknown-ext real assets dropped.
-- [ ] **Filesystem watch.** `watch_roots` zero callers; Settings toggles only store a flag.
+- [x] **Filesystem watch (2026-08-08, DATA-MODEL §6).** `ingest::watch::watch_roots` (notify,
+      debounced) now arms in the writer's idle pass over the `watch_enabled` source roots;
+      a signal rescans every watched source with the **incremental crawl** (unchanged files skip
+      BLAKE3) + the standard persist, reloading the UI only when something actually changed;
+      the watch re-arms after source-set changes. Skipped under the e2e escape hatch.
 - [ ] **Eviction / keep-extracted.** `unmaterialize_package` zero callers; `cache_extracted` not
       honored; workspace cap/7-day retention not enforced.
 - [ ] **Non-content classification.** `detect::is_content` zero callers; `is_content`/`content_kind`
