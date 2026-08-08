@@ -1258,7 +1258,7 @@ impl Catalog {
 /// (`subject|style|material|color|mood|usage|audio|technical|free`), `value` the term, and
 /// `confidence` the model's self-estimate — `None` for user-set and file-derived tags, which are
 /// exact rather than guessed.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct TagAssignment {
     pub namespace: String,
     pub value: String,

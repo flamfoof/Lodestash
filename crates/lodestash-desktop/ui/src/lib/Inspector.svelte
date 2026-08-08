@@ -71,14 +71,30 @@
   let tint = $derived(detail ? `var(${typeToken(detail.media_type)})` : "var(--ls-text-dim)");
 
   // ── Tag-editing slice (G4–G9) ──────────────────────────────────────────────────
-  // TRAITS (G4): the quick-add write path. The desktop shell has no per-asset tag
-  // read (AssetDetail carries no traits), so the chips below are the tags touched in
-  // this session — the grid card still draws the asset's real tag set. `bulkTag` with
-  // a single id is the same writer the bulk bar (B9d) uses, so the op is undoable.
+  // TRAITS (G4): the quick-add write path + the asset's real tag set (`detail.tags`,
+  // read through AssetDetail) — AI labels show their confidence and a ✕ to reject.
+  // `bulkTag` with a single id is the same writer the bulk bar (B9d) uses, so the op
+  // is undoable.
   let sessionTags = $state<string[]>([]);
   let tagValue = $state("");
   let tagBusy = $state(false);
   let tagMsg = $state<string | null>(null);
+
+  /** Reject a tag on the selected asset (UI-SPEC §9): removes it via the same undoable op. */
+  async function rejectTag(namespace: string, value: string) {
+    const id = detail?.asset_id;
+    if (id == null || tagBusy) return;
+    tagBusy = true;
+    try {
+      await bulkTag([id], namespace, value, false);
+      sessionTags = sessionTags.filter((v) => v !== value);
+      view.dataVersion += 1;
+    } catch (e) {
+      tagMsg = String(e);
+    } finally {
+      tagBusy = false;
+    }
+  }
 
   // LINKED FILES (G5) / SIMILAR (G7): both draw the same `related_assets` edges —
   // one fetch, two views of it. `null` while loading so the panels can say so.
@@ -242,10 +258,27 @@
 
     <section class="panel" data-testid="inspector-traits">
       <h3>TRAITS</h3>
-      {#if sessionTags.length === 0}
-        <p class="hint">No tags edited this session — add one below.</p>
+      {#if (detail?.tags.length ?? 0) === 0 && sessionTags.length === 0}
+        <p class="hint">No tags yet — add one below, or run Identify to propose labels.</p>
       {:else}
-        <div class="tagchips">
+        <div class="tagchips" data-testid="inspector-tagchips">
+          {#each detail?.tags ?? [] as t (t.namespace + ":" + t.value)}
+            <span
+              class="tag"
+              style={traitColor.has(t.value) ? `--chip: var(${traitColor.get(t.value)})` : ""}
+              title={t.namespace === "free" ? "hand-added" : `${t.namespace} · ${Math.round((t.confidence ?? 0) * 100)}%`}
+            >
+              {t.value}{#if t.confidence != null}<em class="conf" aria-label="confidence"
+                  >{Math.round(t.confidence * 100)}%</em
+                >{/if}
+              <button
+                class="x"
+                onclick={() => rejectTag(t.namespace, t.value)}
+                aria-label={`Remove tag ${t.value}`}
+                data-testid="reject-tag"
+              >✕</button>
+            </span>
+          {/each}
           {#each sessionTags as t (t)}
             <span
               class="tag"
@@ -583,6 +616,25 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .tag .conf {
+    font-style: normal;
+    opacity: 0.65;
+    margin-left: 2px;
+  }
+  .tag .x {
+    margin-left: 4px;
+    background: none;
+    border: 0;
+    padding: 0 1px;
+    color: inherit;
+    font-size: 9px;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0.5;
+  }
+  .tag .x:hover {
+    opacity: 1;
   }
   .quickadd {
     display: flex;

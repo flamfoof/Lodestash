@@ -47,7 +47,19 @@ pub fn crawl(root: &Path, excludes: &[Exclude]) -> Vec<CrawledFile> {
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            let media_type = detect::by_extension(&abs_path);
+            let media_type = detect::by_extension(&abs_path).or_else(|| {
+                // Magic-byte fallback (INGESTION §1): an unknown extension is not proof of
+                // non-content — a `.bin` texture or a headerless export reads as a real type
+                // from its first bytes. 16 bytes is one cheap read per *unclassified* file,
+                // which is the rare case; classified files never pay it.
+                let mut header = [0u8; 16];
+                let n = std::io::Read::read(
+                    &mut std::fs::File::open(&abs_path).ok()?,
+                    &mut header,
+                )
+                .ok()?;
+                detect::by_magic(&header[..n])
+            });
             Some(CrawledFile {
                 abs_path,
                 rel_path,

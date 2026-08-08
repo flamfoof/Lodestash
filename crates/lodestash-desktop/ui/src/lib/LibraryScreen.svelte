@@ -64,18 +64,22 @@
   }
 
   function onkeydown(e: KeyboardEvent) {
-    // Never steal keys from the search box.
+    // Never steal keys from the search box or a focused control.
     if (e.target instanceof HTMLInputElement) return;
-    // Enter or Space opens Quick Look on the selection (UI-SPEC §0.4). Space is the native
-    // activation key for buttons — a focused bulk-bar button or nudge CTA must keep its
-    // Space, so only fire from a bare body/card position, never from a focused control.
     if (e.target instanceof HTMLTextAreaElement) return;
     if (e.target instanceof HTMLButtonElement || e.target instanceof HTMLSelectElement) return;
-    if (
-      (e.key === "Enter" || e.code === "Space") &&
-      quickLook === null &&
-      view.selected !== null
-    ) {
+    // Space toggles Quick Look (UI-SPEC §0.4): opens on the selection, closes when open.
+    if (e.code === "Space") {
+      e.preventDefault();
+      if (quickLook === null) {
+        if (view.selected !== null) quickLook = view.selected;
+      } else {
+        quickLook = null;
+      }
+      return;
+    }
+    // Enter opens Quick Look on the selection (Space is the toggle above).
+    if (e.key === "Enter" && quickLook === null && view.selected !== null) {
       quickLook = view.selected;
       e.preventDefault();
     }

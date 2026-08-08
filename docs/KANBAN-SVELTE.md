@@ -73,7 +73,9 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       pass + filled by the tag/embed drains; `pump_progress` command; IdentifyScreen renders a
       real done/total bar (+ failed count) while a pass runs. Inspector gained a per-asset
       **✦ Identify** button (B11b) that flags + appraises and bumps the page.
-- [ ] **Inspector TRAITS are blank.** `AssetDetail` carries no traits; no accept/reject chips,
+- [x] **Inspector TRAITS live (2026-08-08).** `AssetDetail.tags` (via `tags_for_asset`) renders
+      the asset's real tag set with AI confidence % and a ✕ reject (same undoable `bulkTag` op);
+      accept/promote-to-trait stays on the Traits screen where the design owns it.
       confidence underbars, or trait quick-add.
 - [ ] **Inspector gaps.** No dependency **relink** interaction (edges render, nothing re-resolves a
       `missing` edge); no in-archive provenance block (Path-in-package / Package ⧉-copy rows);
@@ -84,13 +86,18 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       watch-rescans) is the documented ponytail; perceptual near-dup still out of scope.
 - [ ] **Pack stats modal is a stub.** 3 tiles ("isn't available in this build"); no triangles tile,
       no per-type contents/tags/heaviest. Packages screen rows have **no ◉ Stats** button at all.
-- [ ] **Keyboard map incomplete.** No Ctrl/Cmd-A, no Ctrl/Cmd-Z / Shift-Z redo (button only), no `F`,
+- [x] **Keyboard map (2026-08-08).** Ctrl/Cmd-Z undoes the newest op (Toolbar); **Space toggles**
+      Quick Look (open on selection, close when open); F favourites the selection. Ctrl/Cmd-A
+      (multi-select model) and Shift-Z redo (the op log is pre-image-only — redo needs the
+      forward payload stored) still open.
       Space opens Quick Look but doesn't close it. No right-click / context menu anywhere (FEATURES
       §1.1 + M1.5 imply one; zero `contextmenu` handlers in the shell).
 - [ ] **Trash renders the ordinary grid.** Spec'd table (per-row Restore, library·pack mono line)
       missing.
 - [ ] **Onboarding is a static explainer.** No two-step source/scan flow.
-- [ ] **Tag Graph is static.** No zoom/drag, no click-through, no dependency arcs.
+- [x] **Tag Graph interactive (2026-08-08).** Drag to pan, wheel to zoom (clamped 0.5–4×), click a
+      node to filter the library to that tag and navigate — dependency arcs still belong to the
+      LINKS graph (separate card).
 - [ ] **Settings gaps.** No CLOUD card, no model-download button, no MCP endpoint/token UI, no
       clear-cache/usage bar, no confirm-before-trash toggle.
 - [ ] **Staging is in-memory only.** Tray rows exist; `batch_id` recorded but no Recent-exports list
@@ -153,7 +160,10 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       2026-08-08**: `metrics::perceptual_hash` (64-bit dHash over the shared decode seam) written
       by the metrics drain (`set_perceptual_hash`), `near_duplicate_groups` (union-find, Hamming
       ≤ 6 bits, capped pairwise) + the Duplicates screen's **Similar** tier.
-- [ ] **Magic-byte detection.** Crawl is extension-only; unknown-ext real assets dropped.
+- [x] **Magic-byte detection (2026-08-08).** The crawler falls back to `detect::by_magic` (16-byte
+      header read per *unclassified* file) when the extension misses, so unknown-ext real assets
+      are recovered. `is_content` for the in-pack importer path is still unwired (the loose path
+      subsumes it).
 - [x] **Filesystem watch (2026-08-08, DATA-MODEL §6).** `ingest::watch::watch_roots` (notify,
       debounced) now arms in the writer's idle pass over the `watch_enabled` source roots;
       a signal rescans every watched source with the **incremental crawl** (unchanged files skip

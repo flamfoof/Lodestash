@@ -57,6 +57,14 @@
       undoBusy = false;
     }
   }
+
+  /** Ctrl/Cmd-Z — undo the newest op (UI-SPEC §2). Never steals from an input. */
+  function onkeydown(e: KeyboardEvent) {
+    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && !e.shiftKey) {
+      onUndo();
+    }
+  }
 </script>
 
 <svelte:window
@@ -65,6 +73,7 @@
     // popover is not modal, and a scrim would swallow the first click on every card behind it.
     if (view.filtersOpen && !(e.target as HTMLElement).closest(".filters")) view.filtersOpen = false;
   }}
+  on:keydown={onkeydown}
 />
 
 <div class="toolbar">
@@ -206,7 +215,6 @@
     >
       ↶
     </button>
-
     <button
       class="icon-btn"
       class:on={view.inspectorOpen}

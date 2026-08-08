@@ -504,6 +504,14 @@ export type AssetDetail = {
   in_pack: boolean;
   favorite: boolean;
   trashed: boolean;
+  /** This asset's tags; `confidence` is set for AI-tagged rows (UI-SPEC §9). */
+  tags: TagAssignment[];
+};
+
+export type TagAssignment = {
+  namespace: string;
+  value: string;
+  confidence: number | null;
 };
 
 /**

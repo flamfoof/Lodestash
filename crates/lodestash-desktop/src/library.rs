@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use lodestash_app::config::{SizeTier, SizeTiers, SortBy};
 use lodestash_app::grid;
 use lodestash_app::types::{Category, ContentFilter, StatusFilter, TriBucket};
-use lodestash_core::catalog::Catalog;
+use lodestash_core::catalog::{Catalog, TagAssignment};
 use lodestash_core::types::{AssetStatus, MediaType};
 use serde::{Deserialize, Serialize};
 
@@ -164,6 +164,9 @@ pub struct AssetDetail {
     pub texture_asset_id: Option<i64>,
     /// True when the file is not on disk — an in-pack asset whose bytes are still in the archive.
     pub in_pack: bool,
+    /// This asset's tags (UI-SPEC §9): `confidence` is set for AI-tagged rows, so the Inspector
+    /// can show which labels were guessed vs hand-added.
+    pub tags: Vec<TagAssignment>,
     /// Starred, and soft-deleted. The Inspector draws its actions from these — a trashed asset
     /// offers Restore, not another Trash button.
     pub favorite: bool,
@@ -1733,6 +1736,11 @@ impl Library {
             favorite: row.item.favorite,
             trashed: row.trashed,
             in_pack: row.item.in_pack,
+            tags: self
+                .catalog
+                .as_ref()
+                .and_then(|c| c.tags_for_asset(asset_id).ok())
+                .unwrap_or_default(),
         })
     }
 

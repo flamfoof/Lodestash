@@ -133,6 +133,31 @@
 
   let layout: GraphLayout = $derived(graph ? layoutTagGraph(graph) : { nodes: [], edges: [] });
 
+  // --- Tag Graph interactivity (UI-SPEC §8.2): pan by dragging, zoom with the wheel, and
+  // click a node to filter the library to that tag. ------------------------------
+  let zoom = $state(1);
+  let pan = $state({ x: 0, y: 0 });
+  let drag: { startX: number; startY: number; panX: number; panY: number } | null = null;
+  const zoomAt = (e: WheelEvent) => {
+    const next = Math.min(4, Math.max(0.5, zoom * Math.exp(-e.deltaY * 0.001)));
+    zoom = next;
+  };
+  const startPan = (e: PointerEvent) => {
+    drag = { startX: e.clientX, startY: e.clientY, panX: pan.x, panY: pan.y };
+    (e.currentTarget as SVGElement).setPointerCapture(e.pointerId);
+  };
+  const movePan = (e: PointerEvent) => {
+    if (!drag) return;
+    pan = { x: drag.panX + e.clientX - drag.startX, y: drag.panY + e.clientY - drag.startY };
+  };
+  const endPan = () => (drag = null);
+
+  /** Click-through: filter the library to this tag (the same chip the ⚑ popover would add). */
+  function openTag(label: string) {
+    view.filter = { ...view.filter, traits: [label] };
+    view.go("library");
+  }
+
   /** Reveal an asset in the library, the same move the palette makes. */
   function reveal(id: number, name: string) {
     view.go("library");
@@ -280,36 +305,55 @@
           data-testid="tag-graph"
           viewBox="0 0 {GRAPH_W} {GRAPH_H}"
           role="img"
-          aria-label="Tag co-occurrence graph"
+          aria-label="Tag co-occurrence graph — drag to pan, wheel to zoom, click a tag to filter the library"
+          onwheel={(e) => {
+            e.preventDefault();
+            zoomAt(e);
+          }}
+          onpointerdown={startPan}
+          onpointermove={movePan}
+          onpointerup={endPan}
+          onpointerleave={endPan}
         >
-          <g class="edges">
-            {#each layout.edges as e (`${e.x1}:${e.y1}:${e.x2}:${e.y2}`)}
-              <line
-                class="edge"
-                x1={e.x1}
-                y1={e.y1}
-                x2={e.x2}
-                y2={e.y2}
-                stroke-opacity={e.opacity}
-              />
-            {/each}
-          </g>
-          <g class="nodes">
-            {#each layout.nodes as p (p.id)}
-              <g class="node" transform="translate({p.x} {p.y})">
-                <title>{p.title}</title>
-                <circle r={p.r} />
-                <text
-                  class="label"
-                  x={p.labelX - p.x}
-                  y={p.labelY - p.y}
-                  text-anchor={p.anchor}
-                  dy="0.35em"
+          <g transform="translate({pan.x} {pan.y}) scale({zoom})">
+            <g class="edges">
+              {#each layout.edges as e (`${e.x1}:${e.y1}:${e.x2}:${e.y2}`)}
+                <line
+                  class="edge"
+                  x1={e.x1}
+                  y1={e.y1}
+                  x2={e.x2}
+                  y2={e.y2}
+                  stroke-opacity={e.opacity}
+                />
+              {/each}
+            </g>
+            <g class="nodes">
+              {#each layout.nodes as p (p.id)}
+                <g
+                  class="node"
+                  transform="translate({p.x} {p.y})"
+                  onclick={() => openTag(p.label)}
+                  role="button"
+                  tabindex="0"
+                  onkeydown={(e) => {
+                    if (e.key === "Enter") openTag(p.label);
+                  }}
                 >
-                  {p.label}
-                </text>
-              </g>
-            {/each}
+                  <title>{p.title}</title>
+                  <circle r={p.r} />
+                  <text
+                    class="label"
+                    x={p.labelX - p.x}
+                    y={p.labelY - p.y}
+                    text-anchor={p.anchor}
+                    dy="0.35em"
+                  >
+                    {p.label}
+                  </text>
+                </g>
+              {/each}
+            </g>
           </g>
         </svg>
       {/if}
@@ -515,22 +559,34 @@
     color: var(--ls-text-muted);
     margin-bottom: var(--sp-2);
   }
+  .tag-graph:active {
+    cursor: grabbing;
+  }
   .tag-graph {
     display: block;
     width: 100%;
     height: auto;
     background: var(--ls-surface);
     border: 1px solid var(--ls-border);
+    cursor: grab;
+    touch-action: none;
     border-radius: var(--r-md);
   }
   .tag-graph .edge {
     stroke: var(--ls-text-dim);
     stroke-width: 1;
   }
+  .tag-graph .node {
+    cursor: pointer;
+  }
   .tag-graph .node circle {
     fill: var(--ls-gold);
     stroke: color-mix(in srgb, var(--ls-gold) 55%, var(--ls-bg));
     stroke-width: 1;
+  }
+  .tag-graph .node:hover circle {
+    fill: var(--ls-gold);
+    filter: brightness(1.15);
   }
   .tag-graph .node .label {
     fill: var(--ls-text-dim);

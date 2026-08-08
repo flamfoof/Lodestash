@@ -234,6 +234,13 @@ import JobTray from "./lib/JobTray.svelte";
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
       paletteOpen = !paletteOpen;
       e.preventDefault();
+      return;
+    }
+    // F — favourite the selected asset (UI-SPEC §0.4). Never steals from an input.
+    if (e.key.toLowerCase() === "f" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (view.selected == null) return;
+      write(() => setFavorite([view.selected!], true), () => "Added to Favorites");
     }
   }
 
