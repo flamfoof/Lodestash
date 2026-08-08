@@ -93,9 +93,14 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
 - [x] **Keyboard map (2026-08-08).** Ctrl/Cmd-Z undoes the newest op; **Shift-Z / Ctrl/Cmd-Y
       redo** (op log now carries forward payloads, migration 17 — see the redo card); Space
       toggles Quick Look (open on selection, close when open); F favourites the selection.
-      Ctrl/Cmd-A (multi-select model) and right-click / context menu (FEATURES §1.1) still open.
-- [ ] **Trash renders the ordinary grid.** Spec'd table (per-row Restore, library·pack mono line)
-      missing.
+      Ctrl/Cmd-A (multi-select model) still open.
+- [x] **Right-click context menu (2026-08-08, FEATURES §1.1).** Cards + list rows emit
+      `oncontextmenu`; LibraryScreen floats a menu at the cursor (clamped, Escape/click-away
+      closes): Quick Look, Toggle Favorite, Identify now, Move to Trash (through the
+      confirm-before-trash gate). App owns the write fns.
+- [x] **Trash renders the ordinary grid + per-row Restore (2026-08-08).** The trash view is the
+      ordinary grid/list; the list's rows gained a Restore action in trash mode
+      (`AssetList row-restore`), alongside the inspector's Restore.
 - [ ] **Onboarding is a static explainer.** No two-step source/scan flow.
 - [x] **Tag Graph interactive (2026-08-08).** Drag to pan, wheel to zoom (clamped 0.5–4×), click a
       node to filter the library to that tag and navigate — dependency arcs still belong to the
@@ -108,9 +113,9 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
 - [ ] **Staging is in-memory only.** Tray rows exist; `batch_id` recorded but no Recent-exports list
       and no batch undo in the UI. Top-bar "No project" chip is static — **no project switcher
       popover** (recent exports · ↩ undo · Connect wizard, FEATURES §7.1).
-- [ ] **In-pack Quick Look never pulls the one payload** (FEATURES §5.4). Thumbnails pull via
-      scratch; the viewer short-circuits in-pack to `not_local` (`QuickLook.svelte:49`). Board's 🔴
-      full-res card covers `lodestash://file`; this is the UI behavior.
+- [x] **In-pack Quick Look pulls the one payload (2026-08-08, FEATURES §5.4).** `lodestash://file`
+      now materializes a known in-pack asset through the size-capped scratch (same path the thumb
+      route uses) instead of answering `503 not_local`; whole-pack extraction stays a command.
 - [ ] **Trait create form is under-specified** vs FEATURES §4.6 — no scope picker (any/model/sound/
       image), no usage-description field, defaults `teach:false`; no usage-note editing.
 - [ ] **Unity Assets landing lacks `↻ Sync` + content-derived filter tabs** (§5.3) — only a text box
@@ -137,8 +142,11 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       seeded into tags.
 - [ ] **Smart collections / `embedding_meta`.** DDL-only, never written.
 - [ ] **Trait-vocabulary teaching.** `teach=1` machinery exists; nothing feeds it to a tagger.
-- [ ] **Full-res in-pack file pulls.** `lodestash://file` answers 503 for in-pack (thumbnails fine);
-      per-entry "Extract selected" page-batching (lift the 256 MB `IN_PACK_THUMB_MAX_BYTES` cap).
+- [x] **Full-res in-pack pulls (2026-08-08).** `lodestash://file` and `lodestash://mesh` now
+      materialize a known in-pack asset through the size-capped scratch instead of answering
+      `503 not_local` — Quick Look renders in-pack images/audio/models like loose ones (whole
+      packs still extract by command only). Remaining: per-entry "Extract selected"
+      page-batching (lift the 256 MB `IN_PACK_THUMB_MAX_BYTES` cap).
 - [ ] **Import dialog (§5.2).** Folder → discovered-package list (group/select-all, category badge +
       tabs, version disclosure, "import as libraries") — `add_source_dialog` is a plain folder
       picker today.

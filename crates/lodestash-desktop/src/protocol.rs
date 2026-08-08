@@ -350,13 +350,29 @@ fn mesh(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
             .unwrap_or_else(|_| status(StatusCode::INTERNAL_SERVER_ERROR, "sphere: build"));
     }
 
-    let Some(path) = path.filter(|p| p.exists()) else {
-        // Same contract as `lodestash://file`: a known asset whose bytes are in a pack is not missing.
-        return if known {
-            status(StatusCode::SERVICE_UNAVAILABLE, "not_local")
-        } else {
-            status(StatusCode::NOT_FOUND, "unknown asset")
-        };
+    let path = match path.filter(|p| p.exists()) {
+        Some(p) => p,
+        None => {
+            // Same contract as `lodestash://file`: a known asset whose bytes are in a pack is
+            // not missing — materialize the one payload through the size-capped scratch and
+            // parse it here (FEATURES §5.4), so an in-pack model's Quick Look renders like a
+            // loose one.
+            let guard = lib.lock().ok();
+            let cache = guard.as_ref().and_then(|l| l.thumb_cache_dir().map(Path::to_path_buf));
+            let job = guard.as_ref().and_then(|l| l.thumb_job(id));
+            let local = match (job.as_ref(), cache.as_ref()) {
+                (Some(j), Some(c)) if j.in_pack.is_some() => in_pack_scratch(j, c),
+                _ => None,
+            };
+            match local {
+                Some(p) => p,
+                None => return if known {
+                    status(StatusCode::SERVICE_UNAVAILABLE, "not_local")
+                } else {
+                    status(StatusCode::NOT_FOUND, "unknown asset")
+                },
+            }
+        }
     };
 
     let meshes = match lodestash_ingest::mesh::load_any(&path, &std::collections::BTreeMap::new()) {
@@ -403,18 +419,26 @@ fn file(lib: &Mutex<Library>, rest: &str, req: &Request<Vec<u8>>) -> Response<Ve
         Err(_) => (None, false),
     };
     // An in-pack asset has no local path but is very much a real asset. Answering 404 there
-    // would tell the client it does not exist while it is on screen in the grid.
-    let Some(path) = path else {
+    // would tell the client it does not exist while it is on screen in the grid. Materialize
+    // the single payload into the scratch instead (FEATURES §5.4) — the thumb route already
+    // pulls in-pack bytes the same way; the scratch is size-capped so a hand-written URL
+    // cannot stage a whole pack. Extraction of whole packs stays a command, never a GET.
+    let cache_dir = lib.lock().ok().and_then(|l| l.thumb_cache_dir().map(Path::to_path_buf));
+    let job = lib.lock().ok().and_then(|l| l.thumb_job(id));
+    let local = match path {
+        Some(p) if p.exists() => Some(p),
+        _ => match (job.as_ref(), cache_dir.as_ref()) {
+            (Some(job), Some(cache)) if job.in_pack.is_some() => in_pack_scratch(job, cache),
+            _ => None,
+        },
+    };
+    let Some(path) = local else {
         return if known {
             status(StatusCode::SERVICE_UNAVAILABLE, "not_local")
         } else {
             status(StatusCode::NOT_FOUND, "unknown asset")
         };
     };
-    if !path.exists() {
-        // Extracting is a command, never a GET — the handler stays read-only by construction.
-        return status(StatusCode::SERVICE_UNAVAILABLE, "not_local");
-    }
 
     let Ok(mut f) = File::open(&path) else {
         return status(StatusCode::NOT_FOUND, "open failed");

@@ -15,11 +15,18 @@
     selected,
     onselect,
     onopen,
+    onmenu,
+    trashedOnly = false,
+    onrestore,
   }: {
     items: GridItem[];
     selected: number | null;
     onselect: (id: number) => void;
     onopen: (id: number) => void;
+    onmenu?: (e: MouseEvent, id: number) => void;
+    /** Trash view: a per-row Restore (UI-SPEC §10 — the spec'd trash table). */
+    trashedOnly?: boolean;
+    onrestore?: (id: number) => void;
   } = $props();
 
   /** A row that cannot be thumbnailed just shows nothing rather than a broken-image glyph. */
@@ -43,6 +50,10 @@
       title={item.rel_path}
       onclick={() => onselect(item.asset_id)}
       ondblclick={() => onopen(item.asset_id)}
+      oncontextmenu={(e) => {
+        e.preventDefault();
+        onmenu?.(e, item.asset_id);
+      }}
     >
       <span class="cell name" role="cell">
         <span class="thumb">
@@ -65,6 +76,30 @@
       <span class="cell right num" role="cell">
         {item.triangles ? item.triangles.toLocaleString() : "—"}
       </span>
+      {#if trashedOnly}
+        <span class="cell right" role="cell">
+          <!-- The row root is a <button>, so a real control inside it would be invalid HTML —
+               same rule as the grid's multi-select box. A role=button span keeps the click. -->
+          <span
+            class="restore"
+            role="button"
+            tabindex="0"
+            data-testid="row-restore"
+            onclick={(e) => {
+              e.stopPropagation();
+              onrestore?.(item.asset_id);
+            }}
+            onkeydown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.stopPropagation();
+                onrestore?.(item.asset_id);
+              }
+            }}
+          >
+            Restore
+          </span>
+        </span>
+      {/if}
     </button>
   {/each}
 </div>
@@ -160,5 +195,20 @@
   }
   .right {
     text-align: right;
+  }
+  .restore {
+    border: 1px solid var(--ls-border);
+    border-radius: 5px;
+    background: transparent;
+    color: var(--ls-text-dim);
+    font: inherit;
+    font-size: var(--fs-xs);
+    padding: 2px 8px;
+    cursor: default;
+  }
+  .restore:hover {
+    border-color: var(--ls-border-strong);
+    color: var(--ls-text);
+    background: var(--ls-hover);
   }
 </style>

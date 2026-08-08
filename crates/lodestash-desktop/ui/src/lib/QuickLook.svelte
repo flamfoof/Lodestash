@@ -46,7 +46,9 @@
     // A material's shader ball is *generated* — no bytes are read from the pack — so it is the
     // one type that previews fine while still in an archive.
     if (detail.media_type === "material") return "model";
-    if (detail.in_pack) return "not_local";
+    // In-pack assets preview too: lodestash://file materializes the one payload into the
+    // size-capped scratch on demand (FEATURES §5.4). The `not_local` branch below remains for
+    // genuine pull failures (over the cap, or the pack vanished).
     switch (detail.media_type) {
       case "image":
       case "texture":

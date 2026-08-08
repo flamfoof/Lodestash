@@ -273,6 +273,19 @@ import JobTray from "./lib/JobTray.svelte";
     view.selected = null;
     confirming = false;
   }
+  /** Context-menu actions from the grid (FEATURES §1.1) — the write fns live here. */
+  function onMenuAction(d: { action: string; id: number; favorite: boolean }) {
+    const { action, id, favorite } = d;
+    if (action === "favorite") {
+      write(() => setFavorite([id], !favorite), () => (favorite ? "Removed from Favorites" : "Added to Favorites"));
+    } else if (action === "identify") {
+      write(() => identifyAsset(id), () => "Flagged for identify — appraising…").then(() => {
+        view.dataVersion += 1;
+      });
+    } else if (action === "trash") {
+      confirmTrash(() => write(() => setTrashed([id], true), () => "Moved to Trash"));
+    }
+  }
 </script>
 
 <svelte:window on:keydown={onkeydown} />
@@ -312,6 +325,10 @@ import JobTray from "./lib/JobTray.svelte";
           {favoritesOnly}
           {trashedOnly}
           title={favoritesOnly ? "Favorites" : trashedOnly ? "Trash" : "Library"}
+          onmenuaction={onMenuAction}
+          onrestore={(id) =>
+            write(() => setTrashed([id], false), () => "Restored from Trash").then(afterRemoval)
+          }
         />
       {:else}
         <Screen title={screen.title} milestone={screen.milestone} />

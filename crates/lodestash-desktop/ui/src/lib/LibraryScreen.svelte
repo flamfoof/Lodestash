@@ -7,16 +7,35 @@
   import { gridPage, DENSITIES, bulkTag, type GridPage, type LibraryStatus } from "./api";
   import { view } from "./nav.svelte";
 
+  // Right-click menu (FEATURES §1.1): position + target asset. Closes on any action, Escape,
+  // click-away or a scroll.
+  let menu = $state<{ x: number; y: number; id: number } | null>(null);
+  function closeMenu() {
+    menu = null;
+  }
+  function menuAction(action: "favorite" | "identify" | "trash") {
+    const m = menu;
+    if (!m) return;
+    const favorite = result?.items.find((i) => i.asset_id === m.id)?.favorite ?? false;
+    onmenuaction?.({ action, id: m.id, favorite });
+    closeMenu();
+  }
+
   let {
     status,
     favoritesOnly = false,
     trashedOnly = false,
     title = "Library",
+    onmenuaction,
+    onrestore,
   }: {
     status: LibraryStatus | null;
     favoritesOnly?: boolean;
     trashedOnly?: boolean;
     title?: string;
+    onmenuaction?: (d: { action: string; id: number; favorite: boolean }) => void;
+    /** Trash view: restore one row (UI-SPEC §10). */
+    onrestore?: (id: number) => void;
   } = $props();
 
   let page = $state(0);
@@ -254,6 +273,9 @@
         selected={view.selected}
         onselect={(id) => (view.selected = id)}
         onopen={(id) => (quickLook = id)}
+        onmenu={(e, id) => (menu = { x: e.clientX, y: e.clientY, id })}
+        {trashedOnly}
+        onrestore={(id) => onrestore?.(id)}
       />
     {:else}
       <div class="grid" style="--card: {cardPx}px">
@@ -268,6 +290,7 @@
               selected={view.selected === item.asset_id}
               onselect={(id) => (view.selected = id)}
               onopen={(id) => (quickLook = id)}
+              onmenu={(e, id) => (menu = { x: e.clientX, y: e.clientY, id })}
               onidentified={() => (view.dataVersion += 1)}
             />
             <span
@@ -306,6 +329,36 @@
 
   {#if quickLook !== null}
     <QuickLook assetId={quickLook} onclose={() => (quickLook = null)} onstep={step} />
+
+    {#if menu}
+      <!-- A full-screen transparent layer: one click closes; the menu sits above it at the
+           cursor, clamped to the viewport. -->
+      <div
+        class="menu-backdrop"
+        role="presentation"
+        onclick={closeMenu}
+        oncontextmenu={(e) => {
+          e.preventDefault();
+          closeMenu();
+        }}
+        onkeydown={(e) => e.key === "Escape" && closeMenu()}
+      ></div>
+      <div
+        class="ctx-menu"
+        role="menu"
+        aria-label="Asset actions"
+        style="left: {Math.min(menu.x, window.innerWidth - 180)}px; top: {Math.min(menu.y, window.innerHeight - 140)}px;"
+      >
+        <button role="menuitem" onclick={() => menu && ((quickLook = menu.id), closeMenu())}>
+          Quick Look
+        </button>
+        <button role="menuitem" onclick={() => menuAction("favorite")}>Toggle Favorite</button>
+        <button role="menuitem" onclick={() => menuAction("identify")}>Identify now</button>
+        <button role="menuitem" class="danger" onclick={() => menuAction("trash")}>
+          Move to Trash
+        </button>
+      </div>
+    {/if}
   {/if}
 </section>
 
@@ -515,5 +568,38 @@
   }
   .pager button:disabled {
     opacity: 0.4;
+  }
+  .menu-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 90;
+  }
+  .ctx-menu {
+    position: fixed;
+    z-index: 91;
+    min-width: 168px;
+    padding: 4px;
+    border: 1px solid var(--ls-border);
+    border-radius: 8px;
+    background: var(--ls-surface);
+    box-shadow: 0 8px 28px rgb(0 0 0 / 0.35);
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+  .ctx-menu button {
+    all: unset;
+    cursor: default;
+    padding: 7px 10px;
+    border-radius: 5px;
+    font: inherit;
+    font-size: var(--fs-sm);
+    color: var(--ls-text);
+  }
+  .ctx-menu button:hover {
+    background: var(--ls-hover);
+  }
+  .ctx-menu button.danger {
+    color: var(--ls-danger);
   }
 </style>

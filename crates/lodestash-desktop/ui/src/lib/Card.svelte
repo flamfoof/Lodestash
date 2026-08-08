@@ -19,6 +19,7 @@
     onselect,
     onopen,
     onidentified,
+    onmenu,
   }: {
     item: GridItem;
     selected?: boolean;
@@ -27,6 +28,9 @@
     /** After a ✦ identify completes (B11b) — lets the grid bump its page so the new
      *  preview/tags render. */
     onidentified?: (id: number) => void;
+    /** Right-click (FEATURES §1.1): the shell's context menu. The Card only reports the
+     *  event + asset — the menu itself lives up-tree where the write fns are. */
+    onmenu?: (e: MouseEvent, id: number) => void;
   } = $props();
 
   /**
@@ -114,6 +118,10 @@
   class:selected
   style="--tint: {tint}"
   onclick={() => onselect?.(item.asset_id)}
+  oncontextmenu={(e) => {
+    e.preventDefault();
+    onmenu?.(e, item.asset_id);
+  }}
   ondblclick={() => onopen?.(item.asset_id)}
   title={item.rel_path}
 >
