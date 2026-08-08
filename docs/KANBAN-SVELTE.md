@@ -66,7 +66,9 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
             section (local Ollama text+vision models, opt-in OpenAI-compatible API with
             base URL/model/key — stored in config.json, never logged); `appraise_pass`
             resolves `OpenAiTagger` → `OllamaTagger` → `FilenameTagger`.
-- [ ] **AI search toggle is cosmetic.** ⟨Tags⟩/⟨AI⟩ (`TopBar.svelte:46-59`) changes styling only; the grid ranks FTS-only (`Toolbar.svelte:79-90`). `hybrid_search` exists in core but is reachable only via the ⚪ servers. Wire RRF hybrid into `gridPage`/`search_assets` behind `mode=ai`.
+- [x] **AI search wired (2026-08-08).** `GridQuery.search_mode` + `Library::ai_ranks`: the
+      ⟨Tags⟩/⟨AI⟩ toggle now drives `catalog::hybrid_search` (RRF-fused FTS + SigLIP/CLAP query
+      embeddings, resolved once per process); without a local model it honestly degrades to FTS.
 - [x] **Identify UI polish (2026-08-08).** Shared `Arc<JobProgress>` on AppState, reset per
       pass + filled by the tag/embed drains; `pump_progress` command; IdentifyScreen renders a
       real done/total bar (+ failed count) while a pass runs. Inspector gained a per-asset
@@ -130,14 +132,20 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
 
 - [x] **REST + MCP servers start with the app (2026-08-08, B12).** One `ServerState` →
       `api::serve` (ephemeral loopback port + engine.json written) + `mcp::serve_stdio` on its
-      own thread (self-terminates on stdin EOF; a `--mcp` headless branch is still future — an
+      own thread (self-terminates on stdin EOF); **`--mcp` headless branch shipped 2026-08-08**
+      — `lodestash-desktop --mcp` serves the stdio plane without a window (smoke-tested with a
+      real initialize handshake).
       agent host pipes stdin to the running app). Settings' ENGINE BRIDGE shows the live port.
 - [ ] **10 doc'd agent ops absent on both planes.** `list_tags`, `add_tag`, `list_collections`,
       `apply_mapping`, `identify_asset`, `suggest_tags`, `unpack_package`, staging group
       (ENGINE-API §2).
 - [x] **Hash/dedup wired for loose files (2026-08-08, B6).** `crawler::hash_file` called at
-      crawl for browseable files ⇒ `content_hash` set ⇒ Duplicates groups real; move/rename
-      detection (same-hash-different-path) is the natural next step.
+      crawl for browseable files ⇒ `content_hash` set ⇒ Duplicates groups real; **move/rename
+      detection shipped 2026-08-08** (`reconcile_moves`: vanished path + same hash ⇒ rel_path
+      updated in place, asset_id/tags/embeddings preserved, trashed exempt — before record_crawl
+      so no duplicate insert); **incremental re-hash** (crawl skips BLAKE3 over files known at the
+      same size/mtime via `needs_rehash` + `Library::known_sizes`). Perceptual near-dup still out
+      of scope.
 - [ ] **Magic-byte detection.** Crawl is extension-only; unknown-ext real assets dropped.
 - [ ] **Filesystem watch.** `watch_roots` zero callers; Settings toggles only store a flag.
 - [ ] **Eviction / keep-extracted.** `unmaterialize_package` zero callers; `cache_extracted` not

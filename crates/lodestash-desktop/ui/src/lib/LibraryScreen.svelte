@@ -105,6 +105,7 @@
     gridPage({
       tab: view.tab,
       search: view.search,
+      search_mode: view.searchMode,
       status: view.status,
       sort_by: view.sortBy,
       sort_asc: view.sortAsc,

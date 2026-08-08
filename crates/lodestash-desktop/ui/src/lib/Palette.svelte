@@ -63,7 +63,8 @@
       gridPage({
         tab: "all",
         search: needle,
-        status: "all",
+      search_mode: "tags",
+      status: "all",
         sort_by: "relevance",
         sort_asc: true,
         favorites_only: false,

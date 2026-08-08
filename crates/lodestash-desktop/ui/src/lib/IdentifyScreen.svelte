@@ -68,6 +68,7 @@
     gridPage({
       tab: "all",
       search: "",
+      search_mode: "tags",
       status: "unidentified",
       sort_by: "name",
       sort_asc: true,

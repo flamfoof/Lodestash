@@ -46,23 +46,37 @@ pub struct Crawled {
 /// the grid means a card with no type, no thumbnail and nothing to do with it.
 pub fn crawl_sources(sources: &[Source]) -> Crawled {
     let mut out = Crawled::default();
+    // Multi-source wrapper has no DB context, so every browseable file hashes (the desktop's
+    // single-source `crawl_source` passes the incremental diff).
+    let known = std::collections::HashMap::new();
     for (source_idx, source) in sources.iter().enumerate() {
         if source.pack_only {
             continue;
         }
-        crawl_one(source_idx, &source.root, &source.excludes, &mut out);
+        crawl_one(source_idx, &source.root, &source.excludes, &known, &mut out);
     }
     out
 }
 
 /// Crawl a single source, attributing everything to `source_idx` — the partial-rescan path.
-pub fn crawl_source(source_idx: usize, root: &Path, excludes: &[Exclude]) -> Crawled {
+pub fn crawl_source(
+    source_idx: usize,
+    root: &Path,
+    excludes: &[Exclude],
+    known: &std::collections::HashMap<String, (u64, i64)>,
+) -> Crawled {
     let mut out = Crawled::default();
-    crawl_one(source_idx, root, excludes, &mut out);
+    crawl_one(source_idx, root, excludes, known, &mut out);
     out
 }
 
-fn crawl_one(source_idx: usize, root: &Path, excludes: &[Exclude], out: &mut Crawled) {
+fn crawl_one(
+    source_idx: usize,
+    root: &Path,
+    excludes: &[Exclude],
+    known: &std::collections::HashMap<String, (u64, i64)>,
+    out: &mut Crawled,
+) {
     for file in crawler::crawl(root, excludes) {
         if is_unitypackage(&file.abs_path) {
             if let Some(pkg) = resolve_pending_package(source_idx, &file) {
@@ -74,11 +88,18 @@ fn crawl_one(source_idx: usize, root: &Path, excludes: &[Exclude], out: &mut Cra
             continue;
         }
         // BLAKE3 the payload so the Duplicates screen has a real signal (B6, DATA-MODEL §6).
-        // Only browseable files — hashing dropped ones would be wasted IO. One-time per
-        // import; a size/mtime-gated re-hash (crawler::needs_rehash) is the ponytail for
-        // watch-rescans.
+        // Only browseable files — hashing dropped ones would be wasted IO. The crawl skips
+        // re-hashing files the catalog already knows at the same (size, mtime) — the
+        // incremental diff (DATA-MODEL §6, `crawler::needs_rehash`) — so re-adding an indexed
+        // folder costs one stat per file, not a full re-read.
         let mut file = file;
-        file.hash = crawler::hash_file(&file.abs_path).ok();
+        let rel = file.rel_path.to_string_lossy().replace('\\', "/");
+        let known = known.get(&rel).copied();
+        file.hash = if crawler::needs_rehash(&file, known.map(|(s, _)| s), known.map(|(_, m)| m)) {
+            crawler::hash_file(&file.abs_path).ok()
+        } else {
+            None
+        };
         out.entries.push((source_idx, file));
     }
 }

@@ -613,20 +613,20 @@ impl Catalog {
                     }
                     Some((file_id, _, _, asset_id)) => {
                         tx.execute(
-                            "UPDATE asset_file SET size_bytes = ?2, mtime = ?3,
-                                                   content_hash = NULL
+                            "UPDATE asset_file SET size_bytes = ?2, mtime = ?3
                              WHERE id = ?1",
                             params![file_id, rec.size_bytes, rec.mtime],
                         )
                         .map_err(|e| CoreError::Catalog(format!("asset_file update: {e}")))?;
                         tx.execute(
                             // The bytes changed, so the extracted facets and the outbound
-                            // dependency refs are stale too.
+                            // dependency refs are stale too — and the primary content hash
+                            // follows the new bytes (the crawl hashed the changed file).
                             "UPDATE asset SET updated_at = ?2, embedding_dirty = 1,
                                               metrics_dirty = 1, deps_dirty = 1,
-                                              tags_dirty = 1
+                                              tags_dirty = 1, content_hash = ?3
                              WHERE id = ?1",
-                            params![asset_id, now],
+                            params![asset_id, now, rec.content_hash],
                         )
                         .map_err(|e| CoreError::Catalog(format!("asset touch: {e}")))?;
                         stats.updated += 1;
@@ -1006,6 +1006,89 @@ impl Catalog {
         tx.commit()
             .map_err(|e| CoreError::Catalog(format!("missing commit: {e}")))?;
         Ok((gone, back))
+    }
+
+    /// Move/rename detection (DATA-MODEL §6): a file whose **path vanished** from a crawl while
+    /// its **content hash reappeared at another path** is the same file moved — update `rel_path`
+    /// in place, preserving `asset_id`, tags, embeddings, mappings and the hash. Trashed assets
+    /// are exempt (trash is a user decision; a moved file must not resurrect it). Returns the
+    /// new rel_paths that were consumed, so the caller can drop them from `record_crawl` and
+    /// avoid a duplicate insert.
+    ///
+    /// Call this **before** `record_crawl` on a full-source crawl. Missing rows (`af.missing=1`)
+    /// are included: a file that reappears at a new path is a move back, not a duplicate.
+    pub fn reconcile_moves(
+        &mut self,
+        source_id: i64,
+        records: &[CrawlRecord],
+    ) -> Result<Vec<String>> {
+        let present: std::collections::HashSet<String> =
+            records.iter().map(|r| r.rel_path.clone()).collect();
+        // New-path records with a hash are the move candidates: same bytes, new location.
+        let hash_to_rel: std::collections::HashMap<&str, &CrawlRecord> = records
+            .iter()
+            .filter_map(|r| r.content_hash.as_deref().map(|h| (h, r)))
+            .collect();
+        if hash_to_rel.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Vanished files: in the catalog, not in this crawl, with a known hash.
+        let vanished: Vec<(i64, String, String, i64)> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT af.id, af.rel_path, a.content_hash, a.id
+                     FROM asset_file af JOIN asset a ON a.id = af.asset_id
+                     WHERE a.source_id = ?1 AND a.package_id IS NULL
+                       AND a.status != 'trashed'
+                       AND a.content_hash IS NOT NULL",
+                )
+                .map_err(|e| CoreError::Catalog(format!("moves prep: {e}")))?;
+            let mapped = stmt
+                .query_map(params![source_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .map_err(|e| CoreError::Catalog(format!("moves query: {e}")))?;
+            mapped
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| CoreError::Catalog(format!("moves row: {e}")))?
+        };
+
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| CoreError::Catalog(format!("moves begin: {e}")))?;
+        let mut moved = Vec::new();
+        for (file_id, rel_path, hash, asset_id) in vanished {
+            if present.contains(&rel_path) {
+                continue; // still on disk at the same path — not a move
+            }
+            let Some(rec) = hash_to_rel.get(hash.as_str()) else {
+                continue; // vanished with no hash match — the caller's reconcile_missing flags it
+            };
+            tx.execute(
+                "UPDATE asset_file SET rel_path = ?2, ext = ?3, size_bytes = ?4,
+                                       mtime = ?5, missing = 0
+                 WHERE id = ?1",
+                params![
+                    file_id,
+                    rec.rel_path,
+                    rec.rel_path.rsplit('.').next().map(str::to_lowercase),
+                    rec.size_bytes,
+                    rec.mtime,
+                ],
+            )
+            .map_err(|e| CoreError::Catalog(format!("moves file update: {e}")))?;
+            tx.execute(
+                "UPDATE asset SET name = ?2, updated_at = ?3 WHERE id = ?1",
+                params![asset_id, rec.name, unix_now()],
+            )
+            .map_err(|e| CoreError::Catalog(format!("moves asset update: {e}")))?;
+            moved.push(rec.rel_path.clone());
+        }
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("moves commit: {e}")))?;
+        Ok(moved)
     }
 
     /// Set (or clear, with None) the 1–5 star rating on assets (DATA-MODEL §12).
@@ -4876,6 +4959,18 @@ mod tests {
         }
     }
 
+    fn rec_h(rel: &str, size: i64, mtime: i64, hash: &str) -> CrawlRecord {
+        CrawlRecord {
+            workspace_rel: None,
+            content_hash: Some(hash.to_string()),
+            rel_path: rel.to_string(),
+            name: rel.rsplit('/').next().unwrap_or(rel).to_string(),
+            media_type: "image".to_string(),
+            size_bytes: size,
+            mtime,
+        }
+    }
+
     /// `apply_mapping` is deterministic: rules run in priority order, the lowest-priority match wins,
     /// and the result never depends on rule *insertion* order.
     #[test]
@@ -6388,6 +6483,63 @@ mod tests {
             )
             .expect("count");
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn reconcile_moves_repoints_vanished_path_keeping_asset_id() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let src = c
+            .upsert_import_source("Lib", "C:/lib", "folder")
+            .expect("src");
+
+        // First crawl: one file at its old path, hashed.
+        c.record_crawl(src, None, &[rec_h("rocks/a.png", 10, 100, "H1")])
+            .expect("crawl 1");
+        let before: i64 = c
+            .conn
+            .query_row(
+                "SELECT a.id FROM asset a
+                 JOIN asset_file af ON af.asset_id = a.id
+                 WHERE af.rel_path = 'rocks/a.png'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("old row");
+
+        // The file moved to a subfolder with the same bytes: the vanished path + same hash
+        // ⇒ same file. The record is consumed (returned), so the caller drops it and no
+        // duplicate row is inserted.
+        let moved = c
+            .reconcile_moves(src, &[rec_h("assets/rocks/a.png", 10, 100, "H1")])
+            .expect("moves");
+        assert_eq!(moved, vec!["assets/rocks/a.png".to_string()]);
+        let stats = c.record_crawl(src, None, &[]).expect("crawl 2");
+        assert_eq!(stats.inserted, 0, "moved record must not insert a duplicate");
+
+        // The SAME asset row was repointed — id, hash and name preserved, path updated.
+        let (after, hash, name): (i64, String, String) = c
+            .conn
+            .query_row(
+                "SELECT a.id, a.content_hash, a.name FROM asset a
+                 JOIN asset_file af ON af.asset_id = a.id
+                 WHERE af.rel_path = 'assets/rocks/a.png'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("moved row");
+        assert_eq!(after, before, "move must preserve asset_id");
+        assert_eq!(hash, "H1", "hash survives the move");
+        assert_eq!(name, "a.png");
+        let gone: i64 = c
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset_file WHERE rel_path = 'rocks/a.png'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("old gone");
+        assert_eq!(gone, 0, "the old path must no longer exist");
     }
 
     #[test]

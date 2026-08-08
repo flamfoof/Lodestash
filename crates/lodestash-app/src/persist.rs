@@ -350,13 +350,26 @@ pub fn persist_to_catalog(
         if let Some(json) = &batch.excludes_json {
             blacklists.push((batch.root.clone(), json.clone()));
         }
+        // Move/rename detection (DATA-MODEL §6) runs **before** record_crawl: a vanished row
+        // whose hash reappeared at a new path is the same file moved — rel_path updated in
+        // place (asset_id, tags, embeddings, mappings preserved) — and the consumed records
+        // are dropped so they don't insert a duplicate. Trashed assets are exempt.
+        let moved = catalog
+            .reconcile_moves(id, &batch.records)
+            .map_err(|e| e.to_string())?;
+        let remaining: Vec<CrawlRecord> = batch
+            .records
+            .iter()
+            .filter(|r| !moved.contains(&r.rel_path))
+            .cloned()
+            .collect();
         let stats = catalog
-            .record_crawl(id, None, &batch.records)
+            .record_crawl(id, None, &remaining)
             .map_err(|e| e.to_string())?;
         // Files gone from disk are flagged missing (metadata preserved, hidden from
         // hydrate + grid); files that came back are unflagged.
         let present: std::collections::HashSet<String> =
-            batch.records.iter().map(|r| r.rel_path.clone()).collect();
+            remaining.iter().map(|r| r.rel_path.clone()).collect();
         let (gone, back) = catalog
             .reconcile_missing(id, &present)
             .map_err(|e| e.to_string())?;
@@ -365,6 +378,7 @@ pub fn persist_to_catalog(
             inserted = stats.inserted,
             updated = stats.updated,
             unchanged = stats.unchanged,
+            moved = moved.len(),
             gone,
             back,
             "catalog sync"

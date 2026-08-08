@@ -44,6 +44,7 @@
           const r = await gridPage({
             tab: "all",
             search: "",
+            search_mode: "tags",
             status: "all",
             sort_by: "name",
             sort_asc: true,

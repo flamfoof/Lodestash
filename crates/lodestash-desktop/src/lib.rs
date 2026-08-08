@@ -297,7 +297,16 @@ fn add_source(state: tauri::State<'_, AppState>, path: String) -> Result<WriteRe
             "{path} is marked pack-only — its packs are indexed from their archives, not by walking it"
         ));
     }
-    let crawled = lodestash_app::scan::crawl_source(0, &root, &excludes);
+    let crawled = {
+        // Incremental diff (DATA-MODEL §6): re-adding an already-indexed folder skips re-hashing
+        // files the catalog knows at the same (size, mtime) — one stat per file, not a re-read.
+        let known = state
+            .library
+            .lock()
+            .map(|lib| lib.known_sizes(&lodestash_app::config::stem_name(&root)))
+            .unwrap_or_default();
+        lodestash_app::scan::crawl_source(0, &root, &excludes, &known)
+    };
     if crawled.entries.is_empty() && crawled.pending_packages.is_empty() {
         return Err(format!("nothing indexable in {path}"));
     }
@@ -876,6 +885,89 @@ fn bulk_tag(
     })
 }
 
+/// The REST/MCP `PreviewFn` (ENGINE-API preview endpoints): resolve the asset's cached thumbnail,
+/// generating on a miss — the same deterministic key the `lodestash://thumb` route uses. Shared by
+/// the embedded engine (B12) and the `--mcp` headless server.
+fn engine_preview_fn(cache_root: Option<std::path::PathBuf>) -> lodestash_api::PreviewFn {
+    Box::new(move |src| {
+        use lodestash_ingest::thumb::{generate, meta_key, ThumbParams};
+        let Some(cache) = cache_root.as_deref() else {
+            return None;
+        };
+        let q = lodestash_app::config::AppConfig::load().preview_quality;
+        let params = ThumbParams {
+            width: q.thumb_px(),
+            height: q.thumb_px(),
+            proxy: q.proxy_budget(),
+        };
+        let key = meta_key(
+            src,
+            std::fs::metadata(src).map(|m| m.len()).unwrap_or(0),
+            0,
+        );
+        generate(src, cache, &key, params).ok()
+    })
+}
+
+/// Apply the Settings MCP allow-list (UI-SPEC §16): config holds the disabled half, the state the
+/// enabled set. Returns how many tools stayed enabled (`None` = every tool is live).
+fn apply_allow_list(state: &lodestash_api::ServerState) -> Option<usize> {
+    let cfg = lodestash_app::config::AppConfig::load();
+    if cfg.mcp_disabled_tools.is_empty() {
+        return None;
+    }
+    let enabled: std::collections::HashSet<String> = lodestash_api::AGENT_OPERATIONS
+        .iter()
+        .map(|(n, _)| n.to_string())
+        .filter(|n| !cfg.mcp_disabled_tools.contains(n))
+        .collect();
+    state.set_allowed(enabled.clone());
+    Some(enabled.len())
+}
+
+/// Build the shared engine `ServerState` (B12) — one read-only catalog connection, the allow-list
+/// applied, the per-session token minted. `None` when there is no catalog on disk yet.
+fn build_engine_state() -> Option<(
+    std::sync::Arc<lodestash_api::ServerState>,
+    String,
+    Option<usize>,
+)> {
+    let db = lodestash_app::paths::catalog_db_path()?;
+    if !db.exists() {
+        return None;
+    }
+    let (cache_root, workspace) = lodestash_app::paths::default_cache_dirs();
+    let state = lodestash_api::ServerState::new(
+        &db,
+        workspace.unwrap_or_else(|| cache_root.clone().unwrap_or_default()),
+        engine_preview_fn(cache_root),
+    )
+    .ok()?;
+    let state = std::sync::Arc::new(state);
+    let allowed = apply_allow_list(&state);
+    let token = state.token().to_string();
+    Some((state, token, allowed))
+}
+
+/// `--mcp` headless: the MCP stdio server without the GUI. Runs until stdin closes; `tracing`
+/// already initialized by `run()`. Exits non-zero if there is no catalog to serve.
+fn run_mcp_headless() {
+    let Some((state, _token, _allowed)) = build_engine_state() else {
+        eprintln!(
+            "lodestash-desktop --mcp: no catalog on disk yet — open the app once to create it"
+        );
+        std::process::exit(2);
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("mcp runtime builds");
+    if let Err(e) = rt.block_on(lodestash_mcp::serve_stdio(state)) {
+        tracing::error!(%e, "mcp server exited");
+        std::process::exit(1);
+    }
+}
+
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -883,6 +975,14 @@ pub fn run() {
                 .unwrap_or_else(|_| "lodestash_desktop=info".into()),
         )
         .init();
+
+    // `--mcp` (ENGINE-API §2, MCP↔REST 1:1): serve the MCP stdio plane headless — an agent host
+    // spawns `lodestash-desktop --mcp` and speaks JSON-RPC on stdin/stdout. The process owns
+    // stdin until the host closes it; no window, no REST server, no writer thread.
+    if std::env::args().any(|a| a == "--mcp") {
+        run_mcp_headless();
+        return;
+    }
 
     let library = Library::open();
     let status = library.status();
@@ -953,81 +1053,29 @@ pub fn run() {
             // pipes it (a console or no-stdin launch idles or exits on EOF — a background
             // thread either way). Both share one ServerState with its own read-only catalog
             // connection — the API never writes the catalog, so the single-writer rule holds.
-            let db = lodestash_app::paths::catalog_db_path();
-            let (cache_root, workspace) = lodestash_app::paths::default_cache_dirs();
-            let (engine_state, engine_port, engine_token, engine_allowed) = match db {
-                Some(db) if db.exists() => {
-                    let cache_root_for_preview = cache_root.clone();
-                    let preview: lodestash_api::PreviewFn = Box::new(move |src| {
-                        use lodestash_ingest::thumb::{generate, meta_key, ThumbParams};
-                        let Some(cache) = cache_root_for_preview.as_deref() else {
-                            return None;
-                        };
-                        let q = lodestash_app::config::AppConfig::load().preview_quality;
-                        let params = ThumbParams {
-                            width: q.thumb_px(),
-                            height: q.thumb_px(),
-                            proxy: q.proxy_budget(),
-                        };
-                        let key = meta_key(
-                            src,
-                            std::fs::metadata(src).map(|m| m.len()).unwrap_or(0),
-                            0,
-                        );
-                        generate(src, cache, &key, params).ok()
-                    });
-                    let state = lodestash_api::ServerState::new(
-                        &db,
-                        workspace.unwrap_or_else(|| cache_root.clone().unwrap_or_default()),
-                        preview,
-                    )
-                    .map(std::sync::Arc::new)
-                    .map_err(|e| e.to_string());
-                    match state {
-                        Ok(state) => {
-                            // The allow-list (UI-SPEC §16): config holds the disabled half.
-                            let cfg = lodestash_app::config::AppConfig::load();
-                            let allowed = if cfg.mcp_disabled_tools.is_empty() {
-                                None
-                            } else {
-                                Some(
-                                    lodestash_api::AGENT_OPERATIONS
-                                        .iter()
-                                        .map(|(n, _)| n.to_string())
-                                        .filter(|n| !cfg.mcp_disabled_tools.contains(n))
-                                        .collect::<std::collections::HashSet<_>>(),
-                                )
-                            };
-                            if let Some(set) = allowed.clone() {
-                                state.set_allowed(set);
-                            }
-                            let token = state.token().to_string();
-                            let port = lodestash_api::serve(state.clone())
-                                .map(|h| h.port)
-                                .map_err(|e| tracing::error!(%e, "engine API failed to bind"))
-                                .ok();
-                            // MCP stdio plane on its own thread — self-terminates on stdin EOF.
-                            let state_arc = state.clone();
-                            std::thread::Builder::new()
-                                .name("lodestash-mcp".into())
-                                .spawn(move || {
-                                    let rt = tokio::runtime::Builder::new_current_thread()
-                                        .enable_all()
-                                        .build()
-                                        .expect("mcp runtime builds");
-                                    let _ = rt.block_on(lodestash_mcp::serve_stdio(state));
-                                })
-                                .ok();
-                            (Some(state_arc), port, token, allowed.map(|s| s.len()))
-                        }
-                        Err(e) => {
-                            tracing::warn!(%e, "engine state unavailable");
-                            (None, None, String::new(), None)
-                        }
+            let (engine_state, engine_port, engine_token, engine_allowed) =
+                match build_engine_state() {
+                    Some((state, token, allowed)) => {
+                        let port = lodestash_api::serve(state.clone())
+                            .map(|h| h.port)
+                            .map_err(|e| tracing::error!(%e, "engine API failed to bind"))
+                            .ok();
+                        // MCP stdio plane on its own thread — self-terminates on stdin EOF.
+                        let state_arc = state.clone();
+                        std::thread::Builder::new()
+                            .name("lodestash-mcp".into())
+                            .spawn(move || {
+                                let rt = tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .build()
+                                    .expect("mcp runtime builds");
+                                let _ = rt.block_on(lodestash_mcp::serve_stdio(state));
+                            })
+                            .ok();
+                        (Some(state_arc), port, token, allowed)
                     }
-                }
-                _ => (None, None, String::new(), None),
-            };
+                    None => (None, None, String::new(), None),
+                };
             app.manage(AppState {
                 library: Mutex::new(library),
                 writer,

@@ -60,6 +60,9 @@ pub struct GridQuery {
     pub tab: Category,
     /// Substring match over the name — the Tags-mode filter, before FTS is wired.
     pub search: String,
+    /// ⟨Tags⟩/⟨AI⟩ (TopBar): "tags" = FTS ranks; "ai" = RRF-fused FTS + query embeddings
+    /// (hybrid_search). Anything else behaves as tags.
+    pub search_mode: String,
     /// `discovered` and `indexed` both fold into Unidentified (DATA-MODEL §8).
     pub status: StatusFilter,
     pub sort_by: SortBy,
@@ -97,6 +100,7 @@ impl Default for GridQuery {
         Self {
             tab: Category::All,
             search: String::new(),
+            search_mode: "tags".to_string(),
             status: StatusFilter::All,
             sort_by: SortBy::Name,
             sort_asc: true,
@@ -557,6 +561,9 @@ pub struct Library {
     /// Assets staged in the tray (I6). In-memory only — the tray is transient design state;
     /// the commit-to-project half rides the engine build (B9e keeps the collect side).
     staged: Vec<i64>,
+    /// The local text-capable embedder for AI-mode search (TopBar ⟨Tags⟩/⟨AI⟩), resolved once
+    /// — model load is seconds, so per keystroke would be unusable. `None` until first use.
+    ai_embedder: std::sync::Mutex<Option<std::sync::Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>>,
 }
 
 struct Row {
@@ -616,6 +623,7 @@ impl Library {
                     paths: HashMap::new(),
                     tiers: lodestash_app::config::AppConfig::load().size_tiers.normalized(),
                     staged: Vec::new(),
+                    ai_embedder: Default::default(),
                 };
                 lib.reload();
                 lib
@@ -637,6 +645,7 @@ impl Library {
             paths: HashMap::new(),
             tiers: SizeTiers::default(),
             staged: Vec::new(),
+            ai_embedder: Default::default(),
         }
     }
 
@@ -928,11 +937,17 @@ impl Library {
         ranks.is_some_and(|m| m.contains_key(&r.item.asset_id)) || r.search_key.contains(needle)
     }
 
-    /// Filter, sort, page. Runs the FTS query for the active search, then hands the ranks to
+    /// Filter, sort, page. Runs the search for the active mode, then hands the ranks to
     /// [`Self::page_with_ranks`], which is where the actual work — and the testability — lives.
     pub fn page(&self, q: &GridQuery) -> GridPage {
         let needle = q.search.trim().to_lowercase();
-        let ranks = self.search_ranks(&needle);
+        // ⟨Tags⟩/⟨AI⟩ (TopBar): AI mode RRF-fuses FTS with query embeddings (hybrid_search);
+        // without a local model it honestly degrades to the FTS ranks.
+        let ranks = if q.search_mode == "ai" {
+            self.ai_ranks(&needle).or_else(|| self.search_ranks(&needle))
+        } else {
+            self.search_ranks(&needle)
+        };
         self.page_with_ranks(q, ranks.as_ref())
     }
 
@@ -1697,8 +1712,55 @@ impl Library {
         Some(ids.into_iter().enumerate().map(|(r, id)| (id, r)).collect())
     }
 
+    /// AI-mode search (TopBar ⟨Tags⟩/⟨AI⟩): RRF-fuse FTS with query embeddings via
+    /// `catalog::hybrid_search` (AI-PIPELINE §3). The embedder resolves once (model load is
+    /// seconds — per keystroke would be unusable) and the query embeds in its text space, which
+    /// is the same joint space the image/audio embeddings were written into. Returns `None` when
+    /// no local model is installed or the embed is a stub, so `page` falls back to FTS honestly.
+    fn ai_ranks(&self, needle: &str) -> Option<HashMap<i64, usize>> {
+        if needle.is_empty() {
+            return None;
+        }
+        let embedder = {
+            let mut slot = self.ai_embedder.lock().ok()?;
+            if slot.is_none() {
+                *slot = lodestash_app::drains::resolve_embedder();
+            }
+            slot.clone()?
+        };
+        let vec = embedder.embed_text(needle);
+        if vec.is_empty() {
+            return None; // a stub embedder — no usable text space
+        }
+        let model_id = embedder.model_id().to_string();
+        const HIT_CAP: usize = 100_000;
+        let ids = self
+            .catalog
+            .as_ref()?
+            .hybrid_search(needle, &[(model_id.as_str(), vec.as_slice())], None, HIT_CAP)
+            .ok()?;
+        Some(ids.into_iter().enumerate().map(|(r, id)| (id, r)).collect())
+    }
+
     pub fn thumb_cache_dir(&self) -> Option<&Path> {
         self.thumb_cache.as_deref()
+    }
+
+    /// The catalog's last-known (size, mtime) per loose-file rel_path for one source root — the
+    /// crawl's incremental diff (`crawler::needs_rehash`, DATA-MODEL §6). Re-adding an
+    /// already-indexed folder then skips BLAKE3 over every unchanged file. In-pack rows are
+    /// exempt: their files live in the workspace cache, not the source.
+    pub fn known_sizes(&self, root: &str) -> HashMap<String, (u64, i64)> {
+        self.rows
+            .iter()
+            .filter(|r| !r.trashed && r.source.as_deref() == Some(root) && !r.item.in_pack)
+            .map(|r| {
+                (
+                    r.browse_path.to_string_lossy().replace('\\', "/"),
+                    (r.item.size_bytes as u64, r.mtime),
+                )
+            })
+            .collect()
     }
 
     pub fn asset_path(&self, asset_id: i64) -> Option<&Path> {
@@ -1951,6 +2013,7 @@ mod tests {
             paths: HashMap::new(),
             tiers: SizeTiers::default(),
             staged: Vec::new(),
+            ai_embedder: Default::default(),
         }
     }
 

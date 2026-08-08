@@ -80,6 +80,8 @@ export type Facets = {
 export type GridQuery = {
   tab: string;
   search: string;
+  /** ⟨Tags⟩/⟨AI⟩ — "tags" = FTS ranks, "ai" = RRF-fused FTS + query embeddings. */
+  search_mode: "tags" | "ai";
   status: string;
   sort_by: string;
   sort_asc: boolean;
