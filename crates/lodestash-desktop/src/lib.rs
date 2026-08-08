@@ -465,6 +465,21 @@ fn get_settings() -> Result<Settings, String> {
     lodestash_app::config::edit_config(|c| Settings::from_config(c))
 }
 
+/// Bytes + file count under the preview cache root (Settings' CACHE card).
+#[tauri::command]
+fn preview_cache_usage(state: tauri::State<'_, AppState>) -> Result<(u64, usize), String> {
+    let lib = state.library.lock().map_err(|_| "library lock poisoned".to_string())?;
+    Ok(lib.preview_cache_usage())
+}
+
+/// Empty the preview cache (thumbs + mesh/inpack scratch — all regenerable). Runs under the
+/// library lock; the workspace (extracted assets) is never touched.
+#[tauri::command]
+fn clear_preview_cache(state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    let lib = state.library.lock().map_err(|_| "library lock poisoned".to_string())?;
+    Ok(lib.clear_preview_cache())
+}
+
 /// Persist the Settings snapshot and re-read the library so the size tiers and source rows the
 /// grid draws follow immediately (badges, ⚑ size facet, watch toggles).
 #[tauri::command]
@@ -1164,6 +1179,8 @@ pub fn run() {
             set_trait_style,
             get_settings,
             set_settings,
+            preview_cache_usage,
+            clear_preview_cache,
             set_source_watch,
             collections,
             collection_members,

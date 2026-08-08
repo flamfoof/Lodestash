@@ -82,6 +82,8 @@ export type GridQuery = {
   search: string;
   /** ⟨Tags⟩/⟨AI⟩ — "tags" = FTS ranks, "ai" = RRF-fused FTS + query embeddings. */
   search_mode: "tags" | "ai";
+  /** Restrict to exactly these asset ids — the Identify screen's "just appraised" session set. */
+  ids: number[];
   status: string;
   sort_by: string;
   sort_asc: boolean;
@@ -237,6 +239,7 @@ export type Settings = {
   cache_extracted: boolean;
   preview_cache_cap_gb: number;
   auto_purge_preview_cache: boolean;
+  confirm_before_trash: boolean;
   mcp_disabled_tools: string[];
   tagger_model: string | null;
   tagger_vision_model: string | null;
@@ -546,7 +549,13 @@ export const DENSITIES = [
 ] as const;
 
 /** What a write actually did. `refused` + `failed` are the parts worth telling the user about. */
-export type WriteResult = { changed: number; refused: number; failed: number };
+export type WriteResult = {
+  changed: number;
+  refused: number;
+  failed: number;
+  /** Asset ids the appraise pass just promoted — the Identify screen's session set. */
+  promoted: number[];
+};
 
 export const setFavorite = (assetIds: number[], on: boolean) =>
   invoke<WriteResult>("set_favorite", { assetIds, on });
@@ -615,6 +624,9 @@ export const fileUrl = (assetId: number) => `${LODESTASH_BASE}/file/${assetId}`;
  *  (`?q=`). The backend reads the actual quality from config; the query exists so the webview
  *  re-fetches instead of serving a stale-size PNG from its own cache. */
 export let thumbKey = "1";
+export const previewCacheUsage = () => invoke<[number, number]>("preview_cache_usage");
+export const clearPreviewCache = () => invoke<number>("clear_preview_cache");
+
 export const setThumbKey = (k: string) => {
   thumbKey = k;
 };

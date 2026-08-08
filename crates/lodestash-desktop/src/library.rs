@@ -63,6 +63,9 @@ pub struct GridQuery {
     /// ⟨Tags⟩/⟨AI⟩ (TopBar): "tags" = FTS ranks; "ai" = RRF-fused FTS + query embeddings
     /// (hybrid_search). Anything else behaves as tags.
     pub search_mode: String,
+    /// Restrict to exactly these asset ids — the Identify screen's "just appraised" session
+    /// set. Empty = no restriction.
+    pub ids: Vec<i64>,
     /// `discovered` and `indexed` both fold into Unidentified (DATA-MODEL §8).
     pub status: StatusFilter,
     pub sort_by: SortBy,
@@ -101,6 +104,7 @@ impl Default for GridQuery {
             tab: Category::All,
             search: String::new(),
             search_mode: "tags".to_string(),
+            ids: Vec::new(),
             status: StatusFilter::All,
             sort_by: SortBy::Name,
             sort_asc: true,
@@ -298,6 +302,9 @@ pub struct Settings {
     pub cache_extracted: bool,
     pub preview_cache_cap_gb: u32,
     pub auto_purge_preview_cache: bool,
+    /// Ask before trashing (UI-SPEC §11 "confirm before trash"): when on, the trash entry
+    /// points (inspector, bulk bar) require a second confirming click.
+    pub confirm_before_trash: bool,
     /// The MCP allow-list, stored as the disabled half (UI-SPEC §11.5, MCP↔REST 1:1).
     pub mcp_disabled_tools: Vec<String>,
     /// Ollama text model for local tagging (AI-PIPELINE §2). `None` = no local LLM.
@@ -342,6 +349,7 @@ impl Settings {
             cache_extracted: c.cache_extracted,
             preview_cache_cap_gb: c.preview_cache_cap_gb,
             auto_purge_preview_cache: c.auto_purge_preview_cache,
+            confirm_before_trash: c.confirm_before_trash,
             mcp_disabled_tools: c.mcp_disabled_tools.clone(),
             tagger_model: c.tagger_model.clone(),
             tagger_vision_model: c.tagger_vision_model.clone(),
@@ -372,6 +380,7 @@ impl Settings {
         c.cache_extracted = self.cache_extracted;
         c.preview_cache_cap_gb = self.preview_cache_cap_gb;
         c.auto_purge_preview_cache = self.auto_purge_preview_cache;
+        c.confirm_before_trash = self.confirm_before_trash;
         c.mcp_disabled_tools = self.mcp_disabled_tools;
         c.tagger_model = self.tagger_model;
         c.tagger_vision_model = self.tagger_vision_model;
@@ -1017,6 +1026,13 @@ impl Library {
             .filter(|r| match &members {
                 Some(m) => m.contains(&r.item.asset_id),
                 None => true,
+            })
+            .filter(|r| {
+                if q.ids.is_empty() {
+                    true
+                } else {
+                    q.ids.contains(&r.item.asset_id)
+                }
             })
             .filter(|r| match &linked {
                 Some(set) => set.contains(&r.item.asset_id),
@@ -1816,6 +1832,61 @@ impl Library {
 
     pub fn thumb_cache_dir(&self) -> Option<&Path> {
         self.thumb_cache.as_deref()
+    }
+
+    /// Bytes + file count under the preview cache root (Settings' CACHE card). The workspace —
+    /// where extracted assets live — is a sibling directory and never counted here.
+    pub fn preview_cache_usage(&self) -> (u64, usize) {
+        let Some(root) = self.thumb_cache_dir() else {
+            return (0, 0);
+        };
+        let mut bytes = 0u64;
+        let mut files = 0usize;
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(meta) = entry.metadata() {
+                    bytes += meta.len();
+                    files += 1;
+                }
+            }
+        }
+        (bytes, files)
+    }
+
+    /// Empty the preview cache: every loose thumb + the `mesh`/`inpack` scratch dirs. All of it
+    /// regenerates on demand from the source assets, so this is non-destructive by design. The
+    /// workspace (extracted assets) is never touched. Returns the number of files removed. A
+    /// preview being written mid-clear tears — the next generate overwrites it, so it self-heals.
+    pub fn clear_preview_cache(&self) -> usize {
+        let Some(root) = self.thumb_cache_dir() else {
+            return 0;
+        };
+        let mut removed = 0usize;
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name == "mesh" || name == "inpack" {
+                    if let Ok(len) = std::fs::remove_dir_all(&path) {
+                        // count entries best-effort; a missing dir is fine
+                        let _ = len;
+                        removed += 1;
+                    }
+                    continue;
+                }
+                if path.is_file() && std::fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        removed
     }
 
     /// The catalog's last-known (size, mtime) per loose-file rel_path for one source root — the

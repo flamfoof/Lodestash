@@ -16,6 +16,8 @@
     sourceExcludes as fetchSourceExcludes,
     addSourceExclude,
     removeSourceExclude,
+    previewCacheUsage,
+    clearPreviewCache,
     setThumbKey,
     projects,
     setActiveProject,
@@ -40,6 +42,7 @@
     cache_extracted: false,
     preview_cache_cap_gb: 4,
     auto_purge_preview_cache: false,
+    confirm_before_trash: true,
     mcp_disabled_tools: [],
     tagger_model: null,
     tagger_vision_model: null,
@@ -217,6 +220,34 @@
       .then((b) => (bridge = b))
       .catch(() => (bridge = { live: false, port: null, token_set: false, allowed: null }));
   });
+  // CACHE card (STORAGE CAPS): live usage + a clear button. Thumbs + mesh/inpack scratch are
+  // regenerable; the workspace (extracted packs) is never touched by this.
+  let cacheBytes = $state(0);
+  let cacheFiles = $state(0);
+  let cacheBusy = $state(false);
+  $effect(() => {
+    previewCacheUsage()
+      .then(([bytes, files]) => {
+        cacheBytes = bytes;
+        cacheFiles = files;
+      })
+      .catch(() => {});
+  });
+  async function clearCache() {
+    if (cacheBusy) return;
+    cacheBusy = true;
+    try {
+      const removed = await clearPreviewCache();
+      cacheFiles = 0;
+      cacheBytes = 0;
+      // The thumbs are gone — bump the cache-bust key so live <img>s re-render on demand.
+      if (removed > 0) setThumbKey(crypto.randomUUID());
+    } catch {
+      // keep the old numbers; the button re-enables
+    } finally {
+      cacheBusy = false;
+    }
+  }
   $effect(() => {
     projects()
       .then((p) => (editors = p))
@@ -594,6 +625,16 @@
           />
           Auto-purge over cap — drop least-recently-viewed previews.
         </label>
+        <div class="cache-row">
+          <span class="mono">Now: {cacheBytes} in {cacheFiles} files</span>
+          <button class="ghost" onclick={clearCache} disabled={cacheBusy || cacheFiles === 0}>
+            {cacheBusy ? "Clearing…" : "Clear preview cache"}
+          </button>
+        </div>
+        <p class="hint">
+          Previews, decimated meshes and in-pack scratch — all regenerable from the source
+          assets. Extracted pack files (the workspace) are never touched.
+        </p>
       </section>
 
       <section class="card">

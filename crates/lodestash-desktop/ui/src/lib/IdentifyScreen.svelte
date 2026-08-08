@@ -52,8 +52,12 @@
     outcome = null;
     try {
       const r = await identifyAll();
+      // Session set (UI-SPEC §3): the ids that just became identified — show them instead of
+      // letting them vanish into the library.
+      session = r.promoted;
+      sessionOn = r.promoted.length > 0;
       outcome = r.changed > 1
-        ? `Appraised ${r.changed.toLocaleString()} assets — reload to see the backlog shrink.`
+        ? `Appraised ${r.changed.toLocaleString()} assets — ${r.promoted.length} newly identified.`
         : "No local embedder models — install SigLIP/CLAP (Settings → AI) to appraise.";
     } catch (e) {
       outcome = `Appraise failed: ${String(e)}`;
@@ -63,13 +67,17 @@
     }
   }
 
+  // The just-appraised session set: `sessionOn` swaps the grid to exactly these ids.
+  let session = $state<number[]>([]);
+  let sessionOn = $state(false);
   $effect(() => {
     view.dataVersion;
     gridPage({
       tab: "all",
       search: "",
       search_mode: "tags",
-      status: "unidentified",
+      ids: sessionOn ? session : [],
+      status: sessionOn ? "all" : "unidentified",
       sort_by: "name",
       sort_asc: true,
       favorites_only: false,
@@ -98,8 +106,14 @@
       </p>
     </div>
     <div class="right">
-      <span class="count mono">{total.toLocaleString()}</span>
-      <span class="count-label">unidentified</span>
+      {#if sessionOn}
+        <span class="count mono" data-testid="session-count">{session.length.toLocaleString()}</span>
+        <span class="count-label">just appraised</span>
+        <button class="link" onclick={() => (sessionOn = false)}>back to backlog</button>
+      {:else}
+        <span class="count mono">{total.toLocaleString()}</span>
+        <span class="count-label">unidentified</span>
+      {/if}
       <button
         class="identify"
         disabled={running}

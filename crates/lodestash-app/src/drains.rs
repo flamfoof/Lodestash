@@ -967,7 +967,7 @@ pub fn drain_promote_resync(
     // Bounds one embedding pass (`None` = drain until the queue is empty — the egui pump's
     // behavior). The desktop writer passes a cap so a long Identify-all never blocks writes.
     budget: Option<std::time::Duration>,
-) -> (Option<StatusCounts>, AssetIdentityMaps) {
+) -> (Option<StatusCounts>, AssetIdentityMaps, Vec<i64>) {
     drain_metrics(cat, workspace_dir, cache_dir, proxy);
     // Backfill previews for models the metrics drain will never revisit — anything indexed before
     // previews existed is already clean, so without this it stays blank forever. Time-boxed so a
@@ -987,15 +987,19 @@ pub fn drain_promote_resync(
     if let Some(emb) = audio_embedder {
         drain_audio_embeddings(cat, emb.as_ref(), workspace_dir, budget);
     }
-    match cat.promote_statuses() {
-        Ok(0) => return (None, Vec::new()), // nothing moved — nothing to re-read
-        Ok(n) => tracing::info!(writes = n, "status lifecycle reconciled"),
+    let promoted = match cat.promote_statuses() {
+        Ok(p) if p.is_empty() => return (None, Vec::new(), Vec::new()), // nothing moved
+        Ok(p) => {
+            tracing::info!(promoted = p.len(), "status lifecycle reconciled");
+            p
+        }
         Err(e) => {
             tracing::warn!(%e, "status promote failed; statuses stale until next drain");
-            return (None, Vec::new());
+            return (None, Vec::new(), Vec::new());
         }
-    }
-    resync_after_drain(cat, roots)
+    };
+    let (counts, maps) = resync_after_drain(cat, roots);
+    (counts, maps, promoted)
 }
 
 /// Re-read per-status counts + asset identities for `roots` after a drain has changed them.

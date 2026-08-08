@@ -88,9 +88,32 @@ import JobTray from "./lib/JobTray.svelte";
   let onboardingOpen = $state(false);
   getSettings()
     .then((s) => {
+      confirmBeforeTrash = s.confirm_before_trash;
       if (!s.skip_onboarding) onboardingOpen = true;
     })
     .catch(() => {});
+
+  // Confirm-before-trash (UI-SPEC §11): when the setting is on, the first trash click arms a
+  // 3s window that labels the next click as the actual trash. Honest two-step, no modal.
+  let confirmBeforeTrash = $state(false);
+  let trashArmed = $state(false);
+  let trashTimer: ReturnType<typeof setTimeout> | undefined;
+  function confirmTrash(action: () => void) {
+    if (!confirmBeforeTrash) {
+      action();
+      return;
+    }
+    if (trashArmed) {
+      trashArmed = false;
+      clearTimeout(trashTimer);
+      action();
+      return;
+    }
+    trashArmed = true;
+    clearTimeout(trashTimer);
+    trashTimer = setTimeout(() => (trashArmed = false), 3000);
+    push("Click again to confirm — moving to Trash", "warn");
+  }
 
   // Persisted view prefs (FEATURES §10): hydrate once at startup, then write the whole object
   // back on any change. The save effect is gated on `hydrated` — without the gate it would fire
@@ -276,8 +299,10 @@ import JobTray from "./lib/JobTray.svelte";
       {:else if view.route === "dups"}
         <DuplicatesScreen
           ontrash={(ids) =>
-            write(() => setTrashed(ids, true), (n) =>
-              n === 1 ? "Moved to Trash" : `Moved ${n} assets to Trash`,
+            confirmTrash(() =>
+              write(() => setTrashed(ids, true), (n) =>
+                n === 1 ? "Moved to Trash" : `Moved ${n} assets to Trash`,
+              ),
             )
           }
         />
@@ -311,7 +336,9 @@ import JobTray from "./lib/JobTray.svelte";
           )
         }
         ontrash={() =>
-          write(() => setTrashed([view.selected!], true), () => "Moved to Trash").then(afterRemoval)
+          confirmTrash(() =>
+            write(() => setTrashed([view.selected!], true), () => "Moved to Trash").then(afterRemoval),
+          )
         }
         onrestore={() =>
           write(() => setTrashed([view.selected!], false), () => "Restored from Trash").then(afterRemoval)

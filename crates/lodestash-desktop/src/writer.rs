@@ -180,6 +180,9 @@ pub struct WriteResult {
     pub refused: usize,
     /// Files that were meant to go but could not (permissions, in use).
     pub failed: usize,
+    /// Asset ids the appraise pass just promoted to `identified` — the Identify screen's
+    /// session set (UI-SPEC §3). Empty for every non-appraise op.
+    pub promoted: Vec<i64>,
 }
 
 pub struct Job {
@@ -835,7 +838,7 @@ fn appraise_pass(
             AUDIO_TAG_BUDGET_PER_PASS,
         );
     }
-    let (counts, _assets) = drain_promote_resync(
+    let (counts, _assets, promoted) = drain_promote_resync(
         catalog,
         embedder,
         audio_embedder,
@@ -851,6 +854,7 @@ fn appraise_pass(
         changed: counts
             .map(|c| c.identified + c.unidentified)
             .unwrap_or(1),
+        promoted,
         ..Default::default()
     })
 }

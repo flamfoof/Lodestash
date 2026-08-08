@@ -64,6 +64,7 @@
         tab: "all",
         search: needle,
       search_mode: "tags",
+      ids: [],
       status: "all",
         sort_by: "relevance",
         sort_asc: true,

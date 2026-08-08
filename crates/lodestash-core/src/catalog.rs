@@ -1226,7 +1226,7 @@ impl Catalog {
     /// ponytail: an undecodable file stores a *zero* vector to guarantee drain progress,
     /// and that still reads as `identified` here. Filter those out when a zero vector
     /// starts costing something (a wrong search hit, a wrong count).
-    pub fn promote_statuses(&self) -> Result<usize> {
+    pub fn promote_statuses(&self) -> Result<Vec<i64>> {
         let now = unix_now();
         let mut changed = 0usize;
         for sql in [
@@ -1240,18 +1240,45 @@ impl Catalog {
             "UPDATE asset SET status = 'indexed', updated_at = ?1
              WHERE deleted_at IS NULL AND status = 'identified'
                AND NOT EXISTS (SELECT 1 FROM asset_tag t WHERE t.asset_id = asset.id)",
-            "UPDATE asset SET status = 'identified', updated_at = ?1
-             WHERE deleted_at IS NULL AND status IN ('discovered', 'indexed')
-               AND embedding_dirty = 0
-               AND EXISTS (SELECT 1 FROM asset_embedding e WHERE e.asset_id = asset.id)
-               AND EXISTS (SELECT 1 FROM asset_tag t WHERE t.asset_id = asset.id)",
         ] {
             changed += self
                 .conn
                 .execute(sql, params![now])
                 .map_err(|e| CoreError::Catalog(format!("promote_statuses: {e}")))?;
         }
-        Ok(changed)
+        // Capture the promotion candidates first so the pass can hand the appraised set to the
+        // Identify screen's session view (UI-SPEC §3) — the rows that just became identified.
+        let promoted: Vec<i64> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id FROM asset
+                     WHERE deleted_at IS NULL AND status IN ('discovered', 'indexed')
+                       AND embedding_dirty = 0
+                       AND EXISTS (SELECT 1 FROM asset_embedding e WHERE e.asset_id = asset.id)
+                       AND EXISTS (SELECT 1 FROM asset_tag t WHERE t.asset_id = asset.id)",
+                )
+                .map_err(|e| CoreError::Catalog(format!("promote candidates: {e}")))?;
+            let ids = stmt
+                .query_map([], |r| r.get(0))
+                .map_err(|e| CoreError::Catalog(format!("promote candidates query: {e}")))?;
+            ids.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| CoreError::Catalog(format!("promote candidates row: {e}")))?
+        };
+        changed += self
+            .conn
+            .execute(
+                "UPDATE asset SET status = 'identified', updated_at = ?1
+                 WHERE deleted_at IS NULL AND status IN ('discovered', 'indexed')
+                   AND embedding_dirty = 0
+                   AND EXISTS (SELECT 1 FROM asset_embedding e WHERE e.asset_id = asset.id)
+                   AND EXISTS (SELECT 1 FROM asset_tag t WHERE t.asset_id = asset.id)",
+                params![now],
+            )
+            .map_err(|e| CoreError::Catalog(format!("promote_statuses: {e}")))?;
+        // Keep the old count contract for callers that only care about the delta.
+        let _ = changed;
+        Ok(promoted)
     }
 }
 
@@ -6919,7 +6946,7 @@ mod tests {
         let (x, y, z) = (id_of(&c, "x.png"), id_of(&c, "y.png"), id_of(&c, "z.png"));
 
         // Nothing drained yet: everything stays `discovered`.
-        assert_eq!(c.promote_statuses().expect("noop"), 0);
+        assert_eq!(c.promote_statuses().expect("noop").len(), 0);
         assert_eq!(status_of(&c, "x.png"), "discovered");
 
         // Facets drained ⇒ indexed. An embedding alone is *not* enough: the asset is findable
@@ -6929,7 +6956,7 @@ mod tests {
             .expect("metrics drained");
         c.upsert_embedding(y, "m", "image", None, None, &[0.5, 0.5])
             .expect("embed y");
-        assert_eq!(c.promote_statuses().expect("promote"), 3);
+        assert_eq!(c.promote_statuses().expect("promote").len(), 3);
         assert_eq!(status_of(&c, "x.png"), "indexed");
         assert_eq!(
             status_of(&c, "y.png"),
@@ -6945,9 +6972,9 @@ mod tests {
             &[TagAssignment::exact("subject", "rock")],
         )
         .expect("tag y");
-        assert_eq!(c.promote_statuses().expect("promote with tags"), 1);
+        assert_eq!(c.promote_statuses().expect("promote with tags").len(), 1);
         assert_eq!(status_of(&c, "y.png"), "identified");
-        assert_eq!(c.promote_statuses().expect("idempotent"), 0);
+        assert_eq!(c.promote_statuses().expect("idempotent").len(), 0);
 
         // A confirmed row is human-set and never demoted or re-promoted.
         c.conn
@@ -6960,7 +6987,7 @@ mod tests {
         c.conn
             .execute("UPDATE asset SET embedding_dirty=1 WHERE id=?1", params![y])
             .expect("dirty y");
-        assert_eq!(c.promote_statuses().expect("demote"), 1);
+        assert_eq!(c.promote_statuses().expect("demote").len(), 1);
         assert_eq!(status_of(&c, "y.png"), "indexed");
         assert_eq!(status_of(&c, "z.png"), "confirmed");
         let _ = x;
