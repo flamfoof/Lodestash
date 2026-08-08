@@ -236,6 +236,12 @@ export type Settings = {
   preview_cache_cap_gb: number;
   auto_purge_preview_cache: boolean;
   mcp_disabled_tools: string[];
+  tagger_model: string | null;
+  tagger_vision_model: string | null;
+  api_tagging_enabled: boolean;
+  api_base_url: string;
+  api_model: string | null;
+  api_key: string;
 };
 
 export const getSettings = () => invoke<Settings>("get_settings");
@@ -291,6 +297,17 @@ export const identifyAsset = (assetId: number) =>
   invoke<WriteResult>("identify_asset", { assetId });
 /** True while the persist thread is inside an appraise pass (B11d). */
 export const pumpActive = () => invoke<boolean>("pump_active");
+
+export type PumpProgress = { active: boolean; done: number; total: number; failed: number };
+export const pumpProgress = () => invoke<PumpProgress>("pump_progress");
+
+export type EngineBridge = {
+  live: boolean;
+  port: number | null;
+  token_set: boolean;
+  allowed: number | null;
+};
+export const engineBridge = () => invoke<EngineBridge>("engine_bridge");
 /** Per-pack Extract (B2b slice) — unpack into the workspace + reconcile the payloads. */
 export const extractPackage = (packageId: number) =>
   invoke<WriteResult>("extract_package", { packageId });

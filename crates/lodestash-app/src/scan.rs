@@ -73,6 +73,12 @@ fn crawl_one(source_idx: usize, root: &Path, excludes: &[Exclude], out: &mut Cra
         if !is_browseable(&file) {
             continue;
         }
+        // BLAKE3 the payload so the Duplicates screen has a real signal (B6, DATA-MODEL §6).
+        // Only browseable files — hashing dropped ones would be wasted IO. One-time per
+        // import; a size/mtime-gated re-hash (crawler::needs_rehash) is the ponytail for
+        // watch-rescans.
+        let mut file = file;
+        file.hash = crawler::hash_file(&file.abs_path).ok();
         out.entries.push((source_idx, file));
     }
 }

@@ -192,6 +192,7 @@ mod flow_tests {
                 media_type: mt.into(),
                 size_bytes: 1,
                 mtime: 1,
+                content_hash: None,
             };
             cat.record_crawl(
                 src,
@@ -282,6 +283,7 @@ mod flow_tests {
                 media_type: "image".into(),
                 size_bytes: 3,
                 mtime: 1,
+                content_hash: None,
             };
             cat.record_crawl(src, None, &[rec("a.png"), rec("b.png")])
                 .unwrap();

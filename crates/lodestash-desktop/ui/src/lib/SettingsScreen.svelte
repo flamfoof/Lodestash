@@ -19,10 +19,12 @@
     setThumbKey,
     projects,
     setActiveProject,
+    engineBridge,
     type Settings,
     type LibraryStatus,
     type SourceExclude,
     type ProjectRow,
+    type EngineBridge,
   } from "./api";
   import { view } from "./nav.svelte";
 
@@ -39,6 +41,12 @@
     preview_cache_cap_gb: 4,
     auto_purge_preview_cache: false,
     mcp_disabled_tools: [],
+    tagger_model: null,
+    tagger_vision_model: null,
+    api_tagging_enabled: false,
+    api_base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+    api_model: null,
+    api_key: "",
   };
 
   let s = $state<Settings>({ ...DEFAULTS });
@@ -201,6 +209,14 @@
   let editors = $state<ProjectRow[] | null>(null);
   let editorsError = $state<string | null>(null);
   let editorBusy = $state<number | null>(null);
+  // B12: the embedded REST/MCP bridge state (port + token + allow-list) — live when the
+  // catalog exists, paused otherwise.
+  let bridge = $state<EngineBridge | null>(null);
+  $effect(() => {
+    engineBridge()
+      .then((b) => (bridge = b))
+      .catch(() => (bridge = { live: false, port: null, token_set: false, allowed: null }));
+  });
   $effect(() => {
     projects()
       .then((p) => (editors = p))
@@ -383,6 +399,70 @@
       </section>
 
       <section class="card">
+        <h2>AI TAGGING</h2>
+        <p class="hint">
+          Caption + tag assets during Identify (AI-PIPELINE §2/§5). Local path: an Ollama text
+          model, optionally with a vision model that captions the preview first. API path: any
+          OpenAI-compatible vision endpoint (opt-in — the key lives in config.json, never logged).
+          Either path still unions the local zero-shot tags from the embeddings.
+        </p>
+        <label class="field">
+          <span>Ollama text model</span>
+          <input
+            type="text"
+            placeholder="e.g. llama3.2"
+            bind:value={s.tagger_model}
+            onchange={save}
+            data-testid="tagger-model"
+          />
+        </label>
+        <label class="field">
+          <span>Ollama vision model (captions)</span>
+          <input
+            type="text"
+            placeholder="e.g. llava — leave empty to tag from the name alone"
+            bind:value={s.tagger_vision_model}
+            onchange={save}
+            data-testid="tagger-vision"
+          />
+        </label>
+        <label class="check">
+          <input
+            type="checkbox"
+            bind:checked={s.api_tagging_enabled}
+            onchange={save}
+            data-testid="api-tagging"
+          />
+          Use an OpenAI-compatible API for the visual tag pass instead of local Ollama
+        </label>
+        <label class="field">
+          <span>API base URL</span>
+          <input type="text" bind:value={s.api_base_url} onchange={save} data-testid="api-base" />
+        </label>
+        <label class="field">
+          <span>API model</span>
+          <input
+            type="text"
+            placeholder="e.g. gemini-2.0-flash"
+            bind:value={s.api_model}
+            onchange={save}
+            data-testid="api-model"
+          />
+        </label>
+        <label class="field">
+          <span>API key</span>
+          <input
+            type="password"
+            bind:value={s.api_key}
+            onchange={save}
+            autocomplete="off"
+            spellcheck="false"
+            data-testid="api-key"
+          />
+        </label>
+      </section>
+
+      <section class="card">
         <h2>ON-SCREEN QUALITY</h2>
         <p class="hint">
           How sharply the grid thumbnails render — a GPU/perf tradeoff. Grid-only: Quick Look
@@ -519,13 +599,26 @@
       <section class="card">
         <h2>ENGINE BRIDGE</h2>
         <p class="hint">
-          The live bridge to a running engine — port + token handshake — binds when this shell
-          hosts the engine API (B7). Until then: <span class="mono">Bridge paused</span>.
+          The live bridge to a running engine — port + token handshake (B12). The REST server
+          binds a loopback port and writes engine.json; the MCP stdio plane answers when a host
+          pipes stdin. The Unity plugin connects to this port.
         </p>
-        <p class="bridge" data-testid="bridge-state">
-          <span class="dot paused" aria-hidden="true"></span> Bridge paused — the engine bridge
-          ships with the B7 cutover.
-        </p>
+        {#if bridge === null}
+          <p class="bridge">Loading…</p>
+        {:else if bridge.live && bridge.port != null}
+          <p class="bridge live" data-testid="bridge-state">
+            <span class="dot" aria-hidden="true"></span> Live on
+            <span class="mono">127.0.0.1:{bridge.port}</span> · token {bridge.token_set ? "✓" : "—"} ·
+            {bridge.allowed == null
+              ? "all tools enabled"
+              : `{bridge.allowed} tools enabled (allow-list)`}
+          </p>
+        {:else}
+          <p class="bridge" data-testid="bridge-state">
+            <span class="dot paused" aria-hidden="true"></span> Bridge paused — no catalog on
+            disk yet, so the servers are not running.
+          </p>
+        {/if}
       </section>
 
       <section class="card">
@@ -943,6 +1036,30 @@
     border-radius: var(--r-md);
     color: var(--ls-text);
     font-size: var(--fs-sm);
+  }
+  .field {
+    display: grid;
+    gap: 4px;
+    margin: 10px 0;
+  }
+  .field span {
+    font-size: var(--fs-sm);
+    color: var(--ls-text-muted);
+  }
+  .field input {
+    height: var(--control-h);
+    padding: 0 var(--sp-2);
+    background: var(--ls-bg);
+    border: 1px solid var(--ls-border-strong);
+    border-radius: var(--r-md);
+    color: var(--ls-text);
+    font-size: var(--fs-sm);
+    width: 100%;
+    box-sizing: border-box;
+  }
+  .field input:focus {
+    outline: none;
+    border-color: var(--ls-gold);
   }
   .tier-field input:focus {
     outline: none;

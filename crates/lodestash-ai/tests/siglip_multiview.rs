@@ -103,6 +103,7 @@ fn text_query_finds_the_right_3d_model_by_shape() {
         size_bytes: 1,
         mtime: 1,
         workspace_rel: None,
+        content_hash: None,
     };
     c.record_crawl(
         sid,

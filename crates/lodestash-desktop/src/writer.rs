@@ -30,7 +30,9 @@ use lodestash_app::paths::default_cache_dirs;
 use lodestash_app::types::PersistBatch;
 use lodestash_ai::clap_tags::AudioZeroShot;
 use lodestash_ai::image_tags::ImageZeroShot;
-use lodestash_ai::tagger::{FilenameTagger, TeachTrait};
+use lodestash_ai::ollama::OllamaTagger;
+use lodestash_ai::openai::OpenAiTagger;
+use lodestash_ai::tagger::{FilenameTagger, Tagger, TeachTrait};
 use lodestash_core::catalog::{Catalog, PackageEntryRecord};
 use lodestash_core::types::{Exclude, ExcludeKind};
 use lodestash_ingest::unitypackage::{
@@ -397,7 +399,13 @@ fn unix_now() -> i64 {
 impl Writer {
     /// Spawn the writer over `db_path`. The connection is opened **on the thread that owns it**,
     /// never handed across, because that is the whole point of the rule.
-    pub fn spawn(db_path: PathBuf, pump: Arc<AtomicBool>, jobs: JobRegistry, app: Option<tauri::AppHandle>) -> Self {
+    pub fn spawn(
+        db_path: PathBuf,
+        pump: Arc<AtomicBool>,
+        jobs: JobRegistry,
+        app: Option<tauri::AppHandle>,
+        appraise: Arc<AppJobProgress>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel::<WriterMsg>();
         let writer_tx = tx.clone();
         std::thread::Builder::new()
@@ -452,7 +460,16 @@ impl Writer {
                         Ok(WriterMsg::Op(job)) => {
                             if matches!(job.op, Op::ExtractPackage { .. }) {
                                 if extract_queue.is_empty() && !jobs.has_active_extract() {
-                                    let result = run(&mut catalog, &db_path, job.op, &writer_tx, &jobs, &job.reply, &app);
+                                    let result = run(
+                                        &mut catalog,
+                                        &db_path,
+                                        job.op,
+                                        &writer_tx,
+                                        &jobs,
+                                        &job.reply,
+                                        &app,
+                                        &appraise,
+                                    );
                                     let _ = job.reply.send(result);
                                 } else {
                                     // A pack is unpacking (or queued) — join the queue.
@@ -467,7 +484,16 @@ impl Writer {
                             if appraising {
                                 pump.store(true, Ordering::Relaxed);
                             }
-                            let result = run(&mut catalog, &db_path, job.op, &writer_tx, &jobs, &job.reply, &app);
+                            let result = run(
+                                &mut catalog,
+                                &db_path,
+                                job.op,
+                                &writer_tx,
+                                &jobs,
+                                &job.reply,
+                                &app,
+                                &appraise,
+                            );
                             if appraising {
                                 pump.store(false, Ordering::Relaxed);
                             }
@@ -493,7 +519,16 @@ impl Writer {
                             emit_changed(&app, "catalog");
                             emit_changed(&app, "jobs");
                             if let Some(next) = extract_queue.pop_front() {
-                                let r = run(&mut catalog, &db_path, next.op, &writer_tx, &jobs, &next.reply, &app);
+                                let r = run(
+                                    &mut catalog,
+                                    &db_path,
+                                    next.op,
+                                    &writer_tx,
+                                    &jobs,
+                                    &next.reply,
+                                    &app,
+                                    &appraise,
+                                );
                                 let _ = next.reply.send(r);
                             }
                         }
@@ -543,7 +578,16 @@ impl Writer {
                             if let Err(e) = result {
                                 let _ = reply.send(Err(e));
                                 if let Some(next) = extract_queue.pop_front() {
-                                    let r = run(&mut catalog, &db_path, next.op, &writer_tx, &jobs, &next.reply, &app);
+                                    let r = run(
+                                        &mut catalog,
+                                        &db_path,
+                                        next.op,
+                                        &writer_tx,
+                                        &jobs,
+                                        &next.reply,
+                                        &app,
+                                        &appraise,
+                                    );
                                     let _ = next.reply.send(r);
                                 }
                             }
@@ -567,6 +611,7 @@ impl Writer {
                                     idle_embedder.clone(),
                                     idle_audio.clone(),
                                     std::time::Duration::from_secs(1),
+                                    &appraise,
                                 );
                                 pump.store(false, Ordering::Relaxed);
                                 if r.map(|w| w.changed > 0).unwrap_or(false) {
@@ -608,13 +653,20 @@ impl Writer {
 /// One bounded appraise pass (metrics → previews → deps → embeddings → promote) on the
 /// writer thread. Shared by the ✦ kicks and the auto-identify idle pass (B11a–c): embedders
 /// are resolved by the caller (the idle pass resolved them once at startup), everything else
-/// is re-derived here because it can change between passes.
+/// is re-derived here because it can change between passes. `progress` is the shared
+/// B11d surface the Identify screen polls — reset at pass start, filled by the tag/embed
+/// drains as they work.
 fn appraise_pass(
     catalog: &mut Catalog,
     embedder: Option<std::sync::Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
     audio_embedder: Option<std::sync::Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
     budget: std::time::Duration,
+    progress: &AppJobProgress,
 ) -> Result<WriteResult, String> {
+    progress.done.store(0, Ordering::Relaxed);
+    progress.total.store(0, Ordering::Relaxed);
+    progress.failed.store(0, Ordering::Relaxed);
+    progress.cancelled.store(false, Ordering::Relaxed);
     let (cache_dir, workspace_dir) = default_cache_dirs();
     let proxy = AppConfig::load().preview_quality.proxy_budget();
     let roots = catalog
@@ -627,10 +679,10 @@ fn appraise_pass(
         })
         .unwrap_or_default();
     // B11 tail — the tagging half of the appraise pass (was unreachable: the desktop had no
-    // tagger resolver). Local-only, zero new models: the SigLIP embedder already resolved above
-    // drives the visual zero-shot tagger, CLAP drives the audio one, and taught traits (Traits
-    // screen, AI-PIPELINE §6) become candidate labels. The filename tagger is the captioning
-    // stub (no Ollama/cloud endpoint is configured from the desktop yet).
+    // tagger resolver). The SigLIP embedder resolved above drives the visual zero-shot tagger,
+    // CLAP drives the audio one, and taught traits (Traits screen, AI-PIPELINE §6) become
+    // candidate labels. The captioning tagger resolves from settings: OpenAI-compatible endpoint
+    // (opt-in, AI-PIPELINE §5) → local Ollama VLM (AI-PIPELINE §2) → filename stub.
     // Bounded per pass so a writer-thread kick never blocks writes on a long backlog — the
     // remainder stays queued for the next kick / idle auto-identify slice.
     let teach = catalog
@@ -644,15 +696,32 @@ fn appraise_pass(
             usage_note,
         })
         .collect::<Vec<_>>();
-    let progress = AppJobProgress::default();
     let zero_shot = embedder
         .clone()
         .and_then(|e| ImageZeroShot::new(e, &teach));
     let audio_shot = audio_embedder.clone().and_then(AudioZeroShot::new);
-    let tagger = FilenameTagger;
+    let cfg = AppConfig::load();
+    let api_model = cfg
+        .api_model
+        .clone()
+        .filter(|_| cfg.api_tagging_enabled && !cfg.api_key.is_empty());
+    let tagger: Box<dyn Tagger> = if let Some(model) = api_model {
+        Box::new(
+            OpenAiTagger::new(cfg.api_base_url.clone(), cfg.api_key.clone(), model)
+                .with_teaching(teach.clone()),
+        )
+    } else if let Some(model) = cfg.tagger_model.clone() {
+        let mut t = OllamaTagger::new(model);
+        if let Some(vision) = cfg.tagger_vision_model.clone() {
+            t = t.with_vision(vision);
+        }
+        Box::new(t.with_teaching(teach.clone()))
+    } else {
+        Box::new(FilenameTagger)
+    };
     drain_tags(
         catalog,
-        &tagger,
+        tagger.as_ref(),
         zero_shot.as_ref(),
         workspace_dir.as_deref(),
         cache_dir.as_deref(),
@@ -696,6 +765,7 @@ fn run(
     jobs: &JobRegistry,
     reply: &Sender<Result<WriteResult, String>>,
     app: &Option<tauri::AppHandle>,
+    progress: &AppJobProgress,
 ) -> Result<WriteResult, String> {
     match op {
         Op::SetFavorite { ids, on } => catalog
@@ -870,6 +940,7 @@ fn run(
                 embedder,
                 audio_embedder,
                 std::time::Duration::from_secs(20),
+                progress,
             );
             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
             jobs.finish(job.id, result.is_ok(), false, changed);
@@ -893,6 +964,7 @@ fn run(
                 embedder,
                 audio_embedder,
                 std::time::Duration::from_secs(20),
+                progress,
             );
             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
             jobs.finish(job.id, result.is_ok(), false, changed);

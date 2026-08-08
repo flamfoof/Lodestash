@@ -17,6 +17,10 @@ pub struct CrawledFile {
     pub size_bytes: u64,
     pub mtime: i64, // seconds since UNIX epoch
     pub media_type: Option<lodestash_core::types::MediaType>,
+    /// BLAKE3 of the file contents — the exact-duplicate key (DATA-MODEL §6). Filled by the
+    /// caller for persisted (browseable) files only, since hashing every dropped file would
+    /// be wasted IO; `None` otherwise.
+    pub hash: Option<String>,
 }
 
 /// Crawl `root` recursively and yield every content file.
@@ -50,6 +54,7 @@ pub fn crawl(root: &Path, excludes: &[Exclude]) -> Vec<CrawledFile> {
                 size_bytes,
                 mtime,
                 media_type,
+                hash: None,
             })
         })
         .collect()
@@ -213,6 +218,7 @@ mod tests {
             size_bytes: 100,
             mtime: 999,
             media_type: None,
+            hash: None,
         };
         assert!(!needs_rehash(&file, Some(100), Some(999)), "unchanged");
         assert!(needs_rehash(&file, Some(101), Some(999)), "size changed");

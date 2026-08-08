@@ -9,7 +9,13 @@
    * action, present but off, saying exactly why it is off instead of pretending to run.
    */
   import Card from "./Card.svelte";
-  import { gridPage, identifyAll, pumpActive, type GridItem } from "./api";
+  import {
+    gridPage,
+    identifyAll,
+    pumpProgress,
+    type GridItem,
+    type PumpProgress,
+  } from "./api";
   import { view } from "./nav.svelte";
 
   let items = $state<GridItem[]>([]);
@@ -20,17 +26,21 @@
   // B11d: the persist thread may be appraising on its own (auto-identify idle pass) — the
   // header reflects it instead of claiming idle while a pass is running.
   let pumpBusy = $state(false);
+  // B11d surface: the shared pass progress (done/total) — a real bar instead of a spinner.
+  let pump = $state<PumpProgress>({ active: false, done: 0, total: 0, failed: 0 });
   let pumpPoll: ReturnType<typeof setInterval> | null = null;
   $effect(() => {
     view.route;
     if (view.route !== "identify") return;
     pumpPoll ??= setInterval(async () => {
-      pumpBusy = await pumpActive();
-    }, 2000);
+      pump = await pumpProgress();
+      pumpBusy = pump.active;
+    }, 1000);
     return () => {
       clearInterval(pumpPoll!);
       pumpPoll = null;
       pumpBusy = false;
+      pump = { active: false, done: 0, total: 0, failed: 0 };
     };
   });
 
@@ -104,6 +114,20 @@
           ? "✦ Appraising…"
           : `✦ Identify all (${total.toLocaleString()})`}
       </button>
+      {#if pump.active && pump.total > 0}
+        <div class="pass-progress" data-testid="pass-progress">
+          <div class="bar">
+            <div
+              class="fill"
+              style="width: {Math.round((pump.done / pump.total) * 100)}%"
+            ></div>
+          </div>
+          <span class="mono"
+            >{pump.done.toLocaleString()} / {pump.total.toLocaleString()}{#if pump.failed > 0}
+              · {pump.failed} failed{/if}</span
+          >
+        </div>
+      {/if}
       {#if outcome}
         <p class="offline" data-testid="identify-outcome">{outcome}</p>
       {:else}
@@ -207,6 +231,29 @@
     font-size: var(--fs-xs);
     color: var(--ls-text-dim);
     text-align: right;
+  }
+  .pass-progress {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    margin: var(--sp-2) 0 0;
+    justify-content: flex-end;
+  }
+  .pass-progress .bar {
+    width: 160px;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--ls-border);
+    overflow: hidden;
+  }
+  .pass-progress .fill {
+    height: 100%;
+    background: var(--ls-gold);
+    transition: width 0.3s ease;
+  }
+  .pass-progress span {
+    font-size: var(--fs-xs);
+    color: var(--ls-text-muted);
   }
   .body {
     flex: 1;

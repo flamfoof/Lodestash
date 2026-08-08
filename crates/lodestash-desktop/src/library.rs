@@ -293,6 +293,26 @@ pub struct Settings {
     pub auto_purge_preview_cache: bool,
     /// The MCP allow-list, stored as the disabled half (UI-SPEC §11.5, MCP↔REST 1:1).
     pub mcp_disabled_tools: Vec<String>,
+    /// Ollama text model for local tagging (AI-PIPELINE §2). `None` = no local LLM.
+    #[serde(default)]
+    pub tagger_model: Option<String>,
+    /// Optional Ollama vision model that captions the preview before the text model tags
+    /// (AI-PIPELINE §2). `None` = tag from the asset's name alone.
+    #[serde(default)]
+    pub tagger_vision_model: Option<String>,
+    /// Opt-in OpenAI-compatible tagging (AI-PIPELINE §5). On + key + model = the visual tag pass
+    /// uses the API instead of the local Ollama VLM. Off by default — local is free and private.
+    #[serde(default)]
+    pub api_tagging_enabled: bool,
+    /// OpenAI-compatible base URL (default: the provider's endpoint).
+    #[serde(default)]
+    pub api_base_url: String,
+    /// The vision model id at that endpoint. `None` = not configured.
+    #[serde(default)]
+    pub api_model: Option<String>,
+    /// API key for the endpoint — a secret, never logged. Empty = not configured.
+    #[serde(default)]
+    pub api_key: String,
 }
 
 impl Settings {
@@ -316,6 +336,12 @@ impl Settings {
             preview_cache_cap_gb: c.preview_cache_cap_gb,
             auto_purge_preview_cache: c.auto_purge_preview_cache,
             mcp_disabled_tools: c.mcp_disabled_tools.clone(),
+            tagger_model: c.tagger_model.clone(),
+            tagger_vision_model: c.tagger_vision_model.clone(),
+            api_tagging_enabled: c.api_tagging_enabled,
+            api_base_url: c.api_base_url.clone(),
+            api_model: c.api_model.clone(),
+            api_key: c.api_key.clone(),
         }
     }
 
@@ -340,6 +366,12 @@ impl Settings {
         c.preview_cache_cap_gb = self.preview_cache_cap_gb;
         c.auto_purge_preview_cache = self.auto_purge_preview_cache;
         c.mcp_disabled_tools = self.mcp_disabled_tools;
+        c.tagger_model = self.tagger_model;
+        c.tagger_vision_model = self.tagger_vision_model;
+        c.api_tagging_enabled = self.api_tagging_enabled;
+        c.api_base_url = self.api_base_url;
+        c.api_model = self.api_model;
+        c.api_key = self.api_key;
     }
 }
 

@@ -37,6 +37,12 @@ lodestash-core = { workspace = true }
 lodestash-app = { workspace = true }
 # Mesh parse + decimation for the Quick Look viewer (lodestash://mesh).
 lodestash-ingest = { workspace = true }
+# The agent plane (B12, ENGINE-API §1–2, MCP↔REST 1:1): the loopback REST server + the MCP
+# stdio server share one `lodestash_api::ServerState` in this process. The API never writes the
+# catalog (its own read-only connection; the writer keeps single-writer).
+lodestash-api = { workspace = true }
+lodestash-mcp = { workspace = true }
+tokio = { workspace = true }
 lodestash-ai = { workspace = true }
 
 [dev-dependencies]

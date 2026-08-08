@@ -37,6 +37,7 @@ pub fn crawl_record(f: &CrawledFile) -> CrawlRecord {
         size_bytes: f.size_bytes as i64,
         mtime: f.mtime,
         workspace_rel: None,
+        content_hash: f.hash.clone(),
     }
 }
 

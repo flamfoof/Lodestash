@@ -26,6 +26,7 @@
     assetId,
     favorite = false,
     trashed = false,
+    onidentify,
     onfavorite,
     ontrash,
     onrestore,
@@ -37,6 +38,8 @@
     favorite?: boolean;
     /** True when the selection is in the Trash — the actions change to Restore. */
     trashed?: boolean;
+    /** Per-asset Identify now (B11b in the inspector): flag dirty + run one bounded appraise pass. */
+    onidentify: () => void;
     onfavorite: (on: boolean) => void;
     ontrash: () => void;
     onrestore: () => void;
@@ -352,6 +355,14 @@
       asset shows Restore instead — the Trash has to be a way back, not a second dead end.
     -->
     <div class="actions" data-testid="inspector-actions">
+      <button
+        class="star"
+        onclick={onidentify}
+        data-testid="action-identify"
+        title="Flag this asset dirty and run one bounded appraise pass — local tags + embeddings (B11b)."
+      >
+        ✦ Identify
+      </button>
       <button
         class="star"
         class:on={favorite}

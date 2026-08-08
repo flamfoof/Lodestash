@@ -41,6 +41,20 @@ struct AppState {
     /// Raised while the writer thread runs an appraise pass (B11d) — the ✦ controls and any
     /// progress surface read it instead of racing the writer on timing guesses.
     pump: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Shared appraise-pass progress (B11d): the tag/embed drains write done/total into this
+    /// while a pass runs; `pump_progress` reads it for the Identify screen's bar.
+    appraise: std::sync::Arc<lodestash_app::jobs::JobProgress>,
+    /// The agent plane (B12): the embedded REST/MCP `ServerState`, kept alive for the process.
+    /// `None` when there is no catalog on disk yet — the servers then don't exist and the
+    /// Connect screen says so instead of pretending.
+    engine: Option<std::sync::Arc<lodestash_api::ServerState>>,
+    /// The loopback port `engine.json` was written with (ENGINE-API §1).
+    engine_port: Option<u16>,
+    /// The per-session bearer token (ENGINE-API §1) — surfaced for the Connect screen, never
+    /// logged.
+    engine_token: String,
+    /// How many agent tools the allow-list left enabled (`None` = every tool is live).
+    engine_allowed: Option<usize>,
     /// The job tray (B2b): active jobs + the session ring, owned by the writer thread.
     jobs: crate::writer::JobRegistry,
     /// `None` when there is no catalog on disk yet — every write then reports why instead of
@@ -699,6 +713,50 @@ fn pump_active(state: tauri::State<'_, AppState>) -> bool {
     state.pump.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Appraise pass progress (B11d surface): `active` + the drain's done/total counters, so the
+/// Identify screen can render a real bar instead of a spinner (or the drain's first `total`
+/// write arrives only after the tag/embed queues are counted).
+#[tauri::command]
+fn pump_progress(state: tauri::State<'_, AppState>) -> PumpProgress {
+    let progress = &state.appraise;
+    PumpProgress {
+        active: state.pump.load(std::sync::atomic::Ordering::Relaxed),
+        done: progress.done.load(std::sync::atomic::Ordering::Relaxed),
+        total: progress.total.load(std::sync::atomic::Ordering::Relaxed),
+        failed: progress.failed.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct PumpProgress {
+    active: bool,
+    done: u64,
+    total: u64,
+    failed: u64,
+}
+
+/// The embedded agent plane's bridge status (B12, ENGINE-API §1): the loopback port the REST
+/// server bound (written into engine.json for the Unity plugin / Connect wizard), whether the
+/// per-session token is set, and how many agent tools the allow-list left enabled (`null` =
+/// every tool is live). `port: null` = no catalog on disk yet, so no servers.
+#[tauri::command]
+fn engine_bridge(state: tauri::State<'_, AppState>) -> EngineBridge {
+    EngineBridge {
+        port: state.engine_port,
+        token_set: !state.engine_token.is_empty(),
+        allowed: state.engine_allowed,
+        live: state.engine.is_some(),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct EngineBridge {
+    live: bool,
+    port: Option<u16>,
+    token_set: bool,
+    allowed: Option<usize>,
+}
+
 /// Per-pack Extract (B2b slice) — unpack the archive into the workspace and reconcile its
 /// payloads into the catalog, on the persist thread like every write.
 #[tauri::command]
@@ -841,6 +899,7 @@ pub fn run() {
     // One writer for the process (ARCHITECTURE §5), spawned in `setup` — it needs the
     // AppHandle to push change events (pump events, B2b) to the Svelte shell.
     let pump = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let appraise = std::sync::Arc::new(lodestash_app::jobs::JobProgress::default());
     let job_registry = crate::writer::JobRegistry::default();
 
     tauri::Builder::default()
@@ -878,12 +937,107 @@ pub fn run() {
             // are pushed to the shell (pump events, B2b) instead of the UI polling.
             let writer = lodestash_app::paths::catalog_db_path()
                 .filter(|p| p.exists())
-                .map(|p| Writer::spawn(p, pump.clone(), job_registry.clone(), Some(app.handle().clone())));
+                .map(|p| {
+                    Writer::spawn(
+                        p,
+                        pump.clone(),
+                        job_registry.clone(),
+                        Some(app.handle().clone()),
+                        appraise.clone(),
+                    )
+                });
+
+            // B12 — the agent plane (ENGINE-API §1–2, MCP↔REST 1:1) lives in this process:
+            // the REST server binds an ephemeral loopback port and writes engine.json for the
+            // Unity plugin / Connect wizard; the MCP stdio server answers on stdin when a host
+            // pipes it (a console or no-stdin launch idles or exits on EOF — a background
+            // thread either way). Both share one ServerState with its own read-only catalog
+            // connection — the API never writes the catalog, so the single-writer rule holds.
+            let db = lodestash_app::paths::catalog_db_path();
+            let (cache_root, workspace) = lodestash_app::paths::default_cache_dirs();
+            let (engine_state, engine_port, engine_token, engine_allowed) = match db {
+                Some(db) if db.exists() => {
+                    let cache_root_for_preview = cache_root.clone();
+                    let preview: lodestash_api::PreviewFn = Box::new(move |src| {
+                        use lodestash_ingest::thumb::{generate, meta_key, ThumbParams};
+                        let Some(cache) = cache_root_for_preview.as_deref() else {
+                            return None;
+                        };
+                        let q = lodestash_app::config::AppConfig::load().preview_quality;
+                        let params = ThumbParams {
+                            width: q.thumb_px(),
+                            height: q.thumb_px(),
+                            proxy: q.proxy_budget(),
+                        };
+                        let key = meta_key(
+                            src,
+                            std::fs::metadata(src).map(|m| m.len()).unwrap_or(0),
+                            0,
+                        );
+                        generate(src, cache, &key, params).ok()
+                    });
+                    let state = lodestash_api::ServerState::new(
+                        &db,
+                        workspace.unwrap_or_else(|| cache_root.clone().unwrap_or_default()),
+                        preview,
+                    )
+                    .map(std::sync::Arc::new)
+                    .map_err(|e| e.to_string());
+                    match state {
+                        Ok(state) => {
+                            // The allow-list (UI-SPEC §16): config holds the disabled half.
+                            let cfg = lodestash_app::config::AppConfig::load();
+                            let allowed = if cfg.mcp_disabled_tools.is_empty() {
+                                None
+                            } else {
+                                Some(
+                                    lodestash_api::AGENT_OPERATIONS
+                                        .iter()
+                                        .map(|(n, _)| n.to_string())
+                                        .filter(|n| !cfg.mcp_disabled_tools.contains(n))
+                                        .collect::<std::collections::HashSet<_>>(),
+                                )
+                            };
+                            if let Some(set) = allowed.clone() {
+                                state.set_allowed(set);
+                            }
+                            let token = state.token().to_string();
+                            let port = lodestash_api::serve(state.clone())
+                                .map(|h| h.port)
+                                .map_err(|e| tracing::error!(%e, "engine API failed to bind"))
+                                .ok();
+                            // MCP stdio plane on its own thread — self-terminates on stdin EOF.
+                            let state_arc = state.clone();
+                            std::thread::Builder::new()
+                                .name("lodestash-mcp".into())
+                                .spawn(move || {
+                                    let rt = tokio::runtime::Builder::new_current_thread()
+                                        .enable_all()
+                                        .build()
+                                        .expect("mcp runtime builds");
+                                    let _ = rt.block_on(lodestash_mcp::serve_stdio(state));
+                                })
+                                .ok();
+                            (Some(state_arc), port, token, allowed.map(|s| s.len()))
+                        }
+                        Err(e) => {
+                            tracing::warn!(%e, "engine state unavailable");
+                            (None, None, String::new(), None)
+                        }
+                    }
+                }
+                _ => (None, None, String::new(), None),
+            };
             app.manage(AppState {
                 library: Mutex::new(library),
                 writer,
                 pump,
+                appraise,
                 jobs: job_registry,
+                engine: engine_state,
+                engine_port,
+                engine_token,
+                engine_allowed,
             });
             Ok(())
         })
@@ -951,6 +1105,8 @@ pub fn run() {
             identify_all,
             identify_asset,
             pump_active,
+            pump_progress,
+            engine_bridge,
             extract_package,
             jobs,
             cancel_job,

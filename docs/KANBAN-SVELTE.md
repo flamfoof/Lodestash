@@ -62,17 +62,24 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       gained a `max_assets` budget guard (AI-PIPELINE §5.1, `0` = uncapped) so a writer-thread kick
       never blocks writes on a long backlog — the remainder stays queued for the next kick / idle
       slice (64 visual / 48 audio per pass). `cargo test --workspace` green.
-      - [ ] Ollama/cloud captioning endpoint from the desktop (config → `OpenAiTagger`/`OllamaTagger`)
-            — the one piece still stubbed.
+      - [x] **Ollama/cloud captioning endpoint (2026-08-08).** Settings gained an AI TAGGING
+            section (local Ollama text+vision models, opt-in OpenAI-compatible API with
+            base URL/model/key — stored in config.json, never logged); `appraise_pass`
+            resolves `OpenAiTagger` → `OllamaTagger` → `FilenameTagger`.
 - [ ] **AI search toggle is cosmetic.** ⟨Tags⟩/⟨AI⟩ (`TopBar.svelte:46-59`) changes styling only; the grid ranks FTS-only (`Toolbar.svelte:79-90`). `hybrid_search` exists in core but is reachable only via the ⚪ servers. Wire RRF hybrid into `gridPage`/`search_assets` behind `mode=ai`.
-- [ ] **Identify UI polish.** No progress bar (done/total appraised), no session set (identified
-      assets vanish from the backlog), no inspector "Identify now" / per-asset Re-identify.
+- [x] **Identify UI polish (2026-08-08).** Shared `Arc<JobProgress>` on AppState, reset per
+      pass + filled by the tag/embed drains; `pump_progress` command; IdentifyScreen renders a
+      real done/total bar (+ failed count) while a pass runs. Inspector gained a per-asset
+      **✦ Identify** button (B11b) that flags + appraises and bumps the page.
 - [ ] **Inspector TRAITS are blank.** `AssetDetail` carries no traits; no accept/reject chips,
       confidence underbars, or trait quick-add.
 - [ ] **Inspector gaps.** No dependency **relink** interaction (edges render, nothing re-resolves a
       `missing` edge); no in-archive provenance block (Path-in-package / Package ⧉-copy rows);
       card ★ is display-only (only the inspector toggles favourites).
-- [ ] **Duplicates — exact only.** No perceptual near-dup (hash wiring is ⚪/🔴), no "Merge tags".
+- [x] **Duplicates — exact hash wired (2026-08-08).** The crawl now BLAKE3s browseable files
+      (`CrawledFile.hash` → `CrawlRecord.content_hash` → `asset.content_hash` on insert) — the
+      Duplicates screen's groups are real. `needs_rehash` (size/mtime-gated re-hash for
+      watch-rescans) is the documented ponytail; perceptual near-dup still out of scope.
 - [ ] **Pack stats modal is a stub.** 3 tiles ("isn't available in this build"); no triangles tile,
       no per-type contents/tags/heaviest. Packages screen rows have **no ◉ Stats** button at all.
 - [ ] **Keyboard map incomplete.** No Ctrl/Cmd-A, no Ctrl/Cmd-Z / Shift-Z redo (button only), no `F`,
@@ -83,7 +90,7 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
 - [ ] **Onboarding is a static explainer.** No two-step source/scan flow.
 - [ ] **Tag Graph is static.** No zoom/drag, no click-through, no dependency arcs.
 - [ ] **Settings gaps.** No CLOUD card, no model-download button, no MCP endpoint/token UI, no
-      clear-cache/usage bar, no confirm-before-trash toggle; ENGINE BRIDGE says "Bridge paused".
+      clear-cache/usage bar, no confirm-before-trash toggle.
 - [ ] **Staging is in-memory only.** Tray rows exist; `batch_id` recorded but no Recent-exports list
       and no batch undo in the UI. Top-bar "No project" chip is static — **no project switcher
       popover** (recent exports · ↩ undo · Connect wizard, FEATURES §7.1).
@@ -121,14 +128,16 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
 
 ## ⚪ Built but inert — wire into the shell
 
-- [ ] **REST + MCP servers never start.** `api::serve` + `mcp::serve_stdio` zero callers; no `--mcp`
-      branch; handshake `engine.json` never written; Settings says "Bridge paused". All 13 ops are
-      test-only (name-level parity test exists).
+- [x] **REST + MCP servers start with the app (2026-08-08, B12).** One `ServerState` →
+      `api::serve` (ephemeral loopback port + engine.json written) + `mcp::serve_stdio` on its
+      own thread (self-terminates on stdin EOF; a `--mcp` headless branch is still future — an
+      agent host pipes stdin to the running app). Settings' ENGINE BRIDGE shows the live port.
 - [ ] **10 doc'd agent ops absent on both planes.** `list_tags`, `add_tag`, `list_collections`,
       `apply_mapping`, `identify_asset`, `suggest_tags`, `unpack_package`, staging group
       (ENGINE-API §2).
-- [ ] **Hash/dedup dead for loose files.** `crawler::hash_file` never called ⇒ `content_hash` NULL ⇒
-      Duplicates empty on real libraries, no move/rename detection.
+- [x] **Hash/dedup wired for loose files (2026-08-08, B6).** `crawler::hash_file` called at
+      crawl for browseable files ⇒ `content_hash` set ⇒ Duplicates groups real; move/rename
+      detection (same-hash-different-path) is the natural next step.
 - [ ] **Magic-byte detection.** Crawl is extension-only; unknown-ext real assets dropped.
 - [ ] **Filesystem watch.** `watch_roots` zero callers; Settings toggles only store a flag.
 - [ ] **Eviction / keep-extracted.** `unmaterialize_package` zero callers; `cache_extracted` not

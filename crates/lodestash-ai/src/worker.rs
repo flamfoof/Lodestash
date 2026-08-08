@@ -52,6 +52,7 @@ mod tests {
             size_bytes: 1,
             mtime: 1,
             workspace_rel: None,
+            content_hash: None,
         }
     }
 

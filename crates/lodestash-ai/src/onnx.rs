@@ -218,6 +218,7 @@ mod tests {
             size_bytes: 1,
             mtime: 1,
             workspace_rel: None,
+            content_hash: None,
         };
         // "boulder" shares no token with the query "rock"; "cello" is the distractor.
         c.record_crawl(sid, None, &[rec("mossy_boulder"), rec("cello_solo")])

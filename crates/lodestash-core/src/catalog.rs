@@ -29,6 +29,9 @@ pub struct CrawlRecord {
     /// For package-extracted files: path inside the extraction workspace (workspace-relative,
     /// `/`-separated). None for plain on-disk files.
     pub workspace_rel: Option<String>,
+    /// BLAKE3 of the file contents — the exact-duplicate key (DATA-MODEL §6). `None` for
+    /// package-extracted records (their files land in the workspace cache, not the source).
+    pub content_hash: Option<String>,
 }
 
 /// A caller's classification of one in-pack manifest entry (DATA-MODEL §7 "In-pack assets", M14),
@@ -597,8 +600,8 @@ impl Catalog {
                         )
                         .map_err(|e| CoreError::Catalog(format!("asset_file insert: {e}")))?;
                         tx.execute(
-                            "UPDATE asset SET primary_file_id = ?2 WHERE id = ?1",
-                            params![asset_id, tx.last_insert_rowid()],
+                            "UPDATE asset SET primary_file_id = ?2, content_hash = ?3 WHERE id = ?1",
+                            params![asset_id, tx.last_insert_rowid(), rec.content_hash],
                         )
                         .map_err(|e| CoreError::Catalog(format!("primary_file: {e}")))?;
                         stats.inserted += 1;
@@ -4864,6 +4867,7 @@ mod tests {
     fn rec(rel: &str, size: i64, mtime: i64) -> CrawlRecord {
         CrawlRecord {
             workspace_rel: None,
+            content_hash: None,
             rel_path: rel.to_string(),
             name: rel.rsplit('/').next().unwrap_or(rel).to_string(),
             media_type: "image".to_string(),
@@ -4926,6 +4930,7 @@ mod tests {
             .expect("src");
         let music = CrawlRecord {
             workspace_rel: None,
+            content_hash: None,
             rel_path: "Audio/theme.wav".into(),
             name: "theme.wav".into(),
             media_type: "audio".into(),
@@ -4985,6 +4990,7 @@ mod tests {
             .expect("src");
         let sfx = CrawlRecord {
             workspace_rel: None,
+            content_hash: None,
             rel_path: "Audio/step.wav".into(),
             name: "step.wav".into(),
             media_type: "audio".into(),
@@ -5693,6 +5699,7 @@ mod tests {
             size_bytes: 1,
             mtime: 0,
             workspace_rel: None,
+            content_hash: None,
         };
         c.record_crawl(sid, None, &[rec("a.png"), rec("b.png"), rec("c.png")])
             .unwrap();
@@ -5765,6 +5772,7 @@ mod tests {
                 size_bytes: 1,
                 mtime: 0,
                 workspace_rel: None,
+            content_hash: None,
             }],
         )
         .unwrap();
@@ -5857,6 +5865,7 @@ mod tests {
                 size_bytes: 1,
                 mtime: 0,
                 workspace_rel: None,
+            content_hash: None,
             }],
         )
         .unwrap();
@@ -6739,6 +6748,7 @@ mod tests {
         let s = c.upsert_import_source("A", "C:/a", "folder").expect("src");
         let mk = |rel: &str, mt: &str| CrawlRecord {
             workspace_rel: None,
+            content_hash: None,
             rel_path: rel.to_string(),
             name: rel.rsplit('/').next().unwrap_or(rel).to_string(),
             media_type: mt.to_string(),
@@ -8182,6 +8192,7 @@ mod l5_slices_tests {
     fn rec(rel: &str, mt: &str) -> CrawlRecord {
         CrawlRecord {
             workspace_rel: None,
+            content_hash: None,
             rel_path: rel.to_string(),
             name: rel.rsplit('/').next().unwrap_or(rel).to_string(),
             media_type: mt.to_string(),

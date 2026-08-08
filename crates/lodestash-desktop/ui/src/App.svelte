@@ -25,6 +25,7 @@ import JobTray from "./lib/JobTray.svelte";
     onChanged,
     reloadLibrary,
     assetDetail,
+    identifyAsset,
     setFavorite,
     setTrashed,
     removeFromLibrary,
@@ -289,6 +290,14 @@ import JobTray from "./lib/JobTray.svelte";
         assetId={view.selected}
         favorite={selectedDetail?.favorite ?? false}
         trashed={selectedDetail?.trashed ?? false}
+        onidentify={() => {
+          if (view.selected == null) return;
+          write(() => identifyAsset(view.selected!), () => "Flagged for identify — appraising…").then(
+            () => {
+              view.dataVersion += 1;
+            },
+          );
+        }}
         onfavorite={(on) =>
           write(() => setFavorite([view.selected!], on), () =>
             on ? "Added to Favorites" : "Removed from Favorites",
