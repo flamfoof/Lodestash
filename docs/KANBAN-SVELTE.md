@@ -54,11 +54,16 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
 
 ## 🟡 Partial — working, delta named
 
-- [ ] **Identify: the tagging half (B11 tail).** Embeddings + previews + promote run; **no tagger is
-      resolved** — `drain_tags` / `drain_api_tags` / `drain_audio_tags` have zero call sites
-      (`writer.rs appraise_pass`), `mark_for_identify` sets `tags_dirty` nothing drains. Without a
-      tag, the lifecycle rule blocks `identified` — rows stop at `indexed`.
-      - [ ] Wire a tagger resolver (Ollama/local ONNX WD) into `appraise_pass`; run `drain_tags`.
+- [x] **Identify: the tagging half (B11 tail, shipped 2026-08-07).** `drain_tags` / `drain_audio_tags`
+      had zero call sites — no tagger resolver, rows stalled at `indexed`. Now wired into
+      `appraise_pass` (`writer.rs:602`): local-only, zero new models — the already-resolved SigLIP
+      embedder drives `ImageZeroShot`, CLAP drives `AudioZeroShot`, taught traits (Traits screen,
+      AI-PIPELINE §6) become candidate labels, `FilenameTagger` is the captioning stub. Both drains
+      gained a `max_assets` budget guard (AI-PIPELINE §5.1, `0` = uncapped) so a writer-thread kick
+      never blocks writes on a long backlog — the remainder stays queued for the next kick / idle
+      slice (64 visual / 48 audio per pass). `cargo test --workspace` green.
+      - [ ] Ollama/cloud captioning endpoint from the desktop (config → `OpenAiTagger`/`OllamaTagger`)
+            — the one piece still stubbed.
 - [ ] **AI search toggle is cosmetic.** ⟨Tags⟩/⟨AI⟩ (`TopBar.svelte:46-59`) changes styling only; the grid ranks FTS-only (`Toolbar.svelte:79-90`). `hybrid_search` exists in core but is reachable only via the ⚪ servers. Wire RRF hybrid into `gridPage`/`search_assets` behind `mode=ai`.
 - [ ] **Identify UI polish.** No progress bar (done/total appraised), no session set (identified
       assets vanish from the backlog), no inspector "Identify now" / per-asset Re-identify.
@@ -146,12 +151,13 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       bypasses it with an inline `--row-h`. Wire the attribute or delete the block.
 - [ ] **Density default is cozy, not compact** — `nav.svelte.ts:17` defaults `"cozy"` (36px rows);
       DG §4 says default **compact** (32px) with Comfortable as opt-in.
-- [ ] **Status gems unused** — the card renders colored text `?`/`✓` (`Card.svelte:124-130`); the
-      sprite's `ls-status-{unidentified,identified,confirmed}` gems (incl. the gold ★) are never
-      referenced. Confirmed never shows ★.
-- [ ] **Card status rail** — 3px wide, gold for every non-unidentified status; DG §6 says 1px,
-      Identified **verdant** vs Confirmed **gold**.
-- [ ] **Toasts** — left border 3px (DG: 1px); only `ok|err` kinds exist (no warn/info).
+- [x] **Status gems wired (2026-08-07)** — `Card.svelte` renders the sprite's
+      `ls-status-{unidentified,identified,confirmed}` gems; confirmed now shows the gold ★
+      (DG §6).
+- [x] **Card status rail (2026-08-07)** — 1px wide (was 3px); Identified **verdant**
+      (`--ls-status-identified`) vs Confirmed **gold** (`--ls-gold`).
+- [x] **Toasts (2026-08-07)** — left border 1px (was 3px); `warn|info` kinds added
+      (`--ls-warning`/`--ls-info` accents); DG §7.
 - [ ] **Icon sizes diverge** — nav 18 (DG 24), toolbar 14–16 (DG 20), type marks 28–40 (DG 32).
 - [ ] **Sort options** — SORTS = Relevance/Name/Type/Size; DG: Name · Date added · Date modified ·
       Size · Type · Status.

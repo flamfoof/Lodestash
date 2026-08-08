@@ -3,7 +3,7 @@
  * instance is imported by App.svelte, which renders the host. DESIGN-GUIDELINES §7: bottom-right,
  * `--ls-overlay`, 1px accent left-border by type (ok → success, err → danger).
  */
-export type ToastKind = "ok" | "err";
+export type ToastKind = "ok" | "err" | "warn" | "info";
 
 export type Toast = {
   id: number;

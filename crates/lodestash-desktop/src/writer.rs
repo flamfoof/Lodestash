@@ -22,15 +22,25 @@ use std::sync::Arc;
 
 use lodestash_app::config::AppConfig;
 use lodestash_app::drains::{
-    drain_promote_resync, drain_previews, resolve_audio_embedder, resolve_embedder,
+    drain_audio_tags, drain_promote_resync, drain_previews, drain_tags, resolve_audio_embedder,
+    resolve_embedder,
 };
+use lodestash_app::jobs::JobProgress as AppJobProgress;
 use lodestash_app::paths::default_cache_dirs;
 use lodestash_app::types::PersistBatch;
+use lodestash_ai::clap_tags::AudioZeroShot;
+use lodestash_ai::image_tags::ImageZeroShot;
+use lodestash_ai::tagger::{FilenameTagger, TeachTrait};
 use lodestash_core::catalog::{Catalog, PackageEntryRecord};
 use lodestash_core::types::{Exclude, ExcludeKind};
 use lodestash_ingest::unitypackage::{
     extract_at_offsets_with_progress, read_manifest_with_progress, EntryLocator, ExtractedAsset,
 };
+
+/// Bounded tag work per appraise pass (AI-PIPELINE §5.1): a writer-thread kick never blocks
+/// writes on a long backlog; the remainder stays queued for the next kick / idle slice.
+const TAG_BUDGET_PER_PASS: u32 = 64;
+const AUDIO_TAG_BUDGET_PER_PASS: u32 = 48;
 
 /// One asset the write path needs to act on, resolved from the library while its lock is held so
 /// the writer thread never reaches back into it.
@@ -616,6 +626,48 @@ fn appraise_pass(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    // B11 tail — the tagging half of the appraise pass (was unreachable: the desktop had no
+    // tagger resolver). Local-only, zero new models: the SigLIP embedder already resolved above
+    // drives the visual zero-shot tagger, CLAP drives the audio one, and taught traits (Traits
+    // screen, AI-PIPELINE §6) become candidate labels. The filename tagger is the captioning
+    // stub (no Ollama/cloud endpoint is configured from the desktop yet).
+    // Bounded per pass so a writer-thread kick never blocks writes on a long backlog — the
+    // remainder stays queued for the next kick / idle auto-identify slice.
+    let teach = catalog
+        .teaching_traits()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(namespace, value, scope, usage_note)| TeachTrait {
+            namespace,
+            value,
+            scope,
+            usage_note,
+        })
+        .collect::<Vec<_>>();
+    let progress = AppJobProgress::default();
+    let zero_shot = embedder
+        .clone()
+        .and_then(|e| ImageZeroShot::new(e, &teach));
+    let audio_shot = audio_embedder.clone().and_then(AudioZeroShot::new);
+    let tagger = FilenameTagger;
+    drain_tags(
+        catalog,
+        &tagger,
+        zero_shot.as_ref(),
+        workspace_dir.as_deref(),
+        cache_dir.as_deref(),
+        &progress,
+        TAG_BUDGET_PER_PASS,
+    );
+    if let Some(az) = audio_shot.as_ref() {
+        drain_audio_tags(
+            catalog,
+            az,
+            workspace_dir.as_deref(),
+            &progress,
+            AUDIO_TAG_BUDGET_PER_PASS,
+        );
+    }
     let (counts, _assets) = drain_promote_resync(
         catalog,
         embedder,

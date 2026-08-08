@@ -391,7 +391,8 @@ import JobTray from "./lib/JobTray.svelte";
     background: var(--ls-bg);
   }
   /* Toasts (I5/B10c): bottom-right, floating above the 24px statusbar (DESIGN-GUIDELINES §7 —
-     `--ls-overlay`, 1px accent left-border by type: ok → success, err → danger). */
+     `--ls-overlay`, 1px accent left-border by type: ok → success, err → danger, warn → warning,
+     info → info). */
   .toasts {
     position: fixed;
     right: var(--sp-4);
@@ -411,7 +412,7 @@ import JobTray from "./lib/JobTray.svelte";
     padding: var(--sp-2) var(--sp-3);
     background: var(--ls-overlay);
     border: 1px solid var(--ls-border);
-    border-left: 3px solid var(--accent, var(--ls-success));
+    border-left: 1px solid var(--accent, var(--ls-success));
     border-radius: var(--r-md);
     font-size: var(--fs-sm);
     color: var(--ls-text);
@@ -423,6 +424,12 @@ import JobTray from "./lib/JobTray.svelte";
   }
   .toast.err {
     --accent: var(--ls-danger);
+  }
+  .toast.warn {
+    --accent: var(--ls-warning);
+  }
+  .toast.info {
+    --accent: var(--ls-info);
   }
   .toast .msg {
     min-width: 0;

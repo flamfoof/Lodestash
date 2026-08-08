@@ -80,6 +80,12 @@
     item.has_preview ? previewUrl(item.asset_id) : canRaster ? thumbUrl(item.asset_id) : null,
   );
   let unidentified = $derived(item.status === "discovered" || item.status === "indexed");
+  let confirmed = $derived(item.status === "confirmed");
+  // The corner gem carries identification status (DESIGN-GUIDELINES §6): the sprite's three
+  // `ls-status-*` gems — `?` grey, ✓ verdant, ★ gold for confirmed (a human reviewed it).
+  let gem = $derived(
+    unidentified ? "ls-status-unidentified" : confirmed ? "ls-status-confirmed" : "ls-status-identified",
+  );
 
   // FEATURES §1.1: the meta line leads with the pack, because "which pack is this from" is the
   // question a grid of 8k near-identical Synty props actually raises. Size moved to the tier chip.
@@ -103,6 +109,7 @@
 <button
   class="card"
   class:identified={!unidentified}
+  class:confirmed={confirmed}
   class:unidentified={unidentified}
   class:selected
   style="--tint: {tint}"
@@ -126,7 +133,7 @@
         class:unknown={unidentified}
         title={unidentified ? "Unidentified" : item.status}
       >
-        {unidentified ? "?" : "✓"}
+        <Icon name={gem} size={14} />
       </span>
     </span>
     {#if item.size_tier}
@@ -208,9 +215,10 @@
     padding: var(--sp-3);
     background: var(--ls-surface);
     border: 1px solid var(--ls-border);
-    /* F1: a 3px status rail on the left edge — gold when identified/confirmed, grey when
-       discovered/indexed. Kept as a width on the base so the rail never pops the layout. */
-    border-left-width: 3px;
+    /* F1: a 1px status rail on the left edge — gold when confirmed, verdant when identified,
+       grey when discovered/indexed (DESIGN-GUIDELINES §6). Kept as a width on the base so the
+       rail never pops the layout. */
+    border-left-width: 1px;
     border-radius: var(--r-lg);
     text-align: left;
     overflow: hidden;
@@ -235,6 +243,9 @@
      .card:hover/.card.selected so the rail keeps its status colour while the other sides tint
      on hover; equal specificity means later wins here. */
   .card.identified {
+    border-left-color: var(--ls-status-identified);
+  }
+  .card.confirmed {
     border-left-color: var(--ls-gold);
   }
   .card.unidentified {

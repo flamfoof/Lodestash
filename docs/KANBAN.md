@@ -634,12 +634,12 @@ translation. The port removes the translation; the egui build stayed buildable a
   - [x] **B11d — pump progress surface.** `pump: Arc<AtomicBool>` on AppState, raised by the
         writer around appraise passes; `pump_active()` command; IdentifyScreen polls it while
         open and the ✦ header reflects an in-flight pass (e.g. auto-identify).
-  - [ ] **B11b — per-asset Identify now (UI-SPEC §3)** — the card/row ✦ gesture embeds + tags one
-        asset (needs a single-asset embed path).
-  - [ ] **B11c — auto-identify opt-in (AI-PIPELINE §2)** — idle drain embeds when `auto_identify`
-        is on; the Settings toggle exists (check) and must feed the writer's idle pass.
-  - [ ] **B11d — appraise progress surfacing** — the ✦ button + top bar reflect a running pass
-        (pump-active flag shared from the writer), instead of the current button-local state.
+  - [x] **B11e — tagging half (2026-08-07).** `drain_tags` / `drain_audio_tags` were dead (zero
+        call sites — no tagger resolver, rows stalled at `indexed`). `appraise_pass` now resolves
+        the local zero-shot taggers (SigLIP → `ImageZeroShot`, CLAP → `AudioZeroShot`, taught
+        traits as candidate labels) + `FilenameTagger` stub, bounded `max_assets` per pass
+        (AI-PIPELINE §5.1; 64 visual / 48 audio) so a writer-thread kick never blocks writes.
+        Ollama/cloud captioning endpoint still stubbed (no desktop config path).
 
 - [ ] **B1.5 — `lodestash-cli`.** Headless `scan|index|tag|export`; gives the port a smoke test
       needing no window.

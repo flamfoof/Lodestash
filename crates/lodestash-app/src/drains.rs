@@ -476,12 +476,20 @@ pub fn drain_audio_tags(
     zero_shot: &lodestash_ai::clap_tags::AudioZeroShot,
     workspace_dir: Option<&std::path::Path>,
     progress: &crate::jobs::JobProgress,
+    max_assets: u32,
 ) {
     use std::sync::atomic::Ordering;
     const BATCH: usize = 32;
     let model_id = zero_shot.model_id().to_string();
+    let mut tagged_assets = 0usize;
     loop {
         if progress.is_cancelled() {
+            return;
+        }
+        // Budget guard (AI-PIPELINE §5.1): stop after `max_assets` assets and leave the rest
+        // queued, so a writer-thread pass (bounded by design) never blocks writes on a long
+        // backlog. `0` = uncapped.
+        if max_assets != 0 && tagged_assets >= max_assets as usize {
             return;
         }
         let jobs = match cat.audio_assets_needing_tags(BATCH) {
@@ -497,6 +505,10 @@ pub fn drain_audio_tags(
         let n = jobs.len();
         for job in jobs {
             if progress.is_cancelled() {
+                return;
+            }
+            // Hard per-asset cap inside the batch too, so `max_assets` is exact, not +BATCH.
+            if max_assets != 0 && tagged_assets >= max_assets as usize {
                 return;
             }
             let resolved = resolve_job_path(&job, workspace_dir);
@@ -518,6 +530,7 @@ pub fn drain_audio_tags(
                 return;
             }
             progress.done.fetch_add(1, Ordering::Relaxed);
+            tagged_assets += 1;
         }
         if n < BATCH {
             break;
@@ -1019,6 +1032,7 @@ pub fn drain_tags(
     workspace_dir: Option<&std::path::Path>,
     cache_dir: Option<&std::path::Path>,
     progress: &crate::jobs::JobProgress,
+    max_assets: u32,
 ) {
     use std::sync::atomic::Ordering;
     const BATCH: usize = 16;
@@ -1030,9 +1044,16 @@ pub fn drain_tags(
         progress.total.store(total as u64, Ordering::Relaxed);
     }
     let mut tagged = 0usize;
+    let mut tagged_assets = 0usize;
     let model_id = tagger.model_id().to_string();
     loop {
         if progress.is_cancelled() {
+            break;
+        }
+        // Budget guard (AI-PIPELINE §5.1): stop after `max_assets` assets and leave the rest
+        // queued, so a writer-thread pass (bounded by design) never blocks writes on a long
+        // backlog. `0` = uncapped.
+        if max_assets != 0 && tagged_assets >= max_assets as usize {
             break;
         }
         let jobs = match cat.assets_needing_tags(BATCH) {
@@ -1100,6 +1121,10 @@ pub fn drain_tags(
             if progress.is_cancelled() {
                 return;
             }
+            // Hard per-asset cap inside the batch too, so `max_assets` is exact, not +BATCH.
+            if max_assets != 0 && tagged_assets >= max_assets as usize {
+                return;
+            }
             let result = if tagger.supports(&job.media_code) {
                 tagger.tag(
                     &lodestash_ai::tagger::TagInput {
@@ -1131,6 +1156,7 @@ pub fn drain_tags(
                 }
             }
             progress.done.fetch_add(1, Ordering::Relaxed);
+            tagged_assets += 1;
         }
     }
     tracing::info!(tags = tagged, model = %model_id, "tagging pass finished");
