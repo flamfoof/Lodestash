@@ -706,7 +706,7 @@ fn rebuild_watch(catalog: &Catalog) -> Option<lodestash_ingest::watch::RootWatch
 /// BLAKE3 via `needs_rehash`), then the standard persist on this thread (single-writer rule —
 /// `persist_to_catalog` opens its own connection here exactly as `Op::PersistScan` does).
 /// Returns whether anything actually changed, so the UI only reloads when it did.
-fn rescan_watched(catalog: &mut Catalog, db_path: &Path, app: &Option<tauri::AppHandle>) -> bool {
+fn rescan_watched(catalog: &mut Catalog, db_path: &Path, _app: &Option<tauri::AppHandle>) -> bool {
     let cfg = AppConfig::load();
     let project = cfg.last_project_name.as_deref();
     let mut changed = false;
@@ -1560,3 +1560,4 @@ mod tests {
         );
     }
 }
+

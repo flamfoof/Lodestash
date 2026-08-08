@@ -1006,7 +1006,9 @@ try {
         assert.ok(r.decoded > 0, `${a.name}: PNG served but the browser could not decode it`);
       } else {
         assert.equal(r.status, 503, `${a.name}: expected 200 or 503, got ${r.status}`);
-        assert.match(r.body, /not_local/);
+        // The refusal body distinguishes the two honest answers: over the size cap vs a pull
+        // that failed for another reason. Either is fine — what matters is the status.
+        assert.match(r.body, /not_local|pull cap/);
       }
       seen.push(r.status);
     }
@@ -1087,8 +1089,16 @@ try {
       const res = await fetch(`http://lodestash.localhost/file/${assetId}`);
       return { status: res.status, body: await res.text() };
     }, packed.asset_id);
-    assert.equal(r.status, 503, `expected 503 not_local, got ${r.status}`);
-    assert.match(r.body, /not_local/);
+    // FEATURES §5.4: a known in-pack asset's payload is materialized on demand (size-capped
+    // scratch) — the file route serves it instead of the old not_local 503. The distinction
+    // that matters is known-vs-missing: a known asset must never answer 404.
+    assert.notEqual(r.status, 404, "a known in-pack asset must not 404");
+    assert.ok(r.status === 200 || r.status === 503, `unexpected status ${r.status}`);
+    if (r.status === 200) {
+      assert.ok(r.body.length > 0, "200 with an empty body");
+    } else {
+      assert.match(r.body, /not_local/);
+    }
   });
 
   // ── B5: writes ────────────────────────────────────────────────────────────────────────────

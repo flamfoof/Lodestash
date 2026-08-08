@@ -153,8 +153,10 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
 - [x] **Full-res in-pack pulls (2026-08-08).** `lodestash://file` and `lodestash://mesh` now
       materialize a known in-pack asset through the size-capped scratch instead of answering
       `503 not_local` — Quick Look renders in-pack images/audio/models like loose ones (whole
-      packs still extract by command only). Remaining: per-entry "Extract selected"
-      page-batching (lift the 256 MB `IN_PACK_THUMB_MAX_BYTES` cap).
+      packs still extract by command only). The 256 MB pull cap now guards **only the thumb
+      route** (the one that fans out across a pack — the 21.9 GB-pack stampede); a single
+      explicit file/mesh pull is never refused by archive size (the deep-entry decompress-skip
+      is bounded + cached). Remaining: per-entry "Extract selected" page-batching.
 - [ ] **Import dialog (§5.2).** Folder → discovered-package list (group/select-all, category badge +
       tabs, version disclosure, "import as libraries") — `add_source_dialog` is a plain folder
       picker today.

@@ -147,6 +147,31 @@ export async function launch() {
   const page = browser.contexts()[0].pages()[0];
   await page.waitForSelector(".card, .msg", { timeout: 15_000 });
 
+  // First-run onboarding (FEATURES §8) covers the whole UI and swallows clicks when the
+  // user's config has `skip_onboarding` off — the suite tests the app, not the welcome
+  // panel. The flag arrives over IPC a beat *after* the grid renders, so poll until the
+  // panel is gone: dismiss it (a scrim click) whenever it is present, and keep checking
+  // for the whole window in case it arrives late.
+  const onboardDeadline = Date.now() + 6_000;
+  while (Date.now() < onboardDeadline) {
+    const dismissed = await page
+      .evaluate(() => {
+        const el = document.querySelector('[data-testid="onboarding"]');
+        if (el) {
+          el.click();
+          return true;
+        }
+        return false;
+      })
+      .catch(() => false);
+    if (dismissed) {
+      await page.waitForTimeout(300); // let Svelte unmount the panel
+    } else {
+      await page.waitForTimeout(150);
+    }
+  }
+  await page.waitForSelector('[data-testid="onboarding"]', { state: "detached", timeout: 2_000 }).catch(() => {});
+
   return {
     page,
     /** Call a `#[tauri::command]` directly, bypassing the UI. */

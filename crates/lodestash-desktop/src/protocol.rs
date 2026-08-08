@@ -205,14 +205,33 @@ fn thumb(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
 
     let path = match job.path.clone().filter(|p| p.exists()) {
         Some(p) => p,
-        None => match in_pack_scratch(&job, &cache) {
-            Some(p) => p,
-            // A known in-pack asset over the size cap, or one whose pull failed. Not "missing".
-            None if job.in_pack.is_some() => {
-                return status(StatusCode::SERVICE_UNAVAILABLE, "not_local")
+        None => {
+            // Grid-stampede guard: `.unitypackage` is gzip with no random access, so pulling one
+            // payload inflates the archive from byte zero to its offset. On a real multi-GB pack
+            // one page of cards would re-inflate gigabytes each — above the cap the card keeps
+            // its type placeholder until the pack is extracted (the fast random-access path).
+            // The file/mesh routes serve one explicitly opened asset and are not capped.
+            let over_cap = job
+                .in_pack
+                .as_ref()
+                .and_then(|loc| std::fs::metadata(&loc.pack_path).ok())
+                .map(|m| m.len() > lodestash_app::thumbs::IN_PACK_THUMB_MAX_BYTES)
+                .unwrap_or(false);
+            if over_cap {
+                return status(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "pack over the thumbnail pull cap",
+                );
             }
-            None => return status(StatusCode::NOT_FOUND, "file missing"),
-        },
+            match in_pack_scratch(&job, &cache) {
+                Some(p) => p,
+                // A known in-pack asset over the size cap, or one whose pull failed. Not "missing".
+                None if job.in_pack.is_some() => {
+                    return status(StatusCode::SERVICE_UNAVAILABLE, "not_local")
+                }
+                None => return status(StatusCode::NOT_FOUND, "file missing"),
+            }
+        }
     };
 
     // Grid render quality comes from the persisted setting (UI-SPEC §11.3): `thumb_px()`
@@ -273,25 +292,20 @@ fn thumb(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
 /// **This is the one place a GET writes anything**, and the exception is narrow by construction:
 /// it writes only into our own cache directory, and only the bytes of the one asset being drawn.
 /// The `.unitypackage` and the asset's own bytes are untouched, so the non-destructive invariant
-/// holds; what it costs is CPU, not correctness. `lodestash://file` and `lodestash://mesh` still
-/// never pull — those serve whole assets, where the honest answer to "not local" is to extract
-/// the pack.
+/// holds; what it costs is CPU, not correctness.
 ///
-/// **Gated on archive size.** `.unitypackage` is gzip, which has no random access: pulling one
-/// payload inflates the archive from byte zero to that payload's offset. On the real 21.9 GB
-/// music pack a single page of cards re-inflated gigabytes each and pegged the CPU. Above
-/// [`IN_PACK_THUMB_MAX_BYTES`] the card keeps its type placeholder until the pack is extracted,
-/// which is the fast random-access path anyway.
+/// **No archive-size cap here.** `.unitypackage` is gzip, which has no random access: pulling one
+/// payload inflates the archive from byte zero to that payload's offset, so a single pull from a
+/// deep entry in a big pack costs a bounded decompress-skip (seconds on the first hit, then the
+/// scratch is cached). That is fine for the *file* and *mesh* routes, which serve one explicitly
+/// opened asset. The grid-stampede guard — the real 21.9 GB pack where one page of cards
+/// re-inflated gigabytes each — lives in the *thumb* route, the only caller that fans out across
+/// a whole pack.
 ///
 /// ponytail: O(page) independent pulls under the cap; batching a page into one sorted
 /// `extract_at_offsets` skip-scan is what lifts it.
 fn in_pack_scratch(job: &crate::library::ThumbJob, cache: &Path) -> Option<std::path::PathBuf> {
     let loc = job.in_pack.as_ref()?;
-    let archive = std::fs::metadata(&loc.pack_path).ok()?.len();
-    if archive > lodestash_app::thumbs::IN_PACK_THUMB_MAX_BYTES {
-        tracing::debug!(pack = %loc.pack_path, archive, "pack over the thumbnail pull cap");
-        return None;
-    }
     lodestash_app::thumbs::ensure_in_pack_scratch(
         Some(cache),
         &loc.pack_path,
