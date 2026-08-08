@@ -1,7 +1,7 @@
 <script lang="ts">
   import Icon from "./Icon.svelte";
   import Filters from "./Filters.svelte";
-  import { SORTS, STATUSES, DENSITIES, recentOps, undo, type OpLogRow } from "./api";
+  import { SORTS, STATUSES, DENSITIES, recentOps, redoOps, redo, undo, type OpLogRow } from "./api";
   import { view } from "./nav.svelte";
 
   let { total, favorites = 0 }: { total: number; favorites?: number } = $props();
@@ -12,12 +12,19 @@
   // to advance to the next op (a reverted op is removed from the log).
   let lastOp = $state<OpLogRow | null>(null);
   let undoBusy = $state(false);
+  let redoHead = $state<OpLogRow | null>(null);
+  let redoBusy = $state(false);
   $effect(() => {
     view.dataVersion;
     let stale = false;
     recentOps(1)
       .then((rows) => {
         if (!stale) lastOp = rows[0] ?? null;
+      })
+      .catch(() => {});
+    redoOps(1)
+      .then((rows) => {
+        if (!stale) redoHead = rows[0] ?? null;
       })
       .catch(() => {});
     return () => {
@@ -58,11 +65,29 @@
     }
   }
 
-  /** Ctrl/Cmd-Z — undo the newest op (UI-SPEC §2). Never steals from an input. */
+  /** Redo the newest undone op (UI-SPEC §2 Shift-Z). */
+  async function onRedo() {
+    const op = redoHead;
+    if (!op || redoBusy) return;
+    redoBusy = true;
+    try {
+      await redo(op.id);
+      view.dataVersion += 1;
+    } catch {
+      // Nothing changed; the redo stack still holds the op.
+    } finally {
+      redoBusy = false;
+    }
+  }
+
+  /** Ctrl/Cmd-Z undo, Ctrl/Cmd-Shift-Z / Ctrl/Cmd-Y redo (UI-SPEC §2). Never steals from an input. */
   function onkeydown(e: KeyboardEvent) {
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && !e.shiftKey) {
+    const mod = e.ctrlKey || e.metaKey;
+    if (mod && e.key.toLowerCase() === "z" && !e.shiftKey) {
       onUndo();
+    } else if (mod && (e.key.toLowerCase() === "y" || (e.key.toLowerCase() === "z" && e.shiftKey))) {
+      onRedo();
     }
   }
 </script>
@@ -214,6 +239,18 @@
       data-testid="undo-button"
     >
       ↶
+    </button>
+
+    <button
+      class="icon-btn"
+      class:on={!!redoHead}
+      disabled={!redoHead || redoBusy}
+      onclick={onRedo}
+      title={redoHead ? `Redo ${opLabel(redoHead.op_kind)}` : "Nothing to redo"}
+      aria-label={redoHead ? `Redo ${opLabel(redoHead.op_kind)}` : "Nothing to redo"}
+      data-testid="redo-button"
+    >
+      ↷
     </button>
     <button
       class="icon-btn"

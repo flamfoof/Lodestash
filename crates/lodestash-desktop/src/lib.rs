@@ -844,11 +844,27 @@ fn recent_ops(state: tauri::State<'_, AppState>, limit: usize) -> Result<Vec<lod
         .map_err(|_| "library lock poisoned".to_string())
 }
 
+/// The redo stack (UI-SPEC §2 Shift-Z): the newest undone ops, newest first.
+#[tauri::command]
+fn redo_ops(state: tauri::State<'_, AppState>, limit: usize) -> Result<Vec<lodestash_core::catalog::OpLogRow>, String> {
+    state
+        .library
+        .lock()
+        .map(|l| l.redo_candidates(limit))
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
 /// Undo the logged operation `op_id` (UI-SPEC §2 / DESIGN-GUIDELINES §7 L5). Runs on the writer
 /// thread like every catalog mutation; a reverted op is removed from the log.
 #[tauri::command]
 fn undo(state: tauri::State<'_, AppState>, op_id: i64) -> Result<WriteResult, String> {
     state.write(Op::RevertOp { op_id })
+}
+
+/// Redo one undone op (UI-SPEC §2 Shift-Z) — the mirror of `undo`.
+#[tauri::command]
+fn redo(state: tauri::State<'_, AppState>, op_id: i64) -> Result<WriteResult, String> {
+    state.write(Op::RedoOp { op_id })
 }
 
 /// Toggle one asset's membership in a collection (UI-SPEC §6 / §13.5). Both directions go
@@ -1165,7 +1181,9 @@ pub fn run() {
             rename_category,
             delete_category,
             recent_ops,
+            redo_ops,
             undo,
+            redo,
             collection_add_asset,
             collection_remove_asset,
             bulk_tag,

@@ -460,6 +460,8 @@ export type OpLogRow = {
 };
 
 export const recentOps = (limit: number) => invoke<OpLogRow[]>("recent_ops", { limit });
+export const redoOps = (limit: number) => invoke<OpLogRow[]>("redo_ops", { limit });
+export const redo = (opId: number) => invoke<WriteResult>("redo", { opId });
 export const undo = (opId: number) => invoke<WriteResult>("undo", { opId });
 
 export const collectionAddAsset = (collectionId: number, assetId: number) =>

@@ -1584,6 +1584,20 @@ impl Library {
         }
     }
 
+    /// The newest undone ops — the redo stack (UI-SPEC §2 Shift-Z).
+    pub fn redo_candidates(&self, limit: usize) -> Vec<lodestash_core::catalog::OpLogRow> {
+        let Some(cat) = self.catalog.as_ref() else {
+            return Vec::new();
+        };
+        match cat.redo_candidates(limit) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(%e, "redo_candidates failed");
+                Vec::new()
+            }
+        }
+    }
+
     /// The assets related to `asset_id` through dependency edges (DATA-MODEL §10) — the
     /// inspector's LINKED FILES / SIMILAR slices. `outbound` marks which way the edge points.
     pub fn related_assets(&self, asset_id: i64) -> Vec<lodestash_core::catalog::RelatedAsset> {

@@ -264,6 +264,7 @@ impl Catalog {
             (14, MIGRATION_14_IN_PACK_ASSETS),
             (15, MIGRATION_15_VECTOR_PREVIEWS),
             (16, MIGRATION_16_OP_LOG),
+            (17, MIGRATION_17_OP_LOG_REDO),
         ];
 
         for (version, sql) in migrations {
@@ -1854,6 +1855,12 @@ CREATE TABLE IF NOT EXISTS op_log (
   created_at   INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_oplog_created ON op_log(created_at);
+";
+
+const MIGRATION_17_OP_LOG_REDO: &str = "
+ALTER TABLE op_log ADD COLUMN forward_json TEXT;  -- the redo payload; NULL = payload_json IS the forward too
+ALTER TABLE op_log ADD COLUMN undone_at INTEGER;  -- set on undo; redo applies the forward then deletes the row
+CREATE INDEX IF NOT EXISTS idx_oplog_undone ON op_log(undone_at);
 ";
 
 const MIGRATION_12_FAVORITES: &str = "
@@ -4562,7 +4569,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 16, "all 16 migrations should have run");
+        assert_eq!(version, 17, "all 17 migrations should have run");
     }
 
     /// The viewer's texture lookup must walk **both** hops. Stopping at the first lands on the
@@ -8104,15 +8111,27 @@ pub struct OpLogRow {
 impl Catalog {
     /// Append an operation to the undo log. `op_kind` names the mutation (`set_tags`,
     /// `set_trashed`, `create_collection`, …); `payload_json` carries whatever its revert
-    /// needs (see the `revert_*` family and the `record_*_op` helpers). Returns the new
-    /// op's id.
-    pub fn record_op(&self, op_kind: &str, payload_json: &str) -> Result<i64> {
+    /// needs (see the `revert_*` family and the `record_*_op` helpers). `forward_json` is the
+    /// redo payload — `None` means the payload IS the forward too (the change-shaped ops).
+    /// Recording a new op clears the redo stack: after new work, a redo would no longer land
+    /// on the state it described. Returns the new op's id.
+    pub fn record_op(
+        &self,
+        op_kind: &str,
+        payload_json: &str,
+        forward_json: Option<&str>,
+    ) -> Result<i64> {
         self.conn
             .execute(
-                "INSERT INTO op_log (op_kind, payload_json, created_at) VALUES (?1, ?2, ?3)",
-                params![op_kind, payload_json, unix_now()],
+                "INSERT INTO op_log (op_kind, payload_json, forward_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![op_kind, payload_json, forward_json, unix_now()],
             )
             .map_err(|e| CoreError::Catalog(format!("record_op: {e}")))?;
+        // New work invalidates any undone ops.
+        self.conn
+            .execute("DELETE FROM op_log WHERE undone_at IS NOT NULL", [])
+            .map_err(|e| CoreError::Catalog(format!("record_op redo clear: {e}")))?;
         // The log is a recent-actions tail, not a history — cap it so a 10k-asset bulk write
         // cannot grow the file forever. The oldest rows go first.
         let _ = self.conn.execute(
@@ -8123,13 +8142,15 @@ impl Catalog {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// The newest undo-log rows, newest first, capped at `limit`.
+    /// The newest undo-log rows, newest first, capped at `limit`. Undone ops are hidden — they
+    /// are the redo stack, not the undo button's target.
     pub fn recent_ops(&self, limit: usize) -> Result<Vec<OpLogRow>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT id, op_kind, payload_json, created_at FROM op_log
-                  ORDER BY id DESC LIMIT ?1",
+                 WHERE undone_at IS NULL
+                 ORDER BY id DESC LIMIT ?1",
             )
             .map_err(|e| CoreError::Catalog(format!("recent_ops prep: {e}")))?;
         let rows = stmt
@@ -8144,6 +8165,30 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("recent_ops query: {e}")))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| CoreError::Catalog(format!("recent_ops row: {e}")))
+    }
+
+    /// The newest undone ops (the redo stack), newest first, capped at `limit`.
+    pub fn redo_candidates(&self, limit: usize) -> Result<Vec<OpLogRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, op_kind, payload_json, created_at FROM op_log
+                 WHERE undone_at IS NOT NULL
+                 ORDER BY id DESC LIMIT ?1",
+            )
+            .map_err(|e| CoreError::Catalog(format!("redo_candidates prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(OpLogRow {
+                    id: r.get(0)?,
+                    op_kind: r.get(1)?,
+                    payload_json: r.get(2)?,
+                    created_at: r.get(3)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("redo_candidates query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("redo_candidates row: {e}")))
     }
 
     /// Delete undo-log rows by id — after a revert, or when the user clears history.
@@ -8167,7 +8212,12 @@ impl Catalog {
     /// Record a `set_tags` op with the asset's **current** per-source tags snapshotted
     /// into the payload — call this *before* [`Self::set_tags`] mutates, so
     /// [`Self::revert_op`] can restore the exact prior set.
-    pub fn record_set_tags_op(&self, asset_id: i64, source: &str) -> Result<i64> {
+    pub fn record_set_tags_op(
+        &self,
+        asset_id: i64,
+        source: &str,
+        tags: &[TagAssignment],
+    ) -> Result<i64> {
         let prior = {
             let mut stmt = self
                 .conn
@@ -8200,7 +8250,17 @@ impl Catalog {
             })).collect::<Vec<_>>(),
         })
         .to_string();
-        self.record_op("set_tags", &payload)
+        let forward = serde_json::json!({
+            "asset_id": asset_id,
+            "source": source,
+            "tags": tags.iter().map(|t| serde_json::json!({
+                "namespace": t.namespace,
+                "value": t.value,
+                "confidence": t.confidence,
+            })).collect::<Vec<_>>(),
+        })
+        .to_string();
+        self.record_op("set_tags", &payload, Some(&forward))
     }
 
     /// Record a trash/untrash op (the direction passed to [`Self::set_trashed`]) so the
@@ -8211,7 +8271,7 @@ impl Catalog {
             "trashed": trashed,
         })
         .to_string();
-        self.record_op("set_trashed", &payload)
+        self.record_op("set_trashed", &payload, None)
     }
 
     /// Record a collection-create op (id + name) so the created collection can be deleted
@@ -8222,7 +8282,7 @@ impl Catalog {
             "name": name,
         })
         .to_string();
-        self.record_op("create_collection", &payload)
+        self.record_op("create_collection", &payload, None)
     }
 
     /// Record one bulk-tag op for the assets that actually changed (a no-op add on an
@@ -8242,7 +8302,7 @@ impl Catalog {
             "on": on,
         })
         .to_string();
-        self.record_op("bulk_tag", &payload)
+        self.record_op("bulk_tag", &payload, None)
     }
 
     /// Undo the operation recorded as `op_id`, then remove the op from the log (a
@@ -8264,6 +8324,136 @@ impl Catalog {
                 "revert_op: no revert registered for op kind {other:?}"
             ))),
         }
+    }
+
+    /// Keep a reverted op for redo (UI-SPEC §2 Ctrl/Cmd-Z / Shift-Z): mark it undone instead of
+    /// deleting, so [`Self::redo_op`] can apply the forward payload later. New work clears
+    /// undone ops (see [`Self::record_op`]).
+    fn mark_undone(&self, op_id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE op_log SET undone_at = ?2 WHERE id = ?1",
+                params![op_id, unix_now()],
+            )
+            .map_err(|e| CoreError::Catalog(format!("mark_undone: {e}")))?;
+        Ok(())
+    }
+
+    /// Redo one undone op (Shift-Z): apply its forward payload — `forward_json` when the op
+    /// recorded one, else the payload itself (the change-shaped ops) — then consume the row.
+    pub fn redo_op(&mut self, op_id: i64) -> Result<()> {
+        let undone: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM op_log WHERE id = ?1 AND undone_at IS NOT NULL",
+                params![op_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| CoreError::Catalog(format!("redo_op lookup: {e}")))?;
+        if undone == 0 {
+            return Err(CoreError::Catalog(format!(
+                "redo_op: op {op_id} is not undone — nothing to redo"
+            )));
+        }
+        let (kind, payload) = self.op_payload(op_id)?;
+        let forward = self.op_forward(op_id)?.unwrap_or(payload);
+        match kind.as_str() {
+            "set_tags" => self.redo_set_tags(op_id, &forward),
+            "set_trashed" => self.redo_set_trashed(op_id, &forward),
+            "create_collection" => self.redo_create_collection(op_id, &forward),
+            "bulk_tag" => self.redo_bulk_tag(op_id, &forward),
+            other => Err(CoreError::Catalog(format!(
+                "redo_op: no redo registered for op kind {other:?}"
+            ))),
+        }
+    }
+
+    fn op_forward(&self, op_id: i64) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT forward_json FROM op_log WHERE id = ?1",
+                params![op_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| CoreError::Catalog(format!("op_forward: {e}")))
+    }
+
+    /// Redo a `set_tags` op: write the recorded forward tag set back, then consume the row.
+    pub fn redo_set_tags(&mut self, op_id: i64, payload: &str) -> Result<()> {
+        let v: serde_json::Value = serde_json::from_str(payload)
+            .map_err(|e| CoreError::Catalog(format!("redo_set_tags payload: {e}")))?;
+        let asset_id = v["asset_id"]
+            .as_i64()
+            .ok_or_else(|| CoreError::Catalog("redo_set_tags: missing asset_id".into()))?;
+        let source = v["source"]
+            .as_str()
+            .ok_or_else(|| CoreError::Catalog("redo_set_tags: missing source".into()))?;
+        let mut tags = Vec::new();
+        for t in v["tags"].as_array().unwrap_or(&Vec::new()) {
+            tags.push(TagAssignment {
+                namespace: t["namespace"].as_str().unwrap_or("free").to_string(),
+                value: t["value"]
+                    .as_str()
+                    .ok_or_else(|| CoreError::Catalog("redo_set_tags: tag without value".into()))?
+                    .to_string(),
+                confidence: t["confidence"].as_f64(),
+            });
+        }
+        self.set_tags(asset_id, source, None, &tags)?;
+        self.delete_ops(&[op_id])?;
+        Ok(())
+    }
+
+    /// Redo a `set_trashed` op: re-apply the recorded direction, then consume the row.
+    pub fn redo_set_trashed(&self, op_id: i64, payload: &str) -> Result<()> {
+        let v: serde_json::Value = serde_json::from_str(payload)
+            .map_err(|e| CoreError::Catalog(format!("redo_set_trashed payload: {e}")))?;
+        let trashed = v["trashed"]
+            .as_bool()
+            .ok_or_else(|| CoreError::Catalog("redo_set_trashed: missing trashed".into()))?;
+        let ids: Vec<i64> = v["asset_ids"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .filter_map(|x| x.as_i64())
+            .collect();
+        self.set_trashed(&ids, trashed)?;
+        self.delete_ops(&[op_id])?;
+        Ok(())
+    }
+
+    /// Redo a `create_collection` op: re-create it (a fresh id is fine), then consume the row.
+    pub fn redo_create_collection(&self, op_id: i64, payload: &str) -> Result<()> {
+        let v: serde_json::Value = serde_json::from_str(payload)
+            .map_err(|e| CoreError::Catalog(format!("redo_create_collection payload: {e}")))?;
+        let name = v["name"]
+            .as_str()
+            .ok_or_else(|| CoreError::Catalog("redo_create_collection: missing name".into()))?;
+        self.create_collection(name)?;
+        self.delete_ops(&[op_id])?;
+        Ok(())
+    }
+
+    /// Redo a `bulk_tag` op: re-apply the recorded change, then consume the row.
+    pub fn redo_bulk_tag(&mut self, op_id: i64, payload: &str) -> Result<()> {
+        let p: serde_json::Value = serde_json::from_str(payload)
+            .map_err(|e| CoreError::Catalog(format!("redo_bulk_tag payload: {e}")))?;
+        let ids: Vec<i64> = p["asset_ids"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+            .unwrap_or_default();
+        let namespace = p["namespace"].as_str().unwrap_or("free");
+        let value = p["value"].as_str().unwrap_or_default();
+        let on = p["on"].as_bool().unwrap_or(true);
+        for id in &ids {
+            if on {
+                self.add_asset_tag(*id, "manual", namespace, value)?;
+            } else {
+                self.remove_asset_tag(*id, namespace, value)?;
+            }
+        }
+        self.delete_ops(&[op_id])?;
+        Ok(())
     }
 
     /// Undo a `bulk_tag` op: apply the exact inverse per recorded asset (an add is undone by
@@ -8291,9 +8481,7 @@ impl Catalog {
                 self.add_asset_tag(*id, "manual", namespace, value)?;
             }
         }
-        self.conn
-            .execute("DELETE FROM op_log WHERE id = ?1", params![op_id])
-            .map_err(|e| CoreError::Catalog(format!("revert_bulk_tag delete: {e}")))?;
+        self.mark_undone(op_id)?;
         Ok(())
     }
 
@@ -8328,7 +8516,7 @@ impl Catalog {
             });
         }
         self.set_tags(asset_id, source, None, &tags)?;
-        self.delete_ops(&[op_id])?;
+        self.mark_undone(op_id)?;
         Ok(())
     }
 
@@ -8352,12 +8540,12 @@ impl Catalog {
             .filter_map(|x| x.as_i64())
             .collect();
         self.set_trashed(&ids, !trashed)?;
-        self.delete_ops(&[op_id])?;
+        self.mark_undone(op_id)?;
         Ok(())
     }
 
     /// Undo a `create_collection` op: delete the collection the op created (reuses
-    /// [`Self::delete_collection`]), then drop the op.
+    /// [`Self::delete_collection`]), then mark it undone so Shift-Z can redo.
     pub fn revert_create_collection(&self, op_id: i64) -> Result<()> {
         let (kind, payload) = self.op_payload(op_id)?;
         if kind != "create_collection" {
@@ -8370,7 +8558,7 @@ impl Catalog {
             CoreError::Catalog("create_collection op payload: missing collection_id".into())
         })?;
         self.delete_collection(collection_id)?;
-        self.delete_ops(&[op_id])?;
+        self.mark_undone(op_id)?;
         Ok(())
     }
 
@@ -8753,9 +8941,9 @@ mod l5_slices_tests {
     #[test]
     fn op_log_record_recent_delete_manage_the_tail() {
         let c = Catalog::open_in_memory().expect("open");
-        let a = c.record_op("set_trashed", r#"{"asset_ids":[1],"trashed":true}"#).expect("op1");
-        let b = c.record_op("create_collection", r#"{"collection_id":9,"name":"x"}"#).expect("op2");
-        let cc = c.record_op("set_tags", "{}").expect("op3");
+        let a = c.record_op("set_trashed", r#"{"asset_ids":[1],"trashed":true}"#, None).expect("op1");
+        let b = c.record_op("create_collection", r#"{"collection_id":9,"name":"x"}"#, None).expect("op2");
+        let cc = c.record_op("set_tags", "{}", None).expect("op3");
 
         let recent = c.recent_ops(2).expect("recent");
         assert_eq!(recent.len(), 2);
@@ -8783,7 +8971,7 @@ mod l5_slices_tests {
         c.set_tags(asset, "manual", None, &[a1.clone(), a2.clone()])
             .expect("initial");
 
-        let op = c.record_set_tags_op(asset, "manual").expect("snapshot");
+        let op = c.record_set_tags_op(asset, "manual", &[]).expect("snapshot");
         c.set_tags(asset, "manual", None, &[TagAssignment::exact("subject", "changed")])
             .expect("mutate");
         assert_eq!(c.tags_for_asset(asset).expect("tags").len(), 1, "now the new tag only");
@@ -8877,6 +9065,42 @@ mod l5_slices_tests {
     }
 
     #[test]
+    fn redo_applies_the_forward_payload_then_consumes_the_op() {
+        let (mut c, ids) = tagged_catalog(&[("a.fbx", "model_3d")]);
+        let a = ids[0];
+
+        // Trash → undo → redo: the trash lands twice, the row is consumed, and the undo
+        // button's view (recent_ops) shows nothing again.
+        let op = c.record_trash_op(&[a], true).expect("record trash");
+        assert_eq!(c.set_trashed(&[a], true).expect("trash"), 1);
+        c.revert_op(op).expect("undo");
+        assert!(!is_trashed(&c, a));
+        assert!(
+            c.redo_candidates(10).expect("redo stack").iter().any(|r| r.id == op),
+            "the undone op sits on the redo stack"
+        );
+        c.redo_op(op).expect("redo");
+        assert!(is_trashed(&c, a), "redo re-applies the trashed state");
+        assert!(c.recent_ops(10).expect("recent").is_empty(), "redo consumes the row");
+        assert!(
+            c.redo_candidates(10).expect("redo stack").is_empty(),
+            "nothing left to redo"
+        );
+
+        // New work clears the redo stack.
+        let op2 = c.record_trash_op(&[a], false).expect("record untrash 2");
+        assert_eq!(c.set_trashed(&[a], false).expect("untrash 2"), 1);
+        c.revert_op(op2).expect("undo 2");
+        assert_eq!(c.redo_candidates(10).expect("redo stack").len(), 1);
+        c.record_op("set_trashed", r#"{"asset_ids":[1],"trashed":true}"#, None)
+            .expect("new work");
+        assert!(
+            c.redo_candidates(10).expect("redo stack").is_empty(),
+            "new work invalidates the redo stack"
+        );
+    }
+
+    #[test]
     fn revert_create_collection_deletes_the_created_collection() {
         let c = Catalog::open_in_memory().expect("open");
         let id = c.create_collection("Temp").expect("create");
@@ -8891,7 +9115,7 @@ mod l5_slices_tests {
     #[test]
     fn revert_dispatches_and_rejects_unknown_kinds() {
         let mut c = Catalog::open_in_memory().expect("open");
-        let op = c.record_op("mystery", "{}").expect("record");
+        let op = c.record_op("mystery", "{}", None).expect("record");
         assert!(c.revert_op(op).is_err(), "no revert for unknown kind");
         assert_eq!(c.recent_ops(10).expect("recent").len(), 1, "failed revert keeps the op");
         assert!(c.revert_op(999).is_err(), "no such op");

@@ -154,6 +154,9 @@ pub enum Op {
 
     /// Undo one logged mutation (UI-SPEC §2 Ctrl/Cmd-Z, DESIGN-GUIDELINES §7 L5).
     RevertOp { op_id: i64 },
+    /// Redo one undone op (UI-SPEC §2 Shift-Z): applies the op's forward payload and consumes
+    /// the log row — the inverse of [`Op::RevertOp`].
+    RedoOp { op_id: i64 },
     /// Toggle one asset's membership in a collection (UI-SPEC §6, §13.5).
     CollectionAddAsset { collection_id: i64, asset_id: i64 },
     CollectionRemoveAsset { collection_id: i64, asset_id: i64 },
@@ -1176,6 +1179,11 @@ fn run(
         // and every catalog mutation belongs here, one order (ARCHITECTURE §5).
         Op::RevertOp { op_id } => catalog
             .revert_op(op_id)
+            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map_err(|e| e.to_string()),
+
+        Op::RedoOp { op_id } => catalog
+            .redo_op(op_id)
             .map(|_| WriteResult { changed: 1, ..Default::default() })
             .map_err(|e| e.to_string()),
 
