@@ -651,7 +651,7 @@ try {
 
   // An in-pack asset must say so rather than showing a broken viewer — the read-only
   // invariant only means something if the UI explains it instead of looking failed.
-  await check("Quick Look on an in-pack asset explains itself", async () => {
+  await check("Quick Look on an in-pack asset renders its content (FEATURES §5.4)", async () => {
     const p = await invoke("grid_page", {
       query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
                favorites_only: false, page: 0, page_size: 100000 },
@@ -978,7 +978,7 @@ try {
   // left as a typed placeholder. Two outcomes are legitimate and nothing else is — a decodable PNG
   // (pack under the size cap) or 503 not_local (pack over it). A 404 would mean the route lost the
   // asset; a 500 would mean the pull half-succeeded and served a truncated file.
-  await check("in-pack image thumbnails are pulled, or refused over the size cap", async () => {
+  await check("in-pack image thumbnails are pulled, or refused over the size cap (FEATURES §5.4)", async () => {
     const p = await invoke("grid_page", {
       query: { tab: "images", search: "", status: "all", sort_by: "size", sort_asc: true,
                favorites_only: false, page: 0, page_size: 100000 },
@@ -1019,7 +1019,7 @@ try {
   // The pull must not resurrect the model stampede: a model is refused before any gzip scan,
   // in-pack or not. If this ever answers 200, a grid page of in-pack models re-inflates the
   // archive once per card *and* parses a mesh each time.
-  await check("an in-pack model is refused before any pull", async () => {
+  await check("an in-pack model is refused before any pull (FEATURES §5.4)", async () => {
     const p = await invoke("grid_page", {
       query: { tab: "models", search: "", status: "all", sort_by: "name", sort_asc: true,
                favorites_only: false, page: 0, page_size: 100000 },
@@ -1078,7 +1078,7 @@ try {
 
   // An in-pack asset exists but its bytes are in the archive. 503 not_local is the contract;
   // 404 would tell the client an asset it can see in the grid does not exist.
-  await check("an in-pack asset answers 503 not_local, not 404", async () => {
+  await check("a known in-pack asset never 404s: served or not_local (FEATURES §5.4)", async () => {
     const p = await invoke("grid_page", {
       query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
                favorites_only: false, page: 0, page_size: 100000 },
@@ -1146,7 +1146,7 @@ try {
 
   // Trash is the recoverable middle option: the row leaves every normal view, appears in exactly
   // one, and comes back intact. A trashed asset that no view can reach is a trapdoor.
-  await check("trash hides an asset, the Trash lists it, and restore brings it back", async () => {
+  await check("trash hides an asset, the Trash lists it, restore brings it back (UI-SPEC §10)", async () => {
     const live = () =>
       invoke("grid_page", {
         query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,

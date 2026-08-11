@@ -1,5 +1,7 @@
 # Lodestash — Design Guidelines
 
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
+
 A design system for **developers and designers** building Lodestash. **Dark-mode first**, themed with
 restrained **JRPG inventory/appraisal** flavor, and tuned to present **a lot of information that stays
 easy to digest**.

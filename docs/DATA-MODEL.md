@@ -1,5 +1,7 @@
 # Data Model, Search & the Mapping Library
 
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
+
 The storage backbone, the schema, hybrid search, the user-defined "mapping library," and dedup.
 
 ---

@@ -127,11 +127,14 @@ alternatives (Tauri+three.js, pure-Python/PySide6).
 | [`docs/TECH-STACK.md`](docs/TECH-STACK.md) | Implementation-ready stack — crates/libraries per module, AI runtime, sidecar, build/test/CI/packaging |
 | [`docs/MILESTONES.md`](docs/MILESTONES.md) | Release milestones (M0–M6 core path to v1) + **Extra Wins** (incl. ★ Unity Account Sync) |
 | [`docs/KANBAN.md`](docs/KANBAN.md) | Kanban board (Backlog → Ready → In Progress → Review → Done) tracking the build |
+| [`docs/KANBAN-SVELTE.md`](docs/KANBAN-SVELTE.md) | The live Svelte re-write board — lanes per status, every card code-verified |
+| [`docs/decisions/`](docs/decisions/) | **ADRs** — numbered records of pivotal cuts (egui→Tauri/Svelte, single-writer, zero-shot tagging, density default, in-pack cap scope, redo) with supersession links |
 | [`docs/HANDOFF.md`](docs/HANDOFF.md) | Working handoff — state of play, settled decisions, how to run the AI parts, environment traps (not a design spec) |
 | [`docs/HANDOFF-PROMPT.md`](docs/HANDOFF-PROMPT.md) | Paste-ready session-start prompt for the next agent — orientation, working agreements, invariants, traps |
 
 > Working in this repo? Read [`CLAUDE.md`](CLAUDE.md) — the docs are the source of truth, and code must
-> conform to them (update the doc in the same change if it diverges).
+> conform to them (update the doc in the same change if it diverges). After doc-touching work, run
+> `node scripts/check-docs.mjs` — it verifies every `file:line` citation and cross-link resolves.
 
 ---
 

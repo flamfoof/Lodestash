@@ -81,7 +81,7 @@
   --r-lg: 10px;
   --r-pill: 999px;
 
-  /* ---- Density: compact default; [data-density="cozy"] = +4px, [data-density="large"] = +8px (§4) ---- */
+/* ---- Density: compact default; [data-density="cozy"] = +4px, [data-density="large"] = +8px (§4) ---- */
   --row-h: 32px;
   --control-h: 30px;
 
@@ -95,12 +95,15 @@
   --inspector-w: 300px;
 }
 
-:root[data-density="cozy"] {
+/* The shell sets `data-density` on the `.frame` element (App.svelte), so the selectors key on
+   the frame — `:root[data-density]` would never match and the density stops would be dead.
+   The vars inherit down to the rows/controls that consume `--row-h` / `--control-h`. */
+.frame[data-density="cozy"] {
   --row-h: 36px;
   --control-h: 34px;
 }
 
-:root[data-density="large"] {
+.frame[data-density="large"] {
   --row-h: 40px;
   --control-h: 38px;
 }

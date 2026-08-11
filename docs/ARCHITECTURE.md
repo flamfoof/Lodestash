@@ -1,5 +1,7 @@
 # Architecture
 
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
+
 This document covers the system architecture, the component breakdown, the data flow, and the
 **language/stack decision** with the alternatives that were considered.
 

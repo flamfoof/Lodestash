@@ -58,7 +58,7 @@ It earns its place if Lodestash ever hosts or distributes assets, so the column 
    thread's own connection. `lodestash-desktop` currently holds a **read-only** connection and no
    persist thread — that is exactly why browsing was safe to build ahead of the `Engine` split. A
    `#[tauri::command]` must **not** write on the command thread. Either spawn the same short-lived
-   writer the egui app already spawns (`app.rs:2730-2913`) or wait for `Engine`. Two concurrent
+   writer the egui app already spawned (egui-era `app.rs`, deleted at B7) or wait for `Engine`. Two concurrent
    writers is how `database is locked` came back last time (`HANDOFF` §6).
 2. **The destructive path is fenced, and the fence must stay green.**
    `only_paths_under_known_roots_may_be_deleted` (now in `lodestash-app/src/thumbs.rs`) guards
@@ -117,7 +117,7 @@ LINKS chip, bulk bar, Inspector slices, staging tray, undo button). Verified: Ru
 
 **What is genuinely left (all engine-blocked — the B7 build, not slices):**
 - **Identify engine** — ✦ Identify all / per-asset Identify / appraise shimmer: the
-  tagger+embeddings+pump. The egui build already runs this (`app.rs` drain); porting it is the
+  tagger+embeddings+pump. The egui build already runs this (`app.rs` drain — egui era); porting it is the
   engine task.
 - **B2b ingest** — per-pack Extract, §5.2 import dialog, job tray, `+ Add source…` chooser,
   DropZone post-import flow.
@@ -462,7 +462,7 @@ built.
 - **Identify in place, from bytes (full parity, 2026-07-25).** The drain queues carry the in-pack
   locator (`pack_path`+`offset`+`size`+`ext`). **Images** decode straight from bytes
   (`read_payload_at` → `raster::decode_bytes`, `resolve_job_image`, no file written). **Metrics,
-  audio embedding, tags and 3D embedding** now go through `resolve_job_path` (in `app.rs`): on-disk →
+  audio embedding, tags and 3D embedding** now go through `resolve_job_path` (egui-era `app.rs`, deleted at B7): on-disk →
   workspace → **in-pack payload surgically pulled to an OS-temp scratch file** (a `tempfile::TempPath`
   guard deletes it on drop), so the path-based extractors (`metrics::extract`, `decode_audio_48k_mono`,
   `tag_preview`/`thumb::generate`, and the multiview renderer — geometry-only, so an untextured temp
@@ -768,7 +768,7 @@ now runs them after a hydrate, taking the same writer slot. If you add a third p
 catalog for writing, it must respect that slot too.
 
 To get the artifacts: run the app and use **Settings ▸ AI ▸ Download** (sources in the retired
-egui `crates/lodestash-ui/src/models.rs`, mirrored by `lodestash-ai`). They install to the OS data dir under
+egui `crates/lodestash-ui` (deleted at B7) hosted the model stores, mirrored by `lodestash-ai`). They install to the OS data dir under
 `Lodestash/models/{siglip,clap}/` and `Lodestash/runtime/onnxruntime.dll`; the same layout works if you
 copy them in by hand, which is worth doing to avoid re-downloading ~645 MB.
 
@@ -900,7 +900,7 @@ above) ships on `main` first and the port inherits it.
 **Extraction started (2026-08-01, `cdd5c40`).** `crates/lodestash-app` exists and holds `jobs` +
 `models` (433 LOC out of the retired `lodestash-ui`), aliased under their old `crate::jobs` / `crate::models`
 paths in `main.rs` so no call site changed. **Beachhead only** — `config`, `drains`, `persist`,
-`thumbs`, `grid` and the ~900 lines of domain types at `app.rs:1-903` have **not** moved, and the
+`thumbs`, `grid` and the ~900 lines of domain types at egui-era `app.rs:1-903` have **not** moved, and the
 four `app/*.rs` children still open with `use super::*` + `pub(super)`, which is the real work
 (move + visibility flip only, no cleanups; success = a byte-identical screenshot).
 

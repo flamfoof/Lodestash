@@ -1,5 +1,7 @@
 # UI Spec — Screens & Functionality
 
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
+
 The **screen-by-screen functional spec** for the Lodestash desktop app, derived from the interactive
 prototype (`design/Lodestash Prototype.dc.html`) and **normalized against the owning design docs**.
 Where the prototype and an owning doc disagreed, the resolution is stated inline as **⚖ Resolution**

@@ -1,5 +1,7 @@
 # Model Guide — which AI model should I pick?
 
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
+
 A plain-language companion to the identification settings. It answers one question: **"I want good
 tags on my assets — what do I turn on?"** Organised by the kind of asset (image, 3D, audio) and by
 whether you want to run **locally (free, private)** or through a **cloud/API model (costs money, but

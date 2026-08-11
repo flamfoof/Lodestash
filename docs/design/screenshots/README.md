@@ -1,5 +1,7 @@
 # Prototype screenshots — partial mirror
 
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
+
 Captures of the **Lodestash Prototype**, mirrored from the Claude Design project
 `f1fd4bce-f7bc-4b33-b099-d74b78f31998`, path `screenshots/`.
 

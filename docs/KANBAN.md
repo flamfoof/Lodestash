@@ -293,7 +293,7 @@ translation. The port removes the translation; the egui build stayed buildable a
       from the egui `LodestashApp`. Splitting ~144 fields on *does a background thread write it?*
       is judgement per field, not a mechanical move.
 - [~] **B2b remainder — `Engine` + pump.** `Arc<Mutex<Engine>>` and the 33 ms pump running the
-      drain order **verbatim** from `app.rs:9533` (that order encodes the `database is locked`
+      drain order **verbatim** from the egui-era `app.rs` (deleted at B7; that order encodes the `database is locked`
       fix). Blocked on B1. Until then the shell reads the catalog directly, which is sound because
       browsing is a read.
       **Ingest slices shipped 2026-08-07:** per-pack **Extract** (worker thread with byte progress
@@ -319,7 +319,7 @@ translation. The port removes the translation; the egui build stayed buildable a
       **Three actions, deliberately unequal in the UI:**
       1. **Remove from library** — soft-delete **and** an `Exclude { kind: Asset }` on the source's
          blacklist, so a re-scan does not resurrect it. Written to the **app config**, which is what
-         `crawler::crawl` is actually handed (`app.rs:812`) — `import_source.blacklist` is M5
+         `crawler::crawl` is actually handed (egui-era `app.rs:812`) — `import_source.blacklist` is M5
          storage nothing reads yet, so writing only the column would look right and change nothing.
       2. **Trash** — soft-delete only, listed by the Trash view (`GridQuery::trashed_only`),
          restored by `set_trashed(false)`.
@@ -472,7 +472,7 @@ translation. The port removes the translation; the egui build stayed buildable a
         `set_trait_style` (`:3538`). That buys the NEW TRAIT card, the ✦ **promote existing tags**
         strip (`is_trait = false` rows are already in the result), the teaching toggle, per-trait
         colour/glyph, and the chip contract the ⚑ cloud shares. egui reference: `vocabulary_screen`
-        (`app.rs:6331`), `apply_vocab_action` (`:6527`).
+        (egui-era `app.rs:6331`), `apply_vocab_action` (`:6527`).
         **The Mapping tab is not in this card** — taxonomy/category/alias/rule authoring has no
         public catalog surface (only `list_rules` `:3087` and `apply_mapping` `:3133`), so it is a
         core slice first. egui: `mapping_tab` (`:6587`).
@@ -488,10 +488,10 @@ translation. The port removes the translation; the egui build stayed buildable a
         The `unity` route exists in `routes.ts` and the sidebar row renders, but
         `App.svelte` has **no branch for it**, so it falls through to the "not built yet" stub.
         Four thin commands unlock most of the card: a `unity_packages` listing (wrap
-        `list_packages`, mirror `reload_unity_packages` `app.rs:5328`), `set_package_pinned`
+        `list_packages`, mirror `reload_unity_packages` (egui-era `app.rs:5328`), `set_package_pinned`
         (`catalog.rs:2045` — `PackageRow.pinned` already reaches the frontend and is **fetched and
         never rendered**), `list_package_entries` (`:2022`, browse a pack without unpacking), and a
-        `pack_stats` command for the §15 modal (`pack_stats` `app.rs:13500` is pure and unit-tested
+        `pack_stats` command for the §15 modal (egui-era `app.rs:13500` is pure and unit-tested
         at `:14825`, but over the egui `AssetEntry` — port it over `library::Row`). Sort reuses
         `UnitySort` (`types.rs:164`).
         *Stays blocked on B2b:* per-pack Extract, the tick-box batch queue, the §5.2 import dialog

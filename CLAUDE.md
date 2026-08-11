@@ -19,6 +19,17 @@ truth**. This file is the rule set for working in this repo.
    as you work it. Don't start work that isn't a card without adding one.
 5. **New dependencies require updating `docs/TECH-STACK.md`.** Don't introduce a crate/library that
    isn't listed without adding it there with a one-line rationale.
+6. **Conformance review before "done" (docs-vs-diff gate).** Run a review that checks the diff
+   against the governing doc — every requirement implemented, edge cases tested, nothing outside
+   scope, and **no claim in `docs/` contradicted by the change** (a contradiction means the doc
+   updates in the same commit). Invoke the `docs-conformance` skill for the playbook. Report gaps,
+   not style.
+7. **Decisions get recorded.** Pivotal cuts (a doc superseded, a default flipped, an invariant
+   relaxed) get a numbered ADR in `docs/decisions/` with status + supersedes links — commit
+   messages are not a decision log.
+8. **Docs freshness is checked.** Run `node scripts/check-docs.mjs` after doc-touching work (and
+   in CI when one exists): it flags dead `file:line` citations and cross-links. A dead citation is
+   drift — fix the doc or the code.
 
 ## Invariants (do not break without an explicit spec change)
 

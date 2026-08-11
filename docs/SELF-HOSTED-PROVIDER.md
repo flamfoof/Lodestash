@@ -1,5 +1,7 @@
 # Self-Hosted Lodestash Model Service — spec stub (SEPARATE / FUTURE)
 
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
+
 > **Status: not scheduled, not built.** This is a placeholder capturing intent so it isn't lost. It
 > is an **entirely separate spec** from the app's tagging pipeline. Nothing here blocks or changes the
 > shipped identification features. Do not implement from this doc without a dedicated design pass and

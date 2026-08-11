@@ -203,15 +203,11 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
 
 **Real bugs (UI violates the executable token file):**
 
-- [ ] **Undefined `--fs-2xs`** — `JobTray.svelte:232` uses `var(--fs-2xs, 11px)`; tokens.css has no
-      such token (scale starts at `--fs-xs`). The fallback hides the typo. Fix: `var(--fs-xs)`.
-- [ ] **Undefined 40px row stop** — `App.svelte:51` `ROW_H = {compact:32, cozy:36, large:40}`;
-      tokens.css defines only 32/36. Either add the 40px stop to tokens.css or drop large to 36.
-- [ ] **Dead density mechanism** — `:root[data-density="comfortable"]` (tokens.css:98-101) is never
-      set by any component (0 hits); `--control-h` stays 30px at every density; App.svelte:251
-      bypasses it with an inline `--row-h`. Wire the attribute or delete the block.
-- [ ] **Density default is cozy, not compact** — `nav.svelte.ts:17` defaults `"cozy"` (36px rows);
-      DG §4 says default **compact** (32px) with Comfortable as opt-in.
+- [x] **Density tokens live (2026-08-11).** The frame sets `data-density` (compact default, DG §4)
+      but `docs/design/tokens.css` keyed the stops on `:root[data-density]` — never matched, so
+      every density rendered 32px rows and `--control-h` stayed 30px. Selectors now key on
+      `.frame[data-density=…]` (the element that carries the attribute): compact 32/30, cozy
+      36/34, large 40/38. `--fs-2xs` typo and the inline `--row-h` bypass were already gone.
 - [x] **Status gems wired (2026-08-07)** — `Card.svelte` renders the sprite's
       `ls-status-{unidentified,identified,confirmed}` gems; confirmed now shows the gold ★
       (DG §6).

@@ -472,6 +472,8 @@ mod tests {
 
     /// The MCP↔REST 1:1 invariant (ENGINE-API §2): every agent operation exists on **both**
     /// planes. Adding a route without its tool — or a tool without its route — fails here.
+    /// ENGINE-API §2 "1:1 planes" — every AGENT_OPERATION exists as an MCP tool name. The REST
+    /// plane's names come from the same list (engine-api §2), so this one test pins both.
     #[test]
     fn tool_set_matches_the_rest_surface() {
         let dir = tempfile::tempdir().unwrap();

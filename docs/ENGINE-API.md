@@ -1,5 +1,7 @@
 # Engine API — the loopback HTTP/JSON contract
 
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
+
 The **deterministic integration plane**: the loopback HTTP/JSON API that the **Unity editor plugin**
 (and any scripting/CI) speaks. This is the load-bearing interface between the Lodestash core and the
 engine — specified **once, here** — so the GUI, the MCP server, and the Unity plugin are provably

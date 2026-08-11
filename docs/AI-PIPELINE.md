@@ -1,5 +1,7 @@
 # AI Tagging & Embeddings
 
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
+
 How assets are auto-identified (tags) and made semantically searchable (embeddings), with a clean
 **local ↔ online-API** switch. Embeddings power the "search by description" that makes retrieval fast,
 so this subsystem exists to serve search.

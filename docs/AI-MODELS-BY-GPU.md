@@ -1,5 +1,7 @@
 # Local AI Models by GPU Tier — Setup Guide
 
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
+
 A practical guide to **which local AI models to run for auto-tagging and "Search with AI,"** chosen by
 your GPU's **VRAM**. Everything here runs **offline** on your own PC (via ONNX Runtime or Ollama). If
 you'd rather not run anything locally, jump to [Cloud / API](#cloud--api-no-gpu-needed).
@@ -120,40 +122,70 @@ cloud vision model — **Claude** is the built-in default (others can be plugged
 ```bash
 pip install -U "huggingface_hub[cli]"      # the `huggingface-cli download` tool
 # Ollama (only needed for optional vision-LLM captions): install from https://ollama.com/download
+
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
 # ONNX Runtime is bundled in the app (Rust `ort`); GPU acceleration (CUDA / DirectML) is auto-selected.
+
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
 ```
 
 **Embedding model — image & 3D (pick one for your tier)**
 ```bash
 # 4 GB / CPU
+
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
 huggingface-cli download onnx-community/siglip2-base-patch16-256-ONNX  --local-dir models/siglip2-base
 # 6 GB
+
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
 huggingface-cli download onnx-community/siglip2-large-patch16-384-ONNX --local-dir models/siglip2-large
 # 8 GB+  (recommended)
+
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
 huggingface-cli download onnx-community/siglip2-so400m-patch16-512-ONNX --local-dir models/siglip2-so400m
 # 16 GB+ "g" (1B): no prebuilt ONNX — export from source if you want top quality:
+
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
 #   optimum-cli export onnx -m google/siglip2-giant-opt-patch16-384 models/siglip2-giant
+
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
 ```
 
 **Image tagger — discrete tags (pick one)**
 ```bash
 # light (4 GB / CPU)
+
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
 huggingface-cli download SmilingWolf/wd-swinv2-tagger-v3    --local-dir models/wd-swinv2
 # balanced
+
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
 huggingface-cli download SmilingWolf/wd-vit-large-tagger-v3 --local-dir models/wd-vit-large
 # best quality (8 GB+)
+
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
 huggingface-cli download SmilingWolf/wd-eva02-large-tagger-v3 --local-dir models/wd-eva02-large
 # (each repo ships model.onnx + selected_tags.csv label list)
+
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
 ```
 
 **Audio**
 ```bash
 # CLAP — audio embeddings + zero-shot description (ONNX build for runtime use)
+
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
 huggingface-cli download Xenova/clap-htsat-unfused --local-dir models/clap
 #   or export the original yourself: optimum-cli export onnx -m laion/clap-htsat-unfused models/clap
+
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
 # YAMNet / PANNs (sound-event tags) ship pre-converted to ONNX with Lodestash — no manual download.
 
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
+
 # Whisper (only if you tag speech/voice clips) — ggml weights for whisper.cpp:
+
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
 huggingface-cli download ggerganov/whisper.cpp ggml-base.bin     --local-dir models/whisper   # small/fast
 huggingface-cli download ggerganov/whisper.cpp ggml-large-v3.bin --local-dir models/whisper   # 8 GB+
 ```

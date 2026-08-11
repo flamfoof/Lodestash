@@ -1,5 +1,7 @@
 # Ingestion, Formats, Viewing & Playback
 
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
+
 How assets get into the catalog, and how they are viewed/played once there.
 
 Guiding principle: **prefer raw source files; deep-parse Unity serialized formats only when there is

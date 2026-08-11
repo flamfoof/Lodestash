@@ -1,5 +1,7 @@
 # Identification & Search
 
+> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
+
 How Lodestash turns raw assets into richly, *consistently* described records, and the **three ways to
 peruse them** — by tags, by plain language, or via an AI/MCP agent. This is the engine the whole tool
 is built around; it ties together [`AI-PIPELINE.md`](AI-PIPELINE.md) (models),
