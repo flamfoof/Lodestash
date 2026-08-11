@@ -132,8 +132,7 @@ pub struct Jobs {
 
 impl Jobs {
     /// Register a job in `state`. Side-effecting work passes `AwaitingApproval`.
-    pub fn create(&self, kind: &str, summary: String, state: JobState) -> Arc<Job> {
-        let job = Arc::new(Job {
+    pub fn create(&self, kind: &str, summary: String, state: JobState) -> Arc<Job> {        let job = Arc::new(Job {
             id: format!("{}_{}", kind, uuid::Uuid::new_v4().simple()),
             kind: kind.to_string(),
             summary,

@@ -32,6 +32,7 @@
     onrestore,
     onremove,
     ondelete,
+    onimport,
   }: {
     assetId: number | null;
     /** Carried by the grid row, so the star reflects the same state the card draws. */
@@ -46,6 +47,8 @@
     onremove: () => void;
     /** Opens the confirm dialog. This panel never deletes anything directly. */
     ondelete: () => void;
+    /** `⇢ Add to project` (FEATURES §7.2) — queue into the open Unity project. */
+    onimport: () => void;
   } = $props();
 
   let detail = $state<AssetDetail | null>(null);
@@ -410,6 +413,9 @@
         <button onclick={onrestore} data-testid="action-restore">Restore</button>
       {:else}
         <button onclick={ontrash} data-testid="action-trash">Move to Trash</button>
+        <button onclick={onimport} data-testid="action-import" title="Queue this asset into the open Unity project (ENGINE-API §5.2)">
+          ⇢ Add to project
+        </button>
         <button onclick={onremove} data-testid="action-remove" title="Hides it and stops future scans finding it. The file stays on disk.">
           Remove from library
         </button>

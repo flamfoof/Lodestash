@@ -6,10 +6,13 @@
     ids,
     onunstage,
     onclear,
+    onimport,
   }: {
     /** The staged asset ids, in order (App owns the state; this component just draws it). */
     ids: number[];
     onunstage: (id: number) => void;
+    /** `⇢ Add all N to project` (FEATURES §7.2) — queue the whole tray. */
+    onimport: (ids: number[]) => void;
     onclear: () => void;
   } = $props();
 
@@ -102,6 +105,9 @@
         </span>
       {/each}
     </div>
+    <button class="go" data-testid="tray-import" onclick={() => onimport(ids)} disabled={ids.length === 0}>
+      ⇢ Add all {ids.length} to project
+    </button>
     <button class="clear" data-testid="staged-clear" onclick={onclear}>Clear all</button>
     <span class="spacer"></span>
     <button

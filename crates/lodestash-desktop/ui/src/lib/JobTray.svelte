@@ -4,11 +4,19 @@
    * extraction (with byte progress + per-job cancel), appraise kicks (spinner), imports.
    * Active rows keep the tray open; the session ring of finished jobs stays under a toggle.
    */
-  import { jobs, cancelJob, onChanged, type JobsView } from "./api";
+  import { jobs, cancelJob, engineApprovals, engineApprove, engineDeny, onChanged, type JobsView } from "./api";
 
   let view = $state<JobsView>({ active: [], recent: [] });
+  // ENGINE-API §4: the engine's jobs parked on the human approval gate (imports/exports).
+  let approvals = $state<Record<string, unknown>[]>([]);
   let open = $state(false);
   let error = $state<string | null>(null);
+
+  function refreshApprovals() {
+    engineApprovals()
+      .then((a) => (approvals = a))
+      .catch(() => {});
+  }
 
   // The writer pushes `ls:changed` events when the tray changes (pump events, B2b) — no
   // polling. The initial fetch covers whatever happened before this component mounted.
@@ -16,6 +24,7 @@
     jobs()
       .then((jv) => (view = jv))
       .catch((e) => (error = String(e)));
+    refreshApprovals();
     const off = onChanged("jobs", async () => {
       try {
         view = await jobs();
@@ -23,9 +32,27 @@
       } catch (e) {
         error = String(e);
       }
+      refreshApprovals();
     });
     return off;
   });
+
+  async function approve(jobId: unknown) {
+    try {
+      await engineApprove(String(jobId));
+      refreshApprovals();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+  async function deny(jobId: unknown) {
+    try {
+      await engineDeny(String(jobId));
+      refreshApprovals();
+    } catch (e) {
+      error = String(e);
+    }
+  }
 
   async function cancel(jobId: number) {
     try {
@@ -77,8 +104,7 @@
             <span class="label">{j.label}</span>
             {#if j.progress}
               <span class="bar" aria-hidden="true"><i style="width: {pct(j.progress)}%"></i></span>
-              <span class="num">{pct(j.progress)}%</span>
-            {:else}
+              <span class="num">{pct(j.progress)}%</span>            {:else}
               <span class="spin" aria-hidden="true"></span>
             {/if}
             {#if j.cancellable}
@@ -119,6 +145,23 @@
           <li class="none">Nothing finished this session yet.</li>
         {/if}
       </ul>
+    {/if}
+
+    {#if approvals.length > 0}
+      <div class="approvals" data-testid="engine-approvals">
+        <header class="sub">
+          <span class="label">Awaiting your approval</span>
+          <span class="num">{approvals.length}</span>
+        </header>
+        {#each approvals as a (String(a.id))}
+          <div class="job approval">
+            <span class="kind" aria-hidden="true">⇢</span>
+            <span class="label">{String(a.summary ?? a.kind)}</span>
+            <button class="mini ok" onclick={() => approve(a.id)}>Approve</button>
+            <button class="mini cancel" onclick={() => deny(a.id)}>Deny</button>
+          </div>
+        {/each}
+      </div>
     {/if}
   </aside>
 {/if}

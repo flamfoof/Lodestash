@@ -28,6 +28,7 @@ import JobTray from "./lib/JobTray.svelte";
     identifyAsset,
     setFavorite,
     setTrashed,
+    engineImport,
     removeFromLibrary,
     deleteFromDisk,
     getWebPrefs,
@@ -284,6 +285,23 @@ import JobTray from "./lib/JobTray.svelte";
       });
     } else if (action === "trash") {
       confirmTrash(() => write(() => setTrashed([id], true), () => "Moved to Trash"));
+    } else if (action === "import") {
+      importToProject([id]);
+    }
+  }
+
+  /** `⇢ Add to project` (FEATURES §7.2): queue an engine import into the open Unity project. */
+  async function importToProject(ids: number[]) {
+    if (ids.length === 0) return;
+    try {
+      const r = await engineImport(ids);
+      if (r.kind === "AwaitingApproval") {
+        push(`Import queued — approve it in the job tray`, "warn");
+      } else {
+        push(`Already in the project (${r.detail.ids.length} assets)`, "info");
+      }
+    } catch (e) {
+      push(String(e), "err");
     }
   }
 </script>
@@ -357,6 +375,7 @@ import JobTray from "./lib/JobTray.svelte";
             write(() => setTrashed([view.selected!], true), () => "Moved to Trash").then(afterRemoval),
           )
         }
+        onimport={() => view.selected !== null && importToProject([view.selected])}
         onrestore={() =>
           write(() => setTrashed([view.selected!], false), () => "Restored from Trash").then(afterRemoval)
         }
@@ -368,7 +387,12 @@ import JobTray from "./lib/JobTray.svelte";
     {/if}
   </div>
 
-  <StagingTray ids={stagedIds} onunstage={unstageOne} onclear={clearTray} />
+  <StagingTray
+    ids={stagedIds}
+    onunstage={unstageOne}
+    onclear={clearTray}
+    onimport={(ids) => importToProject(ids)}
+  />
   <JobTray />
 
   {#if confirming && selectedDetail}

@@ -839,6 +839,83 @@ struct EngineBridge {
     allowed: Option<usize>,
 }
 
+/// What `engine_import` decided (ENGINE-API §5.2) — the UI renders each honestly.
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", content = "detail")]
+enum EngineImportOutcome {
+    /// Parked on the human approval gate — the job tray shows Approve / Deny.
+    AwaitingApproval { job: serde_json::Value },
+    /// The dup-guard (§5.4) left nothing new.
+    AlreadyImported { ids: Vec<i64> },
+}
+
+/// `⇢ Add to project` (FEATURES §7.2 / ENGINE-API §5.2) — queue an import into the **open**
+/// Unity project through the embedded engine, so the approval gate + the plugin queue are one
+/// surface. No registered editor errors honestly (the fallback is export-to-a-folder).
+#[tauri::command]
+fn engine_import(
+    state: tauri::State<'_, AppState>,
+    asset_ids: Vec<i64>,
+) -> Result<EngineImportOutcome, String> {
+    let engine = state
+        .engine
+        .as_ref()
+        .ok_or_else(|| "the engine bridge isn't running yet — no catalog on disk".to_string())?;
+    match engine.request_import(lodestash_api::ImportRequest {
+        project_id: None,
+        asset_ids,
+        dest_subfolder: None,
+        with_dependencies: true,
+    }) {
+        Ok(lodestash_api::ImportKickoff::Awaiting(job)) => Ok(
+            EngineImportOutcome::AwaitingApproval { job: job.to_json() },
+        ),
+        Ok(lodestash_api::ImportKickoff::AllAlreadyImported(ids)) => {
+            Ok(EngineImportOutcome::AlreadyImported { ids })
+        }
+        Err(lodestash_api::ImportError::NoProject) => Err(
+            "no Unity project registered — open Lodestash in Unity (Settings → Unity Editors), or export to a folder instead".into(),
+        ),
+        Err(lodestash_api::ImportError::Empty) => Err("nothing to import".into()),
+    }
+}
+
+/// Approve an engine job on the approval gate (ENGINE-API §4) — the import then goes to the
+/// Unity plugin's queue.
+#[tauri::command]
+fn engine_approve(state: tauri::State<'_, AppState>, job_id: String) -> bool {
+    match state.engine.as_ref() {
+        Some(engine) => {
+            engine.approve_job(&job_id);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Deny (reject) a job on the approval gate — the pending request is dropped.
+#[tauri::command]
+fn engine_deny(state: tauri::State<'_, AppState>, job_id: String) -> bool {
+    match state.engine.as_ref() {
+        Some(engine) => {
+            engine.deny_job(&job_id);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The engine jobs currently waiting on human approval (ENGINE-API §4) — the job tray's
+/// "agent imports" section.
+#[tauri::command]
+fn engine_approvals(state: tauri::State<'_, AppState>) -> Vec<serde_json::Value> {
+    let Some(engine) = state.engine.as_ref() else {
+        return Vec::new();
+    };
+    let jobs = engine.jobs.awaiting_approval();
+    jobs.iter().map(|j| j.to_json()).collect()
+}
+
 /// Per-pack Extract (B2b slice) — unpack the archive into the workspace and reconcile its
 /// payloads into the catalog, on the persist thread like every write.
 #[tauri::command]
@@ -1302,6 +1379,10 @@ pub fn run() {
             pump_active,
             pump_progress,
             engine_bridge,
+            engine_import,
+            engine_approve,
+            engine_deny,
+            engine_approvals,
             extract_package,
             jobs,
             cancel_job,

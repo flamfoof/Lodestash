@@ -13,7 +13,7 @@
   function closeMenu() {
     menu = null;
   }
-  function menuAction(action: "favorite" | "identify" | "trash") {
+  function menuAction(action: "favorite" | "identify" | "import" | "trash") {
     const m = menu;
     if (!m) return;
     const favorite = result?.items.find((i) => i.asset_id === m.id)?.favorite ?? false;
@@ -354,6 +354,7 @@
         </button>
         <button role="menuitem" onclick={() => menuAction("favorite")}>Toggle Favorite</button>
         <button role="menuitem" onclick={() => menuAction("identify")}>Identify now</button>
+        <button role="menuitem" onclick={() => menuAction("import")}>⇢ Add to project</button>
         <button role="menuitem" class="danger" onclick={() => menuAction("trash")}>
           Move to Trash
         </button>

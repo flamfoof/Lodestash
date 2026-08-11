@@ -315,6 +315,17 @@ export type EngineBridge = {
   allowed: number | null;
 };
 export const engineBridge = () => invoke<EngineBridge>("engine_bridge");
+
+/** `⇢ Add to project` — queue an engine import into the open Unity project (§5.2). */
+export const engineImport = (assetIds: number[]) =>
+  invoke<
+    | { kind: "AwaitingApproval"; detail: { job: Record<string, unknown> } }
+    | { kind: "AlreadyImported"; detail: { ids: number[] } }
+  >("engine_import", { assetIds });
+export const engineApprove = (jobId: string) => invoke<boolean>("engine_approve", { jobId });
+export const engineDeny = (jobId: string) => invoke<boolean>("engine_deny", { jobId });
+/** Jobs parked on the human approval gate (ENGINE-API §4) — the tray's Approve/Deny section. */
+export const engineApprovals = () => invoke<Record<string, unknown>[]>("engine_approvals");
 /** Per-pack Extract (B2b slice) — unpack into the workspace + reconcile the payloads. */
 export const extractPackage = (packageId: number) =>
   invoke<WriteResult>("extract_package", { packageId });
