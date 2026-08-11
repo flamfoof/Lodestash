@@ -12,12 +12,55 @@ pub mod routes;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use lodestash_core::catalog::{
     AssetSummaryRow, Catalog, ImportOutcome, ImportSpec, PackageListing, ProjectRow,
 };
 use lodestash_core::vector::{BruteForceIndex, VectorIndex};
+
+/// ENGINE-API §2 `list_tags` row — `(namespace, value, asset count)`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TagRow {
+    pub namespace: String,
+    pub value: String,
+    pub count: i64,
+}
+
+impl From<(String, String, i64)> for TagRow {
+    fn from((namespace, value, count): (String, String, i64)) -> Self {
+        Self { namespace, value, count }
+    }
+}
+
+/// ENGINE-API §2 `list_collections` row — the core row plus the staging flag, so a client can
+/// render the active project's staging tray apart from the user's named collections.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CollectionRowApi {
+    pub id: i64,
+    pub name: String,
+    pub is_staging: bool,
+    pub asset_count: usize,
+}
+
+impl From<lodestash_core::catalog::CollectionRow> for CollectionRowApi {
+    fn from(r: lodestash_core::catalog::CollectionRow) -> Self {
+        Self {
+            id: r.id,
+            name: r.name,
+            is_staging: false,
+            asset_count: r.asset_count as usize,
+        }
+    }
+}
+
+/// ENGINE-API §2 `suggest_tags` row — a tag with its AI confidence (None = hand-added).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TagProposal {
+    pub namespace: String,
+    pub value: String,
+    pub confidence: Option<f64>,
+}
 
 pub use handshake::{write_handshake, Handshake};
 pub use routes::{package_json, project_json, router, summary_json};
@@ -40,6 +83,16 @@ pub const AGENT_OPERATIONS: &[(&str, &str)] = &[
     ("export_asset", "POST /v1/export"),
     ("get_job_status", "GET /v1/jobs/{id}"),
     ("cancel_job", "POST /v1/jobs/{id}/cancel"),
+    ("list_tags", "GET /v1/tags"),
+    ("add_tag", "POST /v1/assets/{id}/tags"),
+    ("list_collections", "GET /v1/collections"),
+    ("apply_mapping", "POST /v1/mapping/apply"),
+    ("identify_asset", "POST /v1/identify"),
+    ("suggest_tags", "GET /v1/assets/{id}/suggest-tags"),
+    ("unpack_package", "POST /v1/packages/unpack"),
+    ("stage_asset", "POST /v1/stage"),
+    ("list_staged", "GET /v1/stage"),
+    ("import_staged", "POST /v1/stage/import"),
 ];
 
 /// Resolves an asset's source file to a cached preview PNG, generating it on a miss.
@@ -49,6 +102,33 @@ pub type PreviewFn = Box<dyn Fn(&Path) -> Option<PathBuf> + Send + Sync>;
 /// `(model_id, vector)` pairs — SigLIP for visuals, CLAP for audio. Supplied by the caller so
 /// this crate stays model-free; empty (or absent) means semantic search is unavailable.
 pub type QueryEmbedFn = Box<dyn Fn(&str) -> Vec<(String, Vec<f32>)> + Send + Sync>;
+
+/// The catalog mutations the agent planes may request (ENGINE-API §2 "mutating" rows). The
+/// desktop maps each variant to its single-writer `Op` — this crate never writes the catalog
+/// itself (ADR-0002), it only forwards the request and reports how many rows changed.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum AgentWrite {
+    AddTag {
+        asset_id: i64,
+        namespace: String,
+        value: String,
+    },
+    RemoveTag {
+        asset_id: i64,
+        namespace: String,
+        value: String,
+    },
+    ApplyMapping { taxonomy_id: i64 },
+    /// Flag + appraise an explicit set (blocking: the writer runs one bounded pass).
+    Identify { asset_ids: Vec<i64> },
+    /// Extract one pack into the workspace (blocking: the whole M14 flow completes first).
+    UnpackPackage { package_id: i64 },
+    StageAsset { asset_id: i64 },
+    UnstageAsset { asset_id: i64 },
+}
+
+/// The desktop's write bridge — [`AgentWrite`] → writer `Op` → changed rows.
+pub type AgentWriteFn = Box<dyn Fn(AgentWrite) -> Result<usize, String> + Send + Sync>;
 
 /// Body of `import_to_project` (ENGINE-API §5.2). `project_id` omitted ⇒ the active editor.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -163,6 +243,9 @@ pub struct ServerState {
     /// Called when a job starts waiting on the user. The desktop app repaints on it — without
     /// this the approval prompt only appears the next time the window happens to redraw.
     wake: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// The desktop's single-writer bridge (ADR-0002): `None` until `set_write` is called at
+    /// startup. Mutating agent ops error honestly when it is missing.
+    write: Mutex<Option<Arc<AgentWriteFn>>>,
 }
 
 impl ServerState {
@@ -183,6 +266,7 @@ impl ServerState {
             pending_imports: Mutex::new(std::collections::HashMap::new()),
             import_queue: Mutex::new(Vec::new()),
             wake: Mutex::new(None),
+            write: Mutex::new(None),
         })
     }
 
@@ -363,6 +447,160 @@ impl ServerState {
     /// Registered editors, active first (ENGINE-API §5.1 `list_projects`).
     pub fn list_projects(&self) -> lodestash_core::error::Result<Vec<ProjectRow>> {
         self.catalog.lock().unwrap().list_projects()
+    }
+
+    /// The desktop's single-writer bridge. Called once at startup, before any mutating op is
+    /// served; the API errors honestly until then (a headless server without the desktop is
+    /// read-only, which is the correct default).
+    pub fn set_write(&self, f: AgentWriteFn) {
+        *self.write.lock().unwrap() = Some(Arc::new(f));
+    }
+
+    fn write(&self, w: AgentWrite) -> Result<usize, String> {
+        self.write
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|f| f(w))
+            .unwrap_or_else(|| Err("the engine has no writer bridge — read-only mode".into()))
+    }
+
+    /// ENGINE-API §2 `list_tags` — the tag vocabulary with usage counts, most-used first.
+    pub fn list_tags(&self, prefix: &str, limit: usize) -> lodestash_core::error::Result<Vec<TagRow>> {
+        let cat = self.catalog.lock().unwrap();
+        let all = cat.tag_usage(limit)?;
+        Ok(if prefix.is_empty() {
+            all.into_iter().map(Into::into).collect()
+        } else {
+            all.into_iter()
+                .filter(|(ns, v, _)| ns.starts_with(prefix) || v.starts_with(prefix))
+                .map(Into::into)
+                .collect()
+        })
+    }
+
+    /// ENGINE-API §2 `list_collections` — the named collections plus (per the doc) the active
+    /// project's staging tray, flagged so a client can render it apart.
+    pub fn list_collections(&self) -> lodestash_core::error::Result<Vec<CollectionRowApi>> {
+        let cat = self.catalog.lock().unwrap();
+        let mut rows: Vec<CollectionRowApi> = cat
+            .list_collections()?
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        if let Some(project_id) = cat.active_project_id()? {
+            if let Some(tray) = cat.staging_tray_id(project_id)? {
+                let count = cat.collection_members(tray)?.len();
+                rows.push(CollectionRowApi {
+                    id: tray,
+                    name: "Staging".into(),
+                    is_staging: true,
+                    asset_count: count,
+                });
+            }
+        }
+        Ok(rows)
+    }
+
+    /// ENGINE-API §2 `suggest_tags` — the asset's current tags with confidences. The zero-shot
+    /// tagger's output IS the suggestion; an un-tagged asset answers `[]` honestly.
+    pub fn suggest_tags(&self, asset_id: i64) -> lodestash_core::error::Result<Vec<TagProposal>> {
+        let cat = self.catalog.lock().unwrap();
+        Ok(cat
+            .tags_for_asset(asset_id)?
+            .into_iter()
+            .map(|t| TagProposal {
+                namespace: t.namespace,
+                value: t.value,
+                confidence: t.confidence,
+            })
+            .collect())
+    }
+
+    /// ENGINE-API §2 `add_tag` — one `(namespace, value)` on one asset, through the writer.
+    pub fn add_tag(&self, asset_id: i64, namespace: &str, value: &str) -> Result<usize, String> {
+        self.write(AgentWrite::AddTag {
+            asset_id,
+            namespace: namespace.to_string(),
+            value: value.to_string(),
+        })
+    }
+
+    /// ENGINE-API §2 `apply_mapping` — run the deterministic mapping engine over one taxonomy.
+    pub fn apply_mapping(&self, taxonomy_id: i64) -> Result<usize, String> {
+        self.write(AgentWrite::ApplyMapping { taxonomy_id })
+    }
+
+    /// ENGINE-API §2 `identify_asset` — long-running: parks a job and appraises the set on a
+    /// worker thread through the writer bridge. `get_job_status` reports progress/result.
+    pub fn identify_asset(&self, asset_ids: Vec<i64>) -> Result<Arc<jobs::Job>, String> {
+        if asset_ids.is_empty() {
+            return Err("asset_ids must not be empty".into());
+        }
+        let job = self
+            .jobs
+            .create("identify", format!("Identify {} assets", asset_ids.len()), jobs::JobState::Running);
+        let job2 = job.clone();
+        let write = self.write.lock().unwrap().clone();
+        std::thread::spawn(move || match write {
+            Some(f) => match f(AgentWrite::Identify { asset_ids }) {
+                Ok(n) => job2.finish(serde_json::json!({ "changed": n })),
+                Err(e) => job2.fail(e),
+            },
+            None => job2.fail("no writer bridge — read-only mode"),
+        });
+        Ok(job)
+    }
+
+    /// ENGINE-API §2 `unpack_package` — long-running: extracts one pack through the writer
+    /// bridge on a worker thread.
+    pub fn unpack_package(&self, package_id: i64) -> Result<Arc<jobs::Job>, String> {
+        let job = self.jobs.create("unpack", format!("Unpack package {package_id}"), jobs::JobState::Running);
+        let job2 = job.clone();
+        let write = self.write.lock().unwrap().clone();
+        std::thread::spawn(move || match write {
+            Some(f) => match f(AgentWrite::UnpackPackage { package_id }) {
+                Ok(n) => job2.finish(serde_json::json!({ "changed": n })),
+                Err(e) => job2.fail(e),
+            },
+            None => job2.fail("no writer bridge — read-only mode"),
+        });
+        Ok(job)
+    }
+
+    /// ENGINE-API §6 `stage_asset` / `unstage` — the active project's staging shortlist.
+    pub fn stage_asset(&self, asset_id: i64) -> Result<usize, String> {
+        self.write(AgentWrite::StageAsset { asset_id })
+    }
+
+    pub fn unstage_asset(&self, asset_id: i64) -> Result<usize, String> {
+        self.write(AgentWrite::UnstageAsset { asset_id })
+    }
+
+    /// ENGINE-API §6 `list_staged` — the active project's staging tray as asset summaries.
+    /// No active project → `[]` (there is nothing staged anywhere without an editor).
+    pub fn list_staged(&self) -> lodestash_core::error::Result<Vec<AssetSummaryRow>> {
+        let cat = self.catalog.lock().unwrap();
+        let Some(project_id) = cat.active_project_id()? else {
+            return Ok(Vec::new());
+        };
+        let Some(tray) = cat.staging_tray_id(project_id)? else {
+            return Ok(Vec::new());
+        };
+        let ids = cat.collection_members(tray)?;
+        cat.asset_summaries(&ids)
+    }
+
+    /// ENGINE-API §6 `import_staged` — queue the staged shortlist for import into the active
+    /// project (the same approval + queue path as `import_to_project`).
+    pub fn import_staged(&self) -> Result<ImportKickoff, ImportError> {
+        let ids = self.list_staged().map_err(|_| ImportError::Empty)?;
+        self.request_import(ImportRequest {
+            project_id: None,
+            asset_ids: ids.into_iter().map(|a| a.id).collect(),
+            dest_subfolder: None,
+            with_dependencies: true,
+        })
     }
 
     /// Queue an import into a Unity project (ENGINE-API §5.2 `import_to_project`). Resolves the

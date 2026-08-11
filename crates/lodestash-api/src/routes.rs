@@ -1,5 +1,6 @@
 //! The `/v1/` read routes and the auth guard (ENGINE-API §1, §2, §4).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -35,6 +36,15 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/export", post(export))
         .route("/v1/jobs/{id}", get(job_status))
         .route("/v1/jobs/{id}/cancel", post(cancel_job))
+        .route("/v1/tags", get(tags))
+        .route("/v1/assets/{id}/tags", post(add_tag))
+        .route("/v1/collections", get(collections))
+        .route("/v1/mapping/apply", post(apply_mapping))
+        .route("/v1/identify", post(identify_asset))
+        .route("/v1/assets/{id}/suggest-tags", get(suggest_tags))
+        .route("/v1/packages/unpack", post(unpack_package))
+        .route("/v1/stage", get(list_staged).post(stage_asset))
+        .route("/v1/stage/import", post(import_staged))
         .route("/v1/assets/{id}/file", get(file))
         // Order matters: `guard` is added last so it wraps outermost and runs **first** — an
         // unauthenticated caller is rejected before `gate` could reveal which tools exist.
@@ -67,6 +77,16 @@ fn tool_for(method: &Method, path: &str, query: Option<&str>) -> Option<&'static
         ("POST", "/v1/export") => "export_asset",
         ("GET", "/v1/jobs/{id}") => "get_job_status",
         ("POST", "/v1/jobs/{id}/cancel") => "cancel_job",
+        ("GET", "/v1/tags") => "list_tags",
+        ("POST", "/v1/assets/{id}/tags") => "add_tag",
+        ("GET", "/v1/collections") => "list_collections",
+        ("POST", "/v1/mapping/apply") => "apply_mapping",
+        ("POST", "/v1/identify") => "identify_asset",
+        ("GET", "/v1/assets/{id}/suggest-tags") => "suggest_tags",
+        ("POST", "/v1/packages/unpack") => "unpack_package",
+        ("POST", "/v1/stage") => "stage_asset",
+        ("GET", "/v1/stage") => "list_staged",
+        ("POST", "/v1/stage/import") => "import_staged",
         _ => return None,
     })
 }
@@ -292,6 +312,173 @@ async fn list_projects(State(state): State<Shared>) -> Response {
             Json(json!({ "projects": out })).into_response()
         }
         Err(e) => db_err(e),
+    }
+}
+
+/// ENGINE-API §2 `list_tags` — `GET /v1/tags?prefix=&limit=` (read-only).
+async fn tags(State(state): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let prefix = q.get("prefix").map(String::as_str).unwrap_or("");
+    let limit = q
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(500);
+    match state.list_tags(prefix, limit) {
+        Ok(rows) => Json(json!({ "tags": rows })).into_response(),
+        Err(e) => db_err(e),
+    }
+}
+
+/// ENGINE-API §2 `add_tag` — `POST /v1/assets/{id}/tags` (mutating, through the writer).
+async fn add_tag(
+    State(state): State<Shared>,
+    Path(id): Path<i64>,
+    Json(body): Json<TagBody>,
+) -> Response {
+    match state.add_tag(id, &body.namespace, &body.value) {
+        Ok(changed) => Json(json!({ "changed": changed })).into_response(),
+        Err(e) => err(
+            StatusCode::BAD_REQUEST,
+            "write_failed",
+            "The tag write failed.",
+            &e,
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct TagBody {
+    #[serde(default = "default_ns")]
+    namespace: String,
+    value: String,
+}
+fn default_ns() -> String {
+    "free".into()
+}
+
+/// ENGINE-API §2 `list_collections` — `GET /v1/collections` (incl. the staging tray).
+async fn collections(State(state): State<Shared>) -> Response {
+    match state.list_collections() {
+        Ok(rows) => Json(json!({ "collections": rows })).into_response(),
+        Err(e) => db_err(e),
+    }
+}
+
+/// ENGINE-API §2 `apply_mapping` — `POST /v1/mapping/apply` (mutating).
+async fn apply_mapping(
+    State(state): State<Shared>,
+    Json(body): Json<HashMap<String, i64>>,
+) -> Response {
+    let Some(taxonomy_id) = body.get("taxonomy_id").copied() else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "taxonomy_id is required.",
+            "",
+        );
+    };
+    match state.apply_mapping(taxonomy_id) {
+        Ok(changed) => Json(json!({ "changed": changed })).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, "write_failed", "The mapping run failed.", &e),
+    }
+}
+
+/// ENGINE-API §2 `identify_asset` — `POST /v1/identify` (long-running → `202` job).
+async fn identify_asset(
+    State(state): State<Shared>,
+    Json(body): Json<HashMap<String, Vec<i64>>>,
+) -> Response {
+    let Some(asset_ids) = body.get("asset_ids") else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "asset_ids is required.",
+            "",
+        );
+    };
+    match state.identify_asset(asset_ids.clone()) {
+        Ok(job) => (StatusCode::ACCEPTED, Json(job.to_json())).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, "invalid_request", "Identify refused.", &e),
+    }
+}
+
+/// ENGINE-API §2 `suggest_tags` — `GET /v1/assets/{id}/suggest-tags` (read-only).
+async fn suggest_tags(State(state): State<Shared>, Path(id): Path<i64>) -> Response {
+    match state.suggest_tags(id) {
+        Ok(tags) => Json(json!({ "tags": tags })).into_response(),
+        Err(e) => db_err(e),
+    }
+}
+
+/// ENGINE-API §2 `unpack_package` — `POST /v1/packages/unpack` (long-running → `202` job).
+async fn unpack_package(
+    State(state): State<Shared>,
+    Json(body): Json<HashMap<String, i64>>,
+) -> Response {
+    let Some(package_id) = body.get("package_id").copied() else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "package_id is required.",
+            "",
+        );
+    };
+    match state.unpack_package(package_id) {
+        Ok(job) => (StatusCode::ACCEPTED, Json(job.to_json())).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, "invalid_request", "Unpack refused.", &e),
+    }
+}
+
+/// ENGINE-API §6 — `GET /v1/stage` (the active project's shortlist).
+async fn list_staged(State(state): State<Shared>) -> Response {
+    match state.list_staged() {
+        Ok(rows) => {
+            let out: Vec<Value> = rows.iter().map(summary_json).collect();
+            Json(json!({ "assets": out })).into_response()
+        }
+        Err(e) => db_err(e),
+    }
+}
+
+/// ENGINE-API §6 — `POST /v1/stage` `{asset_id}`.
+async fn stage_asset(
+    State(state): State<Shared>,
+    Json(body): Json<HashMap<String, i64>>,
+) -> Response {
+    let Some(asset_id) = body.get("asset_id").copied() else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "asset_id is required.",
+            "",
+        );
+    };
+    match state.stage_asset(asset_id) {
+        Ok(changed) => Json(json!({ "changed": changed })).into_response(),
+        Err(e) => err(StatusCode::CONFLICT, "stage_failed", "Staging refused.", &e),
+    }
+}
+
+/// ENGINE-API §6 — `POST /v1/stage/import` (same approval + queue as import_to_project).
+async fn import_staged(State(state): State<Shared>) -> Response {
+    match state.import_staged() {
+        Ok(crate::ImportKickoff::Awaiting(job)) => {
+            (StatusCode::ACCEPTED, Json(job.to_json())).into_response()
+        }
+        Ok(crate::ImportKickoff::AllAlreadyImported(ids)) => {
+            Json(json!({ "imported_existing": ids, "job_id": null })).into_response()
+        }
+        Err(crate::ImportError::Empty) => err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "The staging tray is empty.",
+            "",
+        ),
+        Err(crate::ImportError::NoProject) => err(
+            StatusCode::CONFLICT,
+            "project_not_registered",
+            "No Unity project is registered.",
+            "Open the Lodestash panel in Unity, or export to a folder instead.",
+        ),
     }
 }
 

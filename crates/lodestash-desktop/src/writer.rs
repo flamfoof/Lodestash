@@ -145,6 +145,14 @@ pub enum Op {
     /// Manual appraise kick for one asset (per-card ✦, KANBAN B11b): flags the asset for
     /// re-embed + re-tag, then runs one bounded pass so it actually happens now.
     IdentifyOne { asset_id: i64 },
+    /// Targeted appraise kick for an explicit set (ENGINE-API §2 `identify_asset`): flags
+    /// each, then ONE bounded pass so a bulk agent call is a single pass, not N.
+    IdentifyIds { asset_ids: Vec<i64> },
+    /// Stage/unstage one asset in the active project's staging tray (ENGINE-API §6). The
+    /// writer resolves the tray (the active project may have none registered — an honest
+    /// error) so the engine planes never touch the catalog themselves (ADR-0002).
+    StageAsset { asset_id: i64 },
+    UnstageAsset { asset_id: i64 },
     /// Per-pack Extract (B2b slice): unpack the archive into the workspace, then reconcile
     /// the payloads into the catalog like a crawl. Explicit and on-demand (UI-SPEC §11.6) —
     /// browsing never unpacks; `lodestash://file` answers 503 until this runs.
@@ -1071,6 +1079,62 @@ fn run(
             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
             jobs.finish(job.id, result.is_ok(), false, changed);
             result
+        }
+
+        Op::IdentifyIds { asset_ids } => {
+            // ENGINE-API §2 `identify_asset`: flag an explicit set, then ONE bounded pass so
+            // a bulk agent call is a single reconcile, not N kicks.
+            for id in &asset_ids {
+                catalog.mark_for_identify(*id).map_err(|e| e.to_string())?;
+            }
+            let job = jobs.start(format!("Identify {} assets", asset_ids.len()), "appraise", false);
+            let embedder = resolve_embedder();
+            let audio_embedder = resolve_audio_embedder();
+            if embedder.is_none() && audio_embedder.is_none() {
+                tracing::warn!("Identify {} assets: no local embedder models — flagged for a later pass", asset_ids.len());
+            }
+            let result = appraise_pass(
+                catalog,
+                embedder,
+                audio_embedder,
+                std::time::Duration::from_secs(20),
+                progress,
+            );
+            let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
+            jobs.finish(job.id, result.is_ok(), false, changed);
+            result
+        }
+
+        Op::StageAsset { asset_id } => {
+            // ENGINE-API §6: the active project's tray is the staging shortlist. No tray =
+            // no registered editor — an honest error, not a silent no-op.
+            let project_id = catalog
+                .active_project_id()
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "no active project registered — register one via the Connect wizard".to_string())?;
+            let tray = catalog
+                .staging_tray_id(project_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "the active project has no staging tray yet".to_string())?;
+            catalog
+                .collection_add_asset(tray, asset_id)
+                .map_err(|e| e.to_string())?;
+            Ok(WriteResult { changed: 1, ..Default::default() })
+        }
+
+        Op::UnstageAsset { asset_id } => {
+            let project_id = catalog
+                .active_project_id()
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "no active project registered".to_string())?;
+            let tray = catalog
+                .staging_tray_id(project_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "the active project has no staging tray yet".to_string())?;
+            catalog
+                .collection_remove_asset(tray, asset_id)
+                .map_err(|e| e.to_string())?;
+            Ok(WriteResult { changed: 1, ..Default::default() })
         }
 
         Op::ExtractPackage { package_id } => {

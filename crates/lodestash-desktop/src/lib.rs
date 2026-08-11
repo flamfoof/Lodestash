@@ -1014,6 +1014,35 @@ fn apply_allow_list(state: &lodestash_api::ServerState) -> Option<usize> {
     Some(enabled.len())
 }
 
+/// The agent planes' write bridge (ADR-0002): each [`lodestash_api::AgentWrite`] maps to the
+/// single-writer `Op` and blocks on its reply — the API crate never touches the catalog itself.
+fn engine_write_bridge(writer: Writer) -> lodestash_api::AgentWriteFn {
+    use lodestash_api::AgentWrite;
+    Box::new(move |w: AgentWrite| match w {
+        AgentWrite::AddTag { asset_id, namespace, value } => writer
+            .run(Op::BulkTag { asset_ids: vec![asset_id], namespace, value, on: true })
+            .map(|r| r.changed),
+        AgentWrite::RemoveTag { asset_id, namespace, value } => writer
+            .run(Op::BulkTag { asset_ids: vec![asset_id], namespace, value, on: false })
+            .map(|r| r.changed),
+        AgentWrite::ApplyMapping { taxonomy_id } => writer
+            .run(Op::ApplyMapping { taxonomy_id })
+            .map(|r| r.changed),
+        AgentWrite::Identify { asset_ids } => writer
+            .run(Op::IdentifyIds { asset_ids })
+            .map(|r| r.changed),
+        AgentWrite::UnpackPackage { package_id } => writer
+            .run(Op::ExtractPackage { package_id })
+            .map(|r| r.changed),
+        AgentWrite::StageAsset { asset_id } => writer
+            .run(Op::StageAsset { asset_id })
+            .map(|r| r.changed),
+        AgentWrite::UnstageAsset { asset_id } => writer
+            .run(Op::UnstageAsset { asset_id })
+            .map(|r| r.changed),
+    })
+}
+
 /// Build the shared engine `ServerState` (B12) — one read-only catalog connection, the allow-list
 /// applied, the per-session token minted. `None` when there is no catalog on disk yet.
 fn build_engine_state() -> Option<(
@@ -1163,6 +1192,11 @@ pub fn run() {
             let (engine_state, engine_port, engine_token, engine_allowed) =
                 match build_engine_state() {
                     Some((state, token, allowed)) => {
+                        // Wire the write bridge before serving: mutating agent ops (add_tag,
+                        // apply_mapping, identify, unpack, staging) go through the single writer.
+                        if let Some(w) = writer.clone() {
+                            state.set_write(engine_write_bridge(w));
+                        }
                         let port = lodestash_api::serve(state.clone())
                             .map(|h| h.port)
                             .map_err(|e| tracing::error!(%e, "engine API failed to bind"))

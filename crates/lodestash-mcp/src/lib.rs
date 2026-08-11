@@ -88,6 +88,48 @@ pub struct ImportArgs {
     pub with_dependencies: Option<bool>,
 }
 
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct TagsArgs {
+    /// Only tags whose namespace or value starts with this (optional).
+    pub prefix: Option<String>,
+    /// Maximum rows (default 500).
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct AddTagArgs {
+    /// The asset to tag.
+    pub asset_id: i64,
+    /// Namespace (default "free").
+    pub namespace: Option<String>,
+    /// The tag value, e.g. "rusty".
+    pub value: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct MappingArgs {
+    /// Taxonomy to run the deterministic mapping engine over.
+    pub taxonomy_id: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct IdentifyArgs {
+    /// Assets to flag + appraise.
+    pub asset_ids: Vec<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct UnpackArgs {
+    /// The pack to extract into the workspace.
+    pub package_id: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct StageArgs {
+    /// The asset to add to (or remove from) the active project's staging tray.
+    pub asset_id: i64,
+}
+
 #[tool_router(router = tool_router)]
 impl Lodestash {
     pub fn new(state: Arc<ServerState>) -> Self {
@@ -415,6 +457,176 @@ impl Lodestash {
             ));
         }
         Ok(CallToolResult::success(content))
+    }
+
+    /// ENGINE-API §2 `list_tags` — the tag vocabulary with usage counts.
+    #[tool(
+        name = "list_tags",
+        description = "List the tag vocabulary with asset counts, most-used first."
+    )]
+    pub async fn list_tags(
+        &self,
+        Parameters(args): Parameters<TagsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.gate("list_tags")?;
+        let rows = self
+            .state
+            .list_tags(&args.prefix.unwrap_or_default(), args.limit.unwrap_or(500))
+            .map_err(internal)?;
+        Ok(CallToolResult::success(vec![ContentBlock::json(rows)?]))
+    }
+
+    /// ENGINE-API §2 `add_tag` — one `(namespace, value)` on one asset (mutating).
+    #[tool(
+        name = "add_tag",
+        description = "Add a tag to an asset. Mutating — the catalog write goes through the app's single writer."
+    )]
+    pub async fn add_tag(
+        &self,
+        Parameters(args): Parameters<AddTagArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.gate("add_tag")?;
+        let ns = args.namespace.unwrap_or_else(|| "free".into());
+        let changed = self
+            .state
+            .add_tag(args.asset_id, &ns, &args.value)
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::json(
+            serde_json::json!({ "changed": changed }),
+        )?]))
+    }
+
+    /// ENGINE-API §2 `list_collections` — named collections + the active project's staging tray.
+    #[tool(
+        name = "list_collections",
+        description = "List the user's collections (and the active project's staging tray, flagged is_staging)."
+    )]
+    pub async fn list_collections(
+        &self,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.gate("list_collections")?;
+        let rows = self.state.list_collections().map_err(internal)?;
+        Ok(CallToolResult::success(vec![ContentBlock::json(rows)?]))
+    }
+
+    /// ENGINE-API §2 `apply_mapping` — run the deterministic mapping engine (mutating).
+    #[tool(
+        name = "apply_mapping",
+        description = "Run the deterministic mapping engine over one taxonomy, writing category assignments. Mutating."
+    )]
+    pub async fn apply_mapping(
+        &self,
+        Parameters(args): Parameters<MappingArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.gate("apply_mapping")?;
+        let changed = self
+            .state
+            .apply_mapping(args.taxonomy_id)
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::json(
+            serde_json::json!({ "changed": changed }),
+        )?]))
+    }
+
+    /// ENGINE-API §2 `identify_asset` — long-running appraise of an explicit set.
+    #[tool(
+        name = "identify_asset",
+        description = "Flag and appraise specific assets (embeddings, tags, promote). Long-running: returns a job id to poll with get_job_status."
+    )]
+    pub async fn identify_asset(
+        &self,
+        Parameters(args): Parameters<IdentifyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.gate("identify_asset")?;
+        let job = self.state.identify_asset(args.asset_ids).map_err(|e| ErrorData::invalid_params(e, None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::json(job.to_json())?]))
+    }
+
+    /// ENGINE-API §2 `suggest_tags` — the asset's tags with confidences (read-only).
+    #[tool(
+        name = "suggest_tags",
+        description = "Read the tags proposed for an asset, with AI confidences. Empty for an untagged asset."
+    )]
+    pub async fn suggest_tags(
+        &self,
+        Parameters(args): Parameters<AssetArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.gate("suggest_tags")?;
+        let rows = self.state.suggest_tags(args.id).map_err(internal)?;
+        Ok(CallToolResult::success(vec![ContentBlock::json(rows)?]))
+    }
+
+    /// ENGINE-API §2 `unpack_package` — extract one pack into the workspace (long-running).
+    #[tool(
+        name = "unpack_package",
+        description = "Extract a .unitypackage into the workspace so its assets become local files. Long-running: returns a job id."
+    )]
+    pub async fn unpack_package(
+        &self,
+        Parameters(args): Parameters<UnpackArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.gate("unpack_package")?;
+        let job = self.state.unpack_package(args.package_id).map_err(|e| ErrorData::invalid_params(e, None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::json(job.to_json())?]))
+    }
+
+    /// ENGINE-API §6 `stage_asset` — add one asset to the active project's staging shortlist.
+    #[tool(
+        name = "stage_asset",
+        description = "Add an asset to the active project's staging tray (per-project shortlist). Requires a registered editor."
+    )]
+    pub async fn stage_asset(
+        &self,
+        Parameters(args): Parameters<StageArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.gate("stage_asset")?;
+        let changed = self
+            .state
+            .stage_asset(args.asset_id)
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::json(
+            serde_json::json!({ "changed": changed }),
+        )?]))
+    }
+
+    /// ENGINE-API §6 `list_staged` — the active project's staging shortlist as summaries.
+    #[tool(
+        name = "list_staged",
+        description = "List the active project's staged assets (the shortlist before import)."
+    )]
+    pub async fn list_staged(&self) -> Result<CallToolResult, ErrorData> {
+        self.gate("list_staged")?;
+        let rows = self.state.list_staged().map_err(internal)?;
+        let json: Vec<_> = rows.iter().map(lodestash_api::summary_json).collect();
+        Ok(CallToolResult::success(vec![ContentBlock::json(json)?]))
+    }
+
+    /// ENGINE-API §6 `import_staged` — queue the staged shortlist for import (approval gate).
+    #[tool(
+        name = "import_staged",
+        description = "Queue every staged asset for import into the active project. Parks on the human approval gate; returns a job id."
+    )]
+    pub async fn import_staged(&self) -> Result<CallToolResult, ErrorData> {
+        self.gate("import_staged")?;
+        match self.state.import_staged() {
+            Ok(lodestash_api::ImportKickoff::Awaiting(job)) => {
+                Ok(CallToolResult::success(vec![ContentBlock::json(job.to_json())?]))
+            }
+            Ok(lodestash_api::ImportKickoff::AllAlreadyImported(ids)) => Ok(
+                CallToolResult::success(vec![ContentBlock::json(serde_json::json!({
+                    "imported_existing": ids,
+                    "job_id": null,
+                }))?]),
+            ),
+            Err(lodestash_api::ImportError::Empty) => Err(ErrorData::invalid_params(
+                "The staging tray is empty — stage_asset first.",
+                None,
+            )),
+            Err(lodestash_api::ImportError::NoProject) => Err(ErrorData::invalid_params(
+                "No Unity project is registered — open the Lodestash panel in Unity first.",
+                None,
+            )),
+        }
     }
 }
 

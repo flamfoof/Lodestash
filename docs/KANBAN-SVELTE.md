@@ -171,9 +171,15 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       — `lodestash-desktop --mcp` serves the stdio plane without a window (smoke-tested with a
       real initialize handshake).
       agent host pipes stdin to the running app). Settings' ENGINE BRIDGE shows the live port.
-- [ ] **10 doc'd agent ops absent on both planes.** `list_tags`, `add_tag`, `list_collections`,
-      `apply_mapping`, `identify_asset`, `suggest_tags`, `unpack_package`, staging group
-      (ENGINE-API §2).
+- [x] **10 doc'd agent ops live on both planes (2026-08-11, ENGINE-API §2).** `list_tags`,
+      `add_tag`, `list_collections` (incl. the active project's staging tray, flagged),
+      `apply_mapping`, `identify_asset` (job), `suggest_tags`, `unpack_package` (job), and the
+      staging group (`stage_asset` / `list_staged` / `import_staged`) — REST routes + MCP tools,
+      gated 1:1 by the parity test (23 ops). Mutations flow through the **write bridge**
+      (ADR-0002): `AgentWrite` → desktop `Op` (BulkTag/ApplyMapping/IdentifyIds/ExtractPackage/
+      StageAsset) → the single writer; `identify_asset`/`unpack_package` park API-side jobs that
+      poll via `get_job_status`. New writer ops: `IdentifyIds`, `StageAsset`, `UnstageAsset`;
+      new catalog accessors: `staging_tray_id`, `active_project_id`.
 - [x] **Hash/dedup wired for loose files (2026-08-08, B6).** `crawler::hash_file` called at
       crawl for browseable files ⇒ `content_hash` set ⇒ Duplicates groups real; **move/rename
       detection shipped 2026-08-08** (`reconcile_moves`: vanished path + same hash ⇒ rel_path

@@ -2910,8 +2910,7 @@ impl Catalog {
                 "SELECT id, name, project_path, unity_version, pipeline, is_active, last_seen_at
                    FROM project
                   ORDER BY is_active DESC, last_seen_at DESC, name",
-            )
-            .map_err(|e| CoreError::Catalog(format!("projects prepare: {e}")))?;
+            )            .map_err(|e| CoreError::Catalog(format!("projects prepare: {e}")))?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(ProjectRow {
@@ -2927,6 +2926,32 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("projects query: {e}")))?;
         rows.collect::<std::result::Result<_, _>>()
             .map_err(|e| CoreError::Catalog(format!("projects collect: {e}")))
+    }
+
+    /// A project's staging tray (`collection.is_staging`, one per project — created empty by
+    /// [`Self::register_project`]). `None` when the project has no tray (never registered, or
+    /// a pre-tray project). The staging ops (ENGINE-API §6) resolve through this.
+    pub fn staging_tray_id(&self, project_id: i64) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM collection WHERE is_staging = 1 AND project_id = ?1",
+                params![project_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| CoreError::Catalog(format!("staging tray lookup: {e}")))
+    }
+
+    /// The active project's id, if any (ENGINE-API §5.1 — `is_active` is a unique flag).
+    pub fn active_project_id(&self) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM project WHERE is_active = 1 LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| CoreError::Catalog(format!("active project lookup: {e}")))
     }
 
     /// Switch which registered Unity editor is active (ENGINE-API §5.1, UI-SPEC §16.1). The
@@ -6956,13 +6981,18 @@ mod tests {
             .expect("metrics drained");
         c.upsert_embedding(y, "m", "image", None, None, &[0.5, 0.5])
             .expect("embed y");
-        assert_eq!(c.promote_statuses().expect("promote").len(), 3);
+        assert_eq!(
+            c.promote_statuses().expect("promote").len(),
+            0,
+            "metrics-drained but untagged: the return is promoted ids only, and nothing promoted"
+        );
         assert_eq!(status_of(&c, "x.png"), "indexed");
         assert_eq!(
             status_of(&c, "y.png"),
             "indexed",
             "an embedding without tags is not identification"
         );
+        assert_eq!(status_of(&c, "z.png"), "indexed");
 
         // Tags on top of the embedding complete it.
         c.set_tags(
@@ -6983,11 +7013,12 @@ mod tests {
                 params![z],
             )
             .expect("confirm z");
-        // y's bytes changed: dirty embedding drops it back to indexed.
+        // y's bytes changed: dirty embedding drops it back to indexed. Demotions are not
+        // promotions — the return stays empty, the status is the signal.
         c.conn
             .execute("UPDATE asset SET embedding_dirty=1 WHERE id=?1", params![y])
             .expect("dirty y");
-        assert_eq!(c.promote_statuses().expect("demote").len(), 1);
+        assert_eq!(c.promote_statuses().expect("demote").len(), 0);
         assert_eq!(status_of(&c, "y.png"), "indexed");
         assert_eq!(status_of(&c, "z.png"), "confirmed");
         let _ = x;
