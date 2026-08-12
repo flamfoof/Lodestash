@@ -19,6 +19,9 @@
     previewCacheUsage,
     clearPreviewCache,
     setThumbKey,
+    modelsStatus,
+    modelDownload,
+    modelRemove,
     projects,
     setActiveProject,
     engineBridge,
@@ -246,6 +249,38 @@
       // keep the old numbers; the button re-enables
     } finally {
       cacheBusy = false;
+    }
+  }
+
+  // MODELS card (AI): install status per model + download/remove. Downloads report through the
+  // job tray; the ORT dll only loads at startup, so its row says so.
+  let models = $state<{ id: string; label: string; installed: boolean; size_mb: number }[]>([]);
+  let modelBusy = $state<string | null>(null);
+  $effect(() => {
+    modelsStatus()
+      .then((m) => (models = m))
+      .catch(() => {});
+  });
+  async function downloadModel(id: string) {
+    if (modelBusy) return;
+    modelBusy = id;
+    try {
+      await modelDownload(id);
+      await modelsStatus().then((m) => (models = m));
+    } catch (e) {
+      // the tray shows the failure detail
+    } finally {
+      modelBusy = null;
+    }
+  }
+  async function removeModels() {
+    if (modelBusy) return;
+    modelBusy = "remove";
+    try {
+      await modelRemove();
+      await modelsStatus().then((m) => (models = m));
+    } finally {
+      modelBusy = null;
     }
   }
   $effect(() => {
@@ -491,6 +526,56 @@
             data-testid="api-key"
           />
         </label>
+      </section>
+
+      <section class="card" data-testid="models-card">
+        <h2>AI MODELS</h2>
+        <p class="hint">
+          What the app runs locally for search + tagging (AI-PIPELINE §2). Downloads stream into
+          <span class="mono">Lodestash/models/</span> and report through the job tray. The ONNX
+          Runtime dll only loads at startup — after a fresh download, restart the app before
+          search uses it.
+        </p>
+        {#each models as m (m.id)}
+          <div class="model-row" data-testid="model-{m.id}">
+            <span class="model-label">
+              {m.label}
+              {#if m.installed}
+                <span class="badge ok">installed</span>
+              {/if}
+            </span>
+            <span class="num dim mono">{m.size_mb} MB</span>
+            {#if m.installed}
+              <button
+                class="ghost"
+                onclick={() => downloadModel(m.id)}
+                disabled={modelBusy !== null}
+                data-testid="model-redownload-{m.id}"
+              >
+                {modelBusy === m.id ? "Downloading…" : "Re-download"}
+              </button>
+            {:else}
+              <button
+                class="gold"
+                onclick={() => downloadModel(m.id)}
+                disabled={modelBusy !== null}
+                data-testid="model-download-{m.id}"
+              >
+                {modelBusy === m.id ? "Downloading…" : `Download ${m.size_mb} MB`}
+              </button>
+            {/if}
+          </div>
+        {/each}
+        {#if models.some((m) => m.installed)}
+          <button
+            class="danger ghost"
+            onclick={removeModels}
+            disabled={modelBusy !== null}
+            data-testid="models-remove"
+          >
+            Remove SigLIP + CLAP (re-download clean)
+          </button>
+        {/if}
       </section>
 
       <section class="card">
@@ -1216,5 +1301,27 @@
   }
   .msg.danger {
     color: var(--ls-danger);
+  }
+  .model-row {
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    gap: 12px;
+    align-items: center;
+    padding: 6px 0;
+    border-top: 1px solid var(--ls-border);
+    font-size: var(--fs-sm);
+  }
+  .model-label {
+    color: var(--ls-text);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .badge.ok {
+    border: 1px solid var(--ls-success);
+    color: var(--ls-success);
+    border-radius: 999px;
+    font-size: var(--fs-xs);
+    padding: 1px 8px;
   }
 </style>

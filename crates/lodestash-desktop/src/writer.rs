@@ -249,9 +249,9 @@ struct JobState {
 
 /// Extract byte progress, read by the tray without taking the registry lock.
 #[derive(Default)]
-struct JobProgress {
-    done: AtomicU64,
-    total: AtomicU64,
+pub struct JobProgress {
+    pub done: AtomicU64,
+    pub total: AtomicU64,
 }
 
 struct ActiveJob {
@@ -263,10 +263,10 @@ struct ActiveJob {
 }
 
 /// Handles a caller holds after `start`, without touching the registry lock again.
-struct JobHandles {
-    id: u64,
-    cancel: Arc<AtomicBool>,
-    progress: Option<Arc<JobProgress>>,
+pub struct JobHandles {
+    pub id: u64,
+    pub cancel: Arc<AtomicBool>,
+    pub progress: Option<Arc<JobProgress>>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -300,7 +300,8 @@ const RECENT_CAP: usize = 20;
 
 impl JobRegistry {
     /// Register an active job; returns the handles the worker uses for progress/cancel.
-    fn start(&self, label: String, kind: &str, cancellable: bool) -> JobHandles {
+    /// Public: model downloads (which never touch the catalog) register through this.
+    pub fn start(&self, label: String, kind: &str, cancellable: bool) -> JobHandles {
         let mut state = self.inner.lock().expect("job registry lock");
         let id = state.next_id;
         state.next_id += 1;
@@ -321,7 +322,8 @@ impl JobRegistry {
     }
 
     /// Move an active job to the session ring. `changed` is what the tray reports.
-    fn finish(&self, id: u64, ok: bool, cancelled: bool, changed: usize) {
+    /// Move an active job to the session ring. Public for the same reason as `start`.
+    pub fn finish(&self, id: u64, ok: bool, cancelled: bool, changed: usize) {
         let mut state = self.inner.lock().expect("job registry lock");
         let Some(pos) = state.active.iter().position(|j| j.id == id) else {
             return;
@@ -1624,4 +1626,5 @@ mod tests {
         );
     }
 }
+
 

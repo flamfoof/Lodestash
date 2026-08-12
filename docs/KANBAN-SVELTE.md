@@ -202,8 +202,13 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       honored; workspace cap/7-day retention not enforced.
 - [ ] **Non-content classification.** `detect::is_content` zero callers; `is_content`/`content_kind`
       never set.
-- [ ] **Model manager / cloud config.** Downloads + cloud API keys unreachable — no UI, no config
-      readers (cloud AI stays opt-in per invariant, but the opt-in surface is missing).
+- [x] **Model manager (2026-08-12).** Settings gained an AI MODELS card: SigLIP 2 (visual
+      search + tagging), CLAP (audio) and the ONNX Runtime dll — install status, Download /
+      Re-download / Remove buttons, progress through the job tray (`models_status` /
+      `model_download` / `model_remove` commands; the downloader in `lodestash-app::models`
+      was egui-era-only). The ORT dll loads at startup, so a fresh download needs a restart
+      (noted in the UI). Cloud API keys were already reachable via AI TAGGING — the remaining
+      opt-in surface gap is gone.
 
 ## 🟠 Visual conformance & doc drift (DESIGN-GUIDELINES audit)
 

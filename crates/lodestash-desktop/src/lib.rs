@@ -916,6 +916,96 @@ fn engine_approvals(state: tauri::State<'_, AppState>) -> Vec<serde_json::Value>
     jobs.iter().map(|j| j.to_json()).collect()
 }
 
+/// One row of the Settings MODELS section — installed vs not, per model.
+#[derive(serde::Serialize)]
+struct ModelStatus {
+    id: &'static str,
+    label: &'static str,
+    installed: bool,
+    size_mb: u32,
+}
+
+/// AI model install status (AI-PIPELINE §2 / AI-MODELS-BY-GPU): SigLIP 2 (visual search),
+/// CLAP (audio search) and the ONNX Runtime dll they load. The downloader is
+/// `lodestash_app::models` — this just reports what's on disk.
+#[tauri::command]
+fn models_status() -> Vec<ModelStatus> {
+    vec![
+        ModelStatus {
+            id: "siglip",
+            label: "SigLIP 2 — visual search + tagging",
+            installed: lodestash_app::models::siglip_installed(),
+            size_mb: 412,
+        },
+        ModelStatus {
+            id: "clap",
+            label: "CLAP — audio search + tagging",
+            installed: lodestash_app::models::clap_installed(),
+            size_mb: 163,
+        },
+        ModelStatus {
+            id: "ort",
+            label: "ONNX Runtime (native dll)",
+            installed: lodestash_app::models::ort_installed(),
+            size_mb: 70,
+        },
+    ]
+}
+
+/// Start a model download (Settings MODELS section). Runs on its own worker thread — the
+/// download never touches the catalog, so the single-writer rule doesn't apply — and reports
+/// through the job tray's progress bar. The ORT dll only loads at startup: a fresh download
+/// needs an app restart before search actually uses it (noted in the UI).
+#[tauri::command]
+fn model_download(state: tauri::State<'_, AppState>, model: String) -> bool {
+    use std::sync::atomic::Ordering;
+    let jobs = state.jobs.clone();
+    let handles = jobs.start(format!("Download {model}"), "download", true);
+    // The tray renders the writer's own progress atomics; the downloader writes the app's.
+    // A pump copies one into the other while the download runs.
+    let app_progress: std::sync::Arc<lodestash_app::jobs::JobProgress> =
+        std::sync::Arc::new(lodestash_app::jobs::JobProgress::default());
+    let writer_progress = handles.progress.clone();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let done = done.clone();
+        let writer_progress = writer_progress.clone();
+        let app_progress = app_progress.clone();
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                if let Some(w) = &writer_progress {
+                    w.done
+                        .store(app_progress.done.load(Ordering::Relaxed), Ordering::Relaxed);
+                    w.total
+                        .store(app_progress.total.load(Ordering::Relaxed), Ordering::Relaxed);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        });
+    }
+    std::thread::spawn(move || {
+        let result = match model.as_str() {
+            "siglip" => lodestash_app::models::download_siglip(app_progress.clone()),
+            "clap" => lodestash_app::models::download_clap(app_progress.clone()),
+            "ort" => lodestash_app::models::download_ort(app_progress.clone()),
+            other => Err(format!("unknown model {other:?}")),
+        };
+        done.store(true, Ordering::Relaxed);
+        let ok = result.is_ok();
+        if let Err(e) = &result {
+            tracing::error!(%e, "model download failed");
+        }
+        jobs.finish(handles.id, ok, false, 0);
+    });
+    true
+}
+
+/// Remove the SigLIP + CLAP model dirs (Settings MODELS "Remove") so they re-download clean.
+#[tauri::command]
+fn model_remove() -> Result<(), String> {
+    lodestash_app::models::remove_models()
+}
+
 /// Per-pack Extract (B2b slice) — unpack the archive into the workspace and reconcile its
 /// payloads into the catalog, on the persist thread like every write.
 #[tauri::command]
@@ -1383,6 +1473,9 @@ pub fn run() {
             engine_approve,
             engine_deny,
             engine_approvals,
+            models_status,
+            model_download,
+            model_remove,
             extract_package,
             jobs,
             cancel_job,

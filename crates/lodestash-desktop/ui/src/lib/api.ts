@@ -641,6 +641,12 @@ export let thumbKey = "1";
 export const previewCacheUsage = () => invoke<[number, number]>("preview_cache_usage");
 export const clearPreviewCache = () => invoke<number>("clear_preview_cache");
 
+/** AI model install status (Settings MODELS): installed vs not + size. */
+export const modelsStatus = () =>
+  invoke<{ id: string; label: string; installed: boolean; size_mb: number }[]>("models_status");
+export const modelDownload = (model: string) => invoke<boolean>("model_download", { model });
+export const modelRemove = () => invoke<void>("model_remove");
+
 export const setThumbKey = (k: string) => {
   thumbKey = k;
 };
