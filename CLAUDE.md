@@ -1,5 +1,8 @@
 # Lodestash — Project Rules
 
+> Last reviewed: 2026-08-12 (unchanged — the conformance rule, invariants and conventions below
+> are the standing operating agreement; see `docs/HANDOFF.md` §1.9 for the current state of play).
+
 Lodestash is a **local-first desktop app to identify, view, and retrieve game assets (3D/audio/image)
 for Unity** (Godot/Unreal later). The `README.md` + `docs/` are the **design spec and the source of
 truth**. This file is the rule set for working in this repo.

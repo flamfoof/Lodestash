@@ -4,8 +4,9 @@ Working notes for whoever (or whatever) continues the build. Unlike the rest of 
 is **not** a design spec — it's the state of play, the decisions already settled, and the traps.
 The design docs still win on any question of what the software *should* do.
 
-Last updated: **2026-08-06** — §1.8 is the current handoff (the B10 small-follow-ups pass,
-committed `1ae9175`…`7d49aca`); the §1.7/§1.6 blocks below are shipped, and §1.5 is historical.
+Last updated: **2026-08-12** — §1.9 is the current handoff (the engine build + backlog tail,
+committed `2ee613e`…`9e5688a`). §1.8's "remaining is the engine build" framing is **shipped** —
+read §1.9 for what actually remains. The §1.7/§1.6 blocks below are shipped, and §1.5 is historical.
 it is historical and already shipped.
 
 ---
@@ -104,6 +105,83 @@ server is `lodestash-mcp`, its own crate).
 preview backfill runs on the persist thread idle in 1s slices — `LODESTASH_NO_PREVIEW_DRAIN=1`
 skips it (e2e sets this); the e2e harness taskkills the app, so geometry persists via the
 Moved/Resized save, not exit.
+
+## 1.9 Next session: the engine build shipped — the open work is the plugin + the shell's second half (2026-08-12)
+
+**The B7 engine build and the backlog tail are done** (commits `2ee613e`…`9e5688a`, all on `main`,
+all verified: `cargo test --workspace` green, svelte-check 0/0, e2e **52/52**, `scripts/check-docs.mjs`
+**0 dead / 0 warnings**, parity test pins **23 agent ops**). What shipped since §1.8:
+
+- **B7 cutover landed (`6e22417`, 2026-08-07).** `crates/lodestash-ui` (egui) is deleted — the
+  Tauri 2 + Svelte 5 shell (`crates/lodestash-desktop` + `ui/`) is the only app. `--mcp` untouched
+  (`lodestash-mcp` is its own crate). The **Identify engine is wired** (`a2f675e`, `d94b5d1`):
+  `appraise_pass` resolves local SigLIP/CLAP zero-shot taggers (taught traits become candidate
+  labels) → Ollama/OpenAI-compatible captioner → `FilenameTagger`, with `max_assets` budget guards;
+  AI search (`GridQuery.search_mode` → `hybrid_search`), real progress bar, per-asset ✦ Identify,
+  and the **session set** (`promote_statuses` returns promoted ids → `WriteResult.promoted` →
+  `GridQuery.ids` — "N just appraised" no longer vanishes).
+- **The engine is embedded (B12, `d94b5d1`).** One `ServerState` starts REST (loopback port +
+  `engine.json`) **and** MCP stdio with the app; `--mcp` headless branch ships. Mutations from the
+  agent planes flow through the **write bridge** (ADR-0002): `AgentWrite` → desktop `Op` → the
+  single writer. All **23 ENGINE-API §2 ops** exist 1:1 on both planes (10 landed `dddb1e1`), the
+  parity test fails the build on drift. `⇢ Add to project` affordances + the **human approval gate
+  in the job tray** (`f280391`) — imports/approvals surface as awaiting-approval jobs.
+- **Crawl/hash completeness.** BLAKE3 hashes at crawl → real Duplicates; **move/rename detection**
+  (`reconcile_moves`, same-hash rel-path fixup before record_crawl); **incremental re-hash**
+  (`needs_rehash`, size/mtime-gated); **magic-byte recovery** for unknown extensions; **filesystem
+  watch** (notify, debounced, incremental rescan, e2e-escape-hatched); **perceptual near-dup**
+  (64-bit dHash, ≤6-bit Hamming union-find → the Duplicates screen's Similar tier).
+- **Undo/redo (`1f86d50`).** Op log carries forward payloads (migration 17: `forward_json`,
+  `undone_at`); redo (Shift-Z / Ctrl-Y) applies + consumes; new work clears the stack. Keyboard map:
+  Ctrl/Cmd-Z, Shift-Z, Space (Quick Look), F (favourite). Ctrl/Cmd-A multi-select still open.
+- **UI-completeness pass (`17c56cd`, `b84d463`, `519ce4d`, `8dc847d`).** Right-click context menu
+  on cards + rows; trash-mode per-row Restore; in-pack Quick Look pulls (file/mesh routes; the
+  256 MB cap now guards **only** the thumb route — ADR-0005); pack-stats modal (triangles tile +
+  per-type breakdown); Unity Assets `↻ Sync` (re-crawls every Asset Store cache root) + category
+  tabs; trait create form (scope/usage-note/teach); Settings clear-cache + confirm-before-trash;
+  **AI MODELS card** (`9e5688a`) — SigLIP/CLAP/ORT download/re-download/remove with job-tray
+  progress (the egui-era `lodestash_app::models` downloader, surfaced).
+- **Workflow (ADR-0006 family, `4a6dec3`).** `docs/decisions/` ADRs (tauri-svelte shell,
+  single-writer, zero-shot tagging, density default, in-pack cap, redo forward payloads);
+  `scripts/check-docs.mjs` (dead-citation/drift checker over `docs/` + `README.md` + `CLAUDE.md`;
+  keep 0 dead / 0 warnings); the docs-conformance review gate; spec-pinned test names.
+
+**What is genuinely left** (all on the board — `docs/KANBAN-SVELTE.md` is current):
+
+1. **Import dialog §5.2** — `add_source_dialog` is still a plain folder picker. The recommended
+   path is **discovery-dialog-only**: pick folder → crawl → modal listing discovered packs
+   (group/select-all, category badge/tabs, "import as libraries") — packs stay browsable in place.
+   The full §5.2 spec needs a "pack folder as a browsable source" model that doesn't exist yet.
+2. **The staging-commit half** — tray rows exist but `batch_id` has no Recent-exports list, no
+   batch undo, and the top-bar "No project" chip is static (**no project switcher popover**,
+   FEATURES §7.1). REST transport endpoints + the approval gate exist; the shell half is the work.
+3. **UPM C# Unity plugin + Connect-wizard plugin half** — the app half is done; the plugin
+   handshake → register/heartbeat → browse → selective import w/ deps → ack needs a real Unity
+   install to build/verify.
+4. **Shell polish (each its own small card):** onboarding two-step; eviction / `keep-extracted`
+   (`unmaterialize_package` has zero callers); per-entry "Extract selected" page-batching; trait
+   usage-note *editing*; inspector gaps (relink a `missing` edge, in-archive provenance block);
+   Ctrl/Cmd-A multi-select; LINKS full graph harvest (prefab `uses_*`); variants + color search.
+5. **Doc drift still open** (the 🟠 row): DESIGN-GUIDELINES §5 sprite caveat, ALIGNMENT-AUDIT rows,
+   ROADMAP/MILESTONES egui-era language, PACK-DIRECTORY-NAV §1, USER-GUIDE blocked-step markers.
+
+**Carried traps + the session's new ones:** the single-writer rule and the write bridge (an agent
+op must end as an `Op`, never a direct catalog write); `promote_statuses` now returns `Vec<i64>` —
+callers use `.len()`; `record_op` takes a third arg (the redo forward payload — pass `None` when
+the payload *is* the forward); the migration-count test asserts **17** — bump it with any new
+migration; **run e2e with `node`, not `bun`** (bun's ws can't handshake WebView2 CDP); the harness
+polls + dismisses the "Point at your Hoard" onboarding panel every run — a new overlay must do the
+same or every DOM interaction times out; **`cargo build -p lodestash-desktop` before e2e** (the
+harness mtime-guards against stale binaries); commit with explicit paths — `.reasonix/` +
+`reasonix.toml` stay untracked; `cargo fmt --all` before committing; never `git add -A` (§6).
+
+**Known open defects (from the 2026-08-01 review, still unfixed — each wants a card):**
+`resolve_job_path` pulls in-pack payloads wholly into RAM with no size check (`PULL_CAP_HINT` only
+bounds the hint); `poll_import_queue` never removes entries so a plugin that polls twice imports
+twice; a cancelled extraction is stamped fully unpacked; `gate` returns 500 instead of 404 on
+unknown paths; `ack_import` never checks the acked ids are a subset of the queue; `unmaterialize_package`'
+s safe-to-delete query leaks deduped bytes inside one pack; `apply_mapping`'s `alias` arm doesn't
+escape `_`/`%` in user patterns.
 
 ## 1.7 Next session: the B9 pass shipped — the remaining backlog is the engine build (2026-08-06)
 
@@ -262,17 +340,21 @@ stack is one-click installable on win-x64 (fetches the ONNX Runtime *and* both m
 **The agent plane is open** (P5, [`ENGINE-API.md`](ENGINE-API.md) + [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md)).
 `lodestash-api` binds an ephemeral loopback port at launch, writes `engine.json`, and serves `/v1/`
 behind a bearer token + loopback `Host`/`Origin` guard. `lodestash --mcp` runs the same operations
-over rmcp stdio. **Twelve** operations exist on **both** planes, and a parity test fails the build if
+over rmcp stdio. **Twenty-three** operations exist on **both** planes (mutations flow through the
+desktop's single writer via the ADR-0002 write bridge), and a parity test fails the build if
 one plane grows a name the other lacks:
 
 | Tool / route | Note |
 |---|---|
 | `get_server_info` · `search_assets` · `get_asset` | |
-| `semantic_search` (`?mode=ai`) | 501 only while no model is loaded |
+| `semantic_search` (`?mode=ai`) | real once a local SigLIP/CLAP model is installed (AI MODELS card) |
 | `get_asset_preview` | image block + `resource_link`; PNG from the grid's own thumb cache |
 | `find_similar` · `list_packages` | |
-| `register_project` · `list_projects` · `import_to_project` | **P5 Unity round-trip** (2026-07-28); import is side-effecting |
+| `register_project` · `list_projects` · `import_to_project` | **P5 Unity round-trip** (2026-07-28); import is side-effecting, human-approved |
 | `export_asset` · `get_job_status` · `cancel_job` | **side-effecting**, see below |
+| `list_tags` · `add_tag` · `suggest_tags` | tag authoring + zero-shot suggestions (2026-08-11) |
+| `list_collections` · `apply_mapping` · `identify_asset` | mapping engine + Identify as an API job (2026-08-11) |
+| `unpack_package` · `stage_asset` · `list_staged` · `import_staged` | staging group — the tray's commit half (2026-08-11) |
 
 Both planes call the *same* `ServerState` methods the REST handlers call — that is what makes the 1:1
 rule structural rather than a convention. `GET /v1/assets/{id}/file` and the plugin transport

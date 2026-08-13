@@ -1,5 +1,7 @@
 # Lodestash — Local Game-Asset Identifier, Viewer & Retriever
 
+> Last reviewed: 2026-08-12 (docs map + install table reconciled against the shipped build).
+
 > **Lodestash** = *lodestone* (it guides you to the right asset) + *stash* (the asset store you draw from).
 
 A **local-first desktop application** that catalogs, previews, tags, and — most importantly —

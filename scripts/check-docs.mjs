@@ -35,6 +35,11 @@ function walk(dir, out = []) {
 }
 
 const mdFiles = walk(DOCS).sort();
+// The repo-root README + CLAUDE.md also cross-link docs/ — scan them too, or a dead link
+// there ships silently.
+for (const root of ["README.md", "CLAUDE.md"]) {
+  if (existsSync(join(ROOT, root))) mdFiles.push(join(ROOT, root));
+}
 const lineCache = new Map();
 function linesOf(p) {
   if (!lineCache.has(p)) {
