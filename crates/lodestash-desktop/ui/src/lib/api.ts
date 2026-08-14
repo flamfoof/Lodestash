@@ -375,6 +375,27 @@ export const projects = () => invoke<ProjectRow[]>("projects");
 export const setActiveProject = (projectId: number) =>
   invoke<WriteResult>("set_active_project", { projectId });
 
+// ── Recent exports & batch undo (UI-SPEC §16.1) ──────────────────────────────────────────────
+
+/** One persisted import batch — every `import_record` sharing a `batch_id`, undoable as a unit. */
+export type ImportBatch = {
+  batch_id: string;
+  project_id: number;
+  project_name: string;
+  /** Destination folder the batch's files were written into (e.g. `Assets/Wildlife`). */
+  dest: string;
+  file_count: number;
+  imported_at: number;
+};
+
+/** The last `limit` import batches, newest first. */
+export const recentExports = (limit: number) =>
+  invoke<ImportBatch[]>("recent_exports", { limit });
+
+/** Undo a batch: delete its copied files + `import_record`s (catalog assets untouched). */
+export const undoImportBatch = (batchId: string) =>
+  invoke<WriteResult>("undo_import_batch", { batchId });
+
 // ── Pump events (B2b) ────────────────────────────────────────────────────────────────────────
 
 /**
@@ -500,6 +521,40 @@ export const syncUnityCache = () => invoke<WriteResult>("sync_unity_cache");
 /** Native folder chooser for the sidebar's "+ Add source…" (B2b). `null` = cancelled. */
 export const addSourceDialog = () =>
   invoke<WriteResult | null>("add_source_dialog");
+
+// ── Import-packages dialog (FEATURES §5.2) ────────────────────────────────────────────────
+
+/** One `.unitypackage` the import dialog lists — see `discover_package_folder`. */
+export type DiscoveredPackageRow = {
+  group: string;
+  publisher: string;
+  name: string;
+  abs_path: string;
+  size_bytes: number;
+  version: string | null;
+  assets: number;
+  category: string | null;
+  duplicate_of: string | null;
+};
+
+/** Native folder chooser for the import dialog. `null` = cancelled. */
+export const pickPackageFolder = () => invoke<string | null>("pick_package_folder");
+
+/** Scan a folder for `.unitypackage` files (read-only) — the dialog's list. */
+export const discoverPackageFolder = (path: string) =>
+  invoke<DiscoveredPackageRow[]>("discover_package_folder", { path });
+
+/** The ticked packs sent back for import (locators are filled server-side). */
+export type ImportSelection = {
+  abs_path: string;
+  name: string;
+  publisher: string | null;
+  category: string | null;
+};
+
+/** Import the ticked packs as libraries — one `package` row apiece, pinned + minted in place. */
+export const importPackages = (root: string, packs: ImportSelection[]) =>
+  invoke<WriteResult>("import_packages", { root, packs });
 
 export const libraryStats = () => invoke<Stats>("library_stats");
 export const duplicateGroups = () => invoke<DupGroup[]>("duplicate_groups");

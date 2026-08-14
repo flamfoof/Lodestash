@@ -248,11 +248,14 @@ indexing skips them. `+ Add source` opens the chooser (§7.4). Persist blacklist
 - **Grouped by publisher / containing folder** (Asset Store-5.x layout). Each group collapses and has
   **select all / clear**.
 - **Per package:** checkbox, name, `vX · size · N assets`, an **auto-detected content-category** badge
-  that is also a **dropdown override** (3D Models / Audio / Code / UI / Materials), and — for multi-
-  version packages — a **“N older versions · newest shown”** disclosure (older versions are not
-  imported). Packages that likely overlap existing content show a `⧉ possibly already indexed as “…”`
-  flag (§5.6).
-- **Category filter tabs** (All / 3D / Audio / Code / UI / Materials) filter the list.
+  that is also a **dropdown override** (3D / Materials / Audio / 2D; Code / UI are override-only — they
+  can't be told from bytes), and — for multi-version packages — a **“N older versions · newest shown”**
+  disclosure (older versions are not imported). Packages that likely overlap existing content show a
+  `⧉ possibly already indexed as “…”` flag (§5.6).
+- **Category filter tabs** (All / 3D / Materials / Audio / 2D / Code / UI) filter the list.
+- **Discovery scans each candidate** (read-only): the list reads each archive's manifest to count
+  classifiable assets, auto-detect the category and read the version (UPM `package.json`) — nothing
+  is written or copied.
 - **Footer:** “indexed in place — no files are copied”, a running **N selected** count, and **Import
   as libraries**. Each selected `.unitypackage` becomes **one Library** (named by the package,
   publisher as subtitle). Import reads each pack's manifest and **mints an in-pack `asset` per entry**
@@ -264,15 +267,13 @@ Cards for each imported package: `ls-unitypackage` mark, name, publisher · vers
 mono path, `N assets · size`, **↻ Sync** (re-scan archive index), **Open →** (open as a library and
 browse it in the folder explorer, §5.4).
 
-**Category — content-derived (2026-07-30).** A pack's category badge and the landing **filter tabs**
-(All / 3D / Materials / Audio / 2D) are derived from its catalogued assets' media types — the
-dominant bucket wins (`dominant_category`/`package_categories`; textures ride with 3D, image/sprite/
-font are 2D). A pack with no catalogued assets yet (browse-only) reads **Unknown** and shows only
-under All. This **replaces the earlier `3D / Audio / Code / UI / Materials` taxonomy** for the
-derived path: *Code* has no `media_type` (scripts are never catalogued) and *UI vs 2D game-art* can't
-be told from bytes, so neither is content-derivable. The **dropdown override** (§5.2) and the
-**§5.2 import-dialog tabs** are deferred: import candidates are unscanned files, so they have no
-content to categorize — those need the stored/overridable category (a later slice).
+**Category — stored, import-detected.** A pack's category badge and the landing **filter tabs**
+(All / 3D / Materials / Audio / 2D, plus Code / UI for packs overridden to those) read the stored
+`package.category`. The import dialog (§5.2) auto-detects it from the archive's classifiable entries
+— 3D (`model_3d`), Materials (`material`/`texture`), Audio (`audio`), 2D (`image`/`sprite`/`font`) —
+and the user can override to any of the six, *Code* and *UI* being override-only (scripts have no
+`media_type`; UI-vs-2D game-art can't be told from bytes). A pack added without the import dialog
+(e.g. `↻ Sync`) carries no category until it is imported, and reads **Unknown** (shows under All only).
 
 ### 5.4 Browse one package — the folder explorer
 **Open → makes the pack a library and navigates it in the ordinary library browser**, not a separate
@@ -358,9 +359,15 @@ Scrollable, max content width ~760px, section cards on `SURFACE`. Sections:
 
 ## 7. Overlays, modals & wizards
 
-- **7.1 Project switcher** — top-bar popover listing export targets (Unity projects); shows recent
-  exports per project with **↩ undo** (removes those files from the project), and **Connect Unity
-  project…** (opens the wizard §7.5). Staging trays are per-project and never mix on switch.
+- **7.1 Project switcher** — top-bar popover (replacing the static “No project” chip) with three
+  sections: **Export targets** (registered Unity projects, active-first; ✓ marks the active one and
+  clicking a row switches it through `set_active_project`), **Recent exports** (the last four
+  persisted import batches, grouped by `import_record.batch_id` — each reads `✓ N files → dest` with
+  a relative time and a confirm-gated **↩ undo** that deletes that batch's copied files + its
+  `import_record` rows through the single writer; catalog assets are never touched), and
+  **+ Connect Unity project…** (routes to Settings → Unity Editors, the wizard's app half). Staging
+  trays are per-project in the engine/collection model (ENGINE-API §6); the Svelte shell's
+  shortlist is still in-memory until that lands.
 - **7.2 Pack stats modal** — per-pack rollup: stat tiles, tag breakdown (each **Find**s in library),
   top assets (each **Open**s), and **Browse** the pack. Opened from Packages/Stats/inspector.
 - **7.3 Quick Look** — full-size preview modal (Space / ⤢). Renders at **full detail regardless of the

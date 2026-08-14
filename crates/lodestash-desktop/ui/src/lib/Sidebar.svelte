@@ -10,7 +10,11 @@
    * `counts` map: two sources for the same number is how a badge comes to disagree with the facet
    * directly under it.
    */
-  let { status = null }: { status?: LibraryStatus | null } = $props();
+  let { status = null, onopensource }: {
+    status?: LibraryStatus | null;
+    /** Open the "Add a source" chooser (App owns it — watch folder vs import packages). */
+    onopensource?: () => void;
+  } = $props();
 
   let counts = $derived<Partial<Record<string, number>>>({
     unidentified: status?.unidentified ?? 0,
@@ -162,7 +166,11 @@
       {/each}
       <!-- B2b: the "+ Add source…" chooser is real now — a native folder dialog (Rust-side),
            then the same import path as dropping a folder on the window. -->
-      <button class="add" onclick={pickSourceDialog} data-testid="add-source">
+      <button
+        class="add"
+        onclick={() => (onopensource ? onopensource() : pickSourceDialog())}
+        data-testid="add-source"
+      >
         + Add source…
       </button>
       {#if addError}

@@ -29,6 +29,8 @@ import JobTray from "./lib/JobTray.svelte";
     setFavorite,
     setTrashed,
     engineImport,
+    addSourceDialog,
+    pickPackageFolder,
     removeFromLibrary,
     deleteFromDisk,
     getWebPrefs,
@@ -43,6 +45,8 @@ import JobTray from "./lib/JobTray.svelte";
   } from "./lib/api";
   import { refreshTraitColors } from "./lib/traits.svelte";
   import Onboarding from "./lib/Onboarding.svelte";
+  import SourceChooser from "./lib/SourceChooser.svelte";
+  import ImportDialog from "./lib/ImportDialog.svelte";
   import { push, dismiss, toasts } from "./lib/toasts.svelte";
 
   let status = $state<LibraryStatus | null>(null);
@@ -250,6 +254,43 @@ import JobTray from "./lib/JobTray.svelte";
 
   let paletteOpen = $state(false);
 
+  // "Add a source" chooser (design README §"Add a source chooser"): Watch a folder (the
+  // existing native import) or Unity Asset Store packages (the §5.2 import dialog).
+  let chooserOpen = $state(false);
+  let importRoot = $state<string | null>(null);
+
+  async function watchFolder() {
+    chooserOpen = false;
+    try {
+      const r = await addSourceDialog();
+      if (r === null) return;
+      view.dataVersion += 1;
+      status = await libraryStatus();
+    } catch (e) {
+      actionError = String(e);
+    }
+  }
+
+  async function importFromFolder() {
+    chooserOpen = false;
+    try {
+      const p = await pickPackageFolder();
+      if (p) importRoot = p;
+    } catch (e) {
+      actionError = String(e);
+    }
+  }
+
+  // Re-pick the folder from inside the open import dialog (the parent owns the path).
+  async function repickImportFolder() {
+    try {
+      const p = await pickPackageFolder();
+      if (p) importRoot = p;
+    } catch (e) {
+      actionError = String(e);
+    }
+  }
+
   /**
    * Ctrl/Cmd-K opens the palette from anywhere — including from inside the search box, which is
    * the one place a global shortcut usually stops working and the one place people press it.
@@ -311,7 +352,7 @@ import JobTray from "./lib/JobTray.svelte";
 <div class="frame" data-density={view.density}>
   <TopBar engineReady={status?.open ?? false} {status} />
   <div class="body">
-    <Sidebar {status} />
+    <Sidebar {status} onopensource={() => (chooserOpen = true)} />
     <main>
       {#if view.route === "traits"}
         <TraitsScreen />
@@ -419,6 +460,18 @@ import JobTray from "./lib/JobTray.svelte";
 
   {#if onboardingOpen}
     <Onboarding onclose={() => (onboardingOpen = false)} />
+  {/if}
+
+  {#if chooserOpen}
+    <SourceChooser
+      onwatch={watchFolder}
+      onimport={importFromFolder}
+      onclose={() => (chooserOpen = false)}
+    />
+  {/if}
+
+  {#if importRoot}
+    <ImportDialog root={importRoot} onclose={() => (importRoot = null)} onrepick={repickImportFolder} />
   {/if}
 
   {#if toasts.length > 0}

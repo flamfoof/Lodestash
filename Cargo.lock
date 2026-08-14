@@ -2718,6 +2718,7 @@ dependencies = [
  "lodestash-core",
  "lodestash-ingest",
  "lodestash-mcp",
+ "rusqlite",
  "serde",
  "serde_json",
  "tauri",

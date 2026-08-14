@@ -20,19 +20,21 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 
-use lodestash_app::config::AppConfig;
-use lodestash_app::drains::{
-    drain_audio_tags, drain_promote_resync, drain_previews, drain_tags, resolve_audio_embedder,
-    resolve_embedder,
-};
-use lodestash_app::jobs::JobProgress as AppJobProgress;
-use lodestash_app::paths::default_cache_dirs;
-use lodestash_app::types::PersistBatch;
+use rusqlite::Connection;
+
 use lodestash_ai::clap_tags::AudioZeroShot;
 use lodestash_ai::image_tags::ImageZeroShot;
 use lodestash_ai::ollama::OllamaTagger;
 use lodestash_ai::openai::OpenAiTagger;
 use lodestash_ai::tagger::{FilenameTagger, Tagger, TeachTrait};
+use lodestash_app::config::AppConfig;
+use lodestash_app::drains::{
+    drain_audio_tags, drain_previews, drain_promote_resync, drain_tags, resolve_audio_embedder,
+    resolve_embedder,
+};
+use lodestash_app::jobs::JobProgress as AppJobProgress;
+use lodestash_app::paths::default_cache_dirs;
+use lodestash_app::types::PersistBatch;
 use lodestash_core::catalog::{Catalog, PackageEntryRecord};
 use lodestash_core::types::{Exclude, ExcludeKind};
 use lodestash_ingest::unitypackage::{
@@ -60,14 +62,27 @@ pub struct Target {
 /// What the writer was asked to do. One variant per user-facing action, so the thread — not the
 /// caller — owns the order of operations for anything that touches more than one thing.
 pub enum Op {
-    SetFavorite { ids: Vec<i64>, on: bool },
+    SetFavorite {
+        ids: Vec<i64>,
+        on: bool,
+    },
     /// Soft delete / restore. Catalog-only; the file on disk is never touched (DATA-MODEL §8).
-    SetTrashed { ids: Vec<i64>, trashed: bool },
+    SetTrashed {
+        ids: Vec<i64>,
+        trashed: bool,
+    },
     /// **Remove from library** — the safe removal. Soft-deletes the row *and* blacklists the
     /// asset in its source, so the next scan does not bring it back. No file is touched.
-    RemoveFromLibrary { targets: Vec<Target>, project: Option<String> },
+    RemoveFromLibrary {
+        targets: Vec<Target>,
+        project: Option<String>,
+    },
     /// **Delete from disk** — the one irreversible action in this product.
-    DeleteFromDisk { targets: Vec<Target>, roots: Vec<PathBuf>, workspace: Option<PathBuf> },
+    DeleteFromDisk {
+        targets: Vec<Target>,
+        roots: Vec<PathBuf>,
+        workspace: Option<PathBuf>,
+    },
     /// Record a finished crawl: upsert the source and reconcile its assets (INGESTION §1).
     ///
     /// The **crawl** does not happen here. It is a disk walk that can take minutes, and the writer
@@ -81,6 +96,14 @@ pub enum Op {
         /// extractable without re-scanning the archive.
         packs: Vec<DiscoveredPack>,
     },
+    /// Import selected `.unitypackage`s as libraries (FEATURES §5.2): upsert the folder as one
+    /// source, then per pack upsert the `package` row, record its manifest locators, mint the
+    /// in-pack assets and pin it — one Library per pack, indexed in place, nothing copied.
+    ImportPacks {
+        /// The picked folder — one source row for every selected pack (idempotent by root).
+        root: String,
+        packs: Vec<ImportPack>,
+    },
     /// Trait-library authoring (UI-SPEC §9, B8a): create or promote a trait — an existing tag
     /// keeps its assignments and gains first-class status.
     UpsertTrait {
@@ -91,9 +114,14 @@ pub enum Op {
         teach: bool,
     },
     /// Demote a trait back to a plain tag; its assignments survive (never touches `asset_tag`).
-    UnpromoteTrait { tag_id: i64 },
+    UnpromoteTrait {
+        tag_id: i64,
+    },
     /// Toggle a trait's teaching flag.
-    SetTraitTeach { tag_id: i64, teach: bool },
+    SetTraitTeach {
+        tag_id: i64,
+        teach: bool,
+    },
     /// Set a trait's chip style — colour (CSS token or hex) + optional icon id. `None` clears.
     SetTraitStyle {
         tag_id: i64,
@@ -101,21 +129,43 @@ pub enum Op {
         icon: Option<String>,
     },
     /// Pause/resume watching one source (UI-SPEC §11.1). Paused sources stay cataloged.
-    SetSourceWatch { id: i64, watch: bool },
+    SetSourceWatch {
+        id: i64,
+        watch: bool,
+    },
     /// Create a named collection (UI-SPEC §6).
-    CreateCollection { name: String },
+    CreateCollection {
+        name: String,
+    },
     /// Delete a collection; memberships cascade (UI-SPEC §6).
-    DeleteCollection { id: i64 },
+    DeleteCollection {
+        id: i64,
+    },
     /// Pin/unpin a `.unitypackage` as a library (FEATURES §5.4) — pinned packs surface in the
     /// sidebar's LIBRARIES facet and get the "Add all to project" affordance.
-    SetPackagePinned { id: i64, pinned: bool },
+    SetPackagePinned {
+        id: i64,
+        pinned: bool,
+    },
     /// The per-source blacklist editor (UI-SPEC §11.1): add/remove one `{kind, value}`
     /// exclusion. `kind` is `folder` or `asset` (DATA-MODEL §10).
-    AddSourceExclude { source_id: i64, kind: String, value: String },
-    RemoveSourceExclude { source_id: i64, kind: String, value: String },
+    AddSourceExclude {
+        source_id: i64,
+        kind: String,
+        value: String,
+    },
+    RemoveSourceExclude {
+        source_id: i64,
+        kind: String,
+        value: String,
+    },
     /// The Mapping tab's taxonomy switcher / authoring (UI-SPEC §9.2).
-    SetActiveTaxonomy { id: i64 },
-    DeleteTaxonomy { id: i64 },
+    SetActiveTaxonomy {
+        id: i64,
+    },
+    DeleteTaxonomy {
+        id: i64,
+    },
     /// Add a mapping rule to a taxonomy (UI-SPEC §9.2). `match_type` is one of
     /// `MAPPING_MATCH_TYPES`; `priority` lower wins.
     AddRule {
@@ -126,7 +176,9 @@ pub enum Op {
         priority: i64,
     },
     /// Delete a mapping rule (UI-SPEC §9.2 row delete).
-    DeleteRule { rule_id: i64 },
+    DeleteRule {
+        rule_id: i64,
+    },
     /// Add a category under a parent (or the root) with its materialized path.
     AddCategory {
         taxonomy_id: i64,
@@ -135,39 +187,74 @@ pub enum Op {
         path: String,
     },
     /// Run the deterministic mapping engine over one taxonomy.
-    ApplyMapping { taxonomy_id: i64 },
+    ApplyMapping {
+        taxonomy_id: i64,
+    },
     /// ✦ Identify all — one bounded appraise pass (embeddings → tags → promote) on the
     /// persist thread, so the catalog stays single-writer. Manual, like the egui build's
     /// Identify button (AI-PIPELINE §2); auto-identify stays a config opt-in.
     IdentifyAll,
-    RenameCategory { id: i64, label: String },
-    DeleteCategory { id: i64 },
+    RenameCategory {
+        id: i64,
+        label: String,
+    },
+    DeleteCategory {
+        id: i64,
+    },
     /// Manual appraise kick for one asset (per-card ✦, KANBAN B11b): flags the asset for
     /// re-embed + re-tag, then runs one bounded pass so it actually happens now.
-    IdentifyOne { asset_id: i64 },
+    IdentifyOne {
+        asset_id: i64,
+    },
     /// Targeted appraise kick for an explicit set (ENGINE-API §2 `identify_asset`): flags
     /// each, then ONE bounded pass so a bulk agent call is a single pass, not N.
-    IdentifyIds { asset_ids: Vec<i64> },
+    IdentifyIds {
+        asset_ids: Vec<i64>,
+    },
     /// Stage/unstage one asset in the active project's staging tray (ENGINE-API §6). The
     /// writer resolves the tray (the active project may have none registered — an honest
     /// error) so the engine planes never touch the catalog themselves (ADR-0002).
-    StageAsset { asset_id: i64 },
-    UnstageAsset { asset_id: i64 },
+    StageAsset {
+        asset_id: i64,
+    },
+    UnstageAsset {
+        asset_id: i64,
+    },
     /// Per-pack Extract (B2b slice): unpack the archive into the workspace, then reconcile
     /// the payloads into the catalog like a crawl. Explicit and on-demand (UI-SPEC §11.6) —
     /// browsing never unpacks; `lodestash://file` answers 503 until this runs.
-    ExtractPackage { package_id: i64 },
+    ExtractPackage {
+        package_id: i64,
+    },
     /// Switch which registered Unity editor is active (ENGINE-API §5.1, UI-SPEC §16.1).
-    SetActiveProject { project_id: i64 },
+    SetActiveProject {
+        project_id: i64,
+    },
+    /// Undo one import batch (UI-SPEC §16.1): delete the batch's copied files from the project
+    /// and its import_record rows — catalog assets are never touched. Runs on this thread like
+    /// every catalog write (ADR-0002).
+    UndoImportBatch {
+        batch_id: String,
+    },
 
     /// Undo one logged mutation (UI-SPEC §2 Ctrl/Cmd-Z, DESIGN-GUIDELINES §7 L5).
-    RevertOp { op_id: i64 },
+    RevertOp {
+        op_id: i64,
+    },
     /// Redo one undone op (UI-SPEC §2 Shift-Z): applies the op's forward payload and consumes
     /// the log row — the inverse of [`Op::RevertOp`].
-    RedoOp { op_id: i64 },
+    RedoOp {
+        op_id: i64,
+    },
     /// Toggle one asset's membership in a collection (UI-SPEC §6, §13.5).
-    CollectionAddAsset { collection_id: i64, asset_id: i64 },
-    CollectionRemoveAsset { collection_id: i64, asset_id: i64 },
+    CollectionAddAsset {
+        collection_id: i64,
+        asset_id: i64,
+    },
+    CollectionRemoveAsset {
+        collection_id: i64,
+        asset_id: i64,
+    },
     /// Bulk-bar tag edit (KANBAN B9d): add/remove one `(namespace, value)` tag on many
     /// assets. Each asset gets its own undo-log entry snapshotted before the write, so
     /// `revert_op` restores the exact prior per-source tag set.
@@ -228,6 +315,19 @@ pub struct DiscoveredPack {
     pub root: String,
     pub abs_path: String,
     pub display_name: String,
+    pub entries: Vec<PackageEntryRecord>,
+}
+
+/// One `.unitypackage` the user chose to import as a library (FEATURES §5.2). Carries the
+/// browse-time manifest locators so the writer records + mints without re-inflating the archive
+/// (the discovery scan already read it). `publisher`/`category` come from the dialog (publisher
+/// = the containing folder; category = the auto-detected badge or the user's dropdown override).
+/// Built server-side in `import_packages` — it never crosses the IPC boundary, so no `Deserialize`.
+pub struct ImportPack {
+    pub abs_path: String,
+    pub name: String,
+    pub publisher: Option<String>,
+    pub category: Option<String>,
     pub entries: Vec<PackageEntryRecord>,
 }
 
@@ -374,7 +474,10 @@ impl JobRegistry {
                     label: j.label.clone(),
                     kind: j.kind.clone(),
                     progress: j.progress.as_ref().map(|p| {
-                        (p.done.load(Ordering::Relaxed), p.total.load(Ordering::Relaxed))
+                        (
+                            p.done.load(Ordering::Relaxed),
+                            p.total.load(Ordering::Relaxed),
+                        )
                     }),
                     cancellable: j.progress.is_some(),
                 })
@@ -505,12 +608,15 @@ impl Writer {
                             // Only the appraise kicks are slow enough to count as "the pump is
                             // running" — everything else is a quick write the frontend already
                             // waits on synchronously.
-                            let appraising = matches!(job.op, Op::IdentifyAll | Op::IdentifyOne { .. });
+                            let appraising =
+                                matches!(job.op, Op::IdentifyAll | Op::IdentifyOne { .. });
                             if appraising {
                                 pump.store(true, Ordering::Relaxed);
                             }
-                            let source_set_changed =
-                                matches!(job.op, Op::PersistScan { .. } | Op::SetSourceWatch { .. });
+                            let source_set_changed = matches!(
+                                job.op,
+                                Op::PersistScan { .. } | Op::SetSourceWatch { .. }
+                            );
                             let result = run(
                                 &mut catalog,
                                 &db_path,
@@ -547,7 +653,8 @@ impl Writer {
                             // The payloads landed on disk off-thread; materialize them here —
                             // the catalog stays single-writer. Then the next queued pack gets
                             // its worker.
-                            let result = materialize_extract(&mut catalog, package_id, outcome);
+                            let result =
+                                materialize_extract(&mut catalog, package_id, outcome, cancelled);
                             let ok = result.is_ok();
                             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
                             jobs.finish(job_id, ok, cancelled, changed);
@@ -589,9 +696,9 @@ impl Writer {
                                     .into_iter()
                                     .find(|p| p.id == package_id)
                                     .ok_or_else(|| format!("package {package_id} not found"))?;
-                                let workspace_dir = default_cache_dirs()
-                                    .1
-                                    .ok_or_else(|| "no workspace directory configured".to_string())?;
+                                let workspace_dir = default_cache_dirs().1.ok_or_else(|| {
+                                    "no workspace directory configured".to_string()
+                                })?;
                                 spawn_extract_worker(
                                     &pkg,
                                     &workspace_dir,
@@ -735,8 +842,7 @@ fn rescan_watched(catalog: &mut Catalog, db_path: &Path, _app: &Option<tauri::Ap
         if crawled.entries.is_empty() && crawled.pending_packages.is_empty() {
             continue;
         }
-        let records =
-            lodestash_app::persist::crawl_records(crawled.entries.iter().map(|(_, f)| f));
+        let records = lodestash_app::persist::crawl_records(crawled.entries.iter().map(|(_, f)| f));
         // Cheap in-memory diff against the catalog's last-known (size, mtime): nothing moved on
         // disk means nothing to persist (and no spurious `last_scanned_at` write + UI reload).
         let same = records.len() == known.len()
@@ -807,9 +913,7 @@ fn appraise_pass(
             usage_note,
         })
         .collect::<Vec<_>>();
-    let zero_shot = embedder
-        .clone()
-        .and_then(|e| ImageZeroShot::new(e, &teach));
+    let zero_shot = embedder.clone().and_then(|e| ImageZeroShot::new(e, &teach));
     let audio_shot = audio_embedder.clone().and_then(AudioZeroShot::new);
     let cfg = AppConfig::load();
     let api_model = cfg
@@ -861,9 +965,7 @@ fn appraise_pass(
     // changed = the appraised backlog size the pass reconciled; when counts are None
     // (nothing moved) report 1 so the frontend toasts a real kick, not a silent no-op.
     Ok(WriteResult {
-        changed: counts
-            .map(|c| c.identified + c.unidentified)
-            .unwrap_or(1),
+        changed: counts.map(|c| c.identified + c.unidentified).unwrap_or(1),
         promoted,
         ..Default::default()
     })
@@ -882,25 +984,39 @@ fn run(
     match op {
         Op::SetFavorite { ids, on } => catalog
             .set_favorite(&ids, on)
-            .map(|changed| WriteResult { changed, ..Default::default() })
+            .map(|changed| WriteResult {
+                changed,
+                ..Default::default()
+            })
             .map_err(|e| e.to_string()),
 
         // Undo (UI-SPEC §2 / DESIGN-GUIDELINES §7 L5): log the trash toggle so Ctrl/Cmd-Z can
         // flip it back. Only a toggle that actually changed rows is worth undoing — logging a
         // no-op would let a revert flip assets that were never touched.
         Op::SetTrashed { ids, trashed } => {
-            let changed = catalog.set_trashed(&ids, trashed).map_err(|e| e.to_string())?;
+            let changed = catalog
+                .set_trashed(&ids, trashed)
+                .map_err(|e| e.to_string())?;
             if changed > 0 {
-                catalog.record_trash_op(&ids, trashed).map_err(|e| e.to_string())?;
+                catalog
+                    .record_trash_op(&ids, trashed)
+                    .map_err(|e| e.to_string())?;
             }
-            Ok(WriteResult { changed, ..Default::default() })
+            Ok(WriteResult {
+                changed,
+                ..Default::default()
+            })
         }
 
-        Op::RemoveFromLibrary { targets, project } => remove_from_library(catalog, targets, project),
-
-        Op::DeleteFromDisk { targets, roots, workspace } => {
-            delete_from_disk(catalog, targets, &roots, workspace.as_deref())
+        Op::RemoveFromLibrary { targets, project } => {
+            remove_from_library(catalog, targets, project)
         }
+
+        Op::DeleteFromDisk {
+            targets,
+            roots,
+            workspace,
+        } => delete_from_disk(catalog, targets, &roots, workspace.as_deref()),
 
         // `persist_to_catalog` opens its **own** connection, which would be a second writer
         // anywhere else. Running it on this thread is what keeps the rule true: this thread's own
@@ -942,60 +1058,155 @@ fn run(
             result
         }
 
-        Op::UpsertTrait { namespace, value, scope, usage_note, teach } => catalog
-            .upsert_trait(&namespace, &value, scope.as_deref(), usage_note.as_deref(), teach)
-            .map(|_| WriteResult { changed: 1, ..Default::default() })
+        // Import-packages dialog (FEATURES §5.2): the discovery scan already read each
+        // archive's manifest, so this records + mints from those locators — no second inflate.
+        // One `package` row per selected pack, pinned and in-pack minted: the Library and its
+        // cards exist immediately; identify runs off the drains in the background.
+        Op::ImportPacks { root, packs } => {
+            let label = format!("Import {} packs", packs.len());
+            let job = jobs.start(label, "import", false);
+            let result = (|| {
+                let name = lodestash_app::config::stem_name(std::path::Path::new(&root));
+                let source_id = catalog
+                    .upsert_import_source(&name, &root, "folder")
+                    .map_err(|e| e.to_string())?;
+                let mut inserted = 0usize;
+                for pack in packs {
+                    let id = catalog
+                        .upsert_package(
+                            source_id,
+                            &pack.abs_path,
+                            &pack.name,
+                            pack.publisher.as_deref(),
+                            pack.category.as_deref(),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    catalog
+                        .record_package_entries(id, &pack.entries)
+                        .map_err(|e| e.to_string())?;
+                    inserted += mint_in_pack(catalog, id, &pack.entries)?;
+                    catalog
+                        .set_package_pinned(id, true)
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(WriteResult {
+                    changed: inserted,
+                    ..Default::default()
+                })
+            })();
+            let ok = result.is_ok();
+            let inserted = result.as_ref().map(|r| r.changed).unwrap_or(0);
+            jobs.finish(job.id, ok, false, inserted);
+            result
+        }
+
+        Op::UpsertTrait {
+            namespace,
+            value,
+            scope,
+            usage_note,
+            teach,
+        } => catalog
+            .upsert_trait(
+                &namespace,
+                &value,
+                scope.as_deref(),
+                usage_note.as_deref(),
+                teach,
+            )
+            .map(|_| WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
             .map_err(|e| e.to_string()),
 
         Op::UnpromoteTrait { tag_id } => catalog
             .unpromote_trait(tag_id)
-            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map(|_| WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
             .map_err(|e| e.to_string()),
 
         Op::SetTraitTeach { tag_id, teach } => catalog
             .set_trait_teach(tag_id, teach)
-            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map(|_| WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
             .map_err(|e| e.to_string()),
 
-        Op::SetTraitStyle { tag_id, color, icon } => catalog
+        Op::SetTraitStyle {
+            tag_id,
+            color,
+            icon,
+        } => catalog
             .set_trait_style(tag_id, color.as_deref(), icon.as_deref())
-            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map(|_| WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
             .map_err(|e| e.to_string()),
 
         Op::SetSourceWatch { id, watch } => catalog
             .set_source_watch(id, watch)
-            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map(|_| WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
             .map_err(|e| e.to_string()),
 
         // Log the create (id + name) after the row exists so undo can delete exactly the
         // collection this op created (UI-SPEC §2 / DESIGN-GUIDELINES §7 L5).
         Op::CreateCollection { name } => {
-            let id = catalog.create_collection(&name).map_err(|e| e.to_string())?;
+            let id = catalog
+                .create_collection(&name)
+                .map_err(|e| e.to_string())?;
             catalog
                 .record_collection_create_op(id, &name)
                 .map_err(|e| e.to_string())?;
-            Ok(WriteResult { changed: 1, ..Default::default() })
+            Ok(WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
         }
 
         Op::DeleteCollection { id } => catalog
             .delete_collection(id)
-            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map(|_| WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
             .map_err(|e| e.to_string()),
 
         Op::SetPackagePinned { id, pinned } => catalog
             .set_package_pinned(id, pinned)
-            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map(|_| WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
             .map_err(|e| e.to_string()),
 
-        Op::AddSourceExclude { source_id, kind, value } => {
+        Op::AddSourceExclude {
+            source_id,
+            kind,
+            value,
+        } => {
             catalog
                 .add_source_exclude(source_id, &kind, &value)
                 .map_err(|e| e.to_string())?;
             sync_source_exclude_to_config(catalog, source_id, &kind, &value, true)?;
-            Ok(WriteResult { changed: 1, ..Default::default() })
+            Ok(WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
         }
 
-        Op::RemoveSourceExclude { source_id, kind, value } => {
+        Op::RemoveSourceExclude {
+            source_id,
+            kind,
+            value,
+        } => {
             let removed = catalog
                 .remove_source_exclude(source_id, &kind, &value)
                 .map_err(|e| e.to_string())?;
@@ -1008,32 +1219,61 @@ fn run(
 
         Op::SetActiveTaxonomy { id } => catalog
             .set_active_taxonomy(id)
-            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map(|_| WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
             .map_err(|e| e.to_string()),
 
-        Op::AddRule { taxonomy_id, category_id, match_type, pattern, priority } => catalog
+        Op::AddRule {
+            taxonomy_id,
+            category_id,
+            match_type,
+            pattern,
+            priority,
+        } => catalog
             .add_rule(taxonomy_id, category_id, &match_type, &pattern, priority)
-            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map(|_| WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
             .map_err(|e| e.to_string()),
 
         Op::DeleteRule { rule_id } => catalog
             .delete_rule(rule_id)
-            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map(|_| WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
             .map_err(|e| e.to_string()),
 
         Op::DeleteTaxonomy { id } => catalog
             .delete_taxonomy(id)
-            .map(|removed| WriteResult { changed: removed, ..Default::default() })
+            .map(|removed| WriteResult {
+                changed: removed,
+                ..Default::default()
+            })
             .map_err(|e| e.to_string()),
 
-        Op::AddCategory { taxonomy_id, parent_id, pref_label, path } => catalog
+        Op::AddCategory {
+            taxonomy_id,
+            parent_id,
+            pref_label,
+            path,
+        } => catalog
             .add_category(taxonomy_id, parent_id, &pref_label, &path)
-            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map(|_| WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
             .map_err(|e| e.to_string()),
 
         Op::ApplyMapping { taxonomy_id } => catalog
             .apply_mapping(taxonomy_id)
-            .map(|changed| WriteResult { changed, ..Default::default() })
+            .map(|changed| WriteResult {
+                changed,
+                ..Default::default()
+            })
             .map_err(|e| e.to_string()),
 
         Op::IdentifyAll => {
@@ -1064,7 +1304,9 @@ fn run(
             // (and whatever else was already pending — the pass reconciles the whole backlog,
             // which is what "identify now" means honestly). No embedders → the flags still
             // get set, so a later pass (or auto-identify) completes the appraise.
-            catalog.mark_for_identify(asset_id).map_err(|e| e.to_string())?;
+            catalog
+                .mark_for_identify(asset_id)
+                .map_err(|e| e.to_string())?;
             let job = jobs.start(format!("Identify asset {asset_id}"), "appraise", false);
             let embedder = resolve_embedder();
             let audio_embedder = resolve_audio_embedder();
@@ -1089,11 +1331,18 @@ fn run(
             for id in &asset_ids {
                 catalog.mark_for_identify(*id).map_err(|e| e.to_string())?;
             }
-            let job = jobs.start(format!("Identify {} assets", asset_ids.len()), "appraise", false);
+            let job = jobs.start(
+                format!("Identify {} assets", asset_ids.len()),
+                "appraise",
+                false,
+            );
             let embedder = resolve_embedder();
             let audio_embedder = resolve_audio_embedder();
             if embedder.is_none() && audio_embedder.is_none() {
-                tracing::warn!("Identify {} assets: no local embedder models — flagged for a later pass", asset_ids.len());
+                tracing::warn!(
+                    "Identify {} assets: no local embedder models — flagged for a later pass",
+                    asset_ids.len()
+                );
             }
             let result = appraise_pass(
                 catalog,
@@ -1113,7 +1362,9 @@ fn run(
             let project_id = catalog
                 .active_project_id()
                 .map_err(|e| e.to_string())?
-                .ok_or_else(|| "no active project registered — register one via the Connect wizard".to_string())?;
+                .ok_or_else(|| {
+                    "no active project registered — register one via the Connect wizard".to_string()
+                })?;
             let tray = catalog
                 .staging_tray_id(project_id)
                 .map_err(|e| e.to_string())?
@@ -1121,7 +1372,10 @@ fn run(
             catalog
                 .collection_add_asset(tray, asset_id)
                 .map_err(|e| e.to_string())?;
-            Ok(WriteResult { changed: 1, ..Default::default() })
+            Ok(WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
         }
 
         Op::UnstageAsset { asset_id } => {
@@ -1136,7 +1390,10 @@ fn run(
             catalog
                 .collection_remove_asset(tray, asset_id)
                 .map_err(|e| e.to_string())?;
-            Ok(WriteResult { changed: 1, ..Default::default() })
+            Ok(WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
         }
 
         Op::ExtractPackage { package_id } => {
@@ -1184,8 +1441,7 @@ fn run(
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_millis() as u64)
                                 .unwrap_or(0);
-                            if now_ms.saturating_sub(last_progress.load(Ordering::Relaxed)) >= 250
-                            {
+                            if now_ms.saturating_sub(last_progress.load(Ordering::Relaxed)) >= 250 {
                                 last_progress.store(now_ms, Ordering::Relaxed);
                                 emit_changed(&wapp, "jobs");
                             }
@@ -1232,39 +1488,71 @@ fn run(
         }
         Op::RenameCategory { id, label } => catalog
             .rename_category(id, &label)
-            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map(|_| WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
             .map_err(|e| e.to_string()),
 
         Op::SetActiveProject { project_id } => catalog
             .set_active_project(project_id)
-            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map(|_| WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
             .map_err(|e| e.to_string()),
+
+        // Batch undo opens its own connection on this thread (the same pattern as
+        // persist_to_catalog): the single-writer rule is about which *thread* writes, and this
+        // is still the writer — no other job can interleave with the delete.
+        Op::UndoImportBatch { batch_id } => undo_import_batch(db_path, &batch_id),
 
         Op::DeleteCategory { id } => catalog
             .delete_category(id)
-            .map(|removed| WriteResult { changed: removed, ..Default::default() })
+            .map(|removed| WriteResult {
+                changed: removed,
+                ..Default::default()
+            })
             .map_err(|e| e.to_string()),
 
         // Undo: the writer thread is the one place a revert may run — it is a catalog mutation
         // and every catalog mutation belongs here, one order (ARCHITECTURE §5).
         Op::RevertOp { op_id } => catalog
             .revert_op(op_id)
-            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map(|_| WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
             .map_err(|e| e.to_string()),
 
         Op::RedoOp { op_id } => catalog
             .redo_op(op_id)
-            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map(|_| WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
             .map_err(|e| e.to_string()),
 
-        Op::CollectionAddAsset { collection_id, asset_id } => catalog
+        Op::CollectionAddAsset {
+            collection_id,
+            asset_id,
+        } => catalog
             .collection_add_asset(collection_id, asset_id)
-            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map(|_| WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
             .map_err(|e| e.to_string()),
 
-        Op::CollectionRemoveAsset { collection_id, asset_id } => catalog
+        Op::CollectionRemoveAsset {
+            collection_id,
+            asset_id,
+        } => catalog
             .collection_remove_asset(collection_id, asset_id)
-            .map(|_| WriteResult { changed: 1, ..Default::default() })
+            .map(|_| WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
             .map_err(|e| e.to_string()),
 
         // Bulk-bar tag edit (KANBAN B9d). Tag writes replace per **source** (`set_tags`
@@ -1272,7 +1560,12 @@ fn run(
         // the `manual` source — the established source for user-set tags (set_tags docs). Each
         // asset's prior `manual` set is snapshotted into its own undo-log entry first, which
         // is exactly the payload `revert_set_tags` restores on undo.
-        Op::BulkTag { asset_ids, namespace, value, on } => {
+        Op::BulkTag {
+            asset_ids,
+            namespace,
+            value,
+            on,
+        } => {
             const SOURCE: &str = "manual";
             let mut changed = 0usize;
             // Only the assets that actually changed go into the undo row — a no-op add on an
@@ -1305,9 +1598,72 @@ fn run(
                     .record_bulk_tag_op(&affected, &namespace, &value, on)
                     .map_err(|e| e.to_string())?;
             }
-            Ok(WriteResult { changed, ..Default::default() })
+            Ok(WriteResult {
+                changed,
+                ..Default::default()
+            })
         }
     }
+}
+
+/// Undo one import batch (UI-SPEC §16.1): delete the batch's copied files from the project,
+/// then its import_record rows — catalog assets are never touched. Runs on the writer thread
+/// over its own short-lived connection, so the single-writer rule holds (same pattern as
+/// persist_to_catalog); the connection does not run migrations (the writer's own catalog already
+/// did at spawn).
+fn undo_import_batch(db_path: &Path, batch_id: &str) -> Result<WriteResult, String> {
+    let conn = Connection::open(db_path).map_err(|e| format!("catalog unavailable: {e}"))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT p.project_path, ir.dest_path
+               FROM import_record ir
+               JOIN project p ON p.id = ir.project_id
+              WHERE ir.batch_id = ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let files: Vec<(String, String)> = stmt
+        .query_map([batch_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())?;
+
+    // Delete the copied files first, while the paths are still known — the records go only
+    // after the files, so a failed delete never strands a record pointing at nothing. A missing
+    // file counts as refused (already gone), an error as failed.
+    let mut failed = 0usize;
+    let mut refused = 0usize;
+    for (project_path, dest_path) in &files {
+        let dest = Path::new(dest_path);
+        // Fence the one destructive path (HANDOFF §6): `dest_path` is project-relative, so a
+        // non-relative path or a `..` component must never resolve outside the project root.
+        if dest.is_absolute()
+            || dest
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            refused += 1;
+            continue;
+        }
+        let abs = Path::new(project_path).join(dest);
+        match std::fs::remove_file(&abs) {
+            Ok(()) => {
+                // Unity's import sidecar, if it exists — leaving it would half-undo the import.
+                let _ = std::fs::remove_file(PathBuf::from(format!("{}.meta", abs.display())));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => refused += 1,
+            Err(_) => failed += 1,
+        }
+    }
+
+    let changed = conn
+        .execute("DELETE FROM import_record WHERE batch_id = ?1", [batch_id])
+        .map_err(|e| e.to_string())?;
+    Ok(WriteResult {
+        changed,
+        failed,
+        refused,
+        ..Default::default()
+    })
 }
 
 /// Mint a pack's in-pack assets (M14 surgical indexing): classify the recorded locators by
@@ -1409,6 +1765,7 @@ fn materialize_extract(
     catalog: &mut Catalog,
     package_id: i64,
     outcome: Result<Vec<ExtractedAsset>, String>,
+    cancelled: bool,
 ) -> Result<WriteResult, String> {
     let extracted = outcome?;
     let pairs: Vec<(String, String)> = extracted
@@ -1423,9 +1780,14 @@ fn materialize_extract(
         .materialize_in_pack_assets(package_id, &pairs)
         .map_err(|e| e.to_string())?;
     let changed = matched.len();
-    catalog
-        .mark_package_unpacked(package_id, changed)
-        .map_err(|e| e.to_string())?;
+    // Only a *finished* extraction may stamp the pack unpacked (HANDOFF §6): a cancelled one
+    // still materializes its valid, resumable files, but `changed` is a truncated count and
+    // recording it as the whole pack would make the catalog claim a full extraction.
+    if !cancelled {
+        catalog
+            .mark_package_unpacked(package_id, changed)
+            .map_err(|e| e.to_string())?;
+    }
     Ok(WriteResult {
         changed,
         ..Default::default()
@@ -1472,7 +1834,10 @@ fn remove_from_library(
         }
     }
     tracing::info!(rows = changed, excluded, "removed from library");
-    Ok(WriteResult { changed, ..Default::default() })
+    Ok(WriteResult {
+        changed,
+        ..Default::default()
+    })
 }
 
 /// Mirror a blacklist edit into the app config the crawler actually reads (UI-SPEC §11.1).
@@ -1626,5 +1991,3 @@ mod tests {
         );
     }
 }
-
-

@@ -2,7 +2,16 @@
   import Icon from "./Icon.svelte";
   import { TABS } from "./routes";
   import { view } from "./nav.svelte";
-  import type { LibraryStatus } from "./api";
+  import { push } from "./toasts.svelte";
+  import {
+    projects,
+    setActiveProject,
+    recentExports,
+    undoImportBatch,
+    type LibraryStatus,
+    type ProjectRow,
+    type ImportBatch,
+  } from "./api";
 
   let { engineReady, status = null }: { engineReady: boolean; status?: LibraryStatus | null } = $props();
 
@@ -24,6 +33,89 @@
     n >= 1000
       ? `${(n / 1000).toLocaleString(undefined, { maximumFractionDigits: 1 })}k`
       : n.toLocaleString();
+
+  // ── Project switcher (UI-SPEC §16.1) ──────────────────────────────────────────────────────
+  // Replaces the static No project chip: export targets (switch via setActiveProject), recent
+  // import batches (per-batch undo), and the Connect wizard entry (routes to Settings → Unity
+  // Editors). The shell staging shortlist is in-memory — switching projects never mixes picks.
+  let open = $state(false);
+  let projectsList = $state<ProjectRow[]>([]);
+  let batches = $state<ImportBatch[]>([]);
+  let undoing = $state<string | null>(null);
+  let confirming = $state<string | null>(null);
+
+  let activeProject = $derived(projectsList.find((p) => p.is_active) ?? null);
+
+  async function loadSwitcher() {
+    try {
+      const [ps, bs] = await Promise.all([projects(), recentExports(4)]);
+      projectsList = ps;
+      batches = bs;
+    } catch {
+      // Open anyway — the empty sections read honestly when the catalog is not there yet.
+      projectsList = [];
+      batches = [];
+    }
+  }
+
+  function toggle() {
+    open = !open;
+    if (open) {
+      confirming = null;
+      loadSwitcher();
+    }
+  }
+
+  async function switchProject(p: ProjectRow) {
+    try {
+      await setActiveProject(p.id);
+      push(`Switched to ${p.name}`, "ok");
+      view.dataVersion += 1; // re-read the grid — staging/imports follow the active project
+    } catch (e) {
+      push(String(e), "err");
+    }
+    await loadSwitcher();
+  }
+
+  async function undoBatch(batchId: string) {
+    // Confirm-gated (UI-SPEC §16.1): first click arms, the second within 3s confirms.
+    if (confirming !== batchId) {
+      confirming = batchId;
+      setTimeout(() => {
+        if (confirming === batchId) confirming = null;
+      }, 3000);
+      return;
+    }
+    confirming = null;
+    undoing = batchId;
+    try {
+      const r = await undoImportBatch(batchId);
+      push(r.changed === 1 ? "Undid 1 file" : `Undid ${r.changed} files`, "ok");
+      view.dataVersion += 1; // re-read the grid after the batch is gone
+    } catch (e) {
+      push(String(e), "err");
+    }
+    undoing = null;
+    await loadSwitcher();
+  }
+
+  function connectProject() {
+    open = false;
+    // The wizard app half lives in Settings → Unity Editors; the entry routes there.
+    view.go("settings");
+  }
+
+  /** Ns / Nm / Nh / Nd ago — the relative time the recent-exports rows show. */
+  function relTime(atUnix: number): string {
+    const s = Math.max(0, Math.floor(Date.now() / 1000 - atUnix));
+    if (s < 60) return `${s}s ago`;
+    if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+    if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+    return `${Math.floor(s / 86400)}d ago`;
+  }
+
+  // Hydrate once so the chip shows the active project name (not just after the popover opens).
+  loadSwitcher();
 </script>
 
 <header class="topbar">
@@ -93,11 +185,89 @@
   {/if}
 
   <div class="chips">
-    <span class="chip"><Icon name="ls-project" size={14} /> No project</span>
+    <button
+      class="chip project-chip"
+      class:has-project={activeProject !== null}
+      data-testid="project-chip"
+      aria-haspopup="menu"
+      aria-expanded={open}
+      onclick={toggle}
+    >
+      <span class="dot" class:on={activeProject !== null}></span>
+      <Icon name="ls-project" size={14} />
+      <span class="label">{activeProject?.name ?? "No project"}</span>
+      <span class="caret" aria-hidden="true">▾</span>
+    </button>
     <span class="chip" class:warn={!engineReady}>
       {engineReady ? "✦ local" : "✦ shell only"}
     </span>
   </div>
+
+  {#if open}
+    <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+    <div class="switcher-scrim" onclick={() => (open = false)}>
+      <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+      <div
+        class="switcher"
+        role="menu"
+        tabindex="-1"
+        onclick={(e) => e.stopPropagation()}
+        data-testid="project-switcher"
+      >
+        <div class="section-title">Export targets</div>
+        {#if projectsList.length === 0}
+          <p class="empty">No Unity project connected.</p>
+        {:else}
+          {#each projectsList as p (p.id)}
+            <button
+              class="project-row"
+              class:active={p.is_active}
+              onclick={() => switchProject(p)}
+              data-testid="project-row"
+            >
+              <span class="dot" class:on={p.is_active}></span>
+              <span class="pinfo">
+                <span class="pname">
+                  {p.name}
+                  {#if p.is_active}<span class="tick" aria-hidden="true">✓</span>{/if}
+                </span>
+                <span class="pmeta">{p.unity_version ?? "Unity"} · {p.project_path}</span>
+              </span>
+            </button>
+          {/each}
+        {/if}
+
+        <div class="section-title">Recent exports</div>
+        {#if batches.length === 0}
+          <p class="empty">Nothing exported yet.</p>
+        {:else}
+          {#each batches as b (b.batch_id)}
+            <div class="batch-row" data-testid="export-batch">
+              <span class="bmeta">
+                ✓ {b.file_count} {b.file_count === 1 ? "file" : "files"} → {b.dest || "/"}
+                <span class="rel">{relTime(b.imported_at)}</span>
+              </span>
+              <span class="bproj">{b.project_name}</span>
+              <button
+                class="undo"
+                class:armed={confirming === b.batch_id}
+                disabled={undoing === b.batch_id}
+                onclick={() => undoBatch(b.batch_id)}
+                data-testid="undo-batch"
+              >
+                {undoing === b.batch_id ? "…" : confirming === b.batch_id ? "confirm?" : "↩ undo"}
+              </button>
+            </div>
+          {/each}
+        {/if}
+
+        <button class="connect" onclick={connectProject} data-testid="connect-project">
+          + Connect Unity project…
+        </button>
+        <p class="footnote">Recent exports undo per batch — catalog assets are never touched.</p>
+      </div>
+    </div>
+  {/if}
 </header>
 
 <style>
@@ -266,5 +436,176 @@
   .chip.warn {
     color: var(--ls-warning);
     border-color: color-mix(in srgb, var(--ls-warning) 40%, transparent);
+  }
+
+  /* Project switcher popover (UI-SPEC §16.1): a dropdown under the chip. */
+  .project-chip {
+    cursor: pointer;
+    font: inherit;
+  }
+  .project-chip.has-project {
+    color: var(--ls-text);
+  }
+  .project-chip .dot,
+  .project-row .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex: none;
+    background: var(--ls-text-muted);
+  }
+  .project-chip .dot.on,
+  .project-row .dot.on {
+    background: var(--ls-success);
+    box-shadow: 0 0 6px color-mix(in srgb, var(--ls-success) 60%, transparent);
+  }
+  .project-chip .label {
+    max-width: 160px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .project-chip .caret {
+    font-size: 10px;
+    color: var(--ls-text-dim);
+  }
+
+  .switcher-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+  }
+  .switcher {
+    position: absolute;
+    top: calc(var(--topbar-h) + 4px);
+    right: var(--sp-3);
+    width: 310px;
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-1);
+    padding: var(--sp-2);
+    background: var(--ls-overlay);
+    border: 1px solid var(--ls-border-strong);
+    border-radius: var(--r-md);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    color: var(--ls-text);
+  }
+  .section-title {
+    font-size: var(--fs-xs);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ls-text-dim);
+    padding: var(--sp-1);
+  }
+  .empty {
+    margin: 0;
+    padding: var(--sp-1);
+    font-size: var(--fs-sm);
+    color: var(--ls-text-muted);
+  }
+  .project-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    padding: var(--sp-1) var(--sp-2);
+    border-radius: var(--r-sm);
+    text-align: left;
+    font: inherit;
+  }
+  .project-row:hover {
+    background: var(--ls-surface);
+  }
+  .project-row.active {
+    background: color-mix(in srgb, var(--ls-gold) 12%, transparent);
+  }
+  .project-row .pinfo {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .project-row .pname {
+    font-size: var(--fs-sm);
+    color: var(--ls-text);
+    display: flex;
+    align-items: center;
+    gap: var(--sp-1);
+  }
+  .project-row .tick {
+    color: var(--ls-gold);
+  }
+  .project-row .pmeta {
+    font-size: var(--fs-xs);
+    color: var(--ls-text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .batch-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    padding: var(--sp-1) var(--sp-2);
+    border-radius: var(--r-sm);
+  }
+  .batch-row:hover {
+    background: var(--ls-surface);
+  }
+  .batch-row .bmeta {
+    flex: 1;
+    min-width: 0;
+    font-size: var(--fs-sm);
+    color: var(--ls-text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .batch-row .rel {
+    color: var(--ls-text-dim);
+  }
+  .batch-row .bproj {
+    flex: none;
+    font-size: var(--fs-xs);
+    color: var(--ls-text-muted);
+    max-width: 90px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .batch-row .undo {
+    flex: none;
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+    text-decoration: underline;
+    font: inherit;
+  }
+  .batch-row .undo:hover:not(:disabled) {
+    color: var(--ls-gold);
+  }
+  .batch-row .undo.armed {
+    color: var(--ls-danger);
+  }
+  .batch-row .undo:disabled {
+    opacity: 0.5;
+    cursor: wait;
+  }
+  .connect {
+    margin-top: var(--sp-1);
+    padding: var(--sp-2);
+    border: 1px dashed var(--ls-border-strong);
+    border-radius: var(--r-sm);
+    font-size: var(--fs-sm);
+    color: var(--ls-text-dim);
+    text-align: left;
+    font: inherit;
+  }
+  .connect:hover {
+    color: var(--ls-gold);
+    border-color: var(--ls-gold);
+  }
+  .footnote {
+    margin: var(--sp-1) 0 0;
+    padding: 0 var(--sp-1);
+    font-size: var(--fs-xs);
+    color: var(--ls-text-muted);
   }
 </style>

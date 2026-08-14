@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use rusqlite::Connection;
 use serde::Serialize;
 use tauri::Manager;
 use tauri_plugin_window_state::AppHandleExt;
@@ -60,6 +61,11 @@ struct AppState {
     /// `None` when there is no catalog on disk yet — every write then reports why instead of
     /// pretending to succeed.
     writer: Option<Writer>,
+    /// The Import-packages dialog's (FEATURES §5.2) discovery cache: archive absolute path → the
+    /// manifest locators `discover_package_folder` read, held so `import_packages` can record +
+    /// mint without re-inflating the archive.
+    discovered:
+        Mutex<std::collections::HashMap<String, Vec<lodestash_core::catalog::PackageEntryRecord>>>,
 }
 
 impl AppState {
@@ -177,7 +183,10 @@ fn near_duplicate_groups(state: tauri::State<'_, AppState>) -> Result<Vec<DupGro
 /// One level of the Folders view (DESIGN-GUIDELINES §7). `source: null` is the top level, where
 /// the tiles are the sources themselves.
 #[tauri::command]
-fn folder_page(state: tauri::State<'_, AppState>, query: FolderQuery) -> Result<FolderPage, String> {
+fn folder_page(
+    state: tauri::State<'_, AppState>,
+    query: FolderQuery,
+) -> Result<FolderPage, String> {
     state
         .library
         .lock()
@@ -418,15 +427,193 @@ fn add_source_dialog(
                 tauri_plugin_dialog::FilePath::Url(_) => PathBuf::new(),
             }));
         });
-    match rx
-        .recv()
-        .map_err(|_| "folder dialog closed".to_string())?
-    {
+    match rx.recv().map_err(|_| "folder dialog closed".to_string())? {
         Some(path) if !path.as_os_str().is_empty() => {
             add_source(state, path.to_string_lossy().into_owned()).map(Some)
         }
         _ => Ok(None),
     }
+}
+
+/// Native folder chooser for the import dialog (FEATURES §5.2): returns the chosen path, or
+/// `None` on cancel. Picking is the only thing here — the scan happens in `discover_package_folder`
+/// so the UI can show a real modal with a spinner rather than a blocking native loop.
+#[tauri::command]
+fn pick_package_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.dialog()
+        .file()
+        .set_title("Choose a folder of .unitypackage files")
+        .pick_folder(move |path| {
+            let _ = tx.send(path.map(|p| match p {
+                tauri_plugin_dialog::FilePath::Path(p) => p.to_string_lossy().into_owned(),
+                tauri_plugin_dialog::FilePath::Url(_) => String::new(),
+            }));
+        });
+    match rx.recv().map_err(|_| "folder dialog closed".to_string())? {
+        Some(path) if !path.is_empty() => Ok(Some(path)),
+        _ => Ok(None),
+    }
+}
+
+/// One `.unitypackage` the import dialog lists (FEATURES §5.2): the folder scanned for packs,
+/// each described for the modal — group (the containing folder, the publisher/category tree in an
+/// Asset Store cache), name, version, size, classifiable entry count, an auto-detected content
+/// category, and the §5.6 duplicate flag.
+#[derive(serde::Serialize)]
+struct DiscoveredPackage {
+    group: String,
+    publisher: String,
+    name: String,
+    abs_path: String,
+    size_bytes: u64,
+    version: Option<String>,
+    assets: usize,
+    category: Option<String>,
+    duplicate_of: Option<String>,
+}
+
+/// The Import-packages dialog's scan (FEATURES §5.2, read-only). Walks the folder for
+/// `.unitypackage` files and reads each archive's manifest to count classifiable assets, detect a
+/// content category, and read the version — stashing the locators for `import_packages` so the
+/// write never re-inflates the archive. Nothing is copied or written.
+#[tauri::command]
+fn discover_package_folder(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<Vec<DiscoveredPackage>, String> {
+    let root = PathBuf::from(&path);
+    if !root.is_dir() {
+        return Err(format!("{path} is not a folder"));
+    }
+    let packs = lodestash_ingest::asset_store::discover(&root);
+    if packs.is_empty() {
+        return Err(format!("no .unitypackage files found in {path}"));
+    }
+
+    // §5.6 duplicate check: normalized-name match against what the catalog already holds.
+    let known: std::collections::HashMap<String, String> = state
+        .library
+        .lock()
+        .map(|l| {
+            l.packages()
+                .into_iter()
+                .map(|p| (lodestash_app::scan::normalize_pack_name(&p.name), p.name))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut out = Vec::with_capacity(packs.len());
+    let mut cache = state
+        .discovered
+        .lock()
+        .map_err(|_| "discovery cache poisoned".to_string())?;
+    for p in packs {
+        let abs = p.path.to_string_lossy().into_owned();
+        let entries: Vec<lodestash_core::catalog::PackageEntryRecord> =
+            lodestash_ingest::unitypackage::read_manifest(&p.path)
+                .map(|m| {
+                    m.iter()
+                        .map(|e| lodestash_core::catalog::PackageEntryRecord {
+                            guid: e.guid.clone(),
+                            pathname: e.pathname.clone(),
+                            tar_offset: e.asset_offset.map(|o| o as i64),
+                            size_bytes: e.asset_size.map(|s| s as i64),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+        let assets = entries
+            .iter()
+            .filter(|e| {
+                e.pathname.as_deref().map_or(false, |pn| {
+                    lodestash_ingest::detect::by_extension(std::path::Path::new(pn)).is_some()
+                })
+            })
+            .count();
+        let category = lodestash_app::scan::dominant_content_category(&entries).map(str::to_owned);
+        // Version needs a second, targeted pass (`read_package_meta`); best-effort — a pack with
+        // no UPM package.json simply shows no version.
+        let version = if entries.is_empty() {
+            None
+        } else {
+            let meta_entries: Vec<lodestash_ingest::unitypackage::PackageEntry> = entries
+                .iter()
+                .map(|e| lodestash_ingest::unitypackage::PackageEntry {
+                    guid: e.guid.clone(),
+                    pathname: e.pathname.clone(),
+                    asset_size: e.size_bytes.map(|s| s as u64),
+                    ..Default::default()
+                })
+                .collect();
+            lodestash_ingest::unitypackage::read_package_meta(&p.path, &meta_entries)
+                .ok()
+                .and_then(|m| m.version)
+        };
+        let duplicate_of = known
+            .get(&lodestash_app::scan::normalize_pack_name(&p.name))
+            .cloned();
+        cache.insert(abs.clone(), entries);
+        out.push(DiscoveredPackage {
+            group: p.group,
+            publisher: p.publisher,
+            name: p.name,
+            abs_path: abs,
+            size_bytes: p.size_bytes,
+            version,
+            assets,
+            category,
+            duplicate_of,
+        });
+    }
+    Ok(out)
+}
+
+/// What the import dialog sends back per ticked pack (FEATURES §5.2) — the display fields plus
+/// the (possibly overridden) category. The manifest locators are filled from the discovery cache
+/// server-side, so the webview never round-trips thousands of entries.
+#[derive(serde::Deserialize)]
+struct ImportSelection {
+    abs_path: String,
+    name: String,
+    publisher: Option<String>,
+    category: Option<String>,
+}
+
+/// Import the ticked packs as libraries (FEATURES §5.2): one `package` row apiece, pinned and
+/// in-pack minted — nothing copied, nothing unpacked. Runs on the single writer (ADR-0002); the
+/// manifest locators come from this session's discovery scan.
+#[tauri::command]
+fn import_packages(
+    state: tauri::State<'_, AppState>,
+    root: String,
+    packs: Vec<ImportSelection>,
+) -> Result<WriteResult, String> {
+    let full = {
+        let mut cache = state
+            .discovered
+            .lock()
+            .map_err(|_| "discovery cache poisoned".to_string())?;
+        let mut full = Vec::with_capacity(packs.len());
+        for sel in packs {
+            let entries = cache.remove(&sel.abs_path).ok_or_else(|| {
+                format!(
+                    "{} was not discovered in this session — re-scan the folder",
+                    sel.abs_path
+                )
+            })?;
+            full.push(crate::writer::ImportPack {
+                abs_path: sel.abs_path,
+                name: sel.name,
+                publisher: sel.publisher,
+                category: sel.category,
+                entries,
+            });
+        }
+        full
+    };
+    state.write(Op::ImportPacks { root, packs: full })
 }
 
 /// Re-read the catalog. The egui app writes it, so a scan there shows up here on request —
@@ -444,7 +631,10 @@ fn reload_library(state: tauri::State<'_, AppState>) -> Result<LibraryStatus, St
 /// The pack browser's left tree (PACK-DIRECTORY-NAV §5). Rooted at one package — derived from
 /// the in-memory rows, so it always agrees with the contents pane.
 #[tauri::command]
-fn pack_dir_tree(state: tauri::State<'_, AppState>, package: String) -> Result<Vec<PackDirNode>, String> {
+fn pack_dir_tree(
+    state: tauri::State<'_, AppState>,
+    package: String,
+) -> Result<Vec<PackDirNode>, String> {
     state
         .library
         .lock()
@@ -493,7 +683,11 @@ fn unpromote_trait(state: tauri::State<'_, AppState>, tag_id: i64) -> Result<Wri
 }
 
 #[tauri::command]
-fn set_trait_teach(state: tauri::State<'_, AppState>, tag_id: i64, teach: bool) -> Result<WriteResult, String> {
+fn set_trait_teach(
+    state: tauri::State<'_, AppState>,
+    tag_id: i64,
+    teach: bool,
+) -> Result<WriteResult, String> {
     state.write(Op::SetTraitTeach { tag_id, teach })
 }
 
@@ -504,7 +698,11 @@ fn set_trait_style(
     color: Option<String>,
     icon: Option<String>,
 ) -> Result<WriteResult, String> {
-    state.write(Op::SetTraitStyle { tag_id, color, icon })
+    state.write(Op::SetTraitStyle {
+        tag_id,
+        color,
+        icon,
+    })
 }
 
 /// The Settings screen's snapshot (UI-SPEC §11). Read once; the frontend writes it back whole.
@@ -516,7 +714,10 @@ fn get_settings() -> Result<Settings, String> {
 /// Bytes + file count under the preview cache root (Settings' CACHE card).
 #[tauri::command]
 fn preview_cache_usage(state: tauri::State<'_, AppState>) -> Result<(u64, usize), String> {
-    let lib = state.library.lock().map_err(|_| "library lock poisoned".to_string())?;
+    let lib = state
+        .library
+        .lock()
+        .map_err(|_| "library lock poisoned".to_string())?;
     Ok(lib.preview_cache_usage())
 }
 
@@ -524,7 +725,10 @@ fn preview_cache_usage(state: tauri::State<'_, AppState>) -> Result<(u64, usize)
 /// library lock; the workspace (extracted assets) is never touched.
 #[tauri::command]
 fn clear_preview_cache(state: tauri::State<'_, AppState>) -> Result<usize, String> {
-    let lib = state.library.lock().map_err(|_| "library lock poisoned".to_string())?;
+    let lib = state
+        .library
+        .lock()
+        .map_err(|_| "library lock poisoned".to_string())?;
     Ok(lib.clear_preview_cache())
 }
 
@@ -544,13 +748,19 @@ fn set_settings(state: tauri::State<'_, AppState>, settings: Settings) -> Result
 /// Pause/resume watching one source (UI-SPEC §11.1). Goes through the writer like every catalog
 /// write; the library reload after it refreshes the Sources rows.
 #[tauri::command]
-fn set_source_watch(state: tauri::State<'_, AppState>, id: i64, watch: bool) -> Result<WriteResult, String> {
+fn set_source_watch(
+    state: tauri::State<'_, AppState>,
+    id: i64,
+    watch: bool,
+) -> Result<WriteResult, String> {
     state.write(Op::SetSourceWatch { id, watch })
 }
 
 /// Every non-staging collection with its member count (UI-SPEC §6).
 #[tauri::command]
-fn collections(state: tauri::State<'_, AppState>) -> Result<Vec<lodestash_core::catalog::CollectionRow>, String> {
+fn collections(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<lodestash_core::catalog::CollectionRow>, String> {
     state
         .library
         .lock()
@@ -560,7 +770,10 @@ fn collections(state: tauri::State<'_, AppState>) -> Result<Vec<lodestash_core::
 
 /// The member ids of one collection — what a collection-filtered grid matches on (UI-SPEC §6).
 #[tauri::command]
-fn collection_members(state: tauri::State<'_, AppState>, collection_id: i64) -> Result<Vec<i64>, String> {
+fn collection_members(
+    state: tauri::State<'_, AppState>,
+    collection_id: i64,
+) -> Result<Vec<i64>, String> {
     state
         .library
         .lock()
@@ -569,7 +782,10 @@ fn collection_members(state: tauri::State<'_, AppState>, collection_id: i64) -> 
 }
 
 #[tauri::command]
-fn create_collection(state: tauri::State<'_, AppState>, name: String) -> Result<WriteResult, String> {
+fn create_collection(
+    state: tauri::State<'_, AppState>,
+    name: String,
+) -> Result<WriteResult, String> {
     state.write(Op::CreateCollection { name })
 }
 
@@ -580,7 +796,11 @@ fn delete_collection(state: tauri::State<'_, AppState>, id: i64) -> Result<Write
 
 /// Pin/unpin a `.unitypackage` as a library (FEATURES §5.4) — the Unity Assets screen's ⬢.
 #[tauri::command]
-fn set_package_pinned(state: tauri::State<'_, AppState>, id: i64, pinned: bool) -> Result<WriteResult, String> {
+fn set_package_pinned(
+    state: tauri::State<'_, AppState>,
+    id: i64,
+    pinned: bool,
+) -> Result<WriteResult, String> {
     state.write(Op::SetPackagePinned { id, pinned })
 }
 
@@ -638,7 +858,9 @@ fn staged(state: tauri::State<'_, AppState>) -> Result<Vec<i64>, String> {
 /// The Stats Tag Graph (UI-SPEC §8.2): tag nodes, tag↔tag co-occurrence edges and the
 /// `tags · links · assets` header counts. Read-only.
 #[tauri::command]
-fn tag_graph(state: tauri::State<'_, AppState>) -> Result<lodestash_core::catalog::TagGraph, String> {
+fn tag_graph(
+    state: tauri::State<'_, AppState>,
+) -> Result<lodestash_core::catalog::TagGraph, String> {
     state
         .library
         .lock()
@@ -649,7 +871,9 @@ fn tag_graph(state: tauri::State<'_, AppState>) -> Result<lodestash_core::catalo
 /// Every resolved asset→asset edge (DATA-MODEL §10) — the set behind the LINKS filter and the
 /// tag graph's dashed dependency arcs. Read-only.
 #[tauri::command]
-fn asset_edges(state: tauri::State<'_, AppState>) -> Result<Vec<lodestash_core::catalog::AssetEdge>, String> {
+fn asset_edges(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<lodestash_core::catalog::AssetEdge>, String> {
     state
         .library
         .lock()
@@ -702,7 +926,9 @@ fn remove_source_exclude(
 
 /// Every taxonomy for the Mapping tab's switcher (UI-SPEC §9.2), active first.
 #[tauri::command]
-fn taxonomies(state: tauri::State<'_, AppState>) -> Result<Vec<lodestash_core::catalog::TaxonomyRow>, String> {
+fn taxonomies(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<lodestash_core::catalog::TaxonomyRow>, String> {
     state
         .library
         .lock()
@@ -724,7 +950,11 @@ fn delete_taxonomy(state: tauri::State<'_, AppState>, id: i64) -> Result<WriteRe
 
 /// Rename a category (UI-SPEC §9.2 row rename) — rewrites descendant paths in one transaction.
 #[tauri::command]
-fn rename_category(state: tauri::State<'_, AppState>, id: i64, label: String) -> Result<WriteResult, String> {
+fn rename_category(
+    state: tauri::State<'_, AppState>,
+    id: i64,
+    label: String,
+) -> Result<WriteResult, String> {
     state.write(Op::RenameCategory { id, label })
 }
 
@@ -768,7 +998,10 @@ fn list_rules(
 /// Run the deterministic mapping engine over one taxonomy (UI-SPEC §9.2 ⚙ Apply). Returns the
 /// number of assets whose category changed. On the writer thread like every catalog write.
 #[tauri::command]
-fn apply_mapping(state: tauri::State<'_, AppState>, taxonomy_id: i64) -> Result<WriteResult, String> {
+fn apply_mapping(
+    state: tauri::State<'_, AppState>,
+    taxonomy_id: i64,
+) -> Result<WriteResult, String> {
     state.write(Op::ApplyMapping { taxonomy_id })
 }
 
@@ -976,8 +1209,10 @@ fn model_download(state: tauri::State<'_, AppState>, model: String) -> bool {
                 if let Some(w) = &writer_progress {
                     w.done
                         .store(app_progress.done.load(Ordering::Relaxed), Ordering::Relaxed);
-                    w.total
-                        .store(app_progress.total.load(Ordering::Relaxed), Ordering::Relaxed);
+                    w.total.store(
+                        app_progress.total.load(Ordering::Relaxed),
+                        Ordering::Relaxed,
+                    );
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
@@ -1009,7 +1244,10 @@ fn model_remove() -> Result<(), String> {
 /// Per-pack Extract (B2b slice) — unpack the archive into the workspace and reconcile its
 /// payloads into the catalog, on the persist thread like every write.
 #[tauri::command]
-fn extract_package(state: tauri::State<'_, AppState>, package_id: i64) -> Result<WriteResult, String> {
+fn extract_package(
+    state: tauri::State<'_, AppState>,
+    package_id: i64,
+) -> Result<WriteResult, String> {
     state.write(Op::ExtractPackage { package_id })
 }
 
@@ -1028,14 +1266,98 @@ fn cancel_job(state: tauri::State<'_, AppState>, job_id: u64) -> bool {
 /// Registered Unity editors, active first (ENGINE-API §5.1) — the Connect wizard's app half.
 #[tauri::command]
 fn projects(state: tauri::State<'_, AppState>) -> Vec<lodestash_core::catalog::ProjectRow> {
-    state.library.lock().map(|l| l.projects()).unwrap_or_default()
+    state
+        .library
+        .lock()
+        .map(|l| l.projects())
+        .unwrap_or_default()
 }
 
 /// Switch which registered Unity editor is active (ENGINE-API §5.1, UI-SPEC §16.1). A write,
 /// so it goes through the writer thread with every other catalog mutation.
 #[tauri::command]
-fn set_active_project(state: tauri::State<'_, AppState>, project_id: i64) -> Result<WriteResult, String> {
+fn set_active_project(
+    state: tauri::State<'_, AppState>,
+    project_id: i64,
+) -> Result<WriteResult, String> {
     state.write(Op::SetActiveProject { project_id })
+}
+
+/// One persisted import batch (UI-SPEC §16.1 Recent exports): every `import_record` sharing a
+/// `batch_id` — what one import run copied into a project, undoable as a unit.
+#[derive(serde::Serialize)]
+pub struct ImportBatch {
+    pub batch_id: String,
+    pub project_id: i64,
+    pub project_name: String,
+    /// The destination folder the batch's files were written into (e.g. `Assets/Wildlife`).
+    pub dest: String,
+    pub file_count: i64,
+    pub imported_at: i64,
+}
+
+/// The last `limit` import batches, newest first (UI-SPEC §16.1). A read — the short-lived
+/// connection never runs migrations and never writes (ARCHITECTURE §5 allows per-task readers).
+#[tauri::command]
+fn recent_exports(limit: usize) -> Result<Vec<ImportBatch>, String> {
+    let Some(db) = lodestash_app::paths::catalog_db_path() else {
+        return Ok(Vec::new());
+    };
+    if !db.exists() {
+        return Ok(Vec::new());
+    }
+    let limit = limit.clamp(1, 100);
+    let conn = Connection::open(&db).map_err(|e| format!("catalog unavailable: {e}"))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT ir.batch_id, ir.project_id, p.name, COUNT(*), MAX(ir.imported_at),
+                    (SELECT i2.dest_path FROM import_record i2 WHERE i2.batch_id = ir.batch_id ORDER BY i2.id LIMIT 1)
+               FROM import_record ir
+               JOIN project p ON p.id = ir.project_id
+              WHERE ir.batch_id IS NOT NULL
+              GROUP BY ir.batch_id
+              ORDER BY MAX(ir.imported_at) DESC
+              LIMIT ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([limit as i64], |r| {
+            let sample: Option<String> = r.get(5)?;
+            Ok(ImportBatch {
+                batch_id: r.get(0)?,
+                project_id: r.get(1)?,
+                project_name: r.get(2)?,
+                dest: dest_directory(sample.as_deref()),
+                file_count: r.get(3)?,
+                imported_at: r.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())
+}
+
+/// The parent folder of an in-project import path (`Assets/Wildlife/Beaver.fbx` →
+/// `Assets/Wildlife`) — what the Recent exports row reads as the destination.
+fn dest_directory(dest_path: Option<&str>) -> String {
+    let Some(p) = dest_path else {
+        return String::new();
+    };
+    let p = p.trim_end_matches(|c| c == '/' || c == '\\');
+    match p.rfind(|c| c == '/' || c == '\\') {
+        Some(i) if i > 0 => p[..i].to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Undo an import batch (UI-SPEC §16.1): delete the batch's copied files from the project and
+/// its `import_record` rows — catalog assets are never touched. Runs on the single writer.
+#[tauri::command]
+fn undo_import_batch(
+    state: tauri::State<'_, AppState>,
+    batch_id: String,
+) -> Result<WriteResult, String> {
+    state.write(Op::UndoImportBatch { batch_id })
 }
 
 /// Add a mapping rule to a taxonomy (UI-SPEC §9.2). `match_type` is one of the shared
@@ -1066,7 +1388,10 @@ fn delete_rule(state: tauri::State<'_, AppState>, rule_id: i64) -> Result<WriteR
 
 /// The newest undo-log rows, newest first, capped at `limit` (UI-SPEC §2 Ctrl/Cmd-Z / L5).
 #[tauri::command]
-fn recent_ops(state: tauri::State<'_, AppState>, limit: usize) -> Result<Vec<lodestash_core::catalog::OpLogRow>, String> {
+fn recent_ops(
+    state: tauri::State<'_, AppState>,
+    limit: usize,
+) -> Result<Vec<lodestash_core::catalog::OpLogRow>, String> {
     state
         .library
         .lock()
@@ -1076,7 +1401,10 @@ fn recent_ops(state: tauri::State<'_, AppState>, limit: usize) -> Result<Vec<lod
 
 /// The redo stack (UI-SPEC §2 Shift-Z): the newest undone ops, newest first.
 #[tauri::command]
-fn redo_ops(state: tauri::State<'_, AppState>, limit: usize) -> Result<Vec<lodestash_core::catalog::OpLogRow>, String> {
+fn redo_ops(
+    state: tauri::State<'_, AppState>,
+    limit: usize,
+) -> Result<Vec<lodestash_core::catalog::OpLogRow>, String> {
     state
         .library
         .lock()
@@ -1156,11 +1484,7 @@ fn engine_preview_fn(cache_root: Option<std::path::PathBuf>) -> lodestash_api::P
             height: q.thumb_px(),
             proxy: q.proxy_budget(),
         };
-        let key = meta_key(
-            src,
-            std::fs::metadata(src).map(|m| m.len()).unwrap_or(0),
-            0,
-        );
+        let key = meta_key(src, std::fs::metadata(src).map(|m| m.len()).unwrap_or(0), 0);
         generate(src, cache, &key, params).ok()
     })
 }
@@ -1186,27 +1510,45 @@ fn apply_allow_list(state: &lodestash_api::ServerState) -> Option<usize> {
 fn engine_write_bridge(writer: Writer) -> lodestash_api::AgentWriteFn {
     use lodestash_api::AgentWrite;
     Box::new(move |w: AgentWrite| match w {
-        AgentWrite::AddTag { asset_id, namespace, value } => writer
-            .run(Op::BulkTag { asset_ids: vec![asset_id], namespace, value, on: true })
+        AgentWrite::AddTag {
+            asset_id,
+            namespace,
+            value,
+        } => writer
+            .run(Op::BulkTag {
+                asset_ids: vec![asset_id],
+                namespace,
+                value,
+                on: true,
+            })
             .map(|r| r.changed),
-        AgentWrite::RemoveTag { asset_id, namespace, value } => writer
-            .run(Op::BulkTag { asset_ids: vec![asset_id], namespace, value, on: false })
+        AgentWrite::RemoveTag {
+            asset_id,
+            namespace,
+            value,
+        } => writer
+            .run(Op::BulkTag {
+                asset_ids: vec![asset_id],
+                namespace,
+                value,
+                on: false,
+            })
             .map(|r| r.changed),
         AgentWrite::ApplyMapping { taxonomy_id } => writer
             .run(Op::ApplyMapping { taxonomy_id })
             .map(|r| r.changed),
-        AgentWrite::Identify { asset_ids } => writer
-            .run(Op::IdentifyIds { asset_ids })
-            .map(|r| r.changed),
+        AgentWrite::Identify { asset_ids } => {
+            writer.run(Op::IdentifyIds { asset_ids }).map(|r| r.changed)
+        }
         AgentWrite::UnpackPackage { package_id } => writer
             .run(Op::ExtractPackage { package_id })
             .map(|r| r.changed),
-        AgentWrite::StageAsset { asset_id } => writer
-            .run(Op::StageAsset { asset_id })
-            .map(|r| r.changed),
-        AgentWrite::UnstageAsset { asset_id } => writer
-            .run(Op::UnstageAsset { asset_id })
-            .map(|r| r.changed),
+        AgentWrite::StageAsset { asset_id } => {
+            writer.run(Op::StageAsset { asset_id }).map(|r| r.changed)
+        }
+        AgentWrite::UnstageAsset { asset_id } => {
+            writer.run(Op::UnstageAsset { asset_id }).map(|r| r.changed)
+        }
     })
 }
 
@@ -1394,13 +1736,15 @@ pub fn run() {
                 engine_port,
                 engine_token,
                 engine_allowed,
+                discovered: Mutex::new(std::collections::HashMap::new()),
             });
             Ok(())
         })
         .register_uri_scheme_protocol("lodestash", |ctx, req| {
             let state = ctx.app_handle().state::<AppState>();
             protocol::handle(&state.library, &req)
-        })        .invoke_handler(tauri::generate_handler![
+        })
+        .invoke_handler(tauri::generate_handler![
             app_info,
             library_status,
             grid_page,
@@ -1420,6 +1764,9 @@ pub fn run() {
             add_source,
             sync_unity_cache,
             add_source_dialog,
+            pick_package_folder,
+            discover_package_folder,
+            import_packages,
             get_web_prefs,
             set_web_prefs,
             pack_dir_tree,
@@ -1480,7 +1827,9 @@ pub fn run() {
             jobs,
             cancel_job,
             projects,
-            set_active_project
+            set_active_project,
+            recent_exports,
+            undo_import_batch
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lodestash");

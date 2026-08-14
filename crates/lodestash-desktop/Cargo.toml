@@ -31,6 +31,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# import_record batch reads + batch undo (UI-SPEC §16.1) run direct SQL against the writer's
+# database path: the catalog's own connection is private to lodestash-core, and rusqlite is
+# already a workspace dependency (TECH-STACK §1) — re-listed here for the shell's two queries.
+rusqlite = { workspace = true }
 # Catalog access. Reads come off this crate's own connection; every write goes through the one
 # writer thread in `writer.rs` (ARCHITECTURE §5, single writer).
 lodestash-core = { workspace = true }
