@@ -29,7 +29,11 @@ pub struct TagRow {
 
 impl From<(String, String, i64)> for TagRow {
     fn from((namespace, value, count): (String, String, i64)) -> Self {
-        Self { namespace, value, count }
+        Self {
+            namespace,
+            value,
+            count,
+        }
     }
 }
 
@@ -118,13 +122,23 @@ pub enum AgentWrite {
         namespace: String,
         value: String,
     },
-    ApplyMapping { taxonomy_id: i64 },
+    ApplyMapping {
+        taxonomy_id: i64,
+    },
     /// Flag + appraise an explicit set (blocking: the writer runs one bounded pass).
-    Identify { asset_ids: Vec<i64> },
+    Identify {
+        asset_ids: Vec<i64>,
+    },
     /// Extract one pack into the workspace (blocking: the whole M14 flow completes first).
-    UnpackPackage { package_id: i64 },
-    StageAsset { asset_id: i64 },
-    UnstageAsset { asset_id: i64 },
+    UnpackPackage {
+        package_id: i64,
+    },
+    StageAsset {
+        asset_id: i64,
+    },
+    UnstageAsset {
+        asset_id: i64,
+    },
 }
 
 /// The desktop's write bridge — [`AgentWrite`] → writer `Op` → changed rows.
@@ -466,7 +480,11 @@ impl ServerState {
     }
 
     /// ENGINE-API §2 `list_tags` — the tag vocabulary with usage counts, most-used first.
-    pub fn list_tags(&self, prefix: &str, limit: usize) -> lodestash_core::error::Result<Vec<TagRow>> {
+    pub fn list_tags(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> lodestash_core::error::Result<Vec<TagRow>> {
         let cat = self.catalog.lock().unwrap();
         let all = cat.tag_usage(limit)?;
         Ok(if prefix.is_empty() {
@@ -537,9 +555,11 @@ impl ServerState {
         if asset_ids.is_empty() {
             return Err("asset_ids must not be empty".into());
         }
-        let job = self
-            .jobs
-            .create("identify", format!("Identify {} assets", asset_ids.len()), jobs::JobState::Running);
+        let job = self.jobs.create(
+            "identify",
+            format!("Identify {} assets", asset_ids.len()),
+            jobs::JobState::Running,
+        );
         let job2 = job.clone();
         let write = self.write.lock().unwrap().clone();
         std::thread::spawn(move || match write {
@@ -555,7 +575,11 @@ impl ServerState {
     /// ENGINE-API §2 `unpack_package` — long-running: extracts one pack through the writer
     /// bridge on a worker thread.
     pub fn unpack_package(&self, package_id: i64) -> Result<Arc<jobs::Job>, String> {
-        let job = self.jobs.create("unpack", format!("Unpack package {package_id}"), jobs::JobState::Running);
+        let job = self.jobs.create(
+            "unpack",
+            format!("Unpack package {package_id}"),
+            jobs::JobState::Running,
+        );
         let job2 = job.clone();
         let write = self.write.lock().unwrap().clone();
         std::thread::spawn(move || match write {

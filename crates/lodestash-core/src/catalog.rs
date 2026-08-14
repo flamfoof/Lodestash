@@ -344,7 +344,8 @@ impl Catalog {
 
     /// Find-or-create an `import_source` by `root_path`; returns its id. The name is
     /// only set on insert (renames are a user action, not a scan side effect).
-    pub fn upsert_import_source(&self, name: &str, root_path: &str, kind: &str) -> Result<i64> {        let existing: Option<i64> = self
+    pub fn upsert_import_source(&self, name: &str, root_path: &str, kind: &str) -> Result<i64> {
+        let existing: Option<i64> = self
             .conn
             .query_row(
                 "SELECT id FROM import_source WHERE root_path = ?1",
@@ -2910,7 +2911,8 @@ impl Catalog {
                 "SELECT id, name, project_path, unity_version, pipeline, is_active, last_seen_at
                    FROM project
                   ORDER BY is_active DESC, last_seen_at DESC, name",
-            )            .map_err(|e| CoreError::Catalog(format!("projects prepare: {e}")))?;
+            )
+            .map_err(|e| CoreError::Catalog(format!("projects prepare: {e}")))?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(ProjectRow {
@@ -5000,7 +5002,14 @@ mod tests {
         let c = Catalog::open_in_memory().expect("open");
         let p1 = c.register_project("C:/dev/GameA", None, None).unwrap();
         let p2 = c.register_project("C:/dev/GameB", None, None).unwrap();
-        assert!(c.list_projects().unwrap().iter().find(|p| p.id == p2).unwrap().is_active);
+        assert!(
+            c.list_projects()
+                .unwrap()
+                .iter()
+                .find(|p| p.id == p2)
+                .unwrap()
+                .is_active
+        );
 
         c.set_active_project(p1).unwrap();
         let projects = c.list_projects().unwrap();
@@ -6004,7 +6013,7 @@ mod tests {
                 size_bytes: 1,
                 mtime: 0,
                 workspace_rel: None,
-            content_hash: None,
+                content_hash: None,
             }],
         )
         .unwrap();
@@ -6097,7 +6106,7 @@ mod tests {
                 size_bytes: 1,
                 mtime: 0,
                 workspace_rel: None,
-            content_hash: None,
+                content_hash: None,
             }],
         )
         .unwrap();
@@ -6187,7 +6196,8 @@ mod tests {
             c.set_trait_style(tid, Some(tok), None).expect("token ok");
         }
         // Strict hex passes (the legacy egui build sends it).
-        c.set_trait_style(tid, Some("#AABBCC"), None).expect("hex ok");
+        c.set_trait_style(tid, Some("#AABBCC"), None)
+            .expect("hex ok");
         // Clearing passes.
         c.set_trait_style(tid, None, None).expect("clear ok");
 
@@ -6259,6 +6269,77 @@ mod tests {
         assert!(
             c.categories_of(ids[1], tax).expect("cats").is_empty(),
             "`%` must be a literal percent sign, not a wildcard"
+        );
+    }
+
+    /// The alias arm escapes `_` too, not just `%`. `_` can't normally reach `norm_name`
+    /// (`normalize_tag` turns it into a space), so inject a literal-underscore tag directly to
+    /// pin the escape: the rule must match the literal `_` and NOT the space variant.
+    #[test]
+    fn alias_rule_treats_underscore_literally() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.seed_media_types().expect("seed");
+        let src = c
+            .upsert_import_source("Lib", "C:/lib", "folder")
+            .expect("src");
+        c.record_crawl(src, None, &[rec("a.png", 1, 1), rec("b.png", 1, 1)])
+            .unwrap();
+        let ids: Vec<i64> = c
+            .conn
+            .prepare("SELECT id FROM asset ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+
+        // Asset 0: a tag whose norm_name carries a literal underscore, bypassing normalize_tag
+        // (which is exactly why `_` in the wildcard arm is only defensive in real data).
+        c.conn
+            .execute(
+                "INSERT INTO tag (name, norm_name, namespace) VALUES (?1, ?2, ?3)",
+                params!["low_poly", "style:low_poly", "style"],
+            )
+            .unwrap();
+        let tag_id: i64 = c
+            .conn
+            .query_row(
+                "SELECT id FROM tag WHERE norm_name = 'style:low_poly'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        c.conn
+            .execute(
+                "INSERT INTO asset_tag (asset_id, tag_id, source, created_at)
+                 VALUES (?1, ?2, 'manual', 0)",
+                params![ids[0], tag_id],
+            )
+            .unwrap();
+        // Asset 1: the same word with a space — what normalize_tag produces for "low_poly".
+        c.set_tags(
+            ids[1],
+            "manual",
+            None,
+            &[TagAssignment::exact("style", "low poly")],
+        )
+        .unwrap();
+
+        let tax = c.create_taxonomy("Default", true).expect("tax");
+        let cat = c
+            .add_category(tax, None, "Low Poly", "Low Poly")
+            .expect("cat");
+        c.add_rule(tax, cat, "alias", "low_poly", 10).expect("rule");
+        c.apply_mapping(tax).expect("apply");
+
+        assert_eq!(
+            c.categories_of(ids[0], tax).expect("cats").len(),
+            1,
+            "the literal underscore alias still matches its own tag"
+        );
+        assert!(
+            c.categories_of(ids[1], tax).expect("cats").is_empty(),
+            "`_` must be a literal underscore, not a wildcard matching the space variant"
         );
     }
 
@@ -6652,7 +6733,10 @@ mod tests {
             .expect("moves");
         assert_eq!(moved, vec!["assets/rocks/a.png".to_string()]);
         let stats = c.record_crawl(src, None, &[]).expect("crawl 2");
-        assert_eq!(stats.inserted, 0, "moved record must not insert a duplicate");
+        assert_eq!(
+            stats.inserted, 0,
+            "moved record must not insert a duplicate"
+        );
 
         // The SAME asset row was repointed — id, hash and name preserved, path updated.
         let (after, hash, name): (i64, String, String) = c
@@ -7922,7 +8006,9 @@ impl Catalog {
             )
             .map_err(|e| CoreError::Catalog(format!("taxonomy activate: {e}")))?;
         if n == 0 {
-            return Err(CoreError::Catalog(format!("no such taxonomy {taxonomy_id}")));
+            return Err(CoreError::Catalog(format!(
+                "no such taxonomy {taxonomy_id}"
+            )));
         }
         tx.commit()
             .map_err(|e| CoreError::Catalog(format!("taxonomy activate commit: {e}")))?;
@@ -7966,7 +8052,9 @@ impl Catalog {
             .execute("DELETE FROM taxonomy WHERE id = ?1", params![taxonomy_id])
             .map_err(|e| CoreError::Catalog(format!("delete taxonomy: {e}")))?;
         if n == 0 {
-            return Err(CoreError::Catalog(format!("no such taxonomy {taxonomy_id}")));
+            return Err(CoreError::Catalog(format!(
+                "no such taxonomy {taxonomy_id}"
+            )));
         }
         removed += 1;
         tx.commit()
@@ -8049,7 +8137,9 @@ impl Catalog {
     pub fn delete_category(&mut self, category_id: i64) -> Result<usize> {
         let ids = self.category_subtree(category_id)?;
         if ids.is_empty() {
-            return Err(CoreError::Catalog(format!("no such category {category_id}")));
+            return Err(CoreError::Catalog(format!(
+                "no such category {category_id}"
+            )));
         }
         let tx = self
             .conn
@@ -8115,7 +8205,10 @@ impl Catalog {
     /// Remove an alias chip (UI-SPEC §9.2 ALIASES ✕).
     pub fn remove_category_alias(&self, alias_id: i64) -> Result<()> {
         self.conn
-            .execute("DELETE FROM category_alias WHERE id = ?1", params![alias_id])
+            .execute(
+                "DELETE FROM category_alias WHERE id = ?1",
+                params![alias_id],
+            )
             .map(|_| ())
             .map_err(|e| CoreError::Catalog(format!("alias remove: {e}")))
     }
@@ -8568,7 +8661,9 @@ impl Catalog {
                 namespace: t["namespace"].as_str().unwrap_or("free").to_string(),
                 value: t["value"]
                     .as_str()
-                    .ok_or_else(|| CoreError::Catalog("set_tags op payload: tag without value".into()))?
+                    .ok_or_else(|| {
+                        CoreError::Catalog("set_tags op payload: tag without value".into())
+                    })?
                     .to_string(),
                 confidence: t["confidence"].as_f64(),
             });
@@ -8701,7 +8796,9 @@ mod l5_slices_tests {
     fn tagged_catalog(rels: &[(&str, &str)]) -> (Catalog, Vec<i64>) {
         let mut c = Catalog::open_in_memory().expect("open");
         c.seed_media_types().expect("seed");
-        let src = c.upsert_import_source("Lib", "C:/lib", "folder").expect("src");
+        let src = c
+            .upsert_import_source("Lib", "C:/lib", "folder")
+            .expect("src");
         let records: Vec<CrawlRecord> = rels.iter().map(|(r, m)| rec(r, m)).collect();
         c.record_crawl(src, None, &records).expect("crawl");
         let ids = rels.iter().map(|(r, _)| asset_id(&c, r)).collect();
@@ -8710,7 +8807,11 @@ mod l5_slices_tests {
 
     #[test]
     fn tag_graph_reports_nodes_edges_and_header_counts() {
-        let (mut c, ids) = tagged_catalog(&[("a.fbx", "model_3d"), ("b.png", "image"), ("c.wav", "audio")]);
+        let (mut c, ids) = tagged_catalog(&[
+            ("a.fbx", "model_3d"),
+            ("b.png", "image"),
+            ("c.wav", "audio"),
+        ]);
         let (a, b, cc) = (ids[0], ids[1], ids[2]);
         // rock on two assets; rpg on one; music+ambient co-occur on the third.
         c.set_tags(
@@ -8723,8 +8824,13 @@ mod l5_slices_tests {
             ],
         )
         .expect("tags a");
-        c.set_tags(b, "manual", None, &[TagAssignment::exact("subject", "rock")])
-            .expect("tags b");
+        c.set_tags(
+            b,
+            "manual",
+            None,
+            &[TagAssignment::exact("subject", "rock")],
+        )
+        .expect("tags b");
         c.set_tags(
             cc,
             "manual",
@@ -8740,7 +8846,11 @@ mod l5_slices_tests {
         assert_eq!(g.asset_count, 3, "all three live tagged assets");
         assert_eq!(g.link_count, 0, "no relationship edges yet");
         assert_eq!(g.nodes.len(), 4);
-        let rock = g.nodes.iter().find(|n| n.value == "rock").expect("rock node");
+        let rock = g
+            .nodes
+            .iter()
+            .find(|n| n.value == "rock")
+            .expect("rock node");
         assert_eq!(rock.usage_count, 2, "rock is on two assets");
         assert_eq!(g.edges.len(), 2, "rock↔rpg on a, music↔ambient on c");
         let pair = |x: i64, y: i64| (x.min(y), x.max(y));
@@ -8748,7 +8858,12 @@ mod l5_slices_tests {
         let rock_id = rock.tag_id;
         let rpg_id = g.nodes.iter().find(|n| n.value == "rpg").unwrap().tag_id;
         let music_id = g.nodes.iter().find(|n| n.value == "music").unwrap().tag_id;
-        let ambient_id = g.nodes.iter().find(|n| n.value == "ambient").unwrap().tag_id;
+        let ambient_id = g
+            .nodes
+            .iter()
+            .find(|n| n.value == "ambient")
+            .unwrap()
+            .tag_id;
         assert!(edges.contains(&pair(rock_id, rpg_id)));
         assert!(edges.contains(&pair(music_id, ambient_id)));
         for e in &g.edges {
@@ -8777,7 +8892,11 @@ mod l5_slices_tests {
         c.set_trashed(&[a], true).expect("trash");
         let g = c.tag_graph().expect("graph");
         assert_eq!(g.asset_count, 2);
-        let rock = g.nodes.iter().find(|n| n.value == "rock").expect("rock node");
+        let rock = g
+            .nodes
+            .iter()
+            .find(|n| n.value == "rock")
+            .expect("rock node");
         assert_eq!(rock.usage_count, 1);
         assert!(g.nodes.iter().all(|n| n.value != "rpg"));
         assert_eq!(g.edges.len(), 1, "only music↔ambient remains");
@@ -8785,7 +8904,11 @@ mod l5_slices_tests {
 
     #[test]
     fn asset_edges_lists_only_resolved_edges_between_live_assets() {
-        let (c, ids) = tagged_catalog(&[("a.fbx", "model_3d"), ("b.png", "image"), ("c.wav", "audio")]);
+        let (c, ids) = tagged_catalog(&[
+            ("a.fbx", "model_3d"),
+            ("b.png", "image"),
+            ("c.wav", "audio"),
+        ]);
         let (a, b, cc) = (ids[0], ids[1], ids[2]);
         let edge = |from: i64, to: Option<i64>| {
             c.conn
@@ -8816,11 +8939,15 @@ mod l5_slices_tests {
     #[test]
     fn source_blacklist_add_list_remove_round_trip() {
         let c = Catalog::open_in_memory().expect("open");
-        let src = c.upsert_import_source("Lib", "C:/lib", "folder").expect("src");
+        let src = c
+            .upsert_import_source("Lib", "C:/lib", "folder")
+            .expect("src");
         assert!(c.list_source_excludes(src).expect("empty").is_empty());
 
-        c.add_source_exclude(src, "folder", "Assets/Editor").expect("add folder");
-        c.add_source_exclude(src, "asset", "junk.fbx").expect("add asset");
+        c.add_source_exclude(src, "folder", "Assets/Editor")
+            .expect("add folder");
+        c.add_source_exclude(src, "asset", "junk.fbx")
+            .expect("add asset");
         let list = c.list_source_excludes(src).expect("list");
         assert_eq!(list.len(), 2);
         assert!(list.contains(&SourceExclude {
@@ -8833,7 +8960,8 @@ mod l5_slices_tests {
         }));
 
         // An exact duplicate is a no-op.
-        c.add_source_exclude(src, "folder", "Assets/Editor").expect("dup");
+        c.add_source_exclude(src, "folder", "Assets/Editor")
+            .expect("dup");
         assert_eq!(c.list_source_excludes(src).expect("list").len(), 2);
 
         assert!(c
@@ -8849,16 +8977,26 @@ mod l5_slices_tests {
         assert_eq!(list[0].kind, "asset");
 
         // Sources are independent — a second source has its own (empty) blacklist.
-        let src2 = c.upsert_import_source("Other", "D:/other", "folder").expect("src2");
+        let src2 = c
+            .upsert_import_source("Other", "D:/other", "folder")
+            .expect("src2");
         assert!(c.list_source_excludes(src2).expect("empty").is_empty());
     }
 
     #[test]
     fn source_blacklist_rejects_unknown_kind_and_empty_value() {
         let c = Catalog::open_in_memory().expect("open");
-        let src = c.upsert_import_source("Lib", "C:/lib", "folder").expect("src");
-        assert!(c.add_source_exclude(src, "file", "x").is_err(), "kind must be folder|asset");
-        assert!(c.add_source_exclude(src, "folder", "   ").is_err(), "empty value rejected");
+        let src = c
+            .upsert_import_source("Lib", "C:/lib", "folder")
+            .expect("src");
+        assert!(
+            c.add_source_exclude(src, "file", "x").is_err(),
+            "kind must be folder|asset"
+        );
+        assert!(
+            c.add_source_exclude(src, "folder", "   ").is_err(),
+            "empty value rejected"
+        );
         assert!(c.list_source_excludes(src).expect("list").is_empty());
     }
 
@@ -8882,7 +9020,8 @@ mod l5_slices_tests {
 
         // Deleting a taxonomy takes its categories, rules and aliases with it.
         let cat = c.add_category(t1, None, "Props", "Props").expect("cat");
-        c.add_rule(t1, cat, "exact_tag", "subject:barrel", 10).expect("rule");
+        c.add_rule(t1, cat, "exact_tag", "subject:barrel", 10)
+            .expect("rule");
         c.add_category_alias(cat, "junk").expect("alias");
         let n = c.delete_taxonomy(t1).expect("delete");
         assert_eq!(n, 2, "category + taxonomy row");
@@ -8898,7 +9037,9 @@ mod l5_slices_tests {
     fn rename_category_rewrites_descendant_paths() {
         let mut c = Catalog::open_in_memory().expect("open");
         let tax = c.create_taxonomy("Default", true).expect("tax");
-        let env = c.add_category(tax, None, "Environment", "Environment").expect("env");
+        let env = c
+            .add_category(tax, None, "Environment", "Environment")
+            .expect("env");
         let foil = c
             .add_category(tax, Some(env), "Foliage", "Environment/Foliage")
             .expect("foil");
@@ -8927,7 +9068,10 @@ mod l5_slices_tests {
 
         // Same label is a no-op, empty label is rejected.
         c.rename_category(env, "World").expect("no-op rename");
-        assert!(c.rename_category(env, "   ").is_err(), "empty label rejected");
+        assert!(
+            c.rename_category(env, "   ").is_err(),
+            "empty label rejected"
+        );
     }
 
     #[test]
@@ -8946,7 +9090,10 @@ mod l5_slices_tests {
 
         assert_eq!(c.delete_category(root).expect("delete"), 2, "root + child");
         assert!(c.list_categories(tax).expect("cats").is_empty());
-        assert!(c.categories_of(asset, tax).expect("cats").is_empty(), "assignments cascade");
+        assert!(
+            c.categories_of(asset, tax).expect("cats").is_empty(),
+            "assignments cascade"
+        );
         let rules: i64 = c
             .conn
             .query_row(
@@ -8967,7 +9114,10 @@ mod l5_slices_tests {
         let id1 = c.add_category_alias(cat, "Barrel").expect("add");
         let id2 = c.add_category_alias(cat, "barrel").expect("add again");
         assert_eq!(id1, id2, "case-insensitive norm makes them the same alias");
-        assert!(c.add_category_alias(cat, "  ").is_err(), "empty alias rejected");
+        assert!(
+            c.add_category_alias(cat, "  ").is_err(),
+            "empty alias rejected"
+        );
 
         let rows = c.list_category_aliases(cat).expect("list");
         assert_eq!(rows.len(), 1);
@@ -8981,11 +9131,18 @@ mod l5_slices_tests {
     fn disabled_rule_is_skipped_by_apply_mapping() {
         let (mut c, ids) = tagged_catalog(&[("barrel.png", "image")]);
         let asset = ids[0];
-        c.set_tags(asset, "manual", None, &[TagAssignment::exact("subject", "barrel")])
-            .expect("tag");
+        c.set_tags(
+            asset,
+            "manual",
+            None,
+            &[TagAssignment::exact("subject", "barrel")],
+        )
+        .expect("tag");
         let tax = c.create_taxonomy("Default", true).expect("tax");
         let cat = c.add_category(tax, None, "Props", "Props").expect("cat");
-        let rule = c.add_rule(tax, cat, "exact_tag", "subject:barrel", 10).expect("rule");
+        let rule = c
+            .add_rule(tax, cat, "exact_tag", "subject:barrel", 10)
+            .expect("rule");
 
         assert_eq!(c.apply_mapping(tax).expect("apply"), 1);
         assert_eq!(c.categories_of(asset, tax).expect("cats").len(), 1);
@@ -8999,8 +9156,16 @@ mod l5_slices_tests {
     #[test]
     fn op_log_record_recent_delete_manage_the_tail() {
         let c = Catalog::open_in_memory().expect("open");
-        let a = c.record_op("set_trashed", r#"{"asset_ids":[1],"trashed":true}"#, None).expect("op1");
-        let b = c.record_op("create_collection", r#"{"collection_id":9,"name":"x"}"#, None).expect("op2");
+        let a = c
+            .record_op("set_trashed", r#"{"asset_ids":[1],"trashed":true}"#, None)
+            .expect("op1");
+        let b = c
+            .record_op(
+                "create_collection",
+                r#"{"collection_id":9,"name":"x"}"#,
+                None,
+            )
+            .expect("op2");
         let cc = c.record_op("set_tags", "{}", None).expect("op3");
 
         let recent = c.recent_ops(2).expect("recent");
@@ -9011,7 +9176,10 @@ mod l5_slices_tests {
 
         let full = c.recent_ops(100).expect("full");
         assert_eq!(full.len(), 3);
-        assert!(full[0].id > full[1].id && full[1].id > full[2].id, "append order");
+        assert!(
+            full[0].id > full[1].id && full[1].id > full[2].id,
+            "append order"
+        );
 
         assert_eq!(c.delete_ops(&[a, b]).expect("delete"), 2);
         let remaining = c.recent_ops(10).expect("remaining");
@@ -9029,17 +9197,31 @@ mod l5_slices_tests {
         c.set_tags(asset, "manual", None, &[a1.clone(), a2.clone()])
             .expect("initial");
 
-        let op = c.record_set_tags_op(asset, "manual", &[]).expect("snapshot");
-        c.set_tags(asset, "manual", None, &[TagAssignment::exact("subject", "changed")])
-            .expect("mutate");
-        assert_eq!(c.tags_for_asset(asset).expect("tags").len(), 1, "now the new tag only");
+        let op = c
+            .record_set_tags_op(asset, "manual", &[])
+            .expect("snapshot");
+        c.set_tags(
+            asset,
+            "manual",
+            None,
+            &[TagAssignment::exact("subject", "changed")],
+        )
+        .expect("mutate");
+        assert_eq!(
+            c.tags_for_asset(asset).expect("tags").len(),
+            1,
+            "now the new tag only"
+        );
 
         c.revert_op(op).expect("revert");
         let tags = c.tags_for_asset(asset).expect("tags");
         assert_eq!(tags.len(), 2);
         assert!(tags.contains(&a1));
         assert!(tags.contains(&a2));
-        assert!(c.recent_ops(10).expect("recent").is_empty(), "reverted op is consumed");
+        assert!(
+            c.recent_ops(10).expect("recent").is_empty(),
+            "reverted op is consumed"
+        );
     }
 
     /// `add_asset_tag` appends — adding one manual tag must not delete the asset's other
@@ -9052,11 +9234,16 @@ mod l5_slices_tests {
             asset,
             "manual",
             None,
-            &[TagAssignment::exact("subject", "rock"), TagAssignment::exact("style", "rpg")],
+            &[
+                TagAssignment::exact("subject", "rock"),
+                TagAssignment::exact("style", "rpg"),
+            ],
         )
         .expect("initial");
 
-        let n = c.add_asset_tag(asset, "manual", "subject", "shiny").expect("add");
+        let n = c
+            .add_asset_tag(asset, "manual", "subject", "shiny")
+            .expect("add");
         assert_eq!(n, 1, "one row inserted");
         let tags = c.tags_for_asset(asset).expect("tags");
         assert_eq!(tags.len(), 3, "rock + rpg survive, shiny joins");
@@ -9064,7 +9251,9 @@ mod l5_slices_tests {
 
         // Adding the same tag again is a no-op — and records nothing (the writer only logs
         // affected ids, so a revert can never yank a pre-existing tag).
-        let again = c.add_asset_tag(asset, "manual", "subject", "shiny").expect("again");
+        let again = c
+            .add_asset_tag(asset, "manual", "subject", "shiny")
+            .expect("again");
         assert_eq!(again, 0, "duplicate insert is a no-op");
     }
 
@@ -9076,19 +9265,29 @@ mod l5_slices_tests {
         let (a, b) = (ids[0], ids[1]);
 
         // Add one tag to both, record the affected pair, then revert.
-        assert_eq!(c.add_asset_tag(a, "manual", "subject", "shiny").expect("a"), 1);
-        assert_eq!(c.add_asset_tag(b, "manual", "subject", "shiny").expect("b"), 1);
+        assert_eq!(
+            c.add_asset_tag(a, "manual", "subject", "shiny").expect("a"),
+            1
+        );
+        assert_eq!(
+            c.add_asset_tag(b, "manual", "subject", "shiny").expect("b"),
+            1
+        );
         let op = c
             .record_bulk_tag_op(&[a, b], "subject", "shiny", true)
             .expect("record");
         c.revert_op(op).expect("revert");
         assert!(
-            c.tags_for_asset(a).expect("tags").is_empty() && c.tags_for_asset(b).expect("tags").is_empty(),
+            c.tags_for_asset(a).expect("tags").is_empty()
+                && c.tags_for_asset(b).expect("tags").is_empty(),
             "revert removed the added tag from both assets"
         );
 
         // Remove-then-revert re-adds it.
-        assert_eq!(c.add_asset_tag(a, "manual", "subject", "dull").expect("a2"), 1);
+        assert_eq!(
+            c.add_asset_tag(a, "manual", "subject", "dull").expect("a2"),
+            1
+        );
         let op2 = c
             .record_bulk_tag_op(&[a], "subject", "dull", false)
             .expect("record");
@@ -9134,12 +9333,18 @@ mod l5_slices_tests {
         c.revert_op(op).expect("undo");
         assert!(!is_trashed(&c, a));
         assert!(
-            c.redo_candidates(10).expect("redo stack").iter().any(|r| r.id == op),
+            c.redo_candidates(10)
+                .expect("redo stack")
+                .iter()
+                .any(|r| r.id == op),
             "the undone op sits on the redo stack"
         );
         c.redo_op(op).expect("redo");
         assert!(is_trashed(&c, a), "redo re-applies the trashed state");
-        assert!(c.recent_ops(10).expect("recent").is_empty(), "redo consumes the row");
+        assert!(
+            c.recent_ops(10).expect("recent").is_empty(),
+            "redo consumes the row"
+        );
         assert!(
             c.redo_candidates(10).expect("redo stack").is_empty(),
             "nothing left to redo"
@@ -9175,9 +9380,16 @@ mod l5_slices_tests {
         let mut c = Catalog::open_in_memory().expect("open");
         let op = c.record_op("mystery", "{}", None).expect("record");
         assert!(c.revert_op(op).is_err(), "no revert for unknown kind");
-        assert_eq!(c.recent_ops(10).expect("recent").len(), 1, "failed revert keeps the op");
+        assert_eq!(
+            c.recent_ops(10).expect("recent").len(),
+            1,
+            "failed revert keeps the op"
+        );
         assert!(c.revert_op(999).is_err(), "no such op");
-        assert!(c.revert_set_tags(op).is_err(), "wrong kind for the focused revert");
+        assert!(
+            c.revert_set_tags(op).is_err(),
+            "wrong kind for the focused revert"
+        );
     }
 
     #[test]

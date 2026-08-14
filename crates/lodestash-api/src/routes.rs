@@ -378,7 +378,12 @@ async fn apply_mapping(
     };
     match state.apply_mapping(taxonomy_id) {
         Ok(changed) => Json(json!({ "changed": changed })).into_response(),
-        Err(e) => err(StatusCode::BAD_REQUEST, "write_failed", "The mapping run failed.", &e),
+        Err(e) => err(
+            StatusCode::BAD_REQUEST,
+            "write_failed",
+            "The mapping run failed.",
+            &e,
+        ),
     }
 }
 
@@ -397,7 +402,12 @@ async fn identify_asset(
     };
     match state.identify_asset(asset_ids.clone()) {
         Ok(job) => (StatusCode::ACCEPTED, Json(job.to_json())).into_response(),
-        Err(e) => err(StatusCode::BAD_REQUEST, "invalid_request", "Identify refused.", &e),
+        Err(e) => err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Identify refused.",
+            &e,
+        ),
     }
 }
 
@@ -424,7 +434,12 @@ async fn unpack_package(
     };
     match state.unpack_package(package_id) {
         Ok(job) => (StatusCode::ACCEPTED, Json(job.to_json())).into_response(),
-        Err(e) => err(StatusCode::BAD_REQUEST, "invalid_request", "Unpack refused.", &e),
+        Err(e) => err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Unpack refused.",
+            &e,
+        ),
     }
 }
 
@@ -933,6 +948,20 @@ mod tests {
             "in flight until the plugin acks"
         );
 
+        // A malformed ack — claiming an id this request never queued — is rejected whole, and it
+        // must NOT consume the queue entry, or the retry with the real ids below would 404.
+        assert!(matches!(
+            st.ack_import(
+                &reqs[0].request_id,
+                vec![crate::AckAsset {
+                    asset_id: 999_999,
+                    dest_path: "Assets/Bogus".into(),
+                    unity_guid: None,
+                }],
+            ),
+            Err(crate::AckError::UnknownRequest)
+        ));
+
         // Simulate the Unity plugin acking with a real in-project path + GUID.
         let req0 = &reqs[0];
         let imported: Vec<crate::AckAsset> = req0
@@ -972,6 +1001,21 @@ mod tests {
         let (s, b) = send(router(st), get_req("/v1/assets/999", Some(&token), None)).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
         assert_eq!(b["error"]["code"], "not_found");
+    }
+
+    /// The gate middleware runs via `Router::layer`, which also fires when no route matches. A
+    /// *required* `MatchedPath` extractor rejected there, so an authenticated request to an
+    /// unknown path answered 500 instead of 404. `Option<MatchedPath>` lets axum answer 404.
+    #[tokio::test]
+    async fn unknown_path_is_404_not_500() {
+        let (_d, st) = state();
+        let token = st.token.clone();
+        let (s, _) = send(
+            router(st),
+            get_req("/v1/definitely-not-a-route", Some(&token), None),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "unknown path -> 404, not 500");
     }
 
     /// The per-tool allow-list (UI-SPEC §16, card 178): a disabled tool is `403 tool_disabled`,

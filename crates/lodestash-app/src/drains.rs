@@ -1388,3 +1388,40 @@ pub fn drain_image_embeddings(
         tracing::info!(embedded = total, "siglip image embeddings written");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lodestash_core::catalog::VisualEmbedJob;
+
+    fn in_pack_job(pack_size: i64) -> VisualEmbedJob {
+        VisualEmbedJob {
+            asset_id: 1,
+            disk_path: None,
+            workspace_rel: None,
+            media_type_id: 0,
+            source_id: 0,
+            media_code: "image".into(),
+            pack_path: Some("C:/packs/P.unitypackage".into()),
+            pack_offset: Some(0),
+            pack_size: Some(pack_size),
+            ext: Some("png".into()),
+        }
+    }
+
+    /// An in-pack payload over the pull cap must be refused *before* `read_payload_at` buffers it —
+    /// a multi-GB asset must never be pulled wholesale into RAM by the identify drain. The guard
+    /// runs ahead of any file IO, so the archive itself need not exist for the refusal.
+    #[test]
+    fn resolve_job_path_refuses_oversized_in_pack_payloads() {
+        assert!(in_pack_pull_ok(IN_PACK_PULL_MAX_BYTES, "P.unitypackage"));
+        assert!(!in_pack_pull_ok(
+            IN_PACK_PULL_MAX_BYTES + 1,
+            "P.unitypackage"
+        ));
+        assert!(
+            resolve_job_path(&in_pack_job(IN_PACK_PULL_MAX_BYTES + 1), None).is_none(),
+            "an over-cap payload resolves to None rather than being pulled into memory"
+        );
+    }
+}
