@@ -14,9 +14,15 @@
 >
 > Per `CLAUDE.md` the governing `docs/` files win over this bundle wherever they disagree.
 
-> **Precedence inside this folder (2026-08-04).** The bundle is not one snapshot — it is three
+> **Precedence inside this folder (2026-08-13).** The bundle is not one snapshot — it is four
 > generations that disagree with each other. Newest wins:
 >
+> 0. **`screenshots/library-mockup-2026-08-13.png`** — a full-window Library mockup produced in
+>    Claude Design and added to the repo on 2026-08-13. The newest artefact here, and the only one
+>    that shows the **asset card at its intended proportions**. **Visual authority only**: it drops
+>    the **Unity Assets** nav row (ten rows again) and the **Materials** category tab, so on nav
+>    order, taxonomy and counts it loses to `FEATURES.md` exactly as the prototype does. The full
+>    shipped-vs-mockup gap list is [`ALIGNMENT-AUDIT.md`](ALIGNMENT-AUDIT.md) §N.
 > 1. **`FEATURES.md`** — reconciled forward, carries dated revision notes (e.g. §5.3's content-derived
 >    categories, 2026-07-30). **The arbiter.** Eleven nav rows: Library, Favorites, Identify,
 >    Collections, Packages, **Unity Assets**, Traits, Stats, Duplicates, Trash, Settings.

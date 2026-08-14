@@ -1,9 +1,19 @@
 # Prototype screenshots — partial mirror
 
-> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
+> Last reviewed: 2026-08-13
 
 Captures of the **Lodestash Prototype**, mirrored from the Claude Design project
 `f1fd4bce-f7bc-4b33-b099-d74b78f31998`, path `screenshots/`.
+
+## The one file here that is not a prototype mirror
+
+`library-mockup-2026-08-13.png` is a **new** full-window Library mockup, made in Claude Design and
+added on 2026-08-13. It is not part of the sequences below, has no frame number, and is the *newest*
+artefact in the whole bundle — the opposite end of the precedence order from everything else in this
+folder. Read `../README.md`'s precedence block before using it: it is a **visual** authority (card
+proportions, affordance visibility, badge treatment) and **not** a nav or taxonomy authority — it
+drops the Unity Assets row and the Materials tab, both of which `FEATURES.md` keeps. The measured
+gap against the shipped app is `../ALIGNMENT-AUDIT.md` §N.
 
 ## Read these last
 
