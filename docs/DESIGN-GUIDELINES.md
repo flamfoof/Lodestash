@@ -157,35 +157,44 @@ Line-height: 1.45 body, 1.2 headings. Weight: 400 body, 500 labels, 600 headings
   shell renders the sprite directly (`<use href="/icons.svg#ls-…">`); the retired egui `theme.rs`
   glyph map was the pre-cutover fallback.
 
-**In the sprite** (`docs/design/icons/icons.svg` — reference by `<use href="icons.svg#ls-…">`):
+**In the sprite** (`docs/design/icons/icons.svg` — 56 symbols, shipped in both that source sprite
+and the app's bundled `public/icons.svg`; reference by `<use href="icons.svg#ls-…">`):
 
 | id | Meaning | | id | Meaning |
 |---|---|---|---|---|
-| `ls-nav-library` | Library | | `ls-type-all` | All types |
-| `ls-nav-favorites` | Favorites ★ | | | |
-| `ls-nav-collections` | Collections | | `ls-type-sound` | Sounds |
-| `ls-nav-identify` | Identify mode (appraise) | | `ls-type-model` | Models (3D) |
-| `ls-nav-packages` | Packages | | `ls-type-image` | Images |
-| `ls-nav-traits` | Traits | | `ls-type-texture` | Textures |
-| `ls-nav-stats` | Stats | | `ls-type-material` | Material (sphere) |
-| `ls-nav-duplicates` | Duplicates | | `ls-type-sprite` | Sprites (frame strip) |
-| `ls-nav-trash` | Trash | | `ls-type-font` | Fonts |
-| `ls-nav-settings` | Settings | | `ls-status-unidentified` | Unidentified `?` gem |
-| `ls-view-grid` / `ls-view-list` | View toggle | | `ls-status-identified` | Identified ✓ gem |
-| `ls-grid-compact/cozy/large` | Grid density | | `ls-status-confirmed` | Confirmed ★ gem |
-| `ls-action-filters` | Filters/facets popover | | `ls-action-fullsize` | Quick Look / full size |
-| `ls-action-stage` | Staging tray / shortlist | | `ls-action-clear` | Clear (✕) |
-| `ls-action-copy` | Copy | | `ls-action-regenerate` | Regenerate thumbnail |
-| `ls-action-exclude` | Exclude / blacklist (⊘) | | `ls-action-expand-open/closed` | Expander chevrons |
-| `ls-action-ai-sieve` | AI sieve | | `ls-folder` | Folder (closed) — pack-browser tree/folder rows |
-| `ls-folder-open` | Folder (open, gold — current path) | | `ls-file` | File (generic) |
+| `ls-logo` | Logo / wordmark | | `ls-type-all` | All types |
+| `ls-nav-library` | Library | | `ls-type-sound` | Sounds |
+| `ls-nav-favorites` | Favorites ★ | | `ls-type-model` | Models (3D) |
+| `ls-nav-collections` | Collections | | `ls-type-image` | Images |
+| `ls-nav-identify` | Identify mode (appraise) | | `ls-type-texture` | Textures |
+| `ls-nav-packages` | Packages | | `ls-type-material` | Material (sphere) |
+| `ls-nav-traits` | Traits | | `ls-type-sprite` | Sprites (frame strip) |
+| `ls-nav-stats` | Stats | | `ls-type-font` | Fonts |
+| `ls-nav-duplicates` | Duplicates | | `ls-status-unidentified` | Unidentified `?` gem |
+| `ls-nav-trash` | Trash | | `ls-status-identified` | Identified ✓ gem |
+| `ls-nav-settings` | Settings | | `ls-status-confirmed` | Confirmed ★ gem |
+| `ls-nav-mapping` | Mapping (rules/categories) | | `ls-action-fullsize` | Quick Look / full size |
+| `ls-search` | Search (generic) | | `ls-action-clear` | Clear (✕) |
+| `ls-search-tags` | Search by Tags | | `ls-action-regenerate` | Regenerate thumbnail |
+| `ls-search-ai` | Search with AI (NL) | | `ls-action-expand-open/closed` | Expander chevrons |
+| `ls-project` | Project chip | | `ls-action-stage` | Staging tray / shortlist |
+| `ls-import` | Import (into project) | | `ls-action-copy` | Copy |
+| `ls-download` | Download | | `ls-action-exclude` | Exclude / blacklist (⊘) |
+| `ls-play` / `ls-pause` | Transport play/pause | | `ls-action-ai-sieve` | AI sieve |
+| `ls-tag-add` | Add tag | | `ls-action-filters` | Filters/facets popover |
+| `ls-dependency` | Dependency (with-deps import) | | `ls-folder` | Folder (closed) — pack-browser tree/folder rows |
+| `ls-non-content` | Non-content (hidden junk) | | `ls-folder-open` | Folder (open, gold — current path) |
+| `ls-color` | Color search swatch | | `ls-file` | File (generic) |
+| `ls-variants` | Variants (stacked tile) | | `ls-unitypackage` | Unity package |
+| `ls-similar` | Similar (near-dup) | | `ls-view-grid` / `ls-view-list` | View toggle |
+| `ls-grid-compact/cozy/large` | Grid density | | | |
 
-**Individual files only** (drawn in `docs/design/icons/` as standalone SVGs, not yet folded into
-the sprite): `logo`, `nav-mapping`, `search`, `search-ai`, `search-tags`, `project`, `import`,
-`download`, `play`/`pause`, `tag-add`, `dependency`, `non-content`, `color`, `variants`, `similar`
-*(all 16 are in the sprite — this list is historical; the "promote when first referenced" step
-already happened).*
-When any of these is first referenced in code, promote it into `icons.svg` under its `ls-*` id.
+All 56 symbols are **folded into the sprite** — there is no "individual files only" set left to
+promote. The former promote-on-first-reference list (`logo`, `nav-mapping`, `search`, `search-ai`,
+`search-tags`, `project`, `import`, `download`, `play`/`pause`, `tag-add`, `dependency`,
+`non-content`, `color`, `variants`, `similar`) is 16/16 in both sprites, and the pre-B7 "Unicode
+glyph stand-ins until SVG rendering lands" fallback (the egui `theme.rs` glyph map) was retired at the
+B7 cutover.
 
 ---
 

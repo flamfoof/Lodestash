@@ -21,17 +21,20 @@ breadcrumb**, and a **folders-first contents list**, with the global **inspector
 
 ## 1. Implementation status (what's built vs the target)
 
-The left tree pane shipped 2026-07-25 (`SidePanel::left("pack_dir_tree_pane")`,
-`build_pack_dir_tree`); the rest of the redesign is the open work this doc nails down. See the KANBAN
-card **"Pack directory navigation — finish the redesign."**
+The pack browser ships as the **pack mode of `FoldersView.svelte`** (DESIGN-GUIDELINES §7 "Browse
+views"): one three-pane view (244px tree · contents · global inspector) driven by the `pack_dir_tree`
+command (`PackDirNode[]`, `api.ts`) whenever a pack filter is active. The earlier egui `SidePanel` /
+`TopBottomPanel` / `pack_contents_list` build was deleted at the B7 cutover; the target layout below
+is now realised in the Svelte shell. Remaining gaps (KANBAN-SVELTE 🟡): the tree has no user-collapsible
+state (expansion derives from the current path) and no responsive fallback below ~900px (§2/§5/§9).
 
 | Region | State |
 |---|---|
-| **A** Left directory tree | **Shipped** — nested `SidePanel`, indented hierarchy, expand chevrons, `direct (recursive)` counts, gold selection rail, click-to-navigate (`current_dir`). Layout/rail geometry **needs a human eyeball** (Glow → blank screenshots, HANDOFF §6). |
-| **B** Breadcrumb bar | **Shipped** (2026-07-29) — for a pack the nav + pack-rooted breadcrumb + grid⇄list toggle now render in a **full-width `TopBottomPanel::top("pack_breadcrumb")` above all three panes** (shown on `ctx` before the inspector + central, so the left tree and inspector start beneath it); the ordinary Folders view keeps its inline body breadcrumb. Bar/segment **pixel geometry needs a human eyeball** (Glow → blank screenshots, HANDOFF §6). |
-| **Center** Contents list | **Shipped in List mode** (2026-07-29) — the folders-first `Name / Size / Items` list (`pack_contents_list`): folder rows first with `direct (recursive)`, then files with a real size + a duration/dimensions third column, virtualized as `[folders…, files…]` over one `show_rows`. Grid mode still shows thumbnail cards (the toggle). Column/row **pixel geometry needs a human eyeball** (Glow → blank screenshots, HANDOFF §6). |
-| **C** Counts + type glyphs | **Done** — folder rows read `direct (recursive)`; file rows carry a colour-coded type glyph + size + duration/dimensions (`content_third_col`, unit-tested). Folded into the Center list above. |
-| **Right** Inspector | **Reused** — the existing global inspector already shows preview + in-archive `Path` + `Package` + stats + Add-to-project. No bespoke inspector needed; keep reusing it. |
+| **A** Left directory tree | **Shipped** — the `FoldersView.svelte` tree pane (`.tree`, 244px) renders the `pack_dir_tree` result: hierarchy indented by `depth`, expand chevrons (`ls-action-expand-open/closed`), folder glyphs (`ls-folder`/`ls-folder-open`, open = current path), `direct · recursive` counts, gold selection rail, click-to-navigate. **Gap (🟡):** no user-collapsible state. |
+| **B** Breadcrumb bar | **Shipped** — `FoldersView.svelte` renders the nav (`← → ↑`, `view.back`/`view.fwd` in `nav.svelte.ts`) + the pack-rooted breadcrumb (pack name as a gold `ls-unitypackage` pill, never "All libraries") + folder segments above the panes; the ordinary Folders view keeps its inline body breadcrumb. **Gap (🟡):** no responsive fallback below ~900px. |
+| **Center** Contents list | **Shipped in List mode** — the folders-first `Name / Size / Items` list (`.flist`): folder rows first with `direct (recursive)`, then files with a real size + a duration/dimensions third column. Grid mode still shows thumbnail cards (the toggle). |
+| **C** Counts + type glyphs | **Done** — folder rows read `direct (recursive)`; file rows carry a colour-coded type glyph (`typeIcon`) + size + duration/dimensions (the `third` column from `folder_page`). Folded into the Center list above. |
+| **Right** Inspector | **Reused** — the global `Inspector.svelte` shows preview + in-archive `Path` + `Package` + stats + Add-to-project. No bespoke inspector; keep reusing it. |
 
 ---
 

@@ -4,11 +4,13 @@ Lodestash is your **local asset hub**: it catalogs everything you own, lets you 
 plain-language description**, preview it, and **pull just what you need into Unity** — without
 ever importing whole asset packs into your project. (Unreal support is planned for a later phase.)
 
-> **Status note (2026-08-07):** Steps 1–5's shell flows work today. Step 3's identification is
-> **partially wired** — local embeddings run, but the tagging step isn't reachable yet, so assets
-> stay *Indexed* rather than flipping to *Identified*, and AI search isn't live in the shell.
-> Step 6 (the Unity bridge) and the MCP path are **engine-project work, not yet runnable**. The
-> board (`KANBAN-SVELTE.md` 🟡/⚪/🔵) tracks the exact deltas.
+> **Status note (updated 2026-08, see [`KANBAN-SVELTE.md`](KANBAN-SVELTE.md) for the live board):**
+> Steps 1–5 work end-to-end today — auto-discovery of the Asset Store cache, cache watching,
+> identification (assets flip to *Identified* as tagging runs), and AI search are all live.
+> **Step 6 (the Unity bridge) and the MCP `import_to_project` path are engine-project work, not yet
+> runnable** — the REST + MCP servers ship with the app and 10 agent operations are live, but the
+> Unity plugin (editor) half and the import round-trip still need a Unity install. The board tracks
+> the exact deltas (🟢 done · 🟡 partial · 🔵 engine-project).
 
 Follow these steps in order. **Step 3 (run identification) matters most — do it before you search.**
 
@@ -90,6 +92,10 @@ Click any result to **view the 3D model** (orbit around it), **play the audio** 
 
 ## Step 6 — Bring it into Unity (the bridge)
 
+> ⚠️ **Not yet runnable** — this step is engine-project work (KANBAN-SVELTE 🔵): the REST + MCP
+> servers ship with the app, but the Unity plugin and the import round-trip aren't built yet. The
+> flow below describes the target behaviour.
+
 With your Unity project open and the Lodestash plugin panel active (opening the panel **registers**
 your project with Lodestash, so it knows where "into Unity" means):
 
@@ -103,7 +109,7 @@ and textures) into your project — **never the whole pack**. That keeps your pr
 you've imported an asset here before, Lodestash flags it **"already imported"** rather than duplicating
 it, and shows its **license/attribution** so credits travel with the asset.
 
-### …or ask Claude to do it (the MCP path)
+### …or ask Claude to do it (the MCP path) — ⚠️ not yet runnable
 
 With the same panel open, you can tell **Claude** (or Claude Code, Cursor, any MCP client): *"find a
 low-poly beaver and import it into my project under `Wildlife/`."* Claude searches the catalog, shows

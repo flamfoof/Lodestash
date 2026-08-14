@@ -33,6 +33,15 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       Extract-selected queue + Cancel, **M14 surgical flow wired end-to-end** (B2c): browse
       persistence → manifest worker → mint in-pack rows → surgical `extract_at_offsets` →
       materialize → render from workspace cache.
+- [x] **Import dialog (§5.2).** `+ Add source…` opens an **Add a source chooser** (Watch a folder /
+      Unity Asset Store packages); the package path opens a native folder picker →
+      `discover_package_folder` (reads each archive's manifest) → a modal listing packs **grouped by
+      containing folder** (select-all/clear per group, collapsible), per-pack `vX · size · N assets`,
+      auto-detected content-category badge + dropdown override, multi-version "newest shown"
+      disclosure, and the §5.6 `⧉ already indexed` note, with category filter tabs and a footer
+      ("indexed in place", N selected, **Import as libraries**). `import_packages` runs on the single
+      writer (`Op::ImportPacks`): one source row + one pinned, in-pack-minted `package` row per
+      ticked pack — nothing copied or unpacked.
 - [x] **Settings.** Sources + per-source blacklist editor, AI tier ↔ quality, size tiers, watch +
       auto-identify toggles, thumb cache, **Unity Editors (Connect wizard app half)**, danger flow
       (confirm-gated delete-from-disk). *(CLOUD card is 🔴.)*
@@ -157,9 +166,6 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       route** (the one that fans out across a pack — the 21.9 GB-pack stampede); a single
       explicit file/mesh pull is never refused by archive size (the deep-entry decompress-skip
       is bounded + cached). Remaining: per-entry "Extract selected" page-batching.
-- [ ] **Import dialog (§5.2).** Folder → discovered-package list (group/select-all, category badge +
-      tabs, version disclosure, "import as libraries") — `add_source_dialog` is a plain folder
-      picker today.
 - [ ] **`⇢ Add to project` / `⇢ Add all N to project` affordances.** Absent everywhere (FEATURES
       §5.4/§5.5, PACK-DIRECTORY-NAV §7) — the engine write path doesn't exist in the shell.
 
@@ -231,6 +237,36 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       Size · Type · Status.
 - [ ] **No `prefers-reduced-motion` policy** beyond one DropZone gate; no shimmer on
       Unidentified→Identified (≤400ms, reduced-motion-gated).
+
+**B12 — visual parity vs the 2026-08-13 mockup.** First pixel-level comparison (a rendered mockup
+now exists: `docs/design/screenshots/library-mockup-2026-08-13.png`). Full matrix + `file:line`
+evidence in [`docs/design/ALIGNMENT-AUDIT.md`](design/ALIGNMENT-AUDIT.md) **§N** — read it before
+starting any card here; the ids below are its row ids. **The mockup drops the Unity Assets nav row
+and the Materials tab — `FEATURES.md` wins on both, do not "fix" the app to match.**
+
+- [ ] **B12a — the card reads as its media type (§N1.1–N1.3).** Thumb 2:1 not square
+      (`Card.svelte:265`); audio gets ▶ + waveform instead of one speaker glyph (`:133`); raster
+      previews `cover` not `contain` (`:278`). Highest value on the board by information-per-line:
+      1,841 sounds and 2,228 images currently render as interchangeable dark squares.
+- [ ] **B12b — subtract the duplicates (§N2.1, §N5.2).** Status filter renders twice, in the toolbar
+      (`Toolbar.svelte:105-111`) and the sidebar facet (`Sidebar.svelte:116-127`) — one state, two
+      controls; and the `LIBRARY` h1 (`LibraryScreen.svelte:163-168`) costs ~56px the design spends
+      on cards. Pure deletion.
+- [ ] **B12c — affordances visible at rest (§N1.4, N1.6, N1.7).** Star (can't favourite from the
+      grid at all today — `Card.svelte:136`), multi-select box (`LibraryScreen.svelte:421`), `+ stage`
+      as a labelled button, and the missing `⤢` full-size. All four are hover-only or absent where
+      the design shows them at rest.
+- [ ] **B12d — treatment polish (§N1.8–N1.11, N4.2).** Full-perimeter status border vs the 1px left
+      rail; two-row chip wrap; italic+dim unidentified names; `1.2k tris`; badge clamp at `999+`
+      (`Sidebar.svelte:231-237` renders `7667` inside a pill and eats the row).
+- [ ] **B12e — `✓ in <project>` membership pill (§N1.5).** Needs a per-card project-membership read;
+      no command exists. Blocked behind the staging/import half (I8).
+- [ ] **B12f — spec calls needed before touching (§N3.1, §N4.1).** The mockup shows tabs with no
+      counts and no PINNED sidebar group; UI-SPEC §0.3 and C6 specify both. Decide, then update the
+      losing doc in the same change.
+- [ ] **B12g — top-bar cosmetics (§N3.2–N3.5).** Health meter as an `n / total` fraction with the bar
+      beneath; engine on the project chip; GPU on the `✦ local` pill (still open from B8); Tags/AI
+      toggle left of the search box.
 
 **Doc drift (docs name things that no longer exist — fix per CLAUDE.md "docs are source of truth"):**
 

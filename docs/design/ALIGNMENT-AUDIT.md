@@ -13,9 +13,11 @@
 > governing `docs/` files win over the bundle on conflict; `DESIGN-GUIDELINES.md` wins over pixel
 > details; `tokens.css` is the single executable token source (the Svelte app imports it directly).
 >
-> **Limitation.** `docs/design/screenshots/*.jpg` cannot be pixel-inspected (no image tool in this
-> environment); the audit is structural — against the prose specs and the prototype HTML. Raster
-> screenshots remain a pixel-level reference only.
+> **Two kinds of pass.** Sections **A–M** are *structural* — the app read against the prose specs
+> and the prototype HTML, because the raster screenshots could not be inspected at the time.
+> Section **N** (2026-08-13) is the first *visual* pass: a rendered mockup compared side-by-side
+> with a screenshot of the running app, so it catches the geometry and affordance-visibility drift
+> that a prose audit structurally cannot see.
 
 ---
 
@@ -39,6 +41,12 @@ drifted. **After remediation (same day)** every nav destination is a working scr
 chrome is built, the divergences are corrected, and the suite is **48/48 green** (plus 150 Rust
 tests). What remains is the documented backend-blocked set — engine/pump/B2b work the board
 already tracks.
+
+**Visual pass (2026-08-13, §N).** With a rendered mockup available for the first time, a pixel
+comparison found a second class of drift that the structural audit could not see: the app is
+*structurally* right and *proportionally* wrong. The card thumb is square where the design is 2:1,
+audio and texture previews are placeholder-flat, and four affordances (star, select box, `⤢`,
+`+ stage`) are hover-only where the design shows them at rest. None of it is backend-blocked.
 
 ## Remediation log (2026-08-04)
 
@@ -105,6 +113,11 @@ its audit class. `ui/` = `crates/lodestash-desktop/ui`.
 
 Legend: **A** = Aligned · **P** = Partial · **M** = Missing · **D** = Divergent.
 Spec citation → app evidence. `ui/` = `crates/lodestash-desktop/ui`.
+
+> **Re-marked against the live [`KANBAN-SVELTE.md`](docs/KANBAN-SVELTE.md) board (2026-08):** the
+> toasts, staging tray, Identify, and Settings rows below shipped after the 08-04 audit and are
+> re-classified — toasts **Aligned**, staging tray **Partial** (in-memory only), Identify **Aligned**
+> (tagging wired into `appraise_pass`), Settings **Aligned** (full §11 screen).
 
 ### A. Frame & shell — FEATURES §0.1, UI-SPEC §0
 
@@ -207,8 +220,8 @@ Spec citation → app evidence. `ui/` = `crates/lodestash-desktop/ui`.
 | I2 | Confirm-delete danger modal | A | DESIGN-GUIDELINES §7 | `ConfirmDelete.svelte` — names paths, remove-alternative, Cancel-focused |
 | I3 | Command palette Ctrl/Cmd-K | A | UI-SPEC §0.4 | `App.svelte:94-99`, `Palette.svelte` |
 | I4 | Drag-in drop overlay, gold dashed | A | DESIGN-GUIDELINES §7 | `DropZone.svelte:78-85` |
-| I5 | Toasts (bottom-right, accent border, auto-dismiss) | P | FEATURES §0.4, UI-SPEC §18 | built (`toasts.svelte.ts` + `App.svelte:397-428`, z-80) — border 3px vs 1px, only ok/err kinds (DG §7) |
-| I6 | Staging tray | P | FEATURES §7.6, UI-SPEC §16.2 | built (`StagingTray.svelte`, bottom-right) — in-memory only, no per-project durability/batch-commit (B: ENGINE-API §6) |
+| I5 | Toasts (bottom-right, accent border, auto-dismiss) | A | FEATURES §0.4, UI-SPEC §18 | built (`toasts.svelte.ts` + `App.svelte:397-428`, z-80) — 1px accent left-border, `warn`/`info` kinds added (`--ls-warning`/`--ls-info`, DG §7) |
+| I6 | Staging tray | P | FEATURES §7.6, UI-SPEC §16.2 | built (`StagingTray.svelte`, bottom-right) — in-memory only: `batch_id` recorded but no Recent-exports list, no batch undo, no project switcher (KANBAN-SVELTE 🟡) |
 | I7 | Pack stats modal | P | UI-SPEC §15 | built on Unity Assets rows (`UnityAssetsScreen.svelte` stats modal) — 3-tile stub; PackagesScreen rows still lack a Stats button |
 | I8 | Project switcher + Connect wizard | P | UI-SPEC §16.1/§17 | Connect wizard **app half** shipped (Settings → Unity Editors, `projects`/`set_active_project`); switcher popover + plugin half open (B) |
 
@@ -218,7 +231,7 @@ Spec citation → app evidence. `ui/` = `crates/lodestash-desktop/ui`.
 |---|---|---|---|
 | J1 | Library | P | core built (grid/list/folders/pager/empty states); gaps D1/D5/D8/D9/D10/F1/F4/F5 |
 | J2 | Favorites | P | filter over library; FEATURES §4.7 wants Cinzel `★ Favorites` header + strap + mono count + diamond-☆ empty state with Browse Library →; app has plain h1 + text-only empty state |
-| J3 | Identify | P | UI-SPEC §3 | backlog + ✦ Identify all/one (B11a–d), pump-active states — progress bar + session set still open; tagger unreachable (rows stall at indexed) |
+| J3 | Identify | A | UI-SPEC §3: backlog + ✦ Identify all/one (B11a–d), appraising states, pump-active polling — tagging wired into `appraise_pass` (2026-08-07), progress bar + session set + per-asset ✦ shipped (08-08); rows flip to Identified |
 | J4 | Packages | P | publisher→pack, unid pill, Browse→ ✓; ◉ Stats → pack-stats **missing** (I7) |
 | J5 | Unity Assets | M | **stub**; FEATURES §5 + PACK-DIRECTORY-NAV + UI-SPEC §15 |
 | J6 | Collections | M | **stub**; FEATURES §4.2, UI-SPEC §6 |
@@ -226,7 +239,7 @@ Spec citation → app evidence. `ui/` = `crates/lodestash-desktop/ui`.
 | J8 | Stats | P | overview ✓ (tiles/size-by-type/disk/heaviest/insights); Tag Graph absent (B, §8.2) |
 | J9 | Duplicates | P | groups ✓, keeper ribbon ✓, Keep all ✓, Move-to-Trash ✓; Merge tags missing (needs tag ops); exact-only (perceptual arrives with embeddings) |
 | J10 | Trash | P | filter over library + Restore in inspector; UI-SPEC §7 wants table rows with inline ↩ Restore |
-| J11 | Settings | M | **stub**; FEATURES §6, UI-SPEC §11, design README §5 |
+| J11 | Settings | A | full §11 screen built (sources + per-source blacklist, AI tier ↔ quality, size tiers, watch/auto-identify, thumb cache, Unity Editors, danger flow, clear-cache, confirm-before-trash) — CLOUD card + model-download 🟡 (FEATURES §6, UI-SPEC §11, design README §5) |
 | J12 | Stub-screen pattern | P | `Screen.svelte` ✓ (title + milestone + one-liner); UI-SPEC §12 wants a `← Back to Library` affordance — absent |
 
 ### K. Icons — DESIGN-GUIDELINES §5, Glyph Catalog, FEATURES §11
@@ -244,7 +257,7 @@ Spec citation → app evidence. `ui/` = `crates/lodestash-desktop/ui`.
 |---|---|---|---|
 | L1 | `prefers-reduced-motion` | P | only `DropZone.svelte:190-194` gates; no global motion policy |
 | L2 | Focus ring | A | `app.css:58-62` `:focus-visible` = `--el-focus-ring` |
-| L3 | Toasts | M | see I5 |
+| L3 | Toasts | A | see I5 |
 | L4 | Appraise shimmer | M | lands with Identify (UI-SPEC §3) |
 | L5 | Keyboard map | P | Ctrl/Cmd-K ✓; Enter→QL (Space missing); Esc ✓; ←/→ QL ✓; Backspace folders ✓; `F` favourite **missing**; `/` search focus **missing**; Ctrl/Cmd-A **missing** (no multi-select); undo **missing** (B) |
 
@@ -258,6 +271,80 @@ Spec citation → app evidence. `ui/` = `crates/lodestash-desktop/ui`.
 | M4 | On-screen quality | M | `config.rs:372` `preview_quality` exists; no UI/command; grid ignores it |
 | M5 | MCP / storage / engine flags | M | `config.rs` has `mcp_disabled_tools` (:451, allow-list engine shipped per KANBAN), `preview_cache_cap_gb`, `auto_purge_preview_cache`, `watch_sources`, `confirm_before_trash`, `auto_identify` — **no Settings UI, no config command** |
 
+### N. Visual parity — mockup vs shipped (2026-08-13)
+
+**Sources.** [`screenshots/library-mockup-2026-08-13.png`](screenshots/library-mockup-2026-08-13.png)
+(the design) against a full-window screenshot of the running app, both ~2000px wide, Library screen,
+compact density. Unlike A–M this pass compares *pixels*, so it reports geometry, affordance
+visibility and treatment — things the prose specs never pinned down.
+
+**Two places the mockup is wrong, and must not be copied.** It shows a **ten-row rail** (no Unity
+Assets) and **four category tabs** (no Materials). `FEATURES.md` §0.3/§0.2 is the arbiter and
+specifies eleven and five; the app is right (`routes.ts:36-48`, `:71-77`). Same regression the Jul-23
+prototype has. Everything below excludes those two.
+
+#### N1. Asset card — the widest gap
+
+| # | Design | Shipped | Evidence |
+|---|---|---|---|
+| N1.1 | Thumb is **wide and short**, ~2:1 (≈186×90 inside a 210px card) | square | `Card.svelte:265` `aspect-ratio: 1` |
+| N1.2 | Audio card = **▶ circle + waveform bars**, type-tinted | one static speaker glyph | `Card.svelte:133` `typeIcon()` fallback |
+| N1.3 | Texture/image previews **bleed edge-to-edge** | letterboxed | `Card.svelte:278` `object-fit: contain` |
+| N1.4 | `⤢` full-size **and** a text `+ stage` button, **visible at rest** | `✦` identify + `⧉` stage, hover-only; no `⤢` | `Card.svelte:172,193`; `:357,390` `opacity: 0` |
+| N1.5 | **`✓ in MyRPG`** green pill on assets already imported into the active project | nothing — no per-card project membership | absent (needs a membership read; I8/staging) |
+| N1.6 | `☆` outline on **every** card, so the grid can favourite | star only renders when already favourited — the grid cannot star | `Card.svelte:136` `{#if item.favorite}` |
+| N1.7 | Multi-select box **visible at rest**, artwork top-left | hover-only | `LibraryScreen.svelte:421` `opacity: 0` |
+| N1.8 | Status = **full-perimeter border** (gold confirmed / verdant identified / none unidentified) | 1px **left rail** only | `Card.svelte:253-261` (F1 shipped as a rail) |
+| N1.9 | Trait chips **wrap to two rows** | hard-clamped to one | `Card.svelte:452-457` `height: 18px; overflow: hidden` |
+| N1.10 | Unidentified card: name **italic + dimmed**, whole card recedes | identical weight/colour to an identified card | `Card.svelte:423` |
+| N1.11 | `1.2k tris` | `1,200 tris` | `Card.svelte:99` `toLocaleString()` |
+
+#### N2. Toolbar
+
+| # | Design | Shipped | Evidence |
+|---|---|---|---|
+| N2.1 | Status filter lives in the **sidebar only** | rendered **twice** — toolbar chips *and* the STATUS facet, one state | `Toolbar.svelte:105-111` + `Sidebar.svelte:116-127` |
+| N2.2 | Keyboard hint strip: `Space quick-looks · ⤢ full size · ◇ stage` | absent | — |
+| N2.3 | One `sort · default` select | `Sort` label + select + separate `↑` button | `Toolbar.svelte:127-142` |
+| N2.4 | Two icon groups (3 density, 2 layout) = 5 buttons | 3 browse + 3 density + undo + redo + inspector = 9 | `Toolbar.svelte:177-263` |
+| N2.5 | Count first at far left, `19 assets · all libraries` | chips first, count second | `Toolbar.svelte:105-124` |
+
+#### N3. Top bar
+
+| # | Design | Shipped | Evidence |
+|---|---|---|---|
+| N3.1 | Tabs carry **no counts**; active = filled gold pill | per-tab counts; active = 2px underline | `TopBar.svelte:154-172` (UI-SPEC §0.3 specifies the underline + counts — spec wins, logged for the record) |
+| N3.2 | Health meter reads `Identified 14 / 19`, bar **beneath** | `24 identified · 7.7k unidentified`, 56px bar to the **left** | `TopBar.svelte:174-185` |
+| N3.3 | Project chip shows the engine: `● MyRPG · Unity 6` | name only | `TopBar.svelte:198` |
+| N3.4 | AI pill shows the device: `+ local · RTX 4070` | `✦ local` | `TopBar.svelte:201` — still open from **B8** |
+| N3.5 | Tags/AI toggle sits **left of** the search box | nested inside the box's right end | `TopBar.svelte:138-151` |
+
+#### N4. Sidebar
+
+| # | Design | Shipped | Evidence |
+|---|---|---|---|
+| N4.1 | No **PINNED** sub-group | pinned packs listed above the sources | `Sidebar.svelte:132-144` (C6 shipped it; the mockup predates or rejects it — spec call needed) |
+| N4.2 | Badges are one digit | `7667` renders in the same pill and eats the row | `Sidebar.svelte:107-109`, `:231-237` — needs a `999+` clamp |
+
+#### N5. Banner and shell
+
+| # | Design | Shipped | Evidence |
+|---|---|---|---|
+| N5.1 | Thin borderless nudge, `? 5 assets are Unidentified — invisible to AI search until appraised.` + gold text link `Open Identify mode →`, no dismiss | boxed amber card, `✦ 7667 assets still unidentified — run Identify` + button + `✕` | `LibraryScreen.svelte:174-189` |
+| N5.2 | **No `LIBRARY` h1** — the toolbar starts at the top | ~56px spent on the heading | `LibraryScreen.svelte:163-168` |
+| N5.3 | No inspector rail when nothing is selected | 268px held open showing "Select an asset." | `App.svelte` inspector branch |
+| N5.4 | No pager, no statusbar | both present | `LibraryScreen.svelte:322-328`; `App.svelte` footer (already logged as **A5**) |
+
+#### N6. Priority
+
+1. **N1.1–N1.3** — the grid is 1,841 sounds and 2,228 images rendering as interchangeable dark
+   squares. Highest information gain per line changed.
+2. **N2.1 + N5.2** — delete the duplicate status control and the heading; pure subtraction.
+3. **N1.4, N1.6, N1.7** — four affordances that exist but are invisible at rest.
+4. **N1.5** — needs a project-membership read; no UI surface for it yet.
+5. **N1.9–N1.11, N4.2** — treatment polish.
+6. **N3.x** — top-bar cosmetics; N3.1 and N4.1 need a spec call before either moves.
+
 ---
 
 ## Open gaps — remaining (post-remediation)
@@ -269,8 +356,8 @@ bulk-bar tag edits, the staging tray's collect side, the Inspector tag-editing s
 for tag/collection/trash. What remains below is the genuinely engine-blocked set.
 
 ### Backend-blocked (board already tracks; not remediated here)
-- **Identify engine**: ✦ Identify all, per-asset Identify now, the appraise shimmer (UI-SPEC §3)
-  — the tagger/embeddings/job pump is the B7 engine build; the screen shows the backlog honestly.
+- **Identify engine** — shipped 2026-08-07: tagging wired into `appraise_pass`, rows flip to
+  Identified. The **appraise shimmer** (UI-SPEC §3, L4) is still open (no `prefers-reduced-motion`-gated sweep).
 - **B2b ingest path**: per-pack Extract, the §5.2 import dialog, the job tray, `+ Add source…`
   folder chooser, the DropZone's post-import flow — all ride the crawl/pump.
 - **Project switcher + Connect wizard** (I8), import/export actions, and the **staging tray's
@@ -286,7 +373,7 @@ for tag/collection/trash. What remains below is the genuinely engine-blocked set
 ### Small follow-ups (visual/keyboard, not stubs)
 - **B6 health meter** in the top bar (UI-SPEC §0.1.5) — counts already flow to `LibraryStatus`.
 - **Space → Quick Look** (L5) — Enter works today; add Space per UI-SPEC §0.4.
-- **Toasts** (I5) — mutating actions currently confirm via the actionError bar and DropZone card.
+- **Toasts** (I5) — ~~mutating actions currently confirm via the actionError bar and DropZone card.~~ *Shipped 2026-08-07 (1px accent border, `warn`/`info` kinds).*
 - **Unidentified nudge banner** (D8) and the card **status left-border** (F1) — design-level
   polish, both specified.
 - **Pack stats modal** (I7) — the ◉ Stats button on pack rows.

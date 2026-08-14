@@ -175,13 +175,12 @@ same or every DOM interaction times out; **`cargo build -p lodestash-desktop` be
 harness mtime-guards against stale binaries); commit with explicit paths — `.reasonix/` +
 `reasonix.toml` stay untracked; `cargo fmt --all` before committing; never `git add -A` (§6).
 
-**Known open defects (from the 2026-08-01 review, still unfixed — each wants a card):**
-`resolve_job_path` pulls in-pack payloads wholly into RAM with no size check (`PULL_CAP_HINT` only
-bounds the hint); `poll_import_queue` never removes entries so a plugin that polls twice imports
-twice; a cancelled extraction is stamped fully unpacked; `gate` returns 500 instead of 404 on
-unknown paths; `ack_import` never checks the acked ids are a subset of the queue; `unmaterialize_package`'
-s safe-to-delete query leaks deduped bytes inside one pack; `apply_mapping`'s `alias` arm doesn't
-escape `_`/`%` in user patterns.
+**Defects from the 2026-08-01 review — resolved.** Six of the seven were fixed in `b53b31f1`
+(2026-08-01): `resolve_job_path` RAM cap, `poll_import_queue` double-import (visibility lease),
+`gate` 404, `ack_import` subset check, `unmaterialize_package` dedup leak, `apply_mapping` alias
+escaping. Regression tests were added for the under-tested ones (2026-08). The seventh — a
+cancelled extraction stamped `unpacked` with a truncated count — was fixed in `materialize_extract`
+(guard `mark_package_unpacked` on the worker's `cancelled` flag) in the same session.
 
 ## 1.7 Next session: the B9 pass shipped — the remaining backlog is the engine build (2026-08-06)
 
