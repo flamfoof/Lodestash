@@ -108,7 +108,9 @@ fn fit_preview_to_content(svg: &str) -> String {
     let mut search_from = 0usize;
     while let Some(rel) = svg[search_from..].find("d=\"") {
         let start = search_from + rel + 3;
-        let Some(end) = svg[start..].find('"') else { break };
+        let Some(end) = svg[start..].find('"') else {
+            break;
+        };
         let d = &svg[start..start + end];
         search_from = start + end + 1;
         let bytes = d.as_bytes();
@@ -130,7 +132,10 @@ fn fit_preview_to_content(svg: &str) -> String {
                         }
                     }
                     // Jump past this pair to the next command letter.
-                    let jump = rest.find(['M', 'L', 'Z']).map(|p| p + 1).unwrap_or(rest.len());
+                    let jump = rest
+                        .find(['M', 'L', 'Z'])
+                        .map(|p| p + 1)
+                        .unwrap_or(rest.len());
                     i += 1 + jump;
                 }
                 _ => i += 1,
@@ -156,7 +161,9 @@ fn fit_preview_to_content(svg: &str) -> String {
     match svg.find(KEY) {
         Some(pos) => {
             let after = &svg[pos + KEY.len()..];
-            let Some(q) = after.find('"') else { return svg.to_string() };
+            let Some(q) = after.find('"') else {
+                return svg.to_string();
+            };
             let close = after[q + 1..].find('"').map(|e| q + 1 + e);
             match close {
                 Some(end) => format!("{}{}{}", &svg[..pos], view, &after[end + 1..]),
@@ -372,7 +379,9 @@ fn mesh(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
             // parse it here (FEATURES §5.4), so an in-pack model's Quick Look renders like a
             // loose one.
             let guard = lib.lock().ok();
-            let cache = guard.as_ref().and_then(|l| l.thumb_cache_dir().map(Path::to_path_buf));
+            let cache = guard
+                .as_ref()
+                .and_then(|l| l.thumb_cache_dir().map(Path::to_path_buf));
             let job = guard.as_ref().and_then(|l| l.thumb_job(id));
             let local = match (job.as_ref(), cache.as_ref()) {
                 (Some(j), Some(c)) if j.in_pack.is_some() => in_pack_scratch(j, c),
@@ -380,11 +389,13 @@ fn mesh(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
             };
             match local {
                 Some(p) => p,
-                None => return if known {
-                    status(StatusCode::SERVICE_UNAVAILABLE, "not_local")
-                } else {
-                    status(StatusCode::NOT_FOUND, "unknown asset")
-                },
+                None => {
+                    return if known {
+                        status(StatusCode::SERVICE_UNAVAILABLE, "not_local")
+                    } else {
+                        status(StatusCode::NOT_FOUND, "unknown asset")
+                    }
+                }
             }
         }
     };
@@ -437,7 +448,10 @@ fn file(lib: &Mutex<Library>, rest: &str, req: &Request<Vec<u8>>) -> Response<Ve
     // the single payload into the scratch instead (FEATURES §5.4) — the thumb route already
     // pulls in-pack bytes the same way; the scratch is size-capped so a hand-written URL
     // cannot stage a whole pack. Extraction of whole packs stays a command, never a GET.
-    let cache_dir = lib.lock().ok().and_then(|l| l.thumb_cache_dir().map(Path::to_path_buf));
+    let cache_dir = lib
+        .lock()
+        .ok()
+        .and_then(|l| l.thumb_cache_dir().map(Path::to_path_buf));
     let job = lib.lock().ok().and_then(|l| l.thumb_job(id));
     let local = match path {
         Some(p) if p.exists() => Some(p),

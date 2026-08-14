@@ -501,9 +501,7 @@ impl Lodestash {
         name = "list_collections",
         description = "List the user's collections (and the active project's staging tray, flagged is_staging)."
     )]
-    pub async fn list_collections(
-        &self,
-    ) -> Result<CallToolResult, ErrorData> {
+    pub async fn list_collections(&self) -> Result<CallToolResult, ErrorData> {
         self.gate("list_collections")?;
         let rows = self.state.list_collections().map_err(internal)?;
         Ok(CallToolResult::success(vec![ContentBlock::json(rows)?]))
@@ -538,8 +536,13 @@ impl Lodestash {
         Parameters(args): Parameters<IdentifyArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.gate("identify_asset")?;
-        let job = self.state.identify_asset(args.asset_ids).map_err(|e| ErrorData::invalid_params(e, None))?;
-        Ok(CallToolResult::success(vec![ContentBlock::json(job.to_json())?]))
+        let job = self
+            .state
+            .identify_asset(args.asset_ids)
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::json(
+            job.to_json(),
+        )?]))
     }
 
     /// ENGINE-API §2 `suggest_tags` — the asset's tags with confidences (read-only).
@@ -566,8 +569,13 @@ impl Lodestash {
         Parameters(args): Parameters<UnpackArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.gate("unpack_package")?;
-        let job = self.state.unpack_package(args.package_id).map_err(|e| ErrorData::invalid_params(e, None))?;
-        Ok(CallToolResult::success(vec![ContentBlock::json(job.to_json())?]))
+        let job = self
+            .state
+            .unpack_package(args.package_id)
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::json(
+            job.to_json(),
+        )?]))
     }
 
     /// ENGINE-API §6 `stage_asset` — add one asset to the active project's staging shortlist.
@@ -610,7 +618,9 @@ impl Lodestash {
         self.gate("import_staged")?;
         match self.state.import_staged() {
             Ok(lodestash_api::ImportKickoff::Awaiting(job)) => {
-                Ok(CallToolResult::success(vec![ContentBlock::json(job.to_json())?]))
+                Ok(CallToolResult::success(vec![ContentBlock::json(
+                    job.to_json(),
+                )?]))
             }
             Ok(lodestash_api::ImportKickoff::AllAlreadyImported(ids)) => Ok(
                 CallToolResult::success(vec![ContentBlock::json(serde_json::json!({

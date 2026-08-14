@@ -579,7 +579,9 @@ pub struct Library {
     staged: Vec<i64>,
     /// The local text-capable embedder for AI-mode search (TopBar ⟨Tags⟩/⟨AI⟩), resolved once
     /// — model load is seconds, so per keystroke would be unusable. `None` until first use.
-    ai_embedder: std::sync::Mutex<Option<std::sync::Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>>,
+    ai_embedder: std::sync::Mutex<
+        Option<std::sync::Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
+    >,
 }
 
 struct Row {
@@ -640,7 +642,9 @@ impl Library {
                     sources: Vec::new(),
                     rows: Vec::new(),
                     paths: HashMap::new(),
-                    tiers: lodestash_app::config::AppConfig::load().size_tiers.normalized(),
+                    tiers: lodestash_app::config::AppConfig::load()
+                        .size_tiers
+                        .normalized(),
                     staged: Vec::new(),
                     ai_embedder: Default::default(),
                 };
@@ -673,7 +677,9 @@ impl Library {
         // Size tiers feed the S/M/L/XL badges and the ⚑ size facet; they come from config, which
         // Settings edits — re-read here so a change lands without a restart (the grid never holds
         // a second copy to go stale).
-        self.tiers = lodestash_app::config::AppConfig::load().size_tiers.normalized();
+        self.tiers = lodestash_app::config::AppConfig::load()
+            .size_tiers
+            .normalized();
         let Some(cat) = self.catalog.as_ref() else {
             return;
         };
@@ -969,7 +975,8 @@ impl Library {
         // ⟨Tags⟩/⟨AI⟩ (TopBar): AI mode RRF-fuses FTS with query embeddings (hybrid_search);
         // without a local model it honestly degrades to the FTS ranks.
         let ranks = if q.search_mode == "ai" {
-            self.ai_ranks(&needle).or_else(|| self.search_ranks(&needle))
+            self.ai_ranks(&needle)
+                .or_else(|| self.search_ranks(&needle))
         } else {
             self.search_ranks(&needle)
         };
@@ -1076,7 +1083,11 @@ impl Library {
             // Relevance selected while the user clears the search box.
             SortBy::Relevance => matched.sort_by(|a, b| {
                 let k = |r: &Row| {
-                    grid::relevance_key(ranks.as_ref().and_then(|m| m.get(&r.item.asset_id).copied()))
+                    grid::relevance_key(
+                        ranks
+                            .as_ref()
+                            .and_then(|m| m.get(&r.item.asset_id).copied()),
+                    )
                 };
                 by(k(a).cmp(&k(b)), a, b)
             }),
@@ -1186,7 +1197,8 @@ impl Library {
         let Some(cat) = self.catalog.as_ref() else {
             return Vec::new();
         };
-        let listings = match cat.list_packages() {            Ok(v) => v,
+        let listings = match cat.list_packages() {
+            Ok(v) => v,
             Err(e) => {
                 tracing::warn!(%e, "list_packages failed");
                 return Vec::new();
@@ -1254,7 +1266,8 @@ impl Library {
     /// The Stats overview, derived from the rows in memory (UI-SPEC §8.1).
     pub fn stats(&self) -> Stats {
         use std::collections::BTreeMap;
-        let mut by_type: BTreeMap<u8, (String, TypeStat)> = BTreeMap::new();        let mut by_pack: HashMap<&str, (usize, i64)> = HashMap::new();
+        let mut by_type: BTreeMap<u8, (String, TypeStat)> = BTreeMap::new();
+        let mut by_pack: HashMap<&str, (usize, i64)> = HashMap::new();
         let mut bytes_total = 0i64;
         let mut triangles_total = 0i64;
         let mut models = 0usize;
@@ -1754,9 +1767,7 @@ impl Library {
             .map(|path| {
                 let depth = path.matches('/').count() + 1;
                 let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-                let has_children = recursive
-                    .keys()
-                    .any(|p| p.starts_with(&format!("{path}/")));
+                let has_children = recursive.keys().any(|p| p.starts_with(&format!("{path}/")));
                 let direct = *direct.get(&path).unwrap_or(&0);
                 let recursive_count = *recursive.get(&path).unwrap_or(&0);
                 PackDirNode {
@@ -1854,7 +1865,12 @@ impl Library {
         let ids = self
             .catalog
             .as_ref()?
-            .hybrid_search(needle, &[(model_id.as_str(), vec.as_slice())], None, HIT_CAP)
+            .hybrid_search(
+                needle,
+                &[(model_id.as_str(), vec.as_slice())],
+                None,
+                HIT_CAP,
+            )
             .ok()?;
         Some(ids.into_iter().enumerate().map(|(r, id)| (id, r)).collect())
     }
@@ -2059,7 +2075,8 @@ fn status_rank(s: AssetStatus) -> u8 {
         AssetStatus::Identified => 2,
         AssetStatus::Indexed => 1,
         AssetStatus::Discovered => 0,
-    }}
+    }
+}
 
 /// Build one duplicate group from its members: keeper first (highest status, ties to earliest
 /// indexed), the reclaimable bytes, and whether the members span packs (the interesting case).
@@ -2070,9 +2087,7 @@ fn dup_group(hash: String, mut rows: Vec<&Row>) -> DupGroup {
         hash,
         size_bytes: rows[0].item.size_bytes,
         keeper: rows[0].item.asset_id,
-        cross_pack: rows
-            .iter()
-            .any(|r| r.item.package.as_deref() != first_pack),
+        cross_pack: rows.iter().any(|r| r.item.package.as_deref() != first_pack),
         items: rows.iter().map(|r| r.item.clone()).collect(),
     }
 }
@@ -2081,9 +2096,7 @@ fn dup_group(hash: String, mut rows: Vec<&Row>) -> DupGroup {
 fn sort_groups(groups: &mut Vec<DupGroup>) {
     groups.sort_by(|a, b| {
         let waste = |g: &DupGroup| g.size_bytes * (g.items.len() as i64 - 1);
-        waste(b)
-            .cmp(&waste(a))
-            .then_with(|| a.hash.cmp(&b.hash))
+        waste(b).cmp(&waste(a)).then_with(|| a.hash.cmp(&b.hash))
     });
 }
 
@@ -2223,9 +2236,17 @@ mod tests {
     #[test]
     fn the_size_badge_follows_the_configured_thresholds() {
         // Defaults (FEATURES §5.3): S < 1 MB, M < 4 MB, L < 8 MB, XL ≥ 8 MB.
-        let mut l = lib(&[("a", "model_3d"), ("b", "model_3d"), ("c", "model_3d"), ("d", "model_3d")]);
+        let mut l = lib(&[
+            ("a", "model_3d"),
+            ("b", "model_3d"),
+            ("c", "model_3d"),
+            ("d", "model_3d"),
+        ]);
         let kb = 1024;
-        for (i, bytes) in [1023 * kb, 1024 * kb, 4096 * kb, 8192 * kb].iter().enumerate() {
+        for (i, bytes) in [1023 * kb, 1024 * kb, 4096 * kb, 8192 * kb]
+            .iter()
+            .enumerate()
+        {
             l.rows[i].item.size_bytes = *bytes;
         }
         l.mark_tiers();
@@ -2236,7 +2257,10 @@ mod tests {
         // second row and it must fall back to S.
         l.tiers.m_kb = 2048;
         l.mark_tiers();
-        assert_eq!(l.rows[1].item.size_tier, "S", "the badge must track SizeTiers, not a fixed scale");
+        assert_eq!(
+            l.rows[1].item.size_tier, "S",
+            "the badge must track SizeTiers, not a fixed scale"
+        );
     }
 
     /// The sidebar's LIBRARIES facet is a button that claims to scope the grid. Before this the
@@ -2441,7 +2465,10 @@ mod tests {
 
         // And the counts follow the same rule, or the nav disagrees with the grid.
         let s = l.status();
-        assert_eq!(s.total_assets, 1, "the Trash is not part of the library count");
+        assert_eq!(
+            s.total_assets, 1,
+            "the Trash is not part of the library count"
+        );
         assert_eq!(s.trashed, 1);
     }
 
@@ -2451,7 +2478,11 @@ mod tests {
     /// comparator ends in `asset_id`. Caught in e2e first: this library has duplicate names.
     #[test]
     fn rows_that_tie_on_every_key_still_reverse_cleanly() {
-        let mut l = lib(&[("dup", "model_3d"), ("dup", "model_3d"), ("dup", "model_3d")]);
+        let mut l = lib(&[
+            ("dup", "model_3d"),
+            ("dup", "model_3d"),
+            ("dup", "model_3d"),
+        ]);
         for (i, r) in l.rows.iter_mut().enumerate() {
             r.item.asset_id = i as i64 + 1;
             r.item.size_bytes = 100;
@@ -2758,7 +2789,10 @@ mod tests {
         assert_eq!(p.tiles[0].name, "Rocks");
         assert_eq!(p.tiles[0].direct, 1, "near.fbx is directly in Rocks/");
         assert_eq!(p.tiles[0].recursive, 2, "…and deep.fbx is under it");
-        assert_eq!(p.total, 3, "the header counts everything at or under this level");
+        assert_eq!(
+            p.total, 3,
+            "the header counts everything at or under this level"
+        );
     }
 
     /// **Packs do not merge.** Every `.unitypackage` lays its assets out under `Assets/…`, and one
@@ -2796,15 +2830,33 @@ mod tests {
     #[test]
     fn pack_tree_lists_folders_with_direct_and_recursive_counts() {
         let l = foldered(&[
-            ("rock", "model_3d", Some("PolygonCity"), "Assets/Props/rock.fbx"),
-            ("tree", "model_3d", Some("PolygonCity"), "Assets/Props/tree.fbx"),
+            (
+                "rock",
+                "model_3d",
+                Some("PolygonCity"),
+                "Assets/Props/rock.fbx",
+            ),
+            (
+                "tree",
+                "model_3d",
+                Some("PolygonCity"),
+                "Assets/Props/tree.fbx",
+            ),
             ("sky", "texture", Some("PolygonCity"), "Assets/Env/sky.png"),
             ("readme", "image", Some("PolygonCity"), "readme.txt"),
         ]);
         let tree = l.pack_tree("PolygonCity");
         let nodes: Vec<(&str, usize, usize, usize, bool)> = tree
             .iter()
-            .map(|n| (n.name.as_str(), n.depth, n.direct, n.recursive, n.has_children))
+            .map(|n| {
+                (
+                    n.name.as_str(),
+                    n.depth,
+                    n.direct,
+                    n.recursive,
+                    n.has_children,
+                )
+            })
             .collect();
         assert_eq!(
             nodes,
@@ -2828,7 +2880,12 @@ mod tests {
     #[test]
     fn a_pack_rooted_folder_page_browses_only_that_pack() {
         let mut l = foldered(&[
-            ("rock", "model_3d", Some("PolygonCity"), "Assets/Props/rock.fbx"),
+            (
+                "rock",
+                "model_3d",
+                Some("PolygonCity"),
+                "Assets/Props/rock.fbx",
+            ),
             ("city", "model_3d", Some("PolygonCity"), "Assets/city.fbx"),
             ("hum", "audio", Some("PolygonCity"), "Assets/hum.wav"),
             ("farm", "model_3d", Some("PolygonFarm"), "Assets/farm.fbx"),
@@ -2844,8 +2901,15 @@ mod tests {
             ..Default::default()
         });
         let names: Vec<&str> = root.tiles.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["Assets"], "the pack's own top folders, not every source's");
-        assert!(root.items.is_empty(), "nothing lives directly in the pack root");
+        assert_eq!(
+            names,
+            ["Assets"],
+            "the pack's own top folders, not every source's"
+        );
+        assert!(
+            root.items.is_empty(),
+            "nothing lives directly in the pack root"
+        );
 
         let inside = l.folder_page(&FolderQuery {
             package: Some("PolygonCity".into()),
@@ -2853,13 +2917,24 @@ mod tests {
             ..Default::default()
         });
         let item_names: Vec<&str> = inside.items.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(item_names, ["city", "hum"], "PolygonFarm's assets never appear");
-        assert_eq!(inside.third, ["—", "2:41"], "third column: dimensions/duration or —");
+        assert_eq!(
+            item_names,
+            ["city", "hum"],
+            "PolygonFarm's assets never appear"
+        );
+        assert_eq!(
+            inside.third,
+            ["—", "2:41"],
+            "third column: dimensions/duration or —"
+        );
         assert_eq!(inside.tiles.len(), 1);
         assert_eq!(inside.tiles[0].name, "Props");
         assert_eq!(inside.tiles[0].direct, 1);
         assert_eq!(inside.tiles[0].recursive, 1);
-        assert_eq!(inside.total, 3, "the header counts everything under this pack folder");
+        assert_eq!(
+            inside.total, 3,
+            "the header counts everything under this pack folder"
+        );
     }
 
     /// Search inside Folders narrows the **subtree**, tile counts included — a tile promising 40
@@ -2954,11 +3029,17 @@ mod tests {
         l.rows[1].status = AssetStatus::Identified;
 
         let s = l.stats();
-        assert_eq!(s.total_assets, 3, "the trashed asset is not part of the library");
+        assert_eq!(
+            s.total_assets, 3,
+            "the trashed asset is not part of the library"
+        );
         assert_eq!(s.bytes_total, 300, "…nor of its size on disk");
         assert_eq!(s.models, 2);
         assert_eq!(s.triangles_total, 900);
-        assert_eq!(s.unidentified, 2, "discovered and indexed both read Unidentified");
+        assert_eq!(
+            s.unidentified, 2,
+            "discovered and indexed both read Unidentified"
+        );
 
         let models = s
             .by_type
@@ -2978,7 +3059,10 @@ mod tests {
         for (i, r) in l.rows.iter_mut().enumerate() {
             r.item.asset_id = i as i64 + 1;
         }
-        assert!(l.duplicates().is_empty(), "three unhashed rows are not a group");
+        assert!(
+            l.duplicates().is_empty(),
+            "three unhashed rows are not a group"
+        );
 
         l.rows[0].content_hash = Some("beef".into());
         l.rows[1].content_hash = Some("beef".into());
@@ -2992,7 +3076,11 @@ mod tests {
     /// unappraised one — a destructive suggestion that looks reasonable on screen.
     #[test]
     fn the_keeper_is_the_most_appraised_copy() {
-        let mut l = lib(&[("first", "model_3d"), ("second", "model_3d"), ("third", "model_3d")]);
+        let mut l = lib(&[
+            ("first", "model_3d"),
+            ("second", "model_3d"),
+            ("third", "model_3d"),
+        ]);
         for (i, r) in l.rows.iter_mut().enumerate() {
             r.item.asset_id = i as i64 + 1;
             r.content_hash = Some("same".into());
@@ -3045,7 +3133,10 @@ mod tests {
             r.content_hash = Some("h".into());
             r.item.package = Some("PolygonCity".into());
         }
-        assert!(!l.duplicates()[0].cross_pack, "all three came from one pack");
+        assert!(
+            !l.duplicates()[0].cross_pack,
+            "all three came from one pack"
+        );
         l.rows[2].item.package = Some("PolygonFarm".into());
         assert!(l.duplicates()[0].cross_pack);
     }

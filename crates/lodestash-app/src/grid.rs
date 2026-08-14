@@ -129,7 +129,11 @@ pub fn sort_indices<T>(
 /// the part that must not diverge between them. Scoping (which source, which pack, trashed,
 /// search) belongs to the caller; only the tab filter is applied here, because tile counts have to
 /// agree with the grid the tab produces. Tiles come back name-sorted (BTreeMap).
-pub fn folder_level<'a, I>(items: I, dir: &std::path::Path, tab: Category) -> (Vec<usize>, Vec<FolderTile>)
+pub fn folder_level<'a, I>(
+    items: I,
+    dir: &std::path::Path,
+    tab: Category,
+) -> (Vec<usize>, Vec<FolderTile>)
 where
     I: IntoIterator<Item = (usize, &'a std::path::Path, Option<MediaType>)>,
 {

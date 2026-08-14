@@ -53,11 +53,8 @@ pub fn crawl(root: &Path, excludes: &[Exclude]) -> Vec<CrawledFile> {
                 // from its first bytes. 16 bytes is one cheap read per *unclassified* file,
                 // which is the rare case; classified files never pay it.
                 let mut header = [0u8; 16];
-                let n = std::io::Read::read(
-                    &mut std::fs::File::open(&abs_path).ok()?,
-                    &mut header,
-                )
-                .ok()?;
+                let n = std::io::Read::read(&mut std::fs::File::open(&abs_path).ok()?, &mut header)
+                    .ok()?;
                 detect::by_magic(&header[..n])
             });
             Some(CrawledFile {

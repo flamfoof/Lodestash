@@ -186,7 +186,9 @@ static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// sanctioned way to mutate config.json; every caller (desktop commands and the writer
 /// thread's blacklist sync) must go through it so no two writers interleave.
 pub fn edit_config<T>(f: impl FnOnce(&mut AppConfig) -> T) -> Result<T, String> {
-    let _g = CONFIG_LOCK.lock().map_err(|_| "config lock poisoned".to_string())?;
+    let _g = CONFIG_LOCK
+        .lock()
+        .map_err(|_| "config lock poisoned".to_string())?;
     let mut config = AppConfig::load();
     let out = f(&mut config);
     config.save();

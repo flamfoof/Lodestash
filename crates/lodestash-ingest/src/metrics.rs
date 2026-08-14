@@ -88,11 +88,7 @@ mod tests {
     fn gradient(w: u32, h: u32) -> RgbImage {
         let mut img = RgbImage::new(w, h);
         for (x, y, p) in img.enumerate_pixels_mut() {
-            *p = Rgb([
-                (x * 7 + y * 3) as u8,
-                (x * 5) as u8,
-                (y * 11) as u8,
-            ]);
+            *p = Rgb([(x * 7 + y * 3) as u8, (x * 5) as u8, (y * 11) as u8]);
         }
         img
     }
@@ -123,7 +119,11 @@ mod tests {
             perceptual_hash(&c).unwrap(),
         );
         assert_eq!(ha, hc, "the same pixels must hash identically");
-        assert!(hamming(ha, hb) <= 6, "a 1px re-size is a near-dup, got {}", hamming(ha, hb));
+        assert!(
+            hamming(ha, hb) <= 6,
+            "a 1px re-size is a near-dup, got {}",
+            hamming(ha, hb)
+        );
 
         // A different picture is far: > 6 bits.
         let mut other = RgbImage::new(64, 64);
