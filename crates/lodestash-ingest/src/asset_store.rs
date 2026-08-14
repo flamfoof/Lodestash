@@ -19,6 +19,20 @@ pub struct AssetStorePackage {
     pub size_bytes: u64,
 }
 
+/// One pack the import dialog lists (FEATURES §5.2), described for grouping rather than the
+/// cache's publisher/category split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredPack {
+    /// Containing folder relative to the picked root — `Publisher/Category` in an Asset Store
+    /// cache, `""` for a pack directly under the root (the flat-folder case `browse` miscounts).
+    pub group: String,
+    /// First path component of `group` — the publisher subtitle (empty for a flat folder).
+    pub publisher: String,
+    pub name: String,
+    pub path: PathBuf,
+    pub size_bytes: u64,
+}
+
 /// The per-OS default Asset Store cache root (INGESTION.md §2), if the platform's base dir is known.
 /// Existence is **not** checked here — callers validate with [`is_asset_store_cache`].
 pub fn default_root() -> Option<PathBuf> {
@@ -156,6 +170,48 @@ pub fn browse(root: &Path) -> Vec<AssetStorePackage> {
     out
 }
 
+/// Discover `.unitypackage`s under `root` for the import dialog (FEATURES §5.2), grouped by the
+/// folder holding each. Unlike [`browse`] — which splits the cache tree into publisher/category
+/// and mislabels a pack directly under `root` — this derives the group from the relative parent
+/// path, so a flat folder groups everything under `""`. Sorted by group, then name.
+pub fn discover(root: &Path) -> Vec<DiscoveredPack> {
+    let mut out: Vec<DiscoveredPack> = WalkDir::new(root)
+        .min_depth(1)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file() && is_unitypackage(e.path()))
+        .filter_map(|e| {
+            let rel = e.path().strip_prefix(root).ok()?;
+            let group = rel
+                .parent()
+                .map(|parent| {
+                    parent
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
+                .unwrap_or_default();
+            let publisher = group.split('/').next().unwrap_or_default().to_string();
+            let name = e
+                .path()
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let size_bytes = e.metadata().ok().map(|m| m.len()).unwrap_or(0);
+            Some(DiscoveredPack {
+                group,
+                publisher,
+                name,
+                path: e.path().to_path_buf(),
+                size_bytes,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.group.cmp(&b.group).then(a.name.cmp(&b.name)));
+    out
+}
+
 fn is_unitypackage(path: &Path) -> bool {
     path.extension()
         .map(|e| e.eq_ignore_ascii_case("unitypackage"))
@@ -259,5 +315,27 @@ mod tests {
         let missing = std::path::Path::new("/definitely/not/here/Asset Store-5.x");
         assert!(browse(missing).is_empty());
         assert!(!is_asset_store_cache(missing));
+    }
+
+    #[test]
+    fn discover_groups_by_containing_folder_and_handles_a_flat_pack() {
+        let dir = tempfile::tempdir().unwrap();
+        build_cache(dir.path());
+        // A pack directly at the root — `browse` would mislabel its publisher as its filename.
+        fs::write(dir.path().join("FlatPack.unitypackage"), b"gz").unwrap();
+
+        let packs = discover(dir.path());
+        assert_eq!(packs.len(), 4);
+
+        let flat = packs.iter().find(|p| p.name == "FlatPack").unwrap();
+        assert_eq!(flat.group, "");
+        assert_eq!(flat.publisher, "");
+
+        let toon = packs
+            .iter()
+            .find(|p| p.name == "Toon Fantasy Nature")
+            .unwrap();
+        assert_eq!(toon.group, "SICS Games/3D ModelsEnvironments");
+        assert_eq!(toon.publisher, "SICS Games");
     }
 }

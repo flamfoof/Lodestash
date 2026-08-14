@@ -17,7 +17,7 @@ use std::sync::Arc;
 use lodestash_core::catalog::PackageEntryRecord;
 use lodestash_core::types::Exclude;
 use lodestash_ingest::crawler::{self, CrawledFile};
-use lodestash_ingest::unitypackage;
+use lodestash_ingest::{detect, unitypackage};
 
 use crate::types::PendingPackage;
 
@@ -176,6 +176,80 @@ pub fn resolve_pending_package(source_idx: usize, file: &CrawledFile) -> Option<
     })
 }
 
+/// The stored `package.category` vocabulary for the import dialog (FEATURES §5.2/§5.3): the four
+/// content-derivable buckets plus the two override-only ones. `Code`/`UI` can never be
+/// auto-detected — scripts have no `media_type` and UI-vs-2D game-art cannot be told from bytes
+/// (FEATURES §5.3).
+pub const CATEGORY_3D: &str = "3D";
+pub const CATEGORY_MATERIALS: &str = "Materials";
+pub const CATEGORY_AUDIO: &str = "Audio";
+pub const CATEGORY_2D: &str = "2D";
+pub const CATEGORY_CODE: &str = "Code";
+pub const CATEGORY_UI: &str = "UI";
+
+/// The override dropdown's full offer (FEATURES §5.2): the four content buckets plus the two
+/// override-only labels.
+pub const IMPORT_CATEGORIES: [&str; 6] = [
+    CATEGORY_3D,
+    CATEGORY_MATERIALS,
+    CATEGORY_AUDIO,
+    CATEGORY_2D,
+    CATEGORY_CODE,
+    CATEGORY_UI,
+];
+
+/// Map a `media_type` code to its content category (FEATURES §5.2 auto-detect). Textures ride
+/// with materials; image/sprite/font are 2D. `None` for anything without a derivable bucket.
+pub fn content_category(media_type_code: &str) -> Option<&'static str> {
+    match media_type_code {
+        "model_3d" => Some(CATEGORY_3D),
+        "material" | "texture" => Some(CATEGORY_MATERIALS),
+        "audio" => Some(CATEGORY_AUDIO),
+        "image" | "sprite" | "font" => Some(CATEGORY_2D),
+        _ => None,
+    }
+}
+
+/// Dominant content category for a pack's manifest entries — the most common classified media
+/// type's bucket. Ties break toward the fixed order above (`3D` first). `None` when no entry
+/// classifies.
+pub fn dominant_content_category(entries: &[PackageEntryRecord]) -> Option<&'static str> {
+    const ORDER: [&str; 4] = [CATEGORY_3D, CATEGORY_MATERIALS, CATEGORY_AUDIO, CATEGORY_2D];
+    let mut counts = [0usize; 4];
+    for e in entries {
+        let Some(p) = e.pathname.as_deref() else {
+            continue;
+        };
+        // Classify by extension, exactly like `classify_in_pack_entries` — `.meta` sidecars and
+        // scripts/prefabs drop out (`by_extension` returns None).
+        let Some(media) = detect::by_extension(std::path::Path::new(p)) else {
+            continue;
+        };
+        let Some(cat) = content_category(media.code()) else {
+            continue;
+        };
+        if let Some(i) = ORDER.iter().position(|c| *c == cat) {
+            counts[i] += 1;
+        }
+    }
+    let mut best: Option<(usize, &'static str)> = None;
+    for (i, cat) in ORDER.iter().enumerate() {
+        if counts[i] > 0 && best.map_or(true, |(bi, _)| counts[i] > counts[bi]) {
+            best = Some((i, cat));
+        }
+    }
+    best.map(|(_, cat)| cat)
+}
+
+/// Normalize a pack name for the §5.6 duplicate check: lowercase, keep alphanumerics only.
+/// Name-only matching (content hashing is the future refinement, FEATURES §5.6).
+pub fn normalize_pack_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,14 +282,21 @@ mod tests {
             excludes: Vec::new(),
             pack_only: true,
         }]);
-        assert!(crawled.entries.is_empty(), "pack-only sources are not walked");
+        assert!(
+            crawled.entries.is_empty(),
+            "pack-only sources are not walked"
+        );
 
         let crawled = crawl_sources(&[Source {
             root: dir.path().to_path_buf(),
             excludes: Vec::new(),
             pack_only: false,
         }]);
-        assert_eq!(crawled.entries.len(), 1, "…but the same source is when it is not");
+        assert_eq!(
+            crawled.entries.len(),
+            1,
+            "…but the same source is when it is not"
+        );
     }
 
     /// Every entry carries the index of the source it came from, or a multi-source scan cannot
@@ -266,5 +347,56 @@ mod tests {
             .map(|(_, f)| f.rel_path.to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["keep.fbx"]);
+    }
+
+    fn entry(pathname: Option<&str>) -> PackageEntryRecord {
+        PackageEntryRecord {
+            guid: pathname.map(|p| format!("g:{p}")).unwrap_or_default(),
+            pathname: pathname.map(str::to_owned),
+            tar_offset: Some(0),
+            size_bytes: Some(1),
+        }
+    }
+
+    #[test]
+    fn the_dominant_category_counts_classifiable_entries_only() {
+        let entries = vec![
+            entry(Some("Assets/Rock.fbx")),
+            entry(Some("Assets/Rock.fbx.meta")),
+            entry(Some("Assets/Wood.png")),
+            entry(Some("Assets/Hum.wav")),
+            entry(Some("Assets/Hum.wav")),
+            entry(Some("Assets/Shotgun.cs")),
+        ];
+        // Audio (2) beats 3D (1) and Materials (1); .meta and .cs classify to nothing.
+        assert_eq!(dominant_content_category(&entries), Some(CATEGORY_AUDIO));
+    }
+
+    #[test]
+    fn a_pack_with_no_classifiable_entries_has_no_category() {
+        assert_eq!(
+            dominant_content_category(&[entry(Some("Assets/Readme.txt"))]),
+            None
+        );
+    }
+
+    #[test]
+    fn content_category_maps_the_seven_value_enum_to_four_buckets() {
+        assert_eq!(content_category("model_3d"), Some(CATEGORY_3D));
+        assert_eq!(content_category("material"), Some(CATEGORY_MATERIALS));
+        assert_eq!(content_category("texture"), Some(CATEGORY_MATERIALS));
+        assert_eq!(content_category("audio"), Some(CATEGORY_AUDIO));
+        assert_eq!(content_category("image"), Some(CATEGORY_2D));
+        assert_eq!(content_category("sprite"), Some(CATEGORY_2D));
+        assert_eq!(content_category("font"), Some(CATEGORY_2D));
+    }
+
+    #[test]
+    fn pack_names_normalize_for_duplicate_matching() {
+        assert_eq!(normalize_pack_name("POLYGon City"), "polygoncity");
+        assert_eq!(
+            normalize_pack_name("Toon-Fantasy_Nature"),
+            "toonfantasynature"
+        );
     }
 }
