@@ -512,9 +512,14 @@ pub fn extract_at_offsets(
 /// Like [`extract_at_offsets`] but drives `on_progress(compressed_read, compressed_total)` as it
 /// skip-scans and stops (clean cancel) when the callback returns false. Progress is in **compressed**
 /// bytes — the honest denominator, since the cost is inflating the gzip up to the payload's offset (a
-/// big pack has no random access, INGESTION §2). A cancel surfaces as the sentinel error
-/// [`is_cancel`] recognizes; on a huge pack this is what lets a single-file preview pull show a real
-/// bar and be aborted instead of appearing frozen.
+/// big pack has no random access, INGESTION §2); on a huge pack this is what lets an extraction show
+/// a real bar and be aborted instead of appearing frozen.
+///
+/// A cancel is **not an error**: it returns the payloads placed so far, exactly like
+/// [`extract_to_workspace_with_progress`]. Payloads are placed incrementally and content-addressed,
+/// so a cancelled run leaves valid files and the caller can still record them — returning `Err`
+/// instead threw away a list of files that were already on disk, leaving their rows unmaterialized
+/// and showing the user a raw I/O error for pressing Cancel.
 pub fn extract_at_offsets_with_progress(
     path: &Path,
     dest: &Path,
@@ -546,35 +551,59 @@ fn extract_at_offsets_from<R: Read>(
 
     let mut pos: u64 = 0;
     let mut extracted = Vec::with_capacity(wanted.len());
-    for w in wanted {
-        if w.offset < pos {
-            continue; // overlapping/duplicate locator — already consumed
+    let walk: io::Result<()> = (|| {
+        for w in wanted {
+            if w.offset < pos {
+                continue; // overlapping/duplicate locator — already consumed
+            }
+            io::copy(&mut (&mut gz).take(w.offset - pos), &mut io::sink())?;
+            pos = w.offset;
+            let tmp_path = tmp_dir.join(&w.guid);
+            let (hash, size) = {
+                let mut region = (&mut gz).take(w.size);
+                // A cancel can land mid-payload, and `?` would carry it out past the cleanup
+                // below — leaving the partial write in `.tmp/<guid>`. Now that a cancel returns
+                // `Ok`, nothing downstream would ever come back for it: cancel a 400 MB payload
+                // often enough and `.tmp` grows without bound (`remove_dir` is non-recursive and
+                // silently fails on a non-empty dir).
+                match stream_hash_to_file(&mut region, &tmp_path) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&tmp_path);
+                        return Err(e);
+                    }
+                }
+            };
+            pos += size;
+            if size != w.size {
+                // Truncated read: stale locator (package changed on disk), *or* a cancel landing
+                // mid-payload. A cancel is reported by the sentinel error the reader already
+                // returned, so only a genuine short read reaches this branch with the stream
+                // healthy — and silently placing a short payload would poison the
+                // content-addressed store.
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "payload {} truncated: wanted {} got {size} bytes",
+                        w.guid, w.size
+                    ),
+                ));
+            }
+            extracted.push(place_payload(
+                dest, w.guid, w.pathname, tmp_path, hash, size,
+            )?);
         }
-        io::copy(&mut (&mut gz).take(w.offset - pos), &mut io::sink())?;
-        pos = w.offset;
-        let tmp_path = tmp_dir.join(&w.guid);
-        let (hash, size) = {
-            let mut region = (&mut gz).take(w.size);
-            stream_hash_to_file(&mut region, &tmp_path)?
-        };
-        pos += size;
-        if size != w.size {
-            // Truncated read: stale locator (package changed on disk). Fail loudly —
-            // silently placing a short payload would poison the content-addressed store.
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "payload {} truncated: wanted {} got {size} bytes",
-                    w.guid, w.size
-                ),
-            ));
-        }
-        extracted.push(place_payload(
-            dest, w.guid, w.pathname, tmp_path, hash, size,
-        )?);
-    }
+        Ok(())
+    })();
     let _ = std::fs::remove_dir(&tmp_dir);
+    // Cancel keeps what was placed (see the doc comment); every other error still propagates,
+    // and the files it already placed likewise survive for a retry.
+    if let Err(e) = walk {
+        if !is_cancel(&e) {
+            return Err(e);
+        }
+    }
     Ok(extracted)
 }
 
@@ -796,6 +825,70 @@ mod tests {
         for a in &again {
             assert!(a.workspace_path.exists());
         }
+    }
+
+    /// A cancelled **surgical** extract keeps what it placed, like the workspace path does.
+    ///
+    /// It used to return the cancel sentinel as an `Err`, which threw away a list of payloads that
+    /// were already on disk: the writer never materialized them (rows kept `workspace_rel` NULL)
+    /// and the user got a raw I/O error string for pressing Cancel.
+    #[test]
+    fn a_cancelled_surgical_extract_keeps_what_it_placed() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"surgical".repeat(400);
+        let pkg = build_test_package(
+            dir.path(),
+            "cafe1234",
+            "Assets/Props/Crate.png",
+            "guid: cafe1234\n",
+            &payload,
+        );
+        let entry = &read_manifest(&pkg).unwrap()[0];
+        let wanted = vec![EntryLocator {
+            guid: entry.guid.clone(),
+            pathname: entry.pathname.clone(),
+            offset: entry.asset_offset.unwrap(),
+            size: entry.asset_size.unwrap(),
+        }];
+
+        // Cancel before a single byte is read: no payload placed, but still not an error.
+        let ws = dir.path().join("ws");
+        let none = extract_at_offsets_with_progress(&pkg, &ws, wanted.clone(), &|_, _| false)
+            .expect("a cancel is not a failure");
+        assert!(none.is_empty(), "nothing was placed before the cancel");
+
+        // Cancel only *after* the payload has been read: the placed file is kept and usable.
+        let seen = std::sync::atomic::AtomicU64::new(0);
+        let placed = extract_at_offsets_with_progress(&pkg, &ws, wanted.clone(), &|read, _| {
+            seen.store(read, std::sync::atomic::Ordering::Relaxed);
+            read == 0 // allow the first read, cancel every one after it
+        })
+        .expect("a cancel is not a failure");
+        assert!(
+            seen.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the progress callback never ran — the test proves nothing"
+        );
+        for a in &placed {
+            assert!(
+                a.workspace_path.exists(),
+                "a placed payload must be on disk"
+            );
+            assert_eq!(std::fs::read(&a.workspace_path).unwrap(), payload);
+        }
+
+        // A genuine error still propagates — a stale locator must never come back as Ok.
+        let bad = extract_at_offsets_with_progress(
+            &pkg,
+            &ws,
+            vec![EntryLocator {
+                guid: "stale".into(),
+                pathname: None,
+                offset: wanted[0].offset,
+                size: wanted[0].size + 4096,
+            }],
+            &|_, _| true,
+        );
+        assert!(bad.is_err(), "a truncated payload must still fail loudly");
     }
 
     #[test]

@@ -6,6 +6,7 @@ INGESTION / AI-PIPELINE / KANBAN truth-check) against the live code. The egui cr
 `lodestash-desktop`/`lodestash-app` are the app. **Card state = verified in code, not comments.**
 
 Lanes: 🟢 Done · 🟡 Partial (delta named) · 🔴 Missing · ⚪ Built but inert (needs wiring) ·
+🔧 Extraction & structure (the 2026-08-14 audit) ·
 🟠 Visual conformance & doc drift · 🔵 Engine-project / deferred. The main board
 ([`KANBAN.md`](KANBAN.md)) holds the full history; the card titles here match the main board's
 B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-desktop/`.
@@ -58,7 +59,7 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
 - [x] **Backend live in the shell.** M1–M16 migrations, catalog functions, drains (metrics →
       previews → deps → embeddings → promote), persist/scan, single-writer thread, `lodestash://`
       protocol (`preview`/`file`/`mesh`, Range-capable, in-pack thumbnails via scratch).
-- [x] **QA.** e2e 52/52 over the real binary (CDP), svelte-check 0/0, `cargo test` green; name-level
+- [x] **QA.** e2e 56/56 over the real binary (CDP), svelte-check 0/0, `cargo test` green; name-level
       REST↔MCP parity test (test-only — see ⚪).
 
 ## 🟡 Partial — working, delta named
@@ -205,7 +206,95 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       BLAKE3) + the standard persist, reloading the UI only when something actually changed;
       the watch re-arms after source-set changes. Skipped under the e2e escape hatch.
 - [ ] **Eviction / keep-extracted.** `unmaterialize_package` zero callers; `cache_extracted` not
-      honored; workspace cap/7-day retention not enforced.
+      honored; workspace cap/7-day retention not enforced. **Re-confirmed 2026-08-14:**
+      `workspace_cache_cap_gb` and `workspace_cache_retention_days` (`config.rs:452,460`) have
+      **zero readers outside `config.rs`** — grep the workspace for either name. INGESTION §2
+      "Workspace retention" specifies size-cap-first-then-LRU with a retention window plus a
+      Settings → Storage cap / retention / **Clear workspace** action; none of it exists, and full
+      extraction writes *every* payload (scripts and prefabs included — that part is per spec), so
+      the workspace grows without bound and nothing ever reclaims it. The largest remaining hole in
+      the extraction feature.
+
+## 🔧 Extraction & structure — the 2026-08-14 audit
+
+Its own lane on purpose: these came out of a full read of the per-pack Extract flow plus the max
+review of that work, and they are neither "built but inert" (the code runs) nor purely visual.
+The fixed rows are kept beside the open ones because the open ones are what the fixes *exposed*.
+
+**Extraction defects found and fixed (2026-08-14)** — full read of the per-pack Extract flow
+(`writer.rs` `Op::ExtractPackage` → manifest worker → `mint_in_pack` → `extract_at_offsets` →
+`materialize_extract`):
+
+- [x] **The extract queue could stall for the whole session.** UI-SPEC §5 unpacks ticked packs one
+      at a time through `extract_queue`, drained by whichever worker reports back. But an
+      `Op::ExtractPackage` can fail *before spawning anything* — package row gone, no workspace
+      configured, `spawn_extract_worker`'s "no extractable payloads" — and the drain sites popped
+      exactly one entry, so a failing pack left everything behind it queued with no worker coming.
+      `extract_queue.is_empty()` then stays false forever, so **every later extract request in the
+      session joins a queue nobody drains**: no job in the tray, no error, and `extract_package`
+      never resolves — the row's spinner turns until the app is restarted. Both drain sites now go
+      through `start_next_extract`, which keeps popping until one op actually spawns a worker.
+- [x] **A cancelled surgical extract threw away the payloads it had already placed.**
+      `extract_at_offsets_from` let the cancel sentinel escape as an `Err`, so `materialize_extract`
+      discarded the list — rows kept `workspace_rel` NULL despite valid content-addressed files
+      being on disk, and pressing Cancel surfaced a raw I/O error string. It now returns what it
+      placed, matching `extract_to_workspace_with_progress`'s contract (a cancel is not a failure;
+      genuine truncation still fails loudly). Covered by
+      `a_cancelled_surgical_extract_keeps_what_it_placed`, mutation-checked.
+- [x] **Cancel reported as failure.** "The pack extracted no assets" / "the pack has no manifest
+      entries" fired even when the user cancelled before the first payload or manifest row landed.
+      Both are now conditioned on `!cancelled`, and a cancel during the *analyze* phase keeps the
+      partial locators (the next run resumes from them) without rolling on into extraction.
+
+**Still open after the 2026-08-14 max review** (found by review, not fixed — each needs a decision
+or more than a patch):
+
+- [ ] **`extract_package` answers at spawn, not at completion.** `Writer::run` (`writer.rs:803`)
+      does a single `wait.recv()` and drops the receiver, and the direct arm sends the
+      `Ok{changed:0}` "queued" sentinel the moment a worker starts. So the `reply.send` the workers
+      make from `ExtractDone`/`ManifestDone` **always lands on a dead channel and is discarded** —
+      the real `changed` count never reaches the frontend, `UnityAssetsScreen`'s per-row spinner
+      clears while the pack is still unpacking, and `extractSelected` marks pack N+1 running while
+      N is still going. Two coherent designs; pick one: **(a)** the tray owns progress and outcome
+      (right for a multi-GB unpack) — then delete the dead `reply` plumbing from both workers and
+      have the row follow the tray's job state; or **(b)** the command blocks to completion — then
+      the direct arm must not send. Today's code is half of each, and the comments claimed (b).
+- [ ] **A panicking worker wedges the queue for the session.** `jobs.finish` only runs when a worker
+      sends its `WriterMsg`; a panic in `read_manifest_with_progress` / `extract_at_offsets_with_progress`
+      (corrupt gzip, malformed tar) unwinds a detached thread, the send never happens, the panic is
+      swallowed, and `has_active_extract()` stays true forever — every later extract takes the
+      `push_back` branch and nothing drains it. `start_next_extract` fixed the `Err` road to this
+      jam, not this one. Wants the worker's join handle watched, or a job lease that expires.
+- [ ] **The sound card's ▶ is decoration.** `<span class="play">▶</span>` sits inside an
+      `aria-hidden` wrapper with no handler, so clicking it selects the card and screen readers
+      cannot reach it. UI-SPEC §2.5 specifies a working ▶/◼ with an inline scrubber and one asset
+      playing at a time (§13.2) — none of it wired.
+- [ ] **Doc drift: card status rail width.** UI-SPEC §2.5 says 3px, DESIGN-GUIDELINES §6 says 1px,
+      the app follows DG (ALIGNMENT-AUDIT F1). UI-SPEC is the stale one — fix it per CLAUDE.md
+      rule 2 so the next reader is not told the code diverges when it conforms.
+
+**Structural audit (2026-08-14)** — answering "too much code per file, too many tests":
+
+- [ ] **`catalog.rs` is 9,423 lines, 51% of it tests.** 153 `pub fn`, **8 `impl Catalog` blocks**
+      (lines 213, 2044, 7575, 7704, 7799, 7899, 7968, 8262, 8732) and 3 `#[cfg(test)]` modules
+      (4615, 7643, 8759) that each own one domain and duplicate their own `rec()` fixture (5096,
+      8763). Every crate depends on this one, so touching a single query recompiles 9.4k lines and
+      re-runs 69 tests. The impl blocks already mark the seams: split to
+      `catalog/{mod,assets,tags,collections,taxonomy,oplog}.rs`, tests moving with their domain —
+      a mechanical move, no behaviour change.
+- [ ] **The test budget is inverted, not oversized.** 324 tests workspace-wide is not the problem;
+      *where* they sit is. `catalog.rs` spends 4,809 lines on CRUD while `writer.rs` — 2,040 lines,
+      the only genuinely concurrent code in the repo, owning the extract queue, cooperative cancel
+      and the spawn/drain invariant — has **zero**. The queue-jam bug fixed above is exactly what
+      one test over `start_next_extract` with a two-op queue and a failing first op would have
+      caught. Cut from the catalog CRUD tests, spend a fraction here: `start_next_extract` is a
+      pure function over `(catalog, queue)` and needs no Tauri.
+
+Checked and **not** a defect: extracting unclassifiable payloads (`.cs`, `.prefab`, `.meta`) is
+INGESTION §2's "full extraction … extracts **every payload** once", which is what makes every
+sibling in a pack random-access on disk. Entries dropped from `wanted` for lacking a `tar_offset`
+are pathname-only folder rows — `read_manifest` records an offset for every real payload
+(`unitypackage.rs:317`).
 - [ ] **Non-content classification.** `detect::is_content` zero callers; `is_content`/`content_kind`
       never set.
 - [x] **Model manager (2026-08-12).** Settings gained an AI MODELS card: SigLIP 2 (visual
@@ -244,29 +333,40 @@ evidence in [`docs/design/ALIGNMENT-AUDIT.md`](design/ALIGNMENT-AUDIT.md) **§N*
 starting any card here; the ids below are its row ids. **The mockup drops the Unity Assets nav row
 and the Materials tab — `FEATURES.md` wins on both, do not "fix" the app to match.**
 
-- [ ] **B12a — the card reads as its media type (§N1.1–N1.3).** Thumb 2:1 not square
-      (`Card.svelte:265`); audio gets ▶ + waveform instead of one speaker glyph (`:133`); raster
-      previews `cover` not `contain` (`:278`). Highest value on the board by information-per-line:
-      1,841 sounds and 2,228 images currently render as interchangeable dark squares.
-- [ ] **B12b — subtract the duplicates (§N2.1, §N5.2).** Status filter renders twice, in the toolbar
-      (`Toolbar.svelte:105-111`) and the sidebar facet (`Sidebar.svelte:116-127`) — one state, two
-      controls; and the `LIBRARY` h1 (`LibraryScreen.svelte:163-168`) costs ~56px the design spends
-      on cards. Pure deletion.
-- [ ] **B12c — affordances visible at rest (§N1.4, N1.6, N1.7).** Star (can't favourite from the
-      grid at all today — `Card.svelte:136`), multi-select box (`LibraryScreen.svelte:421`), `+ stage`
-      as a labelled button, and the missing `⤢` full-size. All four are hover-only or absent where
-      the design shows them at rest.
-- [ ] **B12d — treatment polish (§N1.8–N1.11, N4.2).** Full-perimeter status border vs the 1px left
-      rail; two-row chip wrap; italic+dim unidentified names; `1.2k tris`; badge clamp at `999+`
-      (`Sidebar.svelte:231-237` renders `7667` inside a pill and eats the row).
-- [ ] **B12e — `✓ in <project>` membership pill (§N1.5).** Needs a per-card project-membership read;
-      no command exists. Blocked behind the staging/import half (I8).
-- [ ] **B12f — spec calls needed before touching (§N3.1, §N4.1).** The mockup shows tabs with no
-      counts and no PINNED sidebar group; UI-SPEC §0.3 and C6 specify both. Decide, then update the
-      losing doc in the same change.
-- [ ] **B12g — top-bar cosmetics (§N3.2–N3.5).** Health meter as an `n / total` fraction with the bar
-      beneath; engine on the project chip; GPU on the `✦ local` pill (still open from B8); Tags/AI
-      toggle left of the search box.
+- [x] **B12a — the card reads as its media type (2026-08-14).** Thumb at the spec's **104px**;
+      5-bar `▶` waveform for audio the backend cannot rasterise (the `<img>` still wins when
+      `lodestash://thumb` *can* draw the real envelope — `protocol.rs:264`); `cover` for tileable
+      art, `contain` for subjects, so a 2048² albedo fills the strip while a sprite keeps its head.
+- [x] **B12b — subtract the duplicates (2026-08-14).** Toolbar status chips deleted (the sidebar
+      facet is UI-SPEC §0.2.2's control and §2.1's header row never listed them), which also puts
+      the result label first (§N2.5); no `LIBRARY` heading — Favorites/Trash keep theirs per
+      FEATURES §4.7 and the e2e that pins it.
+- [x] **B12c — the star became a control; `⤢` exists (2026-08-14).** The grid could previously only
+      *report* a favourite. **Three of this card's four items were wrong:** UI-SPEC §2.5 puts the
+      pick checkbox and the `⤢`/`⟡` tray on **hover**, not at rest — the mockup loses. See §N6.
+- [x] **B12d — treatment polish (2026-08-14).** Two-row chip wrap; slate-italic unidentified names
+      *plus* the §2.5 30%-grayscale art behind a large slate `?`; `1.2k tris`; badges clamped at
+      `999+`; and the **confirmed at-rest gold ring** §2.5 asks for (audit row **F4**, open since
+      08-04). Full-perimeter status border **rejected** — §2.5 specifies a left border.
+- [ ] **B12e — `✓ in <project>` membership pill (§N1.5).** *Not blocked* — the earlier "no command
+      exists" was wrong. `import_record` is populated and per-asset membership is queried at
+      `catalog.rs:2985`; what is missing is the bulk read (an `in_project` flag on `GridItem`,
+      filled from the active project's import set at reload).
+- [x] **B12f — resolved by reading the spec (2026-08-14).** Tab counts stay (UI-SPEC §0.3); the
+      PINNED sidebar group stays (audit row C6). No code, no doc change — the mockup predates both.
+- [x] **B12g — top bar (2026-08-14).** Health meter as `Identified n / total` over a 6px
+      gold-gradient bar (§0.1.5); project chip `Name · Engine` (§0.1.6); Tags/AI toggle ahead of the
+      search box per §0.1's order. **GPU name still open** — nothing in `lodestash-desktop`/`-app`
+      exposes an execution provider or adapter name, so the pill would have to invent one (**B8**).
+- [ ] **B12h — the list rows never got it (audit F6).** `AssetList.svelte` still lacks the star,
+      `⤢` and stage treatment UI-SPEC §2.5 specifies for rows; chips are not click-to-search and the
+      pack name is not a link to Pack stats §15. Also **§N5.3**: the inspector holds its rail open
+      showing "Select an asset." when nothing is selected.
+
+> **The trap this pass paid for, in one line:** a hover-revealed control at an `opacity: 0` still
+> takes clicks, so the 104px thumb pulled the action tray under the card's *centre* and ate the
+> double-click that opens Quick Look — surfacing three checks later as the 3D viewer hanging. The
+> e2e now asserts on geometry: *whatever sits at a card's centre must be the card.*
 
 **Doc drift (docs name things that no longer exist — fix per CLAUDE.md "docs are source of truth"):**
 

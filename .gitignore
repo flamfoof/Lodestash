@@ -36,3 +36,13 @@ desktop.ini
 
 # Claudenator isolate worktrees (ephemeral, agent-owned)
 .claudenator-wt-*/
+
+# Node deps: the UI has its own rule, but tooling run from the repo root (reasonix, MCP
+# helpers) installs here too — without a root rule a single `git add .` stages tens of
+# thousands of dependency files onto main.
+node_modules/
+
+# Node deps: the UI has its own rule, but tooling run from the repo root (reasonix, MCP
+# helpers) installs here too — without a root rule a single `git add .` stages tens of
+# thousands of dependency files onto main.
+node_modules/

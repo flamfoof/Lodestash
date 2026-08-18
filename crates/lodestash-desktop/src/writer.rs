@@ -661,19 +661,15 @@ impl Writer {
                             let _ = reply.send(result);
                             emit_changed(&app, "catalog");
                             emit_changed(&app, "jobs");
-                            if let Some(next) = extract_queue.pop_front() {
-                                let r = run(
-                                    &mut catalog,
-                                    &db_path,
-                                    next.op,
-                                    &writer_tx,
-                                    &jobs,
-                                    &next.reply,
-                                    &app,
-                                    &appraise,
-                                );
-                                let _ = next.reply.send(r);
-                            }
+                            start_next_extract(
+                                &mut catalog,
+                                &mut extract_queue,
+                                &db_path,
+                                &writer_tx,
+                                &jobs,
+                                &app,
+                                &appraise,
+                            );
                         }
                         Ok(WriterMsg::ManifestDone {
                             job_id,
@@ -687,9 +683,24 @@ impl Writer {
                             // worker over the locators. The op's reply is answered by that
                             // phase's ExtractDone — except when the manifest failed, which is
                             // answered here so the caller never hangs.
+                            // `true` = an extract worker is now running, so *its* `ExtractDone`
+                            // drains the queue. Anything else — an error, or a cancel that stops
+                            // after the analyze phase — has to settle here, or the queue behind it
+                            // never moves again.
+                            let mut spawned = false;
                             let result = (|| {
                                 let entries = entries?;
                                 let minted = mint_in_pack(&mut catalog, package_id, &entries)?;
+                                // Cancelled during analyze: keep the locators that were read (a
+                                // partial manifest is still progress and the next run resumes from
+                                // it) but do **not** roll on into the extract phase — the user
+                                // asked it to stop.
+                                if cancelled {
+                                    return Ok(WriteResult {
+                                        changed: minted,
+                                        ..Default::default()
+                                    });
+                                }
                                 let pkg = catalog
                                     .list_packages()
                                     .map_err(|e| e.to_string())?
@@ -708,6 +719,7 @@ impl Writer {
                                     &jobs,
                                     &app,
                                 )?;
+                                spawned = true;
                                 Ok(WriteResult {
                                     changed: minted,
                                     ..Default::default()
@@ -718,21 +730,17 @@ impl Writer {
                             jobs.finish(job_id, ok, cancelled, changed);
                             emit_changed(&app, "catalog");
                             emit_changed(&app, "jobs");
-                            if let Err(e) = result {
-                                let _ = reply.send(Err(e));
-                                if let Some(next) = extract_queue.pop_front() {
-                                    let r = run(
-                                        &mut catalog,
-                                        &db_path,
-                                        next.op,
-                                        &writer_tx,
-                                        &jobs,
-                                        &next.reply,
-                                        &app,
-                                        &appraise,
-                                    );
-                                    let _ = next.reply.send(r);
-                                }
+                            if !spawned {
+                                let _ = reply.send(result);
+                                start_next_extract(
+                                    &mut catalog,
+                                    &mut extract_queue,
+                                    &db_path,
+                                    &writer_tx,
+                                    &jobs,
+                                    &app,
+                                    &appraise,
+                                );
                             }
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -969,6 +977,51 @@ fn appraise_pass(
         promoted,
         ..Default::default()
     })
+}
+
+/// Start the next queued `ExtractPackage`, **skipping any that fail before spawning a worker**.
+///
+/// The queue is drained by whichever worker reports back (`ExtractDone` / a failed `ManifestDone`),
+/// so exactly one thing must be true after this returns: either a worker is running, or the queue
+/// is empty. An op that returns `Ok` spawned a worker and will report back. One that returns `Err`
+/// — package row gone, no workspace configured, a pack with no extractable payloads — spawned
+/// **nothing**, so it can never drain the queue itself.
+///
+/// Popping only once was a silent, session-long death: the failed op's reply carried its error, but
+/// every pack behind it sat in a queue nobody would ever drain again. `extract_queue.is_empty()`
+/// stays false from then on, so *every later extract request* takes the "join the queue" branch —
+/// no job in the tray, no error, and (because a queued `Job`'s reply is only sent when it is
+/// finally started) the caller blocks in `Writer::run`'s `wait.recv()` forever.
+///
+/// Note what this does **not** fix: a worker that panics never sends its `WriterMsg`, so
+/// `jobs.finish` never runs and `has_active_extract()` stays true for the rest of the session —
+/// the same jam by a different road. See the extract-lifecycle card on the board.
+fn start_next_extract(
+    catalog: &mut Catalog,
+    queue: &mut VecDeque<Job>,
+    db_path: &Path,
+    tx: &Sender<WriterMsg>,
+    jobs: &JobRegistry,
+    app: &Option<tauri::AppHandle>,
+    progress: &AppJobProgress,
+) {
+    while let Some(next) = queue.pop_front() {
+        let result = run(
+            catalog,
+            db_path,
+            next.op,
+            tx,
+            jobs,
+            &next.reply,
+            app,
+            progress,
+        );
+        let spawned = result.is_ok();
+        let _ = next.reply.send(result);
+        if spawned {
+            return; // a worker is running; its report drains the rest
+        }
+    }
 }
 
 fn run(
@@ -1404,8 +1457,16 @@ fn run(
             // reports back. The extract worker then pulls only the wanted payloads with one
             // gzip skip-scan (`extract_at_offsets`) and the writer **materializes** them
             // (fills `workspace_rel`) — the rows hydrate from the workspace and render from
-            // cache. This command returns "queued" immediately; the op's reply resolves when
-            // the whole flow finishes.
+            // cache.
+            //
+            // **This command answers as soon as a worker is spawned, not when the pack is
+            // unpacked.** `Writer::run` does a single `wait.recv()` and drops the receiver, so the
+            // `reply.send` the workers make from `ExtractDone`/`ManifestDone` always lands on a
+            // dead channel and is discarded. Outcome and progress reach the user through the **job
+            // tray**, which is the right home for a multi-GB unpack — but the frontend's per-row
+            // spinner clears early because of it, and the reply plumbing through the workers is
+            // dead weight. Tracked on the board (extract lifecycle); do not read the worker's
+            // `reply` argument as a promise to the caller.
             let pkg = catalog
                 .list_packages()
                 .map_err(|e| e.to_string())?
@@ -1447,7 +1508,7 @@ fn run(
                             }
                             !report_cancel.load(Ordering::Relaxed)
                         };
-                        let outcome = read_manifest_with_progress(&wpath, &report)
+                        let read = read_manifest_with_progress(&wpath, &report)
                             .map_err(|e| e.to_string())
                             .map(|m| {
                                 m.iter()
@@ -1458,15 +1519,25 @@ fn run(
                                         size_bytes: e.asset_size.map(|s| s as i64),
                                     })
                                     .collect::<Vec<_>>()
-                            })
-                            .and_then(|entries| {
+                            });
+                        let cancelled = wcancel.load(Ordering::Relaxed);
+                        // `read_manifest_with_progress` reports a cancel as an **error**, not as a
+                        // partial `Ok` (`read_manifest_with_progress_reports_and_cancels` asserts
+                        // exactly that) — so a `!cancelled` guard on the empty case alone was dead
+                        // code, and pressing Cancel during Analyze still surfaced a raw
+                        // "extraction cancelled" string as a failed job. Swallow the error here:
+                        // cancelling is a decision, not a fault.
+                        let outcome = if cancelled {
+                            Ok(read.unwrap_or_default())
+                        } else {
+                            read.and_then(|entries| {
                                 if entries.is_empty() {
                                     Err("the pack has no manifest entries".to_string())
                                 } else {
                                     Ok(entries)
                                 }
-                            });
-                        let cancelled = wcancel.load(Ordering::Relaxed);
+                            })
+                        };
                         let _ = wtx.send(WriterMsg::ManifestDone {
                             job_id: handles.id,
                             package_id,
@@ -1736,16 +1807,19 @@ fn spawn_extract_worker(
                 }
                 !report_cancel.load(Ordering::Relaxed)
             };
-            let outcome = extract_at_offsets_with_progress(&wpath, &wworkspace, wanted, &report)
-                .map_err(|e| e.to_string())
-                .and_then(|a| {
-                    if a.is_empty() {
-                        Err("the pack extracted no assets".to_string())
-                    } else {
-                        Ok(a)
-                    }
-                });
+            let placed = extract_at_offsets_with_progress(&wpath, &wworkspace, wanted, &report)
+                .map_err(|e| e.to_string());
             let cancelled = wcancel.load(Ordering::Relaxed);
+            // "Extracted nothing" is a failure — unless the user cancelled before the first
+            // payload landed, which is a cancel, not a fault, and must not surface as an error
+            // toast for pressing Cancel.
+            let outcome = placed.and_then(|a| {
+                if a.is_empty() && !cancelled {
+                    Err("the pack extracted no assets".to_string())
+                } else {
+                    Ok(a)
+                }
+            });
             let _ = wtx.send(WriterMsg::ExtractDone {
                 job_id: handles.id,
                 package_id: wpkg_id,
