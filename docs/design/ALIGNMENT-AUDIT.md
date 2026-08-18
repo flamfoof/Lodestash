@@ -335,15 +335,75 @@ prototype has. Everything below excludes those two.
 | N5.3 | No inspector rail when nothing is selected | 268px held open showing "Select an asset." | `App.svelte` inspector branch |
 | N5.4 | No pager, no statusbar | both present | `LibraryScreen.svelte:322-328`; `App.svelte` footer (already logged as **A5**) |
 
-#### N6. Priority
+#### N6. Remediation (2026-08-14) — and four rows where the mockup lost
 
-1. **N1.1–N1.3** — the grid is 1,841 sounds and 2,228 images rendering as interchangeable dark
-   squares. Highest information gain per line changed.
-2. **N2.1 + N5.2** — delete the duplicate status control and the heading; pure subtraction.
-3. **N1.4, N1.6, N1.7** — four affordances that exist but are invisible at rest.
-4. **N1.5** — needs a project-membership read; no UI surface for it yet.
-5. **N1.9–N1.11, N4.2** — treatment polish.
-6. **N3.x** — top-bar cosmetics; N3.1 and N4.1 need a spec call before either moves.
+Reading **UI-SPEC §2.5 / §2.1 / §0.1** properly before building changed the job: the spec already
+specifies most of what the mockup shows, in more detail, and **beats the mockup on four rows**. Per
+`CLAUDE.md` the governing `docs/` file wins over the bundle, so those four are closed as-is:
+
+| Row | Mockup wants | UI-SPEC says | Outcome |
+|---|---|---|---|
+| N1.7 | select box visible at rest | §2.5 "pick checkbox (top-left, **appears on hover**/when any pick is active)" | unchanged — spec wins |
+| N1.8 | full-perimeter status border | §2.5 "**3px status left-border**" (shipped 1px per DG §6) | unchanged — spec wins |
+| N2.3 | one `sort · default` select | §2.1 "sort select … **± direction**" | unchanged — spec wins |
+| N2.4 | 2 layout buttons | §2.1 "view toggle ⊞ grid / ☰ list / 📁 folders — **three stops in the Tauri shell**" | unchanged — spec wins |
+
+Also resolved without code, closing **B12f**: tab counts (**N3.1**) stay — UI-SPEC §0.3 specifies
+them and the underline; the **PINNED** sidebar group (**N4.1**) stays — it is audit row C6, shipped
+deliberately. The mockup predates both.
+
+**Shipped:** thumbnail at the spec's **104px** (N1.1); 5-bar `▶` waveform for audio (N1.2); `cover`
+for tileable art, `contain` for subjects (N1.3); `⤢` full-size added to the hover tray (N1.4); the
+star is now a **control**, not a read-out (N1.6); two-row chip wrap (N1.9); unidentified cards get
+slate-italic names *plus* the §2.5 30%-grayscale art behind a large slate `?` (N1.10); `1.2k tris`
+(N1.11); the **confirmed at-rest gold ring** the spec asks for and audit row **F4** had open;
+toolbar status chips deleted, leaving the sidebar facet as the only control (N2.1) — which also puts
+the result label first (N2.5); the `Space quick-looks · ⤢ full size · ⟡ stage` hint (N2.2); the
+nudge's spec copy *"N assets are Unidentified — invisible to AI search until appraised."* +
+**Open Identify mode →**, restyled as a slim rule rather than a boxed card (N5.1); no `LIBRARY`
+heading (N5.2 — Favorites/Trash keep theirs per FEATURES §4.7); health meter as `Identified n / total`
+over a 6px gold-gradient bar (N3.2); project chip `Name · Engine` (N3.3); Tags/AI toggle ahead of the
+search box per §0.1's order (N3.5); nav badges clamped at `999+` (N4.2).
+
+**Two defects the build surfaced, both worth knowing:**
+
+1. **A hover-only control under the card's centre swallows the double-click.** Shortening the thumb
+   to 104px pulled the bottom-right action tray up toward the card's centre point, and a third
+   button pushed it left of the horizontal midpoint — where an `opacity: 0` element *still takes
+   clicks*. Double-clicking the middle of a card hit an invisible `⟡` instead of opening Quick
+   Look, and surfaced three checks later as the 3D viewer appearing to hang. Fixed by keeping the
+   tray to the two buttons §2.5 actually lists (`⤢`, `⟡`), moving `✦ Identify now` into the corner
+   group beside the gem it acts on, and tying `pointer-events` to visibility. Pinned by a check
+   that asserts on geometry — *whatever sits at a card's centre must be the card*.
+2. **The backend already draws real audio waveforms.** `lodestash://thumb` rasterises an envelope
+   via `generate_waveform` (`protocol.rs:264`), so the client silhouette must not shadow it: the
+   `<img>` is tried first and the hashed 5-bar fallback renders only when the route 503s — which is
+   most of a Unity library, since in-pack payloads over the pull cap cannot be rasterised. Both
+   paths are pinned separately.
+
+**Corrections to the rows above:** N1.5 said "no command exists" for `✓ in <project>`. Wrong — the
+`import_record` table is populated and per-asset membership is already queried at
+`catalog.rs:2985`. What is missing is a *bulk* read: an `in_project` flag on `GridItem`, filled from
+the active project's import set at reload. Still deferred, but it is a day's work, not a blocked one.
+N3.4 (`✦ local · <GPU>`) genuinely is blocked: no execution-provider or adapter name is exposed
+anywhere in `lodestash-desktop`/`-app`, so the pill would have to invent one. It stays with **B8**.
+
+**Left open:** the list rows (`AssetList.svelte`) did not get the star / `⤢` / stage treatment §2.5
+specifies for them; the inspector still holds its rail open showing "Select an asset." when nothing
+is selected (**N5.3**); the statusbar stays (**N5.4** / **A5** — an honest dev scaffold).
+
+#### N7. Priority
+
+What is left after §N6, in order:
+
+1. **N1.5** — `✓ in <project>`: an `in_project` flag on `GridItem` filled from the active project's
+   `import_record` set at reload. The data is there; the read is not.
+2. **List-row anatomy** (audit row **F6**) — the star / `⤢` / stage treatment §2.5 specifies for
+   rows, which only the cards got.
+3. **N5.3** — collapse the inspector rail when nothing is selected.
+4. **N3.4** — the GPU name on the AI pill, once anything in the app knows it (**B8**).
+5. **Chips are click-to-search** (§2.5) and the pack name is a link to Pack stats §15 — both
+   specified, neither wired.
 
 ---
 

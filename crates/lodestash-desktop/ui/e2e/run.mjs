@@ -219,10 +219,180 @@ try {
     assert.equal(cards, s.favorites, `Favorites rendered ${cards} cards for ${s.favorites} favourites`);
     const starred = await page
       .locator(".card")
-      .evaluateAll((els) => els.filter((e) => e.querySelector(".star")).length);
-    assert.equal(starred, cards, "every card on Favorites must carry the star");
+      // `.star` is on *every* card now (it is the control that makes a favourite, not a
+      // read-out), so counting it would pass for any grid at all. `.star.on` is the lit one.
+      .evaluateAll((els) => els.filter((e) => e.querySelector(".star.on")).length);
+    assert.equal(starred, cards, "every card on Favorites must carry a lit star");
     await page.getByRole("button", { name: "Library", exact: true }).click();
     await page.waitForTimeout(500);
+  });
+
+  // The card's ☆ became a control (UI-SPEC §2.5). Before this, the grid could only *report* a
+  // favourite — you had to open the inspector to make one — and a star that renders but does
+  // not write looks identical in a screenshot to one that does.
+  //
+  // Self-restoring: the second click is both the cleanup and the other half of the assertion,
+  // so the developer's catalog ends where it started even if the check fails midway.
+  await check("the card star writes, and writes back", async () => {
+    await page.fill('input[type="text"]', "");
+    await page.waitForTimeout(600);
+    const before = (await invoke("library_status")).favorites;
+    // Pick an *unstarred* card so the first click is always an add, whatever the catalog holds —
+    // then hold on to **that card's own name**. Re-finding the star by `.star.on` would click
+    // whichever lit star came first in the DOM, i.e. someone's pre-existing favourite: the
+    // catalog count returns to `before` either way, so the assertion would stay green while
+    // un-favouriting an asset the test never touched.
+    const card = page.locator(".card").filter({ hasNot: page.locator(".star.on") }).first();
+    assert.ok((await card.count()) > 0, "no unstarred card on screen to exercise");
+    const name = (await card.locator(".name").textContent())?.trim();
+    const mine = page.locator(".card", { has: page.getByText(name, { exact: true }) }).first();
+    try {
+      await card.getByTestId("card-star").click();
+      // Scoped to this card: a global `.star.on` count is already satisfied by any pre-existing
+      // favourite, so it would return on the first poll and race the async write.
+      await mine.locator(".star.on").waitFor({ state: "attached", timeout: 5000 });
+      assert.equal(
+        (await invoke("library_status")).favorites,
+        before + 1,
+        "clicking the star did not reach the catalog",
+      );
+    } finally {
+      await mine.getByTestId("card-star").click();
+      await page.waitForTimeout(400);
+    }
+    assert.equal(
+      (await invoke("library_status")).favorites,
+      before,
+      "un-starring did not undo the write — the developer's catalog was left dirty",
+    );
+  });
+
+  // Double-click at a card's centre is how Quick Look opens. Shortening the thumb to the
+  // spec's 104px pulled the hover-revealed action tray up toward that centre, and an
+  // `opacity: 0` element still takes clicks — so the double-click hit a button nobody could
+  // see and Quick Look never opened. It looked like the 3D viewer hanging, three checks later.
+  //
+  // Asserting on geometry rather than on the symptom: whatever sits at the centre of a card
+  // must be the card.
+  await check("a card's centre belongs to the card, not to a hover control", async () => {
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.fill('input[type="text"]', "");
+    await page.waitForTimeout(600);
+    const owner = await page.locator(".card").first().evaluate((card) => {
+      const r = card.getBoundingClientRect();
+      // Hover first: the tray is only clickable once revealed, which is exactly the state a
+      // real double-click happens in.
+      card.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+      const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+      return { tag: hit?.tagName, cls: hit?.className?.toString() ?? "", inCard: card.contains(hit) };
+    });
+    assert.ok(owner.inCard, "the card's centre is covered by something outside the card");
+    assert.ok(
+      !/\bact\b|\bid-btn\b|\bsel\b/.test(owner.cls),
+      `a hover-only control sits under the card's centre (${owner.cls}) — double-click cannot reach the card`,
+    );
+  });
+
+  // Most of a real Unity library's audio is still inside a `.unitypackage`, so `lodestash://thumb`
+  // answers 503 and no waveform raster exists — which used to leave 1,841 sounds rendering as one
+  // wall of identical speaker glyphs. That reads as an empty grid rather than as a bug, so nobody
+  // reports it.
+  //
+  // Both paths are pinned here, because the interesting failure is picking the *wrong* one: the
+  // client-side silhouette must not shadow the real envelope the backend can draw.
+  await check("in-pack sounds draw a silhouette; rasterisable ones keep the real envelope", async () => {
+    const sounds = (
+      await invoke("grid_page", {
+        query: { tab: "sounds", search: "", status: "all", sort_by: "name", sort_asc: true,
+                 favorites_only: false, page: 0, page_size: 100000 },
+      })
+    ).items;
+    assert.ok(sounds.length > 0, "no audio in the library — nothing was exercised");
+
+    const show = async (item) => {
+      await page.fill('input[type="text"]', item.name);
+      await page.waitForFunction(
+        (n) => document.querySelector(".card .name")?.textContent?.trim() === n,
+        item.name,
+        { timeout: 5000 },
+      );
+      // The <img> resolves (or 503s into the fallback) a tick after the card mounts.
+      await page.waitForTimeout(700);
+      return page.locator(".card").first();
+    };
+
+    const packed = sounds.find((i) => i.in_pack);
+    if (packed) {
+      const card = await show(packed);
+      assert.equal(await card.locator(".wave").count(), 1, `no silhouette on in-pack ${packed.name}`);
+      assert.equal(await card.locator(".wave .bar").count(), 5, "UI-SPEC §2.5 specifies 5 bars");
+    }
+
+    const loose = sounds.find((i) => !i.in_pack);
+    if (loose) {
+      await show(loose);
+      // An uncached waveform is decoded from the audio on demand — seconds, not milliseconds, the
+      // first time. Wait for the decode rather than for a fixed delay, or this asserts on a
+      // half-loaded <img> and reads as the silhouette winning.
+      await page.waitForFunction(
+        () => {
+          const img = document.querySelector(".card .thumb img");
+          return (img && img.naturalWidth > 0) || !!document.querySelector(".card .wave");
+        },
+        null,
+        { timeout: 20000 },
+      );
+      const w = await page.locator(".card").first().locator(".thumb img")
+        .evaluateAll((e) => e.map((i) => i.naturalWidth));
+      // A silhouette here means the *backend* could not decode this file (codec support is a
+      // property of the machine, not of the code under test) — report it and move on. Only a
+      // present-but-broken <img> is a real failure of the precedence rule.
+      if (w.length === 0) {
+        console.log(`       (skipped loose ${loose.name}: backend could not rasterise it)`);
+      } else {
+        assert.ok(
+          w[0] > 0,
+          `${loose.name} rasterised, so the drawn envelope must win over the silhouette (got [${w}])`,
+        );
+      }
+    }
+
+    // Heights are hashed off the asset id: stable per asset, different between neighbours. A
+    // constant silhouette would still look like a waveform and carry no information at all.
+    await page.fill('input[type="text"]', "");
+    await page.getByTestId("tab-sounds").click();
+    await page.waitForTimeout(900);
+    const shapes = await page
+      .locator(".card .wave")
+      .evaluateAll((els) =>
+        els.slice(0, 12).map((e) =>
+          [...e.querySelectorAll(".bar")].map((b) => b.style.getPropertyValue("--h")).join(","),
+        ),
+      );
+    if (shapes.length > 1) {
+      assert.ok(new Set(shapes).size > 1, "every sound card drew the same waveform");
+    }
+    await page.getByTestId("tab-all").click();
+    await page.waitForTimeout(500);
+  });
+
+  // B12b removed the toolbar's duplicate status chips, leaving the sidebar facet as the only
+  // control. If that removal had orphaned `view.status`, the facet would light up and the grid
+  // would not move — which looks like a slow query rather than a dead control.
+  await check("the sidebar STATUS facet is the one control that filters the grid", async () => {
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.waitForTimeout(400);
+    const s = await invoke("library_status");
+    await page.getByRole("button", { name: /^Unidentified/ }).click();
+    await page.waitForFunction(
+      (n) =>
+        document.querySelector('[data-testid="result-count"]')?.textContent?.replace(/\D/g, "") ===
+        String(n),
+      s.unidentified,
+      { timeout: 5000 },
+    );
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.waitForTimeout(400);
   });
 
   // The facet ids are a contract between two crates and a TypeScript popover. A chip whose id the

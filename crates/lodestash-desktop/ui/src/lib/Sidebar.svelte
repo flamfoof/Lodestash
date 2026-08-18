@@ -105,7 +105,12 @@
         <Icon name={item.icon} size={18} />
         <span class="label">{item.label}</span>
         {#if badge > 0}
-          <span class="badge num">{badge}</span>
+          <!-- Clamped: the rail is 210px and a real first scan puts 7,667 in this pill, which
+               pushes the label it belongs to out of the row entirely. The exact number is on the
+               STATUS facet directly below; the badge only has to say "a lot". -->
+          <span class="badge num" title={badge.toLocaleString()}>
+            {badge > 999 ? "999+" : badge}
+          </span>
         {/if}
       </button>
     {/each}

@@ -124,6 +124,18 @@
     <span class="wordmark">LODESTASH</span>
   </div>
 
+  <!-- UI-SPEC §0.1 orders the top bar brand → **mode toggle** → search box. Nested inside the
+       input's right edge the toggle read as a suffix of whatever you had typed; outside and
+       ahead of it, it reads as what it is — the engine the box will query. -->
+  <div class="mode" role="group" aria-label="Search mode">
+    <button class:on={view.searchMode === "tags"} onclick={() => (view.searchMode = "tags")}>
+      <Icon name="ls-search-tags" size={14} /> Tags
+    </button>
+    <button class:on={view.searchMode === "ai"} onclick={() => (view.searchMode = "ai")}>
+      <Icon name="ls-search-ai" size={14} /> AI
+    </button>
+  </div>
+
   <div class="search" class:ai={view.searchMode === "ai"}>
     <Icon name={view.searchMode === "ai" ? "ls-search-ai" : "ls-search-tags"} size={16} />
     <input
@@ -135,20 +147,6 @@
       oninput={(e) => view.setSearch(e.currentTarget.value)}
       spellcheck="false"
     />
-    <div class="mode" role="group" aria-label="Search mode">
-      <button
-        class:on={view.searchMode === "tags"}
-        onclick={() => (view.searchMode = "tags")}
-      >
-        <Icon name="ls-search-tags" size={14} /> Tags
-      </button>
-      <button
-        class:on={view.searchMode === "ai"}
-        onclick={() => (view.searchMode = "ai")}
-      >
-        <Icon name="ls-search-ai" size={14} /> AI
-      </button>
-    </div>
   </div>
 
   <nav class="tabs" aria-label="Category">
@@ -173,14 +171,18 @@
 
   {#if status}
     <div class="health" role="group" title="Identified vs. unidentified assets" aria-label="Identified vs. unidentified" data-testid="health-meter">
+      <!-- UI-SPEC §0.1.5: the label `Identified n / total` sits **over** a 6px gold bar. A
+           fraction states the goal (get to total); two side-by-side counts only state the
+           split, and read as two unrelated statistics. -->
+      <span class="health-text">
+        <span class="health-label">Identified</span>
+        <span class="health-frac num">
+          <span class="health-id">{fmtCount(identified)}</span> / {fmtCount(identified + unidentified)}
+        </span>
+      </span>
       <div class="health-bar" aria-hidden="true">
         <span class="health-seg" style="--pct: {identifiedPct}%"></span>
       </div>
-      <span class="health-text">
-        <span class="health-id num">{fmtCount(identified)} identified</span>
-        <span class="health-sep">·</span>
-        <span class="health-unid num">{fmtCount(unidentified)} unidentified</span>
-      </span>
     </div>
   {/if}
 
@@ -195,7 +197,13 @@
     >
       <span class="dot" class:on={activeProject !== null}></span>
       <Icon name="ls-project" size={14} />
-      <span class="label">{activeProject?.name ?? "No project"}</span>
+      <!-- UI-SPEC §0.1.6: the chip is `Name · Engine`. Which editor an export lands in is half
+           the fact; a bare project name leaves the Unity version to be guessed. -->
+      <span class="label">
+        {activeProject?.name ?? "No project"}{activeProject?.unity_version
+          ? ` · ${activeProject.unity_version}`
+          : ""}
+      </span>
       <span class="caret" aria-hidden="true">▾</span>
     </button>
     <span class="chip" class:warn={!engineReady}>
@@ -333,12 +341,16 @@
     color: var(--ls-text-dim);
   }
 
+  /* Standing on its own now (it used to sit inside the search box), the toggle needs its own
+     edge or it floats between the wordmark and the input belonging to neither. */
   .mode {
     display: flex;
     gap: 2px;
-    background: var(--ls-surface);
-    border-radius: var(--r-sm);
+    background: var(--ls-bg);
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-md);
     padding: 2px;
+    flex: none;
   }
   .mode button,
   .tabs button {
@@ -378,42 +390,43 @@
     gap: var(--sp-1);
   }
 
+  /* Health meter (UI-SPEC §0.1.5): min-width 180px, label over a 6px gold-gradient bar. */
   .health {
     display: flex;
-    align-items: center;
-    gap: var(--sp-2);
+    flex-direction: column;
+    justify-content: center;
+    gap: 3px;
+    min-width: 180px;
     padding: 0 var(--sp-2);
     white-space: nowrap;
     flex: none;
   }
-  .health-bar {
-    width: 56px;
-    height: 2px;
-    border-radius: var(--r-sm);
-    background: var(--ls-border-strong);
-    overflow: hidden;
-    flex: none;
-  }
-  .health-seg {
-    display: block;
-    height: 100%;
-    width: var(--pct, 0%);
-    background: var(--ls-gold);
-    border-radius: var(--r-sm);
-  }
   .health-text {
     display: flex;
     align-items: baseline;
-    gap: var(--sp-1);
+    justify-content: space-between;
+    gap: var(--sp-2);
     font-size: var(--fs-xs);
     color: var(--ls-text-dim);
   }
   .health-id {
     color: var(--ls-gold);
   }
-  .health-sep {
-    color: var(--ls-text-dim);
-    opacity: 0.6;
+  .health-bar {
+    width: 100%;
+    height: 6px;
+    border-radius: var(--r-pill);
+    background: var(--ls-border-strong);
+    overflow: hidden;
+  }
+  .health-seg {
+    display: block;
+    height: 100%;
+    width: var(--pct, 0%);
+    background: linear-gradient(90deg, var(--ls-gold), var(--ls-gold-bright));
+    border-radius: var(--r-pill);
+    box-shadow: 0 0 6px color-mix(in srgb, var(--ls-gold) 55%, transparent);
+    transition: width 240ms ease;
   }
 
   .chips {

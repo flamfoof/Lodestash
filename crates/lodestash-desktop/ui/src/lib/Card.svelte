@@ -20,6 +20,7 @@
     onopen,
     onidentified,
     onmenu,
+    onfavorite,
   }: {
     item: GridItem;
     selected?: boolean;
@@ -31,6 +32,10 @@
     /** Right-click (FEATURES §1.1): the shell's context menu. The Card only reports the
      *  event + asset — the menu itself lives up-tree where the write fns are. */
     onmenu?: (e: MouseEvent, id: number) => void;
+    /** ☆ → ★ (FEATURES §1.1 "star tile" — UI-SPEC §2.5's overlay list does not carry it): the
+     *  star is a control, not a read-out. Reports the *current*
+     *  flag; the shell inverts it, exactly as the context menu's Toggle Favorite does. */
+    onfavorite?: (id: number, favorite: boolean) => void;
   } = $props();
 
   /**
@@ -91,14 +96,39 @@
     unidentified ? "ls-status-unidentified" : confirmed ? "ls-status-confirmed" : "ls-status-identified",
   );
 
+  /**
+   * UI-SPEC §2.5 sound cards: a ▶ button + a **5-bar** mini-waveform stands in for the thumbnail,
+   * because an audio file has no pixels and one shared speaker glyph makes 1,841 sounds render as
+   * 1,841 identical dark squares.
+   *
+   * The bar heights are hashed off the asset id rather than the real envelope: decoding audio per
+   * card to draw 5 bars is absurd, and a *stable, per-asset* silhouette is what the grid actually
+   * needs — the same card looks the same on every visit, and neighbours look different.
+   * ponytail: hashed silhouette, not real audio; swap in peaks if the drain ever stores them.
+   */
+  let isSound = $derived(item.media_type === "audio");
+  let bars = $derived.by(() => {
+    // `Math.imul`, not `*`: the product of two ~2^31 values passes `Number.MAX_SAFE_INTEGER`, and
+    // the float rounding that follows zeroes the low bits the next `>>> 15` depends on — so the
+    // heights would come off a coarse lattice and neighbouring cards would repeat silhouettes.
+    let h = Math.imul(item.asset_id, 2654435761);
+    return Array.from({ length: 5 }, () => {
+      h = Math.imul(h ^ (h >>> 15), 2246822519);
+      return 35 + (Math.abs(h) % 66); // 35–100% of the strip
+    });
+  });
+
+  /**
+   * Tileable art (texture/material) fills the frame; a subject (image/sprite/font) is letterboxed.
+   * Cropping a tiling albedo costs nothing — cropping a character sprite takes its head off.
+   */
+  let coverFit = $derived(item.media_type === "texture" || item.media_type === "material");
+
   // FEATURES §1.1: the meta line leads with the pack, because "which pack is this from" is the
   // question a grid of 8k near-identical Synty props actually raises. Size moved to the tier chip.
+  const fmtTris = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k` : `${n}`);
   let sub = $derived(
-    [
-      item.package,
-      item.triangles ? `${item.triangles.toLocaleString()} tris` : null,
-      fmtSize(item.size_bytes),
-    ]
+    [item.package, item.triangles ? `${fmtTris(item.triangles)} tris` : null, fmtSize(item.size_bytes)]
       .filter(Boolean)
       .join(" · "),
   );
@@ -113,8 +143,8 @@
 <button
   class="card"
   class:identified={!unidentified}
-  class:confirmed={confirmed}
-  class:unidentified={unidentified}
+  class:confirmed
+  class:unidentified
   class:selected
   style="--tint: {tint}"
   onclick={() => onselect?.(item.asset_id)}
@@ -125,17 +155,89 @@
   ondblclick={() => onopen?.(item.asset_id)}
   title={item.rel_path}
 >
-  <div class="thumb">
+  <div class="thumb" class:unid={unidentified}>
     {#if src}
-      <!-- Vector previews render natively as SVG; rasters come from the on-disk thumb cache. -->
-      <img {src} alt="" loading="lazy" onerror={() => (thumbFailed = true)} />
+      <!-- Vector previews render natively as SVG; rasters come from the on-disk thumb cache —
+           and for audio the thumb route draws the *real* envelope, which beats the hashed
+           silhouette below. So the server's answer wins whenever there is one. -->
+      <img
+        {src}
+        class:cover={coverFit}
+        alt=""
+        loading="lazy"
+        onerror={() => (thumbFailed = true)}
+      />
+    {:else if isSound}
+      <!-- UI-SPEC §2.5: the sound card's stand-in for artwork, for the audio the backend cannot
+           rasterise — in-pack payloads over the pull cap, which is most of a real Unity library.
+           Arcane when identified, slate when not: the same two-colour rule as the rest of the card. -->
+      <span class="wave" aria-hidden="true">
+        <span class="play">▶</span>
+        {#each bars as h, i (i)}
+          <i class="bar" style="--h: {h}%"></i>
+        {/each}
+      </span>
     {:else}
       <Icon name={typeIcon(item.media_type)} size={28} />
     {/if}
+
+    {#if unidentified}
+      <!-- UI-SPEC §2.5: art at 30% + grayscale (handled on .thumb.unid) behind a large slate `?`.
+           An unidentified asset should read as unidentified from across the grid, not by squinting
+           at a 14px gem. -->
+      <span class="qmark num" aria-hidden="true">?</span>
+    {/if}
+
     <span class="corner">
-      {#if item.favorite}
-        <span class="star" title="Favourite" aria-label="Favourite">★</span>
-      {/if}
+      <!-- ✦ Identify now is a B11b addition, not part of UI-SPEC §2.5's card anatomy. It rides in
+           the corner group rather than the bottom-right tray:
+           three buttons down there reach past the *centre* of a 150px card, and a hover-revealed
+           control sitting under the point people double-click swallows the double-click. It also
+           belongs here by meaning — it acts on the identity the gem beside it reports. -->
+      <span
+        class="act id-btn"
+        class:busy={identifying}
+        role="button"
+        tabindex="0"
+        title={identifying ? "Identifying…" : "Identify now — embed and tag this asset"}
+        aria-label={identifying ? `Identifying ${item.name}` : `Identify ${item.name}`}
+        data-testid="card-identify"
+        onclick={(e) => {
+          e.stopPropagation();
+          runIdentify();
+        }}
+        onkeydown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            e.stopPropagation();
+            runIdentify();
+          }
+        }}
+      >✦</span>
+      <!-- The star is always present, so the grid can *make* a favourite instead of only
+           reporting one (UI-SPEC §2.5). A span with role=button: the card root is a <button>
+           and nesting a real one inside it is invalid HTML. -->
+      <span
+        class="star"
+        class:on={item.favorite}
+        role="button"
+        tabindex="0"
+        aria-pressed={item.favorite}
+        title={item.favorite ? "Remove from Favorites" : "Add to Favorites"}
+        aria-label={item.favorite ? `Unfavourite ${item.name}` : `Favourite ${item.name}`}
+        data-testid="card-star"
+        onclick={(e) => {
+          e.stopPropagation();
+          onfavorite?.(item.asset_id, item.favorite);
+        }}
+        onkeydown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            e.stopPropagation();
+            onfavorite?.(item.asset_id, item.favorite);
+          }
+        }}
+      >{item.favorite ? "★" : "☆"}</span>
       <span
         class="state"
         class:unknown={unidentified}
@@ -144,54 +246,57 @@
         <Icon name={gem} size={14} />
       </span>
     </span>
+
     {#if item.size_tier}
       <span class="tier num t{item.size_tier}">{item.size_tier} · {fmtSize(item.size_bytes)}</span>
     {/if}
-    <!-- The stage affordance (I6) is a hover-revealed quick action, bottom-right on the artwork so
-         it never collides with the corner's status gem or the tier badge. A span, not a button:
-         the card root is already a <button>, and nesting a real button inside one is invalid HTML. -->
-    <span
-      class="id-btn"
-      class:busy={identifying}
-      role="button"
-      tabindex="0"
-      title={identifying ? "Identifying…" : "Identify now — embed and tag this asset"}
-      aria-label={identifying ? `Identifying ${item.name}` : `Identify ${item.name}`}
-      data-testid="card-identify"
-      onclick={(e) => {
-        e.stopPropagation();
-        runIdentify();
-      }}
-      onkeydown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
+
+    <!-- Quick actions (UI-SPEC §2.5): bottom-right, hover-revealed, so they never collide with the
+         corner's gem or the bottom-left tier badge. ⤢ full-size, ✦ identify, ⟡ stage. -->
+    <span class="actions">
+      <span
+        class="act"
+        role="button"
+        tabindex="0"
+        title="Full size — Quick Look"
+        aria-label={`Quick Look ${item.name}`}
+        data-testid="card-fullsize"
+        onclick={(e) => {
           e.stopPropagation();
-          runIdentify();
-        }
-      }}
-    >✦</span>
-    <span
-      class="stage-btn"
-      class:on={staged}
-      role="button"
-      tabindex="0"
-      title={staged ? "Staged — click to remove from the tray" : "Stage for import"}
-      aria-label={staged ? `Unstage ${item.name}` : `Stage ${item.name}`}
-      aria-pressed={staged}
-      data-testid="card-stage"
-      onclick={(e) => {
-        e.stopPropagation();
-        onStageClick();
-      }}
-      onkeydown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
+          onopen?.(item.asset_id);
+        }}
+        onkeydown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            e.stopPropagation();
+            onopen?.(item.asset_id);
+          }
+        }}
+      >⤢</span>
+      <span
+        class="act stage-btn"
+        class:on={staged}
+        role="button"
+        tabindex="0"
+        title={staged ? "Staged — click to remove from the tray" : "Stage for import"}
+        aria-label={staged ? `Unstage ${item.name}` : `Stage ${item.name}`}
+        aria-pressed={staged}
+        data-testid="card-stage"
+        onclick={(e) => {
           e.stopPropagation();
           onStageClick();
-        }
-      }}
-    >⧉</span>
+        }}
+        onkeydown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            e.stopPropagation();
+            onStageClick();
+          }
+        }}
+      >⟡</span>
+    </span>
   </div>
+
   <div class="meta">
     <span class="name"><i class="bullet" aria-hidden="true"></i>{item.name}</span>
     <span class="sub num">{sub}</span>
@@ -225,7 +330,11 @@
     border: 1px solid var(--ls-border);
     /* F1: a 1px status rail on the left edge — gold when confirmed, verdant when identified,
        grey when discovered/indexed (DESIGN-GUIDELINES §6). Kept as a width on the base so the
-       rail never pops the layout. */
+       rail never pops the layout. UI-SPEC §2.5 puts the status on the *left border*, not the
+       whole perimeter — the 2026-08-13 mockup shows a full ring and loses to the spec on that
+       point. The **width** is a known, recorded divergence: §2.5 says 3px, DESIGN-GUIDELINES §6
+       says 1px and the app follows DG (ALIGNMENT-AUDIT F1, narrowed 2026-08-07). UI-SPEC's number
+       is the stale one and still needs the same-change fix CLAUDE.md asks for. */
     border-left-width: 1px;
     border-radius: var(--r-lg);
     text-align: left;
@@ -241,6 +350,11 @@
   .card:hover {
     border-color: var(--tint);
     background: var(--ls-surface-raised);
+  }
+  /* UI-SPEC §2.5: "Confirmed cards: faint 1px gold ring at rest." A human vouched for this one;
+     it reads as settled without having to hover or open the inspector. */
+  .card.confirmed {
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--ls-gold) 35%, transparent);
   }
   .card.selected {
     border-color: var(--ls-gold);
@@ -262,7 +376,10 @@
 
   .thumb {
     position: relative;
-    aspect-ratio: 1;
+    /* UI-SPEC §2.5: a 104px thumbnail region, not a square. A square thumb costs ~46px of card
+       height per row at compact density and buys nothing — almost every asset here is wider than
+       it is tall, and the taller frame just letterboxes harder. */
+    height: 104px;
     display: grid;
     place-items: center;
     background: var(--ls-bg);
@@ -281,12 +398,63 @@
        button / overlays are absolutely positioned above the image, so they stay put. */
     transition: transform 0.8s ease;
   }
+  /* Tileable art fills the frame (UI-SPEC §2.5 "dark recess" reads as a hole when a 2048² albedo
+     is letterboxed into a 104px strip). Subjects keep `contain` — see `coverFit`. */
+  .thumb img.cover {
+    object-fit: cover;
+  }
   .card:hover .thumb img {
     transform: rotate(8deg) scale(1.05);
   }
+  /* UI-SPEC §2.5: unidentified art sits at 30% + grayscale behind the slate `?`. */
+  .thumb.unid img,
+  .thumb.unid :global(.icon) {
+    opacity: 0.3;
+    filter: grayscale(1);
+  }
+  .qmark {
+    position: absolute;
+    font-size: 26px;
+    line-height: 1;
+    color: var(--ls-status-unidentified);
+    pointer-events: none;
+  }
+
+  /* Sound card (UI-SPEC §2.5): ▶ + 5-bar mini-waveform. */
+  .wave {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    height: 46px;
+    color: var(--ls-arcane);
+  }
+  .thumb.unid .wave {
+    color: var(--ls-status-unidentified);
+  }
+  .wave .play {
+    display: grid;
+    place-items: center;
+    width: 22px;
+    height: 22px;
+    margin-right: var(--sp-1);
+    font-size: 9px;
+    line-height: 1;
+    border: 1px solid currentColor;
+    border-radius: 50%;
+    /* Optical centring: a ▶ glyph's bounding box is left-heavy, so a mathematically centred
+       triangle reads as sitting too far left. */
+    padding-left: 2px;
+  }
+  .wave .bar {
+    width: 3px;
+    height: var(--h);
+    background: currentColor;
+    border-radius: var(--r-pill);
+    opacity: 0.75;
+  }
 
   /* Star and status share the top-right corner (FEATURES §1.1) so the artwork's top-left stays
-     clear for the multi-select box a later slice adds. */
+     clear for the multi-select box (UI-SPEC §2.5: hover-revealed, owned by LibraryScreen). */
   .corner {
     position: absolute;
     top: var(--sp-1);
@@ -337,69 +505,70 @@
     --tier-fg: var(--ls-danger);
   }
 
-  /* Hover-revealed stage quick action (I6). Sits bottom-right on the artwork, opposite the tier
-     badge, so the two never overlap; the card's hover also reveals it (hovering the button itself
-     keeps `.card:hover` true). */
-  .stage-btn {
+  /* Hover-revealed quick actions (UI-SPEC §2.5): **two** buttons, bottom-right on the artwork,
+     opposite the tier badge. Hovering a button keeps `.card:hover` true, so the tray does not
+     flicker out from under the cursor.
+     Two, not three: at compact density (150px card, 104px thumb) the card's own centre point
+     falls inside this strip, and a third button pushed it left of centre — where an
+     `opacity: 0` element still takes the click, so double-clicking the middle of a card hit a
+     button nobody could see instead of opening Quick Look. `pointer-events` follows visibility
+     for the same reason. */
+  .actions {
     position: absolute;
     right: var(--sp-1);
     bottom: var(--sp-1);
-    display: grid;
-    place-items: center;
-    width: 20px;
-    height: 20px;
-    font-size: var(--fs-sm);
-    line-height: 1;
-    color: var(--ls-gold);
-    background: color-mix(in srgb, var(--ls-bg) 85%, transparent);
-    border: 1px solid var(--ls-border);
-    border-radius: var(--r-sm);
+    display: flex;
+    align-items: center;
+    gap: 3px;
     opacity: 0;
+    pointer-events: none;
     transition: opacity 120ms ease;
   }
-  .card:hover .stage-btn,
-  .stage-btn:focus-visible {
+  .card:hover .actions,
+  .actions:focus-within {
     opacity: 1;
+    pointer-events: auto;
   }
-  .stage-btn:hover {
-    border-color: var(--ls-gold);
-    color: var(--ls-gold-bright);
-  }
-  .stage-btn.on {
-    opacity: 1;
-    border-color: var(--ls-gold);
-    background: var(--ls-overlay);
-  }
-
-  /* ✦ Identify now (B11b): hover-revealed like the stage button, pinned to the artwork's
-     top-right corner — the status gem owns the top-left. Spins while the bounded pass runs. */
+  /* Same rule for the corner's ✦: invisible controls must not be clickable. */
   .id-btn {
-    position: absolute;
-    top: var(--sp-1);
-    right: var(--sp-1);
-    display: grid;
-    place-items: center;
-    width: 20px;
-    height: 20px;
-    font-size: var(--fs-sm);
-    line-height: 1;
-    color: var(--ls-gold);
-    background: color-mix(in srgb, var(--ls-bg) 85%, transparent);
-    border: 1px solid var(--ls-border);
-    border-radius: var(--r-sm);
     opacity: 0;
+    pointer-events: none;
     transition: opacity 120ms ease;
   }
   .card:hover .id-btn,
   .id-btn:focus-visible {
     opacity: 1;
+    pointer-events: auto;
   }
-  .id-btn:hover {
+  .act {
+    display: grid;
+    place-items: center;
+    width: 20px;
+    height: 20px;
+    font-size: var(--fs-sm);
+    line-height: 1;
+    color: var(--ls-gold);
+    background: color-mix(in srgb, var(--ls-bg) 85%, transparent);
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-sm);
+  }
+  .act:hover {
     border-color: var(--ls-gold);
     color: var(--ls-gold-bright);
   }
-  .id-btn.busy {
+  /* A staged card keeps its ⟡ lit with the tray open, so the grid shows what is in the basket
+     without hovering every card. */
+  .stage-btn.on {
+    border-color: var(--ls-gold);
+    background: var(--ls-overlay);
+  }
+  .card:has(.stage-btn.on) .actions {
     opacity: 1;
+    pointer-events: auto;
+  }
+  .act.busy {
+    opacity: 1;
+    pointer-events: auto;
     animation: idspin 900ms linear infinite;
   }
   @keyframes idspin {
@@ -409,10 +578,21 @@
   }
 
   .star {
+    display: grid;
+    place-items: center;
+    width: 16px;
+    height: 16px;
     font-size: var(--fs-sm);
     line-height: 1;
-    color: var(--ls-gold);
+    color: var(--ls-text-dim);
     text-shadow: 0 1px 2px var(--ls-bg);
+    cursor: pointer;
+  }
+  .star:hover {
+    color: var(--ls-gold);
+  }
+  .star.on {
+    color: var(--ls-gold);
   }
 
   .meta {
@@ -429,6 +609,12 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* UI-SPEC §2.5: "Unidentified: slate italic". A grid where an unappraised asset looks exactly
+     like an appraised one hides the single fact this app exists to change. */
+  .card.unidentified .name {
+    font-style: italic;
+    color: var(--ls-text-dim);
   }
   /* Rotated square, not a glyph: the media-type mark has to read at 7px, and every dingbat that
      renders as a diamond in one font falls back to a box in another. */
@@ -447,13 +633,16 @@
     white-space: nowrap;
   }
 
-  /* Fixed height for one row of chips: card height must not depend on how well-tagged an asset
-     is, or the grid goes ragged and every row reflows as tags land. */
+  /* Two rows of chips, at a fixed height: three trait names rarely fit on one line at compact
+     density, and letting the row grow makes card height depend on how well-tagged an asset is —
+     which turns the grid ragged and reflows every row as tags land. */
   .tags {
     display: flex;
+    flex-wrap: wrap;
+    align-content: flex-start;
     align-items: center;
     gap: var(--sp-1);
-    height: 18px;
+    height: 40px;
     overflow: hidden;
   }
   .tag {

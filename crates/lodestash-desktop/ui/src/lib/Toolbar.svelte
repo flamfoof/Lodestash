@@ -1,7 +1,7 @@
 <script lang="ts">
   import Icon from "./Icon.svelte";
   import Filters from "./Filters.svelte";
-  import { SORTS, STATUSES, DENSITIES, recentOps, redoOps, redo, undo, type OpLogRow } from "./api";
+  import { SORTS, DENSITIES, recentOps, redoOps, redo, undo, type OpLogRow } from "./api";
   import { view } from "./nav.svelte";
 
   let { total, favorites = 0 }: { total: number; favorites?: number } = $props();
@@ -102,14 +102,9 @@
 />
 
 <div class="toolbar">
-  <div class="group" role="group" aria-label="Status">
-    {#each STATUSES as s (s.id)}
-      <button class="chip" class:on={view.status === s.id} onclick={() => (view.status = s.id)}>
-        {s.label}
-      </button>
-    {/each}
-  </div>
-
+  <!-- The STATUS filter is the sidebar's facet group (UI-SPEC §0.2.2), and UI-SPEC §2.1's result
+       header row does not list it. Rendering it in both places gave one piece of state two
+       controls that had to be kept in sync by eye. The rail owns it. -->
   {#if view.browse !== "folders"}
     <!-- Result label (FEATURES §1.3). Search keeps the plain form: AI-ranked ✦ results need
          the semantic search the shell does not have yet, and a label that claims ranking that
@@ -121,6 +116,9 @@
         {total.toLocaleString()} assets · {view.source ?? "All libraries"}
       {/if}
     </span>
+    <!-- UI-SPEC §2.1: the keyboard hint, dim, hidden under 1200px. Three bindings nobody
+         discovers by looking at the grid; a line of dim text is cheaper than a help screen. -->
+    <span class="hint">Space quick-looks · ⤢ full size · ⟡ stage</span>
   {/if}
 
   <div class="right">
@@ -281,23 +279,20 @@
     border-radius: var(--r-md);
     padding: 2px;
   }
-  .chip {
-    padding: 2px var(--sp-3);
-    border-radius: var(--r-sm);
-    font-size: var(--fs-sm);
-    color: var(--ls-text-dim);
-  }
-  .chip:hover {
-    color: var(--ls-text);
-  }
-  .chip.on {
-    background: var(--ls-overlay);
-    color: var(--ls-text);
-  }
-
   .count {
     font-size: var(--fs-sm);
     color: var(--ls-text-dim);
+  }
+  .hint {
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+    opacity: 0.7;
+    white-space: nowrap;
+  }
+  @media (max-width: 1200px) {
+    .hint {
+      display: none;
+    }
   }
   .right {
     margin-left: auto;

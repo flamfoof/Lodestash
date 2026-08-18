@@ -160,12 +160,18 @@
 <svelte:window on:keydown={onkeydown} />
 
 <section class="screen">
-  <header>
-    <h1>{title}</h1>
-    {#if status && !status.open}
-      <span class="warn">no catalog — run a scan in the egui build first</span>
-    {/if}
-  </header>
+  <!-- UI-SPEC §2.1 composes the Library top-down as nudge → result header row → grid, with no
+       screen title: the rail already says where you are, and the heading costs ~56px of card
+       space on every screen. Favorites and Trash keep theirs — FEATURES §4.7 specifies that
+       header, and it is the only thing distinguishing them from the Library they filter. -->
+  {#if title !== "Library" || (status && !status.open)}
+    <header>
+      {#if title !== "Library"}<h1>{title}</h1>{/if}
+      {#if status && !status.open}
+        <span class="warn">no catalog — run a scan in the egui build first</span>
+      {/if}
+    </header>
+  {/if}
 
   <Toolbar total={result?.total ?? 0} favorites={status?.favorites ?? 0} />
 
@@ -173,10 +179,12 @@
     <!-- Unidentified nudge (D8/B10d): flat browse only, session-dismissable, routes to Identify. -->
     <div class="nudge" role="status" data-testid="unidentified-banner">
       <span class="text">
-        ✦ <span class="num">{status!.unidentified}</span> assets still unidentified — run Identify
+        <span class="q num" aria-hidden="true">?</span>
+        <span class="num">{status!.unidentified.toLocaleString()}</span> assets are Unidentified —
+        invisible to AI search until appraised.
       </span>
       <button class="go" onclick={() => view.go("identify")} data-testid="unidentified-go">
-        Identify
+        Open Identify mode →
       </button>
       <button
         class="x"
@@ -292,6 +300,7 @@
               onopen={(id) => (quickLook = id)}
               onmenu={(e, id) => (menu = { x: e.clientX, y: e.clientY, id })}
               onidentified={() => (view.dataVersion += 1)}
+              onfavorite={(id, favorite) => onmenuaction?.({ action: "favorite", id, favorite })}
             />
             <span
               class="sel"
@@ -445,18 +454,18 @@
     cursor: pointer;
   }
 
-  /* Unidentified nudge (D8/B10d): slim amber banner above the grid, flat browse only. */
+  /* Unidentified nudge (D8/B10d, UI-SPEC §2.1): a **slim** amber banner above the grid, flat
+     browse only. A boxed card here competes with the cards it sits above for the same glance;
+     one tinted full-bleed rule reads as chrome and gets out of the way. */
   .nudge {
     flex: none;
     display: flex;
     align-items: center;
     gap: var(--sp-2);
     flex-wrap: wrap;
-    margin: 0 var(--sp-5) var(--sp-2);
-    padding: var(--sp-1) var(--sp-3);
-    background: color-mix(in srgb, var(--ls-surface-raised) 85%, var(--ls-warning) 15%);
-    border: 1px solid color-mix(in srgb, var(--ls-warning) 45%, transparent);
-    border-radius: var(--r-md);
+    padding: var(--sp-1) var(--sp-5);
+    background: color-mix(in srgb, var(--ls-surface) 88%, var(--ls-warning) 12%);
+    border-bottom: 1px solid var(--ls-border);
     color: var(--ls-warning);
   }
   .nudge .text {
@@ -467,20 +476,24 @@
   .nudge .num {
     color: var(--ls-gold-bright);
   }
+  .nudge .q {
+    margin-right: var(--sp-1);
+    color: var(--ls-status-unidentified);
+  }
   .nudge button {
-    padding: 2px var(--sp-3);
-    border: 1px solid transparent;
-    border-radius: var(--r-md);
+    padding: 2px var(--sp-2);
+    border: none;
+    border-radius: var(--r-sm);
     font-size: var(--fs-sm);
   }
+  /* A text link, not a filled button: the nudge is an offer, and a solid button in a warning
+     colour reads as "something is broken, press this". */
   .nudge button.go {
-    border-color: color-mix(in srgb, var(--ls-warning) 55%, transparent);
-    background: color-mix(in srgb, var(--ls-warning) 12%, transparent);
-    color: var(--ls-warning);
+    color: var(--ls-gold);
   }
   .nudge button.go:hover {
-    border-color: var(--ls-warning);
     color: var(--ls-gold-bright);
+    text-decoration: underline;
   }
   .nudge button.x {
     color: var(--ls-text-dim);
