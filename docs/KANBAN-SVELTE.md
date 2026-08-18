@@ -249,22 +249,26 @@ The fixed rows are kept beside the open ones because the open ones are what the 
 **Still open after the 2026-08-14 max review** (found by review, not fixed — each needs a decision
 or more than a patch):
 
-- [ ] **`extract_package` answers at spawn, not at completion.** `Writer::run` (`writer.rs:803`)
-      does a single `wait.recv()` and drops the receiver, and the direct arm sends the
-      `Ok{changed:0}` "queued" sentinel the moment a worker starts. So the `reply.send` the workers
-      make from `ExtractDone`/`ManifestDone` **always lands on a dead channel and is discarded** —
-      the real `changed` count never reaches the frontend, `UnityAssetsScreen`'s per-row spinner
-      clears while the pack is still unpacking, and `extractSelected` marks pack N+1 running while
-      N is still going. Two coherent designs; pick one: **(a)** the tray owns progress and outcome
-      (right for a multi-GB unpack) — then delete the dead `reply` plumbing from both workers and
-      have the row follow the tray's job state; or **(b)** the command blocks to completion — then
-      the direct arm must not send. Today's code is half of each, and the comments claimed (b).
-- [ ] **A panicking worker wedges the queue for the session.** `jobs.finish` only runs when a worker
+- [x] **`extract_package` answers at spawn — settled as (a), the tray owns it (2026-08-18).**
+      `Writer::run` does a single `wait.recv()` and drops the receiver, so the `reply.send` the
+      workers made from `ExtractDone`/`ManifestDone` always landed on a dead channel: the real
+      `changed` count never reached the frontend, the per-row spinner cleared while the pack was
+      still unpacking, and the code was half of design (a) wearing the plumbing of (b). **Shipped:**
+      the `reply` field is gone from both `WriterMsg` variants and both worker spawns; the command
+      replies exactly once, at *acceptance*, whether it runs now or queues (it used to reply at
+      spawn when the queue was empty but only at start when it wasn't — one command with two
+      meanings, depending on queue depth); `extract_package` no longer goes through
+      `AppState::write`, which reloaded the whole 8k-row library snapshot at spawn, before a single
+      payload existed; and `UnityAssetsScreen` derives each row's busy state from the tray's active
+      jobs instead of awaiting a promise that resolves in milliseconds.
+- [x] **A panicking worker wedged the queue for the session.** `jobs.finish` only runs when a worker
       sends its `WriterMsg`; a panic in `read_manifest_with_progress` / `extract_at_offsets_with_progress`
       (corrupt gzip, malformed tar) unwinds a detached thread, the send never happens, the panic is
       swallowed, and `has_active_extract()` stays true forever — every later extract takes the
       `push_back` branch and nothing drains it. `start_next_extract` fixed the `Err` road to this
-      jam, not this one. Wants the worker's join handle watched, or a job lease that expires.
+      jam, not this one. **Fixed 2026-08-18:** both workers wrap their body in `catch_unwind` and
+      send an error outcome on the way out, so the send that runs `jobs.finish` and drains the queue
+      happens even when the archive is corrupt enough to panic the gzip/tar path.
 - [ ] **The sound card's ▶ is decoration.** `<span class="play">▶</span>` sits inside an
       `aria-hidden` wrapper with no handler, so clicking it selects the card and screen readers
       cannot reach it. UI-SPEC §2.5 specifies a working ▶/◼ with an inline scrubber and one asset
@@ -282,13 +286,18 @@ or more than a patch):
       re-runs 69 tests. The impl blocks already mark the seams: split to
       `catalog/{mod,assets,tags,collections,taxonomy,oplog}.rs`, tests moving with their domain —
       a mechanical move, no behaviour change.
-- [ ] **The test budget is inverted, not oversized.** 324 tests workspace-wide is not the problem;
-      *where* they sit is. `catalog.rs` spends 4,809 lines on CRUD while `writer.rs` — 2,040 lines,
-      the only genuinely concurrent code in the repo, owning the extract queue, cooperative cancel
-      and the spawn/drain invariant — has **zero**. The queue-jam bug fixed above is exactly what
-      one test over `start_next_extract` with a two-op queue and a failing first op would have
-      caught. Cut from the catalog CRUD tests, spend a fraction here: `start_next_extract` is a
-      pure function over `(catalog, queue)` and needs no Tauri.
+- [x] **The test budget was inverted — `writer.rs` has tests now (2026-08-18).** It had **zero**
+      over the only genuinely concurrent code in the repo, and the reason turned out to be
+      structural rather than neglect: Tauri's window layer (tao/muda/rfd) imports comctl32
+      **v6-only** entry points (`SetWindowSubclass`, `RemoveWindowSubclass`, `DefSubclassProc`,
+      `TaskDialogIndirect`); the app exe carries a manifest declaring that assembly and a `cargo
+      test` binary does not, so it bound comctl32 v5, found none of those exports, and died with
+      `STATUS_ENTRYPOINT_NOT_FOUND` **before the first test ran**. Any test that so much as
+      constructed an `Op` made the whole binary unloadable — which reads as a broken test, not a
+      missing manifest. `build.rs` now passes the Common-Controls v6 `/MANIFESTDEPENDENCY` under
+      MSVC, and the queue invariant is split into `drain_to_first_spawn` with two tests over it,
+      both mutation-checked. **Still open:** the catalog-side trim — `catalog.rs` spends 4,809 lines
+      on CRUD, and its 8 `impl` seams are still one file.
 
 Checked and **not** a defect: extracting unclassifiable payloads (`.cs`, `.prefab`, `.meta`) is
 INGESTION §2's "full extraction … extracts **every payload** once", which is what makes every

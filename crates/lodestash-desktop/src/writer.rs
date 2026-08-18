@@ -294,14 +294,12 @@ enum WriterMsg {
     ManifestDone {
         job_id: u64,
         package_id: i64,
-        reply: Sender<Result<WriteResult, String>>,
         entries: Result<Vec<PackageEntryRecord>, String>,
         cancelled: bool,
     },
     ExtractDone {
         job_id: u64,
         package_id: i64,
-        reply: Sender<Result<WriteResult, String>>,
         outcome: Result<Vec<ExtractedAsset>, String>,
         cancelled: bool,
     },
@@ -587,6 +585,12 @@ impl Writer {
                     match rx.recv_timeout(std::time::Duration::from_secs(1)) {
                         Ok(WriterMsg::Op(job)) => {
                             if matches!(job.op, Op::ExtractPackage { .. }) {
+                                // Extract answers **"accepted"**, not "finished" — the unpack runs
+                                // for minutes on a multi-GB pack, and its progress, outcome and
+                                // cancel button live in the job tray. Both branches reply at the
+                                // same point on purpose: the reply used to be sent at spawn when
+                                // the queue was empty but only at *start* when it wasn't, so one
+                                // command meant two different things depending on queue depth.
                                 if extract_queue.is_empty() && !jobs.has_active_extract() {
                                     let result = run(
                                         &mut catalog,
@@ -594,13 +598,17 @@ impl Writer {
                                         job.op,
                                         &writer_tx,
                                         &jobs,
-                                        &job.reply,
                                         &app,
                                         &appraise,
                                     );
                                     let _ = job.reply.send(result);
                                 } else {
-                                    // A pack is unpacking (or queued) — join the queue.
+                                    // A pack is unpacking (or queued) — join the queue, and say so
+                                    // now rather than blocking the caller until this pack's turn.
+                                    let _ = job.reply.send(Ok(WriteResult {
+                                        changed: 0,
+                                        ..Default::default()
+                                    }));
                                     extract_queue.push_back(job);
                                 }
                                 continue;
@@ -623,7 +631,6 @@ impl Writer {
                                 job.op,
                                 &writer_tx,
                                 &jobs,
-                                &job.reply,
                                 &app,
                                 &appraise,
                             );
@@ -646,7 +653,6 @@ impl Writer {
                         Ok(WriterMsg::ExtractDone {
                             job_id,
                             package_id,
-                            reply,
                             outcome,
                             cancelled,
                         }) => {
@@ -658,7 +664,6 @@ impl Writer {
                             let ok = result.is_ok();
                             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
                             jobs.finish(job_id, ok, cancelled, changed);
-                            let _ = reply.send(result);
                             emit_changed(&app, "catalog");
                             emit_changed(&app, "jobs");
                             start_next_extract(
@@ -674,7 +679,6 @@ impl Writer {
                         Ok(WriterMsg::ManifestDone {
                             job_id,
                             package_id,
-                            reply,
                             entries,
                             cancelled,
                         }) => {
@@ -688,7 +692,9 @@ impl Writer {
                             // after the analyze phase — has to settle here, or the queue behind it
                             // never moves again.
                             let mut spawned = false;
-                            let result = (|| {
+                            // Annotated: nothing consumes this as a reply any more (the tray is
+                            // the reporting surface), so the error type has no inference source.
+                            let result: Result<WriteResult, String> = (|| {
                                 let entries = entries?;
                                 let minted = mint_in_pack(&mut catalog, package_id, &entries)?;
                                 // Cancelled during analyze: keep the locators that were read (a
@@ -715,7 +721,6 @@ impl Writer {
                                     &workspace_dir,
                                     &entries,
                                     &writer_tx,
-                                    &reply,
                                     &jobs,
                                     &app,
                                 )?;
@@ -724,14 +729,14 @@ impl Writer {
                                     changed: minted,
                                     ..Default::default()
                                 })
-                            })();
+                            })(
+                            );
                             let ok = result.is_ok();
                             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
                             jobs.finish(job_id, ok, cancelled, changed);
                             emit_changed(&app, "catalog");
                             emit_changed(&app, "jobs");
                             if !spawned {
-                                let _ = reply.send(result);
                                 start_next_extract(
                                     &mut catalog,
                                     &mut extract_queue,
@@ -987,15 +992,14 @@ fn appraise_pass(
 /// — package row gone, no workspace configured, a pack with no extractable payloads — spawned
 /// **nothing**, so it can never drain the queue itself.
 ///
-/// Popping only once was a silent, session-long death: the failed op's reply carried its error, but
-/// every pack behind it sat in a queue nobody would ever drain again. `extract_queue.is_empty()`
-/// stays false from then on, so *every later extract request* takes the "join the queue" branch —
-/// no job in the tray, no error, and (because a queued `Job`'s reply is only sent when it is
-/// finally started) the caller blocks in `Writer::run`'s `wait.recv()` forever.
+/// Popping only once was a silent, session-long death: every pack behind the failed one sat in a
+/// queue nobody would ever drain again, `extract_queue.is_empty()` stayed false from then on, and
+/// every later extract request took the "join the queue" branch — no job in the tray, no error.
 ///
-/// Note what this does **not** fix: a worker that panics never sends its `WriterMsg`, so
-/// `jobs.finish` never runs and `has_active_extract()` stays true for the rest of the session —
-/// the same jam by a different road. See the extract-lifecycle card on the board.
+/// The caller was already told "accepted" when the op was queued, so a failure here has no channel
+/// to travel back on. It is recorded as a **failed job** instead: the tray is where this feature
+/// reports, and a pack that silently never unpacks is the exact failure this whole path exists to
+/// stop being invisible.
 fn start_next_extract(
     catalog: &mut Catalog,
     queue: &mut VecDeque<Job>,
@@ -1005,23 +1009,42 @@ fn start_next_extract(
     app: &Option<tauri::AppHandle>,
     progress: &AppJobProgress,
 ) {
+    let failures = drain_to_first_spawn(queue, jobs, |op| {
+        run(catalog, db_path, op, tx, jobs, app, progress).map(|_| ())
+    });
+    if failures > 0 {
+        emit_changed(app, "jobs");
+    }
+}
+
+/// The queue invariant itself, with the writer's dependencies handed in.
+///
+/// Split out to be **testable**. Any test that reaches [`run`] links Tauri's window layer
+/// (`comctl32`/`user32`/`gdi32`/`dwmapi`), and a test binary carries no application manifest — so
+/// it binds to comctl32 v5, misses the v6 exports Tauri imports, and dies at load with
+/// `STATUS_ENTRYPOINT_NOT_FOUND` before a single test runs. That is why this file had no tests at
+/// all, over the only genuinely concurrent code in the repo. Taking `start` as a closure puts the
+/// rule back within reach of one.
+///
+/// Returns how many ops failed to spawn — each is recorded as a failed job, because the caller was
+/// already told "accepted" when it queued and has no other way to learn.
+fn drain_to_first_spawn(
+    queue: &mut VecDeque<Job>,
+    jobs: &JobRegistry,
+    mut start: impl FnMut(Op) -> Result<(), String>,
+) -> usize {
+    let mut failures = 0;
     while let Some(next) = queue.pop_front() {
-        let result = run(
-            catalog,
-            db_path,
-            next.op,
-            tx,
-            jobs,
-            &next.reply,
-            app,
-            progress,
-        );
-        let spawned = result.is_ok();
-        let _ = next.reply.send(result);
-        if spawned {
-            return; // a worker is running; its report drains the rest
+        match start(next.op) {
+            Ok(()) => return failures, // a worker is running; its report drains the rest
+            Err(e) => {
+                failures += 1;
+                let h = jobs.start(format!("Extract failed — {e}"), "extract-failed", false);
+                jobs.finish(h.id, false, false, 0);
+            }
         }
     }
+    failures
 }
 
 fn run(
@@ -1030,7 +1053,6 @@ fn run(
     op: Op,
     tx: &Sender<WriterMsg>,
     jobs: &JobRegistry,
-    reply: &Sender<Result<WriteResult, String>>,
     app: &Option<tauri::AppHandle>,
     progress: &AppJobProgress,
 ) -> Result<WriteResult, String> {
@@ -1485,7 +1507,6 @@ fn run(
                 // "extract" so the one-at-a-time queue gates the whole flow.
                 let handles = jobs.start(format!("Analyze {}", pkg.name), "extract", true);
                 let wtx = tx.clone();
-                let wreply = reply.clone();
                 let wcancel = handles.cancel;
                 let wprogress = handles.progress.expect("manifest jobs carry progress");
                 let wpath = PathBuf::from(&pkg.package_path);
@@ -1493,55 +1514,70 @@ fn run(
                 std::thread::Builder::new()
                     .name("manifest-worker".into())
                     .spawn(move || {
-                        let report_cancel = wcancel.clone();
-                        let last_progress = AtomicU64::new(0);
-                        let report = move |done: u64, total: u64| {
-                            wprogress.done.store(done, Ordering::Relaxed);
-                            wprogress.total.store(total, Ordering::Relaxed);
-                            let now_ms = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_millis() as u64)
-                                .unwrap_or(0);
-                            if now_ms.saturating_sub(last_progress.load(Ordering::Relaxed)) >= 250 {
-                                last_progress.store(now_ms, Ordering::Relaxed);
-                                emit_changed(&wapp, "jobs");
-                            }
-                            !report_cancel.load(Ordering::Relaxed)
-                        };
-                        let read = read_manifest_with_progress(&wpath, &report)
-                            .map_err(|e| e.to_string())
-                            .map(|m| {
-                                m.iter()
-                                    .map(|e| PackageEntryRecord {
-                                        guid: e.guid.clone(),
-                                        pathname: e.pathname.clone(),
-                                        tar_offset: e.asset_offset.map(|o| o as i64),
-                                        size_bytes: e.asset_size.map(|s| s as i64),
-                                    })
-                                    .collect::<Vec<_>>()
-                            });
-                        let cancelled = wcancel.load(Ordering::Relaxed);
-                        // `read_manifest_with_progress` reports a cancel as an **error**, not as a
-                        // partial `Ok` (`read_manifest_with_progress_reports_and_cancels` asserts
-                        // exactly that) — so a `!cancelled` guard on the empty case alone was dead
-                        // code, and pressing Cancel during Analyze still surfaced a raw
-                        // "extraction cancelled" string as a failed job. Swallow the error here:
-                        // cancelling is a decision, not a fault.
-                        let outcome = if cancelled {
-                            Ok(read.unwrap_or_default())
-                        } else {
-                            read.and_then(|entries| {
-                                if entries.is_empty() {
-                                    Err("the pack has no manifest entries".to_string())
+                        // Same guarantee as the extract worker: this send is the only thing that
+                        // finishes the job and lets the queue move, so a panic must not eat it.
+                        let work =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                                let report_cancel = wcancel.clone();
+                                let last_progress = AtomicU64::new(0);
+                                let report = move |done: u64, total: u64| {
+                                    wprogress.done.store(done, Ordering::Relaxed);
+                                    wprogress.total.store(total, Ordering::Relaxed);
+                                    let now_ms = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_millis() as u64)
+                                        .unwrap_or(0);
+                                    if now_ms.saturating_sub(last_progress.load(Ordering::Relaxed))
+                                        >= 250
+                                    {
+                                        last_progress.store(now_ms, Ordering::Relaxed);
+                                        emit_changed(&wapp, "jobs");
+                                    }
+                                    !report_cancel.load(Ordering::Relaxed)
+                                };
+                                let read = read_manifest_with_progress(&wpath, &report)
+                                    .map_err(|e| e.to_string())
+                                    .map(|m| {
+                                        m.iter()
+                                            .map(|e| PackageEntryRecord {
+                                                guid: e.guid.clone(),
+                                                pathname: e.pathname.clone(),
+                                                tar_offset: e.asset_offset.map(|o| o as i64),
+                                                size_bytes: e.asset_size.map(|s| s as i64),
+                                            })
+                                            .collect::<Vec<_>>()
+                                    });
+                                let cancelled = wcancel.load(Ordering::Relaxed);
+                                // `read_manifest_with_progress` reports a cancel as an **error**, not as a
+                                // partial `Ok` (`read_manifest_with_progress_reports_and_cancels` asserts
+                                // exactly that) — so a `!cancelled` guard on the empty case alone was dead
+                                // code, and pressing Cancel during Analyze still surfaced a raw
+                                // "extraction cancelled" string as a failed job. Swallow the error here:
+                                // cancelling is a decision, not a fault.
+                                let outcome = if cancelled {
+                                    Ok(read.unwrap_or_default())
                                 } else {
-                                    Ok(entries)
-                                }
-                            })
-                        };
+                                    read.and_then(|entries| {
+                                        if entries.is_empty() {
+                                            Err("the pack has no manifest entries".to_string())
+                                        } else {
+                                            Ok(entries)
+                                        }
+                                    })
+                                };
+                                (outcome, cancelled)
+                            }));
+                        let (outcome, cancelled) =
+                            work.unwrap_or_else(|_| {
+                                (
+                                Err("the manifest worker panicked — the archive is likely corrupt"
+                                    .to_string()),
+                                false,
+                            )
+                            });
                         let _ = wtx.send(WriterMsg::ManifestDone {
                             job_id: handles.id,
                             package_id,
-                            reply: wreply,
                             entries: outcome,
                             cancelled,
                         });
@@ -1550,7 +1586,7 @@ fn run(
             } else {
                 // Locators already recorded (browse persistence) — mint + extract right away.
                 mint_in_pack(catalog, package_id, &entries)?;
-                spawn_extract_worker(&pkg, &workspace_dir, &entries, tx, reply, jobs, app)?;
+                spawn_extract_worker(&pkg, &workspace_dir, &entries, tx, jobs, app)?;
             }
             Ok(WriteResult {
                 changed: 0, // queued — the tray reports the real changed count
@@ -1762,7 +1798,6 @@ fn spawn_extract_worker(
     workspace_dir: &Path,
     entries: &[PackageEntryRecord],
     tx: &Sender<WriterMsg>,
-    reply: &Sender<Result<WriteResult, String>>,
     jobs: &JobRegistry,
     app: &Option<tauri::AppHandle>,
 ) -> Result<(), String> {
@@ -1782,7 +1817,6 @@ fn spawn_extract_worker(
     }
     let handles = jobs.start(format!("Extract {}", pkg.name), "extract", true);
     let wtx = tx.clone();
-    let wreply = reply.clone();
     let wcancel = handles.cancel;
     let wprogress = handles.progress.expect("extract jobs carry progress");
     let wpath = PathBuf::from(&pkg.package_path);
@@ -1792,38 +1826,51 @@ fn spawn_extract_worker(
     std::thread::Builder::new()
         .name("extract-worker".into())
         .spawn(move || {
-            let report_cancel = wcancel.clone();
-            let last_progress = AtomicU64::new(0);
-            let report = move |done: u64, total: u64| {
-                wprogress.done.store(done, Ordering::Relaxed);
-                wprogress.total.store(total, Ordering::Relaxed);
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                if now_ms.saturating_sub(last_progress.load(Ordering::Relaxed)) >= 250 {
-                    last_progress.store(now_ms, Ordering::Relaxed);
-                    emit_changed(&wapp, "jobs");
-                }
-                !report_cancel.load(Ordering::Relaxed)
-            };
-            let placed = extract_at_offsets_with_progress(&wpath, &wworkspace, wanted, &report)
-                .map_err(|e| e.to_string());
-            let cancelled = wcancel.load(Ordering::Relaxed);
-            // "Extracted nothing" is a failure — unless the user cancelled before the first
-            // payload landed, which is a cancel, not a fault, and must not surface as an error
-            // toast for pressing Cancel.
-            let outcome = placed.and_then(|a| {
-                if a.is_empty() && !cancelled {
-                    Err("the pack extracted no assets".to_string())
-                } else {
-                    Ok(a)
-                }
+            // The send below is the **only** thing that runs `jobs.finish` and drains the queue.
+            // A panic in the gzip/tar path (corrupt archive) would unwind a detached thread, the
+            // send would never happen, `has_active_extract()` would stay true forever, and every
+            // later extract would join a queue nobody drains — the same session-long jam
+            // `start_next_extract` fixes for the error path, by a different road.
+            let work = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let report_cancel = wcancel.clone();
+                let last_progress = AtomicU64::new(0);
+                let report = move |done: u64, total: u64| {
+                    wprogress.done.store(done, Ordering::Relaxed);
+                    wprogress.total.store(total, Ordering::Relaxed);
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    if now_ms.saturating_sub(last_progress.load(Ordering::Relaxed)) >= 250 {
+                        last_progress.store(now_ms, Ordering::Relaxed);
+                        emit_changed(&wapp, "jobs");
+                    }
+                    !report_cancel.load(Ordering::Relaxed)
+                };
+                let placed = extract_at_offsets_with_progress(&wpath, &wworkspace, wanted, &report)
+                    .map_err(|e| e.to_string());
+                let cancelled = wcancel.load(Ordering::Relaxed);
+                // "Extracted nothing" is a failure — unless the user cancelled before the first
+                // payload landed, which is a cancel, not a fault, and must not surface as an error
+                // toast for pressing Cancel.
+                let outcome = placed.and_then(|a| {
+                    if a.is_empty() && !cancelled {
+                        Err("the pack extracted no assets".to_string())
+                    } else {
+                        Ok(a)
+                    }
+                });
+                (outcome, cancelled)
+            }));
+            let (outcome, cancelled) = work.unwrap_or_else(|_| {
+                (
+                    Err("the extract worker panicked — the archive is likely corrupt".to_string()),
+                    false,
+                )
             });
             let _ = wtx.send(WriterMsg::ExtractDone {
                 job_id: handles.id,
                 package_id: wpkg_id,
-                reply: wreply,
                 outcome,
                 cancelled,
             });
@@ -2012,6 +2059,85 @@ fn delete_from_disk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// `n` queued `ExtractPackage` jobs. The reply receivers come back with them: dropping one
+    /// makes its `send` fail, which would quietly mask a regression.
+    fn queued_extracts(
+        n: i64,
+    ) -> (
+        VecDeque<Job>,
+        Vec<mpsc::Receiver<Result<WriteResult, String>>>,
+    ) {
+        let mut queue = VecDeque::new();
+        let waits = (0..n)
+            .map(|i| {
+                let (reply, wait) = mpsc::channel();
+                queue.push_back(Job {
+                    op: Op::ExtractPackage {
+                        package_id: 900 + i,
+                    },
+                    reply,
+                });
+                wait
+            })
+            .collect();
+        (queue, waits)
+    }
+
+    /// The extract queue must never strand the packs behind a failing one.
+    ///
+    /// `Op::ExtractPackage` can fail *before* spawning anything — package row gone, no workspace
+    /// configured, a pack with no extractable payloads — and only a spawned worker reports back to
+    /// drain the queue. Draining one entry per report therefore left every pack behind a failure
+    /// queued with nothing coming: `extract_queue.is_empty()` stayed false for the rest of the
+    /// session, so every later extract joined a queue nobody drained — no job, no error, and the
+    /// feature silently dead until restart.
+    #[test]
+    fn a_failing_extract_never_strands_the_queue_behind_it() {
+        let jobs = JobRegistry::default();
+        let (mut queue, _waits) = queued_extracts(3);
+
+        // Every op fails to spawn, so nothing will ever report back on their behalf.
+        let failures =
+            drain_to_first_spawn(&mut queue, &jobs, |_| Err("no such package".to_string()));
+
+        assert_eq!(failures, 3);
+        assert!(
+            queue.is_empty(),
+            "{} pack(s) left queued with no worker coming for them",
+            queue.len()
+        );
+        // The caller was told "accepted" when it queued, so the tray is the only place a spawn
+        // failure can still be seen. Silence here is the same bug wearing a different hat.
+        let failed = jobs.snapshot().recent.iter().filter(|j| !j.ok).count();
+        assert_eq!(failed, 3, "every spawn failure must reach the job tray");
+    }
+
+    /// The other half of the rule: draining stops at the first op that *does* spawn, because that
+    /// worker owns draining the rest. Going past it would unpack two packs at once, which is what
+    /// UI-SPEC §5's one-at-a-time queue exists to prevent.
+    #[test]
+    fn the_queue_stops_at_the_first_op_that_spawns() {
+        let jobs = JobRegistry::default();
+        let (mut queue, _waits) = queued_extracts(3);
+
+        let mut seen = 0;
+        let failures = drain_to_first_spawn(&mut queue, &jobs, |_| {
+            seen += 1;
+            if seen == 2 {
+                Ok(())
+            } else {
+                Err("no such package".to_string())
+            }
+        });
+
+        assert_eq!(failures, 1, "only the first op failed");
+        assert_eq!(seen, 2, "it must stop the moment one spawns");
+        assert_eq!(
+            queue.len(),
+            1,
+            "the pack behind the running one stays queued"
+        );
+    }
 
     fn target(path: Option<&str>) -> Target {
         Target {

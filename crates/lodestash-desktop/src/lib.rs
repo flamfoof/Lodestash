@@ -1243,12 +1243,23 @@ fn model_remove() -> Result<(), String> {
 
 /// Per-pack Extract (B2b slice) — unpack the archive into the workspace and reconcile its
 /// payloads into the catalog, on the persist thread like every write.
+///
+/// **Returns "accepted", not "finished."** Extraction hands off to a worker thread; progress, the
+/// outcome and the cancel button live in the job tray, and the grid refreshes off the `catalog`
+/// change event the writer emits once payloads are materialized. Deliberately *not* `state.write`:
+/// that reloads the 8k-row library snapshot the moment the op returns, which for this op is the
+/// moment the worker is spawned — before a single payload exists. A wasted whole-library re-read
+/// at exactly the wrong time.
 #[tauri::command]
 fn extract_package(
     state: tauri::State<'_, AppState>,
     package_id: i64,
 ) -> Result<WriteResult, String> {
-    state.write(Op::ExtractPackage { package_id })
+    state
+        .writer
+        .as_ref()
+        .ok_or_else(|| "no catalog is open — nothing to write to".to_string())?
+        .run(Op::ExtractPackage { package_id })
 }
 
 /// The job tray (B2b): active jobs (progress, cancellable) + the session ring of finished ones.

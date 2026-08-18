@@ -112,21 +112,44 @@
     }
   }
 
-  // Per-pack Extract (B2b slice): unpack into the workspace + reconcile the payloads. Runs on
-  // the persist thread; the row's button shows a spinner until the write returns.
-  let extracting = $state<Set<number>>(new Set());
+  // Per-pack Extract (B2b slice): unpack into the workspace + reconcile the payloads.
+  //
+  // `extract_package` answers **"accepted"**, not "finished" — the unpack runs on a worker for as
+  // long as the archive takes. So the row's busy state comes from the **job tray**, not from the
+  // promise: awaiting the command cleared the spinner within milliseconds while the pack was still
+  // inflating, which read as "done, and it did nothing".
+  let activeExtracts = $state<string[]>([]);
+  $effect(() => {
+    view.dataVersion;
+    let stop = false;
+    const tick = async () => {
+      if (stop) return;
+      try {
+        const jv = await jobs();
+        activeExtracts = jv.active.filter((j) => j.kind === "extract").map((j) => j.label);
+      } catch {
+        /* the tray owns reporting; a poll miss is not worth an error banner */
+      }
+      if (!stop) setTimeout(tick, 700);
+    };
+    tick();
+    return () => {
+      stop = true;
+    };
+  });
+
+  /** The tray labels its jobs `Analyze <pack>` / `Extract <pack>` (writer.rs). */
+  const busyWith = (name: string) =>
+    activeExtracts.some((l) => l === `Extract ${name}` || l === `Analyze ${name}`);
+
   async function extract(p: PackageRow) {
-    if (extracting.has(p.id)) return;
-    extracting = new Set(extracting).add(p.id);
+    if (busyWith(p.name)) return;
     try {
       await extractPackage(p.id);
+      // Accepted, not done — the writer emits `catalog` when payloads actually land.
       view.dataVersion += 1;
     } catch (e) {
       error = String(e);
-    } finally {
-      const next = new Set(extracting);
-      next.delete(p.id);
-      extracting = next;
     }
   }
 
@@ -316,12 +339,12 @@
                     </button>
                     <button
                       class="open"
-                      class:busy={extracting.has(p.id)}
-                      disabled={extracting.has(p.id)}
+                      class:busy={busyWith(p.name)}
+                      disabled={busyWith(p.name)}
                       onclick={() => extract(p)}
                       data-testid="extract-{p.id}"
                     >
-                      {extracting.has(p.id) ? "Extracting…" : "Extract"}
+                      {busyWith(p.name) ? "Extracting…" : "Extract"}
                     </button>
                     <button class="open" onclick={() => (statsRow = p)} data-testid="stats-{p.id}">
                       Stats
