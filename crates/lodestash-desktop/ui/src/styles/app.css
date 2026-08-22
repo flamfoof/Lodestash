@@ -103,3 +103,35 @@ button {
 .mono {
   user-select: text;
 }
+
+/*
+ * Reduced motion (DESIGN-GUIDELINES §8).
+ *
+ * The rule is: remove movement, never information. Transitions collapse to nothing, the card's
+ * decorative hover-spin stops, and the modal rise is dropped — but progress bars still move their
+ * width, scrims still dim, and status still flips.
+ *
+ * Spinners are the deliberate exception. A rotating glyph is the only signal that a job is alive at
+ * all — freezing it would leave a static mark that reads as a stuck UI, which is worse for the
+ * person this setting exists to help. They keep turning; nothing else does.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* Decorative transforms go entirely, not merely instantly. */
+  .card:hover .thumb img {
+    transform: none !important;
+  }
+
+  /* Glow is motion's cousin here — it pulses attention at something that already moved. */
+  .health-seg,
+  .escalate:hover {
+    box-shadow: none !important;
+  }
+}

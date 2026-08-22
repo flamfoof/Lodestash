@@ -560,9 +560,11 @@ Progress meters animate smoothly; never spin gratuitously.
 - **Contrast:** body text ≥ 4.5:1, large/secondary ≥ 3:1 against its surface. Verified for the tokens
   above on `--ls-surface`/`--ls-surface-raised`.
 - **Never color-only:** status, type, provenance always also carry an icon/label/shape.
-- **Focus:** one ring, everywhere — `box-shadow: var(--el-focus-ring)` (`0 0 0 2px #FFD98A`), applied
-  to card, list row, trait chip, facet row, nav row, type tab, icon button, select and the search
-  box. Three rules that are the whole recipe:
+- **Focus:** one ring, everywhere — a single global `:focus-visible` rule sets
+  `box-shadow: var(--el-focus-ring)` (`0 0 0 2px #FFD98A`), so card, list row, trait chip, facet row,
+  nav row, type tab, icon button, select and the search box all inherit it, including the
+  `role="button"` spans the app uses where a nested `<button>` would be invalid HTML. Three rules
+  that are the whole recipe:
   - **`:focus-visible` only, never `:focus`.** A mouse click must not leave a ring behind it — that
     is what makes people reach for `outline: none` and lose keyboard focus altogether.
   - **Never layout-shifting.** It is a shadow, so nothing reflows when it appears; on a card it

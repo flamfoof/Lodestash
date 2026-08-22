@@ -1,4 +1,5 @@
 <script lang="ts">
+  import EmptyState from "./EmptyState.svelte";
   /**
    * Identify — the appraisal workspace (UI-SPEC §3, FEATURES §3).
    *
@@ -158,12 +159,14 @@
     {#if error}
       <p class="msg danger">{error}</p>
     {:else if items.length === 0}
-      <div class="empty" data-testid="backlog-clear">
-        <span class="gem" aria-hidden="true">✓</span>
-        <h2>Backlog clear</h2>
-        <p>Every asset is appraised and searchable.</p>
-        <button class="go" onclick={() => view.go("library")}>Go to Library →</button>
-      </div>
+      <EmptyState
+        testid="backlog-clear"
+        icon="ls-nav-identify"
+        title="Nothing left to appraise"
+        line="Every asset has been identified. New files are appraised as they arrive."
+        action="Go to Library →"
+        onaction={() => view.go("library")}
+      />
     {:else}
       <div class="grid" data-testid="backlog">
         {#each items as item (item.asset_id)}
@@ -280,53 +283,6 @@
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(var(--card, 148px), 1fr));
     gap: var(--sp-3);
-  }
-  .empty {
-    height: 100%;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: var(--sp-2);
-    color: var(--ls-text-muted);
-  }
-  .gem {
-    width: 48px;
-    height: 48px;
-    display: grid;
-    place-items: center;
-    border: 2px solid var(--ls-success);
-    border-radius: 12px;
-    transform: rotate(45deg);
-    color: var(--ls-success);
-    font-size: var(--fs-2xl);
-    margin-bottom: var(--sp-2);
-  }
-  .gem::first-line {
-    transform: rotate(-45deg);
-  }
-  .empty h2 {
-    margin: 0;
-    font-family: var(--ff-display);
-    font-size: var(--fs-xl);
-  }
-  .empty p {
-    margin: 0;
-    font-size: var(--fs-sm);
-  }
-  .go {
-    margin-top: var(--sp-2);
-    background: none;
-    border: 1px solid var(--ls-gold);
-    border-radius: var(--r-md);
-    color: var(--ls-gold-bright);
-    font: inherit;
-    font-size: var(--fs-sm);
-    padding: 6px var(--sp-4);
-    cursor: pointer;
-  }
-  .go:hover {
-    background: color-mix(in srgb, var(--ls-gold) 14%, transparent);
   }
   .msg {
     color: var(--ls-text-dim);

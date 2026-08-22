@@ -42,12 +42,14 @@ import JobTray from "./lib/JobTray.svelte";
     clearStaged,
     type AssetDetail,
     type LibraryStatus,
+    recentOps,
+    undo as undoOp,
   } from "./lib/api";
   import { refreshTraitColors } from "./lib/traits.svelte";
   import Onboarding from "./lib/Onboarding.svelte";
   import SourceChooser from "./lib/SourceChooser.svelte";
   import ImportDialog from "./lib/ImportDialog.svelte";
-  import { push, dismiss, toasts } from "./lib/toasts.svelte";
+  import { push, dismiss, act, freeze, thaw, toasts, overflow } from "./lib/toasts.svelte";
 
   let status = $state<LibraryStatus | null>(null);
   let reloading = $state(false);
@@ -187,7 +189,11 @@ import JobTray from "./lib/JobTray.svelte";
    * `ok` (when given) turns the result into a confirmation toast (B10c) — failures stay on the
    * action-error bar, never a toast.
    */
-  async function write(run: () => Promise<unknown>, ok?: (changed: number) => string | null) {
+  async function write(
+    run: () => Promise<unknown>,
+    ok?: (changed: number) => string | null,
+    opts?: { undoable?: boolean },
+  ) {
     actionError = null;
     try {
       const res = (await run()) as { changed?: number } | null | undefined;
@@ -198,10 +204,39 @@ import JobTray from "./lib/JobTray.svelte";
       if (ok) {
         const changed = typeof res?.changed === "number" ? res.changed : 1;
         const msg = ok(changed);
-        if (msg) push(msg);
+        if (msg) push(msg, "ok", opts?.undoable ? await undoAction() : undefined);
       }
     } catch (e) {
       actionError = String(e);
+    }
+  }
+
+  /**
+   * Pin the op this write just recorded to the toast that announces it (D8).
+   *
+   * The id is captured **now**, not read at click time: with two toasts on screen, an Undo that
+   * reached for the head of the log would reverse whichever action was newest — silently, and with
+   * a confirmation saying it worked. Only the ops the catalog actually records are undoable
+   * (trash, collection create, bulk tag), so no head means no action slot rather than a button
+   * that lies.
+   *
+   * ponytail: reads the head after the write instead of threading the id back through
+   * `WriteResult` — writes serialise through the one writer thread and the UI awaits each one, so
+   * the head is this write's op. Two genuinely concurrent writes could cross; thread the id
+   * through `WriteResult` if that ever shows up.
+   */
+  async function undoAction() {
+    try {
+      const [head] = await recentOps(1);
+      if (!head) return undefined;
+      return {
+        label: "Undo",
+        run: async () => {
+          await write(() => undoOp(head.id), () => "Undone");
+        },
+      };
+    } catch {
+      return undefined;
     }
   }
 
@@ -325,7 +360,9 @@ import JobTray from "./lib/JobTray.svelte";
         view.dataVersion += 1;
       });
     } else if (action === "trash") {
-      confirmTrash(() => write(() => setTrashed([id], true), () => "Moved to Trash"));
+      confirmTrash(() =>
+        write(() => setTrashed([id], true), () => "Moved to Trash", { undoable: true }),
+      );
     } else if (action === "import") {
       importToProject([id]);
     }
@@ -372,8 +409,10 @@ import JobTray from "./lib/JobTray.svelte";
         <DuplicatesScreen
           ontrash={(ids) =>
             confirmTrash(() =>
-              write(() => setTrashed(ids, true), (n) =>
-                n === 1 ? "Moved to Trash" : `Moved ${n} assets to Trash`,
+              write(
+                () => setTrashed(ids, true),
+                (n) => (n === 1 ? "Moved to Trash" : `Moved ${n} assets to Trash`),
+                { undoable: true },
               ),
             )
           }
@@ -386,7 +425,9 @@ import JobTray from "./lib/JobTray.svelte";
           title={favoritesOnly ? "Favorites" : trashedOnly ? "Trash" : "Library"}
           onmenuaction={onMenuAction}
           onrestore={(id) =>
-            write(() => setTrashed([id], false), () => "Restored from Trash").then(afterRemoval)
+            write(() => setTrashed([id], false), () => "Restored from Trash", { undoable: true }).then(
+              afterRemoval,
+            )
           }
         />
       {:else}
@@ -415,12 +456,18 @@ import JobTray from "./lib/JobTray.svelte";
         }
         ontrash={() =>
           confirmTrash(() =>
-            write(() => setTrashed([view.selected!], true), () => "Moved to Trash").then(afterRemoval),
+            write(() => setTrashed([view.selected!], true), () => "Moved to Trash", { undoable: true }).then(
+              afterRemoval,
+            ),
           )
         }
         onimport={() => view.selected !== null && importToProject([view.selected])}
         onrestore={() =>
-          write(() => setTrashed([view.selected!], false), () => "Restored from Trash").then(afterRemoval)
+          write(
+            () => setTrashed([view.selected!], false),
+            () => "Restored from Trash",
+            { undoable: true },
+          ).then(afterRemoval)
         }
         onremove={() =>
           write(() => removeFromLibrary([view.selected!]), () => "Removed from Library").then(afterRemoval)
@@ -477,10 +524,31 @@ import JobTray from "./lib/JobTray.svelte";
   {/if}
 
   {#if toasts.length > 0}
-    <div class="toasts" data-testid="toast-host" aria-live="polite">
+    <!-- Reaching for Undo must not be a race against the toast offering it, so the whole stack
+         freezes while it is hovered or focused (DESIGN-GUIDELINES §7). -->
+    <div
+      class="toasts"
+      data-testid="toast-host"
+      aria-live="polite"
+      role="presentation"
+      onmouseenter={freeze}
+      onmouseleave={thaw}
+      onfocusin={freeze}
+      onfocusout={thaw}
+    >
+      {#if overflow.count > 0}
+        <div class="toast more" data-testid="toast-overflow">
+          <span class="msg">+{overflow.count} more</span>
+        </div>
+      {/if}
       {#each toasts as t (t.id)}
         <div class="toast {t.kind}" data-testid="toast" role="status">
           <span class="msg">{t.msg}</span>
+          {#if t.action}
+            <button class="act" data-testid="toast-action" onclick={() => act(t.id)}>
+              {t.action.label}
+            </button>
+          {/if}
           <button
             class="dismiss"
             data-testid="toast-dismiss"
@@ -557,6 +625,29 @@ import JobTray from "./lib/JobTray.svelte";
     color: var(--ls-text);
     pointer-events: auto;
     box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+  }
+  /* One action slot, right of the message: Undo when it is reversible, Show when the useful next
+     move is to look at what failed. Never both. */
+  .toast .act {
+    flex: none;
+    margin-left: auto;
+    padding: 0;
+    font: inherit;
+    font-size: var(--fs-sm);
+    color: var(--ls-gold);
+    background: none;
+    border: 0;
+    border-bottom: 1px solid color-mix(in srgb, var(--ls-gold) 50%, transparent);
+    cursor: pointer;
+  }
+  .toast .act:hover {
+    color: var(--ls-gold-bright);
+    border-bottom-color: var(--ls-gold-bright);
+  }
+  .toast.more {
+    --accent: var(--ls-border-strong);
+    color: var(--ls-text-dim);
+    font-size: var(--fs-xs);
   }
   .toast.ok {
     --accent: var(--ls-success);

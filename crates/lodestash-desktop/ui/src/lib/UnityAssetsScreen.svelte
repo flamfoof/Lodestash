@@ -1,4 +1,5 @@
 <script lang="ts">
+  import EmptyState from "./EmptyState.svelte";
   /**
    * Unity Assets (FEATURES §5, UI-SPEC §15) — the `.unitypackage` archive view, distinct from
    * Packages (already-indexed assets): every pack in the download cache, pin/unpin as a library,
@@ -271,15 +272,24 @@
     {:else if !rows}
       <p class="msg">Loading…</p>
     {:else if byPublisher.length === 0}
-      <p class="msg" data-testid="empty">
-        {#if pinnedOnly}
-          Nothing pinned yet — use ⬢ on a pack to pin it as a library.
-        {:else if q}
-          No pack matches “{q}”.
-        {:else}
-          No Unity packages found in the Asset Store cache yet.
-        {/if}
-      </p>
+      {#if pinnedOnly}
+        <EmptyState
+          testid="empty"
+          icon="ls-unitypackage"
+          title="Nothing pinned yet"
+          line="Pin a pack with ⬢ to keep it in the sidebar as a library of its own."
+        />
+      {:else if q}
+        <!-- Filtered-empty, not empty (UI-SPEC §2.6). -->
+        <p class="msg" data-testid="empty">No pack matches “{q}”.</p>
+      {:else}
+        <EmptyState
+          testid="empty"
+          icon="ls-unitypackage"
+          title="No Unity packages found"
+          line="Point Lodestash at a folder of .unitypackage archives to browse inside them without importing anything."
+        />
+      {/if}
     {:else}
       {#if ticked.size > 0 || queuedCount > 0}
         <div class="batch" data-testid="extract-batch">

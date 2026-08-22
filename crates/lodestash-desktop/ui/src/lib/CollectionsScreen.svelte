@@ -1,4 +1,5 @@
 <script lang="ts">
+  import EmptyState from "./EmptyState.svelte";
   /**
    * Collections (UI-SPEC §6): pinned loadouts — "stash tabs for your hoard". Create, browse,
    * delete. Membership is toggled from the asset Inspector (G6); that surface lands with the
@@ -85,10 +86,12 @@
     {:else if !rows}
       <p class="msg">Loading…</p>
     {:else if rows.length === 0}
-      <p class="msg" data-testid="empty">
-        No collections yet. Create one above — they are loadouts you can browse as a single
-        group, not folders on disk.
-      </p>
+      <EmptyState
+        testid="empty"
+        icon="ls-nav-collections"
+        title="No collections yet"
+        line="Collections are named sets you come back to — a level's dressing, a character kit. Not folders on disk."
+      />
     {:else}
       <div class="grid" data-testid="collections">
         {#each rows as c (c.id)}

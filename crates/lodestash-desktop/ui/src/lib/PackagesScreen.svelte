@@ -1,4 +1,5 @@
 <script lang="ts">
+  import EmptyState from "./EmptyState.svelte";
   /**
    * Packages (UI-SPEC §4): everything you own, publisher → pack.
    *
@@ -74,9 +75,18 @@
     {:else if !rows}
       <p class="msg">Loading…</p>
     {:else if byPublisher.length === 0}
-      <p class="msg" data-testid="empty">
-        {#if q}No pack matches “{q}”.{:else}No packs in the catalog yet.{/if}
-      </p>
+      {#if q}
+        <!-- Filtered-empty is not empty: it needs a way out, not a lesson about what a pack
+             is (UI-SPEC §2.6). -->
+        <p class="msg" data-testid="empty">No pack matches “{q}”.</p>
+      {:else}
+        <EmptyState
+          testid="empty"
+          icon="ls-nav-packages"
+          title="No packs indexed"
+          line="A pack is one publisher's release — Synty's Dungeon Realms, say. They appear here once a source is scanned."
+        />
+      {/if}
     {:else}
       <div class="publishers" data-testid="publishers">
         {#each byPublisher as group (group.publisher)}

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import EmptyState from "./EmptyState.svelte";
   /**
    * Duplicates (UI-SPEC §5) — a review queue. **Nothing here is ever auto-resolved.**
    *
@@ -103,8 +104,13 @@
     {:else if !groups}
       <p class="msg">Loading…</p>
     {:else if shown.length === 0 && shownSimilar.length === 0}
-      <p class="msg" data-testid="empty">
-        ⧉ No duplicates left to review.
+      <EmptyState
+        testid="empty"
+        icon="ls-nav-duplicates"
+        title="No duplicates left to review"
+        line="Lodestash flags byte-identical and near-identical assets across packs. Nothing is ever deleted for you."
+      />
+      <p class="msg dismissed">
         {#if (groups?.length ?? 0) + (similar?.length ?? 0) > 0}
           ({(groups?.length ?? 0) + (similar?.length ?? 0)} dismissed this session.)
         {/if}

@@ -1456,6 +1456,65 @@ try {
 
   // Trash is the recoverable middle option: the row leaves every normal view, appears in exactly
   // one, and comes back intact. A trashed asset that no view can reach is a trapdoor.
+  // ── D8: the undo lives where the action was announced ────────────────────────────────────────
+  // The whole point is that the toast undoes *its own* op rather than the head of the log, so the
+  // check drives it through the UI (right-click → Move to Trash → Undo) and then asks the catalog
+  // whether the asset actually came back. Trash is catalog-only — no file is touched either way,
+  // and the asset is restored through the backend in `finally` whatever the UI did.
+  await check("the toast that announces a trash offers the undo that reverses it", async () => {
+    await page.fill('input[type="text"]', "");
+    await page.waitForFunction(() => document.querySelectorAll(".card").length > 3, undefined, {
+      timeout: 5000,
+    });
+    const card = page.locator(".card").first();
+    const name = (await card.locator(".name").textContent())?.trim();
+    const before = await invoke("library_status");
+
+    let victim = null;
+    try {
+      // Driven from the inspector rather than the context menu: same `write()` path, one fewer
+      // moving part, and it needs the selection open anyway.
+      await card.click();
+      await page.waitForSelector('[data-testid="action-trash"]', { timeout: 5000 });
+      await page.click('[data-testid="action-trash"]');
+      // Trash is confirm-gated (UI-SPEC §11.6), and the gate is an *arming* click rather than a
+      // dialog: the first press arms, the second commits. Tolerate both settings by asking for the
+      // toast, and only pressing again if the first press merely armed it.
+      const armed = await page
+        .waitForSelector('[data-testid="toast-action"]', { timeout: 1500 })
+        .then(() => true)
+        .catch(() => false);
+      if (!armed) await page.click('[data-testid="action-trash"]');
+
+      await page.waitForSelector('[data-testid="toast-action"]', { timeout: 5000 });
+      const label = (await page.locator('[data-testid="toast-action"]').textContent())?.trim();
+      assert.equal(label, "Undo", `the trash toast offered "${label}" instead of an Undo`);
+
+      const mid = await invoke("library_status");
+      assert.equal(mid.trashed, before.trashed + 1, `trashing "${name}" did not reach the catalog`);
+      victim = mid;
+
+      await page.click('[data-testid="toast-action"]');
+      await page.waitForFunction(
+        () => !document.querySelector('[data-testid="toast-action"]'),
+        undefined,
+        { timeout: 5000 },
+      );
+      const after = await invoke("library_status");
+      assert.equal(after.trashed, before.trashed, "Undo did not put the asset back");
+    } finally {
+      // Belt and braces: if the UI path failed halfway, the catalog still goes back to where it was.
+      if (victim) {
+        const binned = await invoke("grid_page", {
+          query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+                   favorites_only: false, trashed_only: true, page: 0, page_size: 100000 },
+        });
+        const ids = binned.items.map((i) => i.asset_id);
+        if (ids.length > 0) await invoke("set_trashed", { assetIds: ids, trashed: false });
+      }
+    }
+  });
+
   await check("trash hides an asset, the Trash lists it, restore brings it back (UI-SPEC §10)", async () => {
     const live = () =>
       invoke("grid_page", {
