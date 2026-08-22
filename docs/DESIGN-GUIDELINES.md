@@ -410,9 +410,16 @@ import.
   Ctrl/Cmd-A selects all within the current filter. Selected cards get a 2px `--ls-gold` border + a
   check overlay (top-left); a selection count shows in the top bar. Bulk actions operate on the set.
 - **Right-click context menu** (`--ls-overlay`, §4 elevation 2): Open, **Quick Look** (Space),
-  **Reveal in Explorer/Finder**, **Open with default app**, **Copy path**, Stage, Import…, Add to
-  collection, Edit tags, Re-identify, Find similar, **Move to Trash**. Engine actions gray out (with a
-  tooltip) when no project is active. The same menu serves single and multi selection.
+  **Reveal in Explorer/Finder**, **Open with default app**, **Copy name**, **Copy path**, Stage,
+  Import…, Add to collection, Edit tags, Re-identify, Find similar, **Move to Trash**. Engine actions
+  gray out (with a tooltip) when no project is active. The same menu serves single and multi
+  selection.
+- **Text selection: content yes, chrome no.** The shell sets `user-select: none` so dragging across
+  a grid never paints a selection, and content opts back in — the inspector, Quick Look, dialogs,
+  settings, stat blocks and mono paths. Cards and list rows are `<button>` elements, so a drag over
+  one can never produce a text selection whatever the CSS says: for those, **Copy name / Copy path**
+  in the context menu is the route that actually reaches the text. Finding an asset ends in using it
+  somewhere else, and a catalog whose names must be retyped by hand has not finished the job.
 
 ### View / sort toolbar
 A strip above the grid: a **⚑ Filters** button (opens the content-filter popover below; gold fill +

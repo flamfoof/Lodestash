@@ -51,6 +51,86 @@
     onimport: () => void;
   } = $props();
 
+  /**
+   * UI-SPEC §13 has three states, not one:
+   *
+   * - **collapsed** — nothing selected (or the user closed it): a 26px edge tab. The rail never
+   *   holds 300px open to print "Select an asset." (ALIGNMENT-AUDIT N5.3).
+   * - **compare** — exactly two picked: 460px, two columns, differing rows gold. This is the pane
+   *   Duplicates (§5) reviews groups in.
+   * - **one asset** — the stat block, unchanged.
+   */
+  let compareIds = $derived(view.selectedIds.length === 2 ? [...view.selectedIds] : null);
+  let compare = $state<AssetDetail[] | null>(null);
+  $effect(() => {
+    const ids = compareIds;
+    if (!ids) {
+      compare = null;
+      return;
+    }
+    let live = true;
+    Promise.all(ids.map((id) => assetDetail(id)))
+      .then((d) => {
+        // A row deleted between the pick and the read comes back null; two is the only shape the
+        // pane can render, so anything else collapses back to the single-asset view.
+        const both = d.filter((x): x is AssetDetail => !!x);
+        if (live) compare = both.length === 2 ? both : null;
+      })
+      .catch(() => {
+        if (live) compare = null;
+      });
+    return () => {
+      live = false;
+    };
+  });
+
+  /**
+   * A manual collapse sticks until the next selection — selecting something is an unambiguous ask
+   * to see it, and leaving the rail shut then would swallow the click silently.
+   */
+  $effect(() => {
+    if (assetId != null) view.inspectorOpen = true;
+  });
+
+  let collapsed = $derived(!view.inspectorOpen || (assetId == null && !compareIds));
+
+  /** Compare rows: the fields two assets can actually be judged on, per modality. */
+  type CmpRow = { label: string; values: [string, string] };
+  let compareRows = $derived.by<CmpRow[]>(() => {
+    const pair = compare;
+    if (!pair || pair.length !== 2) return [];
+    const [a, b] = pair;
+    const row = (label: string, f: (d: AssetDetail) => string): CmpRow => ({
+      label,
+      values: [f(a), f(b)],
+    });
+    const rows: CmpRow[] = [
+      row("Status", (d) => statusLabel(d.status)),
+      row("Type", (d) => d.media_type),
+      row("Size", (d) => fmtSize(d.size_bytes)),
+      row("Source", (d) => d.source ?? "—"),
+      row("Tags", (d) => String(d.tags.length)),
+    ];
+    if (a.triangles != null || b.triangles != null) {
+      rows.push(row("Tris", (d) => (d.triangles != null ? d.triangles.toLocaleString() : "—")));
+    }
+    if (a.duration_ms != null || b.duration_ms != null) {
+      rows.push(row("Length", (d) => (d.duration_ms != null ? fmtDuration(d.duration_ms) : "—")));
+    }
+    if (a.width_px != null || b.width_px != null) {
+      rows.push(
+        row("Pixels", (d) => (d.width_px != null ? `${d.width_px}×${d.height_px ?? "?"}` : "—")),
+      );
+    }
+    return rows;
+  });
+
+  /** Drop the comparison down to one side — the pick set, not the catalog. Nothing is deleted. */
+  function keepOnly(i: 0 | 1) {
+    const pair = compare;
+    if (pair) view.selectedIds = [pair[i].asset_id];
+  }
+
   let detail = $state<AssetDetail | null>(null);
   $effect(() => {
     const id = assetId;
@@ -213,10 +293,55 @@
   }
 </script>
 
-<aside class="inspector" style="--tint: {tint}">
-  {#if !detail}
-    <p class="empty">Select an asset.</p>
-  {:else}
+{#if collapsed}
+  <!-- The best empty state is the one that takes no room (DESIGN-GUIDELINES §7). -->
+  <aside class="edge" data-testid="inspector-edge">
+    {#if assetId != null}
+      <button class="vert" onclick={() => (view.inspectorOpen = true)} aria-label="Open inspector">
+        INSPECTOR ‹
+      </button>
+    {:else}
+      <span class="vert dim">INSPECTOR</span>
+    {/if}
+  </aside>
+{:else if compare}
+  <aside class="inspector wide" data-testid="inspector-compare">
+    <header class="cmp-head">
+      <span class="cmp-kicker">Comparing 2</span>
+      <button class="cmp-x" onclick={() => view.clearSelection()} aria-label="Clear comparison">✕</button>
+    </header>
+    <div class="cmp-cols">
+      {#each compare as d (d.asset_id)}
+        <div class="cmp-col">
+          <div class="cmp-art">
+            {#if d.has_preview}
+              <img src={previewUrl(d.asset_id)} alt="" />
+            {:else if d.media_type !== "model_3d" && !d.in_pack}
+              <img src={thumbUrl(d.asset_id)} alt="" onerror={hideBroken} />
+            {:else}
+              <Icon name={typeIcon(d.media_type)} size={28} />
+            {/if}
+          </div>
+          <div class="cmp-name" title={d.rel_path}>{d.name}</div>
+        </div>
+      {/each}
+    </div>
+    <!-- Rows where the two differ go gold on both sides; rows where they agree stay dim, so the eye
+         lands on the facts that decide it rather than on the whole table. -->
+    <div class="cmp-rows" data-testid="compare-rows">
+      {#each compareRows as r (r.label)}
+        <span class="cmp-k">{r.label}</span>
+        <span class="cmp-v num" class:differs={r.values[0] !== r.values[1]}>{r.values[0]}</span>
+        <span class="cmp-v num" class:differs={r.values[0] !== r.values[1]}>{r.values[1]}</span>
+      {/each}
+    </div>
+    <footer class="cmp-foot">
+      <button onclick={() => keepOnly(0)}>Keep left</button>
+      <button onclick={() => keepOnly(1)}>Keep right</button>
+    </footer>
+  </aside>
+{:else if detail}
+  <aside class="inspector" style="--tint: {tint}">
     <div class="hero" data-testid="inspector-hero">
       {#if detail.has_preview}
         <img src={previewUrl(detail.asset_id)} alt="" />
@@ -435,8 +560,8 @@
         <span class="note">Inside a pack — extract it before it can be deleted individually.</span>
       {/if}
     </div>
-  {/if}
-</aside>
+  </aside>
+{/if}
 
 <style>
   .actions {
@@ -488,9 +613,138 @@
     padding: var(--sp-4);
     overflow-y: auto;
   }
-  .empty {
+  /* UI-SPEC §13 compare: 460px, wide enough for two stat columns that still read as columns. */
+  .inspector.wide {
+    width: 460px;
+  }
+
+  /* Collapsed: 26px of edge, not 300px of instruction. */
+  .edge {
+    width: 26px;
+    flex: none;
+    background: var(--ls-surface);
+    border-left: 1px solid var(--ls-border);
+    display: grid;
+    place-items: center;
+  }
+  .vert {
+    writing-mode: vertical-rl;
+    transform: rotate(180deg);
+    font-size: var(--fs-xs);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ls-text-muted);
+    background: none;
+    border: 0;
+    padding: var(--sp-2) 0;
+    font-family: inherit;
+    cursor: pointer;
+  }
+  .vert.dim {
     color: var(--ls-text-dim);
-    margin: 0;
+    cursor: default;
+  }
+  button.vert:hover {
+    color: var(--ls-gold);
+  }
+  button.vert:focus-visible {
+    box-shadow: var(--el-focus-ring);
+    outline: none;
+  }
+
+  .cmp-head {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    margin-bottom: var(--sp-3);
+  }
+  .cmp-kicker {
+    font-size: var(--fs-xs);
+    font-weight: 600;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--ls-text-dim);
+  }
+  .cmp-x {
+    margin-left: auto;
+    background: none;
+    border: 0;
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+    cursor: pointer;
+  }
+  .cmp-x:hover {
+    color: var(--ls-text);
+  }
+  .cmp-cols {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--sp-2);
+  }
+  .cmp-art {
+    height: 110px;
+    display: grid;
+    place-items: center;
+    background: var(--ls-bg);
+    border-radius: var(--r-md);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ls-border-strong) 60%, transparent);
+    overflow: hidden;
+  }
+  .cmp-art img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+  }
+  .cmp-name {
+    margin-top: var(--sp-1);
+    font-size: var(--fs-sm);
+    color: var(--ls-text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .cmp-rows {
+    display: grid;
+    grid-template-columns: 62px 1fr 1fr;
+    gap: 4px var(--sp-2);
+    align-items: center;
+    margin-top: var(--sp-3);
+    padding-top: var(--sp-3);
+    border-top: 1px solid var(--ls-border);
+    font-size: var(--fs-xs);
+  }
+  .cmp-k {
+    color: var(--ls-text-dim);
+  }
+  /* Agreement is not a finding: only the rows that differ earn the eye. */
+  .cmp-v {
+    color: var(--ls-text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .cmp-v.differs {
+    color: var(--ls-gold);
+  }
+  .cmp-foot {
+    display: flex;
+    gap: var(--sp-2);
+    margin-top: var(--sp-4);
+  }
+  .cmp-foot button {
+    flex: 1;
+    height: var(--control-h);
+    font: inherit;
+    font-size: var(--fs-sm);
+    color: var(--ls-text-muted);
+    background: none;
+    border: 1px solid var(--ls-border-strong);
+    border-radius: var(--r-md);
+    cursor: pointer;
+  }
+  .cmp-foot button:hover {
+    border-color: var(--ls-gold);
+    color: var(--ls-text);
   }
 
   .hero {

@@ -7,6 +7,7 @@
   import FoldersView from "./FoldersView.svelte";
   import { gridPage, DENSITIES, bulkTag, type GridPage, type LibraryStatus } from "./api";
   import { view } from "./nav.svelte";
+  import { push } from "./toasts.svelte";
 
   // Right-click menu (FEATURES §1.1): position + target asset. Closes on any action, Escape,
   // click-away or a scroll.
@@ -14,6 +15,26 @@
   function closeMenu() {
     menu = null;
   }
+  /**
+   * Copy the asset's name or its path. Cards and rows are <button>s, so dragging over them can
+   * never produce a text selection whatever the CSS says — this is the affordance that actually
+   * reaches them, and it works identically in grid, list and folders.
+   */
+  async function copyFromMenu(what: "name" | "path") {
+    const m = menu;
+    if (!m) return;
+    const item = result?.items.find((i) => i.asset_id === m.id);
+    const text = what === "name" ? item?.name : item?.rel_path;
+    closeMenu();
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      push(`Copied ${what}`, "info");
+    } catch {
+      push("Could not reach the clipboard", "err");
+    }
+  }
+
   function menuAction(action: "favorite" | "identify" | "import" | "trash") {
     const m = menu;
     if (!m) return;
@@ -102,6 +123,17 @@
     if (e.key === "Enter" && quickLook === null && view.selected !== null) {
       quickLook = view.selected;
       e.preventDefault();
+    }
+    // UI-SPEC §0.4: Escape falls through Quick Look → selection. Quick Look owns its own Escape,
+    // so this only takes the key once the modal is gone — otherwise one press would both close the
+    // preview and drop the selection behind it, and you would land back on an empty inspector.
+    // Without this the §13 collapsed rail is unreachable from the keyboard at all.
+    if (e.key === "Escape" && quickLook === null) {
+      if (view.selected !== null || view.selectedIds.length > 0) {
+        view.selected = null;
+        view.clearSelection();
+        e.preventDefault();
+      }
     }
   }
 
@@ -315,6 +347,8 @@
         onselect={(id) => (view.selected = id)}
         onopen={(id) => (quickLook = id)}
         onmenu={(e, id) => (menu = { x: e.clientX, y: e.clientY, id })}
+        onfavorite={(id, favorite) => onmenuaction?.({ action: "favorite", id, favorite })}
+        onidentify={(id) => onmenuaction?.({ action: "identify", id, favorite: false })}
         {trashedOnly}
         onrestore={(id) => onrestore?.(id)}
       />
@@ -408,6 +442,10 @@
         <button role="menuitem" onclick={() => menu && ((quickLook = menu.id), closeMenu())}>
           Quick Look
         </button>
+        <button role="menuitem" onclick={() => copyFromMenu("name")} data-testid="ctx-copy-name">
+          Copy name
+        </button>
+        <button role="menuitem" onclick={() => copyFromMenu("path")}>Copy path</button>
         <button role="menuitem" onclick={() => menuAction("favorite")}>Toggle Favorite</button>
         <button role="menuitem" onclick={() => menuAction("identify")}>Identify now</button>
         <button role="menuitem" onclick={() => menuAction("import")}>⇢ Add to project</button>

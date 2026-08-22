@@ -22,7 +22,9 @@ body {
   font-size: var(--fs-md);
   line-height: var(--lh-body);
   -webkit-font-smoothing: antialiased;
-  /* Desktop app, not a document: no text selection or rubber-banding by default. */
+  /* Desktop app, not a document: no rubber-banding across chrome by default. Content opts back
+     in below — the whole job of this app is finding an asset and using it somewhere else, and
+     that ends in copying a name or a path. */
   user-select: none;
   overflow: hidden;
 }
@@ -80,4 +82,24 @@ button {
 }
 ::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/*
+ * Content is selectable; chrome is not.
+ *
+ * `user-select: none` on <body> made every asset name, path, pack and stat in the app impossible
+ * to select or copy — reported 2026-08-22. The fix is not to drop the rule (dragging across a grid
+ * of cards should still not paint a selection) but to opt content back in where it lives.
+ *
+ * Cards and list rows are <button> elements, so a drag there starts a button interaction rather
+ * than a selection no matter what this says. For those the context menu's Copy name / Copy path
+ * (UI-SPEC §2.5) is the reliable route, and this rule covers everywhere text is plain markup:
+ * the inspector, Quick Look, dialogs, settings, stat blocks and mono paths.
+ */
+.inspector,
+.ctx-menu,
+[data-selectable],
+.num,
+.mono {
+  user-select: text;
 }

@@ -393,7 +393,9 @@ import JobTray from "./lib/JobTray.svelte";
         <Screen title={screen.title} milestone={screen.milestone} />
       {/if}
     </main>
-    {#if onLibrary && view.inspectorOpen}
+    <!-- UI-SPEC §13: the rail is always mounted on Library screens — collapsed it is a 26px edge
+         tab, not an absent component, and it owns reopening itself when a selection arrives. -->
+    {#if onLibrary}
       <Inspector
         assetId={view.selected}
         favorite={selectedDetail?.favorite ?? false}

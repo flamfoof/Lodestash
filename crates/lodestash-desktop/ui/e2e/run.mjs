@@ -852,6 +852,77 @@ try {
     await page.waitForTimeout(500);
   });
 
+  // ── D6: rows get what cards already have (closes ALIGNMENT-AUDIT F6) ─────────────────────────
+  // Switching to list used to silently cost you the star, Quick Look and staging. The check is
+  // presence *and* reach: a control that renders but does nothing is the failure worth catching.
+  await check("list rows carry the star, Quick Look and stage", async () => {
+    await page.fill('input[type="text"]', "Stairs");
+    await page.waitForTimeout(700);
+    await page.getByRole("button", { name: "List view" }).click();
+    await page.waitForSelector(".list .row", { timeout: 5000 });
+    const row = page.locator(".list .row").first();
+    for (const id of ["row-star", "row-open"]) {
+      assert.equal(await row.locator(`[data-testid="${id}"]`).count(), 1, `no ${id} on a list row`);
+    }
+    // Stage is on identified rows only — an unidentified row leads with ✦ instead, since on a row
+    // you cannot see the art and appraising is the fastest useful thing.
+    const stages = await page.locator('.list [data-testid="row-stage"]').count();
+    const ais = await page.locator('.list [data-testid="row-identify"]').count();
+    const rows = await page.locator(".list .row").count();
+    assert.equal(stages + ais, rows, `${rows} rows carried ${stages} stage + ${ais} identify actions`);
+  });
+
+  await check("⤢ on a row opens Quick Look for that row", async () => {
+    const row = page.locator(".list .row").first();
+    const name = (await row.locator(".label").textContent())?.trim();
+    await row.locator('[data-testid="row-open"]').click();
+    await page.waitForSelector('[data-testid="quicklook"]', { timeout: 5000 });
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="ql-name"]')?.textContent?.trim() !== "…",
+      undefined,
+      { timeout: 5000 },
+    );
+    const shown = (await page.locator('[data-testid="ql-name"]').textContent())?.trim();
+    assert.equal(shown, name, "Quick Look opened a different asset than the row it was clicked on");
+    await page.keyboard.press("Escape");
+    await page.getByRole("button", { name: "Grid view" }).click();
+    await page.waitForSelector(".card", { timeout: 5000 });
+    await page.fill('input[type="text"]', "");
+    await page.waitForTimeout(500);
+  });
+
+  // ── D5: the rail earns its 300px or gets out of the way ──────────────────────────────────────
+  await check("the inspector collapses to an edge tab with nothing selected", async () => {
+    await page.keyboard.press("Escape");
+    await page.waitForSelector('[data-testid="inspector-edge"]', { timeout: 5000 });
+    const wide = await page.locator("aside.inspector").count();
+    assert.equal(wide, 0, "the 300px rail is still open with nothing selected");
+  });
+
+  // Compare is the pane §5 reviews duplicate groups in, so the rule that makes it readable —
+  // agreement stays dim, difference goes gold — is the thing worth pinning.
+  await check("picking two opens compare, and only differing rows are gold", async () => {
+    const boxes = page.locator('[data-testid="card-select"]');
+    await boxes.nth(0).click();
+    await boxes.nth(1).click();
+    await page.waitForSelector('[data-testid="inspector-compare"]', { timeout: 5000 });
+
+    const rows = await page.locator('[data-testid="compare-rows"] .cmp-v').evaluateAll((els) =>
+      els.map((e) => ({ text: e.textContent?.trim() ?? "", gold: e.classList.contains("differs") })),
+    );
+    assert.ok(rows.length >= 4, `expected a stat table, got ${rows.length} cells`);
+    for (let i = 0; i < rows.length; i += 2) {
+      const [a, b] = [rows[i], rows[i + 1]];
+      assert.equal(
+        a.gold,
+        a.text !== b.text,
+        `"${a.text}" vs "${b.text}" is marked ${a.gold ? "different" : "equal"} and is not`,
+      );
+    }
+    // Leave the pick set as it was found — the bulk bar acts on it.
+    await page.click('[data-testid="bulk-clear"]');
+  });
+
   await check("double-click opens Quick Look on the right asset", async () => {
     await page.fill('input[type="text"]', "");
     // Wait for the grid to settle before pinning an element: a `locator` re-resolves on every

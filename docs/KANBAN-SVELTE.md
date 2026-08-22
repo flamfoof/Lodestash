@@ -336,9 +336,9 @@ facet-group owner call).
 - [ ] **D4 — Keep-it ladder.** ★ pin / ⟡ tray / ▣ collection given one stated relationship, plus
       "Save the staging tray as a collection" and empty states that teach the difference.
       UI-SPEC §6, §16.2.
-- [ ] **D5 — Inspector collapse + compare.** 26px edge tab when nothing is selected (closes N5.3);
+- [x] **D5 — Inspector collapse + compare.** 26px edge tab when nothing is selected (closes N5.3);
       460px two-up compare when exactly two are picked, differ-is-gold stat table. UI-SPEC §13.
-- [ ] **D6 — List-row parity.** star / ⤢ / stage / pack link / size badge on rows, actions in a
+- [x] **D6 — List-row parity.** star / ⤢ / stage / pack link / size badge on rows, actions in a
       trailing column (closes audit **F6**). UI-SPEC §2.5.
 - [ ] **D7 — Source availability.** `import_source.state` + `last_seen_at` (**M18**), health check on
       open + after scan, banner / facet ✕ / card plate / Quick Look panel / partial-import refusal /
@@ -362,6 +362,12 @@ facet-group owner call).
 - [ ] **D14 — Empty states.** One anatomy (32px nav glyph · statement title · one teaching line · at
       most one action) across Collections / Duplicates / Trash / Packages / Unity Assets / Identify.
       DG §7 "Feedback".
+- [x] **D16 — Selectable content + Copy name/path.** Reported in use: `user-select: none` on
+      `<body>` made every asset name, path, pack and stat impossible to copy. Content opts back in;
+      cards and rows (both `<button>`) get **Copy name** / **Copy path** in the context menu, where
+      DG §7 had already specified Copy path and nothing built it. Also added: `Escape` clears the
+      selection per UI-SPEC §0.4, which was never implemented and without which D5's collapsed rail
+      is unreachable from the keyboard.
 - [ ] **D15 — Grid keyboard nav (deferred, now a dependency).** Roving `tabindex` so the grid is one
       tab stop, arrow keys inside, Shift+arrow/click ranges. Deliberately out of the design pass, but
       D9 cannot put a ring on a **card** without it. UI-SPEC §0.4; DG §9 records it as an open gap.
