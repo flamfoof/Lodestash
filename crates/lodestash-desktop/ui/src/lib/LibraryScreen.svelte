@@ -359,7 +359,11 @@
         {:else if view.filterCount > 0}
           <p class="msg">No assets match those filters.</p>
         {:else if favoritesOnly}
-          <p class="msg">No favourites yet — star an asset to pin it here.</p>
+          <p class="msg">Nothing starred yet</p>
+          <p class="hint">
+            Star an asset to keep it one click away, in every filter, for good. A star is a pin; the
+            ⟡ tray is a cart for right now; a collection is a set worth naming.
+          </p>
         {:else if trashedOnly}
           <p class="msg">
             The Trash is empty. Nothing here is deleted from disk — trashed assets keep their files.

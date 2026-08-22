@@ -343,9 +343,12 @@ facet-group owner call).
       first, re-ordered as you browse (UI-SPEC §3). Needs the frontend to tell the writer what is
       visible, and the idle pass to consume an ordering rather than picking by dirty-flag order.
       This is the half that makes the backlog follow the user rather than merely run.
-- [ ] **D4 — Keep-it ladder.** ★ pin / ⟡ tray / ▣ collection given one stated relationship, plus
-      "Save the staging tray as a collection" and empty states that teach the difference.
-      UI-SPEC §6, §16.2.
+- [x] **D4 — Keep-it ladder.** The staging tray can promote itself: **▣ Save as collection…**
+      names the set and moves every staged id into it, so a shortlist built by hand is no longer
+      thrown away on import. Empty states teach the relationship — a star is a pin, ⟡ is a cart for
+      right now, ▣ is a set worth naming. `create_collection` answers with a change count rather
+      than the new id, so the id comes from re-listing and matching the name; a collision resolves
+      to the newest row, which is the one that click created.
 - [x] **D5 — Inspector collapse + compare.** 26px edge tab when nothing is selected (closes N5.3);
       460px two-up compare when exactly two are picked, differ-is-gold stat table. UI-SPEC §13.
 - [x] **D6 — List-row parity.** star / ⤢ / stage / pack link / size badge on rows, actions in a

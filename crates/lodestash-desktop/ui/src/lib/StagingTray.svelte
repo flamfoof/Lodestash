@@ -1,4 +1,41 @@
 <script lang="ts">
+  import { collections, createCollection, collectionAddAsset } from "./api";
+  import { push } from "./toasts.svelte";
+  import { view } from "./nav.svelte";
+
+  /**
+   * Promote the tray to a Collection (D4, UI-SPEC §6).
+   *
+   * ★ pins one asset, ⟡ is a cart for right now, ▣ is a set worth naming — each rung can promote to
+   * the next. `create_collection` answers with a change count rather than the new row's id, so the
+   * id comes from re-listing and matching the name we just wrote; a collision resolves to the newest
+   * row, which is the one this click created.
+   */
+  let naming = $state(false);
+  let collName = $state("");
+  let saving = $state(false);
+
+  async function saveAsCollection() {
+    const name = collName.trim();
+    if (!name || saving || ids.length === 0) return;
+    saving = true;
+    try {
+      await createCollection(name);
+      const rows = await collections();
+      const made = rows.filter((c) => c.name === name).sort((a, b) => b.id - a.id)[0];
+      if (!made) throw new Error("the collection did not come back from the catalog");
+      for (const id of ids) await collectionAddAsset(made.id, id);
+      push(`Saved ${ids.length} to “${name}”`);
+      naming = false;
+      collName = "";
+      view.dataVersion += 1;
+    } catch (e) {
+      push(String(e), "err");
+    } finally {
+      saving = false;
+    }
+  }
+
   import Icon from "./Icon.svelte";
   import { emptyFilter, gridPage } from "./api";
 
@@ -108,6 +145,33 @@
     <button class="go" data-testid="tray-import" onclick={() => onimport(ids)} disabled={ids.length === 0}>
       ⇢ Add all {ids.length} to project
     </button>
+    <!-- D4: the tray is a cart, a collection is a named set worth keeping. Without this line the
+         shortlist someone just built by hand is thrown away on import. One rung up the ladder. -->
+    {#if naming}
+      <span class="save-as">
+        <input
+          class="save-name"
+          placeholder="Collection name"
+          bind:value={collName}
+          onkeydown={(e) => e.key === "Enter" && saveAsCollection()}
+          data-testid="tray-collection-name"
+        />
+        <button
+          class="clear"
+          disabled={saving || !collName.trim()}
+          onclick={saveAsCollection}
+          data-testid="tray-collection-save"
+        >Save</button>
+        <button class="clear" onclick={() => (naming = false)}>Cancel</button>
+      </span>
+    {:else}
+      <button
+        class="clear"
+        disabled={ids.length === 0}
+        onclick={() => (naming = true)}
+        data-testid="tray-save-collection"
+      >▣ Save as collection…</button>
+    {/if}
     <button class="clear" data-testid="staged-clear" onclick={onclear}>Clear all</button>
     <span class="spacer"></span>
     <button
@@ -122,6 +186,23 @@
 {/if}
 
 <style>
+  .save-as {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-1);
+  }
+  .save-name {
+    width: 130px;
+    height: 24px;
+    padding: 0 var(--sp-2);
+    font: inherit;
+    font-size: var(--fs-xs);
+    color: var(--ls-text);
+    background: var(--ls-bg);
+    border: 1px solid var(--ls-border-strong);
+    border-radius: var(--r-sm);
+  }
+
   /* A bottom tray (DESIGN-GUIDELINES §7 staging tray): gold hairline on top so it reads as an
      action surface, not another status strip. Gold accent because it is a collect-then-import
      dock, not an AI surface. */

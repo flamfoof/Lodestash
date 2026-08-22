@@ -90,7 +90,7 @@
         testid="empty"
         icon="ls-nav-collections"
         title="No collections yet"
-        line="Collections are named sets you come back to — a level's dressing, a character kit. Not folders on disk."
+        line="Collections are named sets you come back to — a level's dressing, a character kit. Stage some assets and save the tray as one."
       />
     {:else}
       <div class="grid" data-testid="collections">
