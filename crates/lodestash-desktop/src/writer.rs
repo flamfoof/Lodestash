@@ -18,7 +18,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
 
@@ -35,7 +35,7 @@ use lodestash_app::drains::{
 use lodestash_app::jobs::JobProgress as AppJobProgress;
 use lodestash_app::paths::default_cache_dirs;
 use lodestash_app::types::PersistBatch;
-use lodestash_core::catalog::{Catalog, PackageEntryRecord};
+use lodestash_core::catalog::{AppraiseFocus, Catalog, PackageEntryRecord};
 use lodestash_core::types::{Exclude, ExcludeKind};
 use lodestash_ingest::unitypackage::{
     extract_at_offsets_with_progress, read_manifest_with_progress, EntryLocator, ExtractedAsset,
@@ -538,6 +538,10 @@ impl Writer {
         jobs: JobRegistry,
         app: Option<tauri::AppHandle>,
         appraise: Arc<AppJobProgress>,
+        // `focus` is where the user is looking (UI-SPEC §3). Shared with the app rather than sent
+        // as an op: it changes on every scroll, and a browse must never queue behind a running
+        // appraise pass.
+        focus: Arc<Mutex<AppraiseFocus>>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<WriterMsg>();
         let writer_tx = tx.clone();
@@ -616,6 +620,7 @@ impl Writer {
                                         &jobs,
                                         &app,
                                         &appraise,
+                                        &focus,
                                     );
                                     let _ = job.reply.send(result);
                                 } else {
@@ -649,6 +654,7 @@ impl Writer {
                                 &jobs,
                                 &app,
                                 &appraise,
+                                &focus,
                             );
                             if appraising {
                                 pump.store(false, Ordering::Relaxed);
@@ -690,6 +696,7 @@ impl Writer {
                                 &jobs,
                                 &app,
                                 &appraise,
+                                &focus,
                             );
                         }
                         Ok(WriterMsg::ManifestDone {
@@ -761,6 +768,7 @@ impl Writer {
                                     &jobs,
                                     &app,
                                     &appraise,
+                                    &focus,
                                 );
                             }
                         }
@@ -793,6 +801,7 @@ impl Writer {
                                     idle_audio.clone(),
                                     std::time::Duration::from_secs(1),
                                     &appraise,
+                                    &focus,
                                 );
                                 pump.store(false, Ordering::Relaxed);
                                 if r.map(|w| w.changed > 0).unwrap_or(false) {
@@ -908,7 +917,16 @@ fn appraise_pass(
     audio_embedder: Option<std::sync::Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
     budget: std::time::Duration,
     progress: &AppJobProgress,
+    focus: &Mutex<AppraiseFocus>,
 ) -> Result<WriteResult, String> {
+    // UI-SPEC §3: what the user is looking at goes first. Refreshed here rather than at each call
+    // site because every pass — the idle slice, ✦ Identify all, a per-card kick — must read the
+    // *current* focus: the one thing that makes the backlog follow the user is that it is re-read
+    // after they have moved. A poisoned lock is not worth failing an appraisal over; the queue then
+    // keeps whatever order it had, which is the pre-D3b behaviour and still correct.
+    if let Ok(f) = focus.lock() {
+        catalog.set_appraise_focus(f.clone());
+    }
     progress.done.store(0, Ordering::Relaxed);
     progress.total.store(0, Ordering::Relaxed);
     progress.failed.store(0, Ordering::Relaxed);
@@ -1024,9 +1042,10 @@ fn start_next_extract(
     jobs: &JobRegistry,
     app: &Option<tauri::AppHandle>,
     progress: &AppJobProgress,
+    focus: &Mutex<AppraiseFocus>,
 ) {
     let failures = drain_to_first_spawn(queue, jobs, |op| {
-        run(catalog, db_path, op, tx, jobs, app, progress).map(|_| ())
+        run(catalog, db_path, op, tx, jobs, app, progress, focus).map(|_| ())
     });
     if failures > 0 {
         emit_changed(app, "jobs");
@@ -1071,6 +1090,7 @@ fn run(
     jobs: &JobRegistry,
     app: &Option<tauri::AppHandle>,
     progress: &AppJobProgress,
+    focus: &Mutex<AppraiseFocus>,
 ) -> Result<WriteResult, String> {
     match op {
         Op::SetFavorite { ids, on } => catalog
@@ -1407,6 +1427,7 @@ fn run(
                 audio_embedder,
                 std::time::Duration::from_secs(20),
                 progress,
+                focus,
             );
             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
             jobs.finish(job.id, result.is_ok(), false, changed);
@@ -1433,6 +1454,7 @@ fn run(
                 audio_embedder,
                 std::time::Duration::from_secs(20),
                 progress,
+                focus,
             );
             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
             jobs.finish(job.id, result.is_ok(), false, changed);
@@ -1464,6 +1486,7 @@ fn run(
                 audio_embedder,
                 std::time::Duration::from_secs(20),
                 progress,
+                focus,
             );
             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
             jobs.finish(job.id, result.is_ok(), false, changed);

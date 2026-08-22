@@ -732,6 +732,14 @@ export let thumbKey = "1";
 export const previewCacheUsage = () => invoke<[number, number]>("preview_cache_usage");
 export const clearPreviewCache = () => invoke<number>("clear_preview_cache");
 
+/**
+ * Tell the appraisal queues where the user is looking (UI-SPEC §3): this page first, then the rest
+ * of this filter, then everything else newest-first.
+ *
+ * A hint, not a write — it never queues behind a running appraise pass, and nothing is persisted.
+ */
+export const setAppraiseFocus = (query: GridQuery) => invoke<void>("set_appraise_focus", { query });
+
 /** Re-derive source availability from disk (UI-SPEC §11.1). One stat per root, on the writer. */
 export const refreshSourceHealth = () => invoke<WriteResult>("refresh_source_health");
 

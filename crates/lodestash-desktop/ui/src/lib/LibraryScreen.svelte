@@ -8,6 +8,7 @@
   import FoldersView from "./FoldersView.svelte";
   import {
     gridPage,
+    setAppraiseFocus,
     DENSITIES,
     bulkTag,
     recentOps,
@@ -246,6 +247,8 @@
       // the result while the pager sits on page 9 shows an empty grid.
       ` ${JSON.stringify(view.filter)} ${view.packageFilter} ${view.collectionFilter?.id ?? ""} ${view.source}`,
   );
+  /** How long the appraisal queue waits before chasing a new query (UI-SPEC §3). */
+  const FOCUS_DEBOUNCE_MS = 400;
   let lastKey = "";
   $effect(() => {
     if (queryKey !== lastKey) {
@@ -258,7 +261,7 @@
     // Folders runs its own query; asking for a page of 100 cards nobody is looking at is a
     // whole-library sort per keystroke for nothing.
     if (view.browse === "folders") return;
-    gridPage({
+    const q = {
       tab: view.tab,
       search: view.search,
       search_mode: view.searchMode,
@@ -279,12 +282,25 @@
       source: view.source,
       page,
       page_size: pageSize,
-    })
+    };
+    gridPage(q)
       .then((r) => {
         result = r;
         error = null;
       })
       .catch((e) => (error = String(e)));
+
+    /**
+     * D3b (UI-SPEC §3): the same query tells the appraisal queues where to start — this page,
+     * then the rest of this filter, then everything else newest-first.
+     *
+     * Debounced, and on purpose the *only* debounced thing here: the grid must answer every
+     * keystroke, but the backlog does not need to chase a half-typed word. A failure is swallowed
+     * — the queue keeps whatever order it had, which is the behaviour that existed before this and
+     * is still correct.
+     */
+    const t = setTimeout(() => void setAppraiseFocus(q).catch(() => {}), FOCUS_DEBOUNCE_MS);
+    return () => clearTimeout(t);
   });
 
   let cardPx = $derived(DENSITIES.find((d) => d.id === view.density)?.px ?? 148);

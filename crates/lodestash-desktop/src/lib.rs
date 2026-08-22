@@ -45,6 +45,10 @@ struct AppState {
     /// Shared appraise-pass progress (B11d): the tag/embed drains write done/total into this
     /// while a pass runs; `pump_progress` reads it for the Identify screen's bar.
     appraise: std::sync::Arc<lodestash_app::jobs::JobProgress>,
+    /// Appraisal queue order (UI-SPEC §3) — what the user is looking at, shared straight with the
+    /// writer thread. Deliberately **not** an `Op`: browsing must never queue behind a running
+    /// appraise pass, and this is a hint, not a write.
+    focus: std::sync::Arc<Mutex<lodestash_core::catalog::AppraiseFocus>>,
     /// The agent plane (B12): the embedded REST/MCP `ServerState`, kept alive for the process.
     /// `None` when there is no catalog on disk yet — the servers then don't exist and the
     /// Connect screen says so instead of pretending.
@@ -268,6 +272,29 @@ fn relink_source(
         source_id,
         new_root: path,
     })
+}
+
+/// Tell the appraisal queues where the user is looking (UI-SPEC §3).
+///
+/// Called on every browse, so it must be cheap and must never block: it resolves the query against
+/// rows already in memory and swaps one in-memory list — no catalog round-trip, no writer op, no
+/// row written. Going through `write()` instead would make scrolling queue behind whatever appraise
+/// pass is running, which is exactly the wait this feature exists to remove.
+///
+/// The next pass reads it. A pass already running keeps the order it started with rather than being
+/// re-sorted mid-flight; it is bounded to seconds, so the new order lands almost immediately.
+#[tauri::command]
+fn set_appraise_focus(state: tauri::State<'_, AppState>, query: GridQuery) -> Result<(), String> {
+    let order = state
+        .library
+        .lock()
+        .map_err(|_| "library lock poisoned".to_string())?
+        .focus_order(&query);
+    *state
+        .focus
+        .lock()
+        .map_err(|_| "focus lock poisoned".to_string())? = order;
+    Ok(())
 }
 
 /// Star / unstar assets (DATA-MODEL §12). A pin, not a rating — "find this again".
@@ -1722,6 +1749,7 @@ pub fn run() {
     // AppHandle to push change events (pump events, B2b) to the Svelte shell.
     let pump = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let appraise = std::sync::Arc::new(lodestash_app::jobs::JobProgress::default());
+    let focus = std::sync::Arc::new(Mutex::new(lodestash_core::catalog::AppraiseFocus::default()));
     let job_registry = crate::writer::JobRegistry::default();
 
     tauri::Builder::default()
@@ -1766,6 +1794,7 @@ pub fn run() {
                         job_registry.clone(),
                         Some(app.handle().clone()),
                         appraise.clone(),
+                        focus.clone(),
                     )
                 });
 
@@ -1808,6 +1837,7 @@ pub fn run() {
                 writer,
                 pump,
                 appraise,
+                focus,
                 jobs: job_registry,
                 engine: engine_state,
                 engine_port,
@@ -1838,6 +1868,7 @@ pub fn run() {
             refresh_source_health,
             relink_preview,
             relink_source,
+            set_appraise_focus,
             set_trashed,
             remove_from_library,
             delete_from_disk,

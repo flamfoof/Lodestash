@@ -232,9 +232,67 @@ pub struct AssetIdentity {
     pub content_hash: Option<String>,
 }
 
+/// Which assets the appraisal queues should reach **first** (UI-SPEC §3).
+///
+/// Three tiers, in the order the spec names them: what is on screen right now, the rest of the
+/// current filter, then everything else newest-first. Held in memory rather than written to a
+/// column — it changes on every scroll, and a browse that dirties thousands of rows to record
+/// where the eye is would be a write storm for a hint.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AppraiseFocus {
+    /// The page the user is looking at, in the order it is drawn.
+    pub visible: Vec<i64>,
+    /// The rest of the current filter, in the grid's own sort order. Capped by the caller.
+    pub filtered: Vec<i64>,
+}
+
+impl AppraiseFocus {
+    /// The `ORDER BY` the appraisal queues share, over an `asset` aliased `a` (or bare, when the
+    /// query has no alias — pass `"id"`).
+    ///
+    /// Every queue orders by this one expression, which is the only reason "browsing re-orders the
+    /// queue" is one change rather than eight: tags, embeddings, metrics, previews and dependency
+    /// scans all have to move together, or an on-screen asset gets tagged and then waits behind
+    /// 3,000 others for the embedding that would let it be promoted.
+    ///
+    /// The ids are `i64` read out of this same database and formatted by Rust, so they are inlined
+    /// rather than bound — a bound list would need placeholders generated per call and threaded
+    /// through eight different parameter tuples for no gain.
+    ///
+    /// With no focus it is `ORDER BY <col> DESC`: newest first, the spec's third tier, which is
+    /// also what a user with no filter is most likely to want.
+    fn order_by(&self, col: &str) -> String {
+        let bucket = |ids: &[i64]| {
+            ids.iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        match (self.visible.is_empty(), self.filtered.is_empty()) {
+            (true, true) => format!("ORDER BY {col} DESC"),
+            (false, true) => format!(
+                "ORDER BY CASE WHEN {col} IN ({}) THEN 0 ELSE 1 END, {col} DESC",
+                bucket(&self.visible)
+            ),
+            (true, false) => format!(
+                "ORDER BY CASE WHEN {col} IN ({}) THEN 0 ELSE 1 END, {col} DESC",
+                bucket(&self.filtered)
+            ),
+            (false, false) => format!(
+                "ORDER BY CASE WHEN {col} IN ({}) THEN 0 WHEN {col} IN ({}) THEN 1 ELSE 2 END, {col} DESC",
+                bucket(&self.visible),
+                bucket(&self.filtered)
+            ),
+        }
+    }
+}
+
 /// The fully-opened, migration-applied catalog database.
 pub struct Catalog {
     pub(crate) conn: Connection,
+    /// Appraisal queue order (UI-SPEC §3). Not persisted: it is where the user is looking, and
+    /// that is only true for as long as they are looking there.
+    appraise_focus: AppraiseFocus,
 }
 
 impl Catalog {
@@ -244,7 +302,10 @@ impl Catalog {
             Connection::open(path).map_err(|e| CoreError::Catalog(format!("open failed: {e}")))?;
 
         configure_connection(&conn)?;
-        let mut catalog = Self { conn };
+        let mut catalog = Self {
+            conn,
+            appraise_focus: AppraiseFocus::default(),
+        };
         catalog.apply_migrations()?;
         Ok(catalog)
     }
@@ -254,7 +315,10 @@ impl Catalog {
         let conn = Connection::open_in_memory()
             .map_err(|e| CoreError::Catalog(format!("in-memory open failed: {e}")))?;
         configure_connection(&conn)?;
-        let mut catalog = Self { conn };
+        let mut catalog = Self {
+            conn,
+            appraise_focus: AppraiseFocus::default(),
+        };
         catalog.apply_migrations()?;
         Ok(catalog)
     }
@@ -2298,12 +2362,13 @@ impl Catalog {
     pub fn assets_needing_embedding(&self, limit: usize) -> Result<Vec<EmbedJob>> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT id, name, description, media_type_id, source_id
                  FROM asset
                  WHERE embedding_dirty = 1 AND deleted_at IS NULL
-                 ORDER BY id LIMIT ?1",
-            )
+                 {order} LIMIT ?1",
+                order = self.appraise_focus.order_by("id")
+            ))
             .map_err(|e| CoreError::Catalog(format!("embed queue prep: {e}")))?;
         let rows = stmt
             .query_map(params![limit as i64], |r| {
@@ -2333,7 +2398,7 @@ impl Catalog {
     pub fn visual_assets_needing_embedding(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT a.id,
                         CASE WHEN af.workspace_rel IS NULL AND af.package_entry_id IS NULL
                              THEN s.root_path || '/' || af.rel_path END,
@@ -2348,8 +2413,9 @@ impl Catalog {
                  WHERE a.embedding_dirty = 1 AND a.deleted_at IS NULL
                    AND af.missing = 0
                    AND mt.code IN ('image', 'texture', 'sprite', 'model_3d', 'material')
-                 ORDER BY a.id LIMIT ?1",
-            )
+                 {order} LIMIT ?1",
+                order = self.appraise_focus.order_by("a.id")
+            ))
             .map_err(|e| CoreError::Catalog(format!("visual embed queue prep: {e}")))?;
         let rows = stmt
             .query_map(params![limit as i64], |r| {
@@ -2380,7 +2446,7 @@ impl Catalog {
     pub fn audio_assets_needing_tags(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT a.id,
                         CASE WHEN af.workspace_rel IS NULL AND af.package_entry_id IS NULL
                              THEN s.root_path || '/' || af.rel_path END,
@@ -2395,8 +2461,9 @@ impl Catalog {
                  WHERE a.tags_dirty = 1 AND a.deleted_at IS NULL
                    AND af.missing = 0
                    AND mt.code = 'audio'
-                 ORDER BY a.id LIMIT ?1",
-            )
+                 {order} LIMIT ?1",
+                order = self.appraise_focus.order_by("a.id")
+            ))
             .map_err(|e| CoreError::Catalog(format!("audio tag queue prep: {e}")))?;
         let rows = stmt
             .query_map(params![limit as i64], |r| {
@@ -2421,7 +2488,7 @@ impl Catalog {
     pub fn audio_assets_needing_embedding(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT a.id,
                         CASE WHEN af.workspace_rel IS NULL AND af.package_entry_id IS NULL
                              THEN s.root_path || '/' || af.rel_path END,
@@ -2436,8 +2503,9 @@ impl Catalog {
                  WHERE a.embedding_dirty = 1 AND a.deleted_at IS NULL
                    AND af.missing = 0
                    AND mt.code = 'audio'
-                 ORDER BY a.id LIMIT ?1",
-            )
+                 {order} LIMIT ?1",
+                order = self.appraise_focus.order_by("a.id")
+            ))
             .map_err(|e| CoreError::Catalog(format!("audio embed queue prep: {e}")))?;
         let rows = stmt
             .query_map(params![limit as i64], |r| {
@@ -2465,7 +2533,7 @@ impl Catalog {
     pub fn assets_needing_metrics(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT a.id,
                         CASE WHEN af.workspace_rel IS NULL AND af.package_entry_id IS NULL
                              THEN s.root_path || '/' || af.rel_path END,
@@ -2479,8 +2547,9 @@ impl Catalog {
                  LEFT JOIN package pk       ON pk.id = pe.package_id
                  WHERE a.metrics_dirty = 1 AND a.deleted_at IS NULL
                    AND af.missing = 0
-                 ORDER BY a.id LIMIT ?1",
-            )
+                 {order} LIMIT ?1",
+                order = self.appraise_focus.order_by("a.id")
+            ))
             .map_err(|e| CoreError::Catalog(format!("metrics queue prep: {e}")))?;
         let rows = stmt
             .query_map(params![limit as i64], |r| {
@@ -2508,7 +2577,7 @@ impl Catalog {
     pub fn assets_needing_dep_scan(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT a.id,
                         CASE WHEN af.workspace_rel IS NULL AND af.package_entry_id IS NULL
                              THEN s.root_path || '/' || af.rel_path END,
@@ -2522,8 +2591,9 @@ impl Catalog {
                  LEFT JOIN package pk       ON pk.id = pe.package_id
                  WHERE a.deps_dirty = 1 AND a.deleted_at IS NULL
                    AND af.missing = 0
-                 ORDER BY a.id LIMIT ?1",
-            )
+                 {order} LIMIT ?1",
+                order = self.appraise_focus.order_by("a.id")
+            ))
             .map_err(|e| CoreError::Catalog(format!("dep queue prep: {e}")))?;
         let rows = stmt
             .query_map(params![limit as i64], |r| {
@@ -3032,6 +3102,19 @@ impl Catalog {
             )));
         }
         Ok(())
+    }
+
+    /// Point the appraisal queues at what the user is looking at (UI-SPEC §3).
+    ///
+    /// Costs nothing until the next queue query: it replaces an in-memory list, writes no rows and
+    /// touches no file, which is what makes it safe to call on every browse. The queues themselves
+    /// are unchanged in every other respect — the same rows, the same budget, the same durability
+    /// — only the order they are handed back in moves.
+    ///
+    /// Callers cap the lists. An unbounded focus would inline every id in the library into eight
+    /// `ORDER BY` clauses, which turns a hint into the most expensive part of the query.
+    pub fn set_appraise_focus(&mut self, focus: AppraiseFocus) {
+        self.appraise_focus = focus;
     }
 
     /// Re-derive every source's availability from the disk (UI-SPEC §11.1, M18).
@@ -4131,7 +4214,7 @@ impl Catalog {
     pub fn assets_needing_tags(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT a.id,
                         CASE WHEN af.workspace_rel IS NULL AND af.package_entry_id IS NULL
                              THEN s.root_path || '/' || af.rel_path END,
@@ -4145,8 +4228,9 @@ impl Catalog {
                  LEFT JOIN package pk       ON pk.id = pe.package_id
                  WHERE a.tags_dirty = 1 AND a.deleted_at IS NULL
                    AND af.missing = 0
-                 ORDER BY a.id LIMIT ?1",
-            )
+                 {order} LIMIT ?1",
+                order = self.appraise_focus.order_by("a.id")
+            ))
             .map_err(|e| CoreError::Catalog(format!("tag queue prep: {e}")))?;
         let rows = stmt
             .query_map(params![limit as i64], |r| {
@@ -4487,18 +4571,23 @@ impl Catalog {
     /// existed: those assets were already metriced, so they were never revisited and never got a
     /// preview. This queue asks the question previews actually depend on — "is there a row in
     /// `asset_preview`?" — so a backlog drains once and stays drained.
-    /// `after_id` is an exclusive cursor. A model whose preview generation *fails* writes no
-    /// `asset_preview` row, so it stays in this queue; without a cursor a drain would re-attempt
-    /// the same broken batch on every pass and never reach the models behind it. The caller
-    /// advances the cursor past everything it attempted, successful or not.
+    /// `attempted` is what this pass has already tried. A model whose preview generation *fails*
+    /// writes no `asset_preview` row, so it stays in this queue; without the exclusion a drain
+    /// would re-attempt the same broken batch on every iteration and never reach the models
+    /// behind it. The caller adds every id it looks at, successful or not.
+    ///
+    /// It is a **set**, not the `a.id > cursor` this used to be: an id cursor only skips a failure
+    /// while the queue is ordered by ascending id, and since D3b (UI-SPEC §3) the order is whatever
+    /// the user is looking at. A cursor under a reordered queue silently returns nothing, which
+    /// looks exactly like "the backlog is drained".
     pub fn assets_needing_preview(
         &self,
-        after_id: i64,
+        attempted: &[i64],
         limit: usize,
     ) -> Result<Vec<VisualEmbedJob>> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT a.id,
                         CASE WHEN af.workspace_rel IS NULL AND af.package_entry_id IS NULL
                              THEN s.root_path || '/' || af.rel_path END,
@@ -4513,14 +4602,27 @@ impl Catalog {
                  LEFT JOIN asset_preview ap ON ap.asset_id = a.id
                  WHERE mt.code = 'model_3d'
                    AND ap.asset_id IS NULL
-                   AND a.id > ?1
+                   {skip}
                    AND a.deleted_at IS NULL
                    AND af.missing = 0
-                 ORDER BY a.id LIMIT ?2",
-            )
+                 {order} LIMIT ?1",
+                skip = if attempted.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "AND a.id NOT IN ({})",
+                        attempted
+                            .iter()
+                            .map(|i| i.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                },
+                order = self.appraise_focus.order_by("a.id")
+            ))
             .map_err(|e| CoreError::Catalog(format!("preview queue prep: {e}")))?;
         let rows = stmt
-            .query_map(params![after_id, limit as i64], |r| {
+            .query_map(params![limit as i64], |r| {
                 Ok(VisualEmbedJob {
                     asset_id: r.get(0)?,
                     disk_path: r.get(1)?,
@@ -5030,7 +5132,7 @@ mod tests {
             .expect("clean");
 
         let ids: Vec<i64> = catalog
-            .assets_needing_preview(0, 10)
+            .assets_needing_preview(&[], 10)
             .expect("queue")
             .iter()
             .map(|j| j.asset_id)
@@ -5044,7 +5146,7 @@ mod tests {
         // A model whose render fails writes no row, so it stays queued. The cursor is what stops
         // it from wedging the queue ahead of everything behind it.
         let after_first = catalog
-            .assets_needing_preview(ids[0], 10)
+            .assets_needing_preview(&ids[..1], 10)
             .expect("queue")
             .iter()
             .map(|j| j.asset_id)
@@ -5059,7 +5161,7 @@ mod tests {
             .set_vector_preview(ids[0], "<svg/>", 4, "k")
             .expect("store");
         let left: Vec<i64> = catalog
-            .assets_needing_preview(0, 10)
+            .assets_needing_preview(&[], 10)
             .expect("queue")
             .iter()
             .map(|j| j.asset_id)
@@ -5126,7 +5228,10 @@ mod tests {
     fn catalog_at_v4() -> Catalog {
         let conn = Connection::open_in_memory().expect("open");
         configure_connection(&conn).expect("pragmas");
-        let mut c = Catalog { conn };
+        let mut c = Catalog {
+            conn,
+            appraise_focus: AppraiseFocus::default(),
+        };
         c.apply_migrations_up_to(4).expect("migrations to v4");
         c
     }
@@ -5364,6 +5469,115 @@ mod tests {
         std::fs::create_dir_all(&root).expect("mkdir");
         assert_eq!(c.refresh_source_health().unwrap(), vec![1]);
         assert_eq!(c.source_infos().unwrap().remove(0).state, "available");
+    }
+
+    /// Appraisal queue order (UI-SPEC §3): on screen → rest of the current filter → everything
+    /// else, newest first.
+    ///
+    /// Mutation-checked on the four things that would make the queue lie about following the user:
+    /// the three tiers must come back in that order (a queue that merely *contains* the visible
+    /// asset has not prioritised it); the fallback must be **newest first**, not the `ORDER BY id`
+    /// this replaced; setting a focus must not change which rows are eligible, only their order (a
+    /// focus that filtered would strand the rest of the backlog forever); and every queue must move
+    /// together, because an asset that gets tagged and then waits behind 3,000 others for its
+    /// embedding is never promoted and never flips on screen.
+    #[test]
+    fn appraise_focus_orders_every_queue_without_narrowing_it() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        c.conn
+            .execute_batch(
+                "INSERT INTO import_source (id, uuid, name, root_path, kind)
+                     VALUES (1, 's1', 'Src', 'C:/lib', 'folder');
+                 INSERT INTO media_type (id, code, label) VALUES (1, 'image', 'Image');
+                 INSERT INTO asset (id, uuid, source_id, media_type_id, name, created_at, updated_at,
+                                    tags_dirty, embedding_dirty, metrics_dirty, deps_dirty)
+                     VALUES (1, 'a1', 1, 1, 'one',   0, 0, 1, 1, 1, 1),
+                            (2, 'a2', 1, 1, 'two',   0, 0, 1, 1, 1, 1),
+                            (3, 'a3', 1, 1, 'three', 0, 0, 1, 1, 1, 1),
+                            (4, 'a4', 1, 1, 'four',  0, 0, 1, 1, 1, 1);
+                 INSERT INTO asset_file (id, asset_id, rel_path, ext, missing)
+                     VALUES (1, 1, 'one.png', 'png', 0),
+                            (2, 2, 'two.png', 'png', 0),
+                            (3, 3, 'three.png', 'png', 0),
+                            (4, 4, 'four.png', 'png', 0);
+                 UPDATE asset SET primary_file_id = id;",
+            )
+            .expect("fixture");
+
+        let tags = |c: &Catalog| {
+            c.assets_needing_tags(10)
+                .expect("tags")
+                .into_iter()
+                .map(|j| j.asset_id)
+                .collect::<Vec<_>>()
+        };
+        let embeds = |c: &Catalog| {
+            c.assets_needing_embedding(10)
+                .expect("embed")
+                .into_iter()
+                .map(|j| j.asset_id)
+                .collect::<Vec<_>>()
+        };
+        let metrics = |c: &Catalog| {
+            c.assets_needing_metrics(10)
+                .expect("metrics")
+                .into_iter()
+                .map(|j| j.asset_id)
+                .collect::<Vec<_>>()
+        };
+
+        // No focus: newest first. This is the spec's third tier, and it is a deliberate reversal of
+        // the `ORDER BY a.id` that came before — a fresh scan should not start at the oldest asset
+        // in the library.
+        assert_eq!(
+            tags(&c),
+            vec![4, 3, 2, 1],
+            "the unfocused queue is not newest-first"
+        );
+        assert_eq!(embeds(&c), vec![4, 3, 2, 1]);
+        assert_eq!(metrics(&c), vec![4, 3, 2, 1]);
+
+        // Focus: asset 1 is on screen, 2 is elsewhere in the same filter, 3 and 4 are neither.
+        c.set_appraise_focus(AppraiseFocus {
+            visible: vec![1],
+            filtered: vec![2],
+        });
+        for (name, got) in [
+            ("tags", tags(&c)),
+            ("embeddings", embeds(&c)),
+            ("metrics", metrics(&c)),
+        ] {
+            assert_eq!(
+                got,
+                vec![1, 2, 4, 3],
+                "the {name} queue did not follow the user — on screen, then the filter, then newest"
+            );
+        }
+
+        // Order, not eligibility: every dirty row is still in the queue. A focus that narrowed
+        // would leave the rest of the backlog unreachable for as long as the user stayed put.
+        assert_eq!(tags(&c).len(), 4, "focusing dropped rows out of the queue");
+
+        // The visible tier keeps its own order, so the first card on screen is appraised first
+        // rather than whichever of the visible ones happens to have the highest id.
+        c.set_appraise_focus(AppraiseFocus {
+            visible: vec![2, 4],
+            filtered: Vec::new(),
+        });
+        let got = tags(&c);
+        assert_eq!(
+            &got[..2],
+            &[4, 2],
+            "within one tier the queue must still be newest-first, not id-ascending"
+        );
+
+        // Clearing it goes back to newest-first rather than keeping a stale focus alive.
+        c.set_appraise_focus(AppraiseFocus::default());
+        assert_eq!(
+            tags(&c),
+            vec![4, 3, 2, 1],
+            "a cleared focus still ordered the queue"
+        );
     }
 
     /// Relink (UI-SPEC §11.1) — the count shown before committing, and the rewrite itself.

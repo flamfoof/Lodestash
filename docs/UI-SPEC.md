@@ -313,6 +313,15 @@ dashboard you can walk away from:
   now, (2) the rest of the current filter, (3) everything else, newest first. **Browsing re-orders
   the queue** — the assets you are about to want are appraised first, so the backlog stops being
   all-or-nothing.
+  Implemented as an ordering the **whole** appraisal shares, not one queue's: tags, embeddings
+  (text, visual, audio), metrics, previews and dependency scans all order by the same expression,
+  because an asset that gets tagged and then waits behind 3,000 others for its embedding is never
+  promoted and never flips on screen. The focus is a hint held in memory, never a column — it
+  changes on every scroll, and a browse that dirtied rows to record where the eye is would be a
+  write storm for something that stops being true the moment the user moves. It reaches the writer
+  through shared state rather than an op, so browsing never queues behind a running pass, and the
+  second tier is capped (500 ids) because the list is inlined into every queue query.
+  Absent a focus the order is **newest first**, which is the third tier standing alone.
 - **Where the backlog is**: one row per Library Source (name + a slate bar + remaining count) with
   its own **✦ Appraise** — a source or a pack is the unit people think in, not "all 3,912".
 - Any single asset jumps the queue with the per-card **✦** (§2.5); it returns Identified in place

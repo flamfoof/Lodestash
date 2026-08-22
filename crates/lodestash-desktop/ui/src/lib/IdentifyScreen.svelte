@@ -280,6 +280,18 @@
     </div>
   {/if}
 
+  <!-- UI-SPEC §3: the queue order is **shown**, because it is no longer obvious. A backlog that
+       silently reorders itself as you browse is indistinguishable from one picking at random. -->
+  <ol class="queue-order" data-testid="queue-order">
+    <li><strong>What is on screen</strong> in the Library right now</li>
+    <li>The rest of the <strong>current filter</strong>, in the order the grid sorts it</li>
+    <li>Everything else, <strong>newest first</strong></li>
+  </ol>
+  <p class="queue-note">
+    Browsing re-orders the queue — the assets you are about to want are appraised first, so the
+    backlog stops being all-or-nothing. Any single asset jumps it with the card's ✦.
+  </p>
+
   {#if backlog.length > 0}
     <div class="backlog" data-testid="backlog-by-source">
       <span class="kicker">Where the backlog is</span>
@@ -491,6 +503,46 @@
   .pause:disabled {
     opacity: 0.5;
     cursor: wait;
+  }
+
+  .queue-order {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--sp-2);
+    margin: var(--sp-3) 0 0;
+    padding: 0;
+    list-style: none;
+    counter-reset: q;
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+  }
+  .queue-order li {
+    counter-increment: q;
+    padding: 4px var(--sp-2) 4px 6px;
+    background: var(--ls-surface);
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-sm);
+  }
+  .queue-order li::before {
+    content: counter(q);
+    display: inline-grid;
+    place-items: center;
+    width: 15px;
+    height: 15px;
+    margin-right: 6px;
+    font-size: 10px;
+    color: var(--ls-bg);
+    background: var(--ls-arcane);
+    border-radius: 50%;
+  }
+  .queue-order strong {
+    color: var(--ls-text);
+    font-weight: 500;
+  }
+  .queue-note {
+    margin: var(--sp-2) 0 0;
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
   }
 
   .backlog {

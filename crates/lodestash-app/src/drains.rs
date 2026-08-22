@@ -815,7 +815,10 @@ pub fn drain_previews(
     };
     let started = std::time::Instant::now();
     let mut total = 0usize;
-    let mut cursor = 0i64;
+    // Every id this pass has looked at, so a model that fails to render cannot be handed back
+    // forever. A set rather than a high-water id: since D3b the queue is ordered by where the user
+    // is looking, and "greater than the last id" no longer means "not yet tried" (UI-SPEC §3).
+    let mut attempted: Vec<i64> = Vec::new();
     loop {
         // Time-boxed rather than run-to-completion: four CPU renders per model over a few
         // thousand models is minutes of work, and it must not hold the persist thread away from
@@ -823,7 +826,7 @@ pub fn drain_previews(
         if started.elapsed() >= budget {
             break;
         }
-        let jobs = match cat.assets_needing_preview(cursor, BATCH) {
+        let jobs = match cat.assets_needing_preview(&attempted, BATCH) {
             Ok(j) => j,
             Err(e) => {
                 tracing::warn!(%e, "preview queue query failed; retries next pass");
@@ -835,9 +838,9 @@ pub fn drain_previews(
         }
         let n = jobs.len();
         for job in jobs {
-            // Advance past every id we look at, successful or not, so a model that fails to
-            // render cannot wedge the queue ahead of the ones behind it.
-            cursor = cursor.max(job.asset_id);
+            // Record every id we look at, successful or not, so a model that fails to render
+            // cannot wedge the queue ahead of the ones behind it.
+            attempted.push(job.asset_id);
             let resolved = resolve_job_path(&job, workspace_dir);
             let is_scratch = resolved.as_ref().is_some_and(|(_, g)| g.is_some());
             let Some((p, _)) = resolved.as_ref() else {

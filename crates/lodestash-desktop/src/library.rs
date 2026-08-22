@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use lodestash_app::config::{SizeTier, SizeTiers, SortBy};
 use lodestash_app::grid;
 use lodestash_app::types::{Category, ContentFilter, StatusFilter, TriBucket};
-use lodestash_core::catalog::{Catalog, TagAssignment};
+use lodestash_core::catalog::{AppraiseFocus, Catalog, TagAssignment};
 use lodestash_core::types::{AssetStatus, MediaType};
 use serde::{Deserialize, Serialize};
 
@@ -824,6 +824,49 @@ impl Library {
                 total: p.total,
             })
             .map_err(|e| e.to_string())
+    }
+
+    /// Turn the query the grid just ran into the appraisal queue's order (UI-SPEC §3).
+    ///
+    /// Three tiers, from the same filtered-and-sorted list the grid drew: the page on screen, then
+    /// the rest of that filter **starting after the page** (scrolling forward is what people do),
+    /// then whatever was above it. Everything outside the filter is the catalog's own newest-first
+    /// fallback and needs no list.
+    ///
+    /// The whole thing is one `page()` over rows already in memory — no catalog round-trip — which
+    /// is what makes it cheap enough to call on every browse.
+    ///
+    /// ponytail: `FILTER_CAP` bounds the second tier at 500 ids. The list is inlined into eight
+    /// `ORDER BY` clauses; unbounded, a filter matching 8,000 assets would make the hint the most
+    /// expensive part of every queue query. Raise it if a real backlog outruns the lookahead.
+    pub fn focus_order(&self, q: &GridQuery) -> AppraiseFocus {
+        const FILTER_CAP: usize = 500;
+        let mut all = q.clone();
+        all.page = 0;
+        all.page_size = usize::MAX;
+        let ordered: Vec<i64> = self
+            .page(&all)
+            .items
+            .into_iter()
+            .map(|i| i.asset_id)
+            .collect();
+
+        // `page()` clamps a stale page index to the last page rather than showing a blank grid;
+        // clamp identically here or the queue prioritises a page nobody is looking at while the
+        // grid shows another. The two must agree — they are answering the same question.
+        let size = q.page_size.max(1);
+        let pages = ordered.len().div_ceil(size);
+        let page = q.page.min(pages.saturating_sub(1));
+        let start = page.saturating_mul(size).min(ordered.len());
+        let end = start.saturating_add(size).min(ordered.len());
+        let visible = ordered[start..end].to_vec();
+        let filtered = ordered[end..]
+            .iter()
+            .chain(ordered[..start].iter())
+            .copied()
+            .take(FILTER_CAP)
+            .collect();
+        AppraiseFocus { visible, filtered }
     }
 
     /// Stamp `in_project` onto every row from the active project's import set.
@@ -2311,6 +2354,81 @@ mod tests {
             staged: Vec::new(),
             ai_embedder: Default::default(),
         }
+    }
+
+    /// The three tiers the appraisal queue is ordered by (UI-SPEC §3), cut from the query the grid
+    /// just ran.
+    ///
+    /// Mutation-checked on the three things that would quietly undo "the backlog follows you":
+    /// `visible` must be the page **actually on screen** (page 0's ids while the user is on page 1
+    /// is a queue politely appraising what they just scrolled past); the second tier must continue
+    /// *forward* from that page, because scrolling forward is what people do and a tier that
+    /// restarted at the top would prioritise what they have already seen; and the filter must
+    /// narrow both tiers, or focusing inside a search would hand the queue the whole library.
+    #[test]
+    fn focus_order_cuts_the_page_then_the_rest_of_the_filter() {
+        let mut l = lib(&[
+            ("alpha", "image"),
+            ("bravo", "image"),
+            ("charlie", "image"),
+            ("delta", "image"),
+            ("echo", "audio"),
+            ("foxtrot", "audio"),
+        ]);
+        for (i, r) in l.rows.iter_mut().enumerate() {
+            r.item.asset_id = i as i64 + 1;
+        }
+
+        // Page 1 of 2 (page_size 2, name-sorted): charlie + delta are on screen.
+        let q = GridQuery {
+            page: 1,
+            page_size: 2,
+            ..Default::default()
+        };
+        let f = l.focus_order(&q);
+        assert_eq!(f.visible, vec![3, 4], "the focus is not the page on screen");
+        assert_eq!(
+            f.filtered,
+            vec![5, 6, 1, 2],
+            "the second tier must run forward from the page, then wrap"
+        );
+
+        // Page 0: nothing precedes it, so the second tier is simply the remainder.
+        let f = l.focus_order(&GridQuery {
+            page: 0,
+            page_size: 2,
+            ..Default::default()
+        });
+        assert_eq!(f.visible, vec![1, 2]);
+        assert_eq!(f.filtered, vec![3, 4, 5, 6]);
+
+        // A filter narrows both tiers. Without this the queue would happily prioritise the 5,000
+        // assets a search just excluded.
+        let f = l.focus_order(&GridQuery {
+            tab: Category::Sounds,
+            page: 0,
+            page_size: 1,
+            ..Default::default()
+        });
+        assert_eq!(f.visible, vec![5], "the tab filter did not reach the focus");
+        assert_eq!(
+            f.filtered,
+            vec![6],
+            "the filter's remainder leaked other types"
+        );
+
+        // A page index past the end clamps rather than producing an empty focus — the grid clamps
+        // it too, and the two must agree or the queue prioritises a page nobody is looking at.
+        let f = l.focus_order(&GridQuery {
+            page: 99,
+            page_size: 2,
+            ..Default::default()
+        });
+        assert_eq!(
+            f.visible,
+            vec![5, 6],
+            "a stale page index emptied the focus"
+        );
     }
 
     /// The badge is the user's thresholds applied to the card, not a fixed scale. Boundaries are

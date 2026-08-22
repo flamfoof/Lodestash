@@ -1895,6 +1895,41 @@ try {
     assert.equal(offTrack.length, 0, "a card is wider than the grid cell that wraps it");
   });
 
+  // D3b — the appraisal queue follows the user (UI-SPEC §3). The ordering itself is proved in
+  // Rust (`appraise_focus_orders_every_queue_without_narrowing_it`, `focus_order_cuts_the_page…`);
+  // what only a live app can prove is that the query the grid sends is a shape the command
+  // accepts. `links` is top-level on GridQuery while the frontend keeps it inside `filter`, so a
+  // browse call that silently 400s would leave the queue in its default order forever — with
+  // nothing on screen to show for it.
+  await check("the grid's own query is a shape set_appraise_focus accepts", async () => {
+    const query = {
+      tab: "all", search: "", search_mode: "tags", ids: [], status: "all",
+      sort_by: "name", sort_asc: true, favorites_only: false, trashed_only: false,
+      filter: { traits: [], tri_buckets: [], size_tiers: [] }, links: null,
+      package: null, collection: null, source: null, page: 0, page_size: 50,
+    };
+    // Both commands must take it: they are the same query, and the whole design rests on that.
+    const p = await invoke("grid_page", { query });
+    assert.ok(p.items.length > 0, "the probe query matched nothing — it proves nothing");
+    await invoke("set_appraise_focus", { query });
+    // It is a hint, not a write: calling it twice, and on a page past the end, must not error.
+    await invoke("set_appraise_focus", { query: { ...query, page: 9999 } });
+  });
+
+  await check("the Identify screen states the queue order it now uses", async () => {
+    // Scoped to the rail: every card carries an "Identify <name>" action, so a bare role+name
+    // lookup matches 200 of them.
+    await page.locator('nav[aria-label="Main"] .row').filter({ hasText: "Identify" }).click();
+    await page.waitForSelector('[data-testid="queue-order"]', { timeout: 5000 });
+    const tiers = await page.locator('[data-testid="queue-order"] li').allTextContents();
+    assert.equal(tiers.length, 3, `the queue order lists ${tiers.length} tiers, not 3`);
+    assert.ok(tiers[0].includes("on screen"), `tier 1 reads: ${tiers[0]}`);
+    assert.ok(tiers[1].includes("current filter"), `tier 2 reads: ${tiers[1]}`);
+    assert.ok(tiers[2].includes("newest first"), `tier 3 reads: ${tiers[2]}`);
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.waitForSelector(".card", { timeout: 5000 });
+  });
+
   // D7b — source availability, the rest (UI-SPEC §11.1). These run against whatever the real
   // catalog holds: if every source is reachable there is nothing to prove and they skip, which is
   // honest. On this machine source 4's root is a scratchpad folder from an old session, so the

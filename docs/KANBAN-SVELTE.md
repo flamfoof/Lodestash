@@ -339,10 +339,19 @@ facet-group owner call).
       `identify_ids` command, so 400 assets is one bounded pass rather than 400.
       **Note:** the default only affects fresh configs; an existing `config.json` keeps the value it
       has, so anyone who ran this build before still has it off.
-- [ ] **D3b — The priority queue.** On-screen → rest of the current filter → everything else, newest
-      first, re-ordered as you browse (UI-SPEC §3). Needs the frontend to tell the writer what is
-      visible, and the idle pass to consume an ordering rather than picking by dirty-flag order.
-      This is the half that makes the backlog follow the user rather than merely run.
+- [x] **D3b — The priority queue.** `AppraiseFocus` on the `Catalog` + one shared `ORDER BY`
+      expression, so **all eight** appraisal queues (tags, audio tags, three embedding queues,
+      metrics, previews, dep scans) move together — prioritising only the tag queue would leave an
+      on-screen asset tagged and then waiting behind 3,000 others for the embedding that promotes
+      it. `Library::focus_order` cuts the tiers from the query the grid just ran (the page on
+      screen, then the filter running **forward** from it, capped at 500), and reaches the writer
+      through shared state rather than an `Op`: browsing must never queue behind a running appraise
+      pass. Debounced 400ms — the only debounced thing on that path, because the grid must answer
+      every keystroke but the backlog need not chase a half-typed word.
+      **Caught by the change:** `assets_needing_preview` walked its queue with an `a.id > cursor`,
+      which silently returns nothing once the order is no longer ascending — and "nothing" looks
+      exactly like a drained backlog. Now an attempted-set. The queue order is stated on the
+      Identify screen, as §3 requires.
 - [x] **D4 — Keep-it ladder.** The staging tray can promote itself: **▣ Save as collection…**
       names the set and moves every staged id into it, so a shortlist built by hand is no longer
       thrown away on import. Empty states teach the relationship — a star is a pin, ⟡ is a cart for
