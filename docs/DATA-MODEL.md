@@ -44,6 +44,8 @@ CREATE TABLE import_source (
   kind            TEXT NOT NULL,          -- 'folder' | 'asset_store_library' | 'unitypackage' | 'bundle' | 'unreal_pak' (planned) | ...
   last_scanned_at INTEGER,
   watch_enabled   INTEGER NOT NULL DEFAULT 1,
+  state           TEXT NOT NULL DEFAULT 'available',  -- 'available' | 'paused' | 'unavailable' (M18; UI-SPEC §11.1)
+  last_seen_at    INTEGER,                -- unix seconds the root last resolved (M18)
   blacklist       TEXT                    -- JSON: [{kind:'folder'|'asset', value:'<source-rel path or file name>'}] (§blacklist)
 );
 
@@ -580,6 +582,15 @@ asset come from?" at the collection level.
   projects suppress it (redundant noise).
 - **Search facet:** `source_id IN (…)` is already a pre-filter column in `vec_asset`; it becomes
   a UI filter chip ("Library: Synty") in both Search-by-Tags and AI Search modes.
+**Availability** (`state`, `last_seen_at` — M18). A source root is checked when the library opens and
+after every scan: one `is_dir` per **root**, never per asset, off the UI thread, defaulting to
+`available` while pending. A missing *file* is a per-asset fact and never marks the source. Adding a
+root that does not exist is refused up front; a root that goes away **after** indexing is the normal
+end state for external drives and moved folders, and is what `unavailable` exists for. Rows are never
+deleted, trashed or purged because their source went away — the catalog stays fully browsable and
+only the file access fails (UI-SPEC §11.1). Relinking rewrites `root_path` and re-resolves
+`asset_file.rel_path` against the new root; the match count is shown before it commits.
+
 - **`import_source.name`** defaults to the root folder's stem on first add; the user can rename it
   in Project settings without touching the file system.
 
@@ -762,6 +773,7 @@ transaction, in order, on open. Shipped so far:
 | **M2** | Mapping library: `taxonomy`, `category`, `category_alias`, `mapping_rule`, `asset_category` (§4) |
 | **M3** | Engine round-trip: `package` + `asset.package_id`, `project`, `import_record`, `asset.license/attribution/license_url` (§7, §9) |
 | **M4** | `asset.rating`, `package.pipeline`, `project.pipeline` (§12) |
+| **M18** | Source availability: `import_source.state` + `last_seen_at` — the third source state a drive going away needs (UI-SPEC §11.1). `state` is **derived, not authored**: the open/scan health check writes it, `paused` is the user's `watch_enabled` intent surfaced as a state, and nothing in the catalog is deleted because a root went missing |
 | **M5** | UI-SPEC alignment (below) |
 | **M6** | Extracted-pack persistence + surgical extraction: `asset_file.workspace_rel` (locates a package-extracted file in the content-addressed workspace, so extracted packs rehydrate across sessions behind the **Keep extracted packs cached** toggle, default off) + `package_entry` (per-payload guid/pathname/**tar offset**/size from the browse pass — selected assets re-extract with one gzip skip-scan instead of a full unpack, [`INGESTION.md`](INGESTION.md) §2) |
 | **M7** | Unity Assets library pinning: `package.pinned` (`ALTER TABLE package ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`) — backs the Add-to-Library pin (FEATURES.md §5.5, §7 above) so a promoted pack is a durable sidebar LIBRARIES row |

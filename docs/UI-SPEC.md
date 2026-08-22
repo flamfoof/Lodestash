@@ -46,15 +46,22 @@ One window, three fixed regions plus overlays:
 
 1. **Logo** — rotated gold diamond (18px, 2px `--ls-gold` border, inner `--ls-gold-bright` dot, faint
    glow) + `LODESTASH` in Cinzel 16px gold, letter-spaced.
-2. **Search mode toggle** — segmented `⟨⟡ Tags⟩ ⟨✦ AI⟩` (DESIGN-GUIDELINES §7). Switching to Tags
-   clears AI results.
-3. **Search box** (max-width 400px) — border + focus glow follow the active mode (gold / arcane).
-   - **Tags mode**: live substring filter over name + pack + tags
-     (IDENTIFICATION-AND-SEARCH §5A; grows into FTS5/BM25).
-   - **AI mode**: placeholder *"describe what you need — e.g. »pickup sound for rocks« — then
-     Enter"*; **Enter runs the search** (§5B), an animated `✦ sieving…` pulse shows while running,
-     results replace the grid as a **ranked list** with per-card `✦ NN%` match badges.
-     Unidentified assets are never returned (DATA-MODEL §8). Empty result → toast + empty state.
+2. *(removed — the search-mode toggle. ADR-0007. The slot is kept so the §0.1.n citations in
+   ALIGNMENT-AUDIT and the boards keep pointing at the controls they were written about.)*
+3. **Search box** (max-width 460px) — **one box, no mode toggle** (ADR-0007). Typing runs the live
+   substring filter over name + pack + tags (IDENTIFICATION-AND-SEARCH §5A; grows into FTS5/BM25).
+   Placeholder *"Search your hoard"*; gold border + focus glow.
+   - **AI escalation** — a row pinned under the filtered results reads `✦ Ask AI for »query« —
+     searches meaning, not names` with an `⏎` affordance; Enter or a click runs the semantic search
+     (§5B), with the animated `✦ sieving…` pulse while it runs. It is present the whole time, so the
+     AI is never a mode you had to predict.
+   - **AI results** replace the grid as a **ranked list** with per-card `✦ NN%` match badges; the box
+     takes the **arcane** border and the result header (§2.2) reads `✦ N ranked matches` with
+     `← back to name filter`. Unidentified assets are never returned (DATA-MODEL §8); an empty result
+     falls to the §2.6 empty state, which offers the escalation as its primary action.
+   - **AI never runs on a keystroke.** Clearing the query drops back to the unfiltered grid and
+     resets the result mode. The mode is a consequence of what you did — legible in the border and
+     the header — not a switch you set first.
 4. **Type tab row** — see §0.3. *(⚖ Resolution: the prototype squeezed 4 category chips inline; the
    real enum has 7 types + All, so the type filter is its own row under the top bar.)*
 5. **Health meter** (min-width 180px, right-aligned group) — label `Identified n / total` (mono) over
@@ -106,6 +113,13 @@ One vertical panel, three stacked groups:
 Facet groups stay expanded on **every** screen — owner call 2026-08-06: the sidebar's
 navigation must not vanish when a screen other than Library/Identify is active (they are Library
 filters, and every facet click still navigates to Library). Sidebar scrolls as one column.
+**Narrowed by ADR-0009** to *"on every screen, at every width where they fit"*: below 1120px the
+whole sidebar becomes a 48px icon rail and both facet groups move into its flyout — one click away,
+on every screen, for everyone. They are still never hidden by *screen*. DESIGN-GUIDELINES §4 owns
+the ladder.
+
+An **unavailable** Library Source (§11.1) renders its diamond as a red `✕` and dims the row; it
+still selects.
 
 ### 0.3 Type tab row
 
@@ -180,9 +194,15 @@ next time"** checkbox writes the same flag).
   junk (scripts, DLLs, editor tools) is hidden automatically."* (INGESTION §3.)
 - Gold progress bar + a mono log line per pipeline stage (diff → per-source discoveries → hashing/
   thumbnails/non-content count → summary line with totals and flagged duplicates).
-- **On completion**, if new assets exist: an amber callout — *"All N assets start **Unidentified** —
-  AI search can't see them until you run identification."* with **✦ Run identification now**
-  (arcane; → Identify screen, auto-starts Identify-all) and **Skip to Library**.
+- **On completion**, if new assets exist: an **arcane** callout — *"✦ Appraisal has started. All N
+  assets begin Unidentified. They are being appraised in the background, whatever you are looking at
+  first — search gets better as it goes, and you do not have to wait here."* with **Open library →**
+  (gold primary) and **Watch progress** (→ Identify §3).
+  *(ADR-0008: the old amber copy — "AI search can't see them until you run identification" — and its
+  **✦ Run identification now** / **Skip to Library** fork are gone. The fork asked a new user to
+  choose between two things they cannot yet evaluate; under ADR-0008 there is nothing to choose. The
+  honest statement that assets start Unidentified is kept — softening it would hide why early AI
+  searches come back thin.)*
 
 ---
 
@@ -210,7 +230,8 @@ The browse-everything grid. Composition top→bottom:
    sort is disabled while AI-ranked results are shown); **⚑ Filters** button; **grid-density
    segmented** (▪ Compact ▦ Cozy ▣ Large — card min-widths **150 / 205 / 288px**); **view
    toggle** ⊞ grid / ☰ list / 📁 folders — three stops in the Tauri shell (the egui build still
-   offers only Grid / Folders), DESIGN-GUIDELINES §7 "Browse views".
+   offers only Grid / Folders), DESIGN-GUIDELINES §7 "Browse views". The **active-filter bar**
+   (item 7) renders directly under this row whenever anything is filtered.
 3. **Content filter popover** (⚑, 328px, elevation 2) — DESIGN-GUIDELINES §7: TRAIT chip cloud with
    search (arcane select-state), TRIANGLES buckets `≤1k · 1k–3k · 3k–6k · 6k+` (violet, models
    only), FILE SIZE tiers S/M/L/XL with live ranges from §11.4 (tier-colored). Multi-select within
@@ -235,9 +256,29 @@ The browse-everything grid. Composition top→bottom:
    - **List rows** (32–38px, zebra): thumb 26px · type diamond · name · pack (link) · size badge ·
      stats · status gem+label · ⤢ · stage. Same selection/ring behavior.
    - Selected card/row: 2px gold ring. Confirmed cards: faint 1px gold ring at rest.
-6. **Empty state**: large ⌕ + *"Nothing matches"* / (AI) *"Nothing close in your hoard"* + hint —
-   when Unidentified exist: *"N assets are still Unidentified — they can't be found yet."*, else
-   *"Try a broader term or clear the facet filters."*
+6. **Empty state**: large ⌕ + *"No name or trait contains that"* / (AI) *"Nothing close in your
+   hoard"*. The primary action is the **AI escalation** (§0.1.3) — *"✦ Search meaning instead"* —
+   because a description is not a filename and the engine that can answer it is right there
+   (ADR-0007). Under it, when Unidentified exist: *"N assets are still Unidentified and cannot be
+   reached this way"* → Identify. A filtered-empty result never shows a screen's teaching copy
+   (DESIGN-GUIDELINES §7 "Empty states") — the screen is not empty, the filter is.
+7. **Active-filter bar** — one strip under the toolbar listing **every** active constraint as a
+   removable chip, because the filters live in four places (search box, type tabs, two sidebar facet
+   groups, ⚑ popover, ★ toggle) and only pack and collection were ever visible. Left → right in the
+   order filters compose: `query · type · status · library · pack · collection · ⚑ · ★`.
+   Right-aligned: `n of N shown` + **Clear all** — the same reset the sidebar's Library row performs
+   (§0.2), now with a name and a place.
+   - **Chip vocabulary** (colour says which axis, never colour alone): query = gold + magnifier;
+     type = its type token + rotated diamond (matching the §0.3 underline); status = its status token
+     + the same gem shape the facet and card corner use; library / pack / collection = neutral chip
+     with a mono axis prefix (`lib` / `pack`); trait = neutral chip keeping the type-coloured dash it
+     carries on cards; triangles = violet; size tier = its §11.4 tier colour **with the live range**
+     (`M 1–8 MB`), so the letter is never a mystery.
+   - Removing a chip drives the control it came from, so there is exactly one source of truth per
+     axis. Nothing active → **the bar is not rendered** (no empty rail). Beyond one row the tail
+     collapses into a `+N more ▾` popover rather than wrapping the grid downward; **Clear all** stays
+     pinned right.
+   - Cost, accepted: one row of vertical space above the grid whenever anything is filtered.
 
 Card click = select (inspector opens); second click deselects. All filters compose:
 type ∧ library ∧ status ∧ pack ∧ collection ∧ ⚑ filters ∧ query/AI.
@@ -255,8 +296,24 @@ The future list view is exempt (rows are cheap; it stays a single virtualized sc
 Backlog triage per DATA-MODEL §8. Arcane-tinted header:
 - Cinzel title **"Appraise the Backlog"**; subtitle *"Fresh loot is Unidentified — no tags, no
   embeddings, invisible to AI search. Appraisal runs once per asset, locally."*
-- Right: large mono **remaining count**; **✦ Identify all (N)** primary (arcane) — while running it
-  reads **✦ Appraising…** and an arcane progress bar + `done / total appraised` label appears.
+- Right: large mono **remaining count**.
+
+**Appraisal is a background job, not a screen you sit on** (ADR-0008). It starts automatically after
+a scan (respecting the `auto_identify` setting) and runs in the **job tray**, so the screen is a
+dashboard you can walk away from:
+
+- **Running row** (arcane): *"Running in the background — you can browse, stage and import while it
+  works."* + **⏸ Pause**. Paused keeps its place (*"Stopped at 1,284 / 3,912 — nothing is lost"*) and
+  **▶ Resume** continues; done collapses to `◆ All N appraised`.
+- **Progress**: `done / total appraised`, throughput and an estimate over an arcane bar.
+- **Queue order**, shown explicitly because it is no longer obvious: (1) what is on screen right
+  now, (2) the rest of the current filter, (3) everything else, newest first. **Browsing re-orders
+  the queue** — the assets you are about to want are appraised first, so the backlog stops being
+  all-or-nothing.
+- **Where the backlog is**: one row per Library Source (name + a slate bar + remaining count) with
+  its own **✦ Appraise** — a source or a pack is the unit people think in, not "all 3,912".
+- Any single asset jumps the queue with the per-card **✦** (§2.5); it returns Identified in place
+  with the shimmer.
 - Grid shows the **session set**: everything still Unidentified **plus** assets identified this
   session (so results don't vanish as they flip). Cards are the §2 card minus stage/import actions
   (identification first). Each flip: tags fill in from the tagger, status gem `? → ✓`, shimmer.
@@ -298,11 +355,20 @@ catalog `package` rows — they land with the P2 Packages model.)*
 
 Review queue per DATA-MODEL §5 / DESIGN-GUIDELINES §7 — **never auto-delete**. Header subtitle:
 *"Near-duplicates found across packs. Nothing is ever auto-deleted — you decide."*
-One card per group: reason line (mono — e.g. `perceptual hash · 96% similar · different packs`);
-member tiles (thumb + name + pack · stats) with the **keeper** marked by a gold `★ keeper` ribbon
-(keeper = highest status, tie → earliest indexed); actions **Keep both** (dismisses group) ·
-**Merge tags** (union of tags onto keeper, arcane) · **Move duplicate to Trash** (danger outline;
-respects confirm-before-Trash §11.6). Empty state: ⧉ *"No duplicates left to review."*
+**A queue, not a scrolling page.** Header carries `n / N groups reviewed` + a gold progress bar.
+Left: a **group list** (280px) — one row per group (type diamond + keeper name + member count),
+resolved rows dimmed with their outcome (`kept both` / `trashed 1`); `↑ ↓` moves and the list keeps
+your place after every decision. Right: the group itself, in the **§13 compare pane** — reason line
+(mono — e.g. `perceptual hash · 96% similar · different packs`), the two members side by side with
+the **keeper** marked by a gold `★ keeper` ribbon (keeper = highest status, tie → earliest indexed),
+and the same differ-is-gold stat table. Groups of three or more hold the keeper on the left and
+cycle the right pane (`2 of 3 ›`) — always one comparison against the keeper, never a three-way
+stare.
+
+Actions (footer): **Keep both** (dismisses group) · **Merge tags** (union of tags onto keeper,
+arcane) · **Move duplicate to Trash** (danger outline; respects confirm-before-Trash §11.6).
+Empty state: ⧉ *"No duplicates left to review."* + *"Lodestash flags byte-identical and
+near-identical assets across packs. Nothing is ever deleted for you."*
 
 ---
 
@@ -449,6 +515,38 @@ stop scanning). Expanded blacklist panel: excluded chips (folder amber / asset r
 remove) + input + **⊘ folder** / **⊘ asset** add buttons (DATA-MODEL §10 per-source blacklist).
 Header: **+ Add source** (folder picker; Asset Store cache is offered via auto-detect).
 
+**Source state is three-valued** — `available · paused · unavailable` (`import_source.state`,
+DATA-MODEL §1). Adding a folder that does not exist is already refused; a source whose root goes
+away **after** indexing (external drive unplugged, folder moved, pack uninstalled) is the normal end
+state for this product, which only ever points at files it never moves. It is checked on library
+open and after every scan — one `is_dir` per source **root**, never per asset, off the UI thread
+with a timeout, defaulting to `available` while pending (a false "unavailable" flash on every open
+would be worse than the gap it closes). A single missing file is a per-asset fact and never marks
+the source.
+
+While a source is unavailable the catalog stays fully browsable — search, facets, stats, stars and
+traits all still work, which is the point of an index:
+
+- **Banner** (once, top of the Library, dismissible for the session): `✕ <name> is unavailable — N
+  assets are still listed, but their files cannot be reached.` + declared path (mono) + **Relink…**
+- **Sidebar facet** (§0.2): the diamond becomes a red `✕` and the row dims — shape, not colour alone
+  (DESIGN-GUIDELINES §9). The row still selects; filtering to an unavailable library is legitimate.
+- **Cards / rows** (§2.5): the artwork becomes a stated `file unavailable` plate rather than a broken
+  image; `⤢` and `⟡` go inert but stay focusable and explain themselves. Everything the catalog
+  knows still reads.
+- **Quick Look** (§14): an honest panel — *"This file isn't reachable"*, the library and the date it
+  was last seen, the declared path, **Relink library…** / **Copy path**.
+- **Staging / import** (§16.2): refuse out loud and partially — *"3 of 6 staged assets are
+  unavailable — the import skipped them"*. The ones that imported are not rolled back; the ones that
+  did not stay staged.
+- **Never** auto-remove, auto-trash or purge on the next scan. The non-destructive invariant covers
+  absence too.
+
+**Relink panel** (expands from an unavailable row): declared path, **Choose…** for the new root, and
+a **match count shown before committing** — *"◆ 4,198 of 4,206 files matched by relative path — 8
+would stay unavailable"* — then **Relink N assets**. A relink that would strand half the library is
+a thing you see first.
+
 *(Shipped interim: watching is real but **library-wide**, not per source — a **SOURCES ▸ Watch
 sources for changes** checkbox (`AppConfig.watch_sources`, default on) drives one `notify` watcher
 over every open root, debounced 1 s, rescanning only while the library is idle and at most once
@@ -541,7 +639,20 @@ a hidden nav row.
 
 ## 13. Inspector (right panel, 300px)
 
-Opens when an asset is selected; ✕ / Esc closes. Top→bottom:
+Opens when an asset is selected; ✕ / Esc closes.
+
+**Collapsed (nothing selected).** The rail collapses to a **26px edge tab** carrying a vertical
+`INSPECTOR ‹` label — it never holds 300px open to print an instruction. Selecting anything reopens
+it; the tab reopens it manually (for a pinned read of the last selection). A manual collapse sticks
+until the next selection. *(Replaces the "Select an asset." empty state — ALIGNMENT-AUDIT N5.3.)*
+
+**Compare (exactly two picked).** The rail widens to **460px** and shows the two side by side:
+preview over preview, then one stat table with a column each. Rows where the two **differ** are gold
+on both sides; rows where they agree stay dim — the eye lands on the facts that decide it. Footer:
+**Keep left** / **Keep right**. Entered by check-picking exactly two cards, or `C` on a duplicate
+group (§5); three or more falls back to the bulk bar. This is the pane §5 reviews groups in.
+
+Selected, one asset — top→bottom:
 
 1. **Preview** (160px): thumbnail (Unidentified: 30% + grayscale + big `?`); sounds show a static
    waveform, animated EQ bars while playing; **⤢ full size** pill (→ Quick Look); ✕ close.

@@ -6,6 +6,7 @@ INGESTION / AI-PIPELINE / KANBAN truth-check) against the live code. The egui cr
 `lodestash-desktop`/`lodestash-app` are the app. **Card state = verified in code, not comments.**
 
 Lanes: 🟢 Done · 🟡 Partial (delta named) · 🔴 Missing · ⚪ Built but inert (needs wiring) ·
+🎯 UX pass (the 2026-08-22 design review, D-series) ·
 🔧 Extraction & structure (the 2026-08-14 audit) ·
 🟠 Visual conformance & doc drift · 🔵 Engine-project / deferred. The main board
 ([`KANBAN.md`](KANBAN.md)) holds the full history; the card titles here match the main board's
@@ -313,6 +314,59 @@ are pathname-only folder rows — `read_manifest` records an offset for every re
       was egui-era-only). The ORT dll loads at startup, so a fresh download needs a restart
       (noted in the UI). Cloud API keys were already reachable via AI TAGGING — the remaining
       opt-in surface gap is gone.
+
+## 🎯 UX pass — the 2026-08-22 design review (D-series)
+
+Fourteen proposals from a review of the specs against the code, designed as artboards and written
+into UI-SPEC / DESIGN-GUIDELINES / DATA-MODEL in the same change. Three needed an ADR rather than an
+edit: [ADR-0007](decisions/ADR-0007-one-search-box.md) (the search-mode toggle goes),
+[ADR-0008](decisions/ADR-0008-appraisal-is-a-background-job.md) (appraisal leaves its own screen),
+[ADR-0009](decisions/ADR-0009-responsive-ladder.md) (the responsive ladder narrows the 2026-08-06
+facet-group owner call).
+
+- [ ] **D1 — One search box.** Drop the Tags/AI segmented toggle; typing always filters, the AI is a
+      pinned escalation row + the empty state's primary action; arcane border while ranked results
+      are shown, `← back to name filter` returns. UI-SPEC §0.1.3, §2.6; DG §7 "Search bar".
+- [ ] **D2 — Active-filter bar.** One strip under the toolbar, one removable chip per active
+      constraint, `n of N shown` + Clear all, not rendered when nothing is filtered; `+N more`
+      popover past one row. UI-SPEC §2 item 7; DG §7 "Active-filter bar".
+- [ ] **D3 — Appraisal in the tray.** Auto-start after scan (honours `auto_identify`), priority
+      queue (on-screen → current filter → newest), pause/resume, per-source Appraise, Identify screen
+      becomes a dashboard. UI-SPEC §3; ADR-0008.
+- [ ] **D4 — Keep-it ladder.** ★ pin / ⟡ tray / ▣ collection given one stated relationship, plus
+      "Save the staging tray as a collection" and empty states that teach the difference.
+      UI-SPEC §6, §16.2.
+- [ ] **D5 — Inspector collapse + compare.** 26px edge tab when nothing is selected (closes N5.3);
+      460px two-up compare when exactly two are picked, differ-is-gold stat table. UI-SPEC §13.
+- [ ] **D6 — List-row parity.** star / ⤢ / stage / pack link / size badge on rows, actions in a
+      trailing column (closes audit **F6**). UI-SPEC §2.5.
+- [ ] **D7 — Source availability.** `import_source.state` + `last_seen_at` (**M18**), health check on
+      open + after scan, banner / facet ✕ / card plate / Quick Look panel / partial-import refusal /
+      relink panel with a match count before it commits. UI-SPEC §11.1, DATA-MODEL §1.
+- [ ] **D8 — Undo in the toast.** One action slot (`Undo` | `Show`), 6s with an action, hover
+      freezes, 3 at a time. Each toast carries **its own oplog id** — undoing the head of the log
+      from the second-newest toast reverses the wrong action silently. DG §7 "Feedback".
+- [ ] **D9 — Focus ring + reduced motion.** `--el-focus-ring` on card/row/chip/facet/nav/tab/control,
+      `:focus-visible` only, never layout-shifting; the §8 reduced-motion table implemented.
+      DG §8, §9. *(Focusable **cards** wait on a roving `tabindex` — see D15.)*
+- [ ] **D10 — `✓ in <project>` badge.** Four states (active / others / never / older copy) on card,
+      row and stat block; needs an `in_project` flag on `GridItem` from a bulk `import_record` read
+      (closes **N1.5** / B12e). DG §7 "Already imported badge".
+- [ ] **D11 — Duplicates as a queue.** Group list + the §13 compare pane, `n / N reviewed`, keeper
+      ribbon, keep-both / merge-tags / trash, `2 of 3 ›` cycling for larger groups. UI-SPEC §5.
+- [ ] **D12 — Responsive ladder.** 1400 hint · 1280 overlay inspector · 1120 icon rail + facet
+      flyout · 960 `⋯` overflow; floor 900×600. DG §4; ADR-0009.
+- [ ] **D13 — Onboarding copy.** Step 2's amber callout becomes the arcane "Appraisal has started";
+      the Run-identification / Skip fork goes. UI-SPEC §1. *(Consequence of D3 — shipping D3 without
+      this leaves the first thing the app says to a new user false.)*
+- [ ] **D14 — Empty states.** One anatomy (32px nav glyph · statement title · one teaching line · at
+      most one action) across Collections / Duplicates / Trash / Packages / Unity Assets / Identify.
+      DG §7 "Feedback".
+- [ ] **D15 — Grid keyboard nav (deferred, now a dependency).** Roving `tabindex` so the grid is one
+      tab stop, arrow keys inside, Shift+arrow/click ranges. Deliberately out of the design pass, but
+      D9 cannot put a ring on a **card** without it. UI-SPEC §0.4; DG §9 records it as an open gap.
+
+---
 
 ## 🟠 Visual conformance & doc drift (DESIGN-GUIDELINES audit)
 

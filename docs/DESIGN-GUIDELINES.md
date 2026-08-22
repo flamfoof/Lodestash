@@ -142,6 +142,25 @@ Line-height: 1.45 body, 1.2 headings. Weight: 400 body, 500 labels, 600 headings
 - **Elevation:** `0` flat (`--ls-surface`), `1` raised (`--ls-surface-raised` + 1px border), `2`
   popover (`--ls-overlay` + soft shadow `0 8px 24px rgba(0,0,0,.45)`), `focus` (2px `--ls-focus` glow).
 
+### Responsive ladder (ADR-0009)
+
+The shell spends a fixed 210px sidebar + 300px inspector before the grid gets anything, and the
+library toolbar carries about ten controls. One stated ladder, so the next control added has a known
+place to go when the window shrinks. Nothing is ever removed outright — each step moves something
+behind a gesture.
+
+| Below | What changes |
+|---|---|
+| **1400px** | The toolbar's keyboard hint hides. |
+| **1280px** | The inspector **overlays** the grid instead of pushing it, keeping its edge tab (§13). |
+| **1120px** | The sidebar becomes a **48px icon rail**; labels, counts and both facet groups move into a flyout it opens. |
+| **960px** | Sort, density and undo/redo fold into one `⋯` overflow. ★, ⚑ and the view toggle **never** fold — they change what you are looking at. |
+
+**Floor: 900 × 600.** Below that the shell scrolls; the product does not claim to support it.
+
+**Ordering principle:** decoration first, then chrome that can be recalled on demand, then chrome
+that changes state. **The grid is never what shrinks to make room for a control.**
+
 ---
 
 ## 5. Iconography
@@ -228,11 +247,23 @@ gold progress bar) + **project chip** (§below) + active AI-profile pill (shows 
 links to AI-MODELS-BY-GPU). Height 48px, `--ls-surface-raised`. The media-type filter is its own
 **tab row** beneath the bar ([`UI-SPEC.md`](UI-SPEC.md) §0.3), not inline chips.
 
-### Search bar with **mode toggle**
-A segmented control: **⟨ Tags ⟩ ⟨ AI ⟩** (`ls-search-tags` / `ls-search-ai`).
-- **Tags** mode → gold accent, placeholder "filter by tag…".
-- **AI** mode → arcane-teal accent + subtle glow, placeholder "describe what you need…".
-The active mode colors the input's focus ring so you always know which engine you're querying.
+### Search bar
+**One box, no mode toggle** (ADR-0007). Gold accent, placeholder "Search your hoard"; typing filters
+by name/pack/tag instantly.
+
+The AI is an **escalation inside the results**, not a mode set beforehand: a pinned row reads
+`✦ Ask AI for »query«` with an `⏎` affordance (`ls-search-ai`), and the §2.6 empty state offers the
+same thing as its primary action. While AI results are shown the box takes the **arcane-teal** accent
++ subtle glow and the result header reads `✦ N ranked matches` with `← back to name filter` — so the
+engine that answered is still legible, as a consequence rather than a switch. AI never runs on a
+keystroke. Full behaviour: UI-SPEC §0.1.3.
+
+### Active-filter bar
+The one place that answers "why am I seeing these?". A single strip under the library toolbar, one
+removable chip per active constraint, `n of N shown` + **Clear all** pinned right; **not rendered at
+all** when nothing is filtered. Chips carry their axis's own colour *and* a shape or a mono axis
+prefix (§9: never colour alone), and removing one drives the control it came from — one source of
+truth per axis. Anatomy and the chip vocabulary: UI-SPEC §2 item 7.
 ### Sidebar (navigation + facets)
 A single **210px labeled sidebar** (`--ls-surface`), three stacked groups
 ([`UI-SPEC.md`](UI-SPEC.md) §0.2): **navigation** (Library / Identify / Collections / Packages /
@@ -319,6 +350,18 @@ check badge** in `--ls-success` on the card/row and an inline "in <project>" not
 On Import, this turns the action into a confirm ("Re-import? It's already in Assets/…") — never a
 silent duplicate. Pair the color with the icon (never color-only, per §9).
 
+Four states, bottom-left of the artwork beside the size tier (UI-SPEC §2.5):
+
+| State | Treatment |
+|---|---|
+| In the **active** project | `✓ in <project>` in `--ls-success` — check + colour + the project's name |
+| In **other** projects only | `✓ in N others`, dim (`--ls-text-dim`) — history, not a warning |
+| **Never** imported | no badge at all — absence is the common case and must cost nothing |
+| Imported, **source changed since** | `✓ older copy` in `--ls-warning` — the only actionable one |
+
+On a **list row** there is no room for the project name: the check alone, after the name, with the
+full text on hover.
+
 ### Project chip
 The active registered Unity project shows as a small **`ls-project` chip** in the top bar (next to the
 AI-profile chip) — name + a connected/stale dot. Stale (editor closed) dims it and disables "into
@@ -343,8 +386,23 @@ import.
 
 ### Feedback
 - **Toasts** bottom-right, `--ls-overlay`, 1px accent left-border by type (success/warn/danger/info).
-- **Empty states** use a 32px icon + one line + a primary action (e.g., "No Identified assets yet —
-  run Identify").
+  **One action slot**, right of the message: `Undo` when the action is reversible, `Show` when the
+  useful next move is to look at what failed. Never both, never three. Lifetime: **6s with an
+  action** (twice the plain toast — long enough to read, act, and still get out of the way);
+  hovering or focusing the stack freezes every timer in it; **3 at a time**, the fourth collapsing
+  the oldest into `+N more`. An undo confirms in its own toast (`Restored 6 assets`) with **no**
+  action of its own — redo is Ctrl/Cmd-Shift-Z, not a loop of toasts.
+- **Empty states** — one anatomy everywhere (they are where a new user meets a screen, so they are
+  the copy that teaches the product):
+  - **icon** 32px, stroked, `--ls-text-dim` — the screen's own nav glyph, never a new drawing and
+    never an emoji;
+  - **title** 15px `--ls-text`, a statement of fact, not an apology (no "Oops", no exclamation mark);
+  - **line** 11px dim, one sentence ≤ 40ch, teaching the concept behind the screen — not restating
+    the absence the title already named;
+  - **action** exactly one, and only when there is something to do here. A screen you cannot act on
+    gets no button.
+  - **Empty ≠ filtered-empty.** Teaching copy is for a screen with nothing in it; a filtered result
+    with no matches is UI-SPEC §2.6 and needs a way *out*, not a lesson.
 - **Destructive confirms** are modals with a danger accent; never a bare toast.
 
 ### Selection & context menu
@@ -472,10 +530,21 @@ and engine imports are **not** undoable (jobs / external side effects) — confi
 ## 8. Motion
 
 Subtle, fast, purposeful. Durations: micro 120ms, standard 200ms, reveal 360–400ms.
-- **Appraise shimmer** on Unidentified→Identified (gold sweep).
-- Hover raise 120ms; popovers 160ms fade+rise.
-- Progress meters animate smoothly; never spin gratuitously.
-- **Always honor `prefers-reduced-motion`** (drop shimmer/transforms, keep instant state changes).
+
+`prefers-reduced-motion: reduce` is a **required second column**, not a nice-to-have — it removes
+movement, never information. Anything that was *telling* you something still says it.
+
+| Animation | Default | Reduced |
+|---|---|---|
+| Identify shimmer (Unidentified→Identified) | gold sweep, ~0.6s | flips instantly |
+| Model hover-spin (card art) | rotate 8° + scale, 0.8s | hero view holds still |
+| Appraisal / job progress | bar eases, accent glow | bar jumps, no glow — it still updates |
+| Toast enter / leave | rise + fade | fade only, same timing |
+| Card hover action tray | opacity 120ms | instant (`pointer-events` still follows visibility) |
+| Inspector open / close | width eases 180ms | snaps |
+| Modal / onboarding entry | `lsRise` + scrim blur | no rise; the scrim still dims |
+
+Progress meters animate smoothly; never spin gratuitously.
 
 ---
 
@@ -484,11 +553,23 @@ Subtle, fast, purposeful. Durations: micro 120ms, standard 200ms, reveal 360–4
 - **Contrast:** body text ≥ 4.5:1, large/secondary ≥ 3:1 against its surface. Verified for the tokens
   above on `--ls-surface`/`--ls-surface-raised`.
 - **Never color-only:** status, type, provenance always also carry an icon/label/shape.
-- **Focus:** visible 2px `--ls-focus` glow on every interactive element; full keyboard nav (grid is
-  arrow-navigable; **Space** = Quick Look, **Enter** = open, **Del** = move to Trash; `/` focuses
-  search; Ctrl/Cmd-click + Shift-click + Ctrl/Cmd-A select; mode toggle is a real segmented control).
-- **Hit targets:** ≥ 28px in compact, ≥ 32px comfortable.
-- **Motion/again:** reduced-motion respected; no essential info conveyed by animation alone.
+- **Focus:** one ring, everywhere — `box-shadow: var(--el-focus-ring)` (`0 0 0 2px #FFD98A`), applied
+  to card, list row, trait chip, facet row, nav row, type tab, icon button, select and the search
+  box. Three rules that are the whole recipe:
+  - **`:focus-visible` only, never `:focus`.** A mouse click must not leave a ring behind it — that
+    is what makes people reach for `outline: none` and lose keyboard focus altogether.
+  - **Never layout-shifting.** It is a shadow, so nothing reflows when it appears; on a card it
+    *stacks* with the selection ring rather than replacing it.
+  - **Never colour alone.** Focus is a ring; selection is a border **plus** ring; status is a left
+    rail **plus** a gem. Three facts, three shapes.
+- **Keyboard nav:** **Space** = Quick Look, **Enter** = open, **Del** = move to Trash, `/` focuses
+  search, Ctrl/Cmd-A selects all.
+  *(Open gap, stated honestly: the grid is **not** arrow-navigable and has no Shift-click range
+  select — see UI-SPEC §0.4. Focusable **cards** need a roving `tabindex` first, or Tab lands on all
+  50–100 of them; rings on controls, rows and chips stand alone and land ahead of it.)*
+- **Hit targets:** ≥ 28px in compact, ≥ 32px comfortable. In mockup content ≥ 44px.
+- **Motion/again:** reduced-motion respected per the §8 table; no essential info conveyed by
+  animation alone.
 
 ---
 
