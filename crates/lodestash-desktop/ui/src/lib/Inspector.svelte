@@ -1,5 +1,6 @@
 <script lang="ts">
   import Icon from "./Icon.svelte";
+  import CompareRows from "./CompareRows.svelte";
   import {
     assetDetail,
     previewUrl,
@@ -16,6 +17,7 @@
     collectionAddAsset,
     collectionRemoveAsset,
     type AssetDetail,
+    type CompareRow,
     type RelatedAsset,
     type CollectionRow,
   } from "./api";
@@ -95,7 +97,7 @@
   let collapsed = $derived(!view.inspectorOpen || (assetId == null && !compareIds));
 
   /** Compare rows: the fields two assets can actually be judged on, per modality. */
-  type CmpRow = { label: string; values: [string, string] };
+  type CmpRow = CompareRow;
   let compareRows = $derived.by<CmpRow[]>(() => {
     const pair = compare;
     if (!pair || pair.length !== 2) return [];
@@ -326,14 +328,8 @@
         </div>
       {/each}
     </div>
-    <!-- Rows where the two differ go gold on both sides; rows where they agree stay dim, so the eye
-         lands on the facts that decide it rather than on the whole table. -->
-    <div class="cmp-rows" data-testid="compare-rows">
-      {#each compareRows as r (r.label)}
-        <span class="cmp-k">{r.label}</span>
-        <span class="cmp-v num" class:differs={r.values[0] !== r.values[1]}>{r.values[0]}</span>
-        <span class="cmp-v num" class:differs={r.values[0] !== r.values[1]}>{r.values[1]}</span>
-      {/each}
+    <div class="cmp-table">
+      <CompareRows rows={compareRows} />
     </div>
     <footer class="cmp-foot">
       <button onclick={() => keepOnly(0)}>Keep left</button>
@@ -703,28 +699,10 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .cmp-rows {
-    display: grid;
-    grid-template-columns: 62px 1fr 1fr;
-    gap: 4px var(--sp-2);
-    align-items: center;
+  .cmp-table {
     margin-top: var(--sp-3);
     padding-top: var(--sp-3);
     border-top: 1px solid var(--ls-border);
-    font-size: var(--fs-xs);
-  }
-  .cmp-k {
-    color: var(--ls-text-dim);
-  }
-  /* Agreement is not a finding: only the rows that differ earn the eye. */
-  .cmp-v {
-    color: var(--ls-text-dim);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .cmp-v.differs {
-    color: var(--ls-gold);
   }
   .cmp-foot {
     display: flex;

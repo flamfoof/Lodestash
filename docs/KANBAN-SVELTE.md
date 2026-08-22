@@ -386,8 +386,15 @@ facet-group owner call).
       active project. **Delta:** only two of DG §7's four states — "in N others" needs a per-project
       read and "older copy" needs source-mtime vs `imported_at`. Never-imported correctly draws
       nothing.
-- [ ] **D11 — Duplicates as a queue.** Group list + the §13 compare pane, `n / N reviewed`, keeper
-      ribbon, keep-both / merge-tags / trash, `2 of 3 ›` cycling for larger groups. UI-SPEC §5.
+- [x] **D11 — Duplicates as a queue.** Group list (280px, resolved rows keep their place and show
+      their outcome) + the compare pane, `n / N groups reviewed` over a gold bar, keeper ribbon,
+      `2 of N ›` cycling with the keeper always holding the left pane, ↑↓ to move. The differ-is-gold
+      rule now lives in one shared `CompareRows` component used by both §13 and §5 — two copies of
+      it would have drifted. Exact groups queue ahead of visual ones: a byte-identical copy is
+      unambiguously safe to trash and a dHash match is not.
+      **Not verified end-to-end here:** the e2e check exists but *skips* — this library has fewer
+      than two duplicate groups, so the queue path has never actually run. **Delta:** "Merge tags
+      onto keeper" (§5) is still not built; the actions are Keep both / Move to Trash.
 - [ ] **D12 — Responsive ladder.** 1400 hint · 1280 overlay inspector · 1120 icon rail + facet
       flyout · 960 `⋯` overflow; floor 900×600. DG §4; ADR-0009.
 - [x] **D13 — Onboarding copy.** The shipped onboarding is the one-screen explainer, not §1's

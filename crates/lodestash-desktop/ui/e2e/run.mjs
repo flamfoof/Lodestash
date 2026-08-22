@@ -717,9 +717,51 @@ try {
 
     await page.getByRole("button", { name: "Duplicates" }).click();
     await page.waitForSelector(
-      groups.length > 0 ? '[data-testid="dup-groups"]' : '[data-testid="empty"]',
+      groups.length > 0 ? '[data-testid="dup-list"]' : '[data-testid="empty"]',
       { timeout: 5000 },
     );
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.waitForSelector(".card", { timeout: 5000 });
+  });
+
+  // ── D11: Duplicates is a queue reviewed in the compare pane ──────────────────────────────────
+  // "Keep both" is session-only — it decides nothing in the catalog — so this drives the real UI
+  // without writing anything. Skips honestly when this library has no duplicate groups rather than
+  // asserting on an empty screen and calling that a pass.
+  await check("the duplicates queue keeps your place after a decision", async () => {
+    const groups = await invoke("duplicate_groups");
+    const near = await invoke("near_duplicate_groups").catch(() => []);
+    if (groups.length + near.length < 2) {
+      console.log("       skipped — this library has fewer than two duplicate groups");
+      return;
+    }
+    await page.getByRole("button", { name: "Duplicates" }).click();
+    await page.waitForSelector('[data-testid="dup-pane"]', { timeout: 5000 });
+
+    const before = await page.evaluate(() =>
+      document.querySelector('[data-testid="dup-row-0"]')?.className ?? "",
+    );
+    assert.ok(!before.includes("done"), "the first group is already marked resolved");
+
+    await page.click('[data-testid="keep-both"]');
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="dup-row-0"]')?.className.includes("done"),
+      undefined,
+      { timeout: 5000 },
+    );
+    // The resolved row stays in place with its outcome — the queue must read as work done, not as
+    // work vanishing — and the cursor has moved on to the next undecided group.
+    const after = await page.evaluate(() => ({
+      first: document.querySelector('[data-testid="dup-row-0"]')?.className ?? "",
+      onIndex: [...document.querySelectorAll('[data-testid^="dup-row-"]')].findIndex((r) =>
+        r.className.includes("on"),
+      ),
+      rows: document.querySelectorAll('[data-testid^="dup-row-"]').length,
+    }));
+    assert.ok(after.first.includes("done"), "the decision did not stick to its row");
+    assert.notEqual(after.onIndex, 0, "the cursor stayed on the group just decided");
+    assert.equal(after.rows, groups.length + near.length, "a resolved group vanished from the list");
+
     await page.getByRole("button", { name: "Library", exact: true }).click();
     await page.waitForSelector(".card", { timeout: 5000 });
   });

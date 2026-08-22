@@ -177,6 +177,13 @@ export type Stats = {
 };
 
 /** One exact-duplicate group (UI-SPEC §5). A review queue — nothing resolves itself. */
+/**
+ * One row of a two-column comparison (UI-SPEC §13 / §5). Lives here rather than in the component
+ * because both the inspector (`AssetDetail`) and Duplicates (`GridItem`) build these from different
+ * shapes — and a Svelte component's instance script cannot export a type.
+ */
+export type CompareRow = { label: string; values: [string, string] };
+
 export type DupGroup = {
   hash: string;
   size_bytes: number;
