@@ -330,9 +330,19 @@ facet-group owner call).
 - [x] **D2 — Active-filter bar.** One strip under the toolbar, one removable chip per active
       constraint, `n of N shown` + Clear all, not rendered when nothing is filtered; `+N more`
       popover past one row. UI-SPEC §2 item 7; DG §7 "Active-filter bar".
-- [ ] **D3 — Appraisal in the tray.** Auto-start after scan (honours `auto_identify`), priority
-      queue (on-screen → current filter → newest), pause/resume, per-source Appraise, Identify screen
-      becomes a dashboard. UI-SPEC §3; ADR-0008.
+- [x] **D3a — Appraisal runs itself.** The background pass already existed in the writer's idle
+      loop; it was gated on `auto_identify`, which **defaulted to off** — so the product's central
+      capability was opt-in and onboarding's first sentence to a new user was false. Default flipped
+      (ADR-0008), and the Identify screen is a dashboard: a running/paused row whose Pause writes
+      that same setting (it *is* the switch — a second flag would give the app two answers to "is
+      appraisal running?"), plus per-source backlog rows with their own ✦ Appraise via a new
+      `identify_ids` command, so 400 assets is one bounded pass rather than 400.
+      **Note:** the default only affects fresh configs; an existing `config.json` keeps the value it
+      has, so anyone who ran this build before still has it off.
+- [ ] **D3b — The priority queue.** On-screen → rest of the current filter → everything else, newest
+      first, re-ordered as you browse (UI-SPEC §3). Needs the frontend to tell the writer what is
+      visible, and the idle pass to consume an ordering rather than picking by dirty-flag order.
+      This is the half that makes the backlog follow the user rather than merely run.
 - [ ] **D4 — Keep-it ladder.** ★ pin / ⟡ tray / ▣ collection given one stated relationship, plus
       "Save the staging tray as a collection" and empty states that teach the difference.
       UI-SPEC §6, §16.2.
@@ -377,9 +387,12 @@ facet-group owner call).
       ribbon, keep-both / merge-tags / trash, `2 of 3 ›` cycling for larger groups. UI-SPEC §5.
 - [ ] **D12 — Responsive ladder.** 1400 hint · 1280 overlay inspector · 1120 icon rail + facet
       flyout · 960 `⋯` overflow; floor 900×600. DG §4; ADR-0009.
-- [ ] **D13 — Onboarding copy.** Step 2's amber callout becomes the arcane "Appraisal has started";
-      the Run-identification / Skip fork goes. UI-SPEC §1. *(Consequence of D3 — shipping D3 without
-      this leaves the first thing the app says to a new user false.)*
+- [x] **D13 — Onboarding copy.** The shipped onboarding is the one-screen explainer, not §1's
+      two-step scan wizard, so the change landed there: step 2 now says appraisal **starts by
+      itself** rather than implying there is something you must go and run. Assets still arrive
+      Unidentified — softening that would hide why early AI searches come back thin.
+      **Delta:** §1's scan wizard (progress log, completion callout, Open library / Watch progress)
+      is still unbuilt; its copy in the spec is written for ADR-0008 and waits on the wizard.
 - [x] **D14 — Empty states.** One `EmptyState` component enforcing the anatomy (32px nav glyph ·
       statement title · one teaching line · at most one action), across Collections / Duplicates /
       Packages / Unity Assets / Identify. Filtered-empty cases stay separate — those need a way out,

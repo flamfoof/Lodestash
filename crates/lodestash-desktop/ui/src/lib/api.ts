@@ -313,6 +313,10 @@ export const applyMapping = (taxonomyId: number) => invoke<{ changed: number }>(
 /** ✦ Identify all — one bounded appraise pass on the persist thread (B11). */
 export const identifyAll = () => invoke<WriteResult>("identify_all");
 /** ✦ Identify one asset (B11b) — flags it dirty and appraises it in one bounded pass. */
+/** Appraise an explicit set in ONE bounded pass — what "Appraise this source" runs (UI-SPEC §3). */
+export const identifyIds = (assetIds: number[]) =>
+  invoke<WriteResult>("identify_ids", { assetIds });
+
 export const identifyAsset = (assetId: number) =>
   invoke<WriteResult>("identify_asset", { assetId });
 /** True while the persist thread is inside an appraise pass (B11d). */

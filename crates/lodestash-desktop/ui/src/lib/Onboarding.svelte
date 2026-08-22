@@ -47,8 +47,12 @@
       </li>
       <li>
         <span class="n">2</span>
-        <span>Assets arrive <b>Unidentified</b> (<span class="q">???</span>). Appraisal runs once
-        per asset, locally — no account, no cloud.</span>
+        <!-- ADR-0008 (D13): appraisal is a background job now, so the honest sentence is that it
+             has already started. The old copy left a new user believing there was something they
+             had to go and run. Assets *do* still arrive Unidentified — softening that would hide
+             why the first AI searches come back thin. -->
+        <span>Assets arrive <b>Unidentified</b> (<span class="q">???</span>). Appraisal starts by
+        itself and runs in the background, once per asset, locally — no account, no cloud.</span>
       </li>
       <li>
         <span class="n">3</span>

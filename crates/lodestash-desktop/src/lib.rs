@@ -1024,8 +1024,19 @@ fn identify_all(state: tauri::State<'_, AppState>) -> Result<WriteResult, String
     state.write(Op::IdentifyAll)
 }
 
-/// ✦ Identify one asset (B11b) — flags it dirty and runs one bounded appraise pass, so the
-/// per-card ✦ on a fresh/duplicated asset produces its tags and thumbnail now.
+/// ✦ Appraise an explicit set — one bounded pass for the whole set, not one per asset.
+///
+/// What "Appraise this source" on the Identify dashboard (UI-SPEC §3) runs: a source or a pack is
+/// the unit people think in, and asking for 400 assets must not mean 400 passes.
+#[tauri::command]
+fn identify_ids(
+    state: tauri::State<'_, AppState>,
+    asset_ids: Vec<i64>,
+) -> Result<WriteResult, String> {
+    state.write(Op::IdentifyIds { asset_ids })
+}
+
+/// Appraise one asset now (per-card ✦, KANBAN B11b).
 #[tauri::command]
 fn identify_asset(state: tauri::State<'_, AppState>, asset_id: i64) -> Result<WriteResult, String> {
     state.write(Op::IdentifyOne { asset_id })
@@ -1835,6 +1846,7 @@ pub fn run() {
             delete_rule,
             identify_all,
             identify_asset,
+            identify_ids,
             pump_active,
             pump_progress,
             engine_bridge,

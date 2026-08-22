@@ -589,7 +589,12 @@ impl Default for AppConfig {
             confirm_before_trash: true,
             tagger_model: None,
             tagger_vision_model: None,
-            auto_identify: false,
+            // ADR-0008: appraisal is a background job, not a screen you sit on — so the switch
+            // that gates the writer's idle appraise pass starts **on**. Every asset enters
+            // Unidentified and invisible to AI search; leaving this off by default made the
+            // product's central capability opt-in, and made onboarding's first sentence to a
+            // new user false. Turning it off still leaves the manual per-source path.
+            auto_identify: true,
             api_tagging_enabled: false,
             api_base_url: default_api_base_url(),
             api_model: None,
