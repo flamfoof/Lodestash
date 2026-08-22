@@ -407,9 +407,12 @@ facet-group owner call).
       DG §7 had already specified Copy path and nothing built it. Also added: `Escape` clears the
       selection per UI-SPEC §0.4, which was never implemented and without which D5's collapsed rail
       is unreachable from the keyboard.
-- [ ] **D15 — Grid keyboard nav (deferred, now a dependency).** Roving `tabindex` so the grid is one
-      tab stop, arrow keys inside, Shift+arrow/click ranges. Deliberately out of the design pass, but
-      D9 cannot put a ring on a **card** without it. UI-SPEC §0.4; DG §9 records it as an open gap.
+- [x] **D15 — Grid keyboard nav.** Roving `tabindex` (one tab stop), arrows move the lead with
+      focus following it, ↑↓ by a whole row read off the *resolved* `grid-template-columns` rather
+      than recomputed from density, Home/End, and Shift+arrow/click extending the pick set. Left out
+      of the design pass and pulled back in because D9 cannot put a ring on a card without it.
+      Pinned by a check asserting focus and the lead never come apart, and that the grid offers
+      exactly one tab stop. UI-SPEC §0.4; DG §9 no longer records it as a gap.
 
 ---
 

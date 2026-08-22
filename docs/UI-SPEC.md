@@ -161,6 +161,9 @@ A **Favorites screen** sits second in the nav (§0.2), header `★ Favorites` + 
 | `← →` | Quick Look open | step prev/next within the visible set |
 | `Backspace` | Folders view | up one level |
 | `Ctrl/Cmd-A` | grid | select all in current filter |
+| `← → ↑ ↓` | grid | move the lead selection (↑↓ by one row); focus follows it |
+| `Shift` + arrow / click | grid | extend the **pick set** (what the bulk bar acts on) from the lead |
+| `Home` / `End` | grid | first / last of the visible page |
 | `Ctrl/Cmd-Z / Shift-Z` | catalog mutations | undo / redo (DESIGN-GUIDELINES §7) |
 | `Ctrl/Cmd-K` | anywhere | open the command palette: asset search + navigation (ROADMAP P7) |
 

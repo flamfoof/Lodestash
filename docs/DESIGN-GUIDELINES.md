@@ -572,10 +572,13 @@ Progress meters animate smoothly; never spin gratuitously.
   - **Never colour alone.** Focus is a ring; selection is a border **plus** ring; status is a left
     rail **plus** a gem. Three facts, three shapes.
 - **Keyboard nav:** **Space** = Quick Look, **Enter** = open, **Del** = move to Trash, `/` focuses
-  search, Ctrl/Cmd-A selects all.
-  *(Open gap, stated honestly: the grid is **not** arrow-navigable and has no Shift-click range
-  select — see UI-SPEC §0.4. Focusable **cards** need a roving `tabindex` first, or Tab lands on all
-  50–100 of them; rings on controls, rows and chips stand alone and land ahead of it.)*
+  search, Ctrl/Cmd-A selects all. The **grid is one tab stop** — a roving `tabindex` keeps exactly
+  one card tabbable and the arrow keys move within it, so Tab never walks 50–100 cards to leave the
+  grid. Arrows move the lead selection (↑↓ by a whole row, read off the resolved
+  `grid-template-columns` rather than recomputed), **Home/End** jump to the ends, and **Shift**
+  with an arrow or a click extends the *pick set* the bulk bar acts on.
+  **Focus follows the lead**: if the two came apart, Tab would return you to a card the inspector is
+  not describing, and the ring would point at the wrong asset.
 - **Hit targets:** ≥ 28px in compact, ≥ 32px comfortable. In mockup content ≥ 44px.
 - **Motion/again:** reduced-motion respected per the §8 table; no essential info conveyed by
   animation alone.

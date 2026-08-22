@@ -923,6 +923,62 @@ try {
     await page.click('[data-testid="bulk-clear"]');
   });
 
+  // ── D15: the grid is one tab stop, and arrows move inside it ─────────────────────────────────
+  // The property that matters is that focus and the lead selection stay together: if they came
+  // apart, Tab would return you to a card the inspector is not describing, and the focus ring would
+  // be pointing at the wrong asset.
+  await check("arrow keys move the lead, and focus goes with it", async () => {
+    await page.fill('input[type="text"]', "");
+    await page.waitForFunction(() => document.querySelectorAll(".card").length > 6, undefined, {
+      timeout: 5000,
+    });
+    await page.locator(".card").first().click();
+    await page.waitForSelector('[data-testid="inspector-name"]', { timeout: 5000 });
+    const first = await page.evaluate(
+      () => document.querySelector(".card.selected")?.getAttribute("data-asset-id"),
+    );
+
+    await page.keyboard.press("ArrowRight");
+    await page.waitForFunction(
+      (was) => document.querySelector(".card.selected")?.getAttribute("data-asset-id") !== was,
+      first,
+      { timeout: 5000 },
+    );
+    const moved = await page.evaluate(() => ({
+      selected: document.querySelector(".card.selected")?.getAttribute("data-asset-id"),
+      focused: document.activeElement?.getAttribute("data-asset-id"),
+      tabbable: document.querySelectorAll('.card[tabindex="0"]').length,
+    }));
+    assert.notEqual(moved.selected, first, "ArrowRight did not move the lead");
+    assert.equal(moved.focused, moved.selected, "focus and the lead selection came apart");
+    assert.equal(moved.tabbable, 1, `the grid offers ${moved.tabbable} tab stops, not one`);
+
+    // ArrowDown must move by a whole row, which is what makes this navigation rather than a list.
+    const cols = await page.evaluate(() => {
+      const el = document.querySelector('[data-testid="grid"]');
+      return getComputedStyle(el).gridTemplateColumns.split(/\s+/).filter(Boolean).length;
+    });
+    if (cols > 1) {
+      const ids = await page.evaluate(() =>
+        [...document.querySelectorAll(".card")].map((c) => c.getAttribute("data-asset-id")),
+      );
+      const before = ids.indexOf(moved.selected);
+      await page.keyboard.press("ArrowDown");
+      await page.waitForFunction(
+        (was) => document.querySelector(".card.selected")?.getAttribute("data-asset-id") !== was,
+        moved.selected,
+        { timeout: 5000 },
+      );
+      const after = ids.indexOf(
+        await page.evaluate(
+          () => document.querySelector(".card.selected")?.getAttribute("data-asset-id"),
+        ),
+      );
+      assert.equal(after - before, cols, `ArrowDown moved ${after - before} places for ${cols} columns`);
+    }
+    await page.keyboard.press("Escape");
+  });
+
   await check("double-click opens Quick Look on the right asset", async () => {
     await page.fill('input[type="text"]', "");
     // Wait for the grid to settle before pinning an element: a `locator` re-resolves on every

@@ -16,6 +16,7 @@
   let {
     item,
     selected = false,
+    focusable = false,
     onselect,
     onopen,
     onidentified,
@@ -24,7 +25,16 @@
   }: {
     item: GridItem;
     selected?: boolean;
-    onselect?: (id: number) => void;
+    /**
+     * Click. `range` is true when Shift was held — the grid extends the pick set from the lead to
+     * this card rather than moving the lead (D15).
+     */
+    onselect?: (id: number, range?: boolean) => void;
+    /**
+     * D15 roving `tabindex`: the grid is ONE tab stop and arrows move inside it. Without this, a
+     * focus ring on cards means Tab lands on all 50–100 of them before it reaches anything else.
+     */
+    focusable?: boolean;
     onopen?: (id: number) => void;
     /** After a ✦ identify completes (B11b) — lets the grid bump its page so the new
      *  preview/tags render. */
@@ -147,7 +157,9 @@
   class:unidentified
   class:selected
   style="--tint: {tint}"
-  onclick={() => onselect?.(item.asset_id)}
+  data-asset-id={item.asset_id}
+  tabindex={focusable ? 0 : -1}
+  onclick={(e) => onselect?.(item.asset_id, e.shiftKey)}
   oncontextmenu={(e) => {
     e.preventDefault();
     onmenu?.(e, item.asset_id);

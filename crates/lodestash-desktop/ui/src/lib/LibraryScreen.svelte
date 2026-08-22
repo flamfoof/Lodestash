@@ -111,10 +111,76 @@
     view.selected = next.asset_id;
   }
 
+  /**
+   * How many columns the grid is actually rendering (D15).
+   *
+   * Read off the resolved `grid-template-columns` rather than recomputed from the density: the
+   * track count is what `auto-fill` decided at this window width, and any arithmetic here would
+   * disagree with it at exactly the sizes where a wrong answer is most confusing.
+   */
+  function gridCols(): number {
+    const el = document.querySelector('[data-testid="grid"]');
+    if (!el) return 1;
+    const tracks = getComputedStyle(el).gridTemplateColumns.split(/\s+/).filter(Boolean).length;
+    return Math.max(1, tracks);
+  }
+
+  /**
+   * Move the lead selection by `delta` places through the visible page, and take focus with it.
+   *
+   * Focus follows the selection because the roving `tabindex` makes the grid one tab stop: if the
+   * two ever came apart, Tab would return you to a card that is not the one the inspector is
+   * describing.
+   */
+  function moveLead(delta: number, extend: boolean) {
+    const items = result?.items ?? [];
+    if (items.length === 0) return;
+    const at = items.findIndex((i) => i.asset_id === view.selected);
+    const next = at < 0 ? 0 : Math.min(items.length - 1, Math.max(0, at + delta));
+    const id = items[next].asset_id;
+    if (extend && at >= 0) {
+      // Shift extends the *pick set* from the old lead to the new one, the way a file manager does
+      // — the bulk bar acts on that set, so a range has to be a range and not two loose picks.
+      const [lo, hi] = at < next ? [at, next] : [next, at];
+      const span = items.slice(lo, hi + 1).map((i) => i.asset_id);
+      view.selectedIds = Array.from(new Set([...view.selectedIds, ...span]));
+    }
+    view.selected = id;
+    queueMicrotask(() => {
+      const el = document.querySelector<HTMLElement>(`.card[data-asset-id="${id}"]`);
+      el?.focus({ preventScroll: false });
+    });
+  }
+
   function onkeydown(e: KeyboardEvent) {
     // Never steal keys from the search box or a focused control.
     if (e.target instanceof HTMLInputElement) return;
     if (e.target instanceof HTMLTextAreaElement) return;
+
+    // D15: arrows navigate the grid. A card *is* a <button>, so this has to run before the blanket
+    // button guard below — otherwise the one element the arrows exist for is the one they ignore.
+    const onCard = e.target instanceof HTMLElement && e.target.classList.contains("card");
+    const inGrid = view.rowStyle === "grid" && view.browse !== "folders";
+    if (inGrid && (onCard || view.selected !== null) && quickLook === null) {
+      const cols = gridCols();
+      const step: Record<string, number> = {
+        ArrowRight: 1,
+        ArrowLeft: -1,
+        ArrowDown: cols,
+        ArrowUp: -cols,
+      };
+      if (e.key in step) {
+        e.preventDefault();
+        moveLead(step[e.key], e.shiftKey);
+        return;
+      }
+      if (e.key === "Home" || e.key === "End") {
+        e.preventDefault();
+        moveLead(e.key === "Home" ? -1e6 : 1e6, e.shiftKey);
+        return;
+      }
+    }
+
     if (e.target instanceof HTMLButtonElement || e.target instanceof HTMLSelectElement) return;
     // Space toggles Quick Look (UI-SPEC §0.4): opens on the selection, closes when open.
     if (e.code === "Space") {
@@ -395,7 +461,22 @@
             <Card
               {item}
               selected={view.selected === item.asset_id}
-              onselect={(id) => (view.selected = id)}
+              focusable={view.selected === item.asset_id ||
+                (view.selected === null && item.asset_id === result.items[0]?.asset_id)}
+              onselect={(id, range) => {
+                if (range && view.selected !== null) {
+                  const ids = result?.items.map((i) => i.asset_id) ?? [];
+                  const from = ids.indexOf(view.selected);
+                  const to = ids.indexOf(id);
+                  if (from >= 0 && to >= 0) {
+                    const [lo, hi] = from < to ? [from, to] : [to, from];
+                    view.selectedIds = Array.from(
+                      new Set([...view.selectedIds, ...ids.slice(lo, hi + 1)]),
+                    );
+                  }
+                }
+                view.selected = id;
+              }}
               onopen={(id) => (quickLook = id)}
               onmenu={(e, id) => (menu = { x: e.clientX, y: e.clientY, id })}
               onidentified={() => (view.dataVersion += 1)}
