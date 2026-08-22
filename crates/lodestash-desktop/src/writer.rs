@@ -72,6 +72,16 @@ pub enum Op {
     /// connection — and it is a `stat` per source **root**, not per asset, so it stays cheap enough
     /// to run on open and after every scan.
     RefreshSourceHealth,
+    /// Point a source at a new root (UI-SPEC §11.1). The drive came back under a different letter,
+    /// the folder moved, the library was copied to a bigger disk.
+    ///
+    /// A rename, not a re-scan: `asset_file.rel_path` is relative, so every row keeps its identity,
+    /// tags, stars and import history. Only `import_source.root_path` and the absolute
+    /// `package.package_path` under it are rewritten.
+    RelinkSource {
+        source_id: i64,
+        new_root: std::path::PathBuf,
+    },
     /// Soft delete / restore. Catalog-only; the file on disk is never touched (DATA-MODEL §8).
     SetTrashed {
         ids: Vec<i64>,
@@ -1077,6 +1087,19 @@ fn run(
             .refresh_source_health()
             .map(|moved| WriteResult {
                 changed: moved.len(),
+                ..Default::default()
+            })
+            .map_err(|e| e.to_string()),
+
+        // `changed` is the number of packs re-anchored with the root. The asset count the panel
+        // promised comes from `relink_preview`, which ran before the user committed.
+        Op::RelinkSource {
+            source_id,
+            new_root,
+        } => catalog
+            .relink_source(source_id, &new_root)
+            .map(|moved| WriteResult {
+                changed: moved,
                 ..Default::default()
             })
             .map_err(|e| e.to_string()),

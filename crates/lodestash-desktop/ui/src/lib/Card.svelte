@@ -12,6 +12,7 @@
     identifyAsset,
   } from "./api";
   import { traitColor } from "./traits.svelte";
+  import { sources } from "./sources.svelte";
 
   let {
     item,
@@ -82,6 +83,21 @@
     if (staging?.toggleStage) staging.toggleStage(item.asset_id);
     else void stage([item.asset_id]);
   }
+
+  /**
+   * The source this row belongs to is not on disk right now (UI-SPEC §11.1).
+   *
+   * The catalog keeps every fact it holds — name, pack, tags, tier, stars, imported badge all
+   * still read, which is the entire point of an index. Only the two things that need the *bytes*
+   * change: the artwork becomes a stated plate instead of a broken image, and ⟡ goes inert,
+   * because staging a file the import would skip is a promise the tray cannot keep.
+   *
+   * ⤤ deliberately stays live and is the one useful thing left: it opens Quick Look's
+   * "isn't reachable" panel, which carries the path and **Relink**. (UI-SPEC §11.1 said both went
+   * inert; an inert ⤤ beside a live double-click on the same card is a contradiction, and it would
+   * leave the panel the same section specifies reachable only by accident. Bullet amended there.)
+   */
+  let unreachable = $derived(sources.unavailable(item.source_id));
 
   let tint = $derived(`var(${typeToken(item.media_type)})`);
   // Vector preview if the model has one, else a raster thumbnail, else the type mark. `thumbFailed`
@@ -167,8 +183,16 @@
   ondblclick={() => onopen?.(item.asset_id)}
   title={item.rel_path}
 >
-  <div class="thumb" class:unid={unidentified}>
-    {#if src}
+  <div class="thumb" class:unid={unidentified} class:unreachable>
+    {#if unreachable}
+      <!-- Stated, not broken (UI-SPEC §11.1). A missing drive that renders as a failed <img>
+           reads as "Lodestash is broken"; this reads as "the drive is out", which is true and
+           actionable. -->
+      <span class="gone-plate" data-testid="card-unavailable">
+        <span class="gone-mark" aria-hidden="true">✕</span>
+        <span class="gone-text">file unavailable</span>
+      </span>
+    {:else if src}
       <!-- Vector previews render natively as SVG; rasters come from the on-disk thumb cache —
            and for audio the thumb route draws the *real* envelope, which beats the hashed
            silhouette below. So the server's answer wins whenever there is one. -->
@@ -309,24 +333,32 @@
           }
         }}
       >⤢</span>
+      <!-- Inert while the source is away, and still focusable and still explaining itself: a
+           control that vanishes teaches nothing, and one that silently does nothing is worse. -->
       <span
         class="act stage-btn"
         class:on={staged}
+        class:inert={unreachable}
         role="button"
         tabindex="0"
-        title={staged ? "Staged — click to remove from the tray" : "Stage for import"}
+        aria-disabled={unreachable}
+        title={unreachable
+          ? `${sources.get(item.source_id)?.name ?? "This library"} is unavailable — an import would skip this file`
+          : staged
+            ? "Staged — click to remove from the tray"
+            : "Stage for import"}
         aria-label={staged ? `Unstage ${item.name}` : `Stage ${item.name}`}
         aria-pressed={staged}
         data-testid="card-stage"
         onclick={(e) => {
           e.stopPropagation();
-          onStageClick();
+          if (!unreachable) onStageClick();
         }}
         onkeydown={(e) => {
           if (e.key === "Enter" || e.key === " ") {
             e.preventDefault();
             e.stopPropagation();
-            onStageClick();
+            if (!unreachable) onStageClick();
           }
         }}
       >⟡</span>
@@ -619,6 +651,45 @@
   .act:hover {
     border-color: var(--ls-gold);
     color: var(--ls-gold-bright);
+  }
+  /* Inert, not hidden (UI-SPEC §11.1): the control still takes focus and still says why. Marked
+     by shape as well as colour — the strike-through survives a monochrome display and a reader
+     who cannot separate dim gold from gold (DESIGN-GUIDELINES §9). */
+  .act.inert {
+    color: var(--ls-text-dim);
+    cursor: default;
+    text-decoration: line-through;
+  }
+  .act.inert:hover {
+    border-color: var(--ls-border);
+    color: var(--ls-text-dim);
+  }
+
+  /* The `file unavailable` plate (UI-SPEC §11.1). Hatched rather than flat: an empty dark square
+     is what a *failed* thumbnail looks like, and the whole point is that this is not a failure. */
+  .thumb.unreachable {
+    background:
+      repeating-linear-gradient(
+        45deg,
+        transparent 0 6px,
+        color-mix(in srgb, var(--ls-text-dim) 9%, transparent) 6px 12px
+      ),
+      var(--ls-bg);
+  }
+  .gone-plate {
+    display: grid;
+    place-items: center;
+    gap: 2px;
+    color: var(--ls-text-dim);
+  }
+  .gone-mark {
+    font-size: 20px;
+    line-height: 1;
+    color: var(--ls-danger);
+  }
+  .gone-text {
+    font-size: var(--fs-xs);
+    letter-spacing: 0.04em;
   }
   /* A staged card keeps its ⟡ lit with the tray open, so the grid shows what is in the basket
      without hovering every card. */

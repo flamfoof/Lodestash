@@ -1895,6 +1895,123 @@ try {
     assert.equal(offTrack.length, 0, "a card is wider than the grid cell that wraps it");
   });
 
+  // D7b — source availability, the rest (UI-SPEC §11.1). These run against whatever the real
+  // catalog holds: if every source is reachable there is nothing to prove and they skip, which is
+  // honest. On this machine source 4's root is a scratchpad folder from an old session, so the
+  // whole path — plate, inert ⟡, Quick Look panel, relink count — is exercised for real.
+  await check("an asset on an unavailable source draws a plate, not a broken image", async () => {
+    const s = await invoke("library_status");
+    const gone = s.sources.find((x) => x.state === "unavailable");
+    if (!gone) return; // every drive is plugged in — nothing to say
+    const p = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    const item = p.items.find((i) => i.source_id === gone.id);
+    assert.ok(
+      item,
+      `source ${gone.name} is unavailable but owns no listed asset — the index did not survive the drive`,
+    );
+
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.fill('input[type="text"]', item.name);
+    await page.waitForFunction(
+      (id) => !!document.querySelector(`.card[data-asset-id="${id}"]`),
+      item.asset_id,
+      { timeout: 5000 },
+    );
+    const card = page.locator(`.card[data-asset-id="${item.asset_id}"]`);
+    assert.equal(
+      await card.locator('[data-testid="card-unavailable"]').count(), 1,
+      "no `file unavailable` plate on a card whose source is gone",
+    );
+    // Inert, but still there and still focusable — a control that vanishes teaches nothing.
+    const stage = card.locator('[data-testid="card-stage"]');
+    assert.equal(await stage.count(), 1, "the stage button disappeared instead of going inert");
+    assert.equal(await stage.getAttribute("aria-disabled"), "true", "the stage action is live on an unreachable file");
+    assert.equal(await stage.getAttribute("tabindex"), "0", "the inert stage action dropped out of the tab order");
+    assert.ok(
+      (await stage.getAttribute("title"))?.includes("unavailable"),
+      "the inert stage action does not explain itself",
+    );
+    // Everything the catalog knows still reads — the whole point of having an index.
+    const name = (await card.locator(".name").textContent())?.trim();
+    assert.equal(name, item.name, `the card lost its name: "${name}"`);
+  });
+
+  await check("Quick Look says the file is not reachable, and offers the path and a relink", async () => {
+    const s = await invoke("library_status");
+    const gone = s.sources.find((x) => x.state === "unavailable");
+    if (!gone) return;
+    const p = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    const item = p.items.find((i) => i.source_id === gone.id);
+    if (!item) return;
+
+    await page.locator(`.card[data-asset-id="${item.asset_id}"]`).first().dblclick();
+    await page.waitForSelector('[data-testid="quicklook"]', { timeout: 5000 });
+    await page.waitForSelector('[data-testid="ql-unavailable"]', { timeout: 5000 });
+    const panel = (await page.locator('[data-testid="ql-unavailable"]').textContent()) ?? "";
+    assert.ok(panel.includes("reachable"), `the panel reads: ${panel}`);
+    assert.ok(panel.includes(gone.name), "the panel does not name the library that went away");
+    // The declared path is what the user needs to recognise the drive; it must be the *source's*
+    // root, not the asset's, because that is what Relink changes.
+    const declared = await page.locator('[data-testid="ql-unavailable"] .declared').textContent();
+    assert.equal(declared?.trim(), gone.root_path, "the panel shows something other than the source's declared root");
+    assert.equal(await page.locator('[data-testid="ql-relink"]').count(), 1, "no Relink action");
+    assert.equal(await page.locator('[data-testid="ql-copy-path"]').count(), 1, "no Copy path action");
+    // The full-size action stays live precisely so this panel is reachable; no viewer may be
+    // spinning behind it waiting for bytes that are not coming.
+    assert.equal(
+      await page.locator('[data-testid="ql-stage"]').getAttribute("data-kind"), "unreachable",
+      "Quick Look tried to decode a file that is not there",
+    );
+    await page.keyboard.press("Escape");
+    await page.waitForSelector('[data-testid="quicklook"]', { state: "detached", timeout: 5000 });
+    await page.fill('input[type="text"]', "");
+  });
+
+  // The number the relink panel puts in front of the decision. Read-only on purpose: committing a
+  // relink would rewrite the user's own catalog, and the write half is mutation-checked in Rust
+  // (`relink_counts_before_it_commits_and_rewrites_only_paths`).
+  await check("relink_preview counts what a candidate folder actually holds", async () => {
+    const s = await invoke("library_status");
+    const gone = s.sources.find((x) => x.state === "unavailable");
+    if (!gone) return;
+    const empty = await invoke("relink_preview", { sourceId: gone.id, newRoot: process.cwd() });
+    assert.ok(empty.total > 0, "a source with listed assets previewed a total of 0");
+    assert.equal(empty.matched, 0, `an unrelated folder matched ${empty.matched} of ${empty.total} files`);
+    // A folder that is not one must be refused rather than counted as a total miss — "0 of 4,206
+    // matched" for a mistyped path reads as a real answer.
+    await assert.rejects(
+      () => invoke("relink_preview", { sourceId: gone.id, newRoot: `${process.cwd()}/no-such-folder-here` }),
+      "a nonexistent folder previewed as a legitimate zero",
+    );
+  });
+
+  await check("an unavailable source offers Relink, and the panel names the declared root", async () => {
+    const s = await invoke("library_status");
+    const gone = s.sources.find((x) => x.state === "unavailable");
+    if (!gone) return;
+    await page.getByRole("button", { name: "Settings" }).click();
+    await page.waitForSelector('[data-testid="sources"]', { timeout: 5000 });
+    const toggle = page.locator(`[data-testid="relink-toggle-${gone.id}"]`);
+    assert.equal(await toggle.count(), 1, "an unavailable source offers no way to relink it");
+    await toggle.click();
+    await page.waitForSelector(`[data-testid="relink-${gone.id}"]`, { timeout: 3000 });
+    const declared = await page.locator(`[data-testid="relink-${gone.id}"] .declared`).textContent();
+    assert.equal(declared?.trim(), gone.root_path, "the panel shows the wrong declared root");
+    // Nothing commits until a folder is chosen and counted.
+    assert.equal(
+      await page.locator(`[data-testid="relink-commit-${gone.id}"]`).count(), 0,
+      "the relink button is live before anything has been counted",
+    );
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.waitForSelector(".card", { timeout: 5000 });
+  });
+
   // B2b: the Unity Assets batch bar. Ticking a pack must surface "▶ Extract selected (N)" —
   // the queue the job tray shows while packs unpack one at a time (UI-SPEC §5).
   await check("ticking a pack arms the batch extract bar", async () => {

@@ -30,7 +30,7 @@ import JobTray from "./lib/JobTray.svelte";
     setTrashed,
     engineImport,
     addSourceDialog,
-    pickPackageFolder,
+    pickFolder,
     removeFromLibrary,
     deleteFromDisk,
     getWebPrefs,
@@ -51,9 +51,17 @@ import JobTray from "./lib/JobTray.svelte";
   import SourceChooser from "./lib/SourceChooser.svelte";
   import ImportDialog from "./lib/ImportDialog.svelte";
   import { push, dismiss, act, freeze, thaw, toasts, overflow } from "./lib/toasts.svelte";
+  import { sources } from "./lib/sources.svelte";
 
   let status = $state<LibraryStatus | null>(null);
   let reloading = $state(false);
+
+  // One mirror of source availability for everything below the fold (UI-SPEC §11.1). `status` is
+  // assigned from eight places here — open, navigation, pump events, reload, drops — so this
+  // watches the value rather than each assignment: one of those is always the one someone forgets.
+  $effect(() => {
+    sources.sync(status);
+  });
 
   // List-row height is token-driven: the frame sets `data-density`, tokens.css maps it to
   // `--row-h` / `--control-h` (32 / 36 / 40 per DESIGN-GUIDELINES §4) — one source of truth.
@@ -320,7 +328,7 @@ import JobTray from "./lib/JobTray.svelte";
   async function importFromFolder() {
     chooserOpen = false;
     try {
-      const p = await pickPackageFolder();
+      const p = await pickFolder();
       if (p) importRoot = p;
     } catch (e) {
       actionError = String(e);
@@ -330,7 +338,7 @@ import JobTray from "./lib/JobTray.svelte";
   // Re-pick the folder from inside the open import dialog (the parent owns the path).
   async function repickImportFolder() {
     try {
-      const p = await pickPackageFolder();
+      const p = await pickFolder();
       if (p) importRoot = p;
     } catch (e) {
       actionError = String(e);

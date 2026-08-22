@@ -362,6 +362,20 @@ Four states, bottom-left of the artwork beside the size tier (UI-SPEC §2.5):
 On a **list row** there is no room for the project name: the check alone, after the name, with the
 full text on hover.
 
+### Unreachable file (source unavailable)
+The one visual language for "the drive is out" (UI-SPEC §11.1). It has to read as *the drive*, not
+as *the app failing* — the difference is the whole design.
+
+| Surface | Treatment |
+|---|---|
+| **Card artwork** | a hatched plate: 45° repeating stripes over `--ls-bg`, `✕` in `--ls-danger`, the words `file unavailable`. Never a failed `<img>` — a broken-image glyph reads as a bug |
+| **List row** | no room for the words: `✕` in `--ls-danger` in the thumb slot, the sentence on hover |
+| **Actions that need the bytes** | **inert, never hidden** — keep `tabindex="0"`, set `aria-disabled`, and put the reason in the `title`. Marked by **shape** (strike-through) as well as colour, per §9 |
+| **Actions that do not** | stay live. `⤢` Quick Look is the route to the panel that offers Relink |
+| **Everything else** | unchanged. Name, pack, tier, tags, stars and the imported badge all still read — that is what an index is for |
+
+A control that vanishes teaches nothing; one that silently does nothing is worse.
+
 ### Project chip
 The active registered Unity project shows as a small **`ls-project` chip** in the top bar (next to the
 AI-profile chip) — name + a connected/stale dot. Stale (editor closed) dims it and disables "into

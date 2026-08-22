@@ -535,8 +535,13 @@ traits all still work, which is the point of an index:
 - **Sidebar facet** (§0.2): the diamond becomes a red `✕` and the row dims — shape, not colour alone
   (DESIGN-GUIDELINES §9). The row still selects; filtering to an unavailable library is legitimate.
 - **Cards / rows** (§2.5): the artwork becomes a stated `file unavailable` plate rather than a broken
-  image; `⤢` and `⟡` go inert but stay focusable and explain themselves. Everything the catalog
-  knows still reads.
+  image; `⟡` goes inert but stays focusable and explains itself — staging a file the import would
+  skip is a promise the tray cannot keep. Everything the catalog knows still reads.
+  **`⤢` stays live** (narrowed 2026-08-22, shipped D7b): it is the route to the Quick Look panel
+  below, which carries the declared path and **Relink**, and is the one useful action left on an
+  unreachable asset. An inert `⤢` beside a live double-click on the same card is a contradiction,
+  and it would leave the panel this section specifies reachable only by accident. The Inspector's
+  **⇢ Add to project** follows `⟡`, not `⤢`.
 - **Quick Look** (§14): an honest panel — *"This file isn't reachable"*, the library and the date it
   was last seen, the declared path, **Relink library…** / **Copy path**.
 - **Staging / import** (§16.2): refuse out loud and partially — *"3 of 6 staged assets are
@@ -549,6 +554,18 @@ traits all still work, which is the point of an index:
 a **match count shown before committing** — *"◆ 4,198 of 4,206 files matched by relative path — 8
 would stay unavailable"* — then **Relink N assets**. A relink that would strand half the library is
 a thing you see first.
+
+A relink is a **rename, not a re-scan**: `asset_file.rel_path` is relative by definition
+(DATA-MODEL §2), so every row keeps its identity, tags, stars, status and import history. Only two
+things hold an absolute path and both are rewritten — `import_source.root_path` and the
+`package.package_path`s beneath it. A pack that does **not** sit under the declared old root is left
+exactly as it is rather than re-anchored to a guess: it then reads as unavailable, which is true.
+The count walks both location kinds, because counting only one lies — a loose file resolves as
+`<new root>/<rel_path>`, an in-pack asset resolves through its **archive** (memoised per pack, so
+thousands of entries cost one `stat` per pack rather than one each). Assets already extracted into
+the workspace cache are outside both numbers: moving the root does not move them.
+The Library banner's **Relink…** and Quick Look's **Relink library…** both navigate *here* rather
+than opening a second copy of the panel — one place commits the change.
 
 *(Shipped interim: watching is real but **library-wide**, not per source — a **SOURCES ▸ Watch
 sources for changes** checkbox (`AppConfig.watch_sources`, default on) drives one `notify` watcher

@@ -3,6 +3,12 @@ import { listen } from "@tauri-apps/api/event";
 
 export type GridItem = {
   asset_id: number;
+  /**
+   * Which `import_source` owns the row. The frontend looks its availability up in `sources`
+   * (`sources.svelte.ts`) rather than the backend stamping a second copy of `state` onto every
+   * card — the plate, the inert actions and Quick Look's panel are one fact, read three ways.
+   */
+  source_id: number;
   name: string;
   rel_path: string;
   media_type: string;
@@ -566,7 +572,7 @@ export type DiscoveredPackageRow = {
 };
 
 /** Native folder chooser for the import dialog. `null` = cancelled. */
-export const pickPackageFolder = () => invoke<string | null>("pick_package_folder");
+export const pickFolder = (title?: string) => invoke<string | null>("pick_folder", { title });
 
 /** Scan a folder for `.unitypackage` files (read-only) — the dialog's list. */
 export const discoverPackageFolder = (path: string) =>
@@ -602,6 +608,8 @@ export type AssetDetail = {
   height_px: number | null;
   duration_ms: number | null;
   source: string | null;
+  /** Its source's id — the key into `sources` for the "isn't reachable" panel (UI-SPEC §11.1). */
+  source_id: number;
   texture_asset_id: number | null;
   in_pack: boolean;
   favorite: boolean;
@@ -726,6 +734,14 @@ export const clearPreviewCache = () => invoke<number>("clear_preview_cache");
 
 /** Re-derive source availability from disk (UI-SPEC §11.1). One stat per root, on the writer. */
 export const refreshSourceHealth = () => invoke<WriteResult>("refresh_source_health");
+
+/** What a relink would reach — shown **before** it commits (UI-SPEC §11.1). */
+export type RelinkCount = { matched: number; total: number };
+export const relinkPreview = (sourceId: number, newRoot: string) =>
+  invoke<RelinkCount>("relink_preview", { sourceId, newRoot });
+/** Point a source at a new root. A rename, not a re-scan: every row keeps its identity. */
+export const relinkSource = (sourceId: number, newRoot: string) =>
+  invoke<WriteResult>("relink_source", { sourceId, newRoot });
 
 /** AI model install status (Settings MODELS): installed vs not + size. */
 export const modelsStatus = () =>

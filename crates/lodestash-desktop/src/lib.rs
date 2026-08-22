@@ -24,7 +24,7 @@ static LAST_GEOMETRY_SAVE: Mutex<Option<Instant>> = Mutex::new(None);
 
 use crate::library::{
     AssetDetail, DupGroup, Facets, FolderPage, FolderQuery, GridPage, GridQuery, Library,
-    LibraryStatus, PackDirNode, PackageRow, Settings, Stats, VocabRow,
+    LibraryStatus, PackDirNode, PackageRow, RelinkCount, Settings, Stats, VocabRow,
 };
 use crate::writer::{Op, WriteResult, Writer};
 
@@ -226,6 +226,48 @@ fn asset_detail(
 #[tauri::command]
 fn refresh_source_health(state: tauri::State<'_, AppState>) -> Result<WriteResult, String> {
     state.write(Op::RefreshSourceHealth)
+}
+
+/// What relinking this source to that folder would actually reach (UI-SPEC §11.1).
+///
+/// Read-only, and deliberately shown before the button commits: a relink that would strand half the
+/// library is a thing you see first. Slow by nature — one `exists` per loose file, on a drive that
+/// may be cold — so it is `async` and runs off the UI thread.
+#[tauri::command]
+async fn relink_preview(
+    state: tauri::State<'_, AppState>,
+    source_id: i64,
+    new_root: String,
+) -> Result<RelinkCount, String> {
+    let path = std::path::PathBuf::from(&new_root);
+    if !path.is_dir() {
+        return Err(format!("{new_root} is not a folder"));
+    }
+    state
+        .library
+        .lock()
+        .map_err(|_| "library lock poisoned".to_string())?
+        .relink_preview(source_id, &path)
+}
+
+/// Point a source at a new root (UI-SPEC §11.1).
+///
+/// Non-destructive by construction: no asset row is deleted, trashed or re-identified, because the
+/// only things holding an absolute path are the root itself and the packs under it.
+#[tauri::command]
+fn relink_source(
+    state: tauri::State<'_, AppState>,
+    source_id: i64,
+    new_root: String,
+) -> Result<WriteResult, String> {
+    let path = std::path::PathBuf::from(&new_root);
+    if !path.is_dir() {
+        return Err(format!("{new_root} is not a folder"));
+    }
+    state.write(Op::RelinkSource {
+        source_id,
+        new_root: path,
+    })
 }
 
 /// Star / unstar assets (DATA-MODEL §12). A pin, not a rating — "find this again".
@@ -445,16 +487,19 @@ fn add_source_dialog(
     }
 }
 
-/// Native folder chooser for the import dialog (FEATURES §5.2): returns the chosen path, or
-/// `None` on cancel. Picking is the only thing here — the scan happens in `discover_package_folder`
-/// so the UI can show a real modal with a spinner rather than a blocking native loop.
+/// Native folder chooser, returning the chosen path or `None` on cancel.
+///
+/// Picking is the *only* thing it does, which is what lets two very different callers share it: the
+/// import dialog (FEATURES §5.2) scans afterwards in `discover_package_folder`, and the relink
+/// panel (UI-SPEC §11.1) counts afterwards in `relink_preview` — both want a real modal with a
+/// spinner rather than a blocking native loop. `title` is what tells the user which one they are in.
 #[tauri::command]
-fn pick_package_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
+fn pick_folder(app: tauri::AppHandle, title: Option<String>) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
     let (tx, rx) = std::sync::mpsc::channel();
     app.dialog()
         .file()
-        .set_title("Choose a folder of .unitypackage files")
+        .set_title(title.unwrap_or_else(|| "Choose a folder of .unitypackage files".into()))
         .pick_folder(move |path| {
             let _ = tx.send(path.map(|p| match p {
                 tauri_plugin_dialog::FilePath::Path(p) => p.to_string_lossy().into_owned(),
@@ -1791,13 +1836,15 @@ pub fn run() {
             reload_library,
             set_favorite,
             refresh_source_health,
+            relink_preview,
+            relink_source,
             set_trashed,
             remove_from_library,
             delete_from_disk,
             add_source,
             sync_unity_cache,
             add_source_dialog,
-            pick_package_folder,
+            pick_folder,
             discover_package_folder,
             import_packages,
             get_web_prefs,

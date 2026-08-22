@@ -30,6 +30,10 @@
     type SourceExclude,
     type ProjectRow,
     type EngineBridge,
+    pickFolder,
+    relinkPreview,
+    relinkSource,
+    type RelinkCount,
   } from "./api";
   import { view } from "./nav.svelte";
 
@@ -196,6 +200,58 @@
     }
   }
 
+  /**
+   * Relink (UI-SPEC §11.1). The panel exists to put a number in front of a decision: a relink that
+   * would strand half the library is a thing you see *first*, so **Choose…** only ever counts, and
+   * the commit button carries the count it counted.
+   *
+   * Picking a second folder replaces the count rather than adding to it — `chosen` and `count` are
+   * cleared together, because a stale "4,198 matched" beside a newly chosen root is the one lie
+   * this panel must not tell.
+   */
+  let relinkOpen = $state<Record<number, boolean>>({});
+  let relinkChosen = $state<Record<number, string>>({});
+  let relinkCount = $state<Record<number, RelinkCount | null>>({});
+  let relinkBusy = $state<number | null>(null);
+  let relinkError = $state<Record<number, string>>({});
+
+  async function chooseRelinkRoot(id: number, name: string) {
+    const picked = await pickFolder(`Choose the new folder for “${name}”`);
+    if (!picked) return;
+    relinkChosen[id] = picked;
+    relinkCount[id] = null;
+    relinkError[id] = "";
+    relinkBusy = id;
+    try {
+      relinkCount[id] = await relinkPreview(id, picked);
+    } catch (e) {
+      relinkError[id] = String(e);
+    } finally {
+      relinkBusy = null;
+    }
+  }
+
+  async function commitRelink(id: number) {
+    const root = relinkChosen[id];
+    if (!root) return;
+    relinkBusy = id;
+    try {
+      await relinkSource(id, root);
+      relinkOpen[id] = false;
+      relinkChosen[id] = "";
+      relinkCount[id] = null;
+      // The rows the banner and the card plates read come from `status`, and every path the
+      // protocol resolves comes from the reloaded library — both have to re-read or the grid keeps
+      // drawing plates over files that now open.
+      view.dataVersion += 1;
+      status = await libraryStatus();
+    } catch (e) {
+      relinkError[id] = String(e);
+    } finally {
+      relinkBusy = null;
+    }
+  }
+
   async function toggleWatch(id: number, watch: boolean) {
     sourceBusy = id;
     try {
@@ -339,12 +395,36 @@
             {@const excl = excludesBySource[src.id]}
             <li class="src">
               <div class="src-row">
-                <span class="dot" class:paused={!src.watch_enabled} aria-hidden="true"></span>
+                <!-- Shape as well as colour (DESIGN-GUIDELINES §9): a gone source gets the ✕, not
+                     a differently-coloured dot. -->
+                {#if src.state === "unavailable"}
+                  <span class="gone-dot" title="Unavailable — the root is not on disk">✕</span>
+                {:else}
+                  <span class="dot" class:paused={!src.watch_enabled} aria-hidden="true"></span>
+                {/if}
                 <div class="meta">
                   <span class="name">{src.name}</span>
                   <span class="path mono" title={src.root_path}>{src.root_path}</span>
-                  <span class="stat mono">{src.asset_count.toLocaleString()} assets</span>
+                  <span class="stat mono">
+                    {src.asset_count.toLocaleString()} assets
+                    {#if src.state === "unavailable"}
+                      · unavailable{src.last_seen_at
+                        ? ` since ${new Date(src.last_seen_at * 1000).toLocaleDateString()}`
+                        : ""}
+                    {/if}
+                  </span>
                 </div>
+                {#if src.state === "unavailable"}
+                  <button
+                    class="chip relink"
+                    class:on={relinkOpen[src.id]}
+                    aria-expanded={!!relinkOpen[src.id]}
+                    onclick={() => (relinkOpen[src.id] = !relinkOpen[src.id])}
+                    data-testid="relink-toggle-{src.id}"
+                  >
+                    ↻ Relink…
+                  </button>
+                {/if}
                 <button
                   class="chip blacklist"
                   class:on={blacklistOpen[src.id]}
@@ -366,6 +446,52 @@
                   {src.watch_enabled ? "watching" : "paused"}
                 </button>
               </div>
+              {#if relinkOpen[src.id]}
+                {@const c = relinkCount[src.id]}
+                <div class="relink-panel" data-testid="relink-{src.id}">
+                  <p class="msg">
+                    Every row keeps its identity, tags, stars and import history — only the folder
+                    this library points at changes. Nothing on disk is moved or written.
+                  </p>
+                  <div class="relink-row">
+                    <span class="declared mono">{src.root_path}</span>
+                    <button
+                      class="add"
+                      disabled={relinkBusy === src.id}
+                      onclick={() => chooseRelinkRoot(src.id, src.name)}
+                      data-testid="relink-choose-{src.id}"
+                    >
+                      Choose…
+                    </button>
+                  </div>
+                  {#if relinkChosen[src.id]}
+                    <span class="chosen mono" data-testid="relink-chosen-{src.id}">
+                      → {relinkChosen[src.id]}
+                    </span>
+                  {/if}
+                  {#if relinkError[src.id]}
+                    <p class="msg danger">{relinkError[src.id]}</p>
+                  {:else if relinkBusy === src.id && !c}
+                    <p class="msg">Counting what this folder holds…</p>
+                  {:else if c}
+                    <!-- The number before the button, always. -->
+                    <p class="msg count" data-testid="relink-count-{src.id}">
+                      ◆ {c.matched.toLocaleString()} of {c.total.toLocaleString()} files matched by
+                      relative path{c.total - c.matched > 0
+                        ? ` — ${(c.total - c.matched).toLocaleString()} would stay unavailable`
+                        : ""}
+                    </p>
+                    <button
+                      class="add commit"
+                      disabled={relinkBusy === src.id || c.matched === 0}
+                      onclick={() => commitRelink(src.id)}
+                      data-testid="relink-commit-{src.id}"
+                    >
+                      Relink {c.matched.toLocaleString()} assets
+                    </button>
+                  {/if}
+                </div>
+              {/if}
               {#if blacklistOpen[src.id]}
                 {@const draft = draftOf(src.id)}
                 <div class="blacklist" data-testid="excludes-{src.id}">
@@ -874,6 +1000,44 @@
   }
   .num {
     font-variant-numeric: tabular-nums;
+  }
+
+  .gone-dot {
+    color: var(--ls-danger);
+    font-size: var(--fs-sm);
+    line-height: 1;
+    width: 8px;
+    text-align: center;
+  }
+  .relink-panel {
+    display: grid;
+    gap: var(--sp-2);
+    justify-items: start;
+    padding: var(--sp-3);
+    margin-top: var(--sp-2);
+    background: var(--ls-bg);
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-md);
+  }
+  .relink-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    width: 100%;
+  }
+  .relink-panel .declared,
+  .relink-panel .chosen {
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+  }
+  .relink-panel .count {
+    color: var(--ls-gold);
+  }
+  .relink-panel .commit {
+    border-color: var(--ls-gold);
   }
 
   .sources {

@@ -38,6 +38,7 @@
 
   import Icon from "./Icon.svelte";
   import { emptyFilter, gridPage } from "./api";
+  import { sources } from "./sources.svelte";
 
   let {
     ids,
@@ -62,14 +63,22 @@
    * actually covered.
    */
   let names = $state<Map<number, string>>(new Map());
+  /**
+   * The source each staged id belongs to, harvested from the **same** pass that resolves names —
+   * the rows were already in hand, and a second query to ask "is this reachable" would be one the
+   * tray does not need (UI-SPEC §16.2).
+   */
+  let srcOf = $state<Map<number, number>>(new Map());
   let resolving = $state(false);
 
   $effect(() => {
     const want = ids;
     const found = new Map<number, string>();
+    const owner = new Map<number, number>();
     const missing = new Set(want);
     if (want.length === 0) {
       names = found;
+      srcOf = owner;
       resolving = false;
       return;
     }
@@ -99,7 +108,10 @@
             page_size: PAGE,
           });
           for (const it of r.items) {
-            if (missing.delete(it.asset_id)) found.set(it.asset_id, it.name);
+            if (missing.delete(it.asset_id)) {
+              found.set(it.asset_id, it.name);
+              owner.set(it.asset_id, it.source_id);
+            }
           }
           if (p + 1 >= r.pages) break;
         } catch {
@@ -108,6 +120,7 @@
       }
       if (!stale) {
         names = found;
+        srcOf = owner;
         resolving = false;
       }
     })();
@@ -117,8 +130,26 @@
   });
 
   let rows = $derived(
-    ids.map((id) => ({ id, label: names.get(id) ?? null })),
+    ids.map((id) => ({
+      id,
+      label: names.get(id) ?? null,
+      gone: sources.unavailable(srcOf.get(id) ?? -1),
+    })),
   );
+
+  /**
+   * Partial import (UI-SPEC §16.2): refuse **out loud and partially**.
+   *
+   * Said before the click rather than after it — a warning is worth more than a receipt — and the
+   * button carries the honest number. The unreachable picks are simply not sent, so they stay in
+   * the tray for when the drive comes back; nothing that did import is rolled back, because the
+   * import never saw them.
+   *
+   * An id whose source is still unresolved (the name pass has not reached it) counts as reachable.
+   * Withholding a pick on a fact we do not have yet would silently drop it from the import.
+   */
+  let reachable = $derived(rows.filter((r) => !r.gone).map((r) => r.id));
+  let skipped = $derived(ids.length - reachable.length);
 </script>
 
 {#if ids.length > 0}
@@ -129,7 +160,13 @@
     </span>
     <div class="list">
       {#each rows as row (row.id)}
-        <span class="item" data-testid="staged-item" title={`asset #${row.id}`}>
+        <span
+          class="item"
+          class:gone={row.gone}
+          data-testid="staged-item"
+          title={row.gone ? `asset #${row.id} — unavailable` : `asset #${row.id}`}
+        >
+          {#if row.gone}<span class="gone-mark" aria-hidden="true">✕</span>{/if}
           <span class="name">
             {resolving && row.label === null ? "…" : row.label ?? `#${row.id}`}
           </span>
@@ -142,8 +179,24 @@
         </span>
       {/each}
     </div>
-    <button class="go" data-testid="tray-import" onclick={() => onimport(ids)} disabled={ids.length === 0}>
-      ⇢ Add all {ids.length} to project
+    {#if skipped > 0}
+      <span class="refusal" data-testid="tray-unavailable" role="status">
+        {skipped} of {ids.length} staged assets {skipped === 1 ? "is" : "are"} unavailable — the
+        import will skip {skipped === 1 ? "it" : "them"}. {skipped === 1 ? "It stays" : "They stay"}
+        staged.
+      </span>
+    {/if}
+    <button
+      class="go"
+      data-testid="tray-import"
+      onclick={() => onimport(reachable)}
+      disabled={reachable.length === 0}
+    >
+      {#if skipped > 0}
+        ⇢ Add {reachable.length} of {ids.length} to project
+      {:else}
+        ⇢ Add all {ids.length} to project
+      {/if}
     </button>
     <!-- D4: the tray is a cart, a collection is a named set worth keeping. Without this line the
          shortlist someone just built by hand is thrown away on import. One rung up the ladder. -->
@@ -186,6 +239,27 @@
 {/if}
 
 <style>
+  .item.gone .name {
+    color: var(--ls-text-dim);
+    text-decoration: line-through;
+  }
+  .item .gone-mark {
+    color: var(--ls-danger);
+    font-size: var(--fs-xs);
+    line-height: 1;
+  }
+  /* Amber, not red: the import is not broken, it is smaller than asked for (DG §7). */
+  .refusal {
+    max-width: 260px;
+    padding: 4px var(--sp-2);
+    font-size: var(--fs-xs);
+    line-height: 1.35;
+    color: var(--ls-warning);
+    background: color-mix(in srgb, var(--ls-warning) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--ls-warning) 35%, transparent);
+    border-radius: var(--r-sm);
+  }
+
   .save-as {
     display: flex;
     align-items: center;

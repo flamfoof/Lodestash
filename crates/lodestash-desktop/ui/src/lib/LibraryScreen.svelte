@@ -338,6 +338,12 @@
           assets are still listed, but their files cannot be reached.
         {/if}
       </span>
+      <!-- UI-SPEC §11.1 puts **Relink…** on this banner. The panel itself lives on the Settings
+           source row, which owns the folder picker and the match count — duplicating it here would
+           give the app two places to commit the same irreversible-looking write. -->
+      <button class="relink" onclick={() => (view.route = "settings")} data-testid="banner-relink">
+        Relink…
+      </button>
       <button class="x" aria-label="Dismiss" onclick={() => (goneDismissed = true)}>✕</button>
     </div>
   {/if}
@@ -625,6 +631,18 @@
   .gone-banner .path {
     color: var(--ls-text-dim);
     font-size: var(--fs-xs);
+  }
+  .gone-banner .relink {
+    padding: 2px 8px;
+    font-size: var(--fs-xs);
+    color: var(--ls-gold);
+    background: transparent;
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-sm);
+    cursor: pointer;
+  }
+  .gone-banner .relink:hover {
+    border-color: var(--ls-gold);
   }
   .gone-banner .x {
     flex: none;

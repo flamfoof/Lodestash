@@ -5,7 +5,7 @@
 //! `apply_migrations` runs numbered SQL steps in order on first open.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -76,6 +76,17 @@ pub struct SourceInfo {
     pub state: String,
     /// Unix seconds the root last resolved. Drives "unavailable since …" in the UI.
     pub last_seen_at: Option<i64>,
+}
+
+/// The answer to "what would relinking this source to that folder actually reach?" (UI-SPEC §11.1).
+///
+/// `total` counts the assets a relink can speak for — every one the source owns whose bytes are
+/// expected under its root. Assets already extracted into the workspace cache are excluded from
+/// both numbers, because moving the root does not move them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RelinkPreview {
+    pub matched: i64,
+    pub total: i64,
 }
 
 /// What the `✓ in <project>` badge needs to know about one asset (DESIGN-GUIDELINES §7).
@@ -1427,6 +1438,18 @@ fn refresh_fts(conn: &Connection, asset_id: i64, old_concat: &str) -> Result<()>
     )
     .map_err(|e| CoreError::Catalog(format!("fts insert: {e}")))?;
     Ok(())
+}
+
+/// Swap one absolute path's root prefix for another.
+///
+/// `None` when `path` does not sit under `old_root` — the caller then leaves the row alone rather
+/// than inventing a location for it. Uses `strip_prefix` rather than string surgery so a root
+/// stored `C:/cache` still matches a pack stored `C:\cache\x.unitypackage`: the separators differ,
+/// the components do not.
+fn reanchor(path: &Path, old_root: &Path, new_root: &Path) -> Option<PathBuf> {
+    path.strip_prefix(old_root)
+        .ok()
+        .map(|rest| new_root.join(rest))
 }
 
 fn unix_now() -> i64 {
@@ -3069,6 +3092,135 @@ impl Catalog {
             }
         }
         Ok(changed)
+    }
+
+    /// What a relink would achieve, counted **before** it commits (UI-SPEC §11.1).
+    ///
+    /// A relink that would strand half the library is a thing you see first, so this walks every
+    /// asset the source owns and asks whether its backing file resolves under the candidate root.
+    /// Two location kinds resolve differently and both must be counted, or the number lies:
+    ///
+    /// - **loose files** — `<new_root>/<asset_file.rel_path>`, one `exists` each;
+    /// - **in-pack assets** — the file that must be there is the `.unitypackage`, not the entry.
+    ///   Its `package.package_path` is absolute, so it is re-anchored by swapping the old root
+    ///   prefix. Existence is memoised per pack: 5,963 in-pack assets on this library reach ~50
+    ///   distinct archives, and stat-ing each asset would turn a preview into a disk crawl.
+    ///
+    /// Assets already extracted into the workspace cache (`workspace_rel`) do not live under the
+    /// root at all, so they are outside the count entirely — calling them "matched" would credit
+    /// the new root with files it does not hold, and "unmatched" would threaten files that are
+    /// perfectly reachable.
+    ///
+    /// Read-only, and slow by nature (one `exists` per loose file, on a drive that may be cold).
+    /// Callers run it off the UI thread.
+    pub fn relink_preview(&self, source_id: i64, new_root: &Path) -> Result<RelinkPreview> {
+        let old_root: String = self
+            .conn
+            .query_row(
+                "SELECT root_path FROM import_source WHERE id = ?1",
+                params![source_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| CoreError::Catalog(format!("relink source lookup: {e}")))?;
+        let old_root = PathBuf::from(old_root);
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT af.rel_path, p.package_path
+                   FROM asset a
+                   JOIN asset_file af  ON af.id = a.primary_file_id
+                   LEFT JOIN package p ON p.id = a.package_id
+                                      AND af.package_entry_id IS NOT NULL
+                  WHERE a.source_id = ?1
+                    AND af.missing = 0
+                    AND af.workspace_rel IS NULL",
+            )
+            .map_err(|e| CoreError::Catalog(format!("relink preview prep: {e}")))?;
+        let rows: Vec<(String, Option<String>)> = stmt
+            .query_map(params![source_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| CoreError::Catalog(format!("relink preview query: {e}")))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("relink preview row: {e}")))?;
+
+        let mut packs: HashMap<String, bool> = HashMap::new();
+        let mut matched = 0i64;
+        let total = rows.len() as i64;
+        for (rel_path, pack_path) in rows {
+            let hit = match pack_path {
+                Some(pack) => *packs.entry(pack.clone()).or_insert_with(|| {
+                    reanchor(Path::new(&pack), &old_root, new_root).is_some_and(|p| p.exists())
+                }),
+                None => new_root.join(&rel_path).exists(),
+            };
+            if hit {
+                matched += 1;
+            }
+        }
+        Ok(RelinkPreview { matched, total })
+    }
+
+    /// Point a source at a new root (UI-SPEC §11.1). Returns the packs re-anchored with it.
+    ///
+    /// Only two things hold an absolute path: the source root, and every `package.package_path`
+    /// underneath it. `asset_file.rel_path` is relative by definition (schema, M1) and is what makes
+    /// a relink a rename rather than a re-scan — the identity, tags, stars and import history of
+    /// every row survive it.
+    ///
+    /// A pack that does not sit under the declared old root is left exactly as it is rather than
+    /// rewritten to a guess; it will read as unavailable, which is true, instead of pointing
+    /// somewhere plausible and wrong.
+    ///
+    /// Nothing is deleted and no asset row is touched: this is the non-destructive answer to a
+    /// moved drive, and the reason the catalog keeps browsing while the files are gone.
+    pub fn relink_source(&self, source_id: i64, new_root: &Path) -> Result<usize> {
+        let old_root: String = self
+            .conn
+            .query_row(
+                "SELECT root_path FROM import_source WHERE id = ?1",
+                params![source_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| CoreError::Catalog(format!("relink source lookup: {e}")))?;
+        let old_root = PathBuf::from(old_root);
+        let new_str = new_root.to_string_lossy().into_owned();
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, package_path FROM package WHERE source_id = ?1")
+            .map_err(|e| CoreError::Catalog(format!("relink packs prep: {e}")))?;
+        let packs: Vec<(i64, String)> = stmt
+            .query_map(params![source_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| CoreError::Catalog(format!("relink packs query: {e}")))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("relink packs row: {e}")))?;
+
+        let mut moved = 0usize;
+        for (id, path) in packs {
+            let Some(next) = reanchor(Path::new(&path), &old_root, new_root) else {
+                continue;
+            };
+            self.conn
+                .execute(
+                    "UPDATE package SET package_path = ?2 WHERE id = ?1",
+                    params![id, next.to_string_lossy()],
+                )
+                .map_err(|e| CoreError::Catalog(format!("relink pack update: {e}")))?;
+            moved += 1;
+        }
+
+        // The new root is on disk right now — the user just picked it — so the source is available
+        // again and `last_seen_at` is now. Leaving the old state would keep the banner up over
+        // files that open.
+        self.conn
+            .execute(
+                "UPDATE import_source
+                    SET root_path = ?2, state = 'available', last_seen_at = ?3
+                  WHERE id = ?1",
+                params![source_id, new_str, unix_now()],
+            )
+            .map_err(|e| CoreError::Catalog(format!("relink source update: {e}")))?;
+        Ok(moved)
     }
 
     /// The four import states the `✓ in <project>` badge distinguishes (DESIGN-GUIDELINES §7),
@@ -5212,6 +5364,110 @@ mod tests {
         std::fs::create_dir_all(&root).expect("mkdir");
         assert_eq!(c.refresh_source_health().unwrap(), vec![1]);
         assert_eq!(c.source_infos().unwrap().remove(0).state, "available");
+    }
+
+    /// Relink (UI-SPEC §11.1) — the count shown before committing, and the rewrite itself.
+    ///
+    /// Mutation-checked on the four things that would make a relink dangerous rather than merely
+    /// wrong: the preview must count the **pack** for an in-pack asset and not its rel_path (every
+    /// in-pack row would read as unmatched, and the panel would tell the user a good drive strands
+    /// their library); workspace-extracted rows must be outside both numbers; a pack that does not
+    /// sit under the old root must be left alone rather than re-anchored to a guess; and no asset
+    /// row may be deleted or trashed by any of it.
+    #[test]
+    fn relink_counts_before_it_commits_and_rewrites_only_paths() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let old_root = dir.path().join("old");
+        let new_root = dir.path().join("new");
+        std::fs::create_dir_all(old_root.join("sub")).expect("mkdir old");
+        std::fs::create_dir_all(new_root.join("sub")).expect("mkdir new");
+        // The new drive holds one of the two loose files, and the pack.
+        std::fs::write(new_root.join("sub/here.png"), b"x").expect("w");
+        std::fs::write(new_root.join("kit.unitypackage"), b"x").expect("w");
+        let old_pack = old_root.join("kit.unitypackage");
+        let outsider = dir.path().join("elsewhere.unitypackage");
+
+        let c = Catalog::open_in_memory().expect("open");
+        c.conn
+            .execute_batch(&format!(
+                "INSERT INTO import_source (id, uuid, name, root_path, kind)
+                     VALUES (1, 's1', 'Src', '{old}', 'folder');
+                 INSERT INTO media_type (id, code, label) VALUES (1, 'image', 'Image');
+                 INSERT INTO package (id, uuid, source_id, name, package_path)
+                     VALUES (1, 'p1', 1, 'Kit', '{pack}'),
+                            (2, 'p2', 1, 'Stray', '{stray}');
+                 INSERT INTO asset (id, uuid, source_id, media_type_id, name, created_at, updated_at, package_id)
+                     VALUES (1, 'a1', 1, 1, 'here', 0, 0, NULL),
+                            (2, 'a2', 1, 1, 'gone', 0, 0, NULL),
+                            (3, 'a3', 1, 1, 'inpack', 0, 0, 1),
+                            (4, 'a4', 1, 1, 'unpacked', 0, 0, 1);
+                 INSERT INTO package_entry (id, package_id, guid, pathname)
+                     VALUES (1, 1, 'g1', 'Assets/inpack.png');
+                 INSERT INTO asset_file (id, asset_id, rel_path, package_entry_id, workspace_rel)
+                     VALUES (1, 1, 'sub/here.png', NULL, NULL),
+                            (2, 2, 'sub/gone.png', NULL, NULL),
+                            (3, 3, 'Assets/inpack.png', 1, NULL),
+                            (4, 4, 'Assets/unpacked.png', NULL, 'ws/unpacked.png');
+                 UPDATE asset SET primary_file_id = id;",
+                old = old_root.to_string_lossy().replace('\\', "/"),
+                pack = old_pack.to_string_lossy().replace('\\', "/"),
+                stray = outsider.to_string_lossy().replace('\\', "/"),
+            ))
+            .expect("fixture");
+
+        // Three assets are the source's to speak for; the workspace-extracted one is not, because
+        // moving the root does not move it.
+        let p = c.relink_preview(1, &new_root).expect("preview");
+        assert_eq!(p.total, 3, "workspace-extracted rows leaked into the count");
+        assert_eq!(
+            p.matched, 2,
+            "expected here.png + the in-pack asset via its archive"
+        );
+
+        // The same folder with the pack removed drops exactly the in-pack asset — which is the
+        // proof the pack, not `Assets/inpack.png`, is what was checked.
+        std::fs::remove_file(new_root.join("kit.unitypackage")).expect("rm");
+        assert_eq!(c.relink_preview(1, &new_root).expect("preview").matched, 1);
+        std::fs::write(new_root.join("kit.unitypackage"), b"x").expect("w");
+
+        assert_eq!(c.relink_source(1, &new_root).expect("relink"), 1);
+        let info = c.source_infos().unwrap().remove(0);
+        assert_eq!(info.root_path, new_root.to_string_lossy());
+        assert_eq!(info.state, "available");
+        assert!(info.last_seen_at.is_some());
+
+        let packs: Vec<String> = {
+            let mut s = c
+                .conn
+                .prepare("SELECT package_path FROM package ORDER BY id")
+                .unwrap();
+            let v = s
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            v
+        };
+        assert_eq!(
+            PathBuf::from(&packs[0]),
+            new_root.join("kit.unitypackage"),
+            "the pack under the old root was not re-anchored"
+        );
+        assert_eq!(
+            PathBuf::from(&packs[1]),
+            outsider,
+            "a pack outside the old root was rewritten to a guess"
+        );
+
+        let live: i64 = c
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset WHERE deleted_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live, 4, "a relink deleted or trashed asset rows");
     }
 
     /// The bulk read behind the `✓ in <project>` badge (UI-SPEC §2.5).

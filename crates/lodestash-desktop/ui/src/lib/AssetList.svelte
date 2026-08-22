@@ -11,6 +11,7 @@
     statusLabel,
     stage,
   } from "./api";
+  import { sources } from "./sources.svelte";
 
   /**
    * Same tray the cards reach, through the same context the shell owns (App.svelte
@@ -91,8 +92,20 @@
       }}
     >
       <span class="cell name" role="cell">
-        <span class="thumb" class:unid={isUnidentified(item.status)}>
-          {#if isUnidentified(item.status)}
+        <span
+          class="thumb"
+          class:unid={isUnidentified(item.status)}
+          class:unreachable={sources.unavailable(item.source_id)}
+        >
+          {#if sources.unavailable(item.source_id)}
+            <!-- Row parity with the card plate (UI-SPEC §11.1 / §2.5). At 22px there is no room
+                 for the words, so the row carries the mark and the title carries the sentence. -->
+            <span
+              class="gone"
+              data-testid="row-unavailable"
+              title="{sources.get(item.source_id)?.name ?? 'This library'} is unavailable — the file cannot be reached"
+            >✕</span>
+          {:else if isUnidentified(item.status)}
             <span class="q">?</span>
           {:else if item.has_preview}
             <img src={previewUrl(item.asset_id)} alt="" loading="lazy" />
@@ -202,21 +215,27 @@
             <span
               class="act"
               class:on={isStaged(item.asset_id)}
+              class:inert={sources.unavailable(item.source_id)}
               role="button"
               tabindex="0"
               aria-pressed={isStaged(item.asset_id)}
-              title={isStaged(item.asset_id) ? "Staged — click to remove" : "Stage for import"}
+              aria-disabled={sources.unavailable(item.source_id)}
+              title={sources.unavailable(item.source_id)
+                ? `${sources.get(item.source_id)?.name ?? "This library"} is unavailable — an import would skip this file`
+                : isStaged(item.asset_id)
+                  ? "Staged — click to remove"
+                  : "Stage for import"}
               aria-label={isStaged(item.asset_id) ? `Unstage ${item.name}` : `Stage ${item.name}`}
               data-testid="row-stage"
               onclick={(e) => {
                 e.stopPropagation();
-                toggleStage(item.asset_id);
+                if (!sources.unavailable(item.source_id)) toggleStage(item.asset_id);
               }}
               onkeydown={(e) => {
                 if (e.key === "Enter" || e.key === " ") {
                   e.preventDefault();
                   e.stopPropagation();
-                  toggleStage(item.asset_id);
+                  if (!sources.unavailable(item.source_id)) toggleStage(item.asset_id);
                 }
               }}
             >⟡</span>
@@ -364,6 +383,20 @@
     color: var(--ls-status-unidentified);
     font-size: var(--fs-sm);
     line-height: 1;
+  }
+  /* Row parity with the card's plate (UI-SPEC §11.1). */
+  .thumb.unreachable {
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ls-danger) 30%, transparent);
+  }
+  .thumb .gone {
+    color: var(--ls-danger);
+    font-size: var(--fs-sm);
+    line-height: 1;
+  }
+  .act.inert {
+    color: var(--ls-text-dim);
+    cursor: default;
+    text-decoration: line-through;
   }
 
   .pack {

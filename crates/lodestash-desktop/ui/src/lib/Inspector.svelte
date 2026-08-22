@@ -23,6 +23,7 @@
   } from "./api";
   import { view } from "./nav.svelte";
   import { traitColor } from "./traits.svelte";
+  import { sources } from "./sources.svelte";
 
   let {
     assetId,
@@ -534,7 +535,18 @@
         <button onclick={onrestore} data-testid="action-restore">Restore</button>
       {:else}
         <button onclick={ontrash} data-testid="action-trash">Move to Trash</button>
-        <button onclick={onimport} data-testid="action-import" title="Queue this asset into the open Unity project (ENGINE-API §5.2)">
+        <!-- Inert while the drive is out (UI-SPEC §11.1 / §16.2): an import that cannot read the
+             file would queue a job whose only outcome is a skip. Same rule as the card's ⟡. -->
+        {@const gone = !!detail && sources.unavailable(detail.source_id)}
+        <button
+          onclick={() => !gone && onimport()}
+          class:inert={gone}
+          aria-disabled={gone}
+          data-testid="action-import"
+          title={gone
+            ? `${sources.get(detail?.source_id ?? -1)?.name ?? "This library"} is unavailable — an import would skip this file`
+            : "Queue this asset into the open Unity project (ENGINE-API §5.2)"}
+        >
           ⇢ Add to project
         </button>
         <button onclick={onremove} data-testid="action-remove" title="Hides it and stops future scans finding it. The file stays on disk.">
@@ -577,6 +589,11 @@
     font: inherit;
     font-size: var(--fs-sm);
     cursor: pointer;
+  }
+  .actions button.inert {
+    color: var(--ls-text-dim);
+    cursor: default;
+    text-decoration: line-through;
   }
   .actions button:hover {
     border-color: var(--ls-gold);

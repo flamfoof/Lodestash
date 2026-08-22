@@ -50,6 +50,11 @@ pub struct GridItem {
     /// Tag values on this asset — the chips under the card's meta line (FEATURES §1.1). Filled by
     /// [`Library::mark_traits`] in one query for the whole library, not one per card.
     pub traits: Vec<String>,
+    /// The `import_source` this row belongs to. Carried so the frontend can look the source's
+    /// availability up in the list it already has (`LibraryStatus.sources`) instead of the backend
+    /// stamping a second copy of `state` onto 8k cards — the plate, the inert `⤴` and the Quick Look
+    /// "isn't reachable" panel all read the same one fact (UI-SPEC §11.1).
+    pub source_id: i64,
     /// `S` / `M` / `L` / `XL`, from the user's own thresholds rather than a fixed scale, so the
     /// badge means what Settings says it means (FEATURES §5.3).
     pub size_tier: String,
@@ -172,6 +177,9 @@ pub struct AssetDetail {
     pub duration_ms: Option<i64>,
     /// Which source root it came from.
     pub source: Option<String>,
+    /// …and its id, so Quick Look can read that source's availability out of `sources` and say
+    /// *when* it was last seen rather than only that the file will not open (UI-SPEC §11.1).
+    pub source_id: i64,
     /// The albedo texture this model paints with, reached through the dependency graph
     /// (DATA-MODEL §10). `None` when the graph has no edge — the viewer then renders flat.
     pub texture_asset_id: Option<i64>,
@@ -184,6 +192,14 @@ pub struct AssetDetail {
     /// offers Restore, not another Trash button.
     pub favorite: bool,
     pub trashed: bool,
+}
+
+/// The relink panel's headline number (UI-SPEC §11.1) — *"4,198 of 4,206 files matched by relative
+/// path — 8 would stay unavailable"*. Shown **before** the button commits.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct RelinkCount {
+    pub matched: i64,
+    pub total: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -722,7 +738,7 @@ impl Library {
                 // Trashed rows are **kept**, flagged: the Trash screen is the only way back from
                 // a soft delete, and a row the shell never loaded cannot be restored.
                 paths.insert(e.asset_id, root.join(&e.rel_path));
-                rows.push(row_from(e, &info.name, None));
+                rows.push(row_from(e, info.id, &info.name, None));
             }
 
             // In-pack rows are the bulk of a real library — on this machine 5,963 of 8,237 live
@@ -737,7 +753,7 @@ impl Library {
                             .extension()
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_default();
-                        let mut row = row_from(e.asset, &info.name, Some(e.package_name));
+                        let mut row = row_from(e.asset, info.id, &info.name, Some(e.package_name));
                         // Carried per row so a thumbnail pull costs no catalog round-trip.
                         row.locator = Some(InPackLocator {
                             pack_path: e.pack_path,
@@ -761,7 +777,7 @@ impl Library {
                         if let Some(ws) = workspace_dir.as_ref() {
                             paths.insert(e.asset.asset_id, ws.join(&e.workspace_rel));
                         }
-                        rows.push(row_from(e.asset, &info.name, Some(e.package_name)));
+                        rows.push(row_from(e.asset, info.id, &info.name, Some(e.package_name)));
                     }
                 }
                 Err(e) => {
@@ -794,6 +810,20 @@ impl Library {
         self.mark_traits();
         self.mark_tiers();
         self.mark_imported();
+    }
+
+    /// What relinking this source to that folder would reach (UI-SPEC §11.1).
+    ///
+    /// A thin pass-through to the catalog: the count is the whole product here, and it is shown
+    /// before the relink commits so a move that would strand half the library is visible first.
+    pub fn relink_preview(&self, source_id: i64, new_root: &Path) -> Result<RelinkCount, String> {
+        let cat = self.catalog.as_ref().ok_or("no catalog open")?;
+        cat.relink_preview(source_id, new_root)
+            .map(|p| RelinkCount {
+                matched: p.matched,
+                total: p.total,
+            })
+            .map_err(|e| e.to_string())
     }
 
     /// Stamp `in_project` onto every row from the active project's import set.
@@ -1846,6 +1876,7 @@ impl Library {
             height_px: row.height_px,
             duration_ms: row.duration_ms,
             source: row.source.clone(),
+            source_id: row.item.source_id,
             texture_asset_id: self.albedo_texture(asset_id),
             favorite: row.item.favorite,
             trashed: row.trashed,
@@ -2172,6 +2203,7 @@ fn kb_range(lo_kb: u32, hi_kb: u32) -> String {
 /// row is browsable and searchable while `lodestash://file` correctly answers 503.
 fn row_from(
     e: lodestash_core::catalog::HydratedAsset,
+    source_id: i64,
     source: &str,
     package: Option<String>,
 ) -> Row {
@@ -2202,6 +2234,7 @@ fn row_from(
         traits: Vec::new(),
         item: GridItem {
             asset_id: e.asset_id,
+            source_id,
             name,
             rel_path: e.rel_path,
             media_type: e.media_type,
@@ -2248,6 +2281,7 @@ mod tests {
                 browse_path: PathBuf::from(format!("{n}.x")),
                 item: GridItem {
                     asset_id: 0,
+                    source_id: 1,
                     name: (*n).into(),
                     rel_path: format!("{n}.x"),
                     media_type: (*mt).into(),
@@ -2613,7 +2647,7 @@ mod tests {
             metrics: Default::default(),
             content_hash: None,
         };
-        let row = row_from(e.clone(), "Synty", None);
+        let row = row_from(e.clone(), 1, "Synty", None);
         assert_eq!(row.media_type, Some(MediaType::Model3d));
         assert_eq!(row.status, AssetStatus::Identified);
         assert_eq!(row.item.media_type, "model_3d", "the JSON keeps the code");
@@ -2625,7 +2659,7 @@ mod tests {
 
         // …and an in-pack asset browses under its pack, or every pack in the source merges into
         // one `Assets` folder (see the `browse_path` field doc).
-        let packed = row_from(e, "Synty", Some("PolygonCity".into()));
+        let packed = row_from(e, 1, "Synty", Some("PolygonCity".into()));
         assert_eq!(
             packed.browse_path,
             PathBuf::from("PolygonCity/Assets/Rock.fbx")

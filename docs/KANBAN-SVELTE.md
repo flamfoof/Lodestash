@@ -361,11 +361,20 @@ facet-group owner call).
       sidebar facet and the Library banner. Mutation-checked on the three things that would make it
       dangerous: a missing root must not delete or trash rows, a returning root must clear the
       state, and `last_seen_at` must not move while the root is gone.
-- [ ] **D7b — Source availability, the rest.** Card / row `file unavailable` plate, the Quick Look
-      panel, the partial-import refusal (§16.2), and the relink panel with its match count shown
-      before it commits. The card plate needs a per-row source-state read (`GridItem` carries no
-      source today); relink needs `root_path` rewriting + `asset_file.rel_path` re-resolution.
-      UI-SPEC §11.1.
+- [x] **D7b — Source availability, the rest.** `GridItem.source_id` (one i64, stamped in the loop
+      that already had the source in hand) plus `sources.svelte.ts`, so the plate, the inert ⟡,
+      Quick Look's *"this file isn't reachable"* panel and the tray's refusal are **one fact read
+      four ways** rather than four copies of `state` on 8k cards. Relink is a rename, not a re-scan:
+      `Catalog::relink_preview` counts first (loose files by `rel_path`, in-pack assets through
+      their **archive**, memoised per pack; workspace-extracted rows excluded from both numbers),
+      `Catalog::relink_source` rewrites only `root_path` and the `package_path`s under it — a pack
+      outside the old root is left alone rather than re-anchored to a guess. ⇢ the tray refuses
+      **partially and before the click**: unreachable picks are not sent, stay staged, and the
+      button reads `⇢ Add N of M`. **Divergence recorded in UI-SPEC §11.1:** `⤢` stays live (it is
+      the only route to the panel that offers Relink); only `⟡` and the Inspector's ⇢ go inert.
+      Verified on the real catalog — source 4 is genuinely gone, so all four e2e checks ran rather
+      than skipped. `relink_source` is Rust-tested only: committing one in e2e would rewrite the
+      user's own catalog.
 - [x] **D8 — Undo in the toast.** One action slot (`Undo` | `Show`), 6s with an action, hover
       freezes, 3 at a time with the rest collapsed into `+N more`. Each toast pins **its own oplog
       id** at push time — undoing the head of the log from the second-newest toast reverses the

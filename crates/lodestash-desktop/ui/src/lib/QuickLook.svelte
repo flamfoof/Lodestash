@@ -11,6 +11,8 @@
     statusLabel,
     type AssetDetail,
   } from "./api";
+  import { sources } from "./sources.svelte";
+  import { view } from "./nav.svelte";
 
   let {
     assetId,
@@ -43,6 +45,9 @@
   // stored vector preview or the type mark, rather than an empty pane that looks broken.
   let kind = $derived.by(() => {
     if (!detail) return "loading";
+    // Ahead of every viewer: with the drive out there are no bytes for any of them to decode, and
+    // a spinner that never resolves is the failure mode this panel exists to replace.
+    if (sources.unavailable(detail.source_id)) return "unreachable";
     // A material's shader ball is *generated* — no bytes are read from the pack — so it is the
     // one type that previews fine while still in an archive.
     if (detail.media_type === "material") return "model";
@@ -62,6 +67,34 @@
         return "other";
     }
   });
+
+  /**
+   * The unreachable panel's three facts (UI-SPEC §11.1): which library, when it was last seen, and
+   * where it declares itself to be. All three come from the source, not the asset — a per-asset
+   * "missing" is a different thing and must not borrow this wording.
+   */
+  let goneSource = $derived(detail ? sources.get(detail.source_id) : undefined);
+  let declaredRoot = $derived(goneSource?.root_path ?? detail?.abs_path ?? "");
+  let lastSeen = $derived(
+    goneSource?.last_seen_at ? new Date(goneSource.last_seen_at * 1000).toLocaleString() : "",
+  );
+
+  let copied = $state(false);
+  async function copyPath() {
+    try {
+      await navigator.clipboard.writeText(detail?.abs_path || declaredRoot);
+      copied = true;
+      setTimeout(() => (copied = false), 1200);
+    } catch {
+      /* a webview without clipboard permission — the path is selectable above either way */
+    }
+  }
+
+  /** Relink lives on the Settings sources row, which owns the folder picker and the match count. */
+  function openSources() {
+    onclose();
+    view.route = "settings";
+  }
 
   function onkeydown(e: KeyboardEvent) {
     if (e.key === "Escape") onclose();
@@ -99,6 +132,25 @@
     <div class="stage" data-testid="ql-stage" data-kind={kind}>
       {#if kind === "loading"}
         <p class="msg">Loading…</p>
+      {:else if kind === "unreachable"}
+        <!-- UI-SPEC §11.1: honest, and the one place an unreachable asset still offers an action.
+             Everything the catalog knows keeps rendering around it — name, type, size, path, tags
+             — because none of that needed the file. -->
+        <div class="msg stack gone" data-testid="ql-unavailable">
+          <span class="gone-mark" aria-hidden="true">✕</span>
+          <p>This file isn't reachable.</p>
+          <p class="dim">
+            <strong>{sources.get(detail?.source_id ?? -1)?.name ?? "Its library"}</strong> is
+            unavailable{lastSeen ? ` — last seen ${lastSeen}` : ""}.
+          </p>
+          <code class="declared" data-selectable>{declaredRoot}</code>
+          <span class="gone-actions">
+            <button onclick={openSources} data-testid="ql-relink">Relink library…</button>
+            <button onclick={copyPath} data-testid="ql-copy-path">
+              {copied ? "Copied" : "Copy path"}
+            </button>
+          </span>
+        </div>
       {:else if kind === "not_local"}
         <div class="msg stack">
           <Icon name="ls-unitypackage" size={32} />
@@ -144,6 +196,35 @@
 </div>
 
 <style>
+  .msg.stack.gone .gone-mark {
+    font-size: 34px;
+    line-height: 1;
+    color: var(--ls-danger);
+  }
+  .declared {
+    max-width: 360px;
+    overflow-wrap: anywhere;
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+  }
+  .gone-actions {
+    display: flex;
+    gap: var(--sp-2);
+    margin-top: var(--sp-2);
+  }
+  .gone-actions button {
+    padding: 4px 10px;
+    font-size: var(--fs-xs);
+    color: var(--ls-gold);
+    background: var(--ls-surface);
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-sm);
+    cursor: pointer;
+  }
+  .gone-actions button:hover {
+    border-color: var(--ls-gold);
+  }
+
   .scrim {
     position: fixed;
     inset: 0;
