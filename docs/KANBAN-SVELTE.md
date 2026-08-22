@@ -343,12 +343,18 @@ facet-group owner call).
 - [ ] **D7 — Source availability.** `import_source.state` + `last_seen_at` (**M18**), health check on
       open + after scan, banner / facet ✕ / card plate / Quick Look panel / partial-import refusal /
       relink panel with a match count before it commits. UI-SPEC §11.1, DATA-MODEL §1.
-- [ ] **D8 — Undo in the toast.** One action slot (`Undo` | `Show`), 6s with an action, hover
-      freezes, 3 at a time. Each toast carries **its own oplog id** — undoing the head of the log
-      from the second-newest toast reverses the wrong action silently. DG §7 "Feedback".
-- [ ] **D9 — Focus ring + reduced motion.** `--el-focus-ring` on card/row/chip/facet/nav/tab/control,
-      `:focus-visible` only, never layout-shifting; the §8 reduced-motion table implemented.
-      DG §8, §9. *(Focusable **cards** wait on a roving `tabindex` — see D15.)*
+- [x] **D8 — Undo in the toast.** One action slot (`Undo` | `Show`), 6s with an action, hover
+      freezes, 3 at a time with the rest collapsed into `+N more`. Each toast pins **its own oplog
+      id** at push time — undoing the head of the log from the second-newest toast reverses the
+      wrong action silently. DG §7 "Feedback". **Delta:** wired for trash/restore; bulk tag edits
+      (`LibraryScreen.bulkEdit`) bypass `write()` and still toast without an action, and they are
+      undoable. Only 3 ops are recorded at all (trash, collection create, bulk tag) — no head means
+      no slot, rather than a button that lies.
+- [x] **D9 — Focus ring + reduced motion.** The focus half was already global (`app.css`
+      `:focus-visible` → `--el-focus-ring`, covering the `role="button"` spans too) — the review had
+      that wrong and DG §9 is corrected to say so. Built: the §8 reduced-motion table. Spinners are
+      the stated exception — a frozen spinner reads as a stuck UI and is the only signal a job is
+      alive. *(Focusable **cards** still wait on a roving `tabindex` — see D15.)*
 - [ ] **D10 — `✓ in <project>` badge.** Four states (active / others / never / older copy) on card,
       row and stat block; needs an `in_project` flag on `GridItem` from a bulk `import_record` read
       (closes **N1.5** / B12e). DG §7 "Already imported badge".
@@ -359,9 +365,11 @@ facet-group owner call).
 - [ ] **D13 — Onboarding copy.** Step 2's amber callout becomes the arcane "Appraisal has started";
       the Run-identification / Skip fork goes. UI-SPEC §1. *(Consequence of D3 — shipping D3 without
       this leaves the first thing the app says to a new user false.)*
-- [ ] **D14 — Empty states.** One anatomy (32px nav glyph · statement title · one teaching line · at
-      most one action) across Collections / Duplicates / Trash / Packages / Unity Assets / Identify.
-      DG §7 "Feedback".
+- [x] **D14 — Empty states.** One `EmptyState` component enforcing the anatomy (32px nav glyph ·
+      statement title · one teaching line · at most one action), across Collections / Duplicates /
+      Packages / Unity Assets / Identify. Filtered-empty cases stay separate — those need a way out,
+      not a lesson (UI-SPEC §2.6). DG §7 "Feedback". **Delta:** Trash still uses LibraryScreen's own
+      empty branch, which is the filtered-grid path rather than a screen of its own.
 - [x] **D16 — Selectable content + Copy name/path.** Reported in use: `user-select: none` on
       `<body>` made every asset name, path, pack and stat impossible to copy. Content opts back in;
       cards and rows (both `<button>`) get **Copy name** / **Copy path** in the context menu, where
