@@ -395,18 +395,17 @@ facet-group owner call).
       **Not verified end-to-end here:** the e2e check exists but *skips* — this library has fewer
       than two duplicate groups, so the queue path has never actually run. **Delta:** "Merge tags
       onto keeper" (§5) is still not built; the actions are Keep both / Move to Trash.
-- [x] **D12 — Responsive ladder.** All four stops in `app.css`: 1400 hides the keyboard hint (was
-      1200 — already too late), 1280 makes the inspector *overlay* the grid keeping its edge tab,
-      1120 collapses the sidebar to a 48px icon rail whose hover/focus flyout carries the labels,
-      counts and both facet groups (ADR-0009's narrowing, in the flesh), 960 folds sort and its
-      direction button. ★, ⚑ and the view toggle never fold — they change what you are looking at.
-      **Coverage is honest and thin:** the e2e check asserts the four blocks ship and *parse* (a
-      `:global()`-in-a-plain-stylesheet slip drops every rule while type-checking clean — it
-      happened), not that they behave. `setViewportSize` over CDP does not drive this app's media
-      queries: it changes nothing and leaves an emulation override that poisons every later check.
-      Behaviour at the stops is still eyes-only. **Delta:** 960 hides sort rather than folding it
-      into a `⋯` overflow, so those controls are unreachable below that width instead of one click
-      away — the ladder says *move*, not *remove*.
+- [x] **D12 — Responsive ladder.** All four stops, and now actually working: 1400 hides the
+      keyboard hint, 1280 makes the inspector *overlay* the grid keeping its edge tab, 1120
+      collapses the sidebar to a 48px icon rail whose hover / keyboard-focus flyout carries the
+      labels, counts and both facet groups (ADR-0009's narrowing in the flesh), 960 folds sort and
+      its direction button into a `⋯` overflow — **moved, not removed**, which the first cut got
+      wrong. ★, ⚑ and the view toggle never fold.
+      Steps 3 and 4 live in `Sidebar.svelte` / `Toolbar.svelte`, not the global sheet: a component's
+      scoped rules outrank (or tie and beat, on source order) a bare selector in `app.css`, so the
+      first version of both did **nothing at any width** while type-checking and "parsing" clean.
+      Driven end-to-end by `Browser.setWindowBounds` — `setViewportSize` moves nothing here and
+      leaves an emulation override that poisons later checks.
 - [x] **D13 — Onboarding copy.** The shipped onboarding is the one-screen explainer, not §1's
       two-step scan wizard, so the change landed there: step 2 now says appraisal **starts by
       itself** rather than implying there is something you must go and run. Assets still arrive

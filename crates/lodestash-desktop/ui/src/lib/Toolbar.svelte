@@ -12,6 +12,8 @@
   // to advance to the next op (a reverted op is removed from the log).
   let lastOp = $state<OpLogRow | null>(null);
   let undoBusy = $state(false);
+  /** Step 4 of the ladder: below 960px the sort controls live behind this. */
+  let overflowOpen = $state(false);
   let redoHead = $state<OpLogRow | null>(null);
   let redoBusy = $state(false);
   $effect(() => {
@@ -121,23 +123,44 @@
     <span class="hint">Space quick-looks · ⤢ full size · ⟡ stage</span>
   {/if}
 
+<!-- One definition, rendered in the toolbar above 960px and inside the ⋯ popover below it. The
+     ladder says *move* chrome behind a gesture, never remove it — a sort you cannot reach on a
+     narrow window is a worse answer than a sort that costs one click. -->
+{#snippet sortControls()}
+  <label class="sort">
+    Sort
+    <select bind:value={view.sortBy}>
+      {#each SORTS as s (s.id)}
+        <option value={s.id}>{s.label}</option>
+      {/each}
+    </select>
+  </label>
+  <button
+    class="dir"
+    onclick={() => (view.sortAsc = !view.sortAsc)}
+    title={view.sortAsc ? "Ascending" : "Descending"}
+    aria-label={view.sortAsc ? "Ascending" : "Descending"}
+  >
+    {view.sortAsc ? "↑" : "↓"}
+  </button>
+{/snippet}
+
   <div class="right">
-    <label class="sort">
-      Sort
-      <select bind:value={view.sortBy}>
-        {#each SORTS as s (s.id)}
-          <option value={s.id}>{s.label}</option>
-        {/each}
-      </select>
-    </label>
-    <button
-      class="dir"
-      onclick={() => (view.sortAsc = !view.sortAsc)}
-      title={view.sortAsc ? "Ascending" : "Descending"}
-      aria-label={view.sortAsc ? "Ascending" : "Descending"}
-    >
-      {view.sortAsc ? "↑" : "↓"}
-    </button>
+    <span class="sort-inline">{@render sortControls()}</span>
+
+    <div class="overflow">
+      <button
+        class="flag more"
+        aria-expanded={overflowOpen}
+        aria-label="More controls"
+        onclick={() => (overflowOpen = !overflowOpen)}
+        data-testid="toolbar-overflow"
+      >⋯</button>
+      {#if overflowOpen}
+        <button class="scrim" aria-label="Close" onclick={() => (overflowOpen = false)}></button>
+        <div class="pop" data-testid="toolbar-overflow-pop">{@render sortControls()}</div>
+      {/if}
+    </div>
 
     <div class="filters">
       <button
@@ -383,5 +406,59 @@
   }
   .icon-btn:disabled:hover {
     opacity: 0.25;
+  }
+
+  /*
+   * Step 4 of the responsive ladder (DESIGN-GUIDELINES §4). Written here rather than in the global
+   * sheet because these rules have to beat this component's own scoped ones — a bare `.toolbar
+   * .sort` in `app.css` ties on specificity and loses on source order, which is how the first
+   * version of this step did nothing at all at every width.
+   *
+   * ★, ⚑ and the view toggle never fold: they change *what you are looking at*, and the
+   * active-filter bar is what tells you they did.
+   */
+  .overflow {
+    position: relative;
+    display: none;
+  }
+  .more {
+    font-size: var(--fs-lg);
+    line-height: 1;
+  }
+  .scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 20;
+    background: none;
+    border: 0;
+    cursor: default;
+  }
+  .pop {
+    position: absolute;
+    right: 0;
+    top: calc(var(--control-h) + 4px);
+    z-index: 21;
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    padding: var(--sp-2);
+    background: var(--ls-overlay);
+    border: 1px solid var(--ls-border-strong);
+    border-radius: var(--r-md);
+    box-shadow: var(--el-popover-shadow);
+  }
+
+  @media (max-width: 959px) {
+    .sort-inline {
+      display: none;
+    }
+    .overflow {
+      display: block;
+    }
+  }
+  @media (min-width: 960px) {
+    .sort-inline {
+      display: contents;
+    }
   }
 </style>

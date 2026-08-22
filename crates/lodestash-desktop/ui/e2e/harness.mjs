@@ -105,12 +105,43 @@ function assertBinaryIsCurrent() {
 }
 
 /**
+ * Kill a Lodestash left behind by an earlier run before starting a new one.
+ *
+ * This exists because of a failure that wasted two debugging sessions. `connectOverCDP` attaches to
+ * whatever is already listening on the port — so a leaked app from a crashed run silently becomes
+ * the app under test. Every check then drives a window nobody is looking at, in whatever state the
+ * previous run abandoned it (in one case with a device-metrics override still applied), and
+ * *nineteen* checks failed with click timeouts that had nothing to do with the code.
+ *
+ * The tell is always the same and always misleading: the suite fails everywhere at once, and every
+ * failure re-runs green in isolation. Refusing to attach to a process this function did not start
+ * removes the whole class.
+ */
+async function evictStaleApp() {
+  const answering = await reachable(`http://127.0.0.1:${CDP_PORT}/json/version`, 400);
+  if (!answering) return;
+  console.log(`  !    a Lodestash is already on :${CDP_PORT} — killing it; the suite drives its own`);
+  if (process.platform === "win32") {
+    spawnSync("taskkill", ["/IM", "lodestash-desktop.exe", "/T", "/F"], { stdio: "ignore" });
+  } else {
+    spawnSync("pkill", ["-f", "lodestash-desktop"], { stdio: "ignore" });
+  }
+  // The port lingers a moment after the process goes; attaching into that window is the same bug.
+  for (let i = 0; i < 20; i++) {
+    if (!(await reachable(`http://127.0.0.1:${CDP_PORT}/json/version`, 200))) return;
+    await sleep(250);
+  }
+  throw new Error(`:${CDP_PORT} is still held after taskkill — close the running Lodestash by hand`);
+}
+
+/**
  * Start Vite (unless already running) and the app, then attach.
  * Returns `{ page, close }`; always call `close`.
  */
 export async function launch() {
   const spawned = [];
   assertBinaryIsCurrent();
+  await evictStaleApp();
 
   if (!(await reachable(VITE_URL, 1000))) {
     // A debug build loads devUrl, so the dev server has to be up before the window opens.
@@ -145,6 +176,26 @@ export async function launch() {
 
   const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CDP_PORT}`);
   const page = browser.contexts()[0].pages()[0];
+
+  // Belt to `evictStaleApp`'s braces: a device-metrics override outlives the session that set it,
+  // and an inherited one makes every layout assertion measure a window size nobody chose. Clearing
+  // it costs nothing on a clean start.
+  await page
+    .context()
+    .newCDPSession(page)
+    .then((cdp) => cdp.send("Emulation.clearDeviceMetricsOverride"))
+    .catch(() => {});
+
+  // A crash between here and `close()` used to leak the app onto the port for the *next* run.
+  const reap = () => {
+    for (const p of spawned.reverse()) killTree(p);
+  };
+  process.once("exit", reap);
+  process.once("uncaughtException", (e) => {
+    reap();
+    throw e;
+  });
+
   await page.waitForSelector(".card, .msg", { timeout: 15_000 });
 
   // First-run onboarding (FEATURES §8) covers the whole UI and swallows clicks when the

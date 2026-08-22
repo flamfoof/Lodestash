@@ -337,4 +337,76 @@
     font-size: var(--fs-xs);
     color: var(--ls-danger);
   }
+
+  /*
+   * Step 3 of the responsive ladder (DESIGN-GUIDELINES §4, ADR-0009): below 1120px the whole
+   * sidebar becomes a 48px icon rail, and hovering or focusing it widens it *over* the grid rather
+   * than pushing it — the same covering behaviour the inspector adopts one step earlier.
+   *
+   * ADR-0009 narrowed the 2026-08-06 owner call to exactly this: the facet groups are never hidden
+   * by *screen*, and below this width they are one gesture away, on every screen, for everyone.
+   *
+   * `:has(:focus-visible)` rather than `:focus-within`: focus-within matches after a mouse click as
+   * well, so clicking any nav row pinned the rail open until you clicked something else. Keyboard
+   * focus should expand it; a click should not.
+   */
+  @media (max-width: 1119px) {
+    .sidebar {
+      width: 48px;
+      overflow: visible;
+    }
+    .sidebar .label,
+    .sidebar .count,
+    .sidebar h2,
+    .sidebar .add {
+      display: none;
+    }
+    .sidebar .row,
+    .sidebar .facet {
+      position: relative;
+      justify-content: center;
+      padding: 0;
+    }
+    .sidebar .badge {
+      position: absolute;
+      top: 2px;
+      right: 2px;
+      padding: 0 4px;
+      font-size: 9px;
+    }
+    .sidebar:hover,
+    .sidebar:has(:focus-visible) {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 0;
+      z-index: 7;
+      width: var(--sidebar-w);
+      overflow-y: auto;
+      box-shadow: 8px 0 24px rgba(0, 0, 0, 0.45);
+    }
+    .sidebar:hover .label,
+    .sidebar:has(:focus-visible) .label,
+    .sidebar:hover .count,
+    .sidebar:has(:focus-visible) .count,
+    .sidebar:hover h2,
+    .sidebar:has(:focus-visible) h2,
+    .sidebar:hover .add,
+    .sidebar:has(:focus-visible) .add {
+      display: revert;
+    }
+    .sidebar:hover .row,
+    .sidebar:has(:focus-visible) .row,
+    .sidebar:hover .facet,
+    .sidebar:has(:focus-visible) .facet {
+      justify-content: flex-start;
+      padding: 0 var(--sp-2);
+    }
+    .sidebar:hover .badge,
+    .sidebar:has(:focus-visible) .badge {
+      position: static;
+      padding: 1px 7px;
+      font-size: var(--fs-xs);
+    }
+  }
 </style>

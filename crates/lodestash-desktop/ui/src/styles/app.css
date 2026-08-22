@@ -177,80 +177,16 @@ button {
   }
 }
 
-/* < 1120 — the sidebar becomes an icon rail. Labels, counts and both facet groups move into the
-   flyout it opens on hover or focus: still one click away, on every screen, for everyone
-   (ADR-0009 narrows the 2026-08-06 owner call to exactly this). */
-@media (max-width: 1119px) {
-  .sidebar {
-    width: 48px;
-    overflow: visible;
-  }
-  .sidebar .label,
-  .sidebar .count,
-  .sidebar h2,
-  .sidebar .add {
-    display: none;
-  }
-  .sidebar .badge {
-    position: absolute;
-    top: 2px;
-    right: 2px;
-    font-size: 9px;
-    padding: 0 4px;
-  }
-  .sidebar .row,
-  .sidebar .facet {
-    position: relative;
-    justify-content: center;
-    padding: 0;
-  }
-  /* Hover or keyboard focus widens the rail over the grid rather than pushing it — the same
-     covering behaviour the inspector adopts one step earlier. */
-  .sidebar:hover,
-  .sidebar:focus-within {
-    width: 210px;
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    left: 0;
-    z-index: 7;
-    overflow-y: auto;
-    box-shadow: 8px 0 24px rgba(0, 0, 0, 0.45);
-  }
-  .sidebar:hover .label,
-  .sidebar:focus-within .label,
-  .sidebar:hover .count,
-  .sidebar:focus-within .count,
-  .sidebar:hover h2,
-  .sidebar:focus-within h2,
-  .sidebar:hover .add,
-  .sidebar:focus-within .add {
-    display: revert;
-  }
-  .sidebar:hover .row,
-  .sidebar:focus-within .row,
-  .sidebar:hover .facet,
-  .sidebar:focus-within .facet {
-    justify-content: flex-start;
-    padding: 0 var(--sp-2);
-  }
-  .sidebar:hover .badge,
-  .sidebar:focus-within .badge {
-    position: static;
-    font-size: var(--fs-xs);
-    padding: 1px 7px;
-  }
-}
-
-/* < 960 — sort, density and undo/redo fold away. The view toggle, the filters flag and the
-   favourites toggle never fold: they change *what you are looking at*, and the active-filter bar
-   is what tells you they did. */
-@media (max-width: 959px) {
-  .toolbar .sort,
-  .toolbar .dir {
-    display: none;
-  }
-}
+/*
+ * Steps 3 and 4 of the ladder do NOT live here.
+ *
+ * A Svelte component's own rules are scoped (`.sidebar.svelte-hash`), which either outranks a bare
+ * `.sidebar` from this sheet or ties it and wins on source order — so `width: 48px` written here
+ * lost to `width: var(--sidebar-w)` written there, silently, at every width. The icon rail and the
+ * toolbar overflow are therefore defined in `Sidebar.svelte` and `Toolbar.svelte`, next to the
+ * rules they have to beat. Steps 1 and 2 stay put: the hint is already component-scoped, and the
+ * inspector overlay sets a property its component never touches.
+ */
 
 @media (max-width: 899px) {
   .frame {

@@ -766,38 +766,71 @@ try {
     await page.waitForSelector(".card", { timeout: 5000 });
   });
 
-  // ── D12: the responsive ladder is present and parses (ADR-0009) ──────────────────────────────
-  // Deliberately NOT a viewport-driven check. `setViewportSize` over CDP does not drive this app's
-  // media queries — it silently changes nothing and then leaves an emulation override behind that
-  // poisons every check after it. What this asserts instead is that the four stops shipped and that
-  // the browser accepted their selectors: the `:global()`-in-a-plain-stylesheet mistake would have
-  // dropped every rule while type-checking clean. Behaviour at each stop is still eyes-only.
-  await check("the responsive ladder's four stops ship as valid CSS", async () => {
-    const stops = await page.evaluate(() => {
-      const found = [];
-      for (const sheet of [...document.styleSheets]) {
-        let rules;
-        try {
-          rules = sheet.cssRules;
-        } catch {
-          continue; // cross-origin sheet; not ours
-        }
-        for (const rule of [...rules]) {
-          if (rule.type === CSSRule.MEDIA_RULE && /max-width/.test(rule.conditionText ?? "")) {
-            found.push({
-              cond: rule.conditionText,
-              // A media block the parser rejected keeps its condition but drops its contents.
-              rules: rule.cssRules.length,
-            });
-          }
-        }
-      }
-      return found;
-    });
-    for (const px of [1400, 1279, 1119, 959]) {
-      const hit = stops.find((s) => s.cond.includes(String(px)));
-      assert.ok(hit, `no media rule at ${px}px — the ladder step is missing`);
-      assert.ok(hit.rules > 0, `the ${px}px block parsed to zero rules — its selectors were rejected`);
+  // ── D12: the responsive ladder, driven for real (ADR-0009) ───────────────────────────────────
+  // `Browser.setWindowBounds` resizes the actual window, so media queries follow — unlike
+  // `setViewportSize`, which changes nothing here and leaves an emulation override that poisons
+  // every later check. Worth the trouble: the first version of this ladder had two of its four
+  // stops doing *nothing* at any width, because rules written in the global sheet lose to a
+  // component's own scoped ones, and nothing said so.
+  //
+  // Reachability is `offsetParent !== null`, not computed display: what decides whether a control
+  // can be used is whether an ancestor hid it, and the first probe of this got that wrong.
+  await check("each rung of the responsive ladder moves the chrome it promises", async () => {
+    const cdp = await page.context().newCDPSession(page);
+    const { windowId } = await cdp.send("Browser.getWindowForTarget");
+    const { bounds: original } = await cdp.send("Browser.getWindowBounds", { windowId });
+    const at = async (width) => {
+      await cdp.send("Browser.setWindowBounds", {
+        windowId,
+        bounds: { width, height: 800, windowState: "normal" },
+      });
+      // The icon rail widens on hover *by design*, and earlier checks leave the pointer wherever
+      // they last clicked — often on a nav row. Park it over the grid before measuring, or step 3
+      // reads 210px and looks like a broken media query.
+      await page.mouse.move(width - 60, 400);
+      // Earlier checks leave focus on whatever they last clicked; a nav row still holding focus
+      // would expand the rail through `:has(:focus-visible)` and read as a broken media query.
+      await page.evaluate(() => (document.activeElement instanceof HTMLElement ? document.activeElement.blur() : null));
+      await page.waitForTimeout(500);
+      return page.evaluate(() => {
+        const shown = (sel) => {
+          const el = document.querySelector(sel);
+          return el ? el.offsetParent !== null : false;
+        };
+        const rail = document.querySelector(".inspector, .edge");
+        return {
+          hint: shown(".toolbar .hint"),
+          railOverlays: rail ? getComputedStyle(rail).position === "absolute" : false,
+          sidebar: Math.round(document.querySelector(".sidebar").getBoundingClientRect().width),
+          sort: shown(".toolbar .sort"),
+          more: shown('[data-testid="toolbar-overflow"]'),
+          view: shown('[aria-label="View mode"]'),
+        };
+      });
+    };
+    try {
+      const wide = await at(1500);
+      assert.ok(wide.hint, "the keyboard hint is already gone at 1500px");
+      assert.ok(!wide.railOverlays, "the inspector already overlays at 1500px");
+      assert.equal(wide.sidebar, 210, "the sidebar is not full width at 1500px");
+
+      assert.ok(!(await at(1300)).hint, "step 1: the hint did not go by 1300px");
+      assert.ok((await at(1200)).railOverlays, "step 2: the inspector still pushes the grid at 1200px");
+
+      const rail = await at(1000);
+      assert.equal(rail.sidebar, 48, `step 3: sidebar is ${rail.sidebar}px at 1000px, not the icon rail`);
+
+      const narrow = await at(900);
+      assert.ok(!narrow.sort, "step 4: sort is still inline at 900px");
+      assert.ok(narrow.more, "step 4: sort folded away instead of into the ⋯ overflow");
+      assert.ok(narrow.view, "the view toggle folded — it changes what you are looking at");
+    } finally {
+      await cdp.send("Browser.setWindowBounds", { windowId, bounds: original }).catch(() => {});
+      // Give the relayout time to settle before the next check measures anything, and hand keyboard
+      // focus back: this check blurs whatever held it, and a document with nothing focused swallows
+      // the next check's Ctrl-K. Clicking the result count is inert — a span, no state.
+      await page.waitForTimeout(800);
+      await page.click(".toolbar .count", { timeout: 3000 }).catch(() => {});
     }
   });
 
