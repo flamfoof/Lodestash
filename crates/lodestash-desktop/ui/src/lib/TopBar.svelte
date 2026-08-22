@@ -124,29 +124,28 @@
     <span class="wordmark">LODESTASH</span>
   </div>
 
-  <!-- UI-SPEC §0.1 orders the top bar brand → **mode toggle** → search box. Nested inside the
-       input's right edge the toggle read as a suffix of whatever you had typed; outside and
-       ahead of it, it reads as what it is — the engine the box will query. -->
-  <div class="mode" role="group" aria-label="Search mode">
-    <button class:on={view.searchMode === "tags"} onclick={() => (view.searchMode = "tags")}>
-      <Icon name="ls-search-tags" size={14} /> Tags
-    </button>
-    <button class:on={view.searchMode === "ai"} onclick={() => (view.searchMode = "ai")}>
-      <Icon name="ls-search-ai" size={14} /> AI
-    </button>
-  </div>
-
+  <!-- UI-SPEC §0.1.3 (ADR-0007): one box, no mode toggle. Typing always filters; the AI is an
+       escalation offered inside the results (LibraryScreen), reachable from here with Enter. The
+       arcane border is a read-out of which engine answered, not a switch you set first. -->
   <div class="search" class:ai={view.searchMode === "ai"}>
     <Icon name={view.searchMode === "ai" ? "ls-search-ai" : "ls-search-tags"} size={16} />
     <input
       type="text"
-      placeholder={view.searchMode === "ai"
-        ? "describe what you need — e.g. »pickup sound for rocks« — then Enter"
-        : "Search assets, tags, packs…"}
+      placeholder="Search your hoard"
       value={view.search}
       oninput={(e) => view.setSearch(e.currentTarget.value)}
+      onkeydown={(e) => e.key === "Enter" && view.askAi()}
       spellcheck="false"
+      data-testid="search-input"
     />
+    {#if view.search}
+      <button class="clear-q" onclick={() => view.setSearch("")} aria-label="Clear search" data-testid="search-clear">✕</button>
+    {/if}
+    {#if view.search.trim() && view.searchMode !== "ai"}
+      <button class="ask" onclick={() => view.askAi()} data-testid="search-ask-ai">
+        <Icon name="ls-search-ai" size={12} /> Enter to ask AI
+      </button>
+    {/if}
   </div>
 
   <nav class="tabs" aria-label="Category">
@@ -311,7 +310,7 @@
     align-items: center;
     gap: var(--sp-2);
     flex: 1 1 auto;
-    max-width: 400px;
+    max-width: 460px;
     height: var(--control-h);
     padding: 0 var(--sp-2);
     background: var(--ls-bg);
@@ -341,18 +340,41 @@
     color: var(--ls-text-dim);
   }
 
-  /* Standing on its own now (it used to sit inside the search box), the toggle needs its own
-     edge or it floats between the wordmark and the input belonging to neither. */
-  .mode {
-    display: flex;
-    gap: 2px;
-    background: var(--ls-bg);
-    border: 1px solid var(--ls-border);
-    border-radius: var(--r-md);
-    padding: 2px;
+  /* The escalation lives inside the box, at its right edge, so the offer sits on the thing it
+     acts on. It is not a mode: it appears only when there is a query to ask about, and the box
+     drops it again the moment the ranked result is showing. */
+  .ask {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
     flex: none;
+    padding: 2px 7px;
+    border: 1px solid color-mix(in srgb, var(--ls-arcane) 45%, transparent);
+    border-radius: var(--r-pill);
+    background: none;
+    font: inherit;
+    font-size: var(--fs-xs);
+    color: var(--ls-arcane);
+    cursor: pointer;
   }
-  .mode button,
+  .ask:hover {
+    color: var(--ls-arcane-bright);
+    border-color: var(--ls-arcane);
+  }
+  .clear-q {
+    flex: none;
+    padding: 0 2px;
+    background: none;
+    border: 0;
+    font: inherit;
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+    cursor: pointer;
+  }
+  .clear-q:hover {
+    color: var(--ls-text);
+  }
+
   .tabs button {
     display: flex;
     align-items: center;
@@ -363,7 +385,6 @@
     color: var(--ls-text-dim);
     opacity: 0.75;
   }
-  .mode button.on,
   .tabs button.on {
     background: var(--ls-overlay);
     color: var(--ls-text);
@@ -380,7 +401,6 @@
   .tabs button.on .count {
     color: var(--ls-text-muted);
   }
-  .mode button:hover,
   .tabs button:hover {
     color: var(--ls-text);
   }

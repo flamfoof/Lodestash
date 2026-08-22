@@ -81,6 +81,69 @@ try {
     assert.ok(after > 0 && after < before, `expected a narrower result, got ${after} of ${before}`);
   });
 
+  // ── D1 + D2: one search box, and one bar that says what is filtered ──────────────────────────
+  // The bar is the answer to "why am I seeing these?", so the check that matters is not that it
+  // renders — it is that removing a chip actually drives the control the chip came from. A bar that
+  // draws chips but clears nothing is worse than no bar: it claims a reset it did not perform.
+  await check("a query renders a chip, and clearing the chip clears the query", async () => {
+    await page.fill('input[type="text"]', "Stairs");
+    await page.waitForSelector('[data-testid="filter-bar"]', { timeout: 5000 });
+    await page.click('[data-testid="chip-x-q"]');
+    await page.waitForFunction(
+      () => !document.querySelector('[data-testid="filter-bar"]'),
+      undefined,
+      { timeout: 5000 },
+    );
+    const left = await page.inputValue('input[type="text"]');
+    assert.equal(left, "", `the chip cleared the bar but not the search box (still "${left}")`);
+  });
+
+  await check("Clear all resets every axis at once", async () => {
+    await page.fill('input[type="text"]', "Stairs");
+    await page.click('[data-testid="tab-models"]');
+    await page.click('[data-testid="status-identified"]');
+    await page.waitForSelector('[data-testid="filter-bar"]', { timeout: 5000 });
+    const chips = await page.locator('[data-testid="filter-bar"] .chip').count();
+    assert.ok(chips >= 3, `expected a chip per active axis, got ${chips}`);
+
+    await page.click('[data-testid="filter-clear"]');
+    await page.waitForFunction(
+      () => !document.querySelector('[data-testid="filter-bar"]'),
+      undefined,
+      { timeout: 5000 },
+    );
+    // Every axis, not just the one the bar was rendered from — this is the reset that used to be
+    // "click the sidebar's Library row" and nothing told you about.
+    const state = await page.evaluate(() => ({
+      q: document.querySelector('input[type="text"]')?.value ?? "",
+      tab: document.querySelector('[data-testid="tab-all"]')?.className ?? "",
+      status: document.querySelector('[data-testid="status-all"]')?.getAttribute("aria-pressed"),
+    }));
+    assert.equal(state.q, "", "the query survived Clear all");
+    assert.ok(state.tab.includes("on"), "the type tab did not go back to All");
+    assert.equal(state.status, "true", "the status facet did not go back to All");
+  });
+
+  // ADR-0007: the AI is offered, never run for you. If typing ever started a semantic search this
+  // check fails — and so would every keystroke, on a 7k-asset library.
+  await check("the AI is offered inside the results, not run by typing", async () => {
+    await page.fill('input[type="text"]', "Stairs");
+    await page.waitForSelector('[data-testid="escalate"]', { timeout: 5000 });
+    const ranked = await page.locator('[data-testid="ranked-header"]').count();
+    assert.equal(ranked, 0, "typing produced a ranked AI result — the escalation ran itself");
+    await page.fill('input[type="text"]', "");
+  });
+
+  // §2.6: the state the old copy dead-ended in. A description is not a filename, and the engine
+  // that can answer it has to be the primary action here rather than a toggle nobody flipped.
+  await check("an empty result offers the AI instead of dead-ending", async () => {
+    await page.fill('input[type="text"]', "zzzqqqnotathinginanylibrary");
+    await page.waitForSelector('[data-testid="empty"]', { timeout: 5000 });
+    const offer = await page.locator('[data-testid="empty-ask-ai"]').count();
+    assert.equal(offer, 1, "the empty state does not offer the AI escalation");
+    await page.fill('input[type="text"]', "");
+  });
+
   // T4's whole point: the grid used to filter with `contains()` over file names, so a query only
   // ever reached what was spelled in the name. FTS5 indexes name + description + tags, and a
   // tag-only hit is the proof the index is actually being consulted.
@@ -130,12 +193,18 @@ try {
   // The check that would have caught the `lodestash://localhost` routing bug on the spot. A broken
   // image is indistinguishable from a styled placeholder in a screenshot, but its naturalWidth
   // is 0 — so the failure that cost a debugging session becomes one assertion.
+  //
+  // `complete` is not optional here: cards render `loading="lazy"`, so an image below the fold has
+  // naturalWidth 0 while being perfectly healthy. Asserting on that measures the scroll position,
+  // not the route. A 404 or a 503 still sets `complete`, so the bug this exists for is still caught.
   await check("every vector preview decodes (naturalWidth > 0)", async () => {
-    const imgs = await page
-      .locator(".thumb img")
-      .evaluateAll((els) => els.map((e) => ({ src: e.getAttribute("src"), w: e.naturalWidth })));
+    const imgs = await page.locator(".thumb img").evaluateAll((els) =>
+      els.map((e) => ({ src: e.getAttribute("src"), w: e.naturalWidth, done: e.complete })),
+    );
     assert.ok(imgs.length > 0, "no preview images on screen — nothing was exercised");
-    const broken = imgs.filter((i) => i.w === 0);
+    const loaded = imgs.filter((i) => i.done);
+    assert.ok(loaded.length > 0, "no preview image finished loading — nothing was exercised");
+    const broken = loaded.filter((i) => i.w === 0);
     assert.equal(broken.length, 0, `${broken.length} broken: ${broken.map((b) => b.src).join(", ")}`);
   });
 

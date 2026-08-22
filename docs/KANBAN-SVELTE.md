@@ -324,10 +324,10 @@ edit: [ADR-0007](decisions/ADR-0007-one-search-box.md) (the search-mode toggle g
 [ADR-0009](decisions/ADR-0009-responsive-ladder.md) (the responsive ladder narrows the 2026-08-06
 facet-group owner call).
 
-- [ ] **D1 — One search box.** Drop the Tags/AI segmented toggle; typing always filters, the AI is a
+- [x] **D1 — One search box.** Drop the Tags/AI segmented toggle; typing always filters, the AI is a
       pinned escalation row + the empty state's primary action; arcane border while ranked results
       are shown, `← back to name filter` returns. UI-SPEC §0.1.3, §2.6; DG §7 "Search bar".
-- [ ] **D2 — Active-filter bar.** One strip under the toolbar, one removable chip per active
+- [x] **D2 — Active-filter bar.** One strip under the toolbar, one removable chip per active
       constraint, `n of N shown` + Clear all, not rendered when nothing is filtered; `+N more`
       popover past one row. UI-SPEC §2 item 7; DG §7 "Active-filter bar".
 - [ ] **D3 — Appraisal in the tray.** Auto-start after scan (honours `auto_identify`), priority

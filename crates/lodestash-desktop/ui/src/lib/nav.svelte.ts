@@ -10,6 +10,11 @@ class ViewState {
   route = $state<Route>("library");
   tab = $state<TabId>("all");
   search = $state("");
+  /**
+   * Not a mode the user sets any more (ADR-0007): it is what answered. Typing leaves it at "tags";
+   * `askAi()` flips it to "ai" for exactly one query, and any edit to the text puts it back — a
+   * ranked result for a query you have since changed is a lie about what you are looking at.
+   */
   searchMode = $state<"tags" | "ai">("tags");
   status = $state("all");
   sortBy = $state("name");
@@ -158,8 +163,25 @@ class ViewState {
     const had = this.search.trim().length > 0;
     const has = text.trim().length > 0;
     this.search = text;
+    // Editing the query invalidates a ranked result built from the old one (ADR-0007).
+    this.searchMode = "tags";
     if (has && !had && this.sortBy === "name") this.sortBy = "relevance";
     else if (!has && had && this.sortBy === "relevance") this.sortBy = "name";
+  }
+
+  /**
+   * Escalate the current query to the semantic search (UI-SPEC §0.1.3). Deliberately explicit —
+   * Enter, or a click on the escalation row — because embeddings are not something to run on a
+   * keystroke. No query, nothing to ask.
+   */
+  askAi() {
+    if (!this.search.trim()) return;
+    this.searchMode = "ai";
+  }
+
+  /** Back to the substring result for the same query, without retyping it. */
+  backToFilter() {
+    this.searchMode = "tags";
   }
 
   /**

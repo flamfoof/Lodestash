@@ -1,6 +1,7 @@
 <script lang="ts">
   import Card from "./Card.svelte";
   import Toolbar from "./Toolbar.svelte";
+  import FilterBar from "./FilterBar.svelte";
   import QuickLook from "./QuickLook.svelte";
   import AssetList from "./AssetList.svelte";
   import FoldersView from "./FoldersView.svelte";
@@ -174,6 +175,19 @@
   {/if}
 
   <Toolbar total={result?.total ?? 0} favorites={status?.favorites ?? 0} />
+  <!-- UI-SPEC §2 item 7: renders directly under the toolbar, and only when something is filtered. -->
+  <FilterBar shown={result?.total ?? 0} total={status?.total_assets ?? 0} />
+
+  {#if view.searchMode === "ai"}
+    <!-- §0.1.3: while a ranked result is shown the mode is a read-out, with a way back to the
+         substring result for the same query. -->
+    <div class="ranked" data-testid="ranked-header">
+      <span class="ai">✦ <span class="num">{(result?.total ?? 0).toLocaleString()}</span> ranked matches</span>
+      <button class="back" onclick={() => view.backToFilter()} data-testid="back-to-filter">
+        ← back to name filter
+      </button>
+    </div>
+  {/if}
 
   {#if view.browse === "flat" && !nudgeDismissed && (status?.unidentified ?? 0) > 0}
     <!-- Unidentified nudge (D8/B10d): flat browse only, session-dismissable, routes to Identify. -->
@@ -262,19 +276,38 @@
     {:else if !result}
       <p class="msg">Loading…</p>
     {:else if result.items.length === 0}
-      <p class="msg" data-testid="empty">
-        {#if view.search}
-          Nothing matches “{view.search}”.
+      <!-- UI-SPEC §2.6: a filtered-empty result needs a way *out*, not a screen's teaching copy.
+           When there is a query, the way out is the engine that can actually answer a description
+           (ADR-0007) — this is the state the old "Nothing matches" dead-ended in. -->
+      <div class="empty-state" data-testid="empty">
+        {#if view.search && view.searchMode !== "ai"}
+          <p class="msg">No name or trait contains “{view.search}”.</p>
+          <p class="hint">Which is expected, if that is a description rather than a filename.</p>
+          <button class="ask-big" onclick={() => view.askAi()} data-testid="empty-ask-ai">
+            ✦ Search meaning instead
+          </button>
+          {#if (status?.unidentified ?? 0) > 0}
+            <p class="hint">
+              <span class="num">{(status?.unidentified ?? 0).toLocaleString()}</span> assets are still
+              Unidentified and cannot be reached this way —
+              <button class="link" onclick={() => view.go("identify")}>appraise them</button>.
+            </p>
+          {/if}
+        {:else if view.search}
+          <p class="msg">Nothing close in your hoard for “{view.search}”.</p>
+          <button class="link" onclick={() => view.backToFilter()}>← back to name filter</button>
         {:else if view.filterCount > 0}
-          No assets match those filters.
+          <p class="msg">No assets match those filters.</p>
         {:else if favoritesOnly}
-          No favourites yet — star an asset to pin it here.
+          <p class="msg">No favourites yet — star an asset to pin it here.</p>
         {:else if trashedOnly}
-          The Trash is empty. Nothing here is deleted from disk — trashed assets keep their files.
+          <p class="msg">
+            The Trash is empty. Nothing here is deleted from disk — trashed assets keep their files.
+          </p>
         {:else}
-          Nothing in this category.
+          <p class="msg">Nothing in this category.</p>
         {/if}
-      </p>
+      </div>
     {:else if view.rowStyle === "list"}
       <AssetList
         items={result.items}
@@ -286,7 +319,7 @@
         onrestore={(id) => onrestore?.(id)}
       />
     {:else}
-      <div class="grid" style="--card: {cardPx}px">
+      <div class="grid" style="--card: {cardPx}px" data-testid="grid">
         {#each result.items as item (item.asset_id)}
           <!-- The multi-select box (B9d) is a sibling overlaid on the card's artwork top-left —
                the Card root is a <button>, so nesting a real control inside it would be invalid
@@ -325,6 +358,20 @@
           </div>
         {/each}
       </div>
+    {/if}
+
+    <!-- UI-SPEC §0.1.3: the escalation is pinned under the filtered results and stays there the
+         whole time a substring query is showing, so the AI is never a mode you had to predict. It
+         is not shown for an empty result — §2.6's empty state already offers it as the primary
+         action, and two offers of the same thing on one screen is one too many. -->
+    {#if view.search.trim() && view.searchMode !== "ai" && result && result.items.length > 0}
+      <button class="escalate" onclick={() => view.askAi()} data-testid="escalate">
+        <span class="mark">✦</span>
+        <span class="txt">
+          Ask AI for <span class="q">»{view.search.trim()}«</span> — searches meaning, not names
+        </span>
+        <span class="key">⏎</span>
+      </button>
     {/if}
   </div>
 
@@ -373,6 +420,113 @@
 </section>
 
 <style>
+  /* ── D1: one search box (ADR-0007) ────────────────────────────────────────────────────────── */
+  .ranked {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+    padding: var(--sp-2) var(--sp-5);
+    border-bottom: 1px solid var(--ls-border);
+  }
+  .ranked .ai {
+    font-size: var(--fs-sm);
+    color: var(--ls-arcane);
+  }
+  .ranked .back,
+  .link {
+    background: none;
+    border: 0;
+    padding: 0;
+    font: inherit;
+    font-size: var(--fs-xs);
+    color: var(--ls-text-muted);
+    border-bottom: 1px dotted var(--ls-border-strong);
+    cursor: pointer;
+  }
+  .ranked .back {
+    margin-left: auto;
+  }
+  .ranked .back:hover,
+  .link:hover {
+    color: var(--ls-gold);
+    border-bottom-color: var(--ls-gold);
+  }
+
+  .escalate {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    width: calc(100% - var(--sp-5) * 2);
+    margin: var(--sp-3) var(--sp-5) var(--sp-4);
+    padding: var(--sp-2) var(--sp-3);
+    text-align: left;
+    font: inherit;
+    font-size: var(--fs-sm);
+    color: var(--ls-text);
+    background: color-mix(in srgb, var(--ls-arcane) 7%, transparent);
+    border: 1px solid color-mix(in srgb, var(--ls-arcane) 35%, transparent);
+    border-radius: var(--r-md);
+    cursor: pointer;
+  }
+  .escalate:hover {
+    border-color: var(--ls-arcane);
+    background: color-mix(in srgb, var(--ls-arcane) 12%, transparent);
+  }
+  .escalate .mark {
+    color: var(--ls-arcane);
+  }
+  .escalate .txt {
+    flex: 1;
+    min-width: 0;
+  }
+  .escalate .q {
+    color: var(--ls-arcane);
+  }
+  .escalate .key {
+    flex: none;
+    padding: 1px 6px;
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+    border: 1px solid var(--ls-border-strong);
+    border-radius: var(--r-sm);
+  }
+
+  .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--sp-2);
+    padding: var(--sp-6) var(--sp-5);
+    text-align: center;
+  }
+  .empty-state .hint {
+    margin: 0;
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+  }
+  .ask-big {
+    margin-top: var(--sp-1);
+    height: 34px;
+    padding: 0 var(--sp-4);
+    font: inherit;
+    font-size: var(--fs-sm);
+    color: var(--ls-arcane);
+    background: none;
+    border: 1px solid var(--ls-arcane);
+    border-radius: var(--r-md);
+    cursor: pointer;
+  }
+  .ask-big:hover {
+    color: var(--ls-arcane-bright);
+    box-shadow: 0 0 12px color-mix(in srgb, var(--ls-arcane) 25%, transparent);
+  }
+  .escalate:focus-visible,
+  .ask-big:focus-visible,
+  .link:focus-visible,
+  .ranked .back:focus-visible {
+    box-shadow: var(--el-focus-ring);
+    outline: none;
+  }
   .screen {
     display: flex;
     flex-direction: column;

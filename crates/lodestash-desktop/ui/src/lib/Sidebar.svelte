@@ -124,6 +124,7 @@
           class:on={view.status === s.id}
           aria-pressed={view.status === s.id}
           onclick={() => pickStatus(s.id)}
+          data-testid="status-{s.id}"
         >
           <i class="dot" style="--dot: {s.tint}" aria-hidden="true"></i>
           <span class="label">{s.label}</span>
