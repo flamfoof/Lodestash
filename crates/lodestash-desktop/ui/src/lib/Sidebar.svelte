@@ -159,13 +159,24 @@
         <span class="count num">{status?.total_assets ?? 0}</span>
       </button>
       {#each status?.sources ?? [] as src (src.id)}
+        <!-- UI-SPEC §11.1: an unavailable root swaps the diamond for a red ✕ and dims the row —
+             shape, not colour alone (DG §9). The row still selects: filtering to a library whose
+             drive is unplugged is a legitimate thing to want, and everything the catalog knows
+             about it still reads. -->
         <button
           class="facet"
           class:on={view.source === src.name}
+          class:gone={src.state === "unavailable"}
           aria-pressed={view.source === src.name}
           onclick={() => pickSource(src.name)}
-          title={src.root_path}
+          title={src.state === "unavailable"
+            ? `${src.root_path} — unavailable`
+            : src.root_path}
+          data-testid="lib-facet-{src.id}"
         >
+          {#if src.state === "unavailable"}
+            <span class="gone-mark" aria-label="unavailable">✕</span>
+          {/if}
           <span class="label">{src.name}</span>
           <span class="count num">{src.asset_count}</span>
         </button>
@@ -286,6 +297,16 @@
   .count {
     font-size: var(--fs-xs);
     color: var(--ls-text-dim);
+  }
+  .facet.gone {
+    opacity: 0.62;
+  }
+  .gone-mark {
+    flex: none;
+    width: 7px;
+    font-size: 9px;
+    line-height: 1;
+    color: var(--ls-danger);
   }
   /* The Pinned sub-heading sits between the Libraries heading and the facet rows. */
   .group h2.sub {

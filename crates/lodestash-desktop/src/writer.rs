@@ -66,6 +66,12 @@ pub enum Op {
         ids: Vec<i64>,
         on: bool,
     },
+    /// Re-derive every source's availability from disk (UI-SPEC §11.1, M18).
+    ///
+    /// It writes `import_source.state`, so it belongs on the writer thread rather than on a read
+    /// connection — and it is a `stat` per source **root**, not per asset, so it stays cheap enough
+    /// to run on open and after every scan.
+    RefreshSourceHealth,
     /// Soft delete / restore. Catalog-only; the file on disk is never touched (DATA-MODEL §8).
     SetTrashed {
         ids: Vec<i64>,
@@ -1061,6 +1067,16 @@ fn run(
             .set_favorite(&ids, on)
             .map(|changed| WriteResult {
                 changed,
+                ..Default::default()
+            })
+            .map_err(|e| e.to_string()),
+
+        // `changed` is how many sources *moved* state, so a caller can tell "nothing to see" from
+        // "a drive just came back" without diffing the whole list.
+        Op::RefreshSourceHealth => catalog
+            .refresh_source_health()
+            .map(|moved| WriteResult {
+                changed: moved.len(),
                 ..Default::default()
             })
             .map_err(|e| e.to_string()),

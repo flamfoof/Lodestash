@@ -340,9 +340,19 @@ facet-group owner call).
       460px two-up compare when exactly two are picked, differ-is-gold stat table. UI-SPEC §13.
 - [x] **D6 — List-row parity.** star / ⤢ / stage / pack link / size badge on rows, actions in a
       trailing column (closes audit **F6**). UI-SPEC §2.5.
-- [ ] **D7 — Source availability.** `import_source.state` + `last_seen_at` (**M18**), health check on
-      open + after scan, banner / facet ✕ / card plate / Quick Look panel / partial-import refusal /
-      relink panel with a match count before it commits. UI-SPEC §11.1, DATA-MODEL §1.
+- [x] **D7a — Source availability is known and shown.** **M18** (`import_source.state` +
+      `last_seen_at`), `Catalog::refresh_source_health()` — one `is_dir` per **root**, never per
+      asset — carried on `SourceSummary`, run through the writer as `Op::RefreshSourceHealth` (it
+      writes, so ARCHITECTURE §5 says it belongs there) and fired once at open, after the first
+      status read so a slow network root cannot block the first paint. Shown as the red `✕` on the
+      sidebar facet and the Library banner. Mutation-checked on the three things that would make it
+      dangerous: a missing root must not delete or trash rows, a returning root must clear the
+      state, and `last_seen_at` must not move while the root is gone.
+- [ ] **D7b — Source availability, the rest.** Card / row `file unavailable` plate, the Quick Look
+      panel, the partial-import refusal (§16.2), and the relink panel with its match count shown
+      before it commits. The card plate needs a per-row source-state read (`GridItem` carries no
+      source today); relink needs `root_path` rewriting + `asset_file.rel_path` re-resolution.
+      UI-SPEC §11.1.
 - [x] **D8 — Undo in the toast.** One action slot (`Undo` | `Show`), 6s with an action, hover
       freezes, 3 at a time with the rest collapsed into `+N more`. Each toast pins **its own oplog
       id** at push time — undoing the head of the log from the second-newest toast reverses the

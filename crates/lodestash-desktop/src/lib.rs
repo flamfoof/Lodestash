@@ -218,6 +218,16 @@ fn asset_detail(
         .map_err(|_| "library lock poisoned".to_string())
 }
 
+/// Re-derive source availability from disk (UI-SPEC §11.1, M18).
+///
+/// Called when the library opens and after a scan. Nothing here removes, trashes or hides a row —
+/// a source going away leaves the catalog fully browsable and only the files out of reach, which is
+/// the whole point of having an index.
+#[tauri::command]
+fn refresh_source_health(state: tauri::State<'_, AppState>) -> Result<WriteResult, String> {
+    state.write(Op::RefreshSourceHealth)
+}
+
 /// Star / unstar assets (DATA-MODEL §12). A pin, not a rating — "find this again".
 #[tauri::command]
 fn set_favorite(
@@ -1769,6 +1779,7 @@ pub fn run() {
             asset_detail,
             reload_library,
             set_favorite,
+            refresh_source_health,
             set_trashed,
             remove_from_library,
             delete_from_disk,

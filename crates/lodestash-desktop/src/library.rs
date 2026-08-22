@@ -199,6 +199,11 @@ pub struct SourceSummary {
     /// Whether this source is being watched for changes (UI-SPEC §11.1) — drives the
     /// pause/resume toggle on the Settings screen.
     pub watch_enabled: bool,
+    /// `available` | `paused` | `unavailable` (M18, UI-SPEC §11.1). An unavailable source keeps
+    /// every row it owns: the catalog stays browsable, only the files are out of reach.
+    pub state: String,
+    /// Unix seconds the root last resolved — "unavailable since …".
+    pub last_seen_at: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -764,6 +769,8 @@ impl Library {
                 root_path: info.root_path.clone(),
                 asset_count: info.asset_count,
                 watch_enabled: info.watch_enabled,
+                state: info.state.clone(),
+                last_seen_at: info.last_seen_at,
             });
         }
 

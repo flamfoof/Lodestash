@@ -71,6 +71,11 @@ pub struct SourceInfo {
     pub last_scanned_at: Option<i64>,
     pub watch_enabled: bool,
     pub asset_count: i64,
+    /// `available` | `paused` | `unavailable` (M18). Derived by [`Catalog::refresh_source_health`],
+    /// never authored by the user — `paused` is `watch_enabled` surfaced as a state.
+    pub state: String,
+    /// Unix seconds the root last resolved. Drives "unavailable since …" in the UI.
+    pub last_seen_at: Option<i64>,
 }
 
 /// Per-status asset counts (soft-deleted rows excluded). `unidentified` folds
@@ -265,6 +270,7 @@ impl Catalog {
             (15, MIGRATION_15_VECTOR_PREVIEWS),
             (16, MIGRATION_16_OP_LOG),
             (17, MIGRATION_17_OP_LOG_REDO),
+            (18, MIGRATION_18_SOURCE_STATE),
         ];
 
         for (version, sql) in migrations {
@@ -372,10 +378,11 @@ impl Catalog {
             .conn
             .prepare(
                 "SELECT s.id, s.name, s.root_path, s.kind, s.last_scanned_at, s.watch_enabled,
-                        COUNT(a.id) AS asset_count
+                        COUNT(a.id) AS asset_count, s.state, s.last_seen_at
                  FROM import_source s
                  LEFT JOIN asset a ON a.source_id = s.id AND a.deleted_at IS NULL
-                 GROUP BY s.id, s.name, s.root_path, s.kind, s.last_scanned_at, s.watch_enabled
+                 GROUP BY s.id, s.name, s.root_path, s.kind, s.last_scanned_at, s.watch_enabled,
+                          s.state, s.last_seen_at
                  ORDER BY s.name",
             )
             .map_err(|e| CoreError::Catalog(format!("source infos prep: {e}")))?;
@@ -389,6 +396,8 @@ impl Catalog {
                     last_scanned_at: r.get(4)?,
                     watch_enabled: r.get::<_, i64>(5)? != 0,
                     asset_count: r.get::<_, i64>(6)?,
+                    state: r.get(7)?,
+                    last_seen_at: r.get(8)?,
                 })
             })
             .map_err(|e| CoreError::Catalog(format!("source infos query: {e}")))?;
@@ -402,11 +411,12 @@ impl Catalog {
             .conn
             .prepare(
                 "SELECT s.id, s.name, s.root_path, s.kind, s.last_scanned_at, s.watch_enabled,
-                        COUNT(a.id) AS asset_count
+                        COUNT(a.id) AS asset_count, s.state, s.last_seen_at
                  FROM import_source s
                  LEFT JOIN asset a ON a.source_id = s.id AND a.deleted_at IS NULL
                  WHERE s.root_path = ?1
-                 GROUP BY s.id, s.name, s.root_path, s.kind, s.last_scanned_at, s.watch_enabled",
+                 GROUP BY s.id, s.name, s.root_path, s.kind, s.last_scanned_at, s.watch_enabled,
+                          s.state, s.last_seen_at",
             )
             .map_err(|e| CoreError::Catalog(format!("source info prep: {e}")))?;
         let row = stmt
@@ -419,6 +429,8 @@ impl Catalog {
                     last_scanned_at: r.get(4)?,
                     watch_enabled: r.get::<_, i64>(5)? != 0,
                     asset_count: r.get::<_, i64>(6)?,
+                    state: r.get(7)?,
+                    last_seen_at: r.get(8)?,
                 })
             })
             .optional()
@@ -1891,6 +1903,17 @@ ALTER TABLE op_log ADD COLUMN undone_at INTEGER;  -- set on undo; redo applies t
 CREATE INDEX IF NOT EXISTS idx_oplog_undone ON op_log(undone_at);
 ";
 
+/// M18 — source availability (DATA-MODEL §1, UI-SPEC §11.1).
+///
+/// A source root going away *after* indexing is the normal end state for an external drive or a
+/// moved folder, and nothing in the schema could say so: `watch_enabled` is the user's intent, not
+/// the disk's answer. `state` is **derived** — the open/scan health check writes it — and nothing
+/// is ever deleted because a root went missing.
+const MIGRATION_18_SOURCE_STATE: &str = "
+ALTER TABLE import_source ADD COLUMN state TEXT NOT NULL DEFAULT 'available';  -- available|paused|unavailable
+ALTER TABLE import_source ADD COLUMN last_seen_at INTEGER;                     -- unix seconds the root last resolved
+";
+
 const MIGRATION_12_FAVORITES: &str = "
 ALTER TABLE asset ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_asset_favorite ON asset(favorite) WHERE favorite=1;
@@ -2975,6 +2998,66 @@ impl Catalog {
             )));
         }
         Ok(())
+    }
+
+    /// Re-derive every source's availability from the disk (UI-SPEC §11.1, M18).
+    ///
+    /// One `is_dir` per source **root**, never per asset: a single missing file is a per-asset fact
+    /// and must never mark a whole library unavailable. Roots that resolve stamp `last_seen_at`, so
+    /// the UI can say *since when*; roots that do not keep the timestamp they had.
+    ///
+    /// Nothing is deleted, trashed or hidden by this — the catalog stays fully browsable while the
+    /// files are away, which is the entire point of having an index. Callers run it off the UI
+    /// thread: a slow network root can take seconds to answer, and a false "unavailable" flash on
+    /// every open would be worse than the gap it closes.
+    ///
+    /// Returns the ids whose state actually changed, so a caller can decide whether to re-render.
+    pub fn refresh_source_health(&self) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, root_path, state, watch_enabled FROM import_source")
+            .map_err(|e| CoreError::Catalog(format!("source health prep: {e}")))?;
+        let rows: Vec<(i64, String, String, bool)> = stmt
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0))
+            })
+            .map_err(|e| CoreError::Catalog(format!("source health query: {e}")))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("source health row: {e}")))?;
+
+        let now = unix_now();
+        let mut changed = Vec::new();
+        for (id, root, was, watching) in rows {
+            let present = std::path::Path::new(&root).is_dir();
+            // A root that is not there outranks everything: that is the fact stopping files from
+            // opening. `paused` is the user's own intent, and only means anything while the source
+            // is actually reachable.
+            let now_state = match (present, watching) {
+                (false, _) => "unavailable",
+                (true, false) => "paused",
+                (true, true) => "available",
+            };
+            if present {
+                self.conn
+                    .execute(
+                        "UPDATE import_source SET state = ?1, last_seen_at = ?2 WHERE id = ?3",
+                        params![now_state, now, id],
+                    )
+                    .map_err(|e| CoreError::Catalog(format!("source health update: {e}")))?;
+            } else {
+                // Keep the timestamp it had — "unavailable since" is the last time it *was* there.
+                self.conn
+                    .execute(
+                        "UPDATE import_source SET state = ?1 WHERE id = ?2",
+                        params![now_state, id],
+                    )
+                    .map_err(|e| CoreError::Catalog(format!("source health update: {e}")))?;
+            }
+            if was != now_state {
+                changed.push(id);
+            }
+        }
+        Ok(changed)
     }
 
     /// Every asset already imported into the **active** project, in one query.
@@ -4651,7 +4734,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 17, "all 17 migrations should have run");
+        assert_eq!(version, 18, "all 18 migrations should have run");
     }
 
     /// The viewer's texture lookup must walk **both** hops. Stopping at the first lands on the
@@ -5023,6 +5106,69 @@ mod tests {
             cross[0],
             ImportOutcome::Recorded { asset_id: 1, .. }
         ));
+    }
+
+    /// Source availability (UI-SPEC §11.1, M18).
+    ///
+    /// The three things that would make this dangerous rather than merely wrong, all asserted: a
+    /// missing root must **not** delete or trash anything, a root that comes back must clear the
+    /// state again, and `last_seen_at` must keep the last time the root *was* there rather than
+    /// being stamped while it is gone — "unavailable since" is only honest if it does.
+    #[test]
+    fn source_health_marks_a_missing_root_without_touching_its_rows() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let root = dir.path().join("lib");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let root_s = root.to_string_lossy().to_string();
+
+        let c = Catalog::open_in_memory().expect("open");
+        c.conn
+            .execute_batch(&format!(
+                "INSERT INTO import_source (id, uuid, name, root_path, kind)
+                     VALUES (1, 's1', 'Src', '{}', 'folder');
+                 INSERT INTO media_type (id, code, label) VALUES (1, 'image', 'Image');
+                 INSERT INTO asset (id, uuid, source_id, media_type_id, name, created_at, updated_at)
+                     VALUES (1, 'a1', 1, 1, 'one', 0, 0), (2, 'a2', 1, 1, 'two', 0, 0);",
+                root_s.replace('\\', "/")
+            ))
+            .expect("fixture");
+
+        // Present: available, and a first sighting recorded.
+        assert!(c.refresh_source_health().unwrap().is_empty());
+        let info = c.source_infos().unwrap().remove(0);
+        assert_eq!(info.state, "available");
+        let seen = info
+            .last_seen_at
+            .expect("a present root records when it was seen");
+
+        // Gone: unavailable, and the id is reported as moved.
+        std::fs::remove_dir_all(&root).expect("rm");
+        assert_eq!(c.refresh_source_health().unwrap(), vec![1]);
+        let info = c.source_infos().unwrap().remove(0);
+        assert_eq!(info.state, "unavailable");
+        assert_eq!(
+            info.last_seen_at,
+            Some(seen),
+            "last_seen_at moved while the root was gone — 'unavailable since' would lie"
+        );
+        assert_eq!(
+            info.asset_count, 2,
+            "a missing root removed rows from the catalog — the index must survive the drive"
+        );
+        let live: i64 = c
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset WHERE deleted_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live, 2, "a missing root trashed assets");
+
+        // Back again: available, and reported as moved a second time.
+        std::fs::create_dir_all(&root).expect("mkdir");
+        assert_eq!(c.refresh_source_health().unwrap(), vec![1]);
+        assert_eq!(c.source_infos().unwrap().remove(0).state, "available");
     }
 
     /// The bulk read behind the `✓ in <project>` badge (UI-SPEC §2.5).

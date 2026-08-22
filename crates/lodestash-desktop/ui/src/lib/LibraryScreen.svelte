@@ -67,6 +67,13 @@
   let quickLook = $state<number | null>(null);
   /** Unidentified nudge (D8 / KANBAN B10d): ✕ hides it for the rest of the session. */
   let nudgeDismissed = $state(false);
+  /**
+   * Unavailable-source banner (UI-SPEC §11.1, D7). One line naming the source, the count at risk
+   * and the declared path — because the fix is usually "plug the drive back in", not anything in
+   * this app. Dismissed for the session, like the nudge.
+   */
+  let goneDismissed = $state(false);
+  let goneSources = $derived((status?.sources ?? []).filter((s) => s.state === "unavailable"));
 
   // ---- Bulk-bar tag edits (KANBAN B9d) -----------------------------------
   // The tag value input, in the default `free` namespace. `bulkBusy` guards the writer thread
@@ -218,6 +225,27 @@
       <button class="back" onclick={() => view.backToFilter()} data-testid="back-to-filter">
         ← back to name filter
       </button>
+    </div>
+  {/if}
+
+  {#if !goneDismissed && goneSources.length > 0}
+    <div class="gone-banner" role="status" data-testid="source-gone-banner">
+      <span class="mark" aria-hidden="true">✕</span>
+      <span class="text">
+        {#if goneSources.length === 1}
+          <strong>{goneSources[0].name}</strong> is unavailable —
+          <span class="num">{goneSources[0].asset_count.toLocaleString()}</span> assets are still
+          listed, but their files cannot be reached.
+          <span class="path mono">{goneSources[0].root_path}</span>
+        {:else}
+          <strong>{goneSources.length} libraries</strong> are unavailable —
+          <span class="num">
+            {goneSources.reduce((n, s) => n + s.asset_count, 0).toLocaleString()}
+          </span>
+          assets are still listed, but their files cannot be reached.
+        {/if}
+      </span>
+      <button class="x" aria-label="Dismiss" onclick={() => (goneDismissed = true)}>✕</button>
     </div>
   {/if}
 
@@ -458,6 +486,43 @@
 </section>
 
 <style>
+  /* Not a modal and not a toast per asset: one line that says which library went away and how much
+     of the catalog is pointing at it (UI-SPEC §11.1). */
+  .gone-banner {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+    padding: var(--sp-2) var(--sp-5);
+    background: color-mix(in srgb, var(--ls-danger) 8%, transparent);
+    border-top: 1px solid color-mix(in srgb, var(--ls-danger) 40%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, var(--ls-danger) 40%, transparent);
+    font-size: var(--fs-sm);
+    color: var(--ls-text);
+  }
+  .gone-banner .mark {
+    color: var(--ls-danger);
+    font-size: var(--fs-lg);
+    line-height: 1;
+  }
+  .gone-banner .text {
+    flex: 1;
+    min-width: 0;
+  }
+  .gone-banner .path {
+    color: var(--ls-text-dim);
+    font-size: var(--fs-xs);
+  }
+  .gone-banner .x {
+    flex: none;
+    background: none;
+    border: 0;
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+    cursor: pointer;
+  }
+  .gone-banner .x:hover {
+    color: var(--ls-text);
+  }
   /* ── D1: one search box (ADR-0007) ────────────────────────────────────────────────────────── */
   .ranked {
     display: flex;

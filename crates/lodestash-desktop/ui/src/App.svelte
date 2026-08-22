@@ -44,6 +44,7 @@ import JobTray from "./lib/JobTray.svelte";
     type LibraryStatus,
     recentOps,
     undo as undoOp,
+    refreshSourceHealth,
   } from "./lib/api";
   import { refreshTraitColors } from "./lib/traits.svelte";
   import Onboarding from "./lib/Onboarding.svelte";
@@ -86,6 +87,16 @@ import JobTray from "./lib/JobTray.svelte";
   });
 
   libraryStatus()
+    .then((s) => (status = s))
+    .catch(() => {});
+
+  /**
+   * Source health, once at open (UI-SPEC §11.1). Deliberately fire-and-forget and *after* the first
+   * status read: a slow network root can take seconds to answer, and blocking the first paint on it
+   * would trade a real problem for a worse one. The re-read below picks up whatever it found.
+   */
+  refreshSourceHealth()
+    .then(() => libraryStatus())
     .then((s) => (status = s))
     .catch(() => {});
   // Chip colours for styled traits (B8a) — loaded once, refreshed after every vocabulary write.

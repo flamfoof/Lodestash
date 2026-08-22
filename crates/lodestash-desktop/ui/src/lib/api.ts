@@ -33,6 +33,14 @@ export type SourceSummary = {
   asset_count: number;
   /** Whether the source is being watched (UI-SPEC §11.1) — the Settings pause/resume toggle. */
   watch_enabled: boolean;
+  /**
+   * `available` | `paused` | `unavailable` (M18, UI-SPEC §11.1). Unavailable means the root is not
+   * on disk right now — every row it owns is still listed and searchable, only the files are out of
+   * reach. Derived by the health check, never authored.
+   */
+  state: string;
+  /** Unix seconds the root last resolved — "unavailable since …". */
+  last_seen_at: number | null;
 };
 
 export type LibraryStatus = {
@@ -700,6 +708,9 @@ export const fileUrl = (assetId: number) => `${LODESTASH_BASE}/file/${assetId}`;
 export let thumbKey = "1";
 export const previewCacheUsage = () => invoke<[number, number]>("preview_cache_usage");
 export const clearPreviewCache = () => invoke<number>("clear_preview_cache");
+
+/** Re-derive source availability from disk (UI-SPEC §11.1). One stat per root, on the writer. */
+export const refreshSourceHealth = () => invoke<WriteResult>("refresh_source_health");
 
 /** AI model install status (Settings MODELS): installed vs not + size. */
 export const modelsStatus = () =>
