@@ -135,3 +135,125 @@ button {
     box-shadow: none !important;
   }
 }
+
+/*
+ * The responsive ladder (DESIGN-GUIDELINES §4, ADR-0009).
+ *
+ * The shell spends a fixed 210px sidebar + 300px inspector before the grid gets anything, and the
+ * library toolbar carries about ten controls. Before this the entire responsive behaviour was one
+ * media query — the toolbar hint below 1200px — and everything else simply crowded.
+ *
+ * Ordering principle: decoration first, then chrome that can be recalled on demand, then chrome
+ * that changes state. Nothing is removed outright; each step moves something behind a gesture. The
+ * grid is never what shrinks to make room for a control.
+ *
+ * Floor: 900 x 600. Below that the shell scrolls and the product does not claim to support it.
+ */
+
+/* < 1280 — the inspector stops pushing the grid and starts covering it, keeping its edge tab.
+   Selecting no longer reflows a column out from under the cursor. */
+@media (max-width: 1279px) {
+  .body {
+    position: relative;
+  }
+  .body > .inspector {
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    z-index: 6;
+    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.45);
+  }
+  .body > .edge {
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    z-index: 5;
+  }
+  /* The rails are out of flow now, so the main column has to stop reserving room for them. */
+  .body > main {
+    padding-right: 26px;
+  }
+}
+
+/* < 1120 — the sidebar becomes an icon rail. Labels, counts and both facet groups move into the
+   flyout it opens on hover or focus: still one click away, on every screen, for everyone
+   (ADR-0009 narrows the 2026-08-06 owner call to exactly this). */
+@media (max-width: 1119px) {
+  .sidebar {
+    width: 48px;
+    overflow: visible;
+  }
+  .sidebar .label,
+  .sidebar .count,
+  .sidebar h2,
+  .sidebar .add {
+    display: none;
+  }
+  .sidebar .badge {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    font-size: 9px;
+    padding: 0 4px;
+  }
+  .sidebar .row,
+  .sidebar .facet {
+    position: relative;
+    justify-content: center;
+    padding: 0;
+  }
+  /* Hover or keyboard focus widens the rail over the grid rather than pushing it — the same
+     covering behaviour the inspector adopts one step earlier. */
+  .sidebar:hover,
+  .sidebar:focus-within {
+    width: 210px;
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 7;
+    overflow-y: auto;
+    box-shadow: 8px 0 24px rgba(0, 0, 0, 0.45);
+  }
+  .sidebar:hover .label,
+  .sidebar:focus-within .label,
+  .sidebar:hover .count,
+  .sidebar:focus-within .count,
+  .sidebar:hover h2,
+  .sidebar:focus-within h2,
+  .sidebar:hover .add,
+  .sidebar:focus-within .add {
+    display: revert;
+  }
+  .sidebar:hover .row,
+  .sidebar:focus-within .row,
+  .sidebar:hover .facet,
+  .sidebar:focus-within .facet {
+    justify-content: flex-start;
+    padding: 0 var(--sp-2);
+  }
+  .sidebar:hover .badge,
+  .sidebar:focus-within .badge {
+    position: static;
+    font-size: var(--fs-xs);
+    padding: 1px 7px;
+  }
+}
+
+/* < 960 — sort, density and undo/redo fold away. The view toggle, the filters flag and the
+   favourites toggle never fold: they change *what you are looking at*, and the active-filter bar
+   is what tells you they did. */
+@media (max-width: 959px) {
+  .toolbar .sort,
+  .toolbar .dir {
+    display: none;
+  }
+}
+
+@media (max-width: 899px) {
+  .frame {
+    overflow: auto;
+  }
+}

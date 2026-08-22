@@ -766,6 +766,41 @@ try {
     await page.waitForSelector(".card", { timeout: 5000 });
   });
 
+  // ── D12: the responsive ladder is present and parses (ADR-0009) ──────────────────────────────
+  // Deliberately NOT a viewport-driven check. `setViewportSize` over CDP does not drive this app's
+  // media queries — it silently changes nothing and then leaves an emulation override behind that
+  // poisons every check after it. What this asserts instead is that the four stops shipped and that
+  // the browser accepted their selectors: the `:global()`-in-a-plain-stylesheet mistake would have
+  // dropped every rule while type-checking clean. Behaviour at each stop is still eyes-only.
+  await check("the responsive ladder's four stops ship as valid CSS", async () => {
+    const stops = await page.evaluate(() => {
+      const found = [];
+      for (const sheet of [...document.styleSheets]) {
+        let rules;
+        try {
+          rules = sheet.cssRules;
+        } catch {
+          continue; // cross-origin sheet; not ours
+        }
+        for (const rule of [...rules]) {
+          if (rule.type === CSSRule.MEDIA_RULE && /max-width/.test(rule.conditionText ?? "")) {
+            found.push({
+              cond: rule.conditionText,
+              // A media block the parser rejected keeps its condition but drops its contents.
+              rules: rule.cssRules.length,
+            });
+          }
+        }
+      }
+      return found;
+    });
+    for (const px of [1400, 1279, 1119, 959]) {
+      const hit = stops.find((s) => s.cond.includes(String(px)));
+      assert.ok(hit, `no media rule at ${px}px — the ladder step is missing`);
+      assert.ok(hit.rules > 0, `the ${px}px block parsed to zero rules — its selectors were rejected`);
+    }
+  });
+
   await check("Ctrl-K opens the palette, and Enter on an asset reveals it", async () => {
     try {
       await page.fill('input[type="text"]', "");

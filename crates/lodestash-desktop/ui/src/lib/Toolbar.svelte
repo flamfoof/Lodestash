@@ -289,7 +289,9 @@
     opacity: 0.7;
     white-space: nowrap;
   }
-  @media (max-width: 1200px) {
+  /* Step 1 of the ladder (DESIGN-GUIDELINES §4): the keyboard hint is the only thing on screen
+     that teaches nothing you cannot discover, so it goes first — and 1200px was already too late. */
+  @media (max-width: 1400px) {
     .hint {
       display: none;
     }
