@@ -355,9 +355,14 @@ facet-group owner call).
       that wrong and DG §9 is corrected to say so. Built: the §8 reduced-motion table. Spinners are
       the stated exception — a frozen spinner reads as a stuck UI and is the only signal a job is
       alive. *(Focusable **cards** still wait on a roving `tabindex` — see D15.)*
-- [ ] **D10 — `✓ in <project>` badge.** Four states (active / others / never / older copy) on card,
-      row and stat block; needs an `in_project` flag on `GridItem` from a bulk `import_record` read
-      (closes **N1.5** / B12e). DG §7 "Already imported badge".
+- [x] **D10 — `✓ in <project>` badge.** `GridItem.in_project`, filled by one
+      `imported_into_active_project()` read per reload (`mark_imported`, beside `mark_traits`) —
+      the data was always there and the bulk read was not (closes **N1.5** / B12e). Card shows
+      `✓ in project` beside the size tier; rows show the check alone. Mutation-checked on the two
+      ways it could lie: keying off `is_active`, and reading empty rather than erroring with no
+      active project. **Delta:** only two of DG §7's four states — "in N others" needs a per-project
+      read and "older copy" needs source-mtime vs `imported_at`. Never-imported correctly draws
+      nothing.
 - [ ] **D11 — Duplicates as a queue.** Group list + the §13 compare pane, `n / N reviewed`, keeper
       ribbon, keep-both / merge-tags / trash, `2 of 3 ›` cycling for larger groups. UI-SPEC §5.
 - [ ] **D12 — Responsive ladder.** 1400 hint · 1280 overlay inspector · 1120 icon rail + facet

@@ -12,6 +12,11 @@ export type GridItem = {
   favorite: boolean;
   in_pack: boolean;
   package: string | null;
+  /**
+   * Already imported into the **active** project (DESIGN-GUIDELINES §7 "Already imported badge").
+   * Filled by one bulk read per reload, so switching projects re-paints every badge in the grid.
+   */
+  in_project: boolean;
   triangles: number | null;
   /** Tag values, drawn as chips under the meta line (FEATURES §1.1). */
   traits: string[];

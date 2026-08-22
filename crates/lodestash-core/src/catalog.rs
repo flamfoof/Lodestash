@@ -2977,6 +2977,34 @@ impl Catalog {
         Ok(())
     }
 
+    /// Every asset already imported into the **active** project, in one query.
+    ///
+    /// [`Self::already_imported`] answers the same question per asset and is the right shape for a
+    /// dup-guard over a handful of picks; a grid of 8k cards asking it per row is 8k statements.
+    /// This is what the `✓ in <project>` badge (UI-SPEC §2.5, DESIGN-GUIDELINES §7) reads at reload.
+    /// No active project is not an error — it is a library with nothing to compare against, and the
+    /// badge simply does not draw.
+    pub fn imported_into_active_project(&self) -> Result<std::collections::HashSet<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT ir.asset_id FROM import_record ir
+                 JOIN project p ON p.id = ir.project_id
+                 WHERE p.is_active = 1",
+            )
+            .map_err(|e| CoreError::Catalog(format!("imported_into_active prepare: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, i64>(0))
+            .map_err(|e| CoreError::Catalog(format!("imported_into_active query: {e}")))?;
+        let mut out = std::collections::HashSet::new();
+        for r in rows {
+            out.insert(
+                r.map_err(|e| CoreError::Catalog(format!("imported_into_active row: {e}")))?,
+            );
+        }
+        Ok(out)
+    }
+
     /// Which of `asset_ids` already have an `import_record` for `project_id` (ENGINE-API §5.4
     /// dup-guard advisory). A caller warns "already imported — re-import?" before enqueuing.
     pub fn already_imported(&self, asset_ids: &[i64], project_id: i64) -> Result<Vec<i64>> {
@@ -4995,6 +5023,70 @@ mod tests {
             cross[0],
             ImportOutcome::Recorded { asset_id: 1, .. }
         ));
+    }
+
+    /// The bulk read behind the `✓ in <project>` badge (UI-SPEC §2.5).
+    ///
+    /// Mutation-checked on the two things that would make the badge lie: it must key on the
+    /// **active** project (a set that ignores `is_active` would light the badge for assets imported
+    /// into some other project), and it must come back empty rather than error when no project is
+    /// active (a library with nothing to compare against draws no badge).
+    #[test]
+    fn imported_into_active_project_reads_only_the_active_one() {
+        let c = Catalog::open_in_memory().expect("open");
+        // `import_record.asset_id` is a real foreign key — the assets have to exist first.
+        c.conn
+            .execute_batch(
+                "INSERT INTO import_source (id, uuid, name, root_path, kind)
+                     VALUES (1, 's1', 'Src', 'C:/lib', 'folder');
+                 INSERT INTO media_type (id, code, label) VALUES (1, 'image', 'Image');
+                 INSERT INTO asset (id, uuid, source_id, media_type_id, name, created_at, updated_at)
+                     VALUES (1, 'a1', 1, 1, 'one', 0, 0),
+                            (2, 'a2', 1, 1, 'two', 0, 0),
+                            (3, 'a3', 1, 1, 'three', 0, 0);",
+            )
+            .expect("fixture");
+        let p1 = c.register_project("C:/dev/GameA", None, None).unwrap();
+        let p2 = c.register_project("C:/dev/GameB", None, None).unwrap();
+        let specs = |ids: &[i64]| {
+            ids.iter()
+                .map(|&asset_id| ImportSpec {
+                    asset_id,
+                    source_package_id: None,
+                    dest_path: format!("Assets/{asset_id}.png"),
+                    unity_guid: None,
+                    with_deps: true,
+                })
+                .collect::<Vec<_>>()
+        };
+        c.record_imports(p1, &specs(&[1, 2]), "b1").unwrap();
+        c.record_imports(p2, &specs(&[3]), "b2").unwrap();
+
+        c.set_active_project(p1).unwrap();
+        let a = c.imported_into_active_project().unwrap();
+        assert!(
+            a.contains(&1) && a.contains(&2),
+            "active project's imports missing"
+        );
+        assert!(
+            !a.contains(&3),
+            "an import into another project lit the badge"
+        );
+
+        // Switching projects re-answers the question — this is why the badge re-paints on switch.
+        c.set_active_project(p2).unwrap();
+        let b = c.imported_into_active_project().unwrap();
+        assert_eq!(b.len(), 1, "expected only GameB's import");
+        assert!(b.contains(&3));
+
+        // No active project: empty, not an error.
+        c.conn
+            .execute("UPDATE project SET is_active = 0", [])
+            .unwrap();
+        assert!(
+            c.imported_into_active_project().unwrap().is_empty(),
+            "no active project must read as nothing to compare against"
+        );
     }
 
     #[test]

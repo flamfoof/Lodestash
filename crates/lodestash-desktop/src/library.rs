@@ -37,6 +37,10 @@ pub struct GridItem {
     pub in_pack: bool,
     /// Owning pack name, for in-pack assets.
     pub package: Option<String>,
+    /// Already imported into the **active** project (`import_record`, DATA-MODEL §9) — the
+    /// `✓ in <project>` badge. Filled in one query per reload by [`Library::mark_imported`], not
+    /// per card: the data was always there, the bulk read was not (ALIGNMENT-AUDIT N1.5).
+    pub in_project: bool,
     pub triangles: Option<i64>,
     /// Tag values on this asset — the chips under the card's meta line (FEATURES §1.1). Filled by
     /// [`Library::mark_traits`] in one query for the whole library, not one per card.
@@ -777,6 +781,28 @@ impl Library {
         self.mark_favorites();
         self.mark_traits();
         self.mark_tiers();
+        self.mark_imported();
+    }
+
+    /// Stamp `in_project` onto every row from the active project's import set.
+    ///
+    /// One query for the whole library, like [`Self::mark_traits`]. Switching projects re-runs the
+    /// reload, so the badges re-paint — which is correct and visible, and the reason this is not
+    /// cached anywhere else.
+    fn mark_imported(&mut self) {
+        let Some(cat) = self.catalog.as_ref() else {
+            return;
+        };
+        let imported = match cat.imported_into_active_project() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(%e, "imported_into_active_project failed");
+                return;
+            }
+        };
+        for r in &mut self.rows {
+            r.item.in_project = imported.contains(&r.item.asset_id);
+        }
     }
 
     /// Stamp the S/M/L/XL badge onto every card.
@@ -2169,10 +2195,11 @@ fn row_from(
             in_pack: package.is_some(),
             package,
             triangles: e.metrics.tri_count,
-            // Both are filled by a whole-library pass after every row exists (`mark_traits`,
-            // `mark_tiers`) — neither is knowable from a single catalog row.
+            // All three are filled by a whole-library pass after every row exists (`mark_traits`,
+            // `mark_tiers`, `mark_imported`) — none is knowable from a single catalog row.
             traits: Vec::new(),
             size_tier: String::new(),
+            in_project: false,
         },
     }
 }
@@ -2213,6 +2240,7 @@ mod tests {
                     triangles: None,
                     traits: Vec::new(),
                     size_tier: String::new(),
+                    in_project: false,
                 },
             })
             .collect();

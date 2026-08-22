@@ -127,6 +127,9 @@
           }}
         >{item.favorite ? "★" : "☆"}</span>
         <span class="label" class:unid={isUnidentified(item.status)}>{item.name}</span>
+        {#if item.in_project}
+          <span class="imported" data-testid="row-imported" title="Already in the active project">✓</span>
+        {/if}
       </span>
       <span class="cell pack dim" role="cell">{item.package ?? "—"}</span>
       <span class="cell right" role="cell">
@@ -358,6 +361,12 @@
 
   .pack {
     color: var(--ls-gold);
+  }
+  /* A row has no room for the project's name — the check, with the full text on hover. */
+  .imported {
+    flex: none;
+    color: var(--ls-success);
+    font-size: var(--fs-xs);
   }
   .status {
     display: flex;

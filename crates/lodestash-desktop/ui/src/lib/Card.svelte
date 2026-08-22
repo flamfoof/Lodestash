@@ -247,9 +247,18 @@
       </span>
     </span>
 
-    {#if item.size_tier}
-      <span class="tier num t{item.size_tier}">{item.size_tier} · {fmtSize(item.size_bytes)}</span>
-    {/if}
+    <!-- Bottom-left of the artwork: the size tier, and — when it applies — the imported badge.
+         Never imported draws nothing at all: absence is the common case and must cost nothing. -->
+    <span class="corner-bl">
+      {#if item.size_tier}
+        <span class="tier num t{item.size_tier}">{item.size_tier} · {fmtSize(item.size_bytes)}</span>
+      {/if}
+      {#if item.in_project}
+        <span class="imported" data-testid="card-imported" title="Already in the active project">
+          ✓ in project
+        </span>
+      {/if}
+    </span>
 
     <!-- Quick actions (UI-SPEC §2.5): bottom-right, hover-revealed, so they never collide with the
          corner's gem or the bottom-left tier badge. ⤢ full-size, ✦ identify, ⟡ stage. -->
@@ -480,10 +489,29 @@
 
   /* The size badge sits *on* the artwork, bottom-left, so the letter reads against a constant
      backdrop rather than whatever colour the meta row happens to be. */
-  .tier {
+  .corner-bl {
     position: absolute;
     left: var(--sp-1);
     bottom: var(--sp-1);
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    max-width: calc(100% - 56px);
+  }
+  /* Check *and* colour *and* the word — never colour alone (DESIGN-GUIDELINES §9). */
+  .imported {
+    padding: 1px 6px;
+    font-size: var(--fs-xs);
+    line-height: 1.4;
+    color: var(--ls-success);
+    background: color-mix(in srgb, var(--ls-bg) 82%, transparent);
+    border: 1px solid color-mix(in srgb, var(--ls-success) 45%, transparent);
+    border-radius: var(--r-sm);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .tier {
     padding: 1px 6px;
     font-size: var(--fs-xs);
     line-height: 1.4;
