@@ -78,6 +78,17 @@ pub struct SourceInfo {
     pub last_seen_at: Option<i64>,
 }
 
+/// What the `✓ in <project>` badge needs to know about one asset (DESIGN-GUIDELINES §7).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ImportState {
+    /// Imported into the project that is active right now.
+    pub in_active: bool,
+    /// Imported here, but the source file has changed on disk since — the actionable state.
+    pub stale: bool,
+    /// How many *other* projects hold it. History, not a warning.
+    pub others: i64,
+}
+
 /// Per-status asset counts (soft-deleted rows excluded). `unidentified` folds
 /// `discovered|indexed` per DATA-MODEL §8.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -3060,30 +3071,62 @@ impl Catalog {
         Ok(changed)
     }
 
-    /// Every asset already imported into the **active** project, in one query.
+    /// The four import states the `✓ in <project>` badge distinguishes (DESIGN-GUIDELINES §7),
+    /// for the whole library, in two queries.
     ///
     /// [`Self::already_imported`] answers the same question per asset and is the right shape for a
     /// dup-guard over a handful of picks; a grid of 8k cards asking it per row is 8k statements.
-    /// This is what the `✓ in <project>` badge (UI-SPEC §2.5, DESIGN-GUIDELINES §7) reads at reload.
-    /// No active project is not an error — it is a library with nothing to compare against, and the
+    ///
+    /// - **in the active project** — a row in `import_record` joined to `project.is_active`;
+    /// - **older copy** — that row's `imported_at` predates the file's `mtime`, i.e. the source has
+    ///   changed on disk since it was imported. This is the only actionable state, so it must not
+    ///   be inferred from anything softer than the two timestamps;
+    /// - **in N others** — imported somewhere, but not here. History, not a warning;
+    /// - **never** — absent from the map entirely, which is the common case and must cost nothing.
+    ///
+    /// No active project is not an error: it is a library with nothing to compare against, and the
     /// badge simply does not draw.
-    pub fn imported_into_active_project(&self) -> Result<std::collections::HashSet<i64>> {
-        let mut stmt = self
+    pub fn import_states(&self) -> Result<std::collections::HashMap<i64, ImportState>> {
+        let mut out: std::collections::HashMap<i64, ImportState> = std::collections::HashMap::new();
+
+        let mut active = self
             .conn
             .prepare(
-                "SELECT ir.asset_id FROM import_record ir
-                 JOIN project p ON p.id = ir.project_id
-                 WHERE p.is_active = 1",
+                "SELECT ir.asset_id,
+                        MAX(CASE WHEN f.mtime IS NOT NULL AND f.mtime > ir.imported_at
+                                 THEN 1 ELSE 0 END)
+                 FROM import_record ir
+                 JOIN project p ON p.id = ir.project_id AND p.is_active = 1
+                 LEFT JOIN asset_file f ON f.asset_id = ir.asset_id
+                 GROUP BY ir.asset_id",
             )
-            .map_err(|e| CoreError::Catalog(format!("imported_into_active prepare: {e}")))?;
-        let rows = stmt
-            .query_map([], |r| r.get::<_, i64>(0))
-            .map_err(|e| CoreError::Catalog(format!("imported_into_active query: {e}")))?;
-        let mut out = std::collections::HashSet::new();
+            .map_err(|e| CoreError::Catalog(format!("import states prep: {e}")))?;
+        let rows = active
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? != 0)))
+            .map_err(|e| CoreError::Catalog(format!("import states query: {e}")))?;
         for r in rows {
-            out.insert(
-                r.map_err(|e| CoreError::Catalog(format!("imported_into_active row: {e}")))?,
-            );
+            let (id, stale) =
+                r.map_err(|e| CoreError::Catalog(format!("import states row: {e}")))?;
+            let e = out.entry(id).or_default();
+            e.in_active = true;
+            e.stale = stale;
+        }
+
+        let mut others = self
+            .conn
+            .prepare(
+                "SELECT ir.asset_id, COUNT(DISTINCT ir.project_id)
+                 FROM import_record ir
+                 JOIN project p ON p.id = ir.project_id AND p.is_active = 0
+                 GROUP BY ir.asset_id",
+            )
+            .map_err(|e| CoreError::Catalog(format!("import others prep: {e}")))?;
+        let rows = others
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(|e| CoreError::Catalog(format!("import others query: {e}")))?;
+        for r in rows {
+            let (id, n) = r.map_err(|e| CoreError::Catalog(format!("import others row: {e}")))?;
+            out.entry(id).or_default().others = n;
         }
         Ok(out)
     }
@@ -5178,7 +5221,7 @@ mod tests {
     /// into some other project), and it must come back empty rather than error when no project is
     /// active (a library with nothing to compare against draws no badge).
     #[test]
-    fn imported_into_active_project_reads_only_the_active_one() {
+    fn import_states_distinguishes_active_other_and_stale() {
         let c = Catalog::open_in_memory().expect("open");
         // `import_record.asset_id` is a real foreign key — the assets have to exist first.
         c.conn
@@ -5209,28 +5252,50 @@ mod tests {
         c.record_imports(p2, &specs(&[3]), "b2").unwrap();
 
         c.set_active_project(p1).unwrap();
-        let a = c.imported_into_active_project().unwrap();
+        let a = c.import_states().unwrap();
         assert!(
-            a.contains(&1) && a.contains(&2),
+            a[&1].in_active && a[&2].in_active,
             "active project's imports missing"
         );
         assert!(
-            !a.contains(&3),
+            !a.get(&3).map(|s| s.in_active).unwrap_or(false),
             "an import into another project lit the badge"
+        );
+        assert_eq!(a[&3].others, 1, "GameB's import should read as in 1 other");
+        assert!(!a[&1].stale, "nothing has changed on disk yet");
+
+        // "Older copy": the source file's mtime moves past the import. This is the only actionable
+        // state of the four, so it must come from the two timestamps and nothing softer.
+        c.conn
+            .execute(
+                "INSERT INTO asset_file (asset_id, rel_path, mtime) VALUES (1, 'one.png', ?1)",
+                params![i64::MAX],
+            )
+            .unwrap();
+        assert!(
+            c.import_states().unwrap()[&1].stale,
+            "a newer source file did not read as an older copy"
         );
 
         // Switching projects re-answers the question — this is why the badge re-paints on switch.
         c.set_active_project(p2).unwrap();
-        let b = c.imported_into_active_project().unwrap();
-        assert_eq!(b.len(), 1, "expected only GameB's import");
-        assert!(b.contains(&3));
+        let b = c.import_states().unwrap();
+        assert!(
+            b[&3].in_active,
+            "GameB's import is not active after the switch"
+        );
+        assert!(
+            !b[&1].in_active && b[&1].others == 1,
+            "GameA's import should now count as another project's"
+        );
 
-        // No active project: empty, not an error.
+        // No active project: nothing is `in_active`, and it is not an error.
         c.conn
             .execute("UPDATE project SET is_active = 0", [])
             .unwrap();
+        let none = c.import_states().unwrap();
         assert!(
-            c.imported_into_active_project().unwrap().is_empty(),
+            none.values().all(|s| !s.in_active),
             "no active project must read as nothing to compare against"
         );
     }

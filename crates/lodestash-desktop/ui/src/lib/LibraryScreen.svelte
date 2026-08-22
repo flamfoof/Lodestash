@@ -2,10 +2,19 @@
   import Card from "./Card.svelte";
   import Toolbar from "./Toolbar.svelte";
   import FilterBar from "./FilterBar.svelte";
+  import EmptyState from "./EmptyState.svelte";
   import QuickLook from "./QuickLook.svelte";
   import AssetList from "./AssetList.svelte";
   import FoldersView from "./FoldersView.svelte";
-  import { gridPage, DENSITIES, bulkTag, type GridPage, type LibraryStatus } from "./api";
+  import {
+    gridPage,
+    DENSITIES,
+    bulkTag,
+    recentOps,
+    undo as undoOp,
+    type GridPage,
+    type LibraryStatus,
+  } from "./api";
   import { view } from "./nav.svelte";
   import { push } from "./toasts.svelte";
 
@@ -87,12 +96,30 @@
     if (!value || view.selectedIds.length === 0 || bulkBusy) return;
     bulkBusy = true;
     bulkError = null;
+    const n = view.selectedIds.length;
     try {
       await bulkTag(view.selectedIds, "free", value, on);
       view.clearSelection();
       tagValue = "";
       // The writer re-read the catalog; re-ask every screen so the added/removed chips land.
       view.dataVersion += 1;
+      // D8: a bulk tag edit is undoable and records an op, so its toast carries the Undo. This
+      // path bypasses App's `write()` helper, which is why it was the one action announcing itself
+      // with no way back — the toolbar's ↶ was the only route, and only if you noticed it.
+      const [head] = await recentOps(1).catch(() => []);
+      push(
+        `${on ? "Added" : "Removed"} “${value}” ${on ? "to" : "from"} ${n} asset${n === 1 ? "" : "s"}`,
+        "ok",
+        head
+          ? {
+              label: "Undo",
+              run: async () => {
+                await undoOp(head.id).catch(() => {});
+                view.dataVersion += 1;
+              },
+            }
+          : undefined,
+      );
     } catch (e) {
       bulkError = String(e);
     } finally {
@@ -431,9 +458,11 @@
             ⟡ tray is a cart for right now; a collection is a set worth naming.
           </p>
         {:else if trashedOnly}
-          <p class="msg">
-            The Trash is empty. Nothing here is deleted from disk — trashed assets keep their files.
-          </p>
+          <EmptyState
+            icon="ls-nav-trash"
+            title="The Trash is empty"
+            line="Trashing removes an asset from the catalog only — the file stays exactly where it is on disk."
+          />
         {:else}
           <p class="msg">Nothing in this category.</p>
         {/if}

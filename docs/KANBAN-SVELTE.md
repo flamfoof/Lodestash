@@ -369,10 +369,10 @@ facet-group owner call).
 - [x] **D8 — Undo in the toast.** One action slot (`Undo` | `Show`), 6s with an action, hover
       freezes, 3 at a time with the rest collapsed into `+N more`. Each toast pins **its own oplog
       id** at push time — undoing the head of the log from the second-newest toast reverses the
-      wrong action silently. DG §7 "Feedback". **Delta:** wired for trash/restore; bulk tag edits
-      (`LibraryScreen.bulkEdit`) bypass `write()` and still toast without an action, and they are
-      undoable. Only 3 ops are recorded at all (trash, collection create, bulk tag) — no head means
-      no slot, rather than a button that lies.
+      wrong action silently. DG §7 "Feedback". Wired for trash/restore **and** bulk tag edits — the latter bypasses App's
+      `write()` helper, which is why it was the one action announcing itself with no way back. Only
+      3 ops are recorded at all (trash, collection create, bulk tag); no head means no slot, rather
+      than a button that lies.
 - [x] **D9 — Focus ring + reduced motion.** The focus half was already global (`app.css`
       `:focus-visible` → `--el-focus-ring`, covering the `role="button"` spans too) — the review had
       that wrong and DG §9 is corrected to say so. Built: the §8 reduced-motion table. Spinners are
@@ -383,18 +383,21 @@ facet-group owner call).
       the data was always there and the bulk read was not (closes **N1.5** / B12e). Card shows
       `✓ in project` beside the size tier; rows show the check alone. Mutation-checked on the two
       ways it could lie: keying off `is_active`, and reading empty rather than erroring with no
-      active project. **Delta:** only two of DG §7's four states — "in N others" needs a per-project
-      read and "older copy" needs source-mtime vs `imported_at`. Never-imported correctly draws
-      nothing.
+      active project. All four of DG §7's states now: `✓ in project`, `✓ older copy` (amber —
+      `asset_file.mtime` past `import_record.imported_at`, the one actionable one), `✓ in N others`
+      (dim — history, not a warning), and nothing at all for never-imported. `import_states()`
+      answers all of it in two queries per reload.
 - [x] **D11 — Duplicates as a queue.** Group list (280px, resolved rows keep their place and show
       their outcome) + the compare pane, `n / N groups reviewed` over a gold bar, keeper ribbon,
       `2 of N ›` cycling with the keeper always holding the left pane, ↑↓ to move. The differ-is-gold
       rule now lives in one shared `CompareRows` component used by both §13 and §5 — two copies of
       it would have drifted. Exact groups queue ahead of visual ones: a byte-identical copy is
       unambiguously safe to trash and a dHash match is not.
-      **Not verified end-to-end here:** the e2e check exists but *skips* — this library has fewer
-      than two duplicate groups, so the queue path has never actually run. **Delta:** "Merge tags
-      onto keeper" (§5) is still not built; the actions are Keep both / Move to Trash.
+      **Merge tags onto keeper** is built: the union of every member's traits applied to the
+      keeper, never removing anything — a merge that could *lose* a tag would make trashing the
+      duplicate afterwards a data loss, which is the one thing this screen must never be.
+      **Still not verified end-to-end:** the check now needs only one group instead of two, and this
+      library has **zero**, so the queue path has never actually run here.
 - [x] **D12 — Responsive ladder.** All four stops, and now actually working: 1400 hides the
       keyboard hint, 1280 makes the inspector *overlay* the grid keeping its edge tab, 1120
       collapses the sidebar to a 48px icon rail whose hover / keyboard-focus flyout carries the
@@ -415,8 +418,7 @@ facet-group owner call).
 - [x] **D14 — Empty states.** One `EmptyState` component enforcing the anatomy (32px nav glyph ·
       statement title · one teaching line · at most one action), across Collections / Duplicates /
       Packages / Unity Assets / Identify. Filtered-empty cases stay separate — those need a way out,
-      not a lesson (UI-SPEC §2.6). DG §7 "Feedback". **Delta:** Trash still uses LibraryScreen's own
-      empty branch, which is the filtered-grid path rather than a screen of its own.
+      not a lesson (UI-SPEC §2.6). DG §7 "Feedback". Trash uses it too now.
 - [x] **D16 — Selectable content + Copy name/path.** Reported in use: `user-select: none` on
       `<body>` made every asset name, path, pack and stat impossible to copy. Content opts back in;
       cards and rows (both `<button>`) get **Copy name** / **Copy path** in the context menu, where

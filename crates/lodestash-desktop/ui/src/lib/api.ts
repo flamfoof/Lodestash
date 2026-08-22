@@ -17,6 +17,10 @@ export type GridItem = {
    * Filled by one bulk read per reload, so switching projects re-paints every badge in the grid.
    */
   in_project: boolean;
+  /** Imported here, but the source changed on disk since — the one actionable state of the four. */
+  import_stale: boolean;
+  /** How many *other* projects hold it. History, not a warning. */
+  in_other_projects: number;
   triangles: number | null;
   /** Tag values, drawn as chips under the meta line (FEATURES §1.1). */
   traits: string[];

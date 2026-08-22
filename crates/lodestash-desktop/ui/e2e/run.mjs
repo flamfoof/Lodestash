@@ -731,10 +731,13 @@ try {
   await check("the duplicates queue keeps your place after a decision", async () => {
     const groups = await invoke("duplicate_groups");
     const near = await invoke("near_duplicate_groups").catch(() => []);
-    if (groups.length + near.length < 2) {
-      console.log("       skipped — this library has fewer than two duplicate groups");
+    // One group is enough to prove the part that matters — that a decision sticks to its row and
+    // the row keeps its place. The cursor assertion only applies when there is somewhere to move.
+    if (groups.length + near.length < 1) {
+      console.log("       skipped — this library has no duplicate groups at all");
       return;
     }
+    const many = groups.length + near.length > 1;
     await page.getByRole("button", { name: "Duplicates" }).click();
     await page.waitForSelector('[data-testid="dup-pane"]', { timeout: 5000 });
 
@@ -759,7 +762,9 @@ try {
       rows: document.querySelectorAll('[data-testid^="dup-row-"]').length,
     }));
     assert.ok(after.first.includes("done"), "the decision did not stick to its row");
-    assert.notEqual(after.onIndex, 0, "the cursor stayed on the group just decided");
+    if (many) {
+      assert.notEqual(after.onIndex, 0, "the cursor stayed on the group just decided");
+    }
     assert.equal(after.rows, groups.length + near.length, "a resolved group vanished from the list");
 
     await page.getByRole("button", { name: "Library", exact: true }).click();

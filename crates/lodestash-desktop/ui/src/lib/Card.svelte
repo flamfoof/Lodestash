@@ -265,10 +265,25 @@
       {#if item.size_tier}
         <span class="tier num t{item.size_tier}">{item.size_tier} · {fmtSize(item.size_bytes)}</span>
       {/if}
-      {#if item.in_project}
+      <!-- Four states, one badge (DESIGN-GUIDELINES §7). Never imported draws nothing at all. -->
+      {#if item.in_project && item.import_stale}
+        <span
+          class="imported stale"
+          data-testid="card-imported"
+          title="In the active project, but the source file has changed since"
+        >✓ older copy</span>
+      {:else if item.in_project}
         <span class="imported" data-testid="card-imported" title="Already in the active project">
           ✓ in project
         </span>
+      {:else if item.in_other_projects > 0}
+        <span
+          class="imported elsewhere"
+          data-testid="card-imported"
+          title="Imported into {item.in_other_projects} other project{item.in_other_projects === 1
+            ? ''
+            : 's'}, not this one"
+        >✓ in {item.in_other_projects} other{item.in_other_projects === 1 ? "" : "s"}</span>
       {/if}
     </span>
 
@@ -511,6 +526,15 @@
     max-width: calc(100% - 56px);
   }
   /* Check *and* colour *and* the word — never colour alone (DESIGN-GUIDELINES §9). */
+  /* Amber is reserved for the one state you can act on; other projects are history and stay dim. */
+  .imported.stale {
+    color: var(--ls-warning);
+    border-color: color-mix(in srgb, var(--ls-warning) 45%, transparent);
+  }
+  .imported.elsewhere {
+    color: var(--ls-text-dim);
+    border-color: var(--ls-border-strong);
+  }
   .imported {
     padding: 1px 6px;
     font-size: var(--fs-xs);

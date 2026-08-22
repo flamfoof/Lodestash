@@ -17,6 +17,7 @@
   import Card from "./Card.svelte";
   import CompareRows from "./CompareRows.svelte";
   import {
+    bulkTag,
     duplicateGroups,
     nearDuplicateGroups,
     fmtSize,
@@ -26,6 +27,7 @@
     type GridItem,
   } from "./api";
   import { view } from "./nav.svelte";
+  import { push } from "./toasts.svelte";
 
   let { ontrash }: { ontrash: (assetIds: number[]) => void } = $props();
 
@@ -113,6 +115,39 @@
     }
     return out;
   });
+
+  /**
+   * Merge tags onto the keeper (UI-SPEC §5): the union of every member's traits, applied to the
+   * keeper. Nothing is removed from anyone — a merge that could *lose* a tag would make trashing
+   * the duplicate afterwards a data loss, which is exactly what this screen must never be.
+   *
+   * The keeper's own tags are skipped, so a merge over an already-merged group is a no-op rather
+   * than N pointless writes.
+   */
+  let merging = $state(false);
+  async function mergeTags() {
+    const row = current;
+    const keeper = keeperItem;
+    if (!row || !keeper || merging) return;
+    const have = new Set(keeper.traits);
+    const missing = [
+      ...new Set(row.group.items.flatMap((i) => i.traits).filter((v) => !have.has(v))),
+    ];
+    if (missing.length === 0) {
+      push("Nothing to merge — the keeper already has every tag", "info");
+      return;
+    }
+    merging = true;
+    try {
+      for (const value of missing) await bulkTag([keeper.asset_id], "free", value, true);
+      push(`Merged ${missing.length} tag${missing.length === 1 ? "" : "s"} onto the keeper`);
+      view.dataVersion += 1;
+    } catch (e) {
+      push(String(e), "err");
+    } finally {
+      merging = false;
+    }
+  }
 
   function decide(kind: "kept" | "trashed") {
     const row = current;
@@ -260,6 +295,13 @@
             <button class="keep" onclick={() => decide("kept")} data-testid="keep-both">
               Keep both
             </button>
+            <button
+              class="merge"
+              disabled={merging}
+              onclick={mergeTags}
+              title="Give the keeper every tag any copy in this group has. Nothing is removed."
+              data-testid="merge-tags"
+            >Merge tags onto keeper</button>
             <button class="danger" onclick={() => decide("trashed")} data-testid="trash-others">
               Move {current.group.items.length - 1} to Trash
             </button>
@@ -523,5 +565,17 @@
   .pill.warn {
     color: var(--ls-warning);
     border-color: color-mix(in srgb, var(--ls-warning) 45%, transparent);
+  }
+  .actions .merge {
+    border-color: color-mix(in srgb, var(--ls-arcane) 45%, transparent);
+    color: var(--ls-arcane);
+  }
+  .actions .merge:hover:not(:disabled) {
+    border-color: var(--ls-arcane);
+    color: var(--ls-arcane-bright);
+  }
+  .actions .merge:disabled {
+    opacity: 0.5;
+    cursor: wait;
   }
 </style>

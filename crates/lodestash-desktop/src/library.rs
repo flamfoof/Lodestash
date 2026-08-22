@@ -41,6 +41,11 @@ pub struct GridItem {
     /// `✓ in <project>` badge. Filled in one query per reload by [`Library::mark_imported`], not
     /// per card: the data was always there, the bulk read was not (ALIGNMENT-AUDIT N1.5).
     pub in_project: bool,
+    /// Imported here, but the source file has changed on disk since — `✓ older copy`, the one
+    /// actionable state of the four (DESIGN-GUIDELINES §7).
+    pub import_stale: bool,
+    /// How many *other* projects hold it. Reads as `✓ in N others`: history, not a warning.
+    pub in_other_projects: i64,
     pub triangles: Option<i64>,
     /// Tag values on this asset — the chips under the card's meta line (FEATURES §1.1). Filled by
     /// [`Library::mark_traits`] in one query for the whole library, not one per card.
@@ -800,15 +805,21 @@ impl Library {
         let Some(cat) = self.catalog.as_ref() else {
             return;
         };
-        let imported = match cat.imported_into_active_project() {
+        let states = match cat.import_states() {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(%e, "imported_into_active_project failed");
+                tracing::warn!(%e, "import_states failed");
                 return;
             }
         };
         for r in &mut self.rows {
-            r.item.in_project = imported.contains(&r.item.asset_id);
+            // Absent from the map is "never imported" — the common case, and it draws nothing.
+            let Some(s) = states.get(&r.item.asset_id) else {
+                continue;
+            };
+            r.item.in_project = s.in_active;
+            r.item.import_stale = s.stale;
+            r.item.in_other_projects = s.others;
         }
     }
 
@@ -2207,6 +2218,8 @@ fn row_from(
             traits: Vec::new(),
             size_tier: String::new(),
             in_project: false,
+            import_stale: false,
+            in_other_projects: 0,
         },
     }
 }
@@ -2248,6 +2261,8 @@ mod tests {
                     traits: Vec::new(),
                     size_tier: String::new(),
                     in_project: false,
+                    import_stale: false,
+                    in_other_projects: 0,
                 },
             })
             .collect();

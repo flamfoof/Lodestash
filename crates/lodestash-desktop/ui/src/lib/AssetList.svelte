@@ -128,7 +128,14 @@
         >{item.favorite ? "★" : "☆"}</span>
         <span class="label" class:unid={isUnidentified(item.status)}>{item.name}</span>
         {#if item.in_project}
-          <span class="imported" data-testid="row-imported" title="Already in the active project">✓</span>
+          <span
+            class="imported"
+            class:stale={item.import_stale}
+            data-testid="row-imported"
+            title={item.import_stale
+              ? "In the active project, but the source file has changed since"
+              : "Already in the active project"}
+          >✓</span>
         {/if}
       </span>
       <span class="cell pack dim" role="cell">{item.package ?? "—"}</span>
@@ -367,6 +374,9 @@
     flex: none;
     color: var(--ls-success);
     font-size: var(--fs-xs);
+  }
+  .imported.stale {
+    color: var(--ls-warning);
   }
   .status {
     display: flex;
