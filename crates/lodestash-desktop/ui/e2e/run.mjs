@@ -787,6 +787,51 @@ try {
     const cdp = await page.context().newCDPSession(page);
     const { windowId } = await cdp.send("Browser.getWindowForTarget");
     const { bounds: original } = await cdp.send("Browser.getWindowBounds", { windowId });
+
+    /**
+     * Put the window back exactly as it was found.
+     *
+     * Three traps here, all silent, all of which shipped:
+     *
+     * - `getWindowBounds` reports a maximized window as geometry **plus** `windowState:
+     *   "maximized"`, and `setWindowBounds` rejects that combination outright — *"the
+     *   ‘maximized’ state cannot be combined with ‘left’, ‘top’, ‘width’ or ‘height’"*. Handing the
+     *   object straight back therefore throws, and the ladder’s last rung (900×800) is where the
+     *   window stays. Restoring the **state alone** is what puts a maximized window back.
+     * - Sending width/height without left/top lets the window re-centre instead of staying put.
+     * - Round-tripping left/top **does not round-trip**: CDP reports window-frame coordinates and
+     *   applies client coordinates, so writing back the `top` you just read moves the window down
+     *   by one title bar (measured here: 23 → 46). Run after run it walks down the screen until the
+     *   bottom is off it — which is what "the layout keeps getting smaller while the window stays
+     *   the same" actually looks like.
+     *
+     * So the position is corrected rather than assumed: set it, read back, and if it landed
+     * somewhere else, subtract the delta and set once more. Two passes converge because the offset
+     * is a constant frame inset, and asking the window where it ended up beats hard-coding a
+     * platform’s border metrics.
+     *
+     * This is not tidiness. The app under test shares the user’s config directory, so
+     * `tauri-plugin-window-state` writes whatever geometry is left behind and every future launch
+     * opens in it — which is exactly the report that found this.
+     */
+    const restoreWindow = async () => {
+      if (original.windowState && original.windowState !== "normal") {
+        await cdp.send("Browser.setWindowBounds", {
+          windowId,
+          bounds: { windowState: original.windowState },
+        });
+        return;
+      }
+      const { left, top, width, height } = original;
+      let want = { left, top, width, height };
+      for (let pass = 0; pass < 2; pass++) {
+        await cdp.send("Browser.setWindowBounds", { windowId, bounds: want });
+        await page.waitForTimeout(250);
+        const { bounds: got } = await cdp.send("Browser.getWindowBounds", { windowId });
+        if (got.left === left && got.top === top) return;
+        want = { ...want, left: want.left - (got.left - left), top: want.top - (got.top - top) };
+      }
+    };
     const at = async (width) => {
       await cdp.send("Browser.setWindowBounds", {
         windowId,
@@ -833,7 +878,18 @@ try {
       assert.ok(narrow.more, "step 4: sort folded away instead of into the ⋯ overflow");
       assert.ok(narrow.view, "the view toggle folded — it changes what you are looking at");
     } finally {
-      await cdp.send("Browser.setWindowBounds", { windowId, bounds: original }).catch(() => {});
+      await restoreWindow();
+      await page.waitForTimeout(400);
+      // Verified, not assumed. The previous restore swallowed its own error with `.catch(() => {})`
+      // and left the app permanently 900×800 — a check that resizes the user’s window has to prove
+      // it gave it back.
+      const { bounds: after } = await cdp.send("Browser.getWindowBounds", { windowId });
+      assert.deepEqual(
+        after,
+        original,
+        `the ladder did not put the window back — this state is persisted and the app reopens in it` +
+          ` (was ${JSON.stringify(original)}, now ${JSON.stringify(after)})`,
+      );
       // Give the relayout time to settle before the next check measures anything, and hand keyboard
       // focus back: this check blurs whatever held it, and a document with nothing focused swallows
       // the next check's Ctrl-K. Clicking the result count is inert — a span, no state.

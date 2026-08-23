@@ -135,6 +135,50 @@ async function evictStaleApp() {
 }
 
 /**
+ * The suite runs the **user’s own app**, against their config directory — so
+ * `tauri-plugin-window-state` persists whatever window geometry a run leaves behind, and their
+ * next launch opens in it.
+ *
+ * That is not hypothetical. The responsive-ladder check resizes the real window (nothing else
+ * makes media queries fire), its restore silently failed, and the app reopened smaller every time
+ * until it was reported as "the layout keeps getting smaller". The check now restores and verifies
+ * — this is the backstop for the case that check cannot cover: a run killed part-way, where no
+ * `finally` gets to put anything back.
+ *
+ * Snapshot the bytes before launching; write them back after the app has exited (it saves on the
+ * way out, so restoring earlier would just be overwritten). A missing file stays missing.
+ */
+function windowStateFile() {
+  const conf = path.join(REPO, "crates", "lodestash-desktop", "tauri.conf.json");
+  try {
+    const id = JSON.parse(fs.readFileSync(conf, "utf8")).identifier;
+    if (!id || !process.env.APPDATA) return null;
+    return path.join(process.env.APPDATA, id, ".window-state.json");
+  } catch {
+    return null;
+  }
+}
+
+function snapshotWindowState() {
+  const file = windowStateFile();
+  if (!file) return () => {};
+  let saved = null;
+  try {
+    saved = fs.readFileSync(file);
+  } catch {
+    /* no state yet — the restore below then leaves it absent, which is also correct */
+  }
+  return () => {
+    try {
+      if (saved !== null) fs.writeFileSync(file, saved);
+      else fs.rmSync(file, { force: true });
+    } catch {
+      /* the user’s window position is not worth failing a suite over */
+    }
+  };
+}
+
+/**
  * Start Vite (unless already running) and the app, then attach.
  * Returns `{ page, close }`; always call `close`.
  */
@@ -142,6 +186,7 @@ export async function launch() {
   const spawned = [];
   assertBinaryIsCurrent();
   await evictStaleApp();
+  const restoreWindowState = snapshotWindowState();
 
   if (!(await reachable(VITE_URL, 1000))) {
     // A debug build loads devUrl, so the dev server has to be up before the window opens.
@@ -189,6 +234,7 @@ export async function launch() {
   // A crash between here and `close()` used to leak the app onto the port for the *next* run.
   const reap = () => {
     for (const p of spawned.reverse()) killTree(p);
+    restoreWindowState();
   };
   process.once("exit", reap);
   process.once("uncaughtException", (e) => {
@@ -231,6 +277,8 @@ export async function launch() {
     async close() {
       await browser.close().catch(() => {});
       for (const p of spawned.reverse()) killTree(p);
+      // After the app is gone, never before: it writes its window state on the way out.
+      restoreWindowState();
     },
   };
 }

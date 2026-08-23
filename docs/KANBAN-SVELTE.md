@@ -445,6 +445,25 @@ facet-group owner call).
       first version of both did **nothing at any width** while type-checking and "parsing" clean.
       Driven end-to-end by `Browser.setWindowBounds` — `setViewportSize` moves nothing here and
       leaves an emulation override that poisons later checks.
+- [x] **The ladder check was shrinking the real app (found by the user, fixed 2026-08-22).**
+      Reported as *"the entire layout keeps getting smaller despite the window size staying the
+      same"*. D12’s check resizes the **real** window — nothing else makes media queries fire — and
+      its restore was `setWindowBounds(originalBounds).catch(() => {})`. Two silent failures under
+      that `catch`:
+      **(a)** `getWindowBounds` reports a maximized window as geometry *plus*
+      `windowState: "maximized"`, and `setWindowBounds` rejects that combination outright — so the
+      restore threw and the window stayed at the ladder’s last rung, 900×800.
+      **(b)** left/top do not round-trip at all: CDP **reports frame** coordinates and **applies
+      client** coordinates, so writing back the `top` it just gave you moves the window down by one
+      title bar (measured: 23 → 46) — every run, walking the bottom off the screen.
+      The app under test shares the user’s config directory, so `tauri-plugin-window-state`
+      persisted each shrink into the next launch. Fixed in two layers, both verified: the check
+      restores by **state alone** when the window was not normal, corrects position by measuring
+      where it actually landed, and now **asserts** the window came back; and the harness snapshots
+      `.window-state.json` before launch and rewrites it after the app exits, so a run killed
+      part-way — where no `finally` runs — still cannot touch the user’s geometry. Proven with a
+      sentinel geometry that survived a full run, and with the state file byte-identical across
+      consecutive runs.
 - [x] **D13 — Onboarding copy.** The shipped onboarding is the one-screen explainer, not §1's
       two-step scan wizard, so the change landed there: step 2 now says appraisal **starts by
       itself** rather than implying there is something you must go and run. Assets still arrive
