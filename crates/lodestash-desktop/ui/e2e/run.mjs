@@ -10,6 +10,9 @@
  * `playwright-core` alone.
  */
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { launch } from "./harness.mjs";
 
 const results = [];
@@ -1893,6 +1896,104 @@ try {
     assert.ok(spread < 1, `cards span ${spread.toFixed(3)}px — a card is stretching past its track`);
     const offTrack = widths.filter((w) => w.cell !== null && Math.abs(w.card - w.cell) >= 1);
     assert.equal(offTrack.length, 0, "a card is wider than the grid cell that wraps it");
+  });
+
+  // Export to folder (UI-SPEC §16.2) — the level-1 way out of the library, and until the Unity
+  // plugin exists the only one. Run for real against the live catalog: the whole point of this
+  // feature is that a file appears on disk, and nothing short of looking proves that.
+  //
+  // Everything it writes goes into a fresh temp directory it made itself, and it removes only
+  // that. It never touches a library file — the originals are read, and the sandbox check below
+  // is the reason it cannot write into one either.
+  await check("Export to folder copies a real file, and refuses the library itself", async () => {
+    const s0 = await invoke("library_status");
+    const gone = new Set(s0.sources.filter((x) => x.state === "unavailable").map((x) => x.id));
+    const p = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    const loose = p.items.find((i) => !i.in_pack && !gone.has(i.source_id));
+    if (!loose) return; // nothing on disk to copy — the check would prove nothing
+
+    const dest = path.join(os.tmpdir(), `lodestash-e2e-export-${Date.now()}`);
+    try {
+      const r = await invoke("export_assets", {
+        assetIds: [loose.asset_id],
+        destPath: dest,
+        withDependencies: false,
+      });
+      assert.ok(r.written >= 1, `nothing was written: ${JSON.stringify(r)}`);
+      const landed = fs.readdirSync(dest);
+      assert.ok(landed.length >= 1, "the report claimed a write but the folder is empty");
+      // The original is a copy source, never a move source (standing invariant).
+      const detail = await invoke("asset_detail", { assetId: loose.asset_id });
+      assert.ok(fs.existsSync(detail.abs_path), "the export moved the original instead of copying it");
+    } finally {
+      fs.rmSync(dest, { recursive: true, force: true });
+    }
+
+    // The sandbox outlives the approval gate: a destination inside a library source root is
+    // refused for the user exactly as it is for an agent, because that rule protects the
+    // non-destructive invariant rather than the agent boundary.
+    const root = s0.sources[0]?.root_path;
+    if (!root) return;
+    const inside = `${root}/lodestash-e2e-should-never-exist`;
+    await assert.rejects(
+      () => invoke("export_assets", { assetIds: [loose.asset_id], destPath: inside, withDependencies: false }),
+      "exporting into a library source root was allowed",
+    );
+    assert.ok(!fs.existsSync(inside), "a refused export still created its destination");
+  });
+
+  // 72% of a real Unity library is still inside a .unitypackage. An export that skipped those
+  // silently would look like it worked and quietly deliver nothing.
+  await check("an in-pack pick is reported as in-pack, not silently dropped", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    const packed = p.items.find((i) => i.in_pack);
+    if (!packed) return;
+
+    const dest = path.join(os.tmpdir(), `lodestash-e2e-inpack-${Date.now()}`);
+    try {
+      const r = await invoke("export_assets", {
+        assetIds: [packed.asset_id],
+        destPath: dest,
+        withDependencies: false,
+      });
+      assert.equal(r.written, 0, "an in-pack asset was copied — extraction must stay explicit");
+      assert.equal(r.in_pack, 1, `the skip was not attributed to the pack: ${JSON.stringify(r)}`);
+      assert.equal(r.unreachable, 0, "an in-pack asset was miscounted as unreachable");
+    } finally {
+      fs.rmSync(dest, { recursive: true, force: true });
+    }
+  });
+
+  await check("Export to folder is offered where the picks are", async () => {
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.waitForSelector(".card", { timeout: 5000 });
+    // Context menu. Two things this must prove beyond "the item is there", because both were
+    // broken and both are invisible: the menu has to *render at all* on a right-click (it was
+    // nested inside Quick Look's `{#if}`, so it only existed while the modal that hides the grid
+    // was open), and Escape has to close it (its own key handler sat on a never-focused div, so
+    // the only way out was a click — and its full-screen backdrop eats every click until then).
+    await page.locator(".card").first().click({ button: "right" });
+    await page.waitForSelector('[data-testid="ctx-export"]', { timeout: 3000 });
+    await page.keyboard.press("Escape");
+    await page.waitForSelector(".ctx-menu", { state: "detached", timeout: 3000 });
+    assert.equal(
+      await page.locator(".menu-backdrop").count(), 0,
+      "the backdrop outlived the menu — every click on the app behind it is swallowed",
+    );
+    // Inspector, on the selected asset.
+    await page.locator(".card").first().click();
+    await page.waitForSelector('[data-testid="action-export"]', { timeout: 5000 });
+    // Staging tray, once something is staged.
+    await page.locator(".card").first().locator('[data-testid="card-stage"]').click();
+    await page.waitForSelector('[data-testid="tray-export"]', { timeout: 3000 });
+    await page.locator('[data-testid="staged-clear"]').click();
+    await page.waitForSelector('[data-testid="staging-tray"]', { state: "detached", timeout: 3000 });
   });
 
   // D3b — the appraisal queue follows the user (UI-SPEC §3). The ordering itself is proved in

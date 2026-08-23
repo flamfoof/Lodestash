@@ -36,6 +36,7 @@
     onremove,
     ondelete,
     onimport,
+    onexport,
   }: {
     assetId: number | null;
     /** Carried by the grid row, so the star reflects the same state the card draws. */
@@ -52,6 +53,8 @@
     ondelete: () => void;
     /** `⇢ Add to project` (FEATURES §7.2) — queue into the open Unity project. */
     onimport: () => void;
+    /** **Export to folder** (UI-SPEC §16.2): copy this asset anywhere, no editor involved. */
+    onexport: () => void;
   } = $props();
 
   /**
@@ -548,6 +551,13 @@
             : "Queue this asset into the open Unity project (ENGINE-API §5.2)"}
         >
           ⇢ Add to project
+        </button>
+        <button
+          onclick={onexport}
+          data-testid="action-export"
+          title="Copy this file into a folder you choose. The original is never moved."
+        >
+          ⤓ Export to folder…
         </button>
         <button onclick={onremove} data-testid="action-remove" title="Hides it and stops future scans finding it. The file stays on disk.">
           Remove from library

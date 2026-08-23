@@ -34,6 +34,44 @@ impl SandboxError {
     }
 }
 
+/// What an export actually did (UI-SPEC §16.2 / ENGINE-API §2).
+///
+/// The two skip counts are kept apart because they are different problems with different fixes,
+/// and one number covering both would tell the user nothing they can act on: an **in-pack** asset
+/// needs its pack extracted first, an **unreachable** one needs its drive plugged back in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ExportReport {
+    /// Files written into the destination.
+    pub written: u64,
+    /// Picks whose bytes are still inside a `.unitypackage`. Extraction is a separate, explicit
+    /// action — an export never unpacks an archive behind the user's back.
+    pub in_pack: usize,
+    /// Picks whose file the catalog knows about but the disk does not: a source that went away,
+    /// or a file moved out from under the index (UI-SPEC §11.1).
+    pub unreachable: usize,
+    /// How many extra files the dependency closure pulled in — the materials and textures the
+    /// user did not name but would have missed.
+    pub dependencies_added: usize,
+    pub dest_path: String,
+}
+
+impl ExportReport {
+    /// The job payload ENGINE-API §2 clients read. `missing` is kept beside the split halves for
+    /// clients written before the split — dropping it would break them for a rename.
+    pub fn to_json(&self, requested_dependencies: bool) -> serde_json::Value {
+        serde_json::json!({
+            "written": self.written,
+            "missing": self.in_pack + self.unreachable,
+            "in_pack": self.in_pack,
+            "unreachable": self.unreachable,
+            "dest_path": self.dest_path,
+            "dependencies_included": requested_dependencies,
+            "requested_dependencies": requested_dependencies,
+            "dependencies_added": self.dependencies_added,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExportRequest {
     pub asset_ids: Vec<i64>,
@@ -256,6 +294,102 @@ mod flow_tests {
         let result = job.to_json();
         assert_eq!(result["result"]["dependencies_included"], true);
         assert_eq!(result["result"]["dependencies_added"], 1);
+    }
+
+    /// **Export to folder** from the desktop (UI-SPEC §16.2): the person clicking *is* the
+    /// approval, so there is no gate — but every other rule still holds.
+    ///
+    /// Mutation-checked on the four things that would make it dangerous rather than merely wrong:
+    /// the sandbox must still refuse a destination inside a library source root (an export that
+    /// writes into the user's own asset folders breaks the non-destructive invariant, and skipping
+    /// the gate must not skip that); the originals must survive untouched; a pick that cannot be
+    /// copied must be **counted and told apart** — in-pack needs an extract, unreachable needs the
+    /// drive — because one merged "missing" number tells the user nothing they can act on; and a
+    /// refusal must write nothing at all.
+    #[test]
+    fn export_now_skips_the_gate_but_not_the_sandbox() {
+        use lodestash_core::catalog::{Catalog, CrawlRecord};
+
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("here.png"), b"aaa").unwrap();
+        // Catalogued, then gone from disk: the D7b case, from the export's point of view.
+        std::fs::write(lib.join("gone.png"), b"bb").unwrap();
+
+        let db = dir.path().join("catalog.db");
+        {
+            let mut cat = Catalog::open(&db).unwrap();
+            cat.seed_media_types().unwrap();
+            let src = cat
+                .upsert_import_source("Lib", &lib.to_string_lossy(), "folder")
+                .unwrap();
+            let rec = |rel: &str| CrawlRecord {
+                workspace_rel: None,
+                rel_path: rel.into(),
+                name: rel.into(),
+                media_type: "image".into(),
+                size_bytes: 3,
+                mtime: 1,
+                content_hash: None,
+            };
+            cat.record_crawl(src, None, &[rec("here.png"), rec("gone.png")])
+                .unwrap();
+        }
+        std::fs::remove_file(lib.join("gone.png")).unwrap();
+
+        let state =
+            Arc::new(ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap());
+        let ids: Vec<i64> = {
+            let cat = state.catalog.lock().unwrap();
+            let mut v = cat.asset_summaries(&[1, 2]).unwrap();
+            v.sort_by(|a, b| a.name.cmp(&b.name));
+            v.iter().map(|r| r.id).collect()
+        };
+        assert_eq!(ids.len(), 2, "fixture");
+
+        // Refused: inside the library. The gate is gone; the sandbox is not.
+        let refusal = state
+            .export_now(super::ExportRequest {
+                asset_ids: ids.clone(),
+                dest_path: lib.join("out").to_string_lossy().into(),
+                with_dependencies: false,
+            })
+            .expect_err("exporting into the library was allowed");
+        assert!(
+            refusal.contains("inside a library source root"),
+            "the refusal does not say why: {refusal}"
+        );
+        assert!(
+            !lib.join("out").exists(),
+            "a refused export still created its destination"
+        );
+
+        // Allowed: outside every root. One file lands; the catalogued-but-absent one is reported
+        // as unreachable rather than counted as written.
+        let dest = dir.path().join("out");
+        let report = state
+            .export_now(super::ExportRequest {
+                asset_ids: ids.clone(),
+                dest_path: dest.to_string_lossy().into(),
+                with_dependencies: false,
+            })
+            .expect("export");
+        assert_eq!(report.written, 1, "expected exactly the file that exists");
+        assert_eq!(
+            report.unreachable, 1,
+            "a catalogued file missing from disk must be reported, not silently dropped"
+        );
+        assert_eq!(report.in_pack, 0, "nothing here is in a pack");
+        assert!(dest.join("here.png").exists());
+        assert!(!dest.join("gone.png").exists());
+
+        // The originals are untouched — an export copies, it never moves (standing invariant).
+        assert_eq!(
+            std::fs::read(lib.join("here.png")).unwrap(),
+            b"aaa",
+            "the original was modified or moved"
+        );
     }
 
     /// The whole gate: an export request writes nothing until it is approved, and denial is

@@ -790,6 +790,20 @@ targets the **active** project; MCP `stage_asset`/`list_staged`/`import_staged` 
 - Primary: **Import all → <project>** *(⚖ user-facing verb is **Import** for into-project; "Export
   to folder" is reserved for the arbitrary-path `export_asset` flow)*; caption *"picks + linked
   files only — never the whole pack."*
+- Secondary: **⤓ Export to folder…** (shipped 2026-08-22). The same picks, copied to a folder the
+  user chooses — no editor, no plugin, no registered project. It is level 1 of §16.3 made
+  reachable, and while the Unity plugin does not exist it is the **only** way a file leaves the
+  library, so it sits beside Import rather than behind a menu. Also offered on the Inspector and
+  the card context menu, because a single pick should not have to be staged first.
+  The native folder dialog **is** the confirmation: the approval gate in ENGINE-API §4 exists
+  because an *agent* asked, and prompting the user to approve their own click would train them to
+  dismiss the prompt that matters. The **sandbox is not skipped with it** — absolute, no `..`,
+  never inside a library source root — because that rule protects the non-destructive invariant,
+  not the agent boundary.
+  The toast reports what happened, not that the request was accepted, and names skips by **reason**:
+  *in a pack* (extract it first) and *unreachable* (§11.1) are different problems with different
+  fixes, and one merged "missing" number would be useless. An export never unpacks an archive on
+  the user’s behalf — extraction stays an explicit action (§5).
 - **Conflict state** (dup-guard, ENGINE-API §5.4): amber panel *"N of these already exist in
   <project> — exporting again would replace those files."* → **Overwrite / Skip existing / ✕**.
 - **Running state**: mono log lines (resolve → overwrite/skip note → missing-links warning →

@@ -168,10 +168,28 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       route** (the one that fans out across a pack — the 21.9 GB-pack stampede); a single
       explicit file/mesh pull is never refused by archive size (the deep-entry decompress-skip
       is bounded + cached). Remaining: per-entry "Extract selected" page-batching.
-- [ ] **`⇢ Add to project` / `⇢ Add all N to project` affordances.** Absent everywhere (FEATURES
-      §5.4/§5.5, PACK-DIRECTORY-NAV §7) — the engine write path doesn't exist in the shell.
+- [x] **The way out of the library (2026-08-22).** `⇢ Add to project` is on the Inspector, the
+      tray and the context menu, and **⤓ Export to folder…** is beside each of them — the level-1
+      copy (UI-SPEC §16.3) that needs no editor, no plugin and no registered project. Until the
+      Unity plugin exists it is the only way a file actually leaves the library, which is why it is
+      a button and not a menu entry. One implementation shared with the agent plane’s
+      `export_asset`, so what an export copies cannot drift; the approval gate is skipped (the
+      person clicking *is* the approval — ENGINE-API §4 amended) but the **sandbox is not**.
+      Skips are counted by reason: *in a pack* needs an extract, *unreachable* needs the drive
+      (§11.1). An export never unpacks an archive on the user’s behalf.
 
 ## ⚪ Built but inert — wire into the shell
+
+- [x] **The right-click menu never rendered (found + fixed 2026-08-22).** The whole `{#if menu}`
+      block sat **inside** `{#if quickLook !== null}`, so it existed only while the Quick Look modal
+      was open — which is exactly when no card can be right-clicked. Every action reachable only
+      through it (Copy name, Copy path, Toggle Favorite, Identify now, ⇢ Add to project, Move to
+      Trash) was dead from the day it shipped, D16’s Copy name/Copy path included. Nothing had ever
+      right-clicked a card in a test.
+- [x] **…and Escape could not close it (same fix).** Its `Escape` handler was on the
+      `role="presentation"` backdrop, which never takes focus, so it never fired. The only way out
+      was a click — and until then the full-screen backdrop swallowed every click on the app
+      behind it. Escape now lives on the window handler, ahead of everything else.
 
 - [x] **REST + MCP servers start with the app (2026-08-08, B12).** One `ServerState` →
       `api::serve` (ephemeral loopback port + engine.json written) + `mcp::serve_stdio` on its

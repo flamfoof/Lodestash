@@ -740,6 +740,28 @@ export const clearPreviewCache = () => invoke<number>("clear_preview_cache");
  */
 export const setAppraiseFocus = (query: GridQuery) => invoke<void>("set_appraise_focus", { query });
 
+/**
+ * What an **Export to folder** actually did (UI-SPEC §16.2).
+ *
+ * The two skip counts stay apart because they have different fixes: `in_pack` needs the pack
+ * extracted first, `unreachable` needs the drive back. One merged number would say nothing.
+ */
+export type ExportReport = {
+  written: number;
+  in_pack: number;
+  unreachable: number;
+  dependencies_added: number;
+  dest_path: string;
+};
+
+/**
+ * Copy assets to a folder the user picked — the level-1 way out of the library, no editor and no
+ * plugin (UI-SPEC §16.3). Originals are never moved, and the destination is refused if it is
+ * inside a library source root.
+ */
+export const exportAssets = (assetIds: number[], destPath: string, withDependencies = true) =>
+  invoke<ExportReport>("export_assets", { assetIds, destPath, withDependencies });
+
 /** Re-derive source availability from disk (UI-SPEC §11.1). One stat per root, on the writer. */
 export const refreshSourceHealth = () => invoke<WriteResult>("refresh_source_health");
 

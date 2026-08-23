@@ -1206,6 +1206,42 @@ fn engine_import(
     }
 }
 
+/// **Export to folder** (UI-SPEC §16.2) — copy the picks to a folder the user chose, no editor and
+/// no plugin involved.
+///
+/// This is the level-1 way out of the library, and until the Unity plugin exists it is the *only*
+/// one: `engine_import` needs a registered project whose plugin drains the queue. A tool for
+/// fetching assets has to be able to hand you the file.
+///
+/// Non-destructive in both directions. The originals are read, never moved (the standing
+/// invariant), and the destination is sandboxed: absolute, no `..`, and **never inside a library
+/// source root** — exporting into the library would turn a read-only index into a writer of the
+/// user’s own asset folders.
+///
+/// Synchronous, because the toast reports what actually happened. In-pack picks are counted and
+/// reported rather than silently unpacked: extraction is an explicit action, and an export that
+/// quietly inflated a 2 GB archive would be a surprise, not a convenience.
+#[tauri::command]
+fn export_assets(
+    state: tauri::State<'_, AppState>,
+    asset_ids: Vec<i64>,
+    dest_path: String,
+    with_dependencies: bool,
+) -> Result<lodestash_api::export::ExportReport, String> {
+    if asset_ids.is_empty() {
+        return Err("nothing to export".into());
+    }
+    let engine = state
+        .engine
+        .as_ref()
+        .ok_or_else(|| "no catalog is open — there is nothing to export".to_string())?;
+    engine.export_now(lodestash_api::export::ExportRequest {
+        asset_ids,
+        dest_path,
+        with_dependencies,
+    })
+}
+
 /// Approve an engine job on the approval gate (ENGINE-API §4) — the import then goes to the
 /// Unity plugin's queue.
 #[tauri::command]
@@ -1929,6 +1965,7 @@ pub fn run() {
             pump_progress,
             engine_bridge,
             engine_import,
+            export_assets,
             engine_approve,
             engine_deny,
             engine_approvals,

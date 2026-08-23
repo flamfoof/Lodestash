@@ -45,7 +45,7 @@
     }
   }
 
-  function menuAction(action: "favorite" | "identify" | "import" | "trash") {
+  function menuAction(action: "favorite" | "identify" | "import" | "export" | "trash") {
     const m = menu;
     if (!m) return;
     const favorite = result?.items.find((i) => i.asset_id === m.id)?.favorite ?? false;
@@ -181,6 +181,17 @@
   }
 
   function onkeydown(e: KeyboardEvent) {
+    // The context menu is modal-ish — its backdrop covers the window — so Escape has to reach it
+    // before anything else, and from anywhere, including the search box. Its own `onkeydown` lived
+    // on a `role="presentation"` div that never takes focus and so never fired: the menu could only
+    // ever be dismissed by clicking, and until it was, the backdrop swallowed every click on the
+    // app behind it.
+    if (e.key === "Escape" && menu) {
+      closeMenu();
+      e.preventDefault();
+      return;
+    }
+
     // Never steal keys from the search box or a focused control.
     if (e.target instanceof HTMLInputElement) return;
     if (e.target instanceof HTMLTextAreaElement) return;
@@ -584,40 +595,47 @@
   {#if quickLook !== null}
     <QuickLook assetId={quickLook} onclose={() => (quickLook = null)} onstep={step} />
 
-    {#if menu}
-      <!-- A full-screen transparent layer: one click closes; the menu sits above it at the
-           cursor, clamped to the viewport. -->
-      <div
-        class="menu-backdrop"
-        role="presentation"
-        onclick={closeMenu}
-        oncontextmenu={(e) => {
-          e.preventDefault();
-          closeMenu();
-        }}
-        onkeydown={(e) => e.key === "Escape" && closeMenu()}
-      ></div>
-      <div
-        class="ctx-menu"
-        role="menu"
-        aria-label="Asset actions"
-        style="left: {Math.min(menu.x, window.innerWidth - 180)}px; top: {Math.min(menu.y, window.innerHeight - 140)}px;"
-      >
-        <button role="menuitem" onclick={() => menu && ((quickLook = menu.id), closeMenu())}>
-          Quick Look
-        </button>
-        <button role="menuitem" onclick={() => copyFromMenu("name")} data-testid="ctx-copy-name">
-          Copy name
-        </button>
-        <button role="menuitem" onclick={() => copyFromMenu("path")}>Copy path</button>
-        <button role="menuitem" onclick={() => menuAction("favorite")}>Toggle Favorite</button>
-        <button role="menuitem" onclick={() => menuAction("identify")}>Identify now</button>
-        <button role="menuitem" onclick={() => menuAction("import")}>⇢ Add to project</button>
-        <button role="menuitem" class="danger" onclick={() => menuAction("trash")}>
-          Move to Trash
-        </button>
-      </div>
-    {/if}
+  {/if}
+
+  <!-- Right-click actions (FEATURES §1.1). A **sibling** of Quick Look, not a child: nested inside
+       `{#if quickLook !== null}` it only rendered while the modal was open, which is precisely when
+       no card can be right-clicked — so the menu, and every action only reachable through it, was
+       dead from the day it shipped. -->
+  {#if menu}
+    <!-- A full-screen transparent layer: one click closes; the menu sits above it at the
+         cursor, clamped to the viewport. -->
+    <div
+      class="menu-backdrop"
+      role="presentation"
+      onclick={closeMenu}
+      oncontextmenu={(e) => {
+        e.preventDefault();
+        closeMenu();
+      }}
+    ></div>
+    <div
+      class="ctx-menu"
+      role="menu"
+      aria-label="Asset actions"
+      style="left: {Math.min(menu.x, window.innerWidth - 180)}px; top: {Math.min(menu.y, window.innerHeight - 140)}px;"
+    >
+      <button role="menuitem" onclick={() => menu && ((quickLook = menu.id), closeMenu())}>
+        Quick Look
+      </button>
+      <button role="menuitem" onclick={() => copyFromMenu("name")} data-testid="ctx-copy-name">
+        Copy name
+      </button>
+      <button role="menuitem" onclick={() => copyFromMenu("path")}>Copy path</button>
+      <button role="menuitem" onclick={() => menuAction("favorite")}>Toggle Favorite</button>
+      <button role="menuitem" onclick={() => menuAction("identify")}>Identify now</button>
+      <button role="menuitem" onclick={() => menuAction("import")}>⇢ Add to project</button>
+      <button role="menuitem" onclick={() => menuAction("export")} data-testid="ctx-export">
+        ⤓ Export to folder…
+      </button>
+      <button role="menuitem" class="danger" onclick={() => menuAction("trash")}>
+        Move to Trash
+      </button>
+    </div>
   {/if}
 </section>
 

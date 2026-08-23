@@ -897,45 +897,124 @@ impl ServerState {
         dest: PathBuf,
     ) {
         job.set_state(jobs::JobState::Running);
+        let report = match self.copy_export(&req, &dest, &job) {
+            Ok(r) => r,
+            Err(e) => return job.fail(e),
+        };
+        if job.is_cancelled() {
+            job.set_state(jobs::JobState::Cancelled);
+            tracing::info!(%job.id, written = report.written, "export cancelled part-way");
+            return;
+        }
+        job.finish(report.to_json(req.with_dependencies));
+    }
+
+    /// The export itself: resolve the closure, resolve the files, copy them.
+    ///
+    /// One body, two entry points — the approval-gated agent path ([`Self::run_export`]) and the
+    /// desktop’s own [`Self::export_now`]. They must not drift, because "what does an export
+    /// actually copy" is the question both of them are answering.
+    fn copy_export(
+        &self,
+        req: &export::ExportRequest,
+        dest: &Path,
+        job: &jobs::Job,
+    ) -> Result<export::ExportReport, String> {
         // With dependencies, the copy set is the transitive closure over the P2 relationship
         // graph (a material drags its textures). Edges that resolve to nothing in the library
         // add nothing — the closure only walks `resolved` ones.
         let ids = if req.with_dependencies {
-            match self
-                .catalog
+            self.catalog
                 .lock()
                 .unwrap()
                 .dependency_closure(&req.asset_ids)
-            {
-                Ok(ids) => ids,
-                Err(e) => return job.fail(e.to_string()),
-            }
+                .map_err(|e| e.to_string())?
         } else {
             req.asset_ids.clone()
         };
-        let rows = match self.catalog.lock().unwrap().asset_summaries(&ids) {
-            Ok(rows) => rows,
-            Err(e) => return job.fail(e.to_string()),
-        };
-        let files: Vec<(PathBuf, String)> = rows
-            .iter()
-            .filter_map(|r| self.source_path(r).map(|p| (p, file_name_for(r))))
-            .collect();
-        let missing = ids.len().saturating_sub(files.len());
-        match export::copy_files(&files, &dest, &job) {
-            Ok(written) if job.is_cancelled() => {
-                job.set_state(jobs::JobState::Cancelled);
-                tracing::info!(%job.id, written, "export cancelled part-way");
+        let rows = self
+            .catalog
+            .lock()
+            .unwrap()
+            .asset_summaries(&ids)
+            .map_err(|e| e.to_string())?;
+
+        // Two reasons a pick contributes no file, told apart because they have different fixes:
+        // an in-pack asset needs its pack extracted, a missing one needs its drive back.
+        let mut files: Vec<(PathBuf, String)> = Vec::new();
+        let mut in_pack = 0usize;
+        let mut unreachable = 0usize;
+        for r in &rows {
+            if let Some(p) = self.source_path(r) {
+                if p.exists() {
+                    files.push((p, file_name_for(r)));
+                    continue;
+                }
             }
-            Ok(written) => job.finish(serde_json::json!({
-                "written": written,
-                "missing": missing,
-                "dest_path": dest.display().to_string(),
-                "dependencies_included": req.with_dependencies,
-                "requested_dependencies": req.with_dependencies,
-                "dependencies_added": ids.len().saturating_sub(req.asset_ids.len()),
-            })),
-            Err(e) => job.fail(e.to_string()),
+            // `disk_path` is **synthesised** as `root_path/rel_path` for every row without a
+            // `workspace_rel` — including an in-pack asset, whose bytes are inside the archive and
+            // never at that path. So the path existing is not what tells the two apart: a row that
+            // belongs to a package and has not been extracted is in-pack, and everything else that
+            // failed to resolve is genuinely out of reach.
+            if r.package_id.is_some() && r.workspace_rel.is_none() {
+                in_pack += 1;
+            } else {
+                unreachable += 1;
+            }
+        }
+        // Ids the catalog could not describe at all are counted too, or the numbers would not add
+        // up to what the caller asked for.
+        unreachable += ids.len().saturating_sub(rows.len());
+
+        let written = export::copy_files(&files, dest, job).map_err(|e| e.to_string())?;
+        Ok(export::ExportReport {
+            written,
+            in_pack,
+            unreachable,
+            dependencies_added: ids.len().saturating_sub(req.asset_ids.len()),
+            dest_path: dest.display().to_string(),
+        })
+    }
+
+    /// Export **now**, without the approval gate (UI-SPEC §16.2).
+    ///
+    /// The gate exists because an *agent* asked (ENGINE-API §4: nothing is copied until the person
+    /// at the desktop app approves). Here that person is the one asking — they picked the
+    /// destination in a native folder dialog, which is a more deliberate act than a prompt they
+    /// would approve after the fact. Asking them to confirm their own click would be theatre, and
+    /// would train them to dismiss the prompt that does matter.
+    ///
+    /// The **sandbox still applies in full**: absolute, no `..`, and never inside a library source
+    /// root. That rule protects the non-destructive invariant, not the agent boundary, so it holds
+    /// for every caller.
+    ///
+    /// Synchronous on purpose. The caller reports what happened, and it cannot do that honestly
+    /// from a thread it never waited for.
+    pub fn export_now(&self, req: export::ExportRequest) -> Result<export::ExportReport, String> {
+        let roots = self
+            .catalog
+            .lock()
+            .unwrap()
+            .source_roots()
+            .unwrap_or_default();
+        let dest =
+            export::check_dest(&req.dest_path, &roots).map_err(|e| e.message().to_string())?;
+        let summary = format!(
+            "Export {} asset(s) to {}",
+            req.asset_ids.len(),
+            dest.display()
+        );
+        let job = self.jobs.create("export", summary, jobs::JobState::Running);
+        match self.copy_export(&req, &dest, &job) {
+            Ok(report) => {
+                job.finish(report.to_json(req.with_dependencies));
+                Ok(report)
+            }
+            // A copy failure is not a sandbox refusal and must not read like one.
+            Err(e) => {
+                job.fail(e.clone());
+                Err(e)
+            }
         }
     }
 

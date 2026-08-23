@@ -31,6 +31,7 @@ import JobTray from "./lib/JobTray.svelte";
     engineImport,
     addSourceDialog,
     pickFolder,
+    exportAssets,
     removeFromLibrary,
     deleteFromDisk,
     getWebPrefs,
@@ -384,6 +385,48 @@ import JobTray from "./lib/JobTray.svelte";
       );
     } else if (action === "import") {
       importToProject([id]);
+    } else if (action === "export") {
+      exportToFolder([id]);
+    }
+  }
+
+  /**
+   * **Export to folder** (UI-SPEC §16.2) — the level-1 way out, and until the Unity plugin exists
+   * the only one: `importToProject` needs a registered project whose plugin drains the queue.
+   *
+   * The native folder dialog is the confirmation. Nothing else prompts, because picking a
+   * destination is already a deliberate act, and a second "are you sure" would train the user to
+   * click through the one that matters.
+   *
+   * The toast reports what actually happened rather than that the request was accepted: skipped
+   * picks are named by *reason*, since an in-pack asset needs an extract and an unreachable one
+   * needs its drive back.
+   */
+  async function exportToFolder(ids: number[]) {
+    if (ids.length === 0) return;
+    let dest: string | null = null;
+    try {
+      dest = await pickFolder(`Export ${ids.length} asset${ids.length === 1 ? "" : "s"} to…`);
+    } catch (e) {
+      push(String(e), "err");
+      return;
+    }
+    if (!dest) return; // cancelled — not a failure, and not worth a toast
+    try {
+      const r = await exportAssets(ids, dest);
+      const skipped: string[] = [];
+      if (r.in_pack > 0) skipped.push(`${r.in_pack} still in a pack`);
+      if (r.unreachable > 0) skipped.push(`${r.unreachable} unreachable`);
+      const extra = r.dependencies_added > 0 ? ` (+${r.dependencies_added} linked)` : "";
+      if (r.written === 0) {
+        push(`Nothing was exported — ${skipped.join(", ") || "no files to copy"}`, "warn");
+      } else if (skipped.length > 0) {
+        push(`Exported ${r.written}${extra} — skipped ${skipped.join(", ")}`, "warn");
+      } else {
+        push(`Exported ${r.written} file${r.written === 1 ? "" : "s"}${extra} to ${dest}`);
+      }
+    } catch (e) {
+      push(String(e), "err");
     }
   }
 
@@ -481,6 +524,7 @@ import JobTray from "./lib/JobTray.svelte";
           )
         }
         onimport={() => view.selected !== null && importToProject([view.selected])}
+        onexport={() => view.selected !== null && exportToFolder([view.selected])}
         onrestore={() =>
           write(
             () => setTrashed([view.selected!], false),
@@ -501,6 +545,7 @@ import JobTray from "./lib/JobTray.svelte";
     onunstage={unstageOne}
     onclear={clearTray}
     onimport={(ids) => importToProject(ids)}
+    onexport={(ids) => exportToFolder(ids)}
   />
   <JobTray />
 

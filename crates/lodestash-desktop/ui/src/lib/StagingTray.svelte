@@ -45,12 +45,19 @@
     onunstage,
     onclear,
     onimport,
+    onexport,
   }: {
     /** The staged asset ids, in order (App owns the state; this component just draws it). */
     ids: number[];
     onunstage: (id: number) => void;
     /** `⇢ Add all N to project` (FEATURES §7.2) — queue the whole tray. */
     onimport: (ids: number[]) => void;
+    /**
+     * **Export to folder** (UI-SPEC §16.2) — the arbitrary-path copy, distinct from Import by
+     * design: *Import* means into the registered project, *Export* means anywhere else. Keeping
+     * the two verbs apart is what stops "where did my files go" being a question.
+     */
+    onexport: (ids: number[]) => void;
     onclear: () => void;
   } = $props();
 
@@ -197,6 +204,17 @@
       {:else}
         ⇢ Add all {ids.length} to project
       {/if}
+    </button>
+    <!-- Import needs a registered Unity project and its plugin; this needs neither, which makes it
+         the way out that always works (UI-SPEC §16.3 level 1). -->
+    <button
+      class="clear"
+      data-testid="tray-export"
+      disabled={reachable.length === 0}
+      onclick={() => onexport(reachable)}
+      title="Copy these files into a folder you choose. Originals are never moved."
+    >
+      ⤓ Export to folder…
     </button>
     <!-- D4: the tray is a cart, a collection is a named set worth keeping. Without this line the
          shortlist someone just built by hand is thrown away on import. One rung up the ladder. -->

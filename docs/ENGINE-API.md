@@ -101,7 +101,14 @@ in-editor import (§5). Both reuse the **same dependency-closure resolution** de
 
 > **Server-side confirmation (shipped).** `POST /v1/export` returns `202` with a job in state
 > **`awaiting_approval`** — an extra state beyond the §3 set. Nothing is copied until the person at
-> the desktop app approves the prompt; denial cancels the job permanently. This is
+> the desktop app approves the prompt; denial cancels the job permanently.
+>
+> The gate is **scoped to the agent plane**, which is the whole reason it exists: it is the person
+> at the desktop app confirming what something *else* asked for. The desktop’s own **Export to
+> folder** (UI-SPEC §16.2) therefore runs without it — that person is the one asking, and they said
+> so by choosing a destination in a native folder dialog. Both paths share one implementation, so
+> what an export copies cannot drift between them, and the **export sandbox below applies to both**:
+> it protects the non-destructive invariant, not the agent boundary. This is
 > [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md) §5 "confirm mutating ops server-side, don't rely
 > solely on the client's human-in-the-loop", made literal. Clients must poll `GET /v1/jobs/{id}`
 > and handle a job that never leaves `awaiting_approval`.
