@@ -31,10 +31,12 @@ notify     = { workspace = true }
 # Added later in P2:
 # image_dds = "0.7" # DDS/BCn textures
 
-# Rasterises a stored preview SVG for renderers with no SVG support (the egui grid); a webview
-# renders it natively and needs none of this. Already in the tree via egui_extras' svg feature.
-resvg = "0.37"
+
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Test-only since the egui grid was retired: nothing in the product rasterises an SVG any
+# more (the webview renders it natively). It stays so `vectorize`'s tests can prove the
+# generated preview survives a real SVG parser rather than merely looking like markup.
+resvg    = "0.37"
 insta    = { workspace = true }

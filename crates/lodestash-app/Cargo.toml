@@ -6,8 +6,9 @@ rust-version = { workspace = true }
 license     = { workspace = true }
 
 [dependencies]
-# Headless desktop orchestration: everything the app does that is not drawing. Consumed by the
-# egui shell today and by the Tauri backend once the port lands, so it must never gain a UI dep.
+# Headless desktop orchestration: everything the app does that is not drawing. The egui shell it
+# was first written for is gone (B7 cutover, 2026-08-07); the Tauri backend consumes it unchanged,
+# which is the whole point — it must never gain a UI dep.
 lodestash-core   = { workspace = true }
 lodestash-ingest = { workspace = true }
 # config.rs reaches for the cloud provider's default base URL and the agent operation

@@ -8,8 +8,9 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Lodestash desktop shell — Tauri 2 host for the Svelte frontend"
 
-# The binary is named `lodestash-desktop` until the B7 cutover, so it can be built and run
-# side by side with the egui `lodestash` binary during the port.
+# Named `lodestash-desktop` so it could run side by side with the egui `lodestash` binary during
+# the port. That binary was deleted at the B7 cutover (2026-08-07); this is the only shell now, and
+# the name stays because renaming it would break every script and shortcut pointing at it.
 [[bin]]
 name = "lodestash-desktop"
 path = "src/main.rs"

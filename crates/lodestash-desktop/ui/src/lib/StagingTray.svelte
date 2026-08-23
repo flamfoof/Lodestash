@@ -244,15 +244,6 @@
       >▣ Save as collection…</button>
     {/if}
     <button class="clear" data-testid="staged-clear" onclick={onclear}>Clear all</button>
-    <span class="spacer"></span>
-    <button
-      class="commit"
-      data-testid="staged-commit"
-      disabled
-      title="Commit rides the engine build — the Rust/egui collect-and-import pipeline owns the commit side (B9e); this web shell only collects the shortlist for now."
-    >
-      Commit to project
-    </button>
   </div>
 {/if}
 
@@ -363,22 +354,5 @@
   }
   .clear:hover {
     color: var(--ls-gold);
-  }
-  .spacer {
-    flex: 1;
-  }
-  .commit {
-    flex: none;
-    height: var(--control-h);
-    padding: 0 var(--sp-3);
-    border: 1px solid var(--ls-gold);
-    border-radius: var(--r-md);
-    font-size: var(--fs-sm);
-    color: var(--ls-text-muted);
-    opacity: 0.45;
-    cursor: not-allowed;
-  }
-  .commit:focus-visible {
-    box-shadow: var(--el-focus-ring);
   }
 </style>

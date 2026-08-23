@@ -572,19 +572,43 @@ and the Materials tab — `FEATURES.md` wins on both, do not "fix" the app to ma
 
 **Doc drift (docs name things that no longer exist — fix per CLAUDE.md "docs are source of truth"):**
 
-- [ ] **DESIGN-GUIDELINES §5** — "individual files not yet folded into the sprite" list is fully
-      folded (16/16 in both sprites); the "Unicode glyph stand-ins until SVG rendering lands"
-      caveat is obsolete (and names the deleted egui `theme.rs`).
-- [ ] **ALIGNMENT-AUDIT.md** — rows it marks Missing (toasts, staging tray, Identify, Settings) are
-      now built.
-- [ ] **ROADMAP.md** — "egui/eframe on wgpu" shell (Phase 0), "three-d on shared wgpu" + Tauri-as-
-      fallback tables, "normalize-to-glTF on import / runtime only sees glTF" — all superseded by
-      the Tauri 2 + Svelte 5 + WebGL2 shell (the former fallback shipped).
-- [ ] **MILESTONES.md** — "v1 ships at M5" scope note + M1.5 ratings are stale vs the board.
-- [ ] **PACK-DIRECTORY-NAV.md §1** — status table references deleted egui components.
-- [ ] **USER-GUIDE.md** — the core loop (auto-discovery → cache watch → identify flips to
-      Identified → AI search → Unity/MCP import) cannot complete today; the guide should mark the
-      blocked steps or the board should become the guide's status reference.
+- [x] **Two things that lied about themselves, deleted (2026-08-22).**
+      **A dead button in the staging tray:** `Commit to project`, hardcoded `disabled`, sitting
+      beside two that work — and explaining itself with *"commit rides the engine build — the
+      Rust/egui collect-and-import pipeline owns the commit side (B9e)"*. That pipeline does not
+      exist: there is no egui crate and no `lodestash` binary. `⇢ Add all N to project` **is** the
+      commit. Unreferenced by UI-SPEC §16.2, by any e2e check and by any doc — so it went, rather
+      than being kept as a third primary-looking action that never fires.
+      **A dependency kept alive by its own tests:** `vectorize::rasterize()` had **zero production
+      callers**. It existed so a renderer with no SVG support — the egui grid — could show a
+      preview; the webview renders SVG natively. `resvg` (with `usvg` and `tiny-skia` behind it) was
+      compiling into the shipped binary to serve two tests. Demoted to a **dev-dependency** with the
+      function behind `cfg(test)` rather than deleted outright, because one of those tests earns its
+      keep: *the generated SVG must survive a real SVG parser, not just look like markup*. Removing
+      the rasteriser would remove the only thing checking that, and a preview that renders as
+      nothing looks exactly like one that was never generated. Verified out of the graph with
+      `cargo tree -e normal`. TECH-STACK updated per CLAUDE.md rule 5.
+
+- [x] **Doc drift, re-checked against the docs themselves (2026-08-22).** Six cards here claimed
+      a doc still described the retired egui shell. **Five were wrong — the docs were fixed and the
+      cards were never ticked**, which is the same failure as a card claiming code is built:
+      `ROADMAP.md` says "supersedes the egui/wgpu shell" and "retired at the B7 cutover" throughout;
+      `MILESTONES.md` carries an updated-2026-08 note pointing at this board, with the rating UI
+      recorded as parked by design; `USER-GUIDE.md` has a dated status note that is accurate about
+      what is live and what still needs a Unity install; `PACK-DIRECTORY-NAV.md` §1 reads **Shipped**
+      against Svelte components and mentions egui only as history; `ALIGNMENT-AUDIT.md` scopes itself
+      to the Svelte app in its header and notes the egui crate as deleted at B7 (its `Missing` rows
+      are a dated audit record, not a claim about today — and the ones spot-checked, e.g. F3's AI
+      confidence bars, are **still** missing). `DESIGN-GUIDELINES §5`'s "not yet folded into the
+      sprite" list is gone.
+      **One was real, and it was the doc nobody carded:** `TECH-STACK.md` §2 — the table that reads
+      as *the current stack* — still named `three-d 0.18 on eframe's shared Glow` for 3D and `rodio`
+      *for playback* with the waveform "drawn with egui painter", while §5.3 of the same file
+      correctly documented the hand-rolled WebGL2 viewer. A doc contradicting itself is worse than
+      one merely out of date: both halves look authoritative. §2 now names what ships and points at
+      §5.3; the two eframe/Glow rows in the decision table are marked **superseded** rather than
+      deleted, because they were real calls and a reader needs to know they were made and outgrown.
+      Two `Cargo.toml` comments describing the egui binary as current went with it.
 
 ## 🔵 Engine-project / deferred
 

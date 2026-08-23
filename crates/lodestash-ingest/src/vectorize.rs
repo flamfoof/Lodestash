@@ -339,10 +339,19 @@ pub fn view_svg(svg: &str, view: usize) -> String {
     out.replace(r#" display="none""#, "")
 }
 
-/// Rasterise a preview SVG to `size`² RGBA over a transparent background, so a renderer with no SVG
-/// support (the egui grid) can still show it. Returns `None` if the document doesn't parse.
+/// Rasterise a preview SVG to `size`² RGBA over a transparent background. Returns `None` if the
+/// document doesn't parse.
 ///
-/// A webview needs none of this — it renders the SVG natively, which is where the real win is.
+/// **Test-only.** It existed so a renderer with no SVG support — the egui grid — could still show a
+/// preview. That shell is gone and the webview renders SVG natively, so nothing in the product has
+/// called this for some time; `resvg` was compiling into the binary to serve two tests.
+///
+/// Kept rather than deleted, and moved behind `cfg(test)` with `resvg` demoted to a dev-dependency,
+/// because one of those tests is worth its weight: *"the generated SVG must survive a real SVG
+/// parser, not just look like markup"*. Deleting the rasteriser would delete the only thing that
+/// checks it, and a preview that renders as nothing looks exactly like a preview that was never
+/// generated.
+#[cfg(test)]
 pub fn rasterize(svg: &str, size: u32) -> Option<image::RgbaImage> {
     use resvg::usvg::TreeParsing;
     let parsed =
