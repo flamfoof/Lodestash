@@ -243,7 +243,9 @@ The browse-everything grid. Composition top→bottom:
 4. **Bulk bar** (when ≥1 card is check-picked): `N selected` + tag-name input + **+ Add tag** /
    **− Remove tag** (skips Unidentified) + **⟡ Stage all** + ✕ Clear. Bulk tag edits are undoable.
 5. **The grid / list** (virtualized):
-   - **Card** (DESIGN-GUIDELINES §7 anatomy): 3px status left-border; thumbnail region (104px, dark
+   - **Card** (DESIGN-GUIDELINES §7 anatomy): **1px** status left-border (this said 3px until
+     2026-08-22; DESIGN-GUIDELINES §6 says 1px, the app renders 1px, and DG wins on pixel details
+     per `docs/design/README.md` — ALIGNMENT-AUDIT F1); thumbnail region (104px, dark
      recess) with: status gem badge (top-right), **pick checkbox** (top-left, appears on
      hover/when any pick is active), `✦ NN%` AI-match pill (top-left, AI results only),
      **S/M/L/XL size badge** + `✓ in <project>` imported badge (bottom-left), **⤢ Quick Look** +

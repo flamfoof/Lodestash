@@ -15,10 +15,37 @@ import os from "node:os";
 import path from "node:path";
 import { launch } from "./harness.mjs";
 
+/**
+ * The viewport every check is entitled to find the app in, captured once the app is up.
+ *
+ * One check resizes the window on purpose — the responsive ladder, because media queries cannot be
+ * driven any other way — and it restores it afterwards. This is what makes "afterwards" enforceable
+ * for *every* check rather than only that one: a resize left behind silently re-runs everything
+ * after it at a width nobody chose, and the failures land far from the cause. That has happened
+ * twice here (once from a leaked app, once from a restore that threw and was swallowed), and both
+ * times the tell was a suite that failed everywhere at once and passed in isolation.
+ */
+let baseline = null;
+let restoreViewport = async () => {};
+
+const viewport = () => page.evaluate(() => [window.innerWidth, window.innerHeight]);
+
 const results = [];
 async function check(name, fn) {
   try {
     await fn();
+    if (baseline) {
+      const got = await viewport();
+      if (got[0] !== baseline[0] || got[1] !== baseline[1]) {
+        // Put it back before reporting, so one careless check cannot cascade into eighty
+        // unrelated failures — the failure mode this guard exists to make legible, not to spread.
+        await restoreViewport();
+        throw new Error(
+          `left the app at ${got.join("\u00d7")}, not the ${baseline.join("\u00d7")} it started at — ` +
+            `a check that resizes the window must put it back`,
+        );
+      }
+    }
     results.push([true, name]);
     console.log(`  ok   ${name}`);
   } catch (e) {
@@ -30,6 +57,31 @@ async function check(name, fn) {
 const app = await launch();
 const { page, invoke } = app;
 console.log(`\ndriving ${page.url()}\n`);
+
+// Arm the per-check viewport guard against whatever size the app actually opened at — not a
+// hard-coded number, because that is the user's window and it is theirs to size.
+{
+  const cdp = await page.context().newCDPSession(page);
+  const { windowId } = await cdp.send("Browser.getWindowForTarget");
+  const { bounds } = await cdp.send("Browser.getWindowBounds", { windowId });
+  baseline = await viewport();
+  restoreViewport = async () => {
+    if (bounds.windowState && bounds.windowState !== "normal") {
+      await cdp
+        .send("Browser.setWindowBounds", { windowId, bounds: { windowState: bounds.windowState } })
+        .catch(() => {});
+    } else {
+      const { left, top, width, height } = bounds;
+      await cdp
+        .send("Browser.setWindowBounds", { windowId, bounds: { left, top, width, height } })
+        .catch(() => {});
+    }
+    await page
+      .waitForFunction((w) => Math.abs(window.innerWidth - w) <= 1, baseline[0], { timeout: 4000 })
+      .catch(() => {});
+  };
+  console.log(`  …    app viewport ${baseline.join("\u00d7")} — every check must leave it that way\n`);
+}
 
 try {
   // First-run onboarding (FEATURES §8) covers the window on a fresh config. Every DOM
@@ -798,6 +850,7 @@ try {
     // Say so, so that watching the app shrink for a few seconds reads as this check working rather
     // than as the app breaking.
     console.log("  …    resizing the app to walk the responsive ladder — it is put back after");
+    const resizeStart = Date.now();
 
     /**
      * Put the window back exactly as it was found.
@@ -857,7 +910,17 @@ try {
       // Earlier checks leave focus on whatever they last clicked; a nav row still holding focus
       // would expand the rail through `:has(:focus-visible)` and read as a broken media query.
       await page.evaluate(() => (document.activeElement instanceof HTMLElement ? document.activeElement.blur() : null));
-      await page.waitForTimeout(500);
+      // Wait for the resize to *land*, not for a guess at how long it takes. The page knows: its
+      // own `innerWidth` is the width the media queries are being evaluated at. A fixed 500ms per
+      // rung was both slower and less certain — and five of them are most of the several seconds
+      // this check spends visibly shrinking the app, which has been reported as a bug three times.
+      await page
+        .waitForFunction((w) => Math.abs(window.innerWidth - w) <= 1, width, { timeout: 4000 })
+        .catch(() => {});
+      // One frame for the relayout the new width triggers, which `innerWidth` does not wait for.
+      await page.evaluate(
+        () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(null)))),
+      );
       return page.evaluate(() => {
         const shown = (sel) => {
           const el = document.querySelector(sel);
@@ -892,11 +955,14 @@ try {
       assert.ok(narrow.view, "the view toggle folded — it changes what you are looking at");
     } finally {
       await restoreWindow();
-      await page.waitForTimeout(400);
+      await page
+        .waitForFunction((w) => Math.abs(window.innerWidth - w) <= 1, original.width, { timeout: 4000 })
+        .catch(() => {});
       // Verified, not assumed. The previous restore swallowed its own error with `.catch(() => {})`
       // and left the app permanently 900×800 — a check that resizes the user’s window has to prove
       // it gave it back.
       const { bounds: after } = await cdp.send("Browser.getWindowBounds", { windowId });
+      console.log(`  …    the app was resized for ${((Date.now() - resizeStart) / 1000).toFixed(1)}s`);
       assert.deepEqual(
         after,
         original,

@@ -328,9 +328,12 @@ or more than a patch):
       every *selection* change would contradict §2.5's "while that card is the active audio" and
       make the grid transport useless for auditioning several sounds in a row. The one-element
       player already guarantees the "one at a time" the sentence is really about.
-- [ ] **Doc drift: card status rail width.** UI-SPEC §2.5 says 3px, DESIGN-GUIDELINES §6 says 1px,
-      the app follows DG (ALIGNMENT-AUDIT F1). UI-SPEC is the stale one — fix it per CLAUDE.md
-      rule 2 so the next reader is not told the code diverges when it conforms.
+- [x] **Doc drift: card status rail width (2026-08-22).** UI-SPEC §2.5 said 3px against
+      DESIGN-GUIDELINES §6's 1px, and the app renders 1px. DG wins on pixel details
+      (`docs/design/README.md` precedence, ALIGNMENT-AUDIT F1), so UI-SPEC was the stale side and
+      now says 1px. The comment in `Card.svelte` that recorded this as an open divergence says the
+      two agree instead — leaving it would have told the next reader the code diverges when it
+      conforms.
 
 **Structural audit (2026-08-14)** — answering "too much code per file, too many tests":
 
@@ -451,7 +454,7 @@ facet-group owner call).
       the stated exception — a frozen spinner reads as a stuck UI and is the only signal a job is
       alive. *(Focusable **cards** still wait on a roving `tabindex` — see D15.)*
 - [x] **D10 — `✓ in <project>` badge.** `GridItem.in_project`, filled by one
-      `imported_into_active_project()` read per reload (`mark_imported`, beside `mark_traits`) —
+      `import_states()` read per reload (`mark_imported`, beside `mark_traits`) —
       the data was always there and the bulk read was not (closes **N1.5** / B12e). Card shows
       `✓ in project` beside the size tier; rows show the check alone. Mutation-checked on the two
       ways it could lie: keying off `is_active`, and reading empty rather than erroring with no
@@ -612,6 +615,45 @@ and the Materials tab — `FEATURES.md` wins on both, do not "fix" the app to ma
       the rasteriser would remove the only thing checking that, and a preview that renders as
       nothing looks exactly like one that was never generated. Verified out of the graph with
       `cargo tree -e normal`. TECH-STACK updated per CLAUDE.md rule 5.
+
+- [x] **Test review: why the app visibly shrinks, and a guard so it can only ever be one test
+      (2026-08-22).** Reported three times from watching a run. Reviewed the whole suite for it:
+      **exactly one** check resizes anything — D12's responsive ladder, because media queries cannot
+      be driven any other way — and nothing else touches the viewport (the harness only *clears* an
+      inherited emulation override). The root cause was already measured with Win32
+      `GetWindowRect`: `Browser.setWindowBounds` resizes only the **WebView2 controller**, never the
+      Tauri window, so the app renders as a small page pinned inside a full-size frame.
+      Two changes. **Dwell time 4.0s → 0.8s**: the ladder waited a fixed 500ms per rung guessing at
+      when the relayout had settled; it now waits on `window.innerWidth` reaching the rung's width,
+      which is both faster and the actual signal. **A per-check viewport guard** in the `check()`
+      wrapper, so all 83 get it: every check must leave the app at the size it found it, or it fails
+      *by name* with both sizes. It restores before reporting, so one careless check cannot cascade
+      into eighty unrelated failures — the exact shape that wasted two sessions here (a leaked app,
+      then a swallowed restore), where the tell is a suite failing everywhere at once and passing in
+      isolation.
+      Verified by planting a check that resizes and does not restore: it was flagged by name, and
+      the check after it still ran at the right size.
+
+- [x] **The board now checks its own claims (2026-08-22).** `scripts/check-board.mjs`, beside
+      `check-docs.mjs` and named in CLAUDE.md rule 9. A checkbox is a claim about the code, and this
+      session found it rots in both directions: a **ticked** card citing a symbol since renamed, and
+      an **open** card still asserting something is missing years after it shipped — the expensive
+      one, because building a thing never touches the card that says it does not exist. Five cards
+      were in that state; three sent work toward something already finished.
+      The audit it automates: **353 cited symbols across 109 cards.** Ticked cards came back clean
+      apart from D10 naming `imported_into_active_project()`, which its own follow-up replaced with
+      `import_states()` — now corrected. All five open cards flagged for claiming absence were
+      **verified accurate**: `unmaterialize_package` and `detect::is_content` have only test
+      mentions, and `embedding_meta` / `variant_group_id` / `dominant_color` are genuinely never
+      written.
+      `KANBAN.md` carries a `<!-- check-board: historical -->` marker: its pre-B7 cards cite the
+      deleted egui crate, so its 14 dead citations are history, reported as notes rather than
+      failures. Deleting those cards would be tidier and would lose the record; leaving them
+      unmarked made the checker cry wolf 14 times, which is how a checker stops being read.
+      **Caught while writing it:** the parser matched **zero** cards — the repo is CRLF, `` is a
+      line terminator, so a per-line `/^- \[([ x])\] (.*)$/` never matches and the script reports a
+      clean board. A silent zero that reads exactly like success, in the tool built to catch exactly
+      that.
 
 - [x] **Doc drift, re-checked against the docs themselves (2026-08-22).** Six cards here claimed
       a doc still described the retired egui shell. **Five were wrong — the docs were fixed and the

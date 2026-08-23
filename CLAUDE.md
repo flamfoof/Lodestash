@@ -33,6 +33,13 @@ truth**. This file is the rule set for working in this repo.
 8. **Docs freshness is checked.** Run `node scripts/check-docs.mjs` after doc-touching work (and
    in CI when one exists): it flags dead `file:line` citations and cross-links. A dead citation is
    drift — fix the doc or the code.
+9. **Board claims are checked too.** Run `node scripts/check-board.mjs` after board-touching work.
+   A checkbox is a claim about the code and it rots in both directions: a **ticked** card can cite a
+   symbol that has since been renamed, and — the one that costs real time — an **open** card can
+   keep asserting something is missing long after it was built, because building a thing never
+   touches the card that says it does not exist. Five cards were found in that state in one session
+   (2026-08-22); three of them sent work toward something already finished. Before starting from a
+   card, confirm its claim against the code.
 
 ## Invariants (do not break without an explicit spec change)
 

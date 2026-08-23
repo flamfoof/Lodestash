@@ -522,9 +522,9 @@
        grey when discovered/indexed (DESIGN-GUIDELINES §6). Kept as a width on the base so the
        rail never pops the layout. UI-SPEC §2.5 puts the status on the *left border*, not the
        whole perimeter — the 2026-08-13 mockup shows a full ring and loses to the spec on that
-       point. The **width** is a known, recorded divergence: §2.5 says 3px, DESIGN-GUIDELINES §6
-       says 1px and the app follows DG (ALIGNMENT-AUDIT F1, narrowed 2026-08-07). UI-SPEC's number
-       is the stale one and still needs the same-change fix CLAUDE.md asks for. */
+       point. The **width** is 1px per DESIGN-GUIDELINES §6, which wins on pixel details
+       (ALIGNMENT-AUDIT F1, narrowed 2026-08-07); UI-SPEC §2.5 said 3px and was corrected to match
+       on 2026-08-22, so the two now agree with each other and with this line. */
     border-left-width: 1px;
     border-radius: var(--r-lg);
     text-align: left;

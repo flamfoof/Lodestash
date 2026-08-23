@@ -1,5 +1,18 @@
 # Lodestash — Kanban
 
+<!-- check-board: historical -->
+
+> **Cards finished before the B7 cutover (2026-08-07) cite the retired egui shell.**
+> `crates/lodestash-ui` was deleted there, so symbols like `ScrollArea::show_rows`,
+> `spawn_thumbnails`, `Sink::try_seek` and `fonts.rs` no longer resolve — they are a record of work
+> that shipped in a crate that is gone, not a claim about code you can go and read. The live board
+> for the Tauri/Svelte app is [`KANBAN-SVELTE.md`](KANBAN-SVELTE.md).
+>
+> `scripts/check-board.mjs` reads the marker above and reports this file's dead citations as
+> warnings rather than failing on them. Deleting the cards would be tidier and would lose the
+> history; leaving them unmarked made the checker cry wolf 14 times, which is how a checker stops
+> being read.
+
 The working board for building Lodestash. Cards are grouped Backlog → Ready → In Progress → Review →
 Done; **move a card across columns as you work it** (per the `CLAUDE.md` rule). Each card names the
 design doc that governs it — read that doc before implementing, and update it if the implementation
