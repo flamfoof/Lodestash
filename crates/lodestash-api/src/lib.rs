@@ -942,12 +942,16 @@ impl ServerState {
         // Two reasons a pick contributes no file, told apart because they have different fixes:
         // an in-pack asset needs its pack extracted, a missing one needs its drive back.
         let mut files: Vec<(PathBuf, String)> = Vec::new();
+        // Which asset each written file came from, so the history can point back at it.
+        let mut owner: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
         let mut in_pack = 0usize;
         let mut unreachable = 0usize;
         for r in &rows {
             if let Some(p) = self.source_path(r) {
                 if p.exists() {
-                    files.push((p, file_name_for(r)));
+                    let name = file_name_for(r);
+                    owner.insert(name.clone(), r.id);
+                    files.push((p, name));
                     continue;
                 }
             }
@@ -966,9 +970,30 @@ impl ServerState {
         // up to what the caller asked for.
         unreachable += ids.len().saturating_sub(rows.len());
 
-        let written = export::copy_files(&files, dest, job).map_err(|e| e.to_string())?;
+        let names = export::copy_files(&files, dest, job).map_err(|e| e.to_string())?;
+
+        // Export history (FEATURES §7.6) — recorded from what was **written**, not what was asked
+        // for, and recorded for the agent plane too: an export an agent ran still put files on the
+        // user's disk, and they are entitled to see it and undo it.
+        //
+        // A failure to record is not a failure to export. The files exist either way, and reporting
+        // a successful copy as an error would be the worse lie of the two.
+        if !names.is_empty() {
+            let rows: Vec<(Option<i64>, String)> = names
+                .iter()
+                .map(|n| (owner.get(n).copied(), n.clone()))
+                .collect();
+            if let Err(e) = self.catalog.lock().unwrap().record_exports(
+                &job.id,
+                &dest.display().to_string(),
+                &rows,
+            ) {
+                tracing::warn!(%e, "export history not recorded; the files were still written");
+            }
+        }
+
         Ok(export::ExportReport {
-            written,
+            written: names.len() as u64,
             in_pack,
             unreachable,
             dependencies_added: ids.len().saturating_sub(req.asset_ids.len()),

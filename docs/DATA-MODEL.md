@@ -568,7 +568,38 @@ asset stops being listed as a favourite because it has left the grid.
 
 ---
 
-## 10. Library Source labeling & asset relationships
+### 9.1 Export history (`export_record`, M19)
+
+An **export to a folder** is not an import, and `import_record` cannot hold one: its `project_id`
+is `NOT NULL` and its `dest_path` is project-relative, resolved against the project root at undo
+time. A folder export has no project and an absolute destination the user chose, so it gets its own
+table — which also keeps the two verbs apart the way UI-SPEC §16.2 does (**Import** into a project,
+**Export** to anywhere else).
+
+| column | meaning |
+|---|---|
+| `batch_id` | one export run; the unit Recent-exports lists and undo acts on |
+| `asset_id` | the asset it came from, `ON DELETE SET NULL` — trashing an asset later must not erase the record that a copy of it is still sitting in someone's folder |
+| `dest_path` | the absolute folder the run wrote into |
+| `file_name` | **one row per file written**, because undo deletes files and a dependency closure turns one pick into several |
+| `exported_at` | unix seconds |
+
+Rows are written from what was **actually copied**, never from what was requested: an export skips
+in-pack and unreachable picks and a cancelled run stops part-way, so a history built from the
+request would point undo at files that were never created. Both export paths record — the desktop's
+**⤓ Export to folder** and the agent plane's `export_asset` — because an export an agent ran still
+put files on the user's disk.
+
+Undo is the one delete in the app that touches a location the *user* chose, so it is fenced rather
+than trusted: `file_name` must be a bare name, the file must sit directly inside the recorded
+`dest_path`, and that destination is re-checked against the export sandbox **at undo time** (a
+folder that was legal to export into may since have become a library source root). A missing file
+counts as already-undone; a run that could not finish keeps its record, so copies still on disk stay
+findable.
+
+---
+
+## 10.## 10. Library Source labeling & asset relationships
 
 ### Library Source
 

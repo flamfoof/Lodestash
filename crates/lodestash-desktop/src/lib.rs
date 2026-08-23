@@ -23,8 +23,8 @@ use tauri_plugin_window_state::AppHandleExt;
 static LAST_GEOMETRY_SAVE: Mutex<Option<Instant>> = Mutex::new(None);
 
 use crate::library::{
-    AssetDetail, DupGroup, Facets, FolderPage, FolderQuery, GridPage, GridQuery, Library,
-    LibraryStatus, PackDirNode, PackageRow, RelinkCount, Settings, Stats, VocabRow,
+    AssetDetail, DupGroup, ExportBatchRow, Facets, FolderPage, FolderQuery, GridPage, GridQuery,
+    Library, LibraryStatus, PackDirNode, PackageRow, RelinkCount, Settings, Stats, VocabRow,
 };
 use crate::writer::{Op, WriteResult, Writer};
 
@@ -295,6 +295,40 @@ fn set_appraise_focus(state: tauri::State<'_, AppState>, query: GridQuery) -> Re
         .lock()
         .map_err(|_| "focus lock poisoned".to_string())? = order;
     Ok(())
+}
+
+/// The recent **folder** export runs, newest first — the other half of §7.1's "Recent exports".
+///
+/// `recent_exports` above lists imports *into a registered project*; this lists copies to a folder
+/// the user chose. They are separate tables because they are separate acts (UI-SPEC §16.2 keeps the
+/// verbs apart) and because `import_record` cannot hold a folder export: its `project_id` is
+/// `NOT NULL` and its `dest_path` is project-relative.
+///
+/// Read-only, and deliberately a *history*: it lists what was actually written to disk, which is
+/// the only thing undo can act on.
+#[tauri::command]
+fn recent_folder_exports(
+    state: tauri::State<'_, AppState>,
+    limit: usize,
+) -> Result<Vec<ExportBatchRow>, String> {
+    state
+        .library
+        .lock()
+        .map_err(|_| "library lock poisoned".to_string())?
+        .recent_exports(limit.clamp(1, 50))
+}
+
+/// Undo one export run — delete the files it copied out, then forget it (FEATURES §7.1).
+///
+/// Destructive, so it goes through the writer like every other delete, and the writer fences it to
+/// the exact names the run recorded, under the folder it recorded, re-checked against the export
+/// sandbox at undo time. Originals are never in scope: an export copies.
+#[tauri::command]
+fn undo_export_batch(
+    state: tauri::State<'_, AppState>,
+    batch_id: String,
+) -> Result<WriteResult, String> {
+    state.write(Op::UndoExportBatch { batch_id })
 }
 
 /// Star / unstar assets (DATA-MODEL §12). A pin, not a rating — "find this again".
@@ -1966,6 +2000,8 @@ pub fn run() {
             engine_bridge,
             engine_import,
             export_assets,
+            recent_folder_exports,
+            undo_export_batch,
             engine_approve,
             engine_deny,
             engine_approvals,

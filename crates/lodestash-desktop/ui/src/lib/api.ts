@@ -432,6 +432,27 @@ export const recentExports = (limit: number) =>
 export const undoImportBatch = (batchId: string) =>
   invoke<WriteResult>("undo_import_batch", { batchId });
 
+/**
+ * One **folder** export run — the other half of FEATURES §7.1's Recent exports.
+ *
+ * Separate from `ImportBatch` because the acts are separate (UI-SPEC §16.2 keeps *Import* and
+ * *Export* apart) and because `import_record` cannot hold one: its `project_id` is `NOT NULL` and
+ * its `dest_path` is project-relative, while a folder export goes to an absolute path of the
+ * user's choosing.
+ */
+export type FolderExport = {
+  batch_id: string;
+  dest_path: string;
+  /** Files written — what undo deletes, not how many assets were picked. */
+  files: number;
+  exported_at: number;
+};
+export const recentFolderExports = (limit: number) =>
+  invoke<FolderExport[]>("recent_folder_exports", { limit });
+/** Delete the files one folder export wrote, then forget it. Originals are never in scope. */
+export const undoFolderExport = (batchId: string) =>
+  invoke<WriteResult>("undo_export_batch", { batchId });
+
 // ── Pump events (B2b) ────────────────────────────────────────────────────────────────────────
 
 /**

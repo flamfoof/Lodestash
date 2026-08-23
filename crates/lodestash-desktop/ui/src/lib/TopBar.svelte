@@ -8,6 +8,9 @@
     setActiveProject,
     recentExports,
     undoImportBatch,
+    recentFolderExports,
+    undoFolderExport,
+    type FolderExport,
     type LibraryStatus,
     type ProjectRow,
     type ImportBatch,
@@ -40,7 +43,22 @@
   // Editors). The shell staging shortlist is in-memory — switching projects never mixes picks.
   let open = $state(false);
   let projectsList = $state<ProjectRow[]>([]);
-  let batches = $state<ImportBatch[]>([]);
+  /**
+   * Recent exports (FEATURES §7.1), both kinds in **one** list.
+   *
+   * The user does not think in "import batch" and "folder export" — they think *where did that go,
+   * and can I take it back*. So the two histories are merged and sorted by time; only the `kind`
+   * decides which undo runs and what the row says it went to.
+   */
+  type Run = {
+    batch_id: string;
+    kind: "project" | "folder";
+    dest: string;
+    where: string;
+    file_count: number;
+    at: number;
+  };
+  let batches = $state<Run[]>([]);
   let undoing = $state<string | null>(null);
   let confirming = $state<string | null>(null);
 
@@ -48,9 +66,34 @@
 
   async function loadSwitcher() {
     try {
-      const [ps, bs] = await Promise.all([projects(), recentExports(4)]);
+      // Four of each, merged and re-cut to four — asking each side for the four it knows about is
+      // the only way the newest four *overall* are guaranteed to be in hand.
+      const [ps, imports, folders] = await Promise.all([
+        projects(),
+        recentExports(4).catch(() => [] as ImportBatch[]),
+        recentFolderExports(4).catch(() => [] as FolderExport[]),
+      ]);
       projectsList = ps;
-      batches = bs;
+      batches = [
+        ...imports.map((b): Run => ({
+          batch_id: b.batch_id,
+          kind: "project",
+          dest: b.dest || "/",
+          where: b.project_name,
+          file_count: b.file_count,
+          at: b.imported_at,
+        })),
+        ...folders.map((b): Run => ({
+          batch_id: b.batch_id,
+          kind: "folder",
+          dest: b.dest_path,
+          where: "folder",
+          file_count: b.files,
+          at: b.exported_at,
+        })),
+      ]
+        .sort((a, b) => b.at - a.at)
+        .slice(0, 4);
     } catch {
       // Open anyway — the empty sections read honestly when the catalog is not there yet.
       projectsList = [];
@@ -78,6 +121,7 @@
   }
 
   async function undoBatch(batchId: string) {
+    const run = batches.find((b) => b.batch_id === batchId);
     // Confirm-gated (UI-SPEC §16.1): first click arms, the second within 3s confirms.
     if (confirming !== batchId) {
       confirming = batchId;
@@ -89,7 +133,10 @@
     confirming = null;
     undoing = batchId;
     try {
-      const r = await undoImportBatch(batchId);
+      const r =
+        run?.kind === "folder"
+          ? await undoFolderExport(batchId)
+          : await undoImportBatch(batchId);
       push(r.changed === 1 ? "Undid 1 file" : `Undid ${r.changed} files`, "ok");
       view.dataVersion += 1; // re-read the grid after the batch is gone
     } catch (e) {
@@ -250,11 +297,13 @@
         {:else}
           {#each batches as b (b.batch_id)}
             <div class="batch-row" data-testid="export-batch">
-              <span class="bmeta">
-                ✓ {b.file_count} {b.file_count === 1 ? "file" : "files"} → {b.dest || "/"}
-                <span class="rel">{relTime(b.imported_at)}</span>
+              <span class="bmeta" title={b.dest}>
+                ✓ {b.file_count} {b.file_count === 1 ? "file" : "files"} → {b.dest}
+                <span class="rel">{relTime(b.at)}</span>
               </span>
-              <span class="bproj">{b.project_name}</span>
+              <span class="bproj" class:folder={b.kind === "folder"}>
+                {b.kind === "folder" ? "⤓ folder" : b.where}
+              </span>
               <button
                 class="undo"
                 class:armed={confirming === b.batch_id}
@@ -271,7 +320,10 @@
         <button class="connect" onclick={connectProject} data-testid="connect-project">
           + Connect Unity project…
         </button>
-        <p class="footnote">Recent exports undo per batch — catalog assets are never touched.</p>
+        <p class="footnote">
+          Undo works per run and deletes only the copies that run wrote — catalog assets and the
+          originals are never touched.
+        </p>
       </div>
     </div>
   {/if}

@@ -2032,6 +2032,58 @@ try {
     await page.waitForSelector(".card", { timeout: 5000 });
   });
 
+  // UI-SPEC §13.2. The rule worth a check is the one that is easy to get backwards: the scrubber
+  // appears **after first play**, with a hint before it. A timeline you cannot scrub yet is a
+  // control that lies about what it does.
+  await check("the inspector's transport hints before first play, then scrubs", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "sounds", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 200 },
+    });
+    const sound = p.items.find((i) => !i.in_pack);
+    if (!sound) return;
+
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.getByRole("button", { name: /^Sounds/ }).click();
+    await page.waitForFunction(
+      (id) => !!document.querySelector(`.card[data-asset-id="${id}"]`),
+      sound.asset_id,
+      { timeout: 5000 },
+    );
+    // Select it *without* hitting the card's own ▶ — the inspector is what is under test.
+    await page.locator(`.card[data-asset-id="${sound.asset_id}"] .name`).click();
+    await page.waitForSelector('[data-testid="inspector-transport"]', { timeout: 5000 });
+
+    assert.equal(
+      await page.locator('[data-testid="inspector-scrub"]').count(), 0,
+      "the scrubber is offered before anything has played",
+    );
+    const hint = await page.locator('[data-testid="inspector-transport"] .hint').textContent();
+    assert.ok(hint?.includes("play to scrub"), `the hint reads: ${hint}`);
+
+    await page.locator('[data-testid="inspector-play"]').click();
+    await page.waitForSelector('[data-testid="inspector-scrub"]', { timeout: 8000 });
+    await page.waitForFunction(
+      () => {
+        const a = document.querySelector("audio");
+        return !!a && !a.paused && a.currentTime > 0;
+      },
+      undefined,
+      { timeout: 8000 },
+    );
+    const clock = await page.locator('[data-testid="inspector-clock"]').textContent();
+    assert.ok(/\d+:\d\d/.test(clock ?? ""), `the readout is not a clock: ${clock}`);
+
+    // §13.2: leaving the screen stops it. Audio with no visible transport is audio you cannot stop.
+    await page.getByRole("button", { name: "Settings" }).click();
+    await page.waitForFunction(() => (document.querySelector("audio")?.paused ?? true), undefined, {
+      timeout: 5000,
+    });
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.getByRole("button", { name: /^All/ }).click();
+    await page.waitForSelector(".card", { timeout: 5000 });
+  });
+
   // The grid's metadata is a control surface, not decoration (UI-SPEC §2.5: "pack name is a link
   // → Pack stats §15", "chips are click-to-search"). Both were spec'd, neither was wired — the
   // pack name was baked into a joined string, so there was nothing to attach a link to.
@@ -2178,6 +2230,63 @@ try {
       "exporting into a library source root was allowed",
     );
     assert.ok(!fs.existsSync(inside), "a refused export still created its destination");
+  });
+
+  // FEATURES §7.1/§7.6 — an export leaves a history entry, and that entry can undo it.
+  //
+  // Every file this touches is one the check itself exported, into a temp folder it made. It never
+  // deletes anything of the user's: the originals are only ever read, and the undo path is fenced
+  // to the names the run recorded under the folder it recorded.
+  await check("an export is recorded, listed, and can be undone", async () => {
+    const s0 = await invoke("library_status");
+    const gone = new Set(s0.sources.filter((x) => x.state === "unavailable").map((x) => x.id));
+    const p = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    const loose = p.items.find((i) => !i.in_pack && !gone.has(i.source_id));
+    if (!loose) return;
+
+    const dest = path.join(os.tmpdir(), `lodestash-e2e-history-${Date.now()}`);
+    let batchId = null;
+    try {
+      const r = await invoke("export_assets", {
+        assetIds: [loose.asset_id],
+        destPath: dest,
+        withDependencies: false,
+      });
+      assert.ok(r.written >= 1, `nothing was written: ${JSON.stringify(r)}`);
+      const before = fs.readdirSync(dest);
+      assert.ok(before.length >= 1, "the export wrote nothing to undo");
+
+      // The run is in the history, counted by files written rather than assets picked.
+      const runs = await invoke("recent_folder_exports", { limit: 10 });
+      const mine = runs.find((x) => x.dest_path === dest);
+      assert.ok(mine, `the export is not in the history: ${JSON.stringify(runs.slice(0, 3))}`);
+      assert.equal(mine.files, r.written, "the history disagrees with what was written");
+      batchId = mine.batch_id;
+
+      const undone = await invoke("undo_export_batch", { batchId });
+      assert.equal(undone.changed, r.written, `undo reported ${undone.changed} of ${r.written}`);
+      assert.equal(undone.failed, 0, "undo failed on a file it wrote itself");
+      assert.equal(
+        fs.existsSync(dest) ? fs.readdirSync(dest).length : 0, 0,
+        "the exported copies survived their own undo",
+      );
+
+      // The original is untouched — undo deletes copies, never sources.
+      const detail = await invoke("asset_detail", { assetId: loose.asset_id });
+      assert.ok(fs.existsSync(detail.abs_path), "undoing an export deleted the original");
+
+      // And the run is gone from the history, so it cannot be undone twice.
+      const after = await invoke("recent_folder_exports", { limit: 10 });
+      assert.ok(!after.some((x) => x.batch_id === batchId), "a finished undo left its record behind");
+      batchId = null;
+    } finally {
+      // If anything above failed mid-way, clean up rather than leaving a record pointing at temp.
+      if (batchId) await invoke("undo_export_batch", { batchId }).catch(() => {});
+      fs.rmSync(dest, { recursive: true, force: true });
+    }
   });
 
   // 72% of a real Unity library is still inside a .unitypackage. An export that skipped those

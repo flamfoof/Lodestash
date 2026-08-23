@@ -124,9 +124,26 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       (two-step: first click arms a 3s confirm toast, second trashes — inspector + Duplicates
       paths). CLOUD card (the AI TAGGING section covers the API endpoint) + the engine
       port/token surface shipped earlier; model-download button still open.
-- [ ] **Staging is in-memory only.** Tray rows exist; `batch_id` recorded but no Recent-exports list
-      and no batch undo in the UI. Top-bar "No project" chip is static — **no project switcher
-      popover** (recent exports · ↩ undo · Connect wizard, FEATURES §7.1).
+- [x] **Recent exports — both halves of it (2026-08-22).** Another card that had gone stale: the
+      project-switcher popover, the import-batch list and `undo_import_batch` were **already built**
+      in `TopBar.svelte`. What was actually missing is that **⤓ Export to folder wrote no history at
+      all** — shipped earlier the same day, and the one export path that actually runs on this
+      machine, since `⇢ Add to project` queues into a Unity plugin that does not exist yet. A
+      Recent-exports list that could only ever show imports would have been a permanently empty
+      panel.
+      **M19 `export_record`** (DATA-MODEL §9.1) records one row per **file written** — not per asset,
+      because a dependency closure makes those different numbers, and not from the request, because
+      an export skips in-pack and unreachable picks. Both export paths record, the agent plane's
+      included. The popover now merges imports and folder exports into one list sorted by time: the
+      user thinks *where did that go and can I take it back*, not "which table".
+      Undo is the only delete in the app aimed at a folder the **user** chose, so it is fenced on
+      four counts and mutation-checked on each: a `file_name` carrying a path is refused rather than
+      followed out of the folder; the destination is re-checked against the export sandbox **at undo
+      time**, because a folder that was legal to export into may since have become a library source;
+      a missing file counts as already-undone; and a run that cannot finish keeps its record so the
+      copies stay findable. Originals are never in scope — an export copies, so undo deletes copies.
+      **Still open:** staging is per-project in the engine model (ENGINE-API §6); the shell's
+      shortlist is still one in-memory list.
 - [x] **In-pack Quick Look pulls the one payload (2026-08-08, FEATURES §5.4).** `lodestash://file`
       now materializes a known in-pack asset through the size-capped scratch (same path the thumb
       route uses) instead of answering `503 not_local`; whole-pack extraction stays a command.
@@ -302,8 +319,15 @@ or more than a patch):
       list row shows clip length where geometry shows triangles.
       e2e asserts `currentTime` advancing, not that a ◼ rendered — a transport that draws the right
       glyph and plays silence looks identical to one that works.
-      **Still open:** the Inspector's own transport (§13.2 — round ▶/◼ + scrubber + hint before
-      first play). The player it needs now exists.
+      **The Inspector's transport followed (§13.2, same day):** round ▶/◼ on the same one element,
+      a static waveform in the hero that animates while playing (§13.1), and the scrubber appearing
+      **only after first play** with *"play to scrub the timeline"* before it — a timeline you
+      cannot scrub yet is a control that lies about what it does, which is the half worth a check.
+      §13.2's *"switching assets/screens stops playback"* is implemented for **screens** only:
+      leaving the Library with a sound running is audio with no visible transport, but stopping on
+      every *selection* change would contradict §2.5's "while that card is the active audio" and
+      make the grid transport useless for auditioning several sounds in a row. The one-element
+      player already guarantees the "one at a time" the sentence is really about.
 - [ ] **Doc drift: card status rail width.** UI-SPEC §2.5 says 3px, DESIGN-GUIDELINES §6 says 1px,
       the app follows DG (ALIGNMENT-AUDIT F1). UI-SPEC is the stale one — fix it per CLAUDE.md
       rule 2 so the next reader is not told the code diverges when it conforms.

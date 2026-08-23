@@ -72,6 +72,14 @@ pub enum Op {
     /// connection — and it is a `stat` per source **root**, not per asset, so it stays cheap enough
     /// to run on open and after every scan.
     RefreshSourceHealth,
+    /// Undo one **export** run (FEATURES §7.1): delete the files it copied out, then forget it.
+    ///
+    /// Destructive, and the only delete in the app that touches files the *user* chose the location
+    /// of — so it is fenced to exactly the names the run recorded, under exactly the folder it
+    /// recorded, and never anywhere near a library root.
+    UndoExportBatch {
+        batch_id: String,
+    },
     /// Point a source at a new root (UI-SPEC §11.1). The drive came back under a different letter,
     /// the folder moved, the library was copied to a bigger disk.
     ///
@@ -1113,6 +1121,10 @@ fn run(
 
         // `changed` is the number of packs re-anchored with the root. The asset count the panel
         // promised comes from `relink_preview`, which ran before the user committed.
+        // Files first, record second. A record dropped before its files would leave copies on
+        // disk that nothing can name again — the same ordering `undo_import_batch` uses.
+        Op::UndoExportBatch { batch_id } => undo_export_batch(catalog, &batch_id),
+
         Op::RelinkSource {
             source_id,
             new_root,
@@ -1780,6 +1792,85 @@ fn run(
 /// over its own short-lived connection, so the single-writer rule holds (same pattern as
 /// persist_to_catalog); the connection does not run migrations (the writer's own catalog already
 /// did at spawn).
+/// Delete what one export run wrote, then forget the run (FEATURES §7.1).
+///
+/// Every delete here is a file **this app created**, in a folder the user pointed it at, named in
+/// the record the run wrote. That is a narrower promise than it sounds, so it is enforced rather
+/// than assumed — four fences, each for a way this could reach a file it has no business touching:
+///
+/// - `file_name` must be a **bare name**: no separators, no `..`, no absolute path. A record with a
+///   path in it could otherwise walk out of the destination folder.
+/// - the resolved file must sit **directly inside** the recorded `dest_path`.
+/// - the destination must still pass the export sandbox — re-checked **now**, not trusted from
+///   export time, because a library source may have been added over that folder since.
+/// - only files, never directories, and a missing file counts as already-undone rather than failed.
+///
+/// The originals are never in scope: an export copies, so undo deletes copies. The library is not
+/// touched, and no asset row changes — the non-destructive invariant covers this the same way it
+/// covers everything else.
+fn undo_export_batch(catalog: &mut Catalog, batch_id: &str) -> Result<WriteResult, String> {
+    let files = catalog
+        .export_batch_files(batch_id)
+        .map_err(|e| e.to_string())?;
+    if files.is_empty() {
+        return Err("that export is no longer in the history".into());
+    }
+    let roots = catalog.source_roots().unwrap_or_default();
+
+    let mut removed = 0usize;
+    let mut refused = 0usize;
+    let mut failed = 0usize;
+    for (dest_path, file_name) in &files {
+        let bare = Path::new(file_name);
+        let named_once = bare.components().count() == 1
+            && !file_name.contains('/')
+            && !file_name.contains('\\')
+            && bare
+                .file_name()
+                .map(|f| f == bare.as_os_str())
+                .unwrap_or(false);
+        if !named_once {
+            refused += 1;
+            continue;
+        }
+        // The sandbox as it stands *now*: a folder that was legal to export into may since have
+        // been added as a library source, and deleting inside one is what the invariant forbids.
+        let Ok(dest) = lodestash_api::export::check_dest(dest_path, &roots) else {
+            refused += 1;
+            continue;
+        };
+        let abs = dest.join(bare);
+        if !abs.starts_with(&dest) {
+            refused += 1;
+            continue;
+        }
+        match std::fs::metadata(&abs) {
+            Ok(m) if m.is_file() => match std::fs::remove_file(&abs) {
+                Ok(()) => removed += 1,
+                Err(_) => failed += 1,
+            },
+            Ok(_) => refused += 1,
+            // Already gone is the outcome undo wanted, not an error.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => removed += 1,
+            Err(_) => failed += 1,
+        }
+    }
+
+    // Forgotten only once the files are dealt with. A run left half-deleted keeps its record, so
+    // the user can see it and try again rather than losing track of the copies still out there.
+    if failed == 0 {
+        catalog
+            .forget_export_batch(batch_id)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(WriteResult {
+        changed: removed,
+        failed,
+        refused,
+        ..Default::default()
+    })
+}
+
 fn undo_import_batch(db_path: &Path, batch_id: &str) -> Result<WriteResult, String> {
     let conn = Connection::open(db_path).map_err(|e| format!("catalog unavailable: {e}"))?;
     let mut stmt = conn
@@ -2121,6 +2212,86 @@ fn delete_from_disk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Undoing an export (FEATURES §7.1) deletes files the user chose the location of, which makes
+    /// it the most dangerous delete in the app. Mutation-checked on the four fences that keep it
+    /// pointed at its own copies:
+    ///
+    /// a record whose `file_name` carries a path must be **refused**, not followed out of the
+    /// destination; a destination that is now inside a library source root must be refused even
+    /// though it was legal when the export ran (the sandbox is re-checked, not trusted); a file
+    /// that is already gone counts as undone rather than failed; and the record survives a run that
+    /// could not finish, so copies still on disk stay findable.
+    #[test]
+    fn undoing_an_export_deletes_its_own_copies_and_refuses_anything_else() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let out = dir.path().join("out");
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(&out).expect("mkdir out");
+        std::fs::create_dir_all(&lib).expect("mkdir lib");
+        std::fs::write(out.join("rock.fbx"), b"copy").expect("w");
+        std::fs::write(out.join("gone.fbx"), b"copy").expect("w");
+        // The file a traversal would reach if `file_name` were followed as a path.
+        std::fs::write(dir.path().join("outside.txt"), b"do not touch").expect("w");
+        std::fs::remove_file(out.join("gone.fbx")).expect("rm");
+
+        let mut c = Catalog::open_in_memory().expect("open");
+        let out_s = out.to_string_lossy().to_string();
+        c.record_exports(
+            "batch-1",
+            &out_s,
+            &[
+                (None, "rock.fbx".to_string()),
+                (None, "gone.fbx".to_string()),
+                // A record that tries to climb out. Nothing writes one — this is the fence's job.
+                (None, "../outside.txt".to_string()),
+            ],
+        )
+        .expect("record");
+
+        let r = undo_export_batch(&mut c, "batch-1").expect("undo");
+        assert_eq!(
+            r.changed, 2,
+            "the real copy and the already-missing one both count as undone"
+        );
+        assert_eq!(
+            r.refused, 1,
+            "the traversing record was followed instead of refused"
+        );
+        assert_eq!(r.failed, 0);
+        assert!(!out.join("rock.fbx").exists(), "the copy was not deleted");
+        assert!(
+            dir.path().join("outside.txt").exists(),
+            "undo escaped the destination folder"
+        );
+        assert!(
+            c.recent_export_batches(10).expect("list").is_empty(),
+            "a finished undo left its record behind"
+        );
+
+        // A destination that has since become a library source is refused outright, even though the
+        // export into it was legal at the time. The sandbox protects the library, not the moment.
+        c.upsert_import_source("Lib", &lib.to_string_lossy(), "folder")
+            .expect("src");
+        std::fs::write(lib.join("inside.fbx"), b"library file").expect("w");
+        c.record_exports(
+            "batch-2",
+            &lib.to_string_lossy(),
+            &[(None, "inside.fbx".to_string())],
+        )
+        .expect("record");
+
+        let r = undo_export_batch(&mut c, "batch-2").expect("undo");
+        assert_eq!(r.refused, 1, "undo deleted inside a library source root");
+        assert_eq!(r.changed, 0);
+        assert!(
+            lib.join("inside.fbx").exists(),
+            "the non-destructive invariant was broken by an undo"
+        );
+
+        // An unknown batch is an error, not a silent no-op that reads as success.
+        assert!(undo_export_batch(&mut c, "no-such-batch").is_err());
+    }
+
     /// `n` queued `ExtractPackage` jobs. The reply receivers come back with them: dropping one
     /// makes its `send` fail, which would quietly mask a regression.
     fn queued_extracts(

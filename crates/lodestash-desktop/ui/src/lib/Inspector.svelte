@@ -24,6 +24,7 @@
   import { view } from "./nav.svelte";
   import { traitColor } from "./traits.svelte";
   import { sources } from "./sources.svelte";
+  import { player, fmtClock } from "./audio.svelte";
 
   let {
     assetId,
@@ -158,6 +159,36 @@
   const hideBroken = (e: Event) => ((e.currentTarget as HTMLImageElement).style.display = "none");
 
   let tint = $derived(detail ? `var(${typeToken(detail.media_type)})` : "var(--ls-text-dim)");
+
+  /**
+   * Audio transport (UI-SPEC §13.2). The same one element the grid cards drive — there is exactly
+   * one `<audio>` in the app, so the inspector and a card can never disagree about what is playing.
+   *
+   * The scrubber appears **after first play**, with a hint before it: a timeline you cannot yet
+   * scrub is a control that lies, and §13.2 asks for the hint by name.
+   */
+  let isSound = $derived(detail?.media_type === "audio");
+  let isCurrent = $derived(!!detail && player.current === detail.asset_id);
+  let isPlaying = $derived(!!detail && player.isPlaying(detail.asset_id));
+  let clipSeconds = $derived(
+    isCurrent && player.duration ? player.duration : (detail?.duration_ms ?? 0) / 1000,
+  );
+  let progress = $derived(isCurrent && clipSeconds ? Math.min(1, player.position / clipSeconds) : 0);
+  /** Bars for the static waveform (§13.1). Hashed off the id like the card's, so the same asset
+   *  looks the same everywhere; the real envelope lives in the thumb route when it can render one. */
+  let waveBars = $derived.by(() => {
+    let h = Math.imul(detail?.asset_id ?? 1, 2654435761);
+    return Array.from({ length: 24 }, () => {
+      h = Math.imul(h ^ (h >>> 15), 2246822519);
+      return 30 + (Math.abs(h) % 71);
+    });
+  });
+
+  function scrubFrom(e: MouseEvent) {
+    const el = e.currentTarget as HTMLElement;
+    const r = el.getBoundingClientRect();
+    player.seek((e.clientX - r.left) / Math.max(1, r.width));
+  }
 
   // ── Tag-editing slice (G4–G9) ──────────────────────────────────────────────────
   // TRAITS (G4): the quick-add write path + the asset's real tag set (`detail.tags`,
@@ -343,7 +374,14 @@
 {:else if detail}
   <aside class="inspector" style="--tint: {tint}">
     <div class="hero" data-testid="inspector-hero">
-      {#if detail.has_preview}
+      {#if isSound}
+        <!-- §13.1: sounds show a static waveform, and the bars animate while it plays. -->
+        <span class="wave" class:live={isPlaying}>
+          {#each waveBars as h, i (i)}
+            <i class="bar" style="--h: {h}%; --i: {i}"></i>
+          {/each}
+        </span>
+      {:else if detail.has_preview}
         <img src={previewUrl(detail.asset_id)} alt="" />
       {:else if detail.media_type !== "model_3d" && !detail.in_pack}
         <img src={thumbUrl(detail.asset_id)} alt="" onerror={hideBroken} />
@@ -351,6 +389,35 @@
         <Icon name={typeIcon(detail.media_type)} size={40} />
       {/if}
     </div>
+
+    {#if isSound}
+      <!-- UI-SPEC §13.2. Round ▶/◼, then the scrubber — but only once it has been played: a
+           timeline you cannot scrub yet is a control that lies about what it does. -->
+      <div class="transport" data-testid="inspector-transport">
+        <button
+          class="play"
+          onclick={() => detail && player.toggle(detail.asset_id)}
+          aria-pressed={isPlaying}
+          aria-label={isPlaying ? `Stop ${detail.name}` : `Play ${detail.name}`}
+          title={isPlaying ? "Stop" : "Play"}
+          data-testid="inspector-play"
+        >{isPlaying ? "◼" : "▶"}</button>
+        {#if isCurrent}
+          <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+          <span class="track" data-testid="inspector-scrub" onclick={scrubFrom}>
+            <span class="fill" style="width: {Math.round(progress * 100)}%"></span>
+          </span>
+          <span class="clock num" data-testid="inspector-clock">
+            {fmtClock(player.position)} / {fmtClock(clipSeconds)}
+          </span>
+        {:else}
+          <span class="hint">play to scrub the timeline</span>
+        {/if}
+      </div>
+      {#if player.error && isCurrent}
+        <p class="msg danger" data-testid="inspector-audio-error">{player.error}</p>
+      {/if}
+    {/if}
 
     <h2 data-testid="inspector-name">{detail.name}</h2>
     <p class="path" title={detail.abs_path}>{detail.rel_path}</p>
@@ -600,6 +667,86 @@
     font-size: var(--fs-sm);
     cursor: pointer;
   }
+  /* §13.1 waveform + §13.2 transport. */
+  .hero .wave {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    height: 64px;
+    color: var(--ls-arcane);
+  }
+  .hero .wave .bar {
+    width: 3px;
+    height: var(--h);
+    background: currentColor;
+    border-radius: var(--r-pill);
+    opacity: 0.75;
+  }
+  .hero .wave.live .bar {
+    animation: eq 900ms ease-in-out calc(var(--i) * 40ms) infinite alternate;
+  }
+  @keyframes eq {
+    from {
+      transform: scaleY(0.4);
+    }
+    to {
+      transform: scaleY(1);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .hero .wave.live .bar {
+      animation: none;
+    }
+  }
+  .transport {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    margin-top: var(--sp-2);
+  }
+  .transport .play {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    padding-left: 2px;
+    font-size: 11px;
+    line-height: 1;
+    color: var(--ls-arcane);
+    background: none;
+    border: 1px solid currentColor;
+    border-radius: 50%;
+    cursor: pointer;
+  }
+  .transport .play:hover {
+    color: var(--ls-arcane-bright);
+  }
+  .transport .track {
+    flex: 1;
+    min-width: 0;
+    height: 4px;
+    background: color-mix(in srgb, var(--ls-text-dim) 30%, transparent);
+    border-radius: var(--r-pill);
+    cursor: pointer;
+  }
+  .transport .fill {
+    display: block;
+    height: 100%;
+    background: var(--ls-arcane);
+    border-radius: var(--r-pill);
+  }
+  .transport .clock {
+    flex: none;
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+  }
+  .transport .hint {
+    flex: 1;
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+  }
+
   .actions button.inert {
     color: var(--ls-text-dim);
     cursor: default;

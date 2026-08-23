@@ -89,6 +89,18 @@ pub struct RelinkPreview {
     pub total: i64,
 }
 
+/// One export run, as the Recent-exports list reads it (FEATURES §7.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportBatch {
+    pub batch_id: String,
+    /// The folder the run wrote into. Absolute — an export goes wherever the user pointed it.
+    pub dest_path: String,
+    /// Files written, which is what undo would delete. Not the number of assets picked: a
+    /// dependency closure turns one pick into several files.
+    pub files: i64,
+    pub exported_at: i64,
+}
+
 /// What the `✓ in <project>` badge needs to know about one asset (DESIGN-GUIDELINES §7).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ImportState {
@@ -357,6 +369,7 @@ impl Catalog {
             (16, MIGRATION_16_OP_LOG),
             (17, MIGRATION_17_OP_LOG_REDO),
             (18, MIGRATION_18_SOURCE_STATE),
+            (19, MIGRATION_19_EXPORT_HISTORY),
         ];
 
         for (version, sql) in migrations {
@@ -2012,6 +2025,30 @@ ALTER TABLE import_source ADD COLUMN state TEXT NOT NULL DEFAULT 'available';  -
 ALTER TABLE import_source ADD COLUMN last_seen_at INTEGER;                     -- unix seconds the root last resolved
 ";
 
+/// M19 — export history (FEATURES §7.1 "Recent exports", §7.6).
+///
+/// A table of its own rather than a column on `import_record`, because the two are different acts
+/// and the product keeps their verbs apart on purpose (UI-SPEC §16.2): **Import** puts files into a
+/// registered project, **Export** copies them to a folder the user chose. `import_record` cannot
+/// hold an export even if we wanted it to — its `project_id` is `NOT NULL` and its `dest_path` is
+/// project-relative, so undo resolves it against the project root.
+///
+/// One row per **file written**, not per asset: undo has to delete exactly what was written, and a
+/// dependency closure means one pick can produce several files. `asset_id` goes `NULL` rather than
+/// cascading, so trashing an asset later does not quietly erase the record that it was exported —
+/// history the user might still want to undo.
+const MIGRATION_19_EXPORT_HISTORY: &str = "
+CREATE TABLE IF NOT EXISTS export_record (
+    id          INTEGER PRIMARY KEY,
+    batch_id    TEXT    NOT NULL,           -- one export run
+    asset_id    INTEGER REFERENCES asset(id) ON DELETE SET NULL,
+    dest_path   TEXT    NOT NULL,           -- absolute folder the run wrote into
+    file_name   TEXT    NOT NULL,           -- the file written inside it
+    exported_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_export_batch ON export_record(batch_id);
+";
+
 const MIGRATION_12_FAVORITES: &str = "
 ALTER TABLE asset ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_asset_favorite ON asset(favorite) WHERE favorite=1;
@@ -3102,6 +3139,85 @@ impl Catalog {
             )));
         }
         Ok(())
+    }
+
+    /// Record what an export run wrote (FEATURES §7.6), so §7.1 can list it and undo it.
+    ///
+    /// One row per file, taken from what was **actually copied** rather than what was requested:
+    /// an export skips in-pack and unreachable picks, and a cancelled run stops part-way. Undo
+    /// deletes files, so a record of files that were never written would be a record that points
+    /// undo at someone else's.
+    pub fn record_exports(
+        &self,
+        batch_id: &str,
+        dest_path: &str,
+        files: &[(Option<i64>, String)],
+    ) -> Result<usize> {
+        let now = unix_now();
+        let mut stmt = self
+            .conn
+            .prepare(
+                "INSERT INTO export_record (batch_id, asset_id, dest_path, file_name, exported_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .map_err(|e| CoreError::Catalog(format!("export record prep: {e}")))?;
+        let mut n = 0usize;
+        for (asset_id, name) in files {
+            stmt.execute(params![batch_id, asset_id, dest_path, name, now])
+                .map_err(|e| CoreError::Catalog(format!("export record insert: {e}")))?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// The most recent export runs, newest first (FEATURES §7.1 shows four).
+    pub fn recent_export_batches(&self, limit: usize) -> Result<Vec<ExportBatch>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT batch_id, dest_path, COUNT(*), MAX(exported_at)
+                   FROM export_record
+                  GROUP BY batch_id
+                  ORDER BY MAX(exported_at) DESC, batch_id DESC
+                  LIMIT ?1",
+            )
+            .map_err(|e| CoreError::Catalog(format!("export list prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(ExportBatch {
+                    batch_id: r.get(0)?,
+                    dest_path: r.get(1)?,
+                    files: r.get(2)?,
+                    exported_at: r.get(3)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("export list query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("export list row: {e}")))
+    }
+
+    /// The files one run wrote, as `(dest_path, file_name)` — what undo deletes.
+    pub fn export_batch_files(&self, batch_id: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT dest_path, file_name FROM export_record WHERE batch_id = ?1")
+            .map_err(|e| CoreError::Catalog(format!("export files prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![batch_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| CoreError::Catalog(format!("export files query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("export files row: {e}")))
+    }
+
+    /// Drop a run from the history. Called **after** its files are dealt with, never before: a
+    /// record removed first would leave orphaned copies nothing can find again.
+    pub fn forget_export_batch(&self, batch_id: &str) -> Result<usize> {
+        self.conn
+            .execute(
+                "DELETE FROM export_record WHERE batch_id = ?1",
+                params![batch_id],
+            )
+            .map_err(|e| CoreError::Catalog(format!("export forget: {e}")))
     }
 
     /// Point the appraisal queues at what the user is looking at (UI-SPEC §3).
@@ -5031,7 +5147,7 @@ mod tests {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("user_version");
-        assert_eq!(version, 18, "all 18 migrations should have run");
+        assert_eq!(version, 19, "all 19 migrations should have run");
     }
 
     /// The viewer's texture lookup must walk **both** hops. Stopping at the first lands on the

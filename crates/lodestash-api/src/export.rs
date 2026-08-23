@@ -105,16 +105,20 @@ fn normalize(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/").to_lowercase()
 }
 
-/// Copy `files` into `dest`, one per unit of progress. Returns the number written. Stops early
-/// (leaving what it already wrote) when the job is cancelled.
+/// Copy `files` into `dest`, one per unit of progress. Returns the **names actually written**, in
+/// order. Stops early (leaving what it already wrote) when the job is cancelled.
+///
+/// Names rather than a count, because the export history records what undo would have to delete
+/// (FEATURES §7.6). A cancelled run writes fewer files than it was asked for, and a history built
+/// from the request instead of the result would point undo at files it never created.
 pub fn copy_files(
     files: &[(PathBuf, String)],
     dest: &Path,
     job: &crate::jobs::Job,
-) -> std::io::Result<u64> {
+) -> std::io::Result<Vec<String>> {
     std::fs::create_dir_all(dest)?;
     job.set_total(files.len() as u64);
-    let mut written = 0u64;
+    let mut written = Vec::with_capacity(files.len());
     for (src, name) in files {
         if job.is_cancelled() {
             break;
@@ -122,7 +126,7 @@ pub fn copy_files(
         // ponytail: name collisions overwrite. Exporting two same-named assets into one folder is
         // rare; add a numeric suffix if it stops being.
         std::fs::copy(src, dest.join(name))?;
-        written += 1;
+        written.push(name.clone());
         job.advance();
     }
     Ok(written)
@@ -184,15 +188,14 @@ mod tests {
         let jobs = crate::jobs::Jobs::default();
         let job = jobs.create("export", "3 files".into(), crate::jobs::JobState::Running);
         let out = dir.path().join("out");
-        assert_eq!(copy_files(&files, &out, &job).unwrap(), 3);
+        assert_eq!(copy_files(&files, &out, &job).unwrap().len(), 3);
         assert_eq!(job.progress(), 1.0);
 
         let cancelled = jobs.create("export", "3 files".into(), crate::jobs::JobState::Running);
         jobs.cancel(&cancelled.id);
         let out2 = dir.path().join("out2");
-        assert_eq!(
-            copy_files(&files, &out2, &cancelled).unwrap(),
-            0,
+        assert!(
+            copy_files(&files, &out2, &cancelled).unwrap().is_empty(),
             "a cancelled job writes nothing further"
         );
     }

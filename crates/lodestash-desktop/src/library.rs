@@ -198,6 +198,16 @@ pub struct AssetDetail {
     pub trashed: bool,
 }
 
+/// One export run for the Recent-exports list (FEATURES §7.1).
+#[derive(Debug, Clone, Serialize)]
+pub struct ExportBatchRow {
+    pub batch_id: String,
+    pub dest_path: String,
+    /// Files written — what undo would delete, not how many assets were picked.
+    pub files: i64,
+    pub exported_at: i64,
+}
+
 /// The relink panel's headline number (UI-SPEC §11.1) — *"4,198 of 4,206 files matched by relative
 /// path — 8 would stay unavailable"*. Shown **before** the button commits.
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -814,6 +824,23 @@ impl Library {
         self.mark_traits();
         self.mark_tiers();
         self.mark_imported();
+    }
+
+    /// The recent export runs (FEATURES §7.1). A thin pass-through — the grouping is the catalog's.
+    pub fn recent_exports(&self, limit: usize) -> Result<Vec<ExportBatchRow>, String> {
+        let cat = self.catalog.as_ref().ok_or("no catalog open")?;
+        cat.recent_export_batches(limit)
+            .map(|v| {
+                v.into_iter()
+                    .map(|b| ExportBatchRow {
+                        batch_id: b.batch_id,
+                        dest_path: b.dest_path,
+                        files: b.files,
+                        exported_at: b.exported_at,
+                    })
+                    .collect()
+            })
+            .map_err(|e| e.to_string())
     }
 
     /// What relinking this source to that folder would reach (UI-SPEC §11.1).

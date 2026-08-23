@@ -53,9 +53,25 @@ import JobTray from "./lib/JobTray.svelte";
   import ImportDialog from "./lib/ImportDialog.svelte";
   import { push, dismiss, act, freeze, thaw, toasts, overflow } from "./lib/toasts.svelte";
   import { sources } from "./lib/sources.svelte";
+  import { player } from "./lib/audio.svelte";
 
   let status = $state<LibraryStatus | null>(null);
   let reloading = $state(false);
+
+  /**
+   * UI-SPEC §13.2: "switching … screens stops playback". Leaving the Library with a sound still
+   * running is audio with no visible source and no way to stop it — the transport that owns it is
+   * no longer on screen.
+   *
+   * Deliberately **not** extended to switching *assets*: §2.5 wants a card to keep playing "while
+   * that card is the active audio" so several sounds can be auditioned in a row, and the one-element
+   * player already guarantees only one plays at a time. Stopping on every selection change would
+   * make the grid transport unusable for the thing it exists to do.
+   */
+  $effect(() => {
+    view.route;
+    return () => player.stop();
+  });
 
   // One mirror of source availability for everything below the fold (UI-SPEC §11.1). `status` is
   // assigned from eight places here — open, navigation, pump events, reload, drops — so this
