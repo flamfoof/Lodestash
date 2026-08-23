@@ -337,13 +337,29 @@ or more than a patch):
 
 **Structural audit (2026-08-14)** — answering "too much code per file, too many tests":
 
-- [ ] **`catalog.rs` is 9,423 lines, 51% of it tests.** 153 `pub fn`, **8 `impl Catalog` blocks**
-      (lines 213, 2044, 7575, 7704, 7799, 7899, 7968, 8262, 8732) and 3 `#[cfg(test)]` modules
-      (4615, 7643, 8759) that each own one domain and duplicate their own `rec()` fixture (5096,
-      8763). Every crate depends on this one, so touching a single query recompiles 9.4k lines and
-      re-runs 69 tests. The impl blocks already mark the seams: split to
-      `catalog/{mod,assets,tags,collections,taxonomy,oplog}.rs`, tests moving with their domain —
-      a mechanical move, no behaviour change.
+- [x] **`catalog.rs` split into a directory module (2026-08-22).** It had reached **10,312 lines**.
+      Now `catalog/` — `mod.rs` 5,310, `tests_catalog.rs` 3,323, `tests_slices.rs` 673, `oplog.rs`
+      482, `taxonomy.rs` 294, `graph.rs` 129, `collections.rs` 128, `excludes.rs` 64. **325 tests
+      pass, the same 325 as before**; nothing but locations changed.
+      **Two premises on the old card were wrong, and are worth correcting rather than quietly
+      dropping.** "Touching a single query recompiles 9.4k lines" — Rust compiles a *crate* at a
+      time, so splitting one file into modules of the same crate changes recompilation not at all.
+      "re-runs 69 tests" — `cargo test` still runs every test in the crate. The real wins are
+      navigation, merge surface, and being able to run `cargo test catalog::oplog::`.
+      **The two large `impl Catalog` blocks stayed** (1,892 and 2,937 lines). The 94 functions in
+      the second do not fall into clean domains — clustering them lands 36 in "other" — so splitting
+      them is a judgement pass over each function, not the mechanical move this was, and a bad split
+      is worse than none.
+      **The first attempt was wrong and was reverted.** Slicing from "start of this block" to "start
+      of the next" swept every `pub struct` sitting *between* two `impl` blocks into the wrong file:
+      `CollectionRow` landed at the bottom of the test module and three exclude helpers landed in
+      `graph.rs`. 22 compile errors, all of it. The second pass moves whole `impl` blocks found by
+      **matching their own closing brace**, and leaves every type and free helper in `mod.rs` where
+      more than one module can reach them.
+      `check-docs.mjs` then caught 5 citations the move broke — all of which were **already** pointing
+      at the wrong line before it (line 3482 of the old file was `Ok(out)`; 3598 was a `"Props"` test
+      fixture). Line citations into a 10k-line file rot on every edit, so they now name the function
+      and its module instead, which survives the next split too.
 - [x] **The test budget was inverted — `writer.rs` has tests now (2026-08-18).** It had **zero**
       over the only genuinely concurrent code in the repo, and the reason turned out to be
       structural rather than neglect: Tauri's window layer (tao/muda/rfd) imports comctl32

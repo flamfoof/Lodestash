@@ -479,9 +479,9 @@ translation. The port removes the translation; the egui build stayed buildable a
         2026-08-04 — see the shipped note at the end of this card.*
         `Library::vocabulary` maps `VocabTrait` → `VocabRow` and **drops `id`, `is_trait`, `scope`,
         `usage_note`, `color`, `icon`** — exactly the six fields every remaining feature needs, and
-        `list_vocabulary` already selects all of them (`catalog.rs:3421`). Widen the row, then add
+        `list_vocabulary` already selects all of them (`catalog/mod.rs`). Widen the row, then add
         four writer ops as passthroughs over functions that already exist:
-        `upsert_trait` (`catalog.rs:3482`), `unpromote_trait` (`:3514`), `set_trait_teach` (`:3527`),
+        `upsert_trait`, `unpromote_trait`, `set_trait_teach` (all `catalog/mod.rs`),
         `set_trait_style` (`:3538`). That buys the NEW TRAIT card, the ✦ **promote existing tags**
         strip (`is_trait = false` rows are already in the result), the teaching toggle, per-trait
         colour/glyph, and the chip contract the ⚑ cloud shares. egui reference: `vocabulary_screen`
@@ -502,7 +502,7 @@ translation. The port removes the translation; the egui build stayed buildable a
         `App.svelte` has **no branch for it**, so it falls through to the "not built yet" stub.
         Four thin commands unlock most of the card: a `unity_packages` listing (wrap
         `list_packages`, mirror `reload_unity_packages` (egui-era `app.rs:5328`), `set_package_pinned`
-        (`catalog.rs:2045` — `PackageRow.pinned` already reaches the frontend and is **fetched and
+        (`catalog/mod.rs` — `PackageRow.pinned` already reaches the frontend and is **fetched and
         never rendered**), `list_package_entries` (`:2022`, browse a pack without unpacking), and a
         `pack_stats` command for the §15 modal (egui-era `app.rs:13500` is pure and unit-tested
         at `:14825`, but over the egui `AssetEntry` — port it over `library::Row`). Sort reuses

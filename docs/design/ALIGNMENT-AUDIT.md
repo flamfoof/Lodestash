@@ -200,7 +200,7 @@ Spec citation → app evidence. `ui/` = `crates/lodestash-desktop/ui`.
 | G2 | Identity: diamond + name + status gem + 2px status rule | P | UI-SPEC §13.3 | `Inspector.svelte:75-84` name + text badges; no gem, no status-colour rule |
 | G3 | Stat block, mono | A | UI-SPEC §13.4 | `Inspector.svelte:86-105` `dl` mono rows (Size/Tris/Dims/Duration/Source) |
 | G4 | TRAITS chips + confidence + `+ trait` | M | UI-SPEC §13.5 | absent — `AssetDetail` (`api.ts:175-193`) has no traits |
-| G5 | LINKED FILES panel | M | UI-SPEC §13.6 | absent — `related_assets` exists (`catalog.rs:3598`) but no command |
+| G5 | LINKED FILES panel | M | UI-SPEC §13.6 | absent — `related_assets` exists (`catalog/mod.rs`) but no command |
 | G6 | COLLECTIONS toggle chips | M | UI-SPEC §13.7 | absent |
 | G7 | SIMILAR IN YOUR HOARD | M | UI-SPEC §13.8 | absent |
 | G8 | Provenance footer (source · pack · license) | P | UI-SPEC §13.9 | Source row ✓ (`:101-104`); license absent |
@@ -383,7 +383,7 @@ search box per §0.1's order (N3.5); nav badges clamped at `999+` (N4.2).
 
 **Corrections to the rows above:** N1.5 said "no command exists" for `✓ in <project>`. Wrong — the
 `import_record` table is populated and per-asset membership is already queried at
-`catalog.rs:2985`. What is missing is a *bulk* read: an `in_project` flag on `GridItem`, filled from
+`catalog/mod.rs`. What is missing is a *bulk* read: an `in_project` flag on `GridItem`, filled from
 the active project's import set at reload. Still deferred, but it is a day's work, not a blocked one.
 N3.4 (`✦ local · <GPU>`) genuinely is blocked: no execution-provider or adapter name is exposed
 anywhere in `lodestash-desktop`/`-app`, so the pill would have to invent one. It stays with **B8**.
