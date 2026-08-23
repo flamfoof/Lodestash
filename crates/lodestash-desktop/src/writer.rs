@@ -795,10 +795,10 @@ impl Writer {
                             // Watch signal (debounced upstream): rescan every watched source with
                             // the incremental crawl. The writer is idle here by construction.
                             if let Some(w) = &watch {
-                                if w.rx.recv_timeout(std::time::Duration::ZERO).is_ok() {
-                                    if rescan_watched(&mut catalog, &db_path, &app) {
-                                        emit_changed(&app, "catalog");
-                                    }
+                                if w.rx.recv_timeout(std::time::Duration::ZERO).is_ok()
+                                    && rescan_watched(&mut catalog, &db_path, &app)
+                                {
+                                    emit_changed(&app, "catalog");
                                 }
                             }
                             if idle_appraises {
@@ -995,7 +995,7 @@ fn appraise_pass(
         zero_shot.as_ref(),
         workspace_dir.as_deref(),
         cache_dir.as_deref(),
-        &progress,
+        progress,
         TAG_BUDGET_PER_PASS,
     );
     if let Some(az) = audio_shot.as_ref() {
@@ -1003,7 +1003,7 @@ fn appraise_pass(
             catalog,
             az,
             workspace_dir.as_deref(),
-            &progress,
+            progress,
             AUDIO_TAG_BUDGET_PER_PASS,
         );
     }
@@ -1042,6 +1042,7 @@ fn appraise_pass(
 /// to travel back on. It is recorded as a **failed job** instead: the tray is where this feature
 /// reports, and a pack that silently never unpacks is the exact failure this whole path exists to
 /// stop being invisible.
+#[allow(clippy::too_many_arguments)]
 fn start_next_extract(
     catalog: &mut Catalog,
     queue: &mut VecDeque<Job>,
@@ -1090,6 +1091,12 @@ fn drain_to_first_spawn(
     failures
 }
 
+// Eight arguments is over clippy's default, and deliberately so: every one is a distinct
+// capability the writer thread owns (the catalog, the db path, the op, the reply channel, the job
+// registry, the app handle, the progress cell, the appraisal focus). Bundling them into a context
+// struct would rename the problem, not remove it — the same eight things would still have to be
+// threaded here, and one indirection further from the call sites that read them.
+#[allow(clippy::too_many_arguments)]
 fn run(
     catalog: &mut Catalog,
     db_path: &Path,

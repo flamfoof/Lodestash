@@ -337,6 +337,25 @@ or more than a patch):
 
 **Structural audit (2026-08-14)** — answering "too much code per file, too many tests":
 
+- [x] **Pre-plugin project review (2026-08-22).** Asked for before starting the Unity plugin.
+      **Workspace is clippy-clean** — 20 warnings down to 0. Most were mechanical (`sort_by_key`,
+      `&mut Vec` → `&mut [_]`, `let…else` → `?`). Two were mine from the catalog split. One was a
+      small lie in the code: a binding named `len` holding `()` under a comment about counting
+      cache entries — `remove_dir_all` returns `Result<()>`, so it never counted anything and read
+      as a tally. The two 8-argument writer functions keep an `#[allow]` **with the reason**: every
+      argument is a distinct capability the writer owns, and a context struct would rename the
+      problem rather than remove it.
+      **The readiness answer:** the plugin's contract is in better shape than the board said, and
+      the one real gap was the wire itself — now closed (see the staging-commit card). Discovery was
+      verified against the running app: `engine.json` is written where §1 says, with the documented
+      fields. ENGINE-API §1 amended where it overstated the guarantee — the `0600` is Unix-only and
+      on Windows the protection is the per-user `%LOCALAPPDATA%` ACL, which is adequate but is not
+      the same promise, and anything running as this user can read the session token.
+      **Left alone, deliberately:** `catalog/mod.rs` (5,310) and `library.rs` (3,452) are still the
+      big two, and `TraitsScreen.svelte` (1,516) and `SettingsScreen.svelte` (1,491) lead the
+      frontend. None of them blocks the plugin, and splitting on size alone is how a refactor
+      becomes churn.
+
 - [x] **`catalog.rs` split into a directory module (2026-08-22).** It had reached **10,312 lines**.
       Now `catalog/` — `mod.rs` 5,310, `tests_catalog.rs` 3,323, `tests_slices.rs` 673, `oplog.rs`
       482, `taxonomy.rs` 294, `graph.rs` 129, `collections.rs` 128, `excludes.rs` 64. **325 tests
@@ -698,7 +717,20 @@ and the Materials tab — `FEATURES.md` wins on both, do not "fix" the app to ma
       main-thread `AssetDatabase` → ack. (Needs a Unity install to verify.)
 - [ ] **Connect wizard plugin half.** App half done (Settings → Unity Editors); the plugin side
       registers/heartbeats.
-- [ ] **Staging-commit half + batch undo.** Import enqueue → queue poll → ack → `import_record` →
+- [~] **Staging-commit half + batch undo — the app half is done; the plugin half is not.**
+      Reviewed 2026-08-22 before starting the plugin, and this card understated what exists:
+      register → approval gate → enqueue → poll → **lease/visibility timeout** → ack → `import_record`
+      → dup-guard on re-import is implemented and covered end to end. Batch undo shipped with the
+      export history (M19) for folder exports; `undo_import_batch` already existed for project
+      imports.
+      What the review **added** is the layer the C# actually talks to: an HTTP-level test of
+      `GET /v1/import-queue` and `POST /v1/import-queue/{id}/ack` asserting the wire field by field
+      — query-parameter name, bare-array response, `request_id` / `job_id` / `dest_subfolder` /
+      `assets[].id` / `assets[].file_url`, 401 for an unauthenticated poll, the empty re-poll inside
+      the lease window, and `404 not_found` on a second ack. The state-level test proved the logic;
+      none of it proved the shape, and the shape is what gets compiled into the plugin.
+      **Remaining is genuinely the plugin:** the C# side. Original card text follows.
+      Import enqueue → queue poll → ack → `import_record` →
       Recent exports / batch undo (REST-only transport endpoints exist).
 - [ ] **LINKS full graph harvest.** prefab `uses_mesh`/`uses_audio`/`uses_script`; prefabs inside an
       extracted pack workspace.

@@ -1151,23 +1151,20 @@ impl Library {
         // one edge query per row. An empty neighbour set — the selected asset has no edges, or
         // the catalog is missing — means **zero rows**: filtering by a link that doesn't exist
         // must show nothing, not everything.
-        let linked: Option<std::collections::HashSet<i64>> = match q.links {
-            Some(id) => Some(
-                self.catalog
-                    .as_ref()
-                    .and_then(|cat| cat.asset_edges().ok())
-                    .map(|edges| {
-                        edges
-                            .iter()
-                            .filter(|e| e.from == id || e.to == id)
-                            .flat_map(|e| [e.from, e.to])
-                            .filter(|&x| x != id)
-                            .collect::<std::collections::HashSet<_>>()
-                    })
-                    .unwrap_or_default(),
-            ),
-            None => None,
-        };
+        let linked: Option<std::collections::HashSet<i64>> = q.links.map(|id| {
+            self.catalog
+                .as_ref()
+                .and_then(|cat| cat.asset_edges().ok())
+                .map(|edges| {
+                    edges
+                        .iter()
+                        .filter(|e| e.from == id || e.to == id)
+                        .flat_map(|e| [e.from, e.to])
+                        .filter(|&x| x != id)
+                        .collect::<std::collections::HashSet<_>>()
+                })
+                .unwrap_or_default()
+        });
         let mut matched: Vec<&Row> = self
             .rows
             .iter()
@@ -1391,7 +1388,7 @@ impl Library {
                         duration_ms: 0,
                     })
                     .collect();
-                types.sort_by(|a, b| b.count.cmp(&a.count));
+                types.sort_by_key(|t| std::cmp::Reverse(t.count));
                 PackageRow {
                     id: p.id,
                     name: p.name,
@@ -1536,8 +1533,10 @@ impl Library {
         let mut parent: Vec<usize> = (0..rows.len()).collect();
         for i in 0..rows.len() {
             let a = rows[i].perceptual_hash.unwrap();
-            for j in (i + 1)..rows.len() {
-                let b = rows[j].perceptual_hash.unwrap();
+            // `enumerate().skip()` rather than a range: `j` is still needed as an index into
+            // `parent` for the union-find below, so it has to survive the rewrite.
+            for (j, other) in rows.iter().enumerate().skip(i + 1) {
+                let b = other.perceptual_hash.unwrap();
                 let d = a
                     .iter()
                     .zip(b.iter())
@@ -2068,9 +2067,11 @@ impl Library {
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().to_string();
                 if name == "mesh" || name == "inpack" {
-                    if let Ok(len) = std::fs::remove_dir_all(&path) {
-                        // count entries best-effort; a missing dir is fine
-                        let _ = len;
+                    // One unit per cache directory removed. `remove_dir_all` answers
+                    // `Result<()>`, so there is no entry count to be had here — this used to bind
+                    // that `()` to a variable called `len` under a comment about counting entries,
+                    // which read as a tally and was never one.
+                    if std::fs::remove_dir_all(&path).is_ok() {
                         removed += 1;
                     }
                     continue;
@@ -2242,7 +2243,7 @@ fn dup_group(hash: String, mut rows: Vec<&Row>) -> DupGroup {
 }
 
 /// Biggest reclaimable bytes first: a group of six 40 MB textures is the one worth opening.
-fn sort_groups(groups: &mut Vec<DupGroup>) {
+fn sort_groups(groups: &mut [DupGroup]) {
     groups.sort_by(|a, b| {
         let waste = |g: &DupGroup| g.size_bytes * (g.items.len() as i64 - 1);
         waste(b).cmp(&waste(a)).then_with(|| a.hash.cmp(&b.hash))

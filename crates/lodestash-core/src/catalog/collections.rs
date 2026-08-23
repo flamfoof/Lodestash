@@ -79,27 +79,6 @@ impl Catalog {
     }
 }
 
-#[cfg(test)]
-mod collection_tests {
-    use super::*;
-
-    #[test]
-    fn collections_list_create_delete_round_trip_and_skip_staging() {
-        let c = Catalog::open_in_memory().expect("open");
-        let id = c.create_collection("Terrain").expect("create");
-        let rows = c.list_collections().expect("list");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].name, "Terrain");
-        assert_eq!(rows[0].asset_count, 0);
-
-        c.delete_collection(id).expect("delete");
-        assert!(c.list_collections().expect("list").is_empty());
-
-        // The staging tray is never listable or deletable as a user collection.
-        assert!(c.delete_collection(0).is_err(), "no such collection");
-    }
-}
-
 impl Catalog {
     /// Add an asset to a collection (UI-SPEC §6 — membership is toggled from the asset
     /// inspector, §13.5). Idempotent: adding an already-present member is a no-op.
@@ -124,5 +103,26 @@ impl Catalog {
             )
             .map_err(|e| CoreError::Catalog(format!("collection_remove_asset: {e}")))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod collection_tests {
+    use super::*;
+
+    #[test]
+    fn collections_list_create_delete_round_trip_and_skip_staging() {
+        let c = Catalog::open_in_memory().expect("open");
+        let id = c.create_collection("Terrain").expect("create");
+        let rows = c.list_collections().expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "Terrain");
+        assert_eq!(rows[0].asset_count, 0);
+
+        c.delete_collection(id).expect("delete");
+        assert!(c.list_collections().expect("list").is_empty());
+
+        // The staging tray is never listable or deletable as a user collection.
+        assert!(c.delete_collection(0).is_err(), "no such collection");
     }
 }

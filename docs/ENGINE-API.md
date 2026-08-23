@@ -39,8 +39,15 @@ client. Startup sequence:
    | **macOS** | `~/Library/Application Support/Lodestash/engine.json` |
    | **Linux** | `~/.local/share/lodestash/engine.json` |
 
-   The file is created with user-only permissions and is **rewritten each session** (token rotates);
-   it is removed on clean shutdown. A stale file (dead `pid`) is ignored by clients.
+   The file is **rewritten each session** (token rotates) and removed on clean shutdown. A stale
+   file (dead `pid`) is ignored by clients.
+
+   **Permissions, precisely** (`handshake.rs`): on Unix the file is `chmod 0600` after writing. On
+   **Windows there is no explicit mode set** — the protection is the per-user ACL that
+   `%LOCALAPPDATA%` already carries, which keeps other non-administrator users out of the profile.
+   That is adequate, and it is not the same guarantee, so it is written down rather than implied by
+   "user-only permissions": anything running **as this user** can read the token, and the loopback +
+   `Origin` checks in §4 are what stand between that and a hostile local process.
 3. The plugin reads `engine.json`, then sends every request with
    `Authorization: Bearer <token>` and a loopback `Origin`/`Host`.
 4. The server **validates token + `Origin`/host** on every request:

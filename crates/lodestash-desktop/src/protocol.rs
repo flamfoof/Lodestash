@@ -142,7 +142,7 @@ fn fit_preview_to_content(svg: &str) -> String {
             }
         }
     }
-    if !found || !(max_x > min_x && max_y > min_y) {
+    if !found || max_x <= min_x || max_y <= min_y {
         return svg.to_string(); // degenerate or non-contour content — serve as stored
     }
     let side = (max_x - min_x).max(max_y - min_y);

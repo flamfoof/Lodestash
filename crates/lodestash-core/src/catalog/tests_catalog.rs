@@ -1938,7 +1938,7 @@ fn trait_promote_teach_and_unpromote_keeps_assignments() {
 /// cannot smuggle CSS through it.
 #[test]
 fn trait_style_rejects_anything_but_the_palette_or_strict_hex() {
-    let mut c = Catalog::open_in_memory().expect("open");
+    let c = Catalog::open_in_memory().expect("open");
     c.seed_media_types().expect("seed");
     let tid = c
         .upsert_trait("trait", "shiny", None, None, true)

@@ -643,7 +643,7 @@ fn discover_package_folder(
         let assets = entries
             .iter()
             .filter(|e| {
-                e.pathname.as_deref().map_or(false, |pn| {
+                e.pathname.as_deref().is_some_and(|pn| {
                     lodestash_ingest::detect::by_extension(std::path::Path::new(pn)).is_some()
                 })
             })
@@ -1517,8 +1517,8 @@ fn dest_directory(dest_path: Option<&str>) -> String {
     let Some(p) = dest_path else {
         return String::new();
     };
-    let p = p.trim_end_matches(|c| c == '/' || c == '\\');
-    match p.rfind(|c| c == '/' || c == '\\') {
+    let p = p.trim_end_matches(['/', '\\']);
+    match p.rfind(['/', '\\']) {
         Some(i) if i > 0 => p[..i].to_string(),
         _ => String::new(),
     }
@@ -1649,9 +1649,7 @@ fn bulk_tag(
 fn engine_preview_fn(cache_root: Option<std::path::PathBuf>) -> lodestash_api::PreviewFn {
     Box::new(move |src| {
         use lodestash_ingest::thumb::{generate, meta_key, ThumbParams};
-        let Some(cache) = cache_root.as_deref() else {
-            return None;
-        };
+        let cache = cache_root.as_deref()?;
         let q = lodestash_app::config::AppConfig::load().preview_quality;
         let params = ThumbParams {
             width: q.thumb_px(),

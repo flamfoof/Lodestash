@@ -763,6 +763,19 @@ mod tests {
         b.body(Body::empty()).unwrap()
     }
 
+    /// The POST half of `get_req`. JSON body, same loopback Host and bearer token, because the
+    /// guard checks both on every request.
+    fn post_req(uri: &str, token: Option<&str>, body: Value) -> HttpRequest<Body> {
+        let mut b = HttpRequest::post(uri)
+            .header(header::HOST, "127.0.0.1:51731")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(t) = token {
+            b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        b.body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
     /// The guard's whole job, one case per rejection reason plus the accept.
     #[tokio::test]
     async fn guard_accepts_only_a_loopback_request_with_the_session_token() {
@@ -991,6 +1004,194 @@ mod tests {
         match st.request_import(mk(ids[0], Some(pid))) {
             Ok(crate::ImportKickoff::AllAlreadyImported(v)) => assert_eq!(v, vec![ids[0]]),
             _ => panic!("re-import must be dup-guarded"),
+        }
+    }
+
+    /// The **wire** the Unity plugin will be written against (ENGINE-API §5.3), end to end over
+    /// HTTP rather than through `ServerState`.
+    ///
+    /// The state-level round-trip is covered above, but the plugin does not call Rust functions —
+    /// it calls two URLs with a bearer token and parses JSON. Everything that can be wrong between
+    /// those two layers is invisible to that test and invisible to the C# author until they are
+    /// deep in an editor: the query-parameter name, the field names inside each queued request,
+    /// whether the response is a bare array or an envelope, which status code an already-acked
+    /// request returns, and whether an unauthenticated poll leaks the queue.
+    ///
+    /// This is the contract. If it changes, the plugin breaks in the field, so it is asserted
+    /// field by field rather than by shape.
+    #[tokio::test]
+    async fn the_plugin_transport_works_over_http_exactly_as_specified() {
+        use lodestash_core::catalog::{Catalog, CrawlRecord};
+
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("beaver.fbx"), b"mesh").unwrap();
+        let db = dir.path().join("catalog.db");
+        let asset_id = {
+            let mut cat = Catalog::open(&db).unwrap();
+            cat.seed_media_types().unwrap();
+            let src = cat
+                .upsert_import_source("Lib", &lib.to_string_lossy(), "folder")
+                .unwrap();
+            cat.record_crawl(
+                src,
+                None,
+                &[CrawlRecord {
+                    workspace_rel: None,
+                    rel_path: "beaver.fbx".into(),
+                    name: "beaver.fbx".into(),
+                    media_type: "model_3d".into(),
+                    size_bytes: 4,
+                    mtime: 1,
+                    content_hash: None,
+                }],
+            )
+            .unwrap();
+            cat.assets_for_source(src).unwrap()[0].asset_id
+        };
+        let st: Shared =
+            Arc::new(ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap());
+        let token = st.token.clone();
+
+        // The plugin registers itself first (§5.1).
+        let (s, body) = send(
+            router(st.clone()),
+            post_req(
+                "/v1/projects/register",
+                Some(&token),
+                json!({ "project_path": "C:/dev/Game", "engine_version": "6000.0.23f1" }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "register: {body}");
+        let project_id = body["project_id"]
+            .as_i64()
+            .expect("register returns project_id");
+
+        // An unauthenticated poll must not hand the queue to anything on loopback.
+        let (s, _) = send(
+            router(st.clone()),
+            get_req(
+                &format!("/v1/import-queue?project_id={project_id}"),
+                None,
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::UNAUTHORIZED,
+            "the import queue is readable without a token"
+        );
+
+        // Queue an import and approve it, the way the desktop app does.
+        let job = match st.request_import(crate::ImportRequest {
+            project_id: Some(project_id),
+            asset_ids: vec![asset_id],
+            dest_subfolder: Some("Wildlife".into()),
+            with_dependencies: false,
+        }) {
+            Ok(crate::ImportKickoff::Awaiting(j)) => j,
+            _ => panic!("expected an awaiting-approval job"),
+        };
+        st.approve_job(&job.id);
+
+        // Poll it the way the plugin does. The enqueue runs on a worker thread, so retry.
+        let mut queued = Value::Null;
+        for _ in 0..200 {
+            let (s, body) = send(
+                router(st.clone()),
+                get_req(
+                    &format!("/v1/import-queue?project_id={project_id}"),
+                    Some(&token),
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK);
+            assert!(body.is_array(), "§5.3 specifies a bare array, got: {body}");
+            if !body.as_array().unwrap().is_empty() {
+                queued = body;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let reqs = queued.as_array().expect("nothing was ever queued");
+        assert_eq!(reqs.len(), 1);
+
+        // Field by field — every one of these names is compiled into the plugin.
+        let r = &reqs[0];
+        let request_id = r["request_id"].as_str().expect("request_id").to_string();
+        assert!(r["job_id"].is_string(), "job_id missing: {r}");
+        assert_eq!(r["dest_subfolder"], "Wildlife");
+        let assets = r["assets"].as_array().expect("assets array");
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0]["id"], asset_id, "the plugin acks by this id");
+        assert!(
+            assets[0]["file_url"].is_string(),
+            "§5.3: each asset carries the file_url the plugin fetches — {}",
+            assets[0]
+        );
+
+        // A second poll inside the lease window returns nothing, or the plugin copies twice.
+        let (_, again) = send(
+            router(st.clone()),
+            get_req(
+                &format!("/v1/import-queue?project_id={project_id}"),
+                Some(&token),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            again.as_array().unwrap().len(),
+            0,
+            "a re-poll re-served the same request"
+        );
+
+        // Ack with what Unity actually produced.
+        let (s, body) = send(
+            router(st.clone()),
+            post_req(
+                &format!("/v1/import-queue/{request_id}/ack"),
+                Some(&token),
+                json!({ "imported": [{
+                    "asset_id": asset_id,
+                    "dest_path": "Assets/Wildlife/beaver.fbx",
+                    "unity_guid": "8e1cdeadbeef"
+                }]}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "ack rejected: {body}");
+
+        // Acking twice is a 404 with the documented envelope, not a 500 and not a silent success —
+        // a plugin that retries after a dropped response has to be able to tell those apart.
+        let (s, body) = send(
+            router(st.clone()),
+            post_req(
+                &format!("/v1/import-queue/{request_id}/ack"),
+                Some(&token),
+                json!({ "imported": [] }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        assert_eq!(
+            body["error"]["code"], "not_found",
+            "ack error envelope: {body}"
+        );
+
+        // And the durable half: the ack wrote the `import_record` the dup-guard reads.
+        match st.request_import(crate::ImportRequest {
+            project_id: Some(project_id),
+            asset_ids: vec![asset_id],
+            dest_subfolder: None,
+            with_dependencies: false,
+        }) {
+            Ok(crate::ImportKickoff::AllAlreadyImported(v)) => assert_eq!(v, vec![asset_id]),
+            _ => panic!("the ack did not persist an import_record"),
         }
     }
 
