@@ -28,6 +28,8 @@ export type GridItem = {
   /** How many *other* projects hold it. History, not a warning. */
   in_other_projects: number;
   triangles: number | null;
+  /** Clip length for audio — the sound card's `pos / dur` readout before playback starts. */
+  duration_ms: number | null;
   /** Tag values, drawn as chips under the meta line (FEATURES §1.1). */
   traits: string[];
   /** `S` / `M` / `L` / `XL` from the user's own thresholds — never recompute it here. */

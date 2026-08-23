@@ -288,10 +288,22 @@ or more than a patch):
       jam, not this one. **Fixed 2026-08-18:** both workers wrap their body in `catch_unwind` and
       send an error outcome on the way out, so the send that runs `jobs.finish` and drains the queue
       happens even when the archive is corrupt enough to panic the gzip/tar path.
-- [ ] **The sound card's ▶ is decoration.** `<span class="play">▶</span>` sits inside an
-      `aria-hidden` wrapper with no handler, so clicking it selects the card and screen readers
-      cannot reach it. UI-SPEC §2.5 specifies a working ▶/◼ with an inline scrubber and one asset
-      playing at a time (§13.2) — none of it wired.
+- [x] **The sound card's ▶ plays (2026-08-22).** It was a glyph in an `aria-hidden` wrapper with
+      no handler — clicking it selected the card, and a screen reader could not reach it — across
+      **1,841 of 7,691 assets**. Now a real control over the artwork (so it is there whether the
+      thumb route drew a real envelope or the hashed bars stood in), with the scrubber + `pos / dur`
+      readout on the active card only, EQ animation on the bars while playing, and reduced-motion
+      dropping the movement but keeping the lit colour. One `audio.svelte.ts` player owns the single
+      `<audio>` element, which is what makes §13.2's "one asset plays at a time" true by
+      construction: starting another sound re-points the one element, so the previous card stops
+      because it lost the player, not because something remembered to stop it. A pull that fails
+      (in-pack over the size cap) says so on the card instead of leaving a ▶ that never starts.
+      `GridItem.duration_ms` came with it, so a card prints its length before the first play and a
+      list row shows clip length where geometry shows triangles.
+      e2e asserts `currentTime` advancing, not that a ◼ rendered — a transport that draws the right
+      glyph and plays silence looks identical to one that works.
+      **Still open:** the Inspector's own transport (§13.2 — round ▶/◼ + scrubber + hint before
+      first play). The player it needs now exists.
 - [ ] **Doc drift: card status rail width.** UI-SPEC §2.5 says 3px, DESIGN-GUIDELINES §6 says 1px,
       the app follows DG (ALIGNMENT-AUDIT F1). UI-SPEC is the stale one — fix it per CLAUDE.md
       rule 2 so the next reader is not told the code diverges when it conforms.
@@ -532,20 +544,26 @@ and the Materials tab — `FEATURES.md` wins on both, do not "fix" the app to ma
       *plus* the §2.5 30%-grayscale art behind a large slate `?`; `1.2k tris`; badges clamped at
       `999+`; and the **confirmed at-rest gold ring** §2.5 asks for (audit row **F4**, open since
       08-04). Full-perimeter status border **rejected** — §2.5 specifies a left border.
-- [ ] **B12e — `✓ in <project>` membership pill (§N1.5).** *Not blocked* — the earlier "no command
-      exists" was wrong. `import_record` is populated and per-asset membership is queried at
-      `catalog.rs:2985`; what is missing is the bulk read (an `in_project` flag on `GridItem`,
-      filled from the active project's import set at reload).
+- [x] **B12e — `✓ in <project>` membership pill (§N1.5). Shipped as D10**, with all four states
+      rather than one: in the active project, in N others, never, and `✓ older copy` for an import
+      the source has changed under. The bulk read this card asked for is `Catalog::import_states`.
 - [x] **B12f — resolved by reading the spec (2026-08-14).** Tab counts stay (UI-SPEC §0.3); the
       PINNED sidebar group stays (audit row C6). No code, no doc change — the mockup predates both.
 - [x] **B12g — top bar (2026-08-14).** Health meter as `Identified n / total` over a 6px
       gold-gradient bar (§0.1.5); project chip `Name · Engine` (§0.1.6); Tags/AI toggle ahead of the
       search box per §0.1's order. **GPU name still open** — nothing in `lodestash-desktop`/`-app`
       exposes an execution provider or adapter name, so the pill would have to invent one (**B8**).
-- [ ] **B12h — the list rows never got it (audit F6).** `AssetList.svelte` still lacks the star,
-      `⤢` and stage treatment UI-SPEC §2.5 specifies for rows; chips are not click-to-search and the
-      pack name is not a link to Pack stats §15. Also **§N5.3**: the inspector holds its rail open
-      showing "Select an asset." when nothing is selected.
+- [x] **B12h — rows, chips and pack links (star/⤤/stage in D6; the rest 2026-08-22).** D6 gave
+      rows the star, `⤤` and stage, and D5 closed §N5.3's always-open rail. What its card still
+      claimed and the code did not do: **the pack name was not a link anywhere in the grid** and
+      **chips were not click-to-search**, both spelled out in §2.5 (*"pack name is a link → Pack
+      stats §15"*, *"chips are click-to-search"*). On cards the pack was baked into a joined
+      `pack · tris · size` string, so there was nothing to attach a link to — that string is why it
+      was never built. Now: pack → Pack stats on cards **and** rows, chip → adds that trait to the
+      ⚡ filter (not the search box, so it composes with what is already narrowed and is removable
+      from the active-filter bar like every other axis, D2), clicking a lit chip clears it.
+      `PackStats.svelte` was lifted out of `UnityAssetsScreen`, which is why "**any** pack-name link
+      (cards, list rows, Packages, Stats)" had meant exactly one screen: the modal lived inside it.
 
 > **The trap this pass paid for, in one line:** a hover-revealed control at an `opacity: 0` still
 > takes clicks, so the 104px thumb pulled the action tray under the card's *centre* and ate the

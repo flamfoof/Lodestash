@@ -47,6 +47,10 @@ pub struct GridItem {
     /// How many *other* projects hold it. Reads as `✓ in N others`: history, not a warning.
     pub in_other_projects: i64,
     pub triangles: Option<i64>,
+    /// Clip length for audio, so a sound card can print `pos / dur` **before** the first play
+    /// (UI-SPEC §2.5) and a list row can show its length in the stats column. `None` for
+    /// everything else, and for audio the metrics drain has not reached yet.
+    pub duration_ms: Option<i64>,
     /// Tag values on this asset — the chips under the card's meta line (FEATURES §1.1). Filled by
     /// [`Library::mark_traits`] in one query for the whole library, not one per card.
     pub traits: Vec<String>,
@@ -2289,6 +2293,7 @@ fn row_from(
             in_pack: package.is_some(),
             package,
             triangles: e.metrics.tri_count,
+            duration_ms: e.metrics.duration_ms,
             // All three are filled by a whole-library pass after every row exists (`mark_traits`,
             // `mark_tiers`, `mark_imported`) — none is knowable from a single catalog row.
             traits: Vec::new(),
@@ -2335,6 +2340,7 @@ mod tests {
                     in_pack: false,
                     package: None,
                     triangles: None,
+                    duration_ms: None,
                     traits: Vec::new(),
                     size_tier: String::new(),
                     in_project: false,

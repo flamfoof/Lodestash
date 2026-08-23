@@ -12,6 +12,7 @@
     stage,
   } from "./api";
   import { sources } from "./sources.svelte";
+  import { fmtClock } from "./audio.svelte";
 
   /**
    * Same tray the cards reach, through the same context the shell owns (App.svelte
@@ -32,6 +33,7 @@
     onmenu,
     onfavorite,
     onidentify,
+    onpack,
     trashedOnly = false,
     onrestore,
   }: {
@@ -49,6 +51,8 @@
     /** Unidentified rows lead with ✦ — on a row you cannot see the art, so appraising is the
      *  fastest useful thing. */
     onidentify?: (id: number) => void;
+    /** Pack name → Pack stats (UI-SPEC §15). Reported up: one modal per screen, not per row. */
+    onpack?: (name: string) => void;
     /** Trash view: a per-row Restore (UI-SPEC §10 — the spec'd trash table). */
     trashedOnly?: boolean;
     onrestore?: (id: number) => void;
@@ -151,7 +155,32 @@
           >✓</span>
         {/if}
       </span>
-      <span class="cell pack dim" role="cell">{item.package ?? "—"}</span>
+      <span class="cell pack dim" role="cell">
+        {#if item.package}
+          <!-- §2.5 spells the row out as "name · pack (link) · size badge …". D6 built every other
+               column and left this one a plain span. -->
+          <span
+            class="packlink"
+            role="button"
+            tabindex="-1"
+            title="Pack stats for {item.package}"
+            data-testid="row-pack"
+            onclick={(e) => {
+              e.stopPropagation();
+              onpack?.(item.package!);
+            }}
+            onkeydown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                e.stopPropagation();
+                onpack?.(item.package!);
+              }
+            }}
+          >{item.package}</span>
+        {:else}
+          —
+        {/if}
+      </span>
       <span class="cell right" role="cell">
         {#if item.size_tier}
           <span class="tier num t{item.size_tier}" title={fmtSize(item.size_bytes)}>
@@ -159,8 +188,14 @@
           </span>
         {/if}
       </span>
+      <!-- The stats column carries whatever the type actually has: triangles for geometry, clip
+           length for a sound. A column of — down 1,841 audio rows says nothing (UI-SPEC §2.5). -->
       <span class="cell right num" role="cell">
-        {item.triangles ? item.triangles.toLocaleString() : "—"}
+        {#if item.media_type === "audio" && item.duration_ms}
+          {fmtClock(item.duration_ms / 1000)}
+        {:else}
+          {item.triangles ? item.triangles.toLocaleString() : "—"}
+        {/if}
       </span>
       <span class="cell status" role="cell" class:dim={item.status !== "confirmed"}>
         <span class="gem" aria-hidden="true"></span>
@@ -401,6 +436,13 @@
 
   .pack {
     color: var(--ls-gold);
+  }
+  .packlink {
+    cursor: pointer;
+  }
+  .packlink:hover {
+    color: var(--ls-gold-bright);
+    text-decoration: underline;
   }
   /* A row has no room for the project's name — the check, with the full text on hover. */
   .imported {

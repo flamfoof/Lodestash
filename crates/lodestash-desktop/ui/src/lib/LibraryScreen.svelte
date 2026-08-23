@@ -3,6 +3,7 @@
   import Toolbar from "./Toolbar.svelte";
   import FilterBar from "./FilterBar.svelte";
   import EmptyState from "./EmptyState.svelte";
+  import PackStats from "./PackStats.svelte";
   import QuickLook from "./QuickLook.svelte";
   import AssetList from "./AssetList.svelte";
   import FoldersView from "./FoldersView.svelte";
@@ -75,6 +76,25 @@
   let result = $state<GridPage | null>(null);
   let error = $state<string | null>(null);
   let quickLook = $state<number | null>(null);
+  /** Pack stats (UI-SPEC §15), opened by a pack-name link on any card or row. */
+  let packStats = $state<string | null>(null);
+
+  /**
+   * A trait chip answers the question it raises: *show me the rest of these* (UI-SPEC §2.5, "chips
+   * are click-to-search").
+   *
+   * It adds to the ⚡ filter rather than typing into the search box, so it composes with whatever
+   * is already narrowed and appears in the active-filter bar — removable there like every other
+   * axis (D2). Clicking a chip already in the filter removes it, so the same click undoes itself
+   * and a chip can never be added twice.
+   */
+  function toggleTrait(value: string) {
+    const traits = view.filter.traits;
+    view.filter = {
+      ...view.filter,
+      traits: traits.includes(value) ? traits.filter((t) => t !== value) : [...traits, value],
+    };
+  }
   /** Unidentified nudge (D8 / KANBAN B10d): ✕ hides it for the rest of the session. */
   let nudgeDismissed = $state(false);
   /**
@@ -509,6 +529,7 @@
         onmenu={(e, id) => (menu = { x: e.clientX, y: e.clientY, id })}
         onfavorite={(id, favorite) => onmenuaction?.({ action: "favorite", id, favorite })}
         onidentify={(id) => onmenuaction?.({ action: "identify", id, favorite: false })}
+        onpack={(name) => (packStats = name)}
         {trashedOnly}
         onrestore={(id) => onrestore?.(id)}
       />
@@ -542,6 +563,8 @@
               onopen={(id) => (quickLook = id)}
               onmenu={(e, id) => (menu = { x: e.clientX, y: e.clientY, id })}
               onidentified={() => (view.dataVersion += 1)}
+              onpack={(name) => (packStats = name)}
+              ontrait={toggleTrait}
               onfavorite={(id, favorite) => onmenuaction?.({ action: "favorite", id, favorite })}
             />
             <span
@@ -596,6 +619,10 @@
     <QuickLook assetId={quickLook} onclose={() => (quickLook = null)} onstep={step} />
 
   {/if}
+
+  <!-- UI-SPEC §15, reached from any pack-name link on a card or row. A sibling of Quick Look and
+       the context menu, never a child of either — that nesting is what made the menu unreachable. -->
+  <PackStats name={packStats} onclose={() => (packStats = null)} />
 
   <!-- Right-click actions (FEATURES §1.1). A **sibling** of Quick Look, not a child: nested inside
        `{#if quickLook !== null}` it only rendered while the modal was open, which is precisely when

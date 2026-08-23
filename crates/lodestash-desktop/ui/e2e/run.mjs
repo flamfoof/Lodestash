@@ -775,11 +775,19 @@ try {
   });
 
   // ── D12: the responsive ladder, driven for real (ADR-0009) ───────────────────────────────────
-  // `Browser.setWindowBounds` resizes the actual window, so media queries follow — unlike
+  // `Browser.setWindowBounds` resizes what the page sees, so media queries follow — unlike
   // `setViewportSize`, which changes nothing here and leaves an emulation override that poisons
   // every later check. Worth the trouble: the first version of this ladder had two of its four
   // stops doing *nothing* at any width, because rules written in the global sheet lose to a
   // component's own scoped ones, and nothing said so.
+  //
+  // **What it actually resizes**, measured with Win32 `GetWindowRect` rather than assumed: only the
+  // **WebView2 controller**, never the Tauri window. Held at 900×800, CDP and `window.outerWidth`
+  // both report 900×800 while the real HWND is still `IsZoomed: True` at 2576×1408. So for a few
+  // seconds this check makes the app look like a small page pinned inside a full-size frame, with
+  // black around it — alarming, reported as a bug once, and entirely transient. It also means a
+  // *failed* restore does not shrink the window, it strands the webview inside it, which is what
+  // the original "the layout keeps getting smaller" report was actually looking at.
   //
   // Reachability is `offsetParent !== null`, not computed display: what decides whether a control
   // can be used is whether an ancestor hid it, and the first probe of this got that wrong.
@@ -787,6 +795,9 @@ try {
     const cdp = await page.context().newCDPSession(page);
     const { windowId } = await cdp.send("Browser.getWindowForTarget");
     const { bounds: original } = await cdp.send("Browser.getWindowBounds", { windowId });
+    // Say so, so that watching the app shrink for a few seconds reads as this check working rather
+    // than as the app breaking.
+    console.log("  …    resizing the app to walk the responsive ladder — it is put back after");
 
     /**
      * Put the window back exactly as it was found.
@@ -832,10 +843,12 @@ try {
         want = { ...want, left: want.left - (got.left - left), top: want.top - (got.top - top) };
       }
     };
+    // Height is held at whatever it already was: only width drives this ladder, and changing both
+    // makes the transient resize twice as jarring for nothing.
     const at = async (width) => {
       await cdp.send("Browser.setWindowBounds", {
         windowId,
-        bounds: { width, height: 800, windowState: "normal" },
+        bounds: { width, height: original.height, windowState: "normal" },
       });
       // The icon rail widens on hover *by design*, and earlier checks leave the pointer wherever
       // they last clicked — often on a nav row. Park it over the grid before measuring, or step 3
@@ -1952,6 +1965,172 @@ try {
     assert.ok(spread < 1, `cards span ${spread.toFixed(3)}px — a card is stretching past its track`);
     const offTrack = widths.filter((w) => w.cell !== null && Math.abs(w.card - w.cell) >= 1);
     assert.equal(offTrack.length, 0, "a card is wider than the grid cell that wraps it");
+  });
+
+  // The sound card's ▶ used to be a glyph inside an `aria-hidden` wrapper with no handler: clicking
+  // it selected the card, and a screen reader could not reach it at all. 1,841 of this library's
+  // 7,691 assets are audio, so that was a quarter of the grid with no way to hear anything.
+  //
+  // "It rendered" is not the assertion — `currentTime` advancing is. A transport that draws a ◼ and
+  // plays silence looks identical to one that works.
+  await check("the sound card's ▶ actually plays, and only one plays at a time", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "sounds", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 200 },
+    });
+    const sounds = p.items.filter((i) => !i.in_pack);
+    if (sounds.length < 2) return; // needs two on-disk sounds to prove the "one at a time" rule
+
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.getByRole("button", { name: /^Sounds/ }).click();
+    await page.waitForFunction(
+      (id) => !!document.querySelector(`.card[data-asset-id="${id}"] [data-testid="card-play"]`),
+      sounds[0].asset_id,
+      { timeout: 5000 },
+    );
+
+    const play = (id) => page.locator(`.card[data-asset-id="${id}"] [data-testid="card-play"]`);
+    const first = play(sounds[0].asset_id);
+    assert.equal(await first.getAttribute("tabindex"), "0", "the transport is not reachable by keyboard");
+
+    await first.click();
+    // The element is the app's only <audio>; poll it rather than trusting the button's glyph.
+    await page.waitForFunction(
+      () => {
+        const a = document.querySelector("audio") ?? null;
+        return !!a && !a.paused && a.currentTime > 0;
+      },
+      undefined,
+      { timeout: 8000 },
+    );
+    assert.equal(await first.getAttribute("aria-pressed"), "true", "the button did not flip to playing");
+    // The scrubber and clock belong to the active card only (§2.5).
+    const scrubs = await page.locator('[data-testid="card-scrub"]').count();
+    assert.equal(scrubs, 1, `${scrubs} cards drew a scrubber — only the active one should`);
+
+    // Starting another sound stops the first, because there is one element, not one per card.
+    await play(sounds[1].asset_id).click();
+    await page.waitForFunction(
+      (id) =>
+        document
+          .querySelector(`.card[data-asset-id="${id}"] [data-testid="card-play"]`)
+          ?.getAttribute("aria-pressed") === "false",
+      sounds[0].asset_id,
+      { timeout: 8000 },
+    );
+    assert.equal(
+      await page.locator('[data-testid="card-scrub"]').count(), 1,
+      "two cards claim to be the active audio",
+    );
+
+    // Stop, so the suite does not leave a sound running behind every later check.
+    await play(sounds[1].asset_id).click();
+    await page.waitForFunction(() => (document.querySelector("audio")?.paused ?? true), undefined, {
+      timeout: 5000,
+    });
+    await page.getByRole("button", { name: /^All/ }).click();
+    await page.waitForSelector(".card", { timeout: 5000 });
+  });
+
+  // The grid's metadata is a control surface, not decoration (UI-SPEC §2.5: "pack name is a link
+  // → Pack stats §15", "chips are click-to-search"). Both were spec'd, neither was wired — the
+  // pack name was baked into a joined string, so there was nothing to attach a link to.
+  await check("a card's pack name opens Pack stats for that pack", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    const withPack = p.items.find((i) => i.package);
+    if (!withPack) return; // a library of loose files only — nothing to link
+
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.fill('input[type="text"]', withPack.name);
+    await page.waitForFunction(
+      (id) => !!document.querySelector(`.card[data-asset-id="${id}"]`),
+      withPack.asset_id,
+      { timeout: 5000 },
+    );
+    const card = page.locator(`.card[data-asset-id="${withPack.asset_id}"]`);
+    await card.locator('[data-testid="card-pack"]').click();
+    await page.waitForSelector('[data-testid="pack-stats"]', { timeout: 5000 });
+    await page.waitForSelector('[data-testid="pack-stats-grid"]', { timeout: 5000 });
+    const title = (await page.locator("#pack-stats-title").textContent())?.trim();
+    assert.equal(title, withPack.package, `Pack stats opened on "${title}"`);
+    // It must not also have opened Quick Look: the click has to stop at the link.
+    assert.equal(await page.locator('[data-testid="quicklook"]').count(), 0, "the pack link also opened Quick Look");
+    await page.keyboard.press("Escape");
+    await page.waitForSelector('[data-testid="pack-stats"]', { state: "detached", timeout: 3000 });
+    await page.fill('input[type="text"]', "");
+  });
+
+  await check("a list row's pack name opens it too", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    const withPack = p.items.find((i) => i.package);
+    if (!withPack) return;
+
+    await page.fill('input[type="text"]', withPack.name);
+    await page.waitForSelector(".card", { timeout: 5000 });
+    // Switch to list rows — the whole point of D6 is that they carry what cards carry.
+    await page.locator('[aria-label="View mode"] button').nth(1).click();
+    await page.waitForSelector('[data-testid="row-pack"]', { timeout: 5000 });
+    await page.locator('[data-testid="row-pack"]').first().click();
+    await page.waitForSelector('[data-testid="pack-stats"]', { timeout: 5000 });
+    await page.keyboard.press("Escape");
+    await page.waitForSelector('[data-testid="pack-stats"]', { state: "detached", timeout: 3000 });
+    await page.locator('[aria-label="View mode"] button').first().click();
+    await page.waitForSelector(".card", { timeout: 5000 });
+    await page.fill('input[type="text"]', "");
+  });
+
+  // A chip that looks clickable and does nothing is worse than no chip. It must reach the ⚑ filter
+  // — not the search box — so it composes with what is already narrowed and is removable from the
+  // active-filter bar like every other axis (D2).
+  await check("a trait chip filters by that trait, and clicking it again clears it", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    const tagged = p.items.find((i) => i.traits.length > 0);
+    if (!tagged) return; // nothing appraised yet — no chips exist to click
+
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.fill('input[type="text"]', tagged.name);
+    await page.waitForFunction(
+      (id) => !!document.querySelector(`.card[data-asset-id="${id}"] [data-testid="card-chip"]`),
+      tagged.asset_id,
+      { timeout: 5000 },
+    );
+    const chip = page
+      .locator(`.card[data-asset-id="${tagged.asset_id}"] [data-testid="card-chip"]`)
+      .first();
+    const label = (await chip.textContent())?.trim();
+    await chip.click();
+
+    await page.waitForSelector('[data-testid="filter-bar"]', { timeout: 5000 });
+    const bar = (await page.locator('[data-testid="filter-bar"]').textContent()) ?? "";
+    assert.ok(bar.includes(label), `the active-filter bar does not carry "${label}": ${bar}`);
+    assert.equal(
+      await page.locator('[data-testid="quicklook"]').count(), 0,
+      "the chip click fell through and opened Quick Look",
+    );
+
+    // Same click undoes itself — a chip can never be added twice.
+    await page.fill('input[type="text"]', tagged.name);
+    await page.waitForTimeout(300);
+    const again = page
+      .locator(`.card[data-asset-id="${tagged.asset_id}"] [data-testid="card-chip"]`)
+      .first();
+    if ((await again.count()) > 0) {
+      await again.click();
+      await page.waitForTimeout(300);
+      const after = (await page.locator('[data-testid="filter-bar"]').textContent().catch(() => "")) ?? "";
+      assert.ok(!after.includes(label), `"${label}" survived a second click: ${after}`);
+    }
+    await page.fill('input[type="text"]', "");
+    await page.waitForSelector(".card", { timeout: 5000 });
   });
 
   // Export to folder (UI-SPEC §16.2) — the level-1 way out of the library, and until the Unity

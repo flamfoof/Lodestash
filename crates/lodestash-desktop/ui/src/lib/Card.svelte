@@ -13,6 +13,7 @@
   } from "./api";
   import { traitColor } from "./traits.svelte";
   import { sources } from "./sources.svelte";
+  import { player, fmtClock } from "./audio.svelte";
 
   let {
     item,
@@ -23,6 +24,8 @@
     onidentified,
     onmenu,
     onfavorite,
+    onpack,
+    ontrait,
   }: {
     item: GridItem;
     selected?: boolean;
@@ -43,6 +46,17 @@
     /** Right-click (FEATURES §1.1): the shell's context menu. The Card only reports the
      *  event + asset — the menu itself lives up-tree where the write fns are. */
     onmenu?: (e: MouseEvent, id: number) => void;
+    /**
+     * Pack name → Pack stats (UI-SPEC §2.5: "pack name is a link → Pack stats §15"). Reported up
+     * rather than opened here: the modal is one per screen, not one per card.
+     */
+    onpack?: (name: string) => void;
+    /**
+     * Trait chip → filter by it (§2.5: "chips are click-to-search"). The chip answers the question
+     * it raises — *show me the rest of these* — and lands in the active-filter bar, where it is
+     * removable like every other axis (D2).
+     */
+    ontrait?: (value: string) => void;
     /** ☆ → ★ (FEATURES §1.1 "star tile" — UI-SPEC §2.5's overlay list does not carry it): the
      *  star is a control, not a read-out. Reports the *current*
      *  flag; the shell inverts it, exactly as the context menu's Toggle Favorite does. */
@@ -133,6 +147,31 @@
    * ponytail: hashed silhouette, not real audio; swap in peaks if the drain ever stores them.
    */
   let isSound = $derived(item.media_type === "audio");
+  /**
+   * The card’s own transport (UI-SPEC §2.5). Only one asset plays at a time, so a card asks the
+   * shared player whether it is the one — it holds no playback state of its own, and a card that
+   * scrolls out of view and back cannot disagree with what is actually coming out of the speakers.
+   */
+  let isCurrent = $derived(isSound && player.current === item.asset_id);
+  let isPlaying = $derived(isSound && player.isPlaying(item.asset_id));
+  /** Catalog duration is the fallback until the element has metadata of its own. */
+  let clipSeconds = $derived(
+    isCurrent && player.duration ? player.duration : (item.duration_ms ?? 0) / 1000,
+  );
+  let progress = $derived(
+    isCurrent && clipSeconds ? Math.min(1, player.position / clipSeconds) : 0,
+  );
+
+  function toggleAudio() {
+    player.toggle(item.asset_id);
+  }
+
+  /** Click anywhere on the bar to seek there — the scrubber is the bar, not a separate control. */
+  function scrubFrom(e: MouseEvent) {
+    const el = e.currentTarget as HTMLElement;
+    const r = el.getBoundingClientRect();
+    player.seek((e.clientX - r.left) / Math.max(1, r.width));
+  }
   let bars = $derived.by(() => {
     // `Math.imul`, not `*`: the product of two ~2^31 values passes `Number.MAX_SAFE_INTEGER`, and
     // the float rounding that follows zeroes the low bits the next `>>> 15` depends on — so the
@@ -152,9 +191,12 @@
 
   // FEATURES §1.1: the meta line leads with the pack, because "which pack is this from" is the
   // question a grid of 8k near-identical Synty props actually raises. Size moved to the tier chip.
+  //
+  // The pack is rendered separately from the rest rather than joined into one string — that string
+  // is exactly why §2.5’s "pack name is a link" was never built: there was nothing to attach it to.
   const fmtTris = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k` : `${n}`);
-  let sub = $derived(
-    [item.package, item.triangles ? `${fmtTris(item.triangles)} tris` : null, fmtSize(item.size_bytes)]
+  let stats = $derived(
+    [item.triangles ? `${fmtTris(item.triangles)} tris` : null, fmtSize(item.size_bytes)]
       .filter(Boolean)
       .join(" · "),
   );
@@ -207,14 +249,56 @@
       <!-- UI-SPEC §2.5: the sound card's stand-in for artwork, for the audio the backend cannot
            rasterise — in-pack payloads over the pull cap, which is most of a real Unity library.
            Arcane when identified, slate when not: the same two-colour rule as the rest of the card. -->
-      <span class="wave" aria-hidden="true">
-        <span class="play">▶</span>
+      <span class="wave">
         {#each bars as h, i (i)}
-          <i class="bar" style="--h: {h}%"></i>
+          <i class="bar" class:live={isPlaying} style="--h: {h}%; --i: {i}"></i>
         {/each}
       </span>
     {:else}
       <Icon name={typeIcon(item.media_type)} size={28} />
+    {/if}
+
+    {#if isSound && !unreachable}
+      <!-- §2.5 puts ▶/◼ **in place of the thumbnail** — so it rides over the artwork rather than
+           replacing one branch of it, and a sound card has a transport whether the thumb route drew
+           a real envelope or the hashed bars stood in. It used to be a `▶` glyph inside an
+           `aria-hidden` wrapper with no handler: clicking it selected the card, and a screen reader
+           could not reach it at all. -->
+      <span
+        class="transport"
+        class:on={isCurrent}
+        role="button"
+        tabindex="0"
+        aria-pressed={isPlaying}
+        title={isPlaying ? "Stop" : "Play"}
+        aria-label={isPlaying ? `Stop ${item.name}` : `Play ${item.name}`}
+        data-testid="card-play"
+        onclick={(e) => {
+          e.stopPropagation();
+          toggleAudio();
+        }}
+        onkeydown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            e.stopPropagation();
+            toggleAudio();
+          }
+        }}
+      >{isPlaying ? "◼" : "▶"}</span>
+      {#if isCurrent}
+        <!-- Only the active card carries a scrubber: 100 idle timelines is noise, and §2.5 asks
+             for it "while that card is the active audio". -->
+        <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+        <span class="scrub" data-testid="card-scrub" onclick={(e) => { e.stopPropagation(); scrubFrom(e); }}>
+          <span class="scrub-fill" style="width: {Math.round(progress * 100)}%"></span>
+        </span>
+        <span class="clock num" data-testid="card-clock">
+          {fmtClock(player.position)} / {fmtClock(clipSeconds)}
+        </span>
+      {/if}
+      {#if player.error && isCurrent}
+        <span class="audio-err" data-testid="card-audio-error">{player.error}</span>
+      {/if}
     {/if}
 
     {#if unidentified}
@@ -367,7 +451,30 @@
 
   <div class="meta">
     <span class="name"><i class="bullet" aria-hidden="true"></i>{item.name}</span>
-    <span class="sub num">{sub}</span>
+    <span class="sub num">
+      {#if item.package}
+        <!-- A role=button span, not a <button>: the card root is already a <button> and nesting
+             one inside it is invalid HTML — the same rule the star and ✦ follow. -->
+        <span
+          class="pack"
+          role="button"
+          tabindex="-1"
+          title="Pack stats for {item.package}"
+          data-testid="card-pack"
+          onclick={(e) => {
+            e.stopPropagation();
+            onpack?.(item.package!);
+          }}
+          onkeydown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              e.stopPropagation();
+              onpack?.(item.package!);
+            }
+          }}
+        >{item.package}</span>{#if stats}<span class="sep"> · </span>{/if}
+      {/if}{stats}
+    </span>
   </div>
   <div class="tags">
     {#if unidentified}
@@ -378,7 +485,22 @@
       {#each chips as t (t)}
         <span
           class="tag"
+          role="button"
+          tabindex="-1"
+          title="Show everything tagged “{t}”"
+          data-testid="card-chip"
           style={traitColor.has(t) ? `--chip: var(${traitColor.get(t)})` : ""}
+          onclick={(e) => {
+            e.stopPropagation();
+            ontrait?.(t);
+          }}
+          onkeydown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              e.stopPropagation();
+              ontrait?.(t);
+            }
+          }}
         >{t}<i class="dash" aria-hidden="true"></i></span>
       {/each}
       {#if overflow > 0}
@@ -499,18 +621,96 @@
   .thumb.unid .wave {
     color: var(--ls-status-unidentified);
   }
-  .wave .play {
+  .transport {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
     display: grid;
     place-items: center;
-    width: 22px;
-    height: 22px;
-    margin-right: var(--sp-1);
-    font-size: 9px;
+    width: 26px;
+    height: 26px;
+    font-size: 10px;
     line-height: 1;
+    color: var(--ls-arcane);
+    background: color-mix(in srgb, var(--ls-bg) 78%, transparent);
     border: 1px solid currentColor;
     border-radius: 50%;
-    /* Optical centring: a ▶ glyph's bounding box is left-heavy, so a mathematically centred
-       triangle reads as sitting too far left. */
+    cursor: pointer;
+    z-index: 2;
+  }
+  .transport:hover,
+  .transport.on {
+    color: var(--ls-arcane-bright);
+    background: color-mix(in srgb, var(--ls-bg) 92%, transparent);
+  }
+  .thumb.unid .transport {
+    color: var(--ls-status-unidentified);
+  }
+  /* The scrubber sits on the bottom edge of the artwork, where a progress bar belongs and where it
+     cannot collide with the tier badge or the hover actions. */
+  .scrub {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 4px;
+    background: color-mix(in srgb, var(--ls-text-dim) 30%, transparent);
+    cursor: pointer;
+    z-index: 2;
+  }
+  .scrub-fill {
+    display: block;
+    height: 100%;
+    background: var(--ls-arcane);
+  }
+  .clock {
+    position: absolute;
+    left: var(--sp-2);
+    top: var(--sp-2);
+    font-size: 9px;
+    line-height: 1;
+    padding: 2px 4px;
+    color: var(--ls-arcane);
+    background: color-mix(in srgb, var(--ls-bg) 80%, transparent);
+    border-radius: var(--r-sm);
+    z-index: 2;
+  }
+  .audio-err {
+    position: absolute;
+    left: var(--sp-2);
+    right: var(--sp-2);
+    bottom: var(--sp-3);
+    font-size: 9px;
+    line-height: 1.25;
+    color: var(--ls-danger);
+    background: color-mix(in srgb, var(--ls-bg) 88%, transparent);
+    border-radius: var(--r-sm);
+    padding: 2px 4px;
+    z-index: 2;
+  }
+  /* Animated EQ while playing (DESIGN-GUIDELINES §8) — gated on reduced motion below, where a
+     playing card keeps the lit colour and drops the movement. */
+  .wave .bar.live {
+    animation: eq 900ms ease-in-out calc(var(--i) * 90ms) infinite alternate;
+  }
+  @keyframes eq {
+    from {
+      transform: scaleY(0.45);
+    }
+    to {
+      transform: scaleY(1);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .wave .bar.live {
+      animation: none;
+    }
+  }
+  /* Optical centring: a ▶ glyph's bounding box is left-heavy, so a mathematically centred
+     triangle reads as sitting too far left. Lives on `.transport` now — the decorative `.play`
+     span it used to style is gone, replaced by a control that actually plays. */
+  .transport {
     padding-left: 2px;
   }
   .wave .bar {
@@ -651,6 +851,22 @@
   .act:hover {
     border-color: var(--ls-gold);
     color: var(--ls-gold-bright);
+  }
+  /* Gold, like every other pack-name link in the app (Inspector, Packages). Underlined on hover
+     rather than always, so a grid of 100 cards is not a wall of rules. */
+  .sub .pack {
+    color: var(--ls-gold);
+    cursor: pointer;
+  }
+  .sub .pack:hover {
+    color: var(--ls-gold-bright);
+    text-decoration: underline;
+  }
+  .sub .sep {
+    color: var(--ls-text-dim);
+  }
+  .tags .tag[role="button"] {
+    cursor: pointer;
   }
   /* Inert, not hidden (UI-SPEC §11.1): the control still takes focus and still says why. Marked
      by shape as well as colour — the strike-through survives a monochrome display and a reader

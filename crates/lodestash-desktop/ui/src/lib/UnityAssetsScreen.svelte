@@ -20,20 +20,9 @@
   let pinnedOnly = $state(false);
 
   /** The pack whose stats modal is open, if any (UI-SPEC §15). */
+  import PackStats from "./PackStats.svelte";
   let statsRow = $state<PackageRow | null>(null);
-  let sheetRef = $state<HTMLDivElement | null>(null);
 
-  // Focus the dialog when it opens so Tab/Escape work immediately (review B10e).
-  $effect(() => {
-    if (statsRow) sheetRef?.focus();
-  });
-
-  function onkeydown(e: KeyboardEvent) {
-    if (e.key === "Escape") {
-      statsRow = null;
-      e.preventDefault();
-    }
-  }
 
   async function load() {
     try {
@@ -226,7 +215,6 @@
   }
 </script>
 
-<svelte:window on:keydown={onkeydown} />
 <section class="screen">
   <header>
     <div class="title">
@@ -372,73 +360,9 @@
     {/if}
   </div>
 
-  {#if statsRow}
-    <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-    <div class="scrim" onclick={() => (statsRow = null)} data-testid="pack-stats">
-      <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-      <div
-        class="sheet"
-        onclick={(e) => e.stopPropagation()}
-        role="alertdialog"
-        tabindex="-1"
-        bind:this={sheetRef}
-        aria-modal="true"
-        aria-labelledby="pack-stats-title"
-      >
-        <div class="sheet-head">
-          <div class="sheet-title">
-            <h3 id="pack-stats-title">{statsRow.name}</h3>
-            <p class="meta">
-              {statsRow.publisher}
-              {#if statsRow.category}<span class="sep">·</span> {statsRow.category}{/if}
-            </p>
-          </div>
-          <button
-            class="close"
-            aria-label="Close pack stats"
-            onclick={() => (statsRow = null)}
-            data-testid="pack-stats-close"
-          >
-            ✕
-          </button>
-        </div>
-
-        <div class="grid" data-testid="pack-stats-grid">
-          <div class="tile">
-            <span class="num value">{statsRow.count.toLocaleString()}</span>
-            <span class="label">indexed assets</span>
-          </div>
-          <div class="tile" class:warn={statsRow.unidentified > 0}>
-            <span class="num value">{statsRow.unidentified.toLocaleString()}</span>
-            <span class="label">unidentified</span>
-          </div>
-          <div class="tile">
-            <span class="num value">{fmtSize(statsRow.bytes)}</span>
-            <span class="label">size</span>
-          </div>
-          <div class="tile">
-            <span class="num value">{statsRow.triangles ? statsRow.triangles.toLocaleString() : "—"}</span>
-            <span class="label">triangles</span>
-          </div>
-        </div>
-
-        {#if statsRow.by_type.length > 0}
-          <div class="types" data-testid="pack-stats-types">
-            {#each statsRow.by_type as t (t.media_type)}
-              <div class="type-row">
-                <span class="type-name">{t.media_type}</span>
-                <span class="type-count mono">{t.count.toLocaleString()}</span>
-                <span class="type-bytes mono dim">{fmtSize(t.bytes)}</span>
-              </div>
-            {/each}
-          </div>
-        {:else}
-          <p class="note">No assets indexed from this pack yet — add its folder as a source to pull
-            the contents in.</p>
-        {/if}
-      </div>
-    </div>
-  {/if}
+  <!-- UI-SPEC §15 lives in `PackStats.svelte` now: the same modal opens from cards and list rows,
+       which is what "any pack-name link" was always supposed to mean. -->
+  <PackStats name={statsRow?.name ?? null} onclose={() => (statsRow = null)} />
 </section>
 
 <style>
@@ -660,110 +584,5 @@
   }
   .num {
     font-variant-numeric: tabular-nums;
-  }
-  .scrim {
-    position: fixed;
-    inset: 0;
-    background: rgb(0 0 0 / 0.6);
-    display: grid;
-    place-items: center;
-    z-index: 100;
-  }
-  .sheet {
-    width: min(420px, 92vw);
-    background: var(--ls-surface);
-    border: 1px solid var(--ls-border-strong);
-    border-radius: var(--r-lg);
-    padding: var(--sp-4);
-    display: flex;
-    flex-direction: column;
-    gap: var(--sp-3);
-  }
-  .sheet-head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: var(--sp-2);
-    padding: 0;
-    flex-wrap: nowrap;
-  }
-  .sheet h3 {
-    margin: 0;
-    font-size: var(--fs-lg);
-  }
-  .meta {
-    margin: var(--sp-1) 0 0;
-    font-size: var(--fs-sm);
-    color: var(--ls-text-muted);
-  }
-  .sep {
-    color: var(--ls-text-dim);
-  }
-  .close {
-    flex: none;
-    width: var(--control-h);
-    height: var(--control-h);
-    background: none;
-    border: 1px solid var(--ls-border);
-    border-radius: var(--r-sm);
-    color: var(--ls-text-dim);
-    font: inherit;
-    cursor: pointer;
-  }
-  .close:hover {
-    color: var(--ls-gold-bright);
-    border-color: var(--ls-gold);
-  }
-  .grid {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: var(--sp-2);
-  }
-  .tile {
-    display: flex;
-    flex-direction: column;
-    gap: var(--sp-1);
-    padding: var(--sp-3);
-    background: var(--ls-bg);
-    border: 1px solid var(--ls-border);
-    border-radius: var(--r-md);
-  }
-  .tile .value {
-    font-size: var(--fs-xl);
-    font-weight: 700;
-  }
-  .tile.warn .value {
-    color: var(--ls-gold-bright);
-  }
-  .tile .label {
-    font-size: var(--fs-xs);
-    color: var(--ls-text-dim);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-  }
-  .types {
-    margin-top: 12px;
-    border-top: 1px solid var(--ls-border);
-    padding-top: 8px;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    max-height: 220px;
-    overflow: auto;
-  }
-  .type-row {
-    display: grid;
-    grid-template-columns: 1fr auto auto;
-    gap: 12px;
-    align-items: baseline;
-    font-size: var(--fs-sm);
-  }
-  .type-name {
-    color: var(--ls-text);
-  }
-  .note {
-    margin: 0;
-    font-size: var(--fs-sm);
-    color: var(--ls-text-dim);
   }
 </style>
