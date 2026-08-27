@@ -671,3 +671,36 @@ fn collection_membership_add_remove_is_idempotent() {
     // The Collections screen count reflects the live membership.
     assert_eq!(c.list_collections().expect("list")[0].asset_count, 1);
 }
+
+/// UI-SPEC §7: *"Trashed assets leave search, dup groups, and staging everywhere."*
+///
+/// The membership row deliberately survives — Trash is reversible, and a restore has to put the
+/// asset back where it was — so "leaves" has to be enforced on the read. Both reads: the grid
+/// filter and `import_staged` go through `collection_members`, the Collections screen through
+/// `list_collections`. Until 2026-08-26 neither excluded them, so a staged asset in the Trash
+/// still counted in the tray badge and would have been copied by an import.
+#[test]
+fn trashing_a_member_takes_it_out_of_the_collection_without_forgetting_it() {
+    let (c, ids) = tagged_catalog(&[("a.fbx", "model_3d"), ("b.png", "image")]);
+    let (a, b) = (ids[0], ids[1]);
+    let col = c.create_collection("Terrain").expect("create");
+    c.collection_add_asset(col, a).expect("add a");
+    c.collection_add_asset(col, b).expect("add b");
+
+    c.set_trashed(&[a], true).expect("trash a");
+    let members = c.collection_members(col).expect("members");
+    assert_eq!(members, vec![b], "a trashed asset is still a member");
+    assert_eq!(
+        c.list_collections().expect("list")[0].asset_count,
+        1,
+        "the collection card counted a trashed asset"
+    );
+
+    // Restoring brings it back — the membership row was never deleted.
+    c.set_trashed(&[a], false).expect("restore a");
+    assert_eq!(
+        c.collection_members(col).expect("members").len(),
+        2,
+        "restore lost the membership"
+    );
+}

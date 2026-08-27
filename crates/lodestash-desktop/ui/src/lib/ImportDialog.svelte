@@ -370,7 +370,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: var(--font-mono, monospace);
+    font-family: var(--ff-mono);
     font-size: var(--fs-sm);
     color: var(--ls-text-dim);
   }

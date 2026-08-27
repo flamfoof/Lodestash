@@ -135,7 +135,7 @@
     border-radius: var(--r-md);
     max-height: 9rem;
     overflow: auto;
-    font-family: var(--font-mono, monospace);
+    font-family: var(--ff-mono);
     font-size: var(--fs-sm);
     color: var(--ls-text-dim);
     /* Long paths scroll rather than stretching the dialog off-screen. */

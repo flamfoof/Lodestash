@@ -585,8 +585,11 @@ Progress meters animate smoothly; never spin gratuitously.
     *stacks* with the selection ring rather than replacing it.
   - **Never colour alone.** Focus is a ring; selection is a border **plus** ring; status is a left
     rail **plus** a gem. Three facts, three shapes.
-- **Keyboard nav:** **Space** = Quick Look, **Enter** = open, **Del** = move to Trash, `/` focuses
-  search, Ctrl/Cmd-A selects all. The **grid is one tab stop** — a roving `tabindex` keeps exactly
+- **Keyboard nav:** **Space** = Quick Look, **Enter** = open, **Del** = move to Trash (the lead
+  selection only), `/` focuses search, Ctrl/Cmd-A picks every card on the current page. The full
+  map with its contexts and precedence lives in **UI-SPEC §0.4**, which owns it — this line
+  names the keys the accessibility contract depends on, and it drifted from that table until
+  2026-08-26 (`Del` and `/` were here, absent there, and implemented in neither). The **grid is one tab stop** — a roving `tabindex` keeps exactly
   one card tabbable and the arrow keys move within it, so Tab never walks 50–100 cards to leave the
   grid. Arrows move the lead selection (↑↓ by a whole row, read off the resolved
   `grid-template-columns` rather than recomputed), **Home/End** jump to the ends, and **Shift**

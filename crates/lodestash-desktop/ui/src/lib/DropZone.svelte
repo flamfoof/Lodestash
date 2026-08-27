@@ -160,7 +160,7 @@
     color: var(--ls-danger);
   }
   .path {
-    font-family: var(--font-mono, monospace);
+    font-family: var(--ff-mono);
     font-size: var(--fs-sm);
     color: var(--ls-text-dim);
   }

@@ -13,6 +13,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { launch } from "./harness.mjs";
 
 /**
@@ -30,13 +31,34 @@ let restoreViewport = async () => {};
 
 const viewport = () => page.evaluate(() => [window.innerWidth, window.innerHeight]);
 
+/**
+ * Poll an async predicate until it holds. `page.waitForFunction` runs *inside* the page and so
+ * cannot await a Tauri `invoke` from this side; several checks need exactly that — press a key,
+ * then wait for the catalog to agree — and a fixed sleep would either be flaky or slow.
+ */
+async function waitFor(pred, message, timeout = 5000) {
+  const until = Date.now() + timeout;
+  for (;;) {
+    if (await pred()) return;
+    if (Date.now() > until) throw new Error(message);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
 const results = [];
 async function check(name, fn) {
   try {
     await fn();
     if (baseline) {
       const got = await viewport();
-      if (got[0] !== baseline[0] || got[1] !== baseline[1]) {
+      // ±1px, the same slack the restore below settles for — they disagreed until 2026-08-26,
+      // and that disagreement is what a 30/87 run looked like. `Browser.setWindowBounds` reports
+      // **frame** geometry and applies **client** geometry, so a restore lands within a pixel of
+      // where it started and not reliably on it; the restore already waits on `<= 1` and then
+      // returned happy, whereupon this compared exactly and failed the *next* eighty checks. The
+      // leak this guard exists to catch is a check that forgot to restore at all — hundreds of
+      // pixels, an entire responsive rung — never one.
+      if (Math.abs(got[0] - baseline[0]) > 1 || Math.abs(got[1] - baseline[1]) > 1) {
         // Put it back before reporting, so one careless check cannot cascade into eighty
         // unrelated failures — the failure mode this guard exists to make legible, not to spread.
         await restoreViewport();
@@ -887,13 +909,22 @@ try {
         return;
       }
       const { left, top, width, height } = original;
-      let want = { left, top, width, height };
-      for (let pass = 0; pass < 2; pass++) {
+      const target = { left, top, width, height };
+      let want = { ...target };
+      // Correct **all four** axes, not just position. The frame-vs-client mismatch documented
+      // above applies to size exactly as it does to position: writing back the `width` just read
+      // lands a pixel wide, and because the result is persisted by `tauri-plugin-window-state`
+      // the next run reads *that* as its original and adds another. It is a one-pixel bug that
+      // grows without bound, and it is the tell behind "the window is not the size I left it".
+      for (let pass = 0; pass < 3; pass++) {
         await cdp.send("Browser.setWindowBounds", { windowId, bounds: want });
         await page.waitForTimeout(250);
         const { bounds: got } = await cdp.send("Browser.getWindowBounds", { windowId });
-        if (got.left === left && got.top === top) return;
-        want = { ...want, left: want.left - (got.left - left), top: want.top - (got.top - top) };
+        const off = Object.fromEntries(
+          Object.keys(target).map((k) => [k, got[k] - target[k]]),
+        );
+        if (Object.values(off).every((d) => d === 0)) return;
+        want = Object.fromEntries(Object.keys(target).map((k) => [k, want[k] - off[k]]));
       }
     };
     // Height is held at whatever it already was: only width drives this ladder, and changing both
@@ -963,9 +994,17 @@ try {
       // it gave it back.
       const { bounds: after } = await cdp.send("Browser.getWindowBounds", { windowId });
       console.log(`  …    the app was resized for ${((Date.now() - resizeStart) / 1000).toFixed(1)}s`);
+      // Within a pixel per axis, not exactly — the corrective loop above converges to the pixel
+      // and no further, because CDP reports frame geometry and applies client geometry and the
+      // inset is not always an integer at fractional DPI. Demanding exact equality here failed a
+      // restore that had in fact worked, and every check after it inherited the failure. The leak
+      // worth failing over is a window left an entire responsive rung away, never one pixel.
+      const drift = ["left", "top", "width", "height"].filter(
+        (k) => Math.abs(after[k] - original[k]) > 1,
+      );
       assert.deepEqual(
-        after,
-        original,
+        [drift, after.windowState ?? "normal"],
+        [[], original.windowState ?? "normal"],
         `the ladder did not put the window back — this state is persisted and the app reopens in it` +
           ` (was ${JSON.stringify(original)}, now ${JSON.stringify(after)})`,
       );
@@ -1770,6 +1809,303 @@ try {
   // check drives it through the UI (right-click → Move to Trash → Undo) and then asks the catalog
   // whether the asset actually came back. Trash is catalog-only — no file is touched either way,
   // and the asset is restored through the backend in `finally` whatever the UI did.
+  /**
+   * Every `var(--token)` the app actually *renders* resolves to something.
+   *
+   * A misspelled custom property is the quietest bug CSS has: `var(--font-mono, monospace)` looks
+   * like a token with a sensible fallback and is in fact a typo for `--ff-mono` that silently
+   * caught itself, so four mono readouts were never JetBrains Mono. Where there is no fallback the
+   * declaration is simply dropped — `background: var(--ls-hover)` gave the context menu no hover
+   * at all, and `minmax(var(--card, 148px))` pinned the Identify grid to one density forever.
+   * None of it warns, none of it fails a build, and none of it is visible unless you already knew.
+   *
+   * This walks the live DOM instead of the source, so it only judges what the app is really using.
+   */
+  await check("every CSS token the app renders is a token that exists", async () => {
+    const unresolved = await page.evaluate(() => {
+      const bad = [];
+      const root = getComputedStyle(document.documentElement);
+      const seen = new Set();
+      for (const sheet of document.styleSheets) {
+        let rules;
+        try {
+          rules = sheet.cssRules;
+        } catch {
+          continue; // cross-origin; nothing of ours lives there
+        }
+        const walk = (list) => {
+          for (const r of list) {
+            if (r.cssRules) walk(r.cssRules);
+            if (!r.style) continue;
+            // Anything the rule defines itself is defined for its own subtree.
+            const local = new Set();
+            for (const prop of r.style) if (prop.startsWith("--")) local.add(prop);
+            for (const prop of r.style) {
+              const value = r.style.getPropertyValue(prop);
+              for (const m of value.matchAll(/var\(\s*(--[\w-]+)\s*([,)])/g)) {
+                const [, name, next] = m;
+                if (local.has(name)) continue;
+                if (root.getPropertyValue(name).trim() !== "") continue;
+                // A token with a fallback still *renders*, but if the name is wrong the fallback
+                // is what you get forever — which is the bug, not the safety net.
+                const key = `${name} in ${r.selectorText ?? "?"} { ${prop} }`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                bad.push({ name, selector: r.selectorText ?? "?", prop, fallback: next === "," });
+              }
+            }
+          }
+        };
+        walk(rules);
+      }
+      return bad;
+    });
+    // Element-scoped tokens (`style="--card: 205px"`, `--h` on a waveform bar, `--depth` on a
+    // tree row) live on the element, never on `:root`, so the sweep above cannot see them.
+    //
+    // Deliberately **not** an allow-list of their names: a hand-kept list of exceptions is the
+    // thing that rots, and this check exists precisely because nobody notices token names going
+    // stale. The rule instead is *is this name ever assigned anywhere in the running app* —
+    // in any stylesheet rule, or in any element's inline style. A name that is assigned nowhere
+    // is the bug (`--font-mono`, `--ls-hover`); a name assigned somewhere is a real token whose
+    // scope this sweep simply cannot reach.
+    //
+    // What that trade gives up is the third case: `--card` **was** assigned — on the Library
+    // grid — and merely absent on the Identify one. No name-based rule can see that, which is
+    // why the element check below names it directly.
+    const assigned = await page.evaluate(() => {
+      const names = new Set();
+      for (const sheet of document.styleSheets) {
+        let rules;
+        try {
+          rules = sheet.cssRules;
+        } catch {
+          continue;
+        }
+        const walk = (list) => {
+          for (const r of list) {
+            if (r.cssRules) walk(r.cssRules);
+            if (!r.style) continue;
+            for (const prop of r.style) if (prop.startsWith("--")) names.add(prop);
+          }
+        };
+        walk(rules);
+      }
+      for (const el of document.querySelectorAll("[style]")) {
+        for (const prop of el.style) if (prop.startsWith("--")) names.add(prop);
+      }
+      return [...names];
+    });
+    // …plus every name the *source* assigns. An inline token can be conditional —
+    // `style={traitColor.has(v) ? `--chip: var(${…})` : ""}` — so whether the running app has one
+    // set depends on the data in this library, not on whether the code is correct. Reading the
+    // components closes that gap without an exceptions list: a name assigned in the source is a
+    // real token, and a name assigned nowhere at all is the bug this check is for.
+    const src = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "src");
+    const files = [];
+    (function walkDir(d) {
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) walkDir(p);
+        else if (/\.(svelte|css|ts)$/.test(e.name)) files.push(p);
+      }
+    })(src);
+    const assignedSet = new Set(assigned);
+    for (const f of files) {
+      for (const m of fs.readFileSync(f, "utf8").matchAll(/(--[\w-]+)\s*:/g)) {
+        assignedSet.add(m[1]);
+      }
+    }
+    const real = unresolved.filter((u) => !assignedSet.has(u.name));
+    assert.deepEqual(
+      real,
+      [],
+      // One line: the runner prints only a failure's first line, and a list that scrolls off is
+      // a list nobody reads.
+      `these var() names resolve to nothing \u2014 ` +
+        real
+          .map((u) => `${u.name} in ${u.selector} { ${u.prop} }${u.fallback ? " [falls back, so it never looks broken]" : ""}`)
+          .join(" \u00b7 "),
+    );
+    // …and the element-scoped ones must actually be set where they are used, or they are the
+    // same bug wearing a fallback: the Identify grid read `--card` that nothing assigned.
+    const cardSet = await page.evaluate(() => {
+      const el = document.querySelector('[data-testid="grid"], [data-testid="backlog"]');
+      return el ? el.style.getPropertyValue("--card").trim() : "";
+    });
+    assert.notEqual(cardSet, "", "the grid reads --card but nothing sets it on the element");
+  });
+
+  await check("the Inspector offers Stage, and it reaches the tray", async () => {
+    await page.fill('[data-testid="search-input"]', "");
+    await page.waitForFunction(() => document.querySelectorAll(".card").length > 0, undefined, {
+      timeout: 5000,
+    });
+    await page.locator(".card").first().click();
+    await page.waitForSelector('[data-testid="action-stage"]', { timeout: 5000 });
+    const id = Number(
+      await page.evaluate(() => document.querySelector(".card.selected")?.getAttribute("data-asset-id")),
+    );
+    const before = (await invoke("staged")).length;
+    try {
+      await page.click('[data-testid="action-stage"]');
+      await waitFor(
+        async () => (await invoke("staged")).includes(id),
+        "the Inspector's Stage did not reach the tray",
+      );
+      // And it is a toggle, not an add — the label has to answer back.
+      await waitFor(
+        async () => (await page.textContent('[data-testid="action-stage"]')).includes("Staged"),
+        "the button never said it was staged",
+      );
+      await page.click('[data-testid="action-stage"]');
+      await waitFor(
+        async () => !(await invoke("staged")).includes(id),
+        "Stage would not un-stage",
+      );
+    } finally {
+      await invoke("unstage", { ids: [id] });
+    }
+    assert.equal((await invoke("staged")).length, before, "the tray did not come back to where it was");
+  });
+
+  await check("sort goes inert while AI results are ranked", async () => {
+    await page.fill('[data-testid="search-input"]', "");
+    const live = await page.isDisabled('[data-testid="toolbar"] .sort select').catch(() => null);
+    if (live !== null) assert.equal(live, false, "sort is disabled with no query at all");
+
+    // Escalate to the AI the way the UI offers it — the row pinned under the filtered results.
+    await page.fill('[data-testid="search-input"]', "stone");
+    const escalate = page.locator('[data-testid="escalate"], .escalate').first();
+    if ((await escalate.count()) === 0) return; // no escalation offered for this query; nothing to assert
+    await escalate.click();
+    await waitFor(
+      async () => await page.isDisabled(".sort select"),
+      "the sort stayed live over AI-ranked results, where changing it throws the ranking away",
+    );
+    await page.fill('[data-testid="search-input"]', "");
+    await waitFor(
+      async () => !(await page.isDisabled(".sort select")),
+      "clearing the query left the sort disabled",
+    );
+  });
+
+  // ---- The keyboard map (UI-SPEC §0.4) ----------------------------------------------------
+  // Every row below was wrong or absent until the 2026-08-26 audit, and none of it was visible
+  // from a screenshot: a key that does nothing looks exactly like a key you pressed wrong.
+
+  await check("/ focuses the search box from anywhere", async () => {
+    await page.fill('[data-testid="search-input"]', "");
+    await page.locator(".card").first().click();
+    await page.waitForSelector('[data-testid="inspector-name"]', { timeout: 5000 });
+    await page.keyboard.press("/");
+    const focused = await page.evaluate(
+      () => document.activeElement?.getAttribute("data-testid"),
+    );
+    assert.equal(focused, "search-input", "/ did not reach the search box");
+    // And it must not type itself into the box it just focused.
+    const value = await page.inputValue('[data-testid="search-input"]');
+    assert.equal(value, "", `/ left "${value}" in the box`);
+    await page.keyboard.press("Escape");
+    await page.locator("body").click({ position: { x: 5, y: 5 } });
+  });
+
+  await check("F toggles the star rather than only adding it", async () => {
+    await page.fill('[data-testid="search-input"]', "");
+    await page.waitForFunction(() => document.querySelectorAll(".card").length > 0, undefined, {
+      timeout: 5000,
+    });
+    await page.locator(".card").first().click();
+    await page.waitForSelector('[data-testid="inspector-name"]', { timeout: 5000 });
+    const id = Number(
+      await page.evaluate(() => document.querySelector(".card.selected")?.getAttribute("data-asset-id")),
+    );
+    const starred = async () => {
+      const p = await invoke("grid_page", {
+        query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+                 favorites_only: true, trashed_only: false, page: 0, page_size: 100000 },
+      });
+      return p.items.some((i) => i.asset_id === id);
+    };
+    const was = await starred();
+    try {
+      await page.keyboard.press("f");
+      await page.waitForFunction(async () => true, undefined, { timeout: 200 }).catch(() => {});
+      await waitFor(async () => (await starred()) !== was, "F did not change the star");
+      await page.keyboard.press("f");
+      await waitFor(async () => (await starred()) === was, "the second F did not toggle it back");
+    } finally {
+      await invoke("set_favorite", { assetIds: [id], on: was });
+    }
+  });
+
+  await check("Ctrl-A picks the page, and a filter change disarms the bulk bar", async () => {
+    await page.fill('[data-testid="search-input"]', "");
+    await page.waitForFunction(() => document.querySelectorAll(".card").length > 2, undefined, {
+      timeout: 5000,
+    });
+    await page.locator(".card").first().click();
+    const cards = await page.evaluate(() => document.querySelectorAll(".card").length);
+
+    await page.keyboard.press("Control+a");
+    await page.waitForSelector('[data-testid="bulk-count"]', { timeout: 5000 });
+    const picked = Number(
+      (await page.textContent('[data-testid="bulk-count"]')).replace(/\D+/g, ""),
+    );
+    assert.equal(picked, cards, `Ctrl-A picked ${picked} of the ${cards} cards on the page`);
+
+    // The pick set is what the bulk bar writes tags to. Narrowing the filter has to disarm it,
+    // or `+ Add tag` stays live and aimed at assets that are no longer on screen.
+    await page.fill('[data-testid="search-input"]', "zzzz-no-such-asset");
+    await waitFor(
+      async () => (await page.locator('[data-testid="bulk-count"]').count()) === 0,
+      "the bulk bar survived a filter change, still holding the old picks",
+    );
+    await page.fill('[data-testid="search-input"]', "");
+    await page.keyboard.press("Escape");
+  });
+
+  await check("Delete moves the selection to Trash, through the confirm gate", async () => {
+    const live = () =>
+      invoke("grid_page", {
+        query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+                 favorites_only: false, trashed_only: false, page: 0, page_size: 100000 },
+      });
+    await page.fill('[data-testid="search-input"]', "");
+    await page.waitForFunction(() => document.querySelectorAll(".card").length > 0, undefined, {
+      timeout: 5000,
+    });
+    await page.locator(".card").first().click();
+    await page.waitForSelector('[data-testid="inspector-name"]', { timeout: 5000 });
+    const id = Number(
+      await page.evaluate(() => document.querySelector(".card.selected")?.getAttribute("data-asset-id")),
+    );
+    const before = (await live()).total;
+    try {
+      // First press arms; §11.7's gate is on by default, so one press must NOT bin anything.
+      await page.keyboard.press("Delete");
+      await page.waitForSelector(".toast", { timeout: 5000 });
+      assert.equal((await live()).total, before, "the first Delete binned it without confirming");
+
+      await page.keyboard.press("Delete");
+      await waitFor(async () => (await live()).total === before - 1, "Delete never moved it to Trash");
+    } finally {
+      // Catalog-only and reversible — the file on disk was never touched (DATA-MODEL §8).
+      await invoke("set_trashed", { assetIds: [id], trashed: false });
+    }
+    assert.equal((await live()).total, before, "restore did not bring it back");
+
+    // Leave no Undo toast behind. The next check waits 1.5 s for a `toast-action` to decide
+    // whether its own trash click armed or committed — this check's Undo would still be on
+    // screen, it would read it as "committed", skip its confirming click, and fail on a trash
+    // that never happened. A leaked toast is as much cross-check state as a leaked window size.
+    await page.waitForFunction(
+      () => !document.querySelector('[data-testid="toast-action"]'),
+      undefined,
+      { timeout: 8000 },
+    );
+  });
+
   await check("the toast that announces a trash offers the undo that reverses it", async () => {
     await page.fill('input[type="text"]', "");
     await page.waitForFunction(() => document.querySelectorAll(".card").length > 3, undefined, {

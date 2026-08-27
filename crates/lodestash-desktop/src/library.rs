@@ -1857,9 +1857,31 @@ impl Library {
         self.staged.clear();
     }
 
-    /// The staged asset ids, in the order they were staged.
+    /// The staged asset ids, in the order they were staged — **live rows only**.
+    ///
+    /// UI-SPEC §7: *"Trashed assets leave search, dup groups, and staging everywhere."* Filtered
+    /// on read rather than purged when the trash op runs, for the same reason
+    /// `Catalog::collection_members` does it that way: Trash is reversible, and a restore has to
+    /// put the asset back in the tray it was picked into. Until 2026-08-26 neither end did it, so
+    /// a trashed asset kept its tile in the tray and `⇢ Add all N to project` would have queued
+    /// an import for it.
+    ///
+    /// A staged id with no row at all (its source went away between sessions) also drops out —
+    /// the tray is transient, and there is nothing useful to draw for it.
     pub fn staged_ids(&self) -> Vec<i64> {
-        self.staged.clone()
+        // One pass over the rows, then a set lookup per pick — the tray holds tens of ids and the
+        // library holds thousands, so the nested form would be the wrong way round.
+        let live: std::collections::HashSet<i64> = self
+            .rows
+            .iter()
+            .filter(|r| !r.trashed)
+            .map(|r| r.item.asset_id)
+            .collect();
+        self.staged
+            .iter()
+            .copied()
+            .filter(|id| live.contains(id))
+            .collect()
     }
 
     /// The pack browser's left tree (PACK-DIRECTORY-NAV §5): every folder inside one package with
@@ -2677,6 +2699,35 @@ mod tests {
             names,
             ["zeta", "mid", "alpha"],
             "rank 0, rank 1, then the unranked"
+        );
+    }
+
+    /// UI-SPEC §7: *"Trashed assets leave search, dup groups, and **staging** everywhere."*
+    ///
+    /// The pick is kept, not dropped — Trash is reversible, so restoring has to put the asset back
+    /// in the tray it was picked into. Until 2026-08-26 the tray showed it the whole time, and
+    /// `⇢ Add all N to project` would have queued an import for an asset the user had just binned.
+    #[test]
+    fn a_trashed_pick_leaves_the_staging_tray_and_comes_back_with_it() {
+        let mut l = lib(&[("kept", "model_3d"), ("binned", "model_3d")]);
+        l.rows[0].item.asset_id = 10;
+        l.rows[1].item.asset_id = 20;
+
+        assert_eq!(l.stage(&[10, 20]), 2);
+        assert_eq!(l.staged_ids(), vec![10, 20]);
+
+        l.rows[1].trashed = true;
+        assert_eq!(
+            l.staged_ids(),
+            vec![10],
+            "a trashed asset is still in the tray"
+        );
+
+        l.rows[1].trashed = false;
+        assert_eq!(
+            l.staged_ids(),
+            vec![10, 20],
+            "restoring lost the pick, and its place in the order"
         );
     }
 

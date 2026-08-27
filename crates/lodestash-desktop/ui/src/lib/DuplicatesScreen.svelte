@@ -346,7 +346,7 @@
     color: var(--ls-text-muted);
   }
   .mono {
-    font-family: var(--font-mono, monospace);
+    font-family: var(--ff-mono);
   }
   .pill {
     padding: 0 var(--sp-2);

@@ -155,7 +155,9 @@ import JobTray from "./lib/JobTray.svelte";
     trashArmed = true;
     clearTimeout(trashTimer);
     trashTimer = setTimeout(() => (trashArmed = false), 3000);
-    push("Click again to confirm — moving to Trash", "warn");
+    // "Press again", not "Click again": the same arm/confirm now backs the Delete key, and a
+    // prompt that names the wrong gesture is a prompt people stop reading.
+    push("Press again to confirm — moving to Trash", "warn");
   }
 
   // Persisted view prefs (FEATURES §10): hydrate once at startup, then write the whole object
@@ -282,9 +284,31 @@ import JobTray from "./lib/JobTray.svelte";
   // thread LibraryScreen → Card; the tray itself gets ids + handlers as plain props.
   const STAGING_CTX = "ls:staging";
   let stagedIds = $state<number[]>([]);
-  staged()
-    .then((ids) => (stagedIds = ids))
-    .catch(() => {});
+  /**
+   * Re-read the tray after any catalog write, rather than only at startup.
+   *
+   * This was a one-shot `staged()` at init, so the tray only ever changed when *it* was the thing
+   * clicked. Trashing a staged asset left its tile sitting there — UI-SPEC §7 says a trashed
+   * asset leaves staging everywhere, and `Library::staged_ids` now enforces that on the read, but
+   * nothing asked again for the answer.
+   *
+   * **Not** a fix for the per-project tray of UI-SPEC §16.2: the shell's shortlist is still one
+   * in-memory list that no project owns (the open half of the export-history card in
+   * `KANBAN-SVELTE.md`), so switching project does not swap it — there is only one. This effect
+   * is what will make the swap show up once there is something to swap.
+   */
+  $effect(() => {
+    view.dataVersion;
+    let stale = false;
+    staged()
+      .then((ids) => {
+        if (!stale) stagedIds = ids;
+      })
+      .catch(() => {});
+    return () => {
+      stale = true;
+    };
+  });
 
   /** Toggle one asset in/out of the tray, then re-read the authoritative list. */
   async function toggleStage(id: number) {
@@ -372,13 +396,73 @@ import JobTray from "./lib/JobTray.svelte";
       e.preventDefault();
       return;
     }
-    // F — favourite the selected asset (UI-SPEC §0.4). Never steals from an input.
+    const inText =
+      e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement;
+
+    // `/` focuses the search box (DESIGN-GUIDELINES §9 keyboard nav). Missing until 2026-08-26,
+    // along with Delete below — both are named there and neither was in UI-SPEC §0.4's table,
+    // which is the table someone implementing the keyboard map reads. §0.4 now carries them.
+    if (e.key === "/" && !inText && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      const box = document.querySelector<HTMLInputElement>('[data-testid="search-input"]');
+      if (box) {
+        e.preventDefault();
+        box.focus();
+        box.select();
+      }
+      return;
+    }
+
+    // Delete — move the selection to Trash, through the same arm/confirm gate the context menu
+    // uses, so the §11.7 "Confirm before moving to Trash" setting governs the key too. Acts on
+    // the **lead** only, not the pick set: the bulk bar deliberately offers no trash action, and
+    // a key that can bin fifty assets at once should not arrive without a bar that says so.
+    // Inert on the Trash screen — those rows are already there, and Restore is their action.
+    if (e.key === "Delete" && !inText && view.route !== "trash" && view.selected !== null) {
+      const id = view.selected;
+      e.preventDefault();
+      confirmTrash(() =>
+        write(() => setTrashed([id], true), () => "Moved to Trash", { undoable: true }).then(
+          afterRemoval,
+        ),
+      );
+      return;
+    }
+
+    // F — **toggle** the pin on the selection (UI-SPEC §0.3). It set `true` unconditionally until
+    // 2026-08-26, so the key could only ever add: pressing it on a starred asset re-wrote the same
+    // row and toasted "Added to Favorites" a second time. The card's ☆/★ tile and the context menu
+    // both toggled, so the same gesture had two different meanings depending on where you made it.
+    //
+    // The current value comes from `favIntent` when there is one, not from `selectedDetail`.
+    // `selectedDetail` is refetched *after* the write lands, so two presses inside that round trip
+    // — which is one key-repeat, never mind a fast hand — would both read the pre-write value and
+    // both write the same thing. `favIntent` records what this key last asked for, so the second
+    // press answers the first rather than racing it.
     if (e.key.toLowerCase() === "f" && !e.ctrlKey && !e.metaKey && !e.altKey) {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
-      if (view.selected == null) return;
-      write(() => setFavorite([view.selected!], true), () => "Added to Favorites");
+      if (inText) return;
+      const id = view.selected;
+      if (id == null) return;
+      e.preventDefault();
+      const on = favIntent?.id === id ? favIntent.on : (selectedDetail?.favorite ?? false);
+      favIntent = { id, on: !on };
+      write(
+        () => setFavorite([id], !on),
+        () => (on ? "Removed from Favorites" : "Added to Favorites"),
+      );
     }
   }
+
+  /**
+   * What `F` last asked for, and for which asset — cleared once the catalog answers with it, or
+   * whenever the selection moves. Nothing else writes this: the card's ☆ tile and the context
+   * menu both read the row they are drawn from, which is already current.
+   */
+  let favIntent = $state<{ id: number; on: boolean } | null>(null);
+  $effect(() => {
+    const d = selectedDetail;
+    if (!d || favIntent == null) return;
+    if (d.asset_id !== favIntent.id || d.favorite === favIntent.on) favIntent = null;
+  });
 
   function afterRemoval() {
     // The asset just left this view; keeping it selected would leave the Inspector describing

@@ -19,6 +19,7 @@
   } from "./api";
   import { view } from "./nav.svelte";
   import { push } from "./toasts.svelte";
+  import { player } from "./audio.svelte";
 
   // Right-click menu (FEATURES §1.1): position + target asset. Closes on any action, Escape,
   // click-away or a scroll.
@@ -216,6 +217,12 @@
     if (e.target instanceof HTMLInputElement) return;
     if (e.target instanceof HTMLTextAreaElement) return;
 
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+      e.preventDefault();
+      pickPage();
+      return;
+    }
+
     // D15: arrows navigate the grid. A card *is* a <button>, so this has to run before the blanket
     // button guard below — otherwise the one element the arrows exist for is the one they ignore.
     const onCard = e.target instanceof HTMLElement && e.target.classList.contains("card");
@@ -265,15 +272,40 @@
         view.selected = null;
         view.clearSelection();
         e.preventDefault();
+      } else if (player.current !== null) {
+        // The third rung of §0.4's ladder, missing until 2026-08-26. A card's ▶ plays without
+        // selecting anything, so with no selection to clear Escape did nothing at all and the
+        // only way to stop a sound was to find the card again — or leave the screen, which is
+        // what App.svelte's route effect does. Escape is the key people press for that.
+        player.stop();
+        e.preventDefault();
       }
     }
+  }
+
+  /**
+   * `Ctrl/Cmd-A` — pick every card in view (UI-SPEC §0.4).
+   *
+   * **Scoped to the current page, not the whole filter**, which is a narrowing of what §0.4 says
+   * and is written down there too. Pagination arrived after that line: `result.items` is one page,
+   * `result.total` can be eight thousand, and the bulk bar this fills acts on what it holds —
+   * one keystroke that arms a tag write over eight thousand rows the user cannot see is a footgun,
+   * not a shortcut. The page is what `step()` already treats as "the visible set".
+   */
+  function pickPage() {
+    const ids = (result?.items ?? []).map((x) => x.asset_id);
+    if (ids.length === 0) return;
+    const all = ids.every((id) => view.selectedIds.includes(id));
+    view.selectedIds = all
+      ? view.selectedIds.filter((id) => !ids.includes(id))
+      : Array.from(new Set([...view.selectedIds, ...ids]));
   }
 
   // Any change to what is being *asked for* resets to the first page. Staying on page 9 after
   // a query that matches two assets is how a grid ends up looking empty; sort order changes
   // reset too, since page 9 of a re-sorted list is a different set of assets entirely.
   let queryKey = $derived(
-    `${view.tab} ${view.search} ${view.status} ${view.sortBy} ${view.sortAsc} ${trashedOnly}` +
+    `${view.route} ${view.tab} ${view.search} ${view.status} ${view.sortBy} ${view.sortAsc} ${trashedOnly}` +
       // The ⚑ filter belongs in the reset key for the same reason the search does: narrowing
       // the result while the pager sits on page 9 shows an empty grid.
       ` ${JSON.stringify(view.filter)} ${view.packageFilter} ${view.collectionFilter?.id ?? ""} ${view.source}`,
@@ -283,8 +315,16 @@
   let lastKey = "";
   $effect(() => {
     if (queryKey !== lastKey) {
+      const first = lastKey === "";
       lastKey = queryKey;
       page = 0;
+      // The pick set has to go with the page. It is what the bulk bar acts on, and nothing
+      // cleared it until 2026-08-26: narrow the filter — or walk to Trash and back — and the bar
+      // still read "3 selected" over a grid holding none of them, with **+ Add tag** live and
+      // aimed at assets that were no longer on screen. `view.selected` (the lead, which drives
+      // the Inspector) is deliberately left alone: it survives a filter change on purpose, and
+      // one asset being described is not the same as a bulk write being armed.
+      if (!first) view.clearSelection();
     }
     // Re-run after any write: the backend re-read the catalog, so this re-asks rather than
     // patching rows locally to match a guess about what changed.
@@ -1061,7 +1101,7 @@
     color: var(--ls-text);
   }
   .ctx-menu button:hover {
-    background: var(--ls-hover);
+    background: var(--ls-overlay);
   }
   .ctx-menu button.danger {
     color: var(--ls-danger);

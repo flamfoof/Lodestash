@@ -407,6 +407,110 @@ are pathname-only folder rows — `read_manifest` records an offset for every re
       (noted in the UI). Cloud API keys were already reachable via AI TAGGING — the remaining
       opt-in surface gap is gone.
 
+## ✅ Cross-feature audit — 2026-08-26 (pre-plugin)
+
+A pass over the features **and the seams between them**, asked for before the Unity plugin starts.
+Eleven defects, every one of them silent: none showed as an error, a failing test or a wrong pixel in
+a screenshot, and six were the same shape — *a rule stated in one doc and enforced in one place*,
+so the second place that needed it never got it. Verification after: **cargo test 328 · clippy 0 ·
+e2e 90/90 · svelte-check 0/0 · check-docs 36/0 · check-board 0**.
+
+- [x] **`--font-mono` is not a token — four mono readouts were never JetBrains Mono.**
+      `ConfirmDelete`, `DropZone`, `DuplicatesScreen` and `ImportDialog` all styled their mono
+      rows `font-family: var(--font-mono, monospace)`. The token is **`--ff-mono`**; the fallback
+      silently caught it, so paths and counts in four places rendered in whatever generic
+      monospace the system offered. A misspelled custom property does not warn — CSS has no
+      concept of one existing. The other 40-odd files got it right, which is why nobody looked.
+- [x] **`F` could only ever add a favourite.** UI-SPEC §0.3 specifies a toggle with two toasts;
+      `App.svelte` passed `true` unconditionally and always toasted "Added to Favorites". The
+      card's ☆/★ tile and the context menu both toggled correctly, so the same gesture meant two
+      different things depending on where you made it. Now reads the current value — and reads it
+      from **what the key last asked for** when a write is still in flight, because
+      `selectedDetail` refetches only after the write lands and one key-repeat outruns that.
+- [x] **`Ctrl/Cmd-A`, `Delete` and `/` did nothing.** All three are in a keyboard map. `Ctrl-A` was
+      in UI-SPEC §0.4; `Delete` and `/` were in DESIGN-GUIDELINES §9 and **not** in §0.4, which is
+      the table anyone implementing the keyboard reads. The two docs disagreed about what the
+      keyboard does and the app implemented neither answer. §0.4 now carries all three and DG §9
+      points at it as the owner. `Ctrl-A` is deliberately **page-scoped**, a narrowing written into
+      the spec: pagination arrived after that line, and one keystroke arming the bulk bar over
+      eight thousand invisible rows is a footgun. `Delete` is lead-only and rides the §11.7
+      confirm gate.
+- [x] **Escape's third rung was missing.** §0.4's ladder is *close Quick Look → clear selection →
+      stop audio*. The first two were wired. A card's ▶ plays without selecting anything, so with
+      no selection to clear Escape did nothing and the only way to stop a sound was to find the
+      card again — or leave the screen, which is what the route effect already did.
+- [x] **The pick set outlived the grid it was picked from.** Nothing cleared `selectedIds` on a
+      filter, query, sort or route change. Pick three cards, narrow the search — or walk to Trash
+      and back — and the bulk bar still read `3 selected` with **+ Add tag** live, aimed at assets
+      no longer on screen. It now resets with the page, on the same key that already reset it;
+      the *lead* selection is deliberately untouched, since one asset being described is not the
+      same as a bulk write being armed.
+- [x] **Trashed assets stayed in collections and in both staging trays.** UI-SPEC §7 is explicit
+      — *"trashed assets leave search, dup groups, and staging everywhere"* — and search and dup
+      groups honoured it (both run through `live()`). Collections did not: `collection_members`
+      and `list_collections`' count returned soft-deleted rows, so a collection card counted
+      assets its strip would not draw, and `import_staged` would have copied a binned asset into
+      a Unity project. The shell's own in-memory tray had the same hole. **Filtered on read at
+      both ends, not purged on trash**: Trash is reversible, and a restore has to put the asset
+      back in the collection and the tray it was picked into — both covered by a test that trashes
+      and restores.
+- [x] **The staging tray never re-read itself.** `staged()` was called once at startup, so the
+      tray only changed when the tray was the thing clicked — trashing a staged asset left its
+      tile sitting there. Now follows `dataVersion` like every other read. *(This is not the
+      per-project tray of §16.2; the shell's shortlist is still one in-memory list — see the open
+      half of the export-history card.)*
+- [x] **The Inspector had no ⟡ Stage.** §13.10 puts Stage beside Import in that action row. The
+      card had it, the list row had it, and the panel you open to decide about **one** asset did
+      not — you had to go back to the grid and find the card again. §16.2 already assumed the
+      pairing, offering Export to folder here "because a single pick should not have to be staged
+      first". Wired through the same staging context the cards use, inert on an unreachable file
+      for the same reason `⟡` is on the card.
+- [x] **Two more tokens that resolve to nothing, found by sweeping every `var()` in the app.**
+      `--ls-hover` is not a token, so `.ctx-menu button:hover` and the Trash row's `↩ Restore`
+      had **no hover state at all** — the declaration is simply dropped, and a control that does
+      not answer the pointer reads as a dead control. `--card` is set on the Library grid element
+      (`style="--card: {cardPx}px"`) but the **Identify** grid only read it, with a `148px`
+      fallback: the density segmented control worked everywhere the user could watch it change
+      and silently did nothing on the one screen they leave running. Both fixed, and the sweep is
+      now a permanent e2e check that walks the live stylesheets — the class of bug is invisible
+      by construction, so it needed a machine to look.
+- [x] **Sort stayed live over AI-ranked results.** §2.2 says it is disabled there, and it was not.
+      `page_with_ranks` consults the ranks **only** under `SortBy::Relevance`, so picking Size or
+      Name threw the ranking away while the cards kept their `✦ NN%` badges — percentages sitting
+      in an order they no longer described, which is worse than no percentages.
+
+### The e2e suite was hiding its own failures
+
+Found while verifying the above: a run reported **30/87**, and 57 of those failures were one
+message — `left the app at 2561×1370, not the 2560×1370 it started at`.
+
+- [x] **The viewport guard and the restore disagreed by a pixel.** The ladder check's restore waits
+      for `Math.abs(innerWidth - w) <= 1` and then returns satisfied; the per-check guard added
+      alongside it compared **exactly**. One pixel of frame-vs-client rounding therefore passed the
+      restore, failed the guard, and failed every one of the eighty checks after it. Both are `<= 1`
+      now. The leak this guard exists to catch is a window left an entire responsive rung away.
+- [x] **And the restore only corrected two of its four axes** — the real bug under that pixel.
+      `Browser.setWindowBounds` reports **frame** geometry and applies **client** geometry; the
+      corrective second pass handled `left`/`top` (added when this walked the window down the
+      screen a title bar at a time) but not `width`/`height`. So each run put the window back one
+      pixel wider, `tauri-plugin-window-state` persisted it, and the next run read *that* as its
+      original and added another. A one-pixel bug with no upper bound — and the same mechanism,
+      on the same call, as the drift already fixed for position. All four axes are corrected now.
+- [x] **A check leaked an Undo toast into the next one.** The new `Delete` check ended with its
+      undo toast still on screen; the trash-toast check that follows waits 1.5 s for a
+      `toast-action` to decide whether its own click armed or committed, read the leftover as its
+      own, skipped its confirming click and failed on a trash that never happened. Toasts are
+      cross-check state exactly like window size, and this suite now treats them that way.
+
+**Not defects, confirmed by the same pass** — recorded so the next audit does not re-derive them:
+all 11 nav destinations render real screens (no stub is reachable); zero hard-coded hex in any
+component, every colour a token (the failures above were *misspelled* tokens, not literals);
+`:focus-visible` discipline holds everywhere, with every `outline: none` paired with the ring
+shadow; Settings' cards match §11's order (MCP absent, which
+§11.5 already marks interim); dup grouping and search already filter trashed rows; the unavailable
+source chain (banner → facet → card plate → inert `⟡` with live `⤴` → Quick Look relink) is
+complete; deleting a collection clears it from the active filter.
+
 ## 🎯 UX pass — the 2026-08-22 design review (D-series)
 
 Fourteen proposals from a review of the specs against the code, designed as artboards and written

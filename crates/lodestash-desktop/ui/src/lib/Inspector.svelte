@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { getContext } from "svelte";
   import Icon from "./Icon.svelte";
   import CompareRows from "./CompareRows.svelte";
   import {
@@ -25,6 +26,20 @@
   import { traitColor } from "./traits.svelte";
   import { sources } from "./sources.svelte";
   import { player, fmtClock } from "./audio.svelte";
+
+  /**
+   * The staging tray, through the same context the cards use (App.svelte `setContext("ls:staging")`).
+   *
+   * UI-SPEC §13.10 puts **⟡ Stage / ✓ Staged** in this action row, beside Import. It was the one
+   * surface without it until 2026-08-26: the card had ⟡, the list row had ⟡, and the panel you
+   * open to *decide* about a single asset had no way to add it to the shortlist — you had to go
+   * back to the grid and find the card again. §16.2 already assumes the pairing, offering Export
+   * to folder here "because a single pick should not have to be staged first".
+   */
+  const staging = getContext<{
+    isStaged?: (id: number) => boolean;
+    toggleStage?: (id: number) => void;
+  }>("ls:staging");
 
   let {
     assetId,
@@ -57,6 +72,8 @@
     /** **Export to folder** (UI-SPEC §16.2): copy this asset anywhere, no editor involved. */
     onexport: () => void;
   } = $props();
+
+  let staged = $derived(assetId != null && (staging?.isStaged?.(assetId) ?? false));
 
   /**
    * UI-SPEC §13 has three states, not one:
@@ -619,6 +636,26 @@
         >
           ⇢ Add to project
         </button>
+        <!-- ⟡ Stage sits **before** Export, matching §13.10's order: the tray is the cheap,
+             reversible pick; exporting writes files. Inert on an unreachable file for the same
+             reason ⟡ is on the card — staging what an import would skip is a promise the tray
+             cannot keep (§11.1). -->
+        <button
+          class="stage"
+          class:on={staged}
+          class:inert={gone}
+          aria-disabled={gone}
+          aria-pressed={staged}
+          onclick={() => !gone && assetId != null && staging?.toggleStage?.(assetId)}
+          data-testid="action-stage"
+          title={gone
+            ? `${sources.get(detail?.source_id ?? -1)?.name ?? "This library"} is unavailable — an import would skip this file`
+            : staged
+              ? "In the staging tray — click to take it out"
+              : "Add to the staging tray (UI-SPEC §16.2)"}
+        >
+          {staged ? "✓ Staged" : "⟡ Stage"}
+        </button>
         <button
           onclick={onexport}
           data-testid="action-export"
@@ -755,7 +792,8 @@
   .actions button:hover {
     border-color: var(--ls-gold);
   }
-  .actions .star.on {
+  .actions .star.on,
+  .actions .stage.on {
     color: var(--ls-gold);
     border-color: var(--ls-gold);
   }

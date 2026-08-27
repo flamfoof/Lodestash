@@ -12,6 +12,13 @@
   // to advance to the next op (a reverted op is removed from the log).
   let lastOp = $state<OpLogRow | null>(null);
   let undoBusy = $state(false);
+  /**
+   * AI results are ranked by match (UI-SPEC §2.2), so sorting them by anything else is not a
+   * sort — it is discarding the ranking. `searchMode` alone is not enough: escalating and then
+   * clearing the box leaves the mode set with nothing ranked to protect.
+   */
+  let ranked = $derived(view.searchMode === "ai" && view.search.trim() !== "");
+
   /** Step 4 of the ladder: below 960px the sort controls live behind this. */
   let overflowOpen = $state(false);
   let redoHead = $state<OpLogRow | null>(null);
@@ -127,9 +134,18 @@
      ladder says *move* chrome behind a gesture, never remove it — a sort you cannot reach on a
      narrow window is a worse answer than a sort that costs one click. -->
 {#snippet sortControls()}
-  <label class="sort">
+  <!-- Inert while AI results are on screen (UI-SPEC §2.2: *"sort is disabled while AI-ranked
+       results are shown"*). It was live until 2026-08-26, and picking Size or Name there threw the
+       ranking away without saying so: `page_with_ranks` only consults the ranks under
+       `SortBy::Relevance`, so the cards kept their `✦ NN%` badges while sitting in an order those
+       numbers no longer described. A percentage in the wrong order is worse than no percentage. -->
+  <label class="sort" class:inert={ranked}>
     Sort
-    <select bind:value={view.sortBy}>
+    <select
+      bind:value={view.sortBy}
+      disabled={ranked}
+      title={ranked ? "AI results are ranked by match — clear the search to sort" : "Sort the grid"}
+    >
       {#each SORTS as s (s.id)}
         <option value={s.id}>{s.label}</option>
       {/each}
@@ -137,8 +153,13 @@
   </label>
   <button
     class="dir"
+    disabled={ranked}
     onclick={() => (view.sortAsc = !view.sortAsc)}
-    title={view.sortAsc ? "Ascending" : "Descending"}
+    title={ranked
+      ? "AI results are ranked by match — clear the search to sort"
+      : view.sortAsc
+        ? "Ascending"
+        : "Descending"}
     aria-label={view.sortAsc ? "Ascending" : "Descending"}
   >
     {view.sortAsc ? "↑" : "↓"}
@@ -400,6 +421,17 @@
   }
   /* The undo button dims hard when the log is empty or an undo is in flight; hover must not
      re-brighten a button that cannot act. */
+  /* Disabled sort: dimmed and un-clickable, but still readable and still focusable-looking —
+     the user has to be able to see *which* sort is in force while the ranking holds it. */
+  .sort.inert,
+  .sort select:disabled,
+  .dir:disabled {
+    color: var(--ls-text-dim);
+    cursor: default;
+  }
+  .dir:disabled:hover {
+    border-color: var(--ls-border);
+  }
   .icon-btn:disabled {
     opacity: 0.25;
     cursor: default;

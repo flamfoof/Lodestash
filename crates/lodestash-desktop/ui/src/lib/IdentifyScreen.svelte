@@ -18,12 +18,16 @@
     getSettings,
     setSettings,
     libraryStatus,
+    DENSITIES,
     type GridItem,
     type PumpProgress,
     type Settings,
     type SourceSummary,
   } from "./api";
   import { view } from "./nav.svelte";
+
+  /** Same density stops as the Library grid (UI-SPEC §20.10) — one table, both screens. */
+  let cardPx = $derived(DENSITIES.find((d) => d.id === view.density)?.px ?? 148);
 
   /**
    * ADR-0008: appraisal is a background job, not a screen you sit on. The writer's idle pass does
@@ -335,7 +339,11 @@
         onaction={() => view.go("library")}
       />
     {:else}
-      <div class="grid" data-testid="backlog">
+      <!-- The backlog grid is the §2 grid minus stage/import (UI-SPEC §3), density included.
+           It read `var(--card, 148px)` and nothing ever set `--card` here, so this screen sat at
+           the fallback whatever the toolbar's ▪/▦/▣ said — a setting that worked everywhere the
+           user could see it change and silently did not on the one screen they leave running. -->
+      <div class="grid" style="--card: {cardPx}px" data-testid="backlog">
         {#each items as item (item.asset_id)}
           <Card
             {item}
@@ -448,7 +456,7 @@
   }
   .grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(var(--card, 148px), 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(var(--card), 1fr));
     gap: var(--sp-3);
   }
   .bg-row {

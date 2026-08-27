@@ -160,15 +160,34 @@ A **Favorites screen** sits second in the nav (§0.2), header `★ Favorites` + 
 | `Esc` | Quick Look open → else selection → else | close QL / clear selection / stop audio |
 | `← →` | Quick Look open | step prev/next within the visible set |
 | `Backspace` | Folders view | up one level |
-| `Ctrl/Cmd-A` | grid | select all in current filter |
+| `Ctrl/Cmd-A` | grid | pick every card on the **current page** |
 | `← → ↑ ↓` | grid | move the lead selection (↑↓ by one row); focus follows it |
 | `Shift` + arrow / click | grid | extend the **pick set** (what the bulk bar acts on) from the lead |
 | `Home` / `End` | grid | first / last of the visible page |
 | `Ctrl/Cmd-Z / Shift-Z` | catalog mutations | undo / redo (DESIGN-GUIDELINES §7) |
 | `Ctrl/Cmd-K` | anywhere | open the command palette: asset search + navigation (ROADMAP P7) |
+| `/` | anywhere | focus the search box |
+| `Delete` | asset selected | move it to Trash (through the §11.7 confirm gate) |
 
 Keys never fire while an input/textarea has focus — **except `Ctrl/Cmd-K`**, since the search
 box is where people press it.
+
+Three of these rows were reconciled on 2026-08-26, after an audit found the two docs disagreeing
+about what the keyboard does and the app implementing neither answer:
+
+- **`/` and `Delete`** were only ever in DESIGN-GUIDELINES §9's keyboard-nav paragraph, never in
+  this table — and this table is what anyone implementing the keyboard map reads. Both were
+  missing from the app. They are here now, and `Delete` is deliberately **lead-only**: the bulk
+  bar offers no trash action, and a key that can bin fifty assets at once should not arrive
+  without a bar that says so.
+- **`Ctrl/Cmd-A` is scoped to the current page**, not the whole filter, which is a narrowing of
+  what this row used to claim. Pagination (§2) arrived after that line was written: a filter can
+  hold eight thousand assets, one page holds fifty to a hundred, and the pick set this fills is
+  what the bulk bar writes tags to. One keystroke arming a write over eight thousand rows the
+  user cannot see is a footgun, not a shortcut. The page is already what `← →` in Quick Look
+  treats as "the visible set".
+- **`F` is a toggle**, per §0.3 — it set the star unconditionally until the same audit, so it
+  could only ever add, while the card's ☆/★ tile and the context menu both toggled.
 
 ---
 

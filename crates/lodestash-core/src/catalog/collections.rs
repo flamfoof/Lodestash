@@ -13,13 +13,18 @@ use super::*;
 
 impl Catalog {
     /// Every non-staging collection, name-ordered, with its member count (UI-SPEC §6).
+    ///
+    /// The count is of **live** members. UI-SPEC §7 is explicit that a trashed asset "leaves
+    /// search, dup groups, and staging everywhere", and a collection card reading `12 assets`
+    /// over a strip that renders nine is the same lie in a smaller place.
     pub fn list_collections(&self) -> Result<Vec<CollectionRow>> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT c.id, c.name, COUNT(ca.asset_id) AS n
+                "SELECT c.id, c.name, COUNT(a.id) AS n
                  FROM collection c
                  LEFT JOIN collection_asset ca ON ca.collection_id = c.id
+                 LEFT JOIN asset a ON a.id = ca.asset_id AND a.deleted_at IS NULL
                  WHERE c.is_staging = 0
                  GROUP BY c.id
                  ORDER BY c.name COLLATE NOCASE",
@@ -65,11 +70,23 @@ impl Catalog {
         Ok(())
     }
 
-    /// The member ids of one collection — what a collection-filtered grid matches on.
+    /// The **live** member ids of one collection — what a collection-filtered grid matches on,
+    /// what the staging tray counts, and what `import_staged` copies.
+    ///
+    /// Trashed members are excluded here rather than at each call site, because this is the one
+    /// function all three route through (UI-SPEC §7: a trashed asset leaves staging everywhere).
+    /// Until 2026-08-26 it returned them: the tray badge counted assets that were in the Trash,
+    /// and an import of that tray would have tried to copy them into the project. `set_trashed`
+    /// deliberately does not delete the membership row — Trash is reversible, and a restore has
+    /// to put the asset back in the collections it was in.
     pub fn collection_members(&self, id: i64) -> Result<Vec<i64>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT asset_id FROM collection_asset WHERE collection_id = ?1")
+            .prepare(
+                "SELECT ca.asset_id FROM collection_asset ca
+                   JOIN asset a ON a.id = ca.asset_id
+                  WHERE ca.collection_id = ?1 AND a.deleted_at IS NULL",
+            )
             .map_err(|e| CoreError::Catalog(format!("collection_members: {e}")))?;
         let rows = stmt
             .query_map(params![id], |r| r.get::<_, i64>(0))

@@ -554,6 +554,6 @@
   .restore:hover {
     border-color: var(--ls-border-strong);
     color: var(--ls-text);
-    background: var(--ls-hover);
+    background: var(--ls-overlay);
   }
 </style>
