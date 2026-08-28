@@ -686,7 +686,19 @@ import JobTray from "./lib/JobTray.svelte";
   {/if}
 
   {#if onboardingOpen}
-    <Onboarding onclose={() => (onboardingOpen = false)} />
+    <!-- Onboarding indexes folders now (UI-SPEC §1), so the shell has to re-read after it —
+         otherwise the library behind the panel is the empty one the user just fixed. -->
+    <Onboarding
+      onclose={() => (onboardingOpen = false)}
+      onindexed={async () => {
+        try {
+          status = await libraryStatus();
+        } catch {
+          /* the next navigation re-asks */
+        }
+        view.dataVersion += 1;
+      }}
+    />
   {/if}
 
   {#if chooserOpen}

@@ -53,6 +53,10 @@ export type SourceSummary = {
   state: string;
   /** Unix seconds the root last resolved — "unavailable since …". */
   last_seen_at: number | null;
+  /** `folder`, or a cache kind — onboarding (§1) tags rows "auto-detected" vs "folder". */
+  kind: string;
+  /** Unix seconds of the last completed crawl; `null` = never re-scanned since indexing. */
+  last_scanned_at: number | null;
 };
 
 export type LibraryStatus = {
@@ -581,6 +585,15 @@ export const bulkTag = (assetIds: number[], namespace: string, value: string, on
  */
 export const addSource = (path: string) => invoke<WriteResult>("add_source", { path });
 export const syncUnityCache = () => invoke<WriteResult>("sync_unity_cache");
+
+/** One Asset Store cache root found on disk and not yet a source (UI-SPEC §1). */
+export type CacheCandidate = { path: string; packs: number };
+/**
+ * Detect the Unity cache **without importing it**. Onboarding has to show the cache before the
+ * user agrees to index it — `syncUnityCache` is the version that crawls, and calling that to find
+ * out whether there was anything to find would index the machine to answer a question.
+ */
+export const unityCacheCandidates = () => invoke<CacheCandidate[]>("unity_cache_candidates");
 /** Native folder chooser for the sidebar's "+ Add source…" (B2b). `null` = cancelled. */
 export const addSourceDialog = () =>
   invoke<WriteResult | null>("add_source_dialog");

@@ -182,7 +182,7 @@ function snapshotWindowState() {
  * Start Vite (unless already running) and the app, then attach.
  * Returns `{ page, close }`; always call `close`.
  */
-export async function launch() {
+export async function launch({ keepOnboarding = false } = {}) {
   const spawned = [];
   assertBinaryIsCurrent();
   await evictStaleApp();
@@ -249,7 +249,13 @@ export async function launch() {
   // panel. The flag arrives over IPC a beat *after* the grid renders, so poll until the
   // panel is gone: dismiss it (a scrim click) whenever it is present, and keep checking
   // for the whole window in case it arrives late.
-  const onboardDeadline = Date.now() + 6_000;
+  //
+  // `keepOnboarding` opts out, for the one check that is *about* the panel. Without it that
+  // check could never run: it is written as "if the panel is present, assert things about it",
+  // and this loop guarantees it never is — so it passed for months having asserted nothing.
+  // Six seconds of clicking is also why the panel cannot be inspected by hand through this
+  // harness, which is how a rewritten onboarding screen nearly shipped unseen.
+  const onboardDeadline = keepOnboarding ? 0 : Date.now() + 6_000;
   while (Date.now() < onboardDeadline) {
     const dismissed = await page
       .evaluate(() => {
@@ -267,7 +273,11 @@ export async function launch() {
       await page.waitForTimeout(150);
     }
   }
-  await page.waitForSelector('[data-testid="onboarding"]', { state: "detached", timeout: 2_000 }).catch(() => {});
+  if (!keepOnboarding) {
+    await page
+      .waitForSelector('[data-testid="onboarding"]', { state: "detached", timeout: 2_000 })
+      .catch(() => {});
+  }
 
   return {
     page,

@@ -226,6 +226,50 @@ next time"** checkbox writes the same flag).
   honest statement that assets start Unidentified is kept — softening it would hide why early AI
   searches come back thin.)*
 
+**Shipped 2026-08-28**, and it replaces a **static explainer**: three numbered sentences and a
+"Get started" that described the app instead of setting it up — and whose third sentence promised
+you could *"pull the right asset into Unity in one step"*, which nothing in the app can do until
+the plugin exists. Step 1 now lists the sources actually indexed and the Asset Store cache detected
+on disk but not yet added (read-only detection: `unity_cache_candidates`, an `is_dir` per candidate
+root, never a crawl — running the importing version to find out whether there was anything to find
+would index the machine to answer a question). Step 2 runs the scan.
+
+**Two narrowings, both forced by what the backend can honestly report:**
+
+- **No "M new files" count** in the returning-user banner. Counting un-indexed files means walking
+  every source root, which costs the same as the scan the number is advertising. The banner states
+  what it knows — assets indexed, sources, when the last crawl finished — and the button reads
+  **⌘ Scan sources** rather than naming a size it would have to do the work twice to learn.
+- **The progress bar measures sources completed, not files.** `add_source` is a synchronous disk
+  walk that reports nothing mid-crawl; its own doc comment says *"a fake bar that jumps 0 → 100 is
+  worse than an honest spinner"*, and that is still true. Sources are scanned one at a time —
+  sequential because they contend on the same disk — so the bar and each mono log line correspond
+  to a source that genuinely finished, with the count it returned. A source that fails is logged
+  and the run continues: one unplugged drive must not stop the others. A per-file bar needs the
+  crawl to report progress, which is the job-tray work in ROADMAP, not this screen's.
+
+**Shipped 2026-08-28**, and it replaces a **static explainer**: three numbered sentences and a
+"Get started" that described the app instead of setting it up — and whose third sentence promised
+you could *"pull the right asset into Unity in one step"*, which nothing in the app can do until
+the plugin exists. Step 1 now lists the sources actually indexed and the Asset Store cache detected
+on disk but not yet added (read-only detection: `unity_cache_candidates`, an `is_dir` per candidate
+root, never a crawl — running the importing version to find out whether there was anything to find
+would index the machine to answer a question). Step 2 runs the scan.
+
+**Two narrowings, both forced by what the backend can honestly report:**
+
+- **No "M new files" count** in the returning-user banner. Counting un-indexed files means walking
+  every source root, which costs the same as the scan the number is advertising. The banner states
+  what it knows — assets indexed, sources, when the last crawl finished — and the button reads
+  **⌘ Scan sources** rather than naming a size it would have to do the work twice to learn.
+- **The progress bar measures sources completed, not files.** `add_source` is a synchronous disk
+  walk that reports nothing mid-crawl; its own doc comment says *"a fake bar that jumps 0 → 100 is
+  worse than an honest spinner"*, and that is still true. Sources are scanned one at a time —
+  sequential because they contend on the same disk — so the bar and each mono log line correspond
+  to a source that genuinely finished, with the count it returned. A source that fails is logged
+  and the run continues: one unplugged drive must not stop the others. A per-file bar needs the
+  crawl to report progress, which is the job-tray work in ROADMAP, not this screen's.
+
 ---
 
 ## 2. Library (home screen)
@@ -267,7 +311,10 @@ The browse-everything grid. Composition top→bottom:
      per `docs/design/README.md` — ALIGNMENT-AUDIT F1); thumbnail region (104px, dark
      recess) with: status gem badge (top-right), **pick checkbox** (top-left, appears on
      hover/when any pick is active), `✦ NN%` AI-match pill (top-left, AI results only),
-     **S/M/L/XL size badge** + `✓ in <project>` imported badge (bottom-left), **⤢ Quick Look** +
+     **S/M/L/XL size badge** (the **letter only** — it sits on the artwork and has nowhere to
+     grow; it read `S · 412 KB` until 2026-08-28, which repeated the byte size already in the stat
+     line below and could wrap the badge onto a second row over the thumbnail. Exact size on hover,
+     matching what the list row has always done) + `✓ in <project>` imported badge (bottom-left), **⤢ Quick Look** +
      **⟡ stage/✓ staged** actions (bottom-right, hover-revealed); body: type diamond + name
      (Unidentified: slate italic), mono pack line (pack name is a link → Pack stats §15) +
      short stats, trait chips (first 3 + `+N` expander; chips are click-to-search).

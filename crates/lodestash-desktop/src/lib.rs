@@ -520,6 +520,48 @@ fn sync_unity_cache(state: tauri::State<'_, AppState>) -> Result<WriteResult, St
     })
 }
 
+/// Unity Asset Store cache roots that **exist on this machine and are not already a source**
+/// (UI-SPEC §1: *"the Unity Asset Store cache is auto-detected … and listed first when present"*).
+///
+/// Read-only and cheap on purpose — an `is_dir` per candidate root and a `discover` of the pack
+/// names, never a crawl. Onboarding has to be able to *show* the cache before the user agrees to
+/// index it; `sync_unity_cache` is the version that imports, and running that to find out whether
+/// there was anything to find would index the machine to answer a question.
+#[tauri::command]
+fn unity_cache_candidates(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<CacheCandidate>, String> {
+    let known: Vec<String> = state
+        .library
+        .lock()
+        .map(|l| {
+            l.status()
+                .sources
+                .iter()
+                .map(|s| s.root_path.to_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(lodestash_ingest::asset_store::candidate_roots()
+        .into_iter()
+        .filter(|r| r.is_dir())
+        .map(|r| r.to_string_lossy().into_owned())
+        .filter(|p| !known.contains(&p.to_lowercase()))
+        .map(|path| {
+            let packs = lodestash_ingest::asset_store::discover(std::path::Path::new(&path)).len();
+            CacheCandidate { path, packs }
+        })
+        .collect())
+}
+
+/// One detected-but-not-yet-added Asset Store cache root (§1's source row).
+#[derive(serde::Serialize)]
+struct CacheCandidate {
+    path: String,
+    /// How many packs sit in it — the number that makes "add this" an informed click.
+    packs: usize,
+}
+
 /// The sidebar's "+ Add source…" chooser (B2b): a native folder dialog, then the same
 /// import path as dropping the folder. `None` = the user cancelled. Runs on the persist
 /// thread via `add_source`'s write; the dialog itself lives on the main thread.
@@ -1943,6 +1985,7 @@ pub fn run() {
             delete_from_disk,
             add_source,
             sync_unity_cache,
+            unity_cache_candidates,
             add_source_dialog,
             pick_folder,
             discover_package_folder,

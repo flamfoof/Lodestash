@@ -115,7 +115,32 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
 - [x] **Trash renders the ordinary grid + per-row Restore (2026-08-08).** The trash view is the
       ordinary grid/list; the list's rows gained a Restore action in trash mode
       (`AssetList row-restore`), alongside the inspector's Restore.
-- [ ] **Onboarding is a static explainer.** No two-step source/scan flow.
+- [x] **Onboarding is the two-step setup flow (2026-08-28, UI-SPEC §1).** Step 1 lists the
+      sources actually indexed — name, mono path, asset count, `folder` / `auto-detected` pill,
+      unavailable roots dimmed with a ✕ — above a verdant *"existing index found — N assets
+      across M sources, last scanned X"* banner, with **+ Add another folder…**, **Scan sources**
+      and **Open library →**. Step 2 scans and reports. `SourceSummary` gained `kind` and
+      `last_scanned_at` (both already on `SourceInfo`, never carried to the frontend), and
+      `unity_cache_candidates` detects the Asset Store cache **without importing it** — an
+      `is_dir` per candidate root, because the importing version would crawl the machine to
+      answer whether there was anything to find.
+      **Two narrowings, written into §1:** no *"M new files"* count (finding it out costs the
+      same walk as the scan it advertises), and the progress bar counts **sources**, not files —
+      `add_source` is a synchronous crawl that reports nothing mid-walk, and its own doc says a
+      fake bar is worse than an honest spinner. Each log line is a source that genuinely finished.
+      The old copy also promised you could *"pull the right asset into Unity in one step"*, which
+      nothing in the app can do until the plugin exists.
+- [x] **The e2e onboarding check had never asserted anything (2026-08-28).** `launch()` spends six
+      seconds clicking the panel away so the other ninety checks can reach the app — correct, and
+      it means the check written as *"if the panel is present, assert things about it"* takes its
+      branch **never**. It passed for months over a screen it could not see, which is how a
+      rewritten onboarding nearly shipped unlooked-at. The harness gained `keepOnboarding`, the
+      check now asserts the thing that actually matters to the suite (the panel is *gone*), and
+      the panel itself is inspected by `node e2e/onboarding-shot.mjs`. Two real bugs came out of
+      finally looking: the footer wrapped **Open library →** onto a row of its own *below* the
+      secondaries, and §1's `⌕` is not in the bundled Inter so it rendered as tofu — the same
+      trap §15 hit with `◉`, and the same fix (the icon sprite, since the fonts ship with the app
+      for the offline invariant).
 - [x] **Tag Graph interactive (2026-08-08).** Drag to pan, wheel to zoom (clamped 0.5–4×), click a
       node to filter the library to that tag and navigate — dependency arcs still belong to the
       LINKS graph (separate card).
@@ -177,7 +202,9 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
 - [ ] **License/attribution harvest.** Columns exist, no setter; `.meta` `labels:` parsed but never
       seeded into tags.
 - [ ] **Smart collections / `embedding_meta`.** DDL-only, never written.
-- [ ] **Trait-vocabulary teaching.** `teach=1` machinery exists; nothing feeds it to a tagger.
+- [x] **Trait-vocabulary teaching — stale card, corrected 2026-08-28.** It *is* wired:
+      `writer.rs` reads `teaching_traits()` into `ImageZeroShot`, and `ollama.rs` tests that they
+      enter the prompt only when in scope.
 - [x] **Full-res in-pack pulls (2026-08-08).** `lodestash://file` and `lodestash://mesh` now
       materialize a known in-pack asset through the size-capped scratch instead of answering
       `503 not_local` — Quick Look renders in-pack images/audio/models like loose ones (whole
@@ -713,11 +740,19 @@ facet-group owner call).
       (`--ls-status-identified`) vs Confirmed **gold** (`--ls-gold`).
 - [x] **Toasts (2026-08-07)** — left border 1px (was 3px); `warn|info` kinds added
       (`--ls-warning`/`--ls-info` accents); DG §7.
+- [x] **Card size badge is one short token again (2026-08-28).** It read `S · 412 KB`, which
+      repeated the byte size already in the stat line two rows below and was wide enough to wrap
+      onto a second row *over the thumbnail* at compact density. UI-SPEC §2.5 asks for the letter
+      and only the letter; exact size is on hover, which is what the **list row** has always done
+      — the card was the odd one out. `Card.svelte`'s own comment claimed size had "moved to the
+      tier chip"; both rendered it.
 - [ ] **Icon sizes diverge** — nav 18 (DG 24), toolbar 14–16 (DG 20), type marks 28–40 (DG 32).
-- [ ] **Sort options** — SORTS = Relevance/Name/Type/Size; DG: Name · Date added · Date modified ·
-      Size · Type · Status.
-- [ ] **No `prefers-reduced-motion` policy** beyond one DropZone gate; no shimmer on
-      Unidentified→Identified (≤400ms, reduced-motion-gated).
+- [ ] **Sort options** — SORTS = Relevance/Name/Type/Size/**Date**; DG also wants *Date added*
+      and *Status*. (Partly stale: "Date modified" shipped as `Date`.)
+- [ ] **No identify shimmer** on Unidentified→Identified (≤400ms, reduced-motion-gated).
+      *(The other half of this card was stale, corrected 2026-08-28: there **is** a global
+      `prefers-reduced-motion` block in `app.css` killing transitions and decorative transforms
+      — it is not "one DropZone gate".)*
 
 **B12 — visual parity vs the 2026-08-13 mockup.** First pixel-level comparison (a rendered mockup
 now exists: `docs/design/screenshots/library-mockup-2026-08-13.png`). Full matrix + `file:line`

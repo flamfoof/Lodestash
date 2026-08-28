@@ -111,13 +111,61 @@ try {
   // the modal must never trap the library behind it. A returning user (skip_onboarding set)
   // never sees it, which this check also tolerates.
   await check("onboarding is dismissed, and the library stays reachable", async () => {
+    // **This does not test onboarding**, and saying so is the point: `launch()` spends six
+    // seconds clicking the panel away before this line runs, so the panel is never present and
+    // the branch below never taken. It was written as "if present, assert things about it" and
+    // has therefore asserted nothing since the day it landed — which is how a rewritten
+    // onboarding screen nearly shipped unseen. What is checked here is the thing that matters to
+    // the other ninety checks: the panel is *gone* and the library behind it is reachable.
+    // The panel itself is a `keepOnboarding` launch — `node e2e/onboarding-shot.mjs` — plus the
+    // command-level check below.
     const box = page.locator('[data-testid="onboarding"]');
-    if ((await box.count()) > 0) {
-      await page.locator('[data-testid="onboarding-go"]').click();
-      await box.waitFor({ state: "detached", timeout: 5000 });
-    }
+    assert.equal(await box.count(), 0, "onboarding survived the harness — it will swallow every click");
     const s = await invoke("library_status");
     assert.equal(s.open, true, "no catalog open — run a scan in the egui build first");
+  });
+
+  /**
+   * Onboarding §1's two reads, checked at the command layer because the panel itself only renders
+   * on a machine that has not dismissed it — and the wiring is what breaks silently.
+   *
+   * `unity_cache_candidates` is the detect-without-importing half: onboarding has to *show* the
+   * Asset Store cache before the user agrees to index it, and the importing version would crawl
+   * the machine to answer the question.
+   */
+  await check("onboarding can list sources and detect the cache without indexing anything", async () => {
+    const before = await invoke("library_status");
+
+    // The source rows need `kind` (folder vs auto-detected pill) and `last_scanned_at`
+    // ("last scanned …"). Both are on `SourceInfo` and were simply not carried to the frontend.
+    for (const src of before.sources) {
+      assert.equal(typeof src.kind, "string", `source ${src.name} has no kind`);
+      assert.ok(
+        src.last_scanned_at === null || typeof src.last_scanned_at === "number",
+        `source ${src.name} has a malformed last_scanned_at`,
+      );
+    }
+
+    const candidates = await invoke("unity_cache_candidates");
+    assert.ok(Array.isArray(candidates), "unity_cache_candidates did not return a list");
+    const roots = before.sources.map((s) => s.root_path.toLowerCase());
+    for (const c of candidates) {
+      assert.equal(typeof c.path, "string", "a candidate has no path");
+      assert.equal(typeof c.packs, "number", "a candidate has no pack count");
+      assert.ok(
+        !roots.includes(c.path.toLowerCase()),
+        `${c.path} is already a source and must not be offered again`,
+      );
+    }
+
+    // Detection must not index. The whole point of the separate command is that asking is free.
+    const after = await invoke("library_status");
+    assert.equal(
+      after.total_assets,
+      before.total_assets,
+      "detecting the cache changed the library — it crawled instead of looking",
+    );
+    assert.equal(after.sources.length, before.sources.length, "detecting the cache added a source");
   });
 
   await check("the shell opens a real catalog", async () => {

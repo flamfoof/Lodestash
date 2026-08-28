@@ -190,7 +190,11 @@
   let coverFit = $derived(item.media_type === "texture" || item.media_type === "material");
 
   // FEATURES §1.1: the meta line leads with the pack, because "which pack is this from" is the
-  // question a grid of 8k near-identical Synty props actually raises. Size moved to the tier chip.
+  // question a grid of 8k near-identical Synty props actually raises.
+  //
+  // The **exact size lives here**, and the tier badge on the artwork carries only its letter
+  // (UI-SPEC §2.5). This comment used to claim size had moved to the badge; both rendered it, so
+  // every card printed the same figure twice and the badge was wide enough to wrap.
   //
   // The pack is rendered separately from the rest rather than joined into one string — that string
   // is exactly why §2.5’s "pack name is a link" was never built: there was nothing to attach it to.
@@ -371,7 +375,15 @@
          Never imported draws nothing at all: absence is the common case and must cost nothing. -->
     <span class="corner-bl">
       {#if item.size_tier}
-        <span class="tier num t{item.size_tier}">{item.size_tier} · {fmtSize(item.size_bytes)}</span>
+        <!-- The **letter**, which is all UI-SPEC §2.5 asks of this badge ("S/M/L/XL size badge").
+             It read `S · 412 KB` until 2026-08-28: the exact size repeated the stat line two rows
+             below it, and the pair could break around the · and take the badge onto a second row,
+             which at compact density covers the artwork it is sitting on. The number is on hover,
+             and in the stat line where a precise figure belongs. The list row has always done it
+             this way — the card was the odd one out. -->
+        <span class="tier num t{item.size_tier}" title={fmtSize(item.size_bytes)}>
+          {item.size_tier}
+        </span>
       {/if}
       <!-- Four states, one badge (DESIGN-GUIDELINES §7). Never imported draws nothing at all. -->
       {#if item.in_project && item.import_stale}
@@ -780,9 +792,11 @@
     text-overflow: ellipsis;
   }
   .tier {
-    padding: 1px 6px;
+    padding: 0 4px;
     font-size: var(--fs-xs);
-    line-height: 1.4;
+    line-height: 1.5;
+    /* One token, one line — the overlay sits on the artwork and has nowhere to grow into. */
+    white-space: nowrap;
     color: var(--tier-fg, var(--ls-text-muted));
     background: color-mix(in srgb, var(--ls-bg) 82%, transparent);
     border: 1px solid color-mix(in srgb, var(--tier-fg, var(--ls-border)) 40%, transparent);

@@ -243,6 +243,13 @@ pub struct SourceSummary {
     pub state: String,
     /// Unix seconds the root last resolved — "unavailable since …".
     pub last_seen_at: Option<i64>,
+    /// How the source was added — `folder`, or the cache kinds ingest mints. Onboarding (§1)
+    /// tags each row with it, so "auto-detected" and "you picked this" are told apart on the one
+    /// screen where the difference is worth knowing.
+    pub kind: String,
+    /// Unix seconds of the last completed crawl. Feeds §1's *"last scanned …"* line; `None`
+    /// means indexed but never re-scanned since.
+    pub last_scanned_at: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -805,6 +812,8 @@ impl Library {
                 watch_enabled: info.watch_enabled,
                 state: info.state.clone(),
                 last_seen_at: info.last_seen_at,
+                kind: info.kind.clone(),
+                last_scanned_at: info.last_scanned_at,
             });
         }
 
