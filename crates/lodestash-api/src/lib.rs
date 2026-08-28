@@ -506,16 +506,16 @@ impl ServerState {
             .into_iter()
             .map(Into::into)
             .collect();
-        if let Some(project_id) = cat.active_project_id()? {
-            if let Some(tray) = cat.staging_tray_id(project_id)? {
-                let count = cat.collection_members(tray)?.len();
-                rows.push(CollectionRowApi {
-                    id: tray,
-                    name: "Staging".into(),
-                    is_staging: true,
-                    asset_count: count,
-                });
-            }
+        // The tray is listed whether or not an editor is registered — same resolver as
+        // `list_staged`, so the two cannot disagree about whether a tray exists (ADR-0010).
+        if let Some(tray) = cat.active_staging_tray_id()? {
+            let count = cat.collection_members(tray)?.len();
+            rows.push(CollectionRowApi {
+                id: tray,
+                name: "Staging".into(),
+                is_staging: true,
+                asset_count: count,
+            });
         }
         Ok(rows)
     }
@@ -601,14 +601,17 @@ impl ServerState {
         self.write(AgentWrite::UnstageAsset { asset_id })
     }
 
-    /// ENGINE-API §6 `list_staged` — the active project's staging tray as asset summaries.
-    /// No active project → `[]` (there is nothing staged anywhere without an editor).
+    /// ENGINE-API §6 `list_staged` — the current staging tray as asset summaries.
+    ///
+    /// "Current" is the active project's tray, or the project-less one when no editor is
+    /// registered (M20). It used to answer `[]` without a project on the reading that *"there is
+    /// nothing staged anywhere without an editor"* — which stopped being true the moment the
+    /// shell started staging into a tray of its own. Both planes resolve through
+    /// `active_staging_tray_id` now, so an agent asking what is staged gets the picks the person
+    /// can see (ADR-0010). `None` still means nothing has ever been staged.
     pub fn list_staged(&self) -> lodestash_core::error::Result<Vec<AssetSummaryRow>> {
         let cat = self.catalog.lock().unwrap();
-        let Some(project_id) = cat.active_project_id()? else {
-            return Ok(Vec::new());
-        };
-        let Some(tray) = cat.staging_tray_id(project_id)? else {
+        let Some(tray) = cat.active_staging_tray_id()? else {
             return Ok(Vec::new());
         };
         let ids = cat.collection_members(tray)?;

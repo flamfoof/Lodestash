@@ -53,6 +53,7 @@
     ondelete,
     onimport,
     onexport,
+    onpack,
   }: {
     assetId: number | null;
     /** Carried by the grid row, so the star reflects the same state the card draws. */
@@ -71,6 +72,8 @@
     onimport: () => void;
     /** **Export to folder** (UI-SPEC §16.2): copy this asset anywhere, no editor involved. */
     onexport: () => void;
+    /** A pack-name link was clicked — App opens the §15 modal. */
+    onpack?: (name: string) => void;
   } = $props();
 
   let staged = $derived(assetId != null && (staging?.isStaged?.(assetId) ?? false));
@@ -462,9 +465,29 @@
         <dt>Duration</dt>
         <dd class="num">{fmtDuration(detail.duration_ms)}</dd>
       {/if}
-      {#if detail.source}
+      <!-- UI-SPEC §13.9 provenance: `Source · <library · pack>`, the pack linking to its stats
+           modal (§15) the way it already does on every card and list row. The Inspector was the
+           one surface that named the library and stopped, so the panel you open to learn about an
+           asset told you less about where it came from than the card you opened it from.
+           License is the other half of this row and is still missing — it needs the license
+           harvest (`package.license`, DATA-MODEL §9), which is not built. -->
+      {#if detail.source || detail.package}
         <dt>Source</dt>
-        <dd>{detail.source}</dd>
+        <dd class="prov">
+          {#if detail.source}<span>{detail.source}</span>{/if}
+          {#if detail.source && detail.package}<span class="sep" aria-hidden="true">·</span>{/if}
+          {#if detail.package}
+            {@const pack = detail.package}
+            <button
+              class="packlink"
+              onclick={() => onpack?.(pack)}
+              title="Pack stats for {pack}"
+              data-testid="inspector-pack"
+            >
+              {pack}
+            </button>
+          {/if}
+        </dd>
       {/if}
     </dl>
 
@@ -782,6 +805,38 @@
     flex: 1;
     font-size: var(--fs-xs);
     color: var(--ls-text-dim);
+  }
+
+  /* Provenance row (UI-SPEC §13.9). The pack is a link because it goes somewhere; the library
+     beside it is not, because it does not. */
+  .prov {
+    display: flex;
+    align-items: baseline;
+    gap: var(--sp-1);
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .prov .sep {
+    color: var(--ls-text-dim);
+  }
+  .packlink {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    color: var(--ls-gold);
+    cursor: pointer;
+    text-align: left;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .packlink:hover {
+    text-decoration: underline;
+  }
+  .packlink:focus-visible {
+    box-shadow: var(--el-focus-ring);
+    outline: none;
   }
 
   .actions button.inert {

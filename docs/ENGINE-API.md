@@ -90,7 +90,7 @@ Each row is the **same core operation** as the matching MCP tool in
 | `import_to_project` | `POST /v1/import` | *side-effecting*; into the **open project** (§5) |
 | `register_project` | `POST /v1/projects/register` | plugin announces the open editor (§5) |
 | `list_projects` / `get_active_project` | `GET /v1/projects` | registered/active editors |
-| `stage_asset` / `list_staged` / `import_staged` | `GET/POST/DELETE /v1/stage`, `POST /v1/stage/import` | per-project shortlist (§6) |
+| `stage_asset` / `list_staged` / `import_staged` | `GET/POST/DELETE /v1/stage`, `POST /v1/stage/import` | the shortlist (§6) |
 | `get_job_status` | `GET /v1/jobs/{id}` | progress/result for long ops |
 | `cancel_job` | `POST /v1/jobs/{id}/cancel` | idempotent; job flips to `cancelled` |
 | `get_server_info` | `GET /v1/server-info` | app + schema + API version |
@@ -317,7 +317,7 @@ Still interim until the real **UPM plugin** lands:
 
 ---
 
-## 6. Staging (the per-project shortlist)
+## 6. Staging (the shortlist)
 
 A **staging area** is a candidates tray shared across the GUI, MCP, and the Unity panel — "collect
 the picks, then import them together," matching the agent loop in
@@ -325,6 +325,14 @@ the picks, then import them together," matching the agent loop in
 project** (`is_staging=1` + `project_id`, [`DATA-MODEL.md`](DATA-MODEL.md) §9) — an import target
 owns its shortlist, and switching projects never mixes picks ([`UI-SPEC.md`](UI-SPEC.md) §16).
 All stage endpoints take an optional `project_id`; omitted ⇒ the **active** project.
+
+**With no project registered there is still a tray** — exactly one, with `project_id IS NULL`
+(M20, [ADR-0010](decisions/ADR-0010-one-staging-tray.md)). These endpoints used to answer `[]` and
+refuse writes in that state, on the reading that nothing can be staged without somewhere to send
+it. The app disagreed and kept its own tray in memory, so `list_staged` reported an empty shortlist
+while the user was looking at six picks. Both planes now resolve through
+`Catalog::active_staging_tray_id` — the active project's tray, else the project-less one — and the
+first `register_project` **adopts** that tray rather than orphaning what it holds.
 
 ```http
 GET    /v1/stage?project_id=2          → AssetSummary[]   (that project's shortlist)

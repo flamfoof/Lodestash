@@ -20,6 +20,7 @@ import JobTray from "./lib/JobTray.svelte";
   import CollectionsScreen from "./lib/CollectionsScreen.svelte";
   import UnityAssetsScreen from "./lib/UnityAssetsScreen.svelte";
   import DropZone from "./lib/DropZone.svelte";
+  import PackStats from "./lib/PackStats.svelte";
   import {
     libraryStatus,
     onChanged,
@@ -218,6 +219,13 @@ import JobTray from "./lib/JobTray.svelte";
       stale = true;
     };
   });
+
+  /**
+   * Pack stats (UI-SPEC §15). Owned here rather than by LibraryScreen, because the Inspector
+   * links to it too (§13.9's provenance row) and the Inspector is App's child. One modal, one
+   * piece of state — two of each is how they end up disagreeing about whether one is open.
+   */
+  let packStats = $state<string | null>(null);
 
   let confirming = $state(false);
   let actionError = $state<string | null>(null);
@@ -586,6 +594,7 @@ import JobTray from "./lib/JobTray.svelte";
           {trashedOnly}
           title={favoritesOnly ? "Favorites" : trashedOnly ? "Trash" : "Library"}
           onmenuaction={onMenuAction}
+          onpack={(name) => (packStats = name)}
           onrestore={(id) =>
             write(() => setTrashed([id], false), () => "Restored from Trash", { undoable: true }).then(
               afterRemoval,
@@ -601,6 +610,7 @@ import JobTray from "./lib/JobTray.svelte";
     {#if onLibrary}
       <Inspector
         assetId={view.selected}
+        onpack={(name) => (packStats = name)}
         favorite={selectedDetail?.favorite ?? false}
         trashed={selectedDetail?.trashed ?? false}
         onidentify={() => {
@@ -648,6 +658,10 @@ import JobTray from "./lib/JobTray.svelte";
     onexport={(ids) => exportToFolder(ids)}
   />
   <JobTray />
+
+  <!-- UI-SPEC §15, reached from a pack-name link anywhere: a card, a list row, or the
+       Inspector's provenance row. One owner, so two of them can never both be open. -->
+  <PackStats name={packStats} onclose={() => (packStats = null)} />
 
   {#if confirming && selectedDetail}
     <ConfirmDelete

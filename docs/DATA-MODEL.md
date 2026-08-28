@@ -143,12 +143,16 @@ CREATE TABLE collection (
   name       TEXT NOT NULL,
   parent_id  INTEGER REFERENCES collection(id),
   is_smart   INTEGER NOT NULL DEFAULT 0,  -- saved-search collection
-  is_staging INTEGER NOT NULL DEFAULT 0,  -- a staging tray (§9); one per registered project
-  project_id INTEGER REFERENCES project(id) ON DELETE CASCADE,  -- staging trays only
+  is_staging INTEGER NOT NULL DEFAULT 0,  -- a staging tray (§9); one per project, plus one with none
+  project_id INTEGER REFERENCES project(id) ON DELETE CASCADE,  -- staging trays only; NULL = no editor yet
   query_json TEXT
 );
 -- Enforce one staging collection per project (trays shared across GUI / MCP / Unity panel, §9).
 CREATE UNIQUE INDEX idx_collection_staging ON collection(project_id) WHERE is_staging=1;
+-- …and exactly one tray belonging to no project (M20). The index above cannot say this: SQLite
+-- treats NULLs as distinct in a UNIQUE index, so it constrains nothing for a project-less row.
+CREATE UNIQUE INDEX idx_collection_staging_unprojected
+  ON collection(is_staging) WHERE is_staging=1 AND project_id IS NULL;
 CREATE TABLE collection_asset (
   collection_id INTEGER NOT NULL REFERENCES collection(id) ON DELETE CASCADE,
   asset_id      INTEGER NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
@@ -543,6 +547,16 @@ ALTER TABLE asset ADD COLUMN license_url TEXT;
   ([`UI-SPEC.md`](UI-SPEC.md) §16). Stage operations take an optional `project_id`, defaulting to
   the active project — an item Claude stages over MCP still appears in the GUI tray and Unity panel
   at once. *(Supersedes the earlier single shared shortlist.)*
+  - **Plus exactly one tray with `project_id IS NULL`** (M20, [ADR-0010](decisions/ADR-0010-one-staging-tray.md)):
+    the tray you pick into **before** any editor is registered, which — until the Unity plugin
+    exists — is every user. M5 deleted such rows on the reading that a shortlist means nothing
+    without a destination; that is true of the agent plane and false of the app, and the shell
+    answered it by keeping a second tray in memory that no other plane could see. One resolver,
+    `Catalog::active_staging_tray_id`, answers "the tray right now" for both planes: the active
+    project's, else this one.
+  - **The first `register_project` adopts it**, picks and all, rather than stranding them in a tray
+    nothing resolves to — the same move M5's data step made for the legacy shared tray. A *second*
+    project gets its own empty tray, so trays still never mix.
 - **Import batches**: `import_record` rows from one tray/queue run share a `batch_id`, so the UI can
   list "Recent exports" per project and **undo a batch** — delete the copied files it produced and
   its records; catalog assets are untouched (confirm-gated, [`UI-SPEC.md`](UI-SPEC.md) §16.1).
@@ -804,6 +818,7 @@ transaction, in order, on open. Shipped so far:
 | **M2** | Mapping library: `taxonomy`, `category`, `category_alias`, `mapping_rule`, `asset_category` (§4) |
 | **M3** | Engine round-trip: `package` + `asset.package_id`, `project`, `import_record`, `asset.license/attribution/license_url` (§7, §9) |
 | **M4** | `asset.rating`, `package.pipeline`, `project.pipeline` (§12) |
+| **M20** | One staging tray with no project: `idx_collection_staging_unprojected`. Relaxes M5's rule that a tray must belong to a project, so the shell can stop keeping its own in-memory shortlist beside the catalog's ([ADR-0010](decisions/ADR-0010-one-staging-tray.md)) |
 | **M18** | Source availability: `import_source.state` + `last_seen_at` — the third source state a drive going away needs (UI-SPEC §11.1). `state` is **derived, not authored**: the open/scan health check writes it, `paused` is the user's `watch_enabled` intent surfaced as a state, and nothing in the catalog is deleted because a root went missing |
 | **M5** | UI-SPEC alignment (below) |
 | **M6** | Extracted-pack persistence + surgical extraction: `asset_file.workspace_rel` (locates a package-extracted file in the content-addressed workspace, so extracted packs rehydrate across sessions behind the **Keep extracted packs cached** toggle, default off) + `package_entry` (per-payload guid/pathname/**tar offset**/size from the browse pass — selected assets re-extract with one gzip skip-scan instead of a full unpack, [`INGESTION.md`](INGESTION.md) §2) |

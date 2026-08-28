@@ -746,6 +746,12 @@ Selected, one asset — top→bottom:
 9. **Provenance footer**: `Source · <library · pack>` (pack → Pack stats), `License · <effective
    license>` (asset → package fallback, DATA-MODEL §9), and when imported: verdant
    `✓ imported in <project> → <dest>/`.
+
+   *(Shipped 2026-08-27: the library · pack row, the pack linking to §15 the way it already does
+   from every card and list row — this panel named the library and stopped, so the place you open
+   to learn about an asset said less about where it came from than the card you opened it from.
+   **License is still absent** and stays that way until the license harvest writes `package.license`;
+   a row that would always read "unknown" is not provenance.)*
 10. **Actions**: Unidentified → full-width **✦ Identify now**. Otherwise: **⟡ Stage / ✓ Staged**
     (gold outline) + **↧ Import / ✓ Imported** (gold primary; dup-guard toast when already in the
     active project) side-by-side, then **✦ Re-identify** (arcane outline; re-queues identification).
@@ -802,7 +808,18 @@ The GUI face of ENGINE-API §5–6 / MCP-AND-ENGINES §3.
 **⚖ Resolution:** staging is **per-project** — one staging collection per registered project
 (replaces the single shared shortlist; DATA-MODEL §9 / ENGINE-API §6 delta in §20). The tray always
 targets the **active** project; MCP `stage_asset`/`list_staged`/`import_staged` gain optional
-`project_id` (default: active). Contents:
+`project_id` (default: active).
+
+**…and one tray before there is a project at all** ([ADR-0010](decisions/ADR-0010-one-staging-tray.md),
+2026-08-27). Per-project was read as *only* per-project, which made the tray unusable for anyone
+without a registered editor — which, while the Unity plugin does not exist, is everyone. The app
+worked around it by keeping its own in-memory list, so the tray on screen and the one ENGINE-API
+§6 reads were different objects: `list_staged` answered `[]` while six picks sat in the tray.
+There is now a single tray with no project, resolved by the same function as the per-project ones,
+and **the first Connect wizard adopts it** rather than dropping the picks it holds. Picks also
+survive a restart, which the in-memory list never did.
+
+Contents:
 - Header: `⟡ Staging` + project dot/name + mono count + `clear`.
 - Thumb strip (34px tiles, type-color border, name tooltip).
 - Dependency line: `N picks → M files incl. materials & textures` (dependency closure minus missing
@@ -891,7 +908,11 @@ in the owning doc** (same-change rule):
    facets + add source). *(DESIGN-GUIDELINES §7 updated.)*
 2. **Per-project staging** — one staging collection per project (`collection.is_staging=1` +
    `project_id`), not a single shared tray; stage ops gain optional `project_id` (default active).
-   *(DATA-MODEL §9, ENGINE-API §6, MCP-AND-ENGINES §2 updated.)*
+   **Narrowed 2026-08-27** ([ADR-0010](decisions/ADR-0010-one-staging-tray.md)): *plus* exactly one
+   tray with `project_id IS NULL`, for the picks made before an editor is connected. Without it
+   "per-project" means "no tray at all" for every user until the plugin ships, which is how the
+   shell came to keep a second, invisible tray of its own.
+   *(DATA-MODEL §9 + M20, ENGINE-API §6, MCP-AND-ENGINES §2 updated.)*
 3. **Import vs Export verbs** — "Import" = into a project (tracked, dup-guarded); "Export to
    folder" = arbitrary path (`export_asset`). The prototype tray's "Export to <project>" label is
    superseded.

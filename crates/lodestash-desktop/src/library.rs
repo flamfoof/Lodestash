@@ -181,6 +181,10 @@ pub struct AssetDetail {
     pub duration_ms: Option<i64>,
     /// Which source root it came from.
     pub source: Option<String>,
+    /// …and which pack inside it, so the Inspector's provenance row can read
+    /// `Source · <library · pack>` and link the pack to its stats modal (UI-SPEC §13.9).
+    /// `None` for a loose file that belongs to no package.
+    pub package: Option<String>,
     /// …and its id, so Quick Look can read that source's availability out of `sources` and say
     /// *when* it was last seen rather than only that the file will not open (UI-SPEC §11.1).
     pub source_id: i64,
@@ -618,9 +622,6 @@ pub struct Library {
     /// The user's S/M/L/XL boundaries (§11.4), read from the same config the egui build writes —
     /// so the size badge on a card and the size facet in the popover agree with each other.
     tiers: SizeTiers,
-    /// Assets staged in the tray (I6). In-memory only — the tray is transient design state;
-    /// the commit-to-project half rides the engine build (B9e keeps the collect side).
-    staged: Vec<i64>,
     /// The local text-capable embedder for AI-mode search (TopBar ⟨Tags⟩/⟨AI⟩), resolved once
     /// — model load is seconds, so per keystroke would be unusable. `None` until first use.
     ai_embedder: std::sync::Mutex<
@@ -689,7 +690,6 @@ impl Library {
                     tiers: lodestash_app::config::AppConfig::load()
                         .size_tiers
                         .normalized(),
-                    staged: Vec::new(),
                     ai_embedder: Default::default(),
                 };
                 lib.reload();
@@ -711,7 +711,6 @@ impl Library {
             rows: Vec::new(),
             paths: HashMap::new(),
             tiers: SizeTiers::default(),
-            staged: Vec::new(),
             ai_embedder: Default::default(),
         }
     }
@@ -1834,41 +1833,26 @@ impl Library {
 
     // ── Staging tray (I6) ──────────────────────────────────────────────────────
 
-    /// Stage `ids` into the tray (dedup, order-preserving). Returns how many were new.
-    pub fn stage(&mut self, ids: &[i64]) -> usize {
-        let mut n = 0;
-        for id in ids {
-            if !self.staged.contains(id) {
-                self.staged.push(*id);
-                n += 1;
-            }
-        }
-        n
-    }
-
-    /// Remove `ids` from the tray. Returns how many were present.
-    pub fn unstage(&mut self, ids: &[i64]) -> usize {
-        let before = self.staged.len();
-        self.staged.retain(|id| !ids.contains(id));
-        before - self.staged.len()
-    }
-
-    pub fn clear_staged(&mut self) {
-        self.staged.clear();
-    }
-
-    /// The staged asset ids, in the order they were staged — **live rows only**.
+    /// The staged asset ids — **live rows only**, read from the catalog tray.
     ///
-    /// UI-SPEC §7: *"Trashed assets leave search, dup groups, and staging everywhere."* Filtered
-    /// on read rather than purged when the trash op runs, for the same reason
-    /// `Catalog::collection_members` does it that way: Trash is reversible, and a restore has to
-    /// put the asset back in the tray it was picked into. Until 2026-08-26 neither end did it, so
-    /// a trashed asset kept its tile in the tray and `⇢ Add all N to project` would have queued
-    /// an import for it.
+    /// The tray moved out of this struct and into `collection(is_staging=1)` on 2026-08-27
+    /// (ADR-0010). It was a `Vec<i64>` here, which made the shell's tray and the one ENGINE-API
+    /// §6 reads two different objects answering the same question, and lost every pick on exit.
     ///
-    /// A staged id with no row at all (its source went away between sessions) also drops out —
-    /// the tray is transient, and there is nothing useful to draw for it.
+    /// UI-SPEC §7 — *"trashed assets leave search, dup groups, and staging everywhere"* — is
+    /// enforced twice on the way here, and deliberately: `collection_members` drops trashed rows
+    /// at the catalog, and this drops ids with no live row in *this* view, which also covers an
+    /// asset whose source has gone. Neither is redundant; they know different things.
     pub fn staged_ids(&self) -> Vec<i64> {
+        let Some(cat) = self.catalog.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(Some(tray)) = cat.active_staging_tray_id() else {
+            return Vec::new();
+        };
+        let Ok(ids) = cat.collection_members(tray) else {
+            return Vec::new();
+        };
         // One pass over the rows, then a set lookup per pick — the tray holds tens of ids and the
         // library holds thousands, so the nested form would be the wrong way round.
         let live: std::collections::HashSet<i64> = self
@@ -1877,11 +1861,7 @@ impl Library {
             .filter(|r| !r.trashed)
             .map(|r| r.item.asset_id)
             .collect();
-        self.staged
-            .iter()
-            .copied()
-            .filter(|id| live.contains(id))
-            .collect()
+        ids.into_iter().filter(|id| live.contains(id)).collect()
     }
 
     /// The pack browser's left tree (PACK-DIRECTORY-NAV §5): every folder inside one package with
@@ -1963,6 +1943,7 @@ impl Library {
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             media_type: row.item.media_type.clone(),
+            package: row.item.package.clone(),
             size_bytes: row.item.size_bytes,
             status: row.item.status.clone(),
             has_preview: row.item.has_preview,
@@ -2407,7 +2388,6 @@ mod tests {
             rows,
             paths: HashMap::new(),
             tiers: SizeTiers::default(),
-            staged: Vec::new(),
             ai_embedder: Default::default(),
         }
     }
@@ -2702,32 +2682,89 @@ mod tests {
         );
     }
 
-    /// UI-SPEC §7: *"Trashed assets leave search, dup groups, and **staging** everywhere."*
+    /// The tray lives in the catalog now (ADR-0010), so this covers the half `staged_ids` still
+    /// owns: an id in the tray with no **live row in this view** is not drawn.
     ///
-    /// The pick is kept, not dropped — Trash is reversible, so restoring has to put the asset back
-    /// in the tray it was picked into. Until 2026-08-26 the tray showed it the whole time, and
-    /// `⇢ Add all N to project` would have queued an import for an asset the user had just binned.
+    /// The catalog already drops trashed members (`collection_members`, tested in core). This
+    /// drops what the catalog cannot know about — a row that is trashed in *this* session's view,
+    /// and a pick whose asset is not in the loaded rows at all because its source went away.
+    /// Neither check is redundant; they know different things, and the tray must never draw a tile
+    /// for something that is not there.
     #[test]
-    fn a_trashed_pick_leaves_the_staging_tray_and_comes_back_with_it() {
+    fn the_tray_never_draws_a_pick_with_no_live_row() {
         let mut l = lib(&[("kept", "model_3d"), ("binned", "model_3d")]);
-        l.rows[0].item.asset_id = 10;
-        l.rows[1].item.asset_id = 20;
+        // No catalog at all — nothing is staged anywhere, and asking must not panic.
+        assert!(
+            l.staged_ids().is_empty(),
+            "a catalog-less library staged something"
+        );
 
-        assert_eq!(l.stage(&[10, 20]), 2);
-        assert_eq!(l.staged_ids(), vec![10, 20]);
+        // Real asset rows: `collection_asset.asset_id` is a foreign key, so a pick is always a
+        // pick of something that exists in the catalog. What it need not be is something *this*
+        // view has loaded — a second source, not hydrated, is exactly that case.
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut cat = Catalog::open(&dir.path().join("catalog.db")).expect("open");
+        cat.seed_media_types().expect("seed");
+        let src = cat
+            .upsert_import_source("Lib", &dir.path().to_string_lossy(), "folder")
+            .expect("source");
+        cat.record_crawl(
+            src,
+            None,
+            &["kept", "binned", "elsewhere"]
+                .iter()
+                .map(|n| lodestash_core::catalog::CrawlRecord {
+                    workspace_rel: None,
+                    rel_path: format!("{n}.fbx"),
+                    name: (*n).into(),
+                    media_type: "model_3d".into(),
+                    size_bytes: 1,
+                    mtime: 0,
+                    content_hash: None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("crawl");
+        let ids: Vec<i64> = cat
+            .assets_for_source(src)
+            .expect("assets")
+            .iter()
+            .map(|a| a.asset_id)
+            .collect();
+        assert_eq!(ids.len(), 3);
+        l.rows[0].item.asset_id = ids[0];
+        l.rows[1].item.asset_id = ids[1];
+
+        let tray = cat.ensure_active_staging_tray().expect("tray");
+        // With no project registered this is the project-less tray (M20) — the state every user
+        // is in until the Unity plugin exists, and the one M5 had made unrepresentable.
+        assert!(
+            cat.active_project_id().expect("active").is_none(),
+            "the fixture registered a project"
+        );
+        for id in &ids {
+            cat.collection_add_asset(tray, *id).expect("stage");
+        }
+        l.catalog = Some(cat);
+
+        assert_eq!(
+            l.staged_ids(),
+            vec![ids[0], ids[1]],
+            "the third pick has no row in this library and must not be drawn"
+        );
 
         l.rows[1].trashed = true;
         assert_eq!(
             l.staged_ids(),
-            vec![10],
-            "a trashed asset is still in the tray"
+            vec![ids[0]],
+            "a row trashed in this view is still in the tray"
         );
 
         l.rows[1].trashed = false;
         assert_eq!(
             l.staged_ids(),
-            vec![10, 20],
-            "restoring lost the pick, and its place in the order"
+            vec![ids[0], ids[1]],
+            "restoring lost the pick — the membership row was never deleted"
         );
     }
 

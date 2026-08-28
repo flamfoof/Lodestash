@@ -18,7 +18,7 @@ fn open_in_memory_applies_migrations() {
         .conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 19, "all 19 migrations should have run");
+    assert_eq!(version, 20, "all 20 migrations should have run");
 }
 
 /// The viewer's texture lookup must walk **both** hops. Stopping at the first lands on the

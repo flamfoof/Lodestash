@@ -370,6 +370,7 @@ impl Catalog {
             (17, MIGRATION_17_OP_LOG_REDO),
             (18, MIGRATION_18_SOURCE_STATE),
             (19, MIGRATION_19_EXPORT_HISTORY),
+            (20, MIGRATION_20_UNPROJECTED_STAGING),
         ];
 
         for (version, sql) in migrations {
@@ -2049,6 +2050,24 @@ CREATE TABLE IF NOT EXISTS export_record (
 CREATE INDEX IF NOT EXISTS idx_export_batch ON export_record(batch_id);
 ";
 
+/// M20 — one staging tray that belongs to no project yet (DATA-MODEL §9, UI-SPEC §16.2).
+///
+/// M5 made trays per-project and **deleted** the legacy shared one, on the reading that a
+/// shortlist only means something once there is an editor to send it to. That was true of the
+/// agent plane and false of the app: the desktop tray is the way a person collects picks, and
+/// the Unity plugin does not exist yet, so *every* user is in the state M5 treated as impossible.
+/// The shell kept its own in-memory list instead — two trays that never agreed, and picks that
+/// did not survive a restart. See ADR-0010.
+///
+/// The index is what M5's could not express. `idx_collection_staging` is
+/// `UNIQUE(project_id) WHERE is_staging=1`, and SQLite treats NULLs as distinct in a UNIQUE
+/// index, so it constrains nothing for a project-less row — which is why M5 had to delete them
+/// rather than rely on it. This one is over a constant, so it admits exactly one such row.
+const MIGRATION_20_UNPROJECTED_STAGING: &str = "
+CREATE UNIQUE INDEX IF NOT EXISTS idx_collection_staging_unprojected
+  ON collection(is_staging) WHERE is_staging=1 AND project_id IS NULL;
+";
+
 const MIGRATION_12_FAVORITES: &str = "
 ALTER TABLE asset ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_asset_favorite ON asset(favorite) WHERE favorite=1;
@@ -3053,15 +3072,34 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("project id: {e}")))?;
         // One staging tray per project (§9), created empty on first registration; the partial
         // UNIQUE index enforces uniqueness, the guard keeps a re-register from erroring.
-        self.conn
+        //
+        // **Unless the project-less tray (M20) is holding picks** — then that tray *becomes* this
+        // project's, keeping what the user collected before they had anywhere to send it. This is
+        // the same move M5's data step made for the legacy shared tray, for the same reason: a
+        // shortlist built by hand is the expensive thing on screen, and connecting an editor is
+        // the moment it finally has a destination. Dropping it there would punish the user for
+        // doing the two steps in the order the app encourages.
+        let adopted = self
+            .conn
             .execute(
-                "INSERT INTO collection (uuid, name, is_staging, project_id)
-                     SELECT ?1, 'Staging', 1, ?2
-                     WHERE NOT EXISTS
-                       (SELECT 1 FROM collection WHERE is_staging=1 AND project_id=?2)",
-                params![uuid::Uuid::new_v4().to_string(), id],
+                "UPDATE collection SET project_id = ?1
+                  WHERE is_staging = 1 AND project_id IS NULL
+                    AND EXISTS (SELECT 1 FROM collection_asset ca WHERE ca.collection_id = collection.id)
+                    AND NOT EXISTS (SELECT 1 FROM collection WHERE is_staging = 1 AND project_id = ?1)",
+                params![id],
             )
-            .map_err(|e| CoreError::Catalog(format!("staging tray: {e}")))?;
+            .map_err(|e| CoreError::Catalog(format!("adopt staging tray: {e}")))?;
+        if adopted == 0 {
+            self.conn
+                .execute(
+                    "INSERT INTO collection (uuid, name, is_staging, project_id)
+                         SELECT ?1, 'Staging', 1, ?2
+                         WHERE NOT EXISTS
+                           (SELECT 1 FROM collection WHERE is_staging=1 AND project_id=?2)",
+                    params![uuid::Uuid::new_v4().to_string(), id],
+                )
+                .map_err(|e| CoreError::Catalog(format!("staging tray: {e}")))?;
+        }
         Ok(id)
     }
 
@@ -3106,6 +3144,62 @@ impl Catalog {
             )
             .optional()
             .map_err(|e| CoreError::Catalog(format!("staging tray lookup: {e}")))
+    }
+
+    /// **The** staging tray right now: the active project's, or the project-less one when no
+    /// editor is registered (M20). Read-only — `None` means nothing has ever been staged, which
+    /// is not the same as an error and must not create a row on a read path.
+    ///
+    /// This is the single resolver both planes use, and the reason they can no longer disagree:
+    /// the shell used to keep its picks in an in-memory `Vec` while ENGINE-API §6 read the
+    /// catalog, so `list_staged` and the tray on screen were two different answers to the same
+    /// question (ADR-0010).
+    pub fn active_staging_tray_id(&self) -> Result<Option<i64>> {
+        match self.active_project_id()? {
+            Some(p) => self.staging_tray_id(p),
+            None => self
+                .conn
+                .query_row(
+                    "SELECT id FROM collection WHERE is_staging = 1 AND project_id IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| CoreError::Catalog(format!("staging tray lookup: {e}"))),
+        }
+    }
+
+    /// The same tray, created if it does not exist yet. **Write path only** — the writer thread
+    /// owns every call (ARCHITECTURE §5), which is what keeps this from being a second writer.
+    ///
+    /// A project that predates its tray gets one here rather than erroring: `register_project`
+    /// creates trays now, but a catalog written before it did would otherwise have a project you
+    /// can never stage into.
+    pub fn ensure_active_staging_tray(&self) -> Result<i64> {
+        if let Some(id) = self.active_staging_tray_id()? {
+            return Ok(id);
+        }
+        let project = self.active_project_id()?;
+        self.conn
+            .execute(
+                "INSERT INTO collection (uuid, name, is_staging, project_id) VALUES (?1, 'Staging', 1, ?2)",
+                params![uuid::Uuid::new_v4().to_string(), project],
+            )
+            .map_err(|e| CoreError::Catalog(format!("staging tray create: {e}")))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Empty the current tray, answering how many picks were dropped (UI-SPEC §16.2 `clear`).
+    pub fn clear_staging_tray(&self) -> Result<usize> {
+        let Some(tray) = self.active_staging_tray_id()? else {
+            return Ok(0);
+        };
+        self.conn
+            .execute(
+                "DELETE FROM collection_asset WHERE collection_id = ?1",
+                params![tray],
+            )
+            .map_err(|e| CoreError::Catalog(format!("clear staging: {e}")))
     }
 
     /// The active project's id, if any (ENGINE-API §5.1 — `is_active` is a unique flag).

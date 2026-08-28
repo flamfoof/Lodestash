@@ -311,9 +311,15 @@ export type RelatedAsset = {
 export const relatedAssets = (assetId: number) => invoke<RelatedAsset[]>("related_assets", { assetId });
 
 /** The staging tray (I6) — in-memory ids, order-preserving. */
-export const stage = (ids: number[]) => invoke<number>("stage", { ids });
-export const unstage = (ids: number[]) => invoke<number>("unstage", { ids });
-export const clearStaged = () => invoke<void>("clear_staged");
+/**
+ * The staging tray (UI-SPEC §16.2). These are **catalog writes** through the single writer, not
+ * in-memory shell state — the tray moved into `collection(is_staging=1)` on 2026-08-27 so the
+ * app and ENGINE-API §6 stop answering "what is staged" differently (ADR-0010). Picks survive a
+ * restart, and follow the active project.
+ */
+export const stage = (ids: number[]) => invoke<WriteResult>("stage", { ids });
+export const unstage = (ids: number[]) => invoke<WriteResult>("unstage", { ids });
+export const clearStaged = () => invoke<WriteResult>("clear_staged");
 export const staged = () => invoke<number[]>("staged");
 
 /** The Mapping tab (UI-SPEC §9.2). */
@@ -631,6 +637,8 @@ export type AssetDetail = {
   height_px: number | null;
   duration_ms: number | null;
   source: string | null;
+  /** The pack it sits in, for §13.9's `Source · <library · pack>` row. `null` for a loose file. */
+  package: string | null;
   /** Its source's id — the key into `sources` for the "isn't reachable" panel (UI-SPEC §11.1). */
   source_id: number;
   texture_asset_id: number | null;

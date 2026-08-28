@@ -1936,6 +1936,83 @@ try {
     assert.notEqual(cardSet, "", "the grid reads --card but nothing sets it on the element");
   });
 
+  await check("the Inspector names the pack, and the name opens its stats", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    const withPack = p.items.find((i) => i.package);
+    if (!withPack) return; // a library of loose files only — nothing to name
+
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.fill('[data-testid="search-input"]', withPack.name);
+    await page.waitForFunction(
+      (id) => !!document.querySelector(`.card[data-asset-id="${id}"]`),
+      withPack.asset_id,
+      { timeout: 5000 },
+    );
+    await page.locator(`.card[data-asset-id="${withPack.asset_id}"]`).click();
+    await page.waitForSelector('[data-testid="inspector-pack"]', { timeout: 5000 });
+
+    // §13.9's provenance row. The panel named the library and stopped until 2026-08-27, so the
+    // place you open to learn about an asset said less about where it came from than the card.
+    const named = (await page.textContent('[data-testid="inspector-pack"]'))?.trim();
+    assert.equal(named, withPack.package, `the Inspector calls the pack "${named}"`);
+
+    await page.click('[data-testid="inspector-pack"]');
+    await page.waitForSelector('[data-testid="pack-stats"]', { timeout: 5000 });
+    const title = (await page.locator("#pack-stats-title").textContent())?.trim();
+    assert.equal(title, withPack.package, `Pack stats opened on "${title}"`);
+    // One modal, one owner: App renders it now, so the grid's copy cannot also be open.
+    assert.equal(
+      await page.locator('[data-testid="pack-stats"]').count(),
+      1,
+      "two Pack stats modals are mounted at once",
+    );
+    await page.keyboard.press("Escape");
+    await page.waitForSelector('[data-testid="pack-stats"]', { state: "detached", timeout: 3000 });
+    await page.fill('[data-testid="search-input"]', "");
+    await page.keyboard.press("Escape");
+  });
+
+  /**
+   * The tray is one object now, not two (ADR-0010).
+   *
+   * The shell kept `Library::staged` in memory while ENGINE-API §6 read
+   * `collection(is_staging=1)`, so "what is staged" had two answers and `list_staged` returned
+   * `[]` over a tray holding picks. This stages through the UI and reads the count back off the
+   * **catalog** — the tray is a collection, so its membership is a catalog fact now.
+   */
+  await check("staging writes to the catalog, not to a list beside it", async () => {
+    await page.fill('[data-testid="search-input"]', "");
+    await page.waitForFunction(() => document.querySelectorAll(".card").length > 1, undefined, {
+      timeout: 5000,
+    });
+    const before = await invoke("staged");
+    const ids = await page.evaluate(() =>
+      [...document.querySelectorAll(".card")].slice(0, 2).map((c) => Number(c.getAttribute("data-asset-id"))),
+    );
+    try {
+      await invoke("stage", { ids });
+      const now = await invoke("staged");
+      for (const id of ids) assert.ok(now.includes(id), `${id} did not reach the tray`);
+
+      // Rebuilding the library from the catalog must not lose them — the tray is not view state.
+      await invoke("reload_library");
+      const after = await invoke("staged");
+      for (const id of ids) {
+        assert.ok(after.includes(id), `${id} fell out of the tray on reload`);
+      }
+
+      // Clearing empties it, and reports how many picks it dropped.
+      const cleared = await invoke("clear_staged");
+      assert.ok(cleared.changed >= ids.length, `clear reported ${cleared.changed} of ${ids.length}`);
+      assert.deepEqual(await invoke("staged"), [], "clear left picks behind");
+    } finally {
+      if (before.length > 0) await invoke("stage", { ids: before });
+    }
+  });
+
   await check("the Inspector offers Stage, and it reaches the tray", async () => {
     await page.fill('[data-testid="search-input"]', "");
     await page.waitForFunction(() => document.querySelectorAll(".card").length > 0, undefined, {

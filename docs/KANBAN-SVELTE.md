@@ -142,8 +142,8 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       time**, because a folder that was legal to export into may since have become a library source;
       a missing file counts as already-undone; and a run that cannot finish keeps its record so the
       copies stay findable. Originals are never in scope — an export copies, so undo deletes copies.
-      **Still open:** staging is per-project in the engine model (ENGINE-API §6); the shell's
-      shortlist is still one in-memory list.
+      **Closed 2026-08-27** — the shell's shortlist is the catalog tray now, see the
+      cross-feature-audit section below.
 - [x] **In-pack Quick Look pulls the one payload (2026-08-08, FEATURES §5.4).** `lodestash://file`
       now materializes a known in-pack asset through the size-capped scratch (same path the thumb
       route uses) instead of answering `503 not_local`; whole-pack extraction stays a command.
@@ -410,10 +410,10 @@ are pathname-only folder rows — `read_manifest` records an offset for every re
 ## ✅ Cross-feature audit — 2026-08-26 (pre-plugin)
 
 A pass over the features **and the seams between them**, asked for before the Unity plugin starts.
-Eleven defects, every one of them silent: none showed as an error, a failing test or a wrong pixel in
+Thirteen defects, every one of them silent: none showed as an error, a failing test or a wrong pixel in
 a screenshot, and six were the same shape — *a rule stated in one doc and enforced in one place*,
-so the second place that needed it never got it. Verification after: **cargo test 328 · clippy 0 ·
-e2e 90/90 · svelte-check 0/0 · check-docs 36/0 · check-board 0**.
+so the second place that needed it never got it. Verification after: **cargo test 329 · clippy 0 ·
+e2e 92/92 · svelte-check 0/0 · check-docs 36/0 · check-board 0**.
 
 - [x] **`--font-mono` is not a token — four mono readouts were never JetBrains Mono.**
       `ConfirmDelete`, `DropZone`, `DuplicatesScreen` and `ImportDialog` all styled their mono
@@ -474,6 +474,36 @@ e2e 90/90 · svelte-check 0/0 · check-docs 36/0 · check-board 0**.
       and silently did nothing on the one screen they leave running. Both fixed, and the sweep is
       now a permanent e2e check that walks the live stylesheets — the class of bug is invisible
       by construction, so it needed a machine to look.
+- [x] **The app and the engine kept two different staging trays.** The shell's was
+      `Library::staged: Vec<i64>`, in memory, project-agnostic, gone on exit. ENGINE-API §6's was
+      `collection(is_staging=1)`, in the catalog, per-project. Two answers to "what is staged":
+      `list_staged` returned `[]` while six picks sat in the tray on screen, and `import_staged`
+      would have imported nothing.
+      The reason the shell had its own is worth stating, because it was not carelessness. M5 made
+      trays per-project and **deleted** the project-less one — correct on the reading that a
+      shortlist means nothing without an editor to send it to, and false in practice: the Unity
+      plugin does not exist, so *no* user has a registered project, and the agent-plane stage op
+      refused with *"no active project registered — register one via the Connect wizard"* for
+      everybody. An in-memory list was the only way the tray worked at all.
+      **M20** adds `UNIQUE(is_staging) WHERE is_staging=1 AND project_id IS NULL` — which M5's
+      index could not express, since SQLite treats NULLs as distinct in a UNIQUE index and so
+      constrained nothing there. `Catalog::active_staging_tray_id` is now the one resolver both
+      planes use, `stage`/`unstage`/`clear_staged` are writer `Op`s like every other mutation
+      (ADR-0002), and the first `register_project` **adopts** the project-less tray with its picks
+      rather than orphaning them — the same move M5's own data step made for the legacy tray.
+      Picks survive a restart, which they never did. [ADR-0010](decisions/ADR-0010-one-staging-tray.md);
+      UI-SPEC §16.2/§20.2, DATA-MODEL §9/§13 and ENGINE-API §6 updated in the same change.
+      Mutation-checked on the adoption (break it and the picks are abandoned) and on the live-row
+      filter.
+- [x] **The Inspector would not say which pack an asset came from.** UI-SPEC §13.9's provenance
+      row is `Source · <library · pack>` with the pack linking to its §15 stats. It named the
+      library and stopped — so the panel you open to learn about an asset told you *less* about
+      its origin than the card you opened it from, which has carried the link all along.
+      `AssetDetail` gained `package`, and **PackStats moved from LibraryScreen to App**: the
+      Inspector is App's child, and two copies of one modal driven by two pieces of state is how
+      they come to disagree about whether one is open.
+      **License stays absent**, and deliberately: it needs the license harvest to write
+      `package.license`, and a provenance row that always reads "unknown" is not provenance.
 - [x] **Sort stayed live over AI-ranked results.** §2.2 says it is disabled there, and it was not.
       `page_with_ranks` consults the ranks **only** under `SortBy::Relevance`, so picking Size or
       Name threw the ranking away while the cards kept their `✦ NN%` badges — percentages sitting

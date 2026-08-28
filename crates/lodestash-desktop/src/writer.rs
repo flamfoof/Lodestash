@@ -235,15 +235,21 @@ pub enum Op {
     IdentifyIds {
         asset_ids: Vec<i64>,
     },
-    /// Stage/unstage one asset in the active project's staging tray (ENGINE-API §6). The
-    /// writer resolves the tray (the active project may have none registered — an honest
-    /// error) so the engine planes never touch the catalog themselves (ADR-0002).
-    StageAsset {
-        asset_id: i64,
+    /// Stage/unstage assets in the current staging tray — the active project's, or the
+    /// project-less one when no editor is registered (ENGINE-API §6, UI-SPEC §16.2, M20).
+    ///
+    /// The writer resolves the tray so no plane touches the catalog itself (ADR-0002), and both
+    /// planes now resolve the *same* tray: the shell used to keep an in-memory list beside this
+    /// one and the two never agreed (ADR-0010). Takes many ids because the shell stages many —
+    /// `⟡ Stage all` on the bulk bar is one gesture and should be one write.
+    StageAssets {
+        asset_ids: Vec<i64>,
     },
-    UnstageAsset {
-        asset_id: i64,
+    UnstageAssets {
+        asset_ids: Vec<i64>,
     },
+    /// Empty the tray (UI-SPEC §16.2 `clear`).
+    ClearStaged,
     /// Per-pack Extract (B2b slice): unpack the archive into the workspace, then reconcile
     /// the payloads into the catalog like a crawl. Explicit and on-demand (UI-SPEC §11.6) —
     /// browsing never unpacks; `lodestash://file` answers 503 until this runs.
@@ -1512,45 +1518,58 @@ fn run(
             result
         }
 
-        Op::StageAsset { asset_id } => {
-            // ENGINE-API §6: the active project's tray is the staging shortlist. No tray =
-            // no registered editor — an honest error, not a silent no-op.
-            let project_id = catalog
-                .active_project_id()
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| {
-                    "no active project registered — register one via the Connect wizard".to_string()
-                })?;
+        // Staging no longer refuses without a registered editor. It used to answer *"no active
+        // project registered — register one via the Connect wizard"*, which was a reasonable rule
+        // for an agent and the wrong one for a person: the shell is where picks are collected, the
+        // Unity plugin does not exist yet, and so that error was the answer for **every** user.
+        // The shell dodged it by keeping its own in-memory list. One tray, created on demand, is
+        // what removes the reason for the second one (M20, ADR-0010).
+        Op::StageAssets { asset_ids } => {
             let tray = catalog
-                .staging_tray_id(project_id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "the active project has no staging tray yet".to_string())?;
-            catalog
-                .collection_add_asset(tray, asset_id)
+                .ensure_active_staging_tray()
                 .map_err(|e| e.to_string())?;
+            let mut changed = 0;
+            for id in asset_ids {
+                catalog
+                    .collection_add_asset(tray, id)
+                    .map_err(|e| e.to_string())?;
+                changed += 1;
+            }
             Ok(WriteResult {
-                changed: 1,
+                changed,
                 ..Default::default()
             })
         }
 
-        Op::UnstageAsset { asset_id } => {
-            let project_id = catalog
-                .active_project_id()
+        Op::UnstageAssets { asset_ids } => {
+            // No tray means nothing was staged, so there is nothing to remove — and creating one
+            // in order to remove from it would be an odd way to spend a write.
+            let Some(tray) = catalog
+                .active_staging_tray_id()
                 .map_err(|e| e.to_string())?
-                .ok_or_else(|| "no active project registered".to_string())?;
-            let tray = catalog
-                .staging_tray_id(project_id)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "the active project has no staging tray yet".to_string())?;
-            catalog
-                .collection_remove_asset(tray, asset_id)
-                .map_err(|e| e.to_string())?;
+            else {
+                return Ok(WriteResult::default());
+            };
+            let mut changed = 0;
+            for id in asset_ids {
+                catalog
+                    .collection_remove_asset(tray, id)
+                    .map_err(|e| e.to_string())?;
+                changed += 1;
+            }
             Ok(WriteResult {
-                changed: 1,
+                changed,
                 ..Default::default()
             })
         }
+
+        Op::ClearStaged => catalog
+            .clear_staging_tray()
+            .map(|changed| WriteResult {
+                changed,
+                ..Default::default()
+            })
+            .map_err(|e| e.to_string()),
 
         Op::ExtractPackage { package_id } => {
             // Per-pack Extract (M14 surgical flow, INGESTION §2): if the manifest locators

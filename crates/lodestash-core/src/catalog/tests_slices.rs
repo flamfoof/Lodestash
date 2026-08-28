@@ -704,3 +704,74 @@ fn trashing_a_member_takes_it_out_of_the_collection_without_forgetting_it() {
         "restore lost the membership"
     );
 }
+
+/// The tray exists before any editor does, and connecting one **adopts** it (M20, ADR-0010).
+///
+/// M5 made staging per-project and deleted the project-less tray, on the reading that a shortlist
+/// means nothing without somewhere to send it. The app disagreed in practice: picks are collected
+/// long before a project is connected — and while the Unity plugin does not exist, *no* user has
+/// a registered project — so the shell kept its own in-memory list instead and the two never
+/// agreed. This checks the whole arc: stage with no project, connect one, keep the picks.
+#[test]
+fn the_staging_tray_survives_having_no_project_and_is_adopted_by_the_first_one() {
+    let (c, ids) = tagged_catalog(&[("a.fbx", "model_3d"), ("b.png", "image")]);
+    let (a, b) = (ids[0], ids[1]);
+
+    assert!(
+        c.active_staging_tray_id().expect("read").is_none(),
+        "a fresh catalog has a tray before anything staged into it"
+    );
+    let tray = c.ensure_active_staging_tray().expect("create");
+    c.collection_add_asset(tray, a).expect("stage a");
+    c.collection_add_asset(tray, b).expect("stage b");
+    assert_eq!(c.active_staging_tray_id().expect("read"), Some(tray));
+    assert_eq!(c.collection_members(tray).expect("members").len(), 2);
+
+    // Creating it twice must not mint a second one — the M20 index says at most one, and a
+    // duplicate would make "the tray" ambiguous rather than erroring somewhere useful.
+    assert_eq!(c.ensure_active_staging_tray().expect("again"), tray);
+
+    // Connect an editor. The picks come with it rather than being stranded in a tray nothing
+    // resolves to any more.
+    let project = c
+        .register_project("C:/dev/MyRPG", Some("6000.0.23f1"), None)
+        .expect("register");
+    assert_eq!(
+        c.staging_tray_id(project).expect("tray"),
+        Some(tray),
+        "connecting a project abandoned the picks instead of adopting them"
+    );
+    assert_eq!(
+        c.active_staging_tray_id().expect("read"),
+        Some(tray),
+        "the active tray no longer resolves after registering"
+    );
+    assert_eq!(c.collection_members(tray).expect("members").len(), 2);
+
+    // A *second* project gets its own empty tray — trays never mix (UI-SPEC §16.1 footnote).
+    let other = c
+        .register_project("C:/dev/Other", None, None)
+        .expect("register 2");
+    let other_tray = c.staging_tray_id(other).expect("tray 2").expect("exists");
+    assert_ne!(
+        other_tray, tray,
+        "the second project reused the first's tray"
+    );
+    assert!(
+        c.collection_members(other_tray)
+            .expect("members")
+            .is_empty(),
+        "a new project started with someone else's picks"
+    );
+    // Registering made `other` active, so the tray on screen is now the empty one.
+    assert_eq!(c.active_staging_tray_id().expect("read"), Some(other_tray));
+
+    // Switching back brings the first project's picks back, which is the whole point of §16.2.
+    c.set_active_project(project).expect("switch");
+    assert_eq!(c.active_staging_tray_id().expect("read"), Some(tray));
+    assert_eq!(c.collection_members(tray).expect("members").len(), 2);
+
+    // And clearing empties the *current* tray only.
+    assert_eq!(c.clear_staging_tray().expect("clear"), 2);
+    assert!(c.collection_members(tray).expect("members").is_empty());
+}

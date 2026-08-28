@@ -934,34 +934,31 @@ fn related_assets(
         .map_err(|_| "library lock poisoned".to_string())
 }
 
-/// Stage asset ids into the tray (I6). In-memory only; the commit half rides the engine.
+/// Stage asset ids into the tray (UI-SPEC §16.2).
+///
+/// Through the writer and into the catalog, like every other mutation — this was an in-memory
+/// `Vec` on `Library` until 2026-08-27, which meant the shell's tray and the one ENGINE-API §6
+/// reads were different objects, and picks did not survive a restart (ADR-0010).
 #[tauri::command]
-fn stage(state: tauri::State<'_, AppState>, ids: Vec<i64>) -> Result<usize, String> {
-    state
-        .library
-        .lock()
-        .map(|mut l| l.stage(&ids))
-        .map_err(|_| "library lock poisoned".to_string())
+fn stage(state: tauri::State<'_, AppState>, ids: Vec<i64>) -> Result<WriteResult, String> {
+    state.write(Op::StageAssets { asset_ids: ids })
 }
 
 #[tauri::command]
-fn unstage(state: tauri::State<'_, AppState>, ids: Vec<i64>) -> Result<usize, String> {
-    state
-        .library
-        .lock()
-        .map(|mut l| l.unstage(&ids))
-        .map_err(|_| "library lock poisoned".to_string())
+fn unstage(state: tauri::State<'_, AppState>, ids: Vec<i64>) -> Result<WriteResult, String> {
+    state.write(Op::UnstageAssets { asset_ids: ids })
 }
 
 #[tauri::command]
-fn clear_staged(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state
-        .library
-        .lock()
-        .map(|mut l| l.clear_staged())
-        .map_err(|_| "library lock poisoned".to_string())
+fn clear_staged(state: tauri::State<'_, AppState>) -> Result<WriteResult, String> {
+    state.write(Op::ClearStaged)
 }
 
+/// The tray's **live** picks, in the order they were staged.
+///
+/// Trashed members are excluded by `collection_members` (UI-SPEC §7: a trashed asset leaves
+/// staging everywhere), and so are assets whose row has gone — the tray only ever draws things
+/// that still exist.
 #[tauri::command]
 fn staged(state: tauri::State<'_, AppState>) -> Result<Vec<i64>, String> {
     state
@@ -1715,12 +1712,16 @@ fn engine_write_bridge(writer: Writer) -> lodestash_api::AgentWriteFn {
         AgentWrite::UnpackPackage { package_id } => writer
             .run(Op::ExtractPackage { package_id })
             .map(|r| r.changed),
-        AgentWrite::StageAsset { asset_id } => {
-            writer.run(Op::StageAsset { asset_id }).map(|r| r.changed)
-        }
-        AgentWrite::UnstageAsset { asset_id } => {
-            writer.run(Op::UnstageAsset { asset_id }).map(|r| r.changed)
-        }
+        AgentWrite::StageAsset { asset_id } => writer
+            .run(Op::StageAssets {
+                asset_ids: vec![asset_id],
+            })
+            .map(|r| r.changed),
+        AgentWrite::UnstageAsset { asset_id } => writer
+            .run(Op::UnstageAssets {
+                asset_ids: vec![asset_id],
+            })
+            .map(|r| r.changed),
     })
 }
 
