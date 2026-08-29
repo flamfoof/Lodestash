@@ -5,6 +5,7 @@
 //! with `Engine` once the B1 extraction lands. Nothing here writes to the catalog — the
 //! single-writer rule (ARCHITECTURE §5) puts every write on the persist thread.
 
+pub mod agent_bridge;
 pub mod library;
 pub mod protocol;
 pub mod storage;
@@ -1886,14 +1887,43 @@ fn bulk_tag(
 /// generating on a miss — the same deterministic key the `lodestash://thumb` route uses. Shared by
 /// the embedded engine (B12) and the `--mcp` headless server.
 fn engine_preview_fn(cache_root: Option<std::path::PathBuf>) -> lodestash_api::PreviewFn {
-    Box::new(move |src| {
-        use lodestash_ingest::thumb::{generate, meta_key, ThumbParams};
+    Box::new(move |subject| {
+        use lodestash_ingest::thumb::{generate, generate_material, meta_key, ThumbParams};
         let cache = cache_root.as_deref()?;
         let q = lodestash_app::config::AppConfig::load().preview_quality;
         let params = ThumbParams {
             width: q.thumb_px(),
             height: q.thumb_px(),
             proxy: q.proxy_budget(),
+        };
+
+        // A material has no pixels of its own — it wears a texture reached through the graph
+        // (DATA-MODEL §10), so it is rendered as a shader ball rather than decoded.
+        if subject.media_type == "material" {
+            let albedo = subject.albedo.as_deref();
+            let src = subject.disk_path.as_deref()?;
+            let key = meta_key(src, std::fs::metadata(src).map(|m| m.len()).unwrap_or(0), 0);
+            return generate_material(cache, &key, params, albedo).ok();
+        }
+
+        // On disk: render from the file. Still in a pack: pull just this payload into the shared
+        // in-pack scratch first (INGESTION §2 surgical pull) — one gzip skip-scan, cached, and
+        // the same scratch the grid's own thumbnail route uses, so the two never disagree.
+        let owned;
+        let src = match (&subject.disk_path, &subject.in_pack) {
+            (Some(p), _) => p.as_path(),
+            (None, Some((pack, offset, size, ext))) => {
+                let (path, _) = lodestash_app::thumbs::ensure_in_pack_scratch(
+                    Some(cache),
+                    pack,
+                    *offset,
+                    *size,
+                    ext,
+                )?;
+                owned = path;
+                owned.as_path()
+            }
+            _ => return None,
         };
         let key = meta_key(src, std::fs::metadata(src).map(|m| m.len()).unwrap_or(0), 0);
         generate(src, cache, &key, params).ok()
@@ -2018,6 +2048,14 @@ fn run_mcp_headless() {
         );
         std::process::exit(2);
     };
+    // Writes go to the running app's single writer, never to a second writer in this process
+    // (ADR-0002). With no app running the forward fails honestly and the server stays read-only.
+    match crate::agent_bridge::forwarding_write_fn() {
+        Some(f) => state.set_write(f),
+        None => tracing::warn!(
+            "no engine.json — this MCP server is read-only until the Lodestash app is running"
+        ),
+    }
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

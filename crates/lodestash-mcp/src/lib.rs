@@ -434,21 +434,40 @@ impl Lodestash {
         let Some(row) = self.state.asset(args.id).map_err(internal)? else {
             return Err(ErrorData::invalid_params("no such asset", None));
         };
-        let Some(png) = self.state.preview_path(args.id) else {
-            return Err(ErrorData::internal_error("no preview for this asset", None));
-        };
-        let bytes = std::fs::read(&png)
-            .map_err(|e| ErrorData::internal_error(format!("preview unreadable: {e}"), None))?;
-
+        // A missing preview is **not** an error. This used to return `Err` before it added
+        // anything, so an asset with no cached render answered with no image, no file link and no
+        // metadata — and since previews resolved for nothing (in-pack assets have no file at the
+        // path the summary fabricates, and materials have no pixels of their own), that was every
+        // asset in a real library. The tool now returns what it has.
+        let mut content = Vec::new();
+        if let Some(png) = self.state.preview_path(args.id) {
+            // An unreadable cache entry costs the image, not the call.
+            if let Ok(bytes) = std::fs::read(&png) {
+                content.push(ContentBlock::image(b64(&bytes), "image/png"));
+            }
+        }
         // MCP-AND-ENGINES "Returning previews — the rule": always pair a viewable image with a
         // resource_link. The model reasons over the image; the consumer fetches the bytes.
-        let mut content = vec![ContentBlock::image(b64(&bytes), "image/png")];
-        if let Some(src) = self.state.source_path(&row) {
+        // Only a file that is really there — an in-pack asset has no path to hand out.
+        if let Some(src) = self.state.source_path(&row).filter(|p| p.is_file()) {
             content.push(ContentBlock::resource_link(
                 Resource::new(file_uri(&src), row.name.clone())
                     .with_description(format!("{} source file", row.media_type)),
             ));
         }
+        // Always say *what* it is, so a caller with no image still has something to reason from.
+        content.push(ContentBlock::json(serde_json::json!({
+            "id": row.id,
+            "name": row.name,
+            "media_type": row.media_type,
+            "format": row.format,
+            "package": row.package_name,
+            "preview": if content.iter().any(|c| matches!(c, ContentBlock::Image(_))) {
+                "rendered"
+            } else {
+                "unavailable"
+            },
+        }))?);
         Ok(CallToolResult::success(content))
     }
 

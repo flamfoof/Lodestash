@@ -4379,6 +4379,38 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("pipeline backfill row: {e}")))
     }
 
+    /// Everything needed to pull an in-pack asset's bytes out of its archive:
+    /// `(package_path, tar_offset, size_bytes, extension)` — the same locator the grid's
+    /// thumbnail route uses (INGESTION §2 "Surgical pull").
+    ///
+    /// `None` unless the asset is genuinely still in the archive: a materialized one has a real
+    /// file and an offset-less entry has nothing to seek to.
+    pub fn in_pack_locator(&self, asset_id: i64) -> Result<Option<(String, i64, i64, String)>> {
+        self.conn
+            .query_row(
+                "SELECT p.package_path, pe.tar_offset, pe.size_bytes, af.ext
+                   FROM asset a
+                   JOIN asset_file af    ON af.id = a.primary_file_id
+                   JOIN package_entry pe ON pe.id = af.package_entry_id
+                   JOIN package p        ON p.id = pe.package_id
+                  WHERE a.id = ?1
+                    AND af.workspace_rel IS NULL
+                    AND pe.tar_offset IS NOT NULL
+                    AND pe.size_bytes IS NOT NULL",
+                params![asset_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| CoreError::Catalog(format!("in_pack_locator: {e}")))
+    }
+
     /// Where an **in-pack** asset lives inside its archive: `(pathname, package_path)` —
     /// the `Assets/…` path the pack declared for it, and the `.unitypackage` holding it
     /// (UI-SPEC §13.9).

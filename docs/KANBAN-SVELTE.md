@@ -226,6 +226,17 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       already in the catalog, and UI-SPEC §13.9's License row reading the effective licence.
       *Still open, and moved to its own card below:* `.meta` `labels:` are parsed but never seeded
       into tags.
+- [x] **The agent plane can read assets and write tags — done 2026-08-29.** Probed
+      `lodestash-desktop --mcp` over stdio and found the surface half-built: 23 tools, clean
+      handshake, reads fine — and `add_tag` refused (`no writer bridge — read-only mode`) while
+      `get_asset_preview` failed for **0 of 60** sampled assets of every type, returning `Err`
+      before it added even the file link. Writes now forward to the running app's single writer
+      over the `engine.json` loopback plane ([ADR-0011](decisions/ADR-0011-headless-mcp-forwards-writes.md));
+      previews resolve the whole subject from the catalog (verified on-disk path, in-pack surgical
+      pull, material albedo) and reached **57 of 60** on the same sample. Verified end to end: a
+      tag written over MCP appears in the app.
+      *Still open:* the Streamable-HTTP MCP transport on the stable port 4319 (UI-SPEC §11.5), and
+      `remove_tag`/`unstage` have neither a REST route nor a tool.
 - [ ] **`.meta` `labels:` → seed tags.** Parsed by `unitypackage::parse_meta`, never written to
       `tag`/`asset_tag`. INGESTION §2 lists them as seed tags. **Surveyed 2026-08-29 before
       building, and deliberately not built yet:** the reference library carries essentially

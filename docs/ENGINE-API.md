@@ -100,6 +100,14 @@ editor needed); **`/v1/import`** routes into the **currently open** Unity projec
 in-editor import (§5). Both reuse the **same dependency-closure resolution** described in
 [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md) §3.
 
+> **Writes from a headless MCP server** are forwarded to the running app over this same loopback
+> plane, using the `engine.json` port + token ([ADR-0011](decisions/ADR-0011-headless-mcp-forwards-writes.md)).
+> `lodestash-desktop --mcp` keeps a read-only catalog connection — WAL admits any number of
+> readers — and posts each mutating op to the app, so ADR-0002's single writer holds across
+> processes without a lock. With no app running the forward fails and the tool says so.
+> `RemoveTag` and `UnstageAsset` cannot be forwarded: neither has a route here (nor an MCP tool),
+> and they are refused rather than reported as zero rows changed.
+
 > **Parity scope.** "1:1" covers the **agent-facing** surface. A few routes are **REST-only by
 > design** — `GET /v1/assets/{id}/file` (the MCP `resource_link` target) and the plugin-transport
 > endpoints `GET /v1/import-queue` + `POST /v1/import-queue/{req}/ack` (§5.3) — because they are

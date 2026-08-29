@@ -3706,3 +3706,64 @@ fn in_pack_location_is_only_for_assets_still_in_the_archive() {
     );
     assert_eq!(c.in_pack_location(999).unwrap(), None, "no such asset");
 }
+
+/// The locator behind an in-pack preview (INGESTION 2 "Surgical pull"). It must answer only for
+/// an asset genuinely still in its archive: a materialized one has a real file to render from,
+/// and an entry with no recorded offset has nothing to seek to.
+#[test]
+fn in_pack_locator_answers_only_for_pullable_assets() {
+    let c = Catalog::open_in_memory().unwrap();
+    c.conn
+        .execute_batch(
+            "INSERT INTO import_source (id, uuid, name, root_path, kind)
+                 VALUES (1, 'src-1', 's', '/s', 'folder');
+             INSERT INTO media_type (id, code, label) VALUES (1, 'image', 'Image');
+             INSERT INTO package (id, uuid, source_id, package_path, name)
+                 VALUES (10, 'p1', 1, 'G:/cache/Pack.unitypackage', 'Pack');
+             INSERT INTO package_entry (id, package_id, guid, pathname, tar_offset, size_bytes) VALUES
+                 (100, 10, 'g1', 'Assets/Rock.png', 4096, 2048),
+                 (101, 10, 'g2', 'Assets/Moss.png', 8192, 1024),
+                 (102, 10, 'g3', 'Assets/Nope.png', NULL, 512);
+             INSERT INTO asset (id, uuid, source_id, media_type_id, package_id, name, created_at, updated_at) VALUES
+                 (1, 'a1', 1, 1, 10, 'Rock', 0, 0),
+                 (2, 'a2', 1, 1, 10, 'Moss', 0, 0),
+                 (3, 'a3', 1, 1, 10, 'Nope', 0, 0),
+                 (4, 'a4', 1, 1, NULL, 'Loose', 0, 0);
+             INSERT INTO asset_file (id, asset_id, rel_path, ext, size_bytes, mtime, package_entry_id, workspace_rel) VALUES
+                 (1, 1, 'Rock.png', 'png', 2048, 0, 100, NULL),
+                 (2, 2, 'Moss.png', 'png', 1024, 0, 101, 'abc/Moss.png'),
+                 (3, 3, 'Nope.png', 'png', 512, 0, 102, NULL),
+                 (4, 4, 'Loose.png', 'png', 10, 0, NULL, NULL);
+             UPDATE asset SET primary_file_id = 1 WHERE id = 1;
+             UPDATE asset SET primary_file_id = 2 WHERE id = 2;
+             UPDATE asset SET primary_file_id = 3 WHERE id = 3;
+             UPDATE asset SET primary_file_id = 4 WHERE id = 4;",
+        )
+        .expect("fixture");
+
+    assert_eq!(
+        c.in_pack_locator(1).unwrap(),
+        Some((
+            "G:/cache/Pack.unitypackage".to_string(),
+            4096,
+            2048,
+            "png".to_string()
+        )),
+        "an asset still in the archive hands back the offset a surgical pull needs"
+    );
+    assert_eq!(
+        c.in_pack_locator(2).unwrap(),
+        None,
+        "an extracted asset renders from its real file, not by re-pulling the archive"
+    );
+    assert_eq!(
+        c.in_pack_locator(3).unwrap(),
+        None,
+        "no offset, nothing to seek to"
+    );
+    assert_eq!(
+        c.in_pack_locator(4).unwrap(),
+        None,
+        "a loose file is in no pack"
+    );
+}

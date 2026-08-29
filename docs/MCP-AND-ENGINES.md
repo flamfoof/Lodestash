@@ -106,6 +106,21 @@ embedded `resource`.
   (or an `audio` block where the client supports it).
 - **Always pair a viewable preview with a `resource_link`** — the agent reasons over the preview; the
   consumer (engine plugin/export) fetches bytes by path/URI.
+- **A missing preview is not an error.** `get_asset_preview` returns what it has — the image when
+  there is one, the `resource_link` when a real file exists, and always a small JSON block naming
+  the asset — so a caller with no image still has something to reason from. It used to answer
+  `Err` before adding anything, which meant *no* content at all.
+
+*(Fixed 2026-08-29, and it was total: previews resolved for **0 of 60** sampled assets of every
+type, so the agent plane could not see a single asset in the library. Two causes. The resolver was
+handed only a **source path**, and the summary query fabricates `root_path/rel_path` for an in-pack
+asset — a file that is not there — so every one of the 5,963 in-pack assets failed; and a
+**material** has no pixels of its own, so decoding its `.mat` was never going to produce an image.
+`ServerState::preview_subject` now resolves the whole subject from the catalog — verified on-disk
+path, in-pack locator for a surgical pull, albedo texture for a shader ball — and the desktop's
+renderer uses the same in-pack scratch the grid's own thumbnail route uses, so the two cannot
+disagree. Same sample afterwards: **57 of 60**, the remainder being assets whose render genuinely
+fails, which now answer with metadata instead of an error.)*
 
 > **Desktop MCP settings** (UI-SPEC §16, FEATURES.md §6.5): the app's MCP card exposes a **literal
 > per-tool allow-list** — one toggle per tool in the table above — plus the enable flag, port

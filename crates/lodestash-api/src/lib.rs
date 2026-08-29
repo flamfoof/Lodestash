@@ -66,7 +66,7 @@ pub struct TagProposal {
     pub confidence: Option<f64>,
 }
 
-pub use handshake::{write_handshake, Handshake};
+pub use handshake::{handshake_path, write_handshake, Handshake};
 pub use routes::{package_json, project_json, router, summary_json};
 
 /// Every agent-facing operation in ENGINE-API §2, by MCP tool name. The MCP crate asserts its
@@ -99,8 +99,21 @@ pub const AGENT_OPERATIONS: &[(&str, &str)] = &[
     ("import_staged", "POST /v1/stage/import"),
 ];
 
-/// Resolves an asset's source file to a cached preview PNG, generating it on a miss.
-pub type PreviewFn = Box<dyn Fn(&Path) -> Option<PathBuf> + Send + Sync>;
+/// Everything a preview renderer needs for one asset, resolved from the catalog by
+/// [`ServerState::preview_subject`] so the renderer needs no database access of its own.
+pub struct PreviewSubject {
+    pub media_type: String,
+    /// The asset's own file, **verified to exist**. `None` for an asset still inside a pack.
+    pub disk_path: Option<PathBuf>,
+    /// `(package path, tar offset, byte size, extension)` for an in-pack asset — the locator a
+    /// surgical pull needs (INGESTION §2).
+    pub in_pack: Option<(String, i64, i64, String)>,
+    /// For a material: the on-disk texture its shader ball wears (DATA-MODEL §10).
+    pub albedo: Option<PathBuf>,
+}
+
+/// Resolves one asset to a cached preview PNG, generating it on a miss.
+pub type PreviewFn = Box<dyn Fn(&PreviewSubject) -> Option<PathBuf> + Send + Sync>;
 
 /// Encodes a natural-language query into every vector space the library has, as
 /// `(model_id, vector)` pairs — SigLIP for visuals, CLAP for audio. Supplied by the caller so
@@ -275,9 +288,9 @@ pub struct ServerState {
     catalog: Mutex<Catalog>,
     pub jobs: jobs::Jobs,
     workspace_dir: PathBuf,
-    /// Given an asset's source file, the cached preview PNG for it (generating on a miss).
-    /// Supplied by the caller because the thumbnail cache layout — and, for audio, the decoder —
-    /// live outside this crate.
+    /// Given everything known about one asset, the cached preview PNG for it (generating on a
+    /// miss). Supplied by the caller because the thumbnail cache layout — and, for audio, the
+    /// decoder — live outside this crate.
     preview: PreviewFn,
     /// `None` until the desktop app has an embedder loaded — `search(.., ai)` then answers
     /// `ai_unavailable` rather than silently degrading to keyword matching.
@@ -1105,8 +1118,46 @@ impl ServerState {
 
     /// The asset's preview PNG on disk, generated on a cache miss.
     pub fn preview_path(&self, id: i64) -> Option<PathBuf> {
+        (self.preview)(&self.preview_subject(id)?)
+    }
+
+    /// Resolve everything a preview needs for one asset, from the catalog, so the renderer needs
+    /// no database access of its own.
+    ///
+    /// Built because the old shape — "give the resolver the source path" — could not describe the
+    /// majority of a real library: an **in-pack** asset has no file at that path (the summary
+    /// query fabricates `root_path/rel_path` for it), so every preview call for one failed, and
+    /// a **material** has no pixels of its own at all. The agent plane could not see a single
+    /// asset of any type as a result.
+    pub fn preview_subject(&self, id: i64) -> Option<PreviewSubject> {
         let row = self.asset(id).ok().flatten()?;
-        (self.preview)(&self.source_path(&row)?)
+        // Only a path that is actually there. `disk_path` is fabricated for in-pack rows.
+        let disk_path = self.source_path(&row).filter(|p| p.is_file());
+        let cat = self.catalog.lock().unwrap();
+        let in_pack = if disk_path.is_none() {
+            cat.in_pack_locator(id).ok().flatten()
+        } else {
+            None
+        };
+        // A material wears a texture reached through the dependency graph (DATA-MODEL §10).
+        let albedo = if row.media_type == "material" {
+            cat.material_albedo_texture(id)
+                .ok()
+                .flatten()
+                .and_then(|tex| cat.asset_summaries(&[tex]).ok())
+                .and_then(|rows| rows.into_iter().next())
+                .and_then(|t| t.disk_path.map(PathBuf::from))
+                .filter(|p| p.is_file())
+        } else {
+            None
+        };
+        drop(cat);
+        Some(PreviewSubject {
+            media_type: row.media_type,
+            disk_path,
+            in_pack,
+            albedo,
+        })
     }
 }
 
