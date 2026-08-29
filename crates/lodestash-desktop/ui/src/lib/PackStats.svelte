@@ -14,13 +14,39 @@
    * ponytail: first match wins if two packs share a name. Checked against the real catalog — 87
    * packs, no collisions. Carry `package_id` on `GridItem` if that ever stops being true.
    */
-  import { packages, fmtSize, type PackageRow } from "./api";
+  import { packages, fmtSize, setPackKeepCached, type PackageRow } from "./api";
+  import Icon from "./Icon.svelte";
 
   let { name, onclose }: { name: string | null; onclose: () => void } = $props();
 
   let row = $state<PackageRow | null>(null);
   let error = $state<string | null>(null);
   let sheetRef = $state<HTMLDivElement | null>(null);
+  let keepBusy = $state(false);
+
+  /**
+   * UI-SPEC §15's keep-cached control, beside the size it governs.
+   *
+   * Deliberately **not** `pinned`, which already means "Add to Library" (M7): whether a pack
+   * shows in the grid and whether its extracted bytes are worth hundreds of megabytes are
+   * different questions, and one switch answering both would make freeing space cost visibility.
+   *
+   * Marking a pack that is not extracted starts no work — it is a promise about the future, not
+   * a command to unpack a gigabyte on a click.
+   */
+  async function toggleKeep() {
+    const r = row;
+    if (!r || keepBusy) return;
+    keepBusy = true;
+    try {
+      await setPackKeepCached(r.id, !r.keep_cached);
+      row = { ...r, keep_cached: !r.keep_cached };
+    } catch (e) {
+      error = String(e);
+    } finally {
+      keepBusy = false;
+    }
+  }
 
   $effect(() => {
     const want = name;
@@ -114,6 +140,35 @@
             <span class="num value">{row.triangles ? row.triangles.toLocaleString() : "—"}</span>
             <span class="label">triangles</span>
           </div>
+        </div>
+
+        <div class="keeprow" data-testid="pack-keep-cached">
+          <span class="keepicon" class:on={row.keep_cached} aria-hidden="true">
+            <Icon name="ls-nav-packages" size={16} />
+          </span>
+          <div class="keeptext">
+            <span>Keep cached</span>
+            <span class="sub">
+              {#if !row.extracted}
+                Not extracted yet — marking it only promises the bytes survive if you do.
+              {:else if row.keep_cached}
+                Kept, so its assets open from disk instead of streaming from the archive.
+              {:else}
+                Evictable — reclaimed once nothing references it. It stays searchable either way.
+              {/if}
+            </span>
+          </div>
+          <button
+            class="switch"
+            class:on={row.keep_cached}
+            onclick={toggleKeep}
+            disabled={keepBusy}
+            aria-pressed={row.keep_cached}
+            aria-label="Keep cached"
+            data-testid="pack-keep-toggle"
+          >
+            <span class="knob"></span>
+          </button>
         </div>
 
         {#if row.by_type.length > 0}
@@ -225,6 +280,76 @@
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
+  /* §15's keep-cached row — the control sits next to the size it governs. */
+  .keeprow {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--sp-3);
+    padding: var(--sp-3);
+    background: var(--ls-surface-raised);
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-md);
+  }
+  /* The sprite bakes its own stroke colour (Icon.svelte), so state reads as opacity. */
+  .keepicon {
+    flex: none;
+    margin-top: 1px;
+    opacity: 0.3;
+  }
+  .keepicon.on {
+    opacity: 1;
+  }
+  .keeptext {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: var(--fs-sm);
+  }
+  .keeptext .sub {
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+  }
+  .switch {
+    flex: none;
+    position: relative;
+    width: 34px;
+    height: 18px;
+    margin-top: 2px;
+    padding: 0;
+    background: none;
+    border: 1px solid var(--ls-border-strong);
+    border-radius: var(--r-pill);
+    cursor: pointer;
+  }
+  .switch.on {
+    background: color-mix(in srgb, var(--ls-gold) 18%, transparent);
+    border-color: var(--ls-gold);
+  }
+  .switch:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .switch .knob {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 12px;
+    height: 12px;
+    border-radius: var(--r-pill);
+    background: var(--ls-text-dim);
+    transition: left 120ms ease, background 120ms ease;
+  }
+  .switch.on .knob {
+    left: 18px;
+    background: var(--ls-gold);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .switch .knob {
+      transition: none;
+    }
+  }
+
   .types {
     margin-top: 12px;
     border-top: 1px solid var(--ls-border);

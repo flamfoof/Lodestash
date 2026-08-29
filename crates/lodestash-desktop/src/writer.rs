@@ -73,6 +73,19 @@ pub enum Op {
         edge_id: i64,
         ignored: bool,
     },
+    /// Mark a pack's extracted bytes as worth keeping (M23, UI-SPEC §15). Not `pinned`, which
+    /// already means "Add to Library" — see the migration.
+    SetPackKeepCached {
+        package_id: i64,
+        keep: bool,
+    },
+    /// Point a pack at a different `.unitypackage` (UI-SPEC §15 Retarget…). Only the path moves:
+    /// every asset, locator and extracted byte stays, because what the rows describe has not
+    /// changed — only where the bytes can be re-read from.
+    RetargetPackage {
+        package_id: i64,
+        new_path: String,
+    },
     /// Re-derive every source's availability from disk (UI-SPEC §11.1, M18).
     ///
     /// It writes `import_source.state`, so it belongs on the writer thread rather than on a read
@@ -722,6 +735,21 @@ impl Writer {
                 // One-shot, before the loop: packs indexed before the harvest existed have no
                 // pipeline, and only the writer thread may fix that (single-writer rule).
                 backfill_package_pipelines(&catalog);
+                // …and enforce the preview cap the settings screen has always shown and never
+                // applied (UI-SPEC §11.4). Startup rather than per-write: the cache grows a
+                // thumbnail at a time and a check on that path would stat the whole tree on every
+                // preview.
+                {
+                    let cfg = AppConfig::load();
+                    if cfg.auto_purge_preview_cache {
+                        if let Some(thumbs) = default_cache_dirs().0 {
+                            crate::storage::purge_previews_over_cap(
+                                &thumbs,
+                                u64::from(cfg.preview_cache_cap_gb) * 1024 * 1024 * 1024,
+                            );
+                        }
+                    }
+                }
                 let (cache_dir, workspace_dir) = default_cache_dirs();
                 let proxy = AppConfig::load().preview_quality.proxy_budget();
                 // B11c: when auto-identify is on and the local models are present, the idle
@@ -1272,6 +1300,25 @@ fn run(
             })
             .map_err(|e| e.to_string())
         }
+
+        Op::SetPackKeepCached { package_id, keep } => catalog
+            .set_package_keep_cached(package_id, keep)
+            .map(|()| WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
+            .map_err(|e| e.to_string()),
+
+        Op::RetargetPackage {
+            package_id,
+            new_path,
+        } => catalog
+            .retarget_package(package_id, &new_path)
+            .map(|()| WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
+            .map_err(|e| e.to_string()),
 
         // `changed` is how many sources *moved* state, so a caller can tell "nothing to see" from
         // "a drive just came back" without diffing the whole list.

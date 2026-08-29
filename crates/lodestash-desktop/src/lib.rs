@@ -7,6 +7,7 @@
 
 pub mod library;
 pub mod protocol;
+pub mod storage;
 pub mod writer;
 
 use std::path::PathBuf;
@@ -341,6 +342,135 @@ fn set_favorite(
     state.write(Op::SetFavorite { ids: asset_ids, on })
 }
 
+/// What a workspace reclaim would remove, without removing it (UI-SPEC §11.4).
+///
+/// Always a dry run. The button that calls it reports the size first, because the sweep deletes
+/// files from the user's disk and the first honest thing to do with 3.6 GB is show it.
+#[tauri::command]
+fn workspace_usage(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::storage::ReclaimPlan, String> {
+    let Some(workspace) = lodestash_app::paths::default_cache_dirs().1 else {
+        return Ok(crate::storage::ReclaimPlan::default());
+    };
+    let referenced = state
+        .library
+        .lock()
+        .map_err(|_| "library lock poisoned".to_string())?
+        .referenced_workspace_paths();
+    Ok(crate::storage::plan_reclaim(&workspace, &referenced))
+}
+
+/// Outcome of a reclaim — recomputed from what actually went, plus where the record was written.
+#[derive(serde::Serialize)]
+struct ReclaimOutcome {
+    removed: usize,
+    freed: u64,
+    /// The append-only log listing every folder removed. `None` means it could not be written,
+    /// which the caller says out loud: deleting gigabytes and keeping no record is worth knowing.
+    log: Option<String>,
+}
+
+/// Reclaim the workspace folders no live asset resolves through (UI-SPEC §11.4).
+///
+/// Re-plans rather than trusting a plan the frontend held: the catalog may have changed since the
+/// dry run, and a stale plan is how a sweep deletes something that has just been re-materialized.
+#[tauri::command]
+fn reclaim_workspace(state: tauri::State<'_, AppState>) -> Result<ReclaimOutcome, String> {
+    let Some(workspace) = lodestash_app::paths::default_cache_dirs().1 else {
+        return Err("no workspace directory configured".into());
+    };
+    let referenced = state
+        .library
+        .lock()
+        .map_err(|_| "library lock poisoned".to_string())?
+        .referenced_workspace_paths();
+    let plan = crate::storage::plan_reclaim(&workspace, &referenced);
+    let log = crate::storage::write_reclaim_log(&workspace, &plan);
+    let (removed, freed) = crate::storage::execute_reclaim(&plan);
+    tracing::info!(removed, freed, "workspace reclaimed");
+    Ok(ReclaimOutcome {
+        removed,
+        freed,
+        log: log.map(|p| p.to_string_lossy().into_owned()),
+    })
+}
+
+/// Packs holding extracted bytes, largest first (UI-SPEC §11.4 storage list).
+#[tauri::command]
+fn workspace_packs(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<crate::library::WorkspacePackRow>, String> {
+    state
+        .library
+        .lock()
+        .map(|l| l.workspace_packs())
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
+/// Keep a pack's extracted bytes (UI-SPEC §15). A pack that is *not* kept stays fully searchable
+/// and previewable — its payloads resolve out of the archive instead of off disk.
+#[tauri::command]
+fn set_pack_keep_cached(
+    state: tauri::State<'_, AppState>,
+    package_id: i64,
+    keep: bool,
+) -> Result<WriteResult, String> {
+    state.write(Op::SetPackKeepCached { package_id, keep })
+}
+
+/// How much of a pack a candidate archive still accounts for, by GUID (UI-SPEC §15 Retarget…).
+///
+/// Read-only, and deliberately never a verdict: a publisher updating a pack legitimately
+/// reshuffles GUIDs, so a low match is reported and the user decides — the same shape as
+/// `relink_preview` for a moved source root.
+#[derive(serde::Serialize)]
+struct RetargetPreview {
+    matched: usize,
+    total: usize,
+}
+
+#[tauri::command]
+fn retarget_preview(
+    state: tauri::State<'_, AppState>,
+    package_id: i64,
+    path: String,
+) -> Result<RetargetPreview, String> {
+    let candidate = PathBuf::from(&path);
+    if !candidate.is_file() {
+        return Err(format!("{path} is not a file"));
+    }
+    let guids: Vec<String> = lodestash_ingest::unitypackage::read_manifest(&candidate)
+        .map_err(|e| format!("{path} could not be read: {e}"))?
+        .into_iter()
+        .map(|e| e.guid)
+        .collect();
+    let lib = state
+        .library
+        .lock()
+        .map_err(|_| "library lock poisoned".to_string())?;
+    let (matched, total) = lib
+        .retarget_match(package_id, &guids)
+        .ok_or_else(|| "no catalog on disk".to_string())?;
+    Ok(RetargetPreview { matched, total })
+}
+
+/// Point a pack at a different archive (UI-SPEC §15 Retarget…).
+#[tauri::command]
+fn retarget_package(
+    state: tauri::State<'_, AppState>,
+    package_id: i64,
+    path: String,
+) -> Result<WriteResult, String> {
+    if !PathBuf::from(&path).is_file() {
+        return Err(format!("{path} is not a file"));
+    }
+    state.write(Op::RetargetPackage {
+        package_id,
+        new_path: path,
+    })
+}
+
 /// ⊘ Ignore / ↺ restore one dependency edge (UI-SPEC §13.6). Catalog-only, and reversible: the
 /// row is muted rather than deleted, so the panel can offer it back and the next dependency scan
 /// cannot resurrect it.
@@ -608,6 +738,30 @@ fn add_source_dialog(
 /// import dialog (FEATURES §5.2) scans afterwards in `discover_package_folder`, and the relink
 /// panel (UI-SPEC §11.1) counts afterwards in `relink_preview` — both want a real modal with a
 /// spinner rather than a blocking native loop. `title` is what tells the user which one they are in.
+#[tauri::command]
+fn pick_package_file(
+    app: tauri::AppHandle,
+    title: Option<String>,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.dialog()
+        .file()
+        .set_title(title.unwrap_or_else(|| "Find this pack's .unitypackage".into()))
+        .add_filter("Unity package", &["unitypackage"])
+        .pick_file(move |path| {
+            let _ = tx.send(path.map(|p| match p {
+                tauri_plugin_dialog::FilePath::Path(p) => p.to_string_lossy().into_owned(),
+                tauri_plugin_dialog::FilePath::Url(_) => String::new(),
+            }));
+        });
+    match rx.recv().map_err(|_| "file dialog closed".to_string())? {
+        Some(path) if !path.is_empty() => Ok(Some(path)),
+        _ => Ok(None),
+    }
+}
+
+/// Native folder chooser for the import dialog. `None` = the user cancelled.
 #[tauri::command]
 fn pick_folder(app: tauri::AppHandle, title: Option<String>) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
@@ -2006,6 +2160,13 @@ pub fn run() {
             reload_library,
             set_favorite,
             set_link_ignored,
+            workspace_usage,
+            reclaim_workspace,
+            workspace_packs,
+            set_pack_keep_cached,
+            retarget_preview,
+            retarget_package,
+            pick_package_file,
             refresh_source_health,
             relink_preview,
             relink_source,

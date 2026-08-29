@@ -2023,6 +2023,101 @@ try {
     await page.keyboard.press("Escape");
   });
 
+  await check("Settings storage says what the workspace actually holds", async () => {
+    // The three STORAGE CAPS controls were inert until 2026-08-29: loaded from config, written
+    // back to config, read by nothing. The workspace grew to 3.55 GB across 1,179 folders that no
+    // catalog row referenced, and the cap capped nothing.
+    //
+    // This **plants its own orphan** rather than asserting whatever the machine happens to hold.
+    // A check shaped "if there are orphans, assert the callout" passes over an empty workspace
+    // without asserting anything — the failure mode the onboarding check sat in for months — and
+    // after the first reclaim, a real machine's workspace is exactly that.
+    const workspace = path.join(process.env.LOCALAPPDATA, "Lodestash", "workspace");
+    const planted = path.join(workspace, "e2e-orphan-" + Date.now());
+    fs.mkdirSync(planted, { recursive: true });
+    fs.writeFileSync(path.join(planted, "junk.bin"), Buffer.alloc(4096));
+
+    // Away and back, so the screen is mounted fresh after the orphan is planted — clicking
+    // Settings while already on Settings is a no-op and would read a stale snapshot.
+    const open = async () => {
+      await page.getByRole("button", { name: "Library", exact: true }).click();
+      await page.getByRole("button", { name: "Settings" }).click();
+      await page.waitForSelector('[data-testid="keep-extracted"]', { timeout: 5000 });
+    };
+    const callout = page.locator('[data-testid="workspace-orphans"]');
+    const none = page.locator('[data-testid="workspace-orphans-none"]');
+
+    try {
+      const plan = await invoke("workspace_usage");
+      assert.ok(
+        plan.entries.some((e) => e.path === planted),
+        "the planted orphan is not in the plan — the sweep cannot see unreferenced folders",
+      );
+      assert.ok(plan.bytes >= 4096, "the plan does not count the orphan's bytes");
+
+      await open();
+      await callout.waitFor({ timeout: 3000 });
+      assert.equal(await none.count(), 0, "both storage states rendered at once");
+      const text = (await callout.textContent()) ?? "";
+      assert.ok(
+        /is not referenced by the catalog/.test(text),
+        `orphan callout does not say what it means: ${text}`,
+      );
+      assert.ok(
+        text.includes(plan.entries.length.toLocaleString()),
+        `callout does not name the ${plan.entries.length} folders it would remove`,
+      );
+      await page.waitForSelector('[data-testid="reclaim-workspace"]', { timeout: 3000 });
+    } finally {
+      fs.rmSync(planted, { recursive: true, force: true });
+    }
+
+    // …and with nothing unreferenced, no reclaim is offered. Removed by hand above rather than
+    // through the button: this check proves what the screen says, not what the sweep deletes —
+    // that is `plan_reclaim`'s own mutation-checked test.
+    const after = await invoke("workspace_usage");
+    if (after.entries.length === 0) {
+      await open();
+      await none.waitFor({ timeout: 3000 });
+      assert.equal(
+        await page.locator('[data-testid="reclaim-workspace"]').count(),
+        0,
+        "a reclaim button was offered with nothing to reclaim",
+      );
+    }
+  });
+
+  await check("a pack can be kept, and keeping it is not pinning it", async () => {
+    // M23. `pinned` already means "Add to Library" (M7) — sharing one flag would make freeing
+    // disk space cost the pack its place in the sidebar, so this checks they move independently.
+    const packs = await invoke("packages");
+    if (packs.length === 0) return;
+    const target = packs[0];
+    const was = target.keep_cached;
+    const pinnedWas = target.pinned;
+
+    const read = async () => (await invoke("packages")).find((p) => p.id === target.id);
+    try {
+      await invoke("set_pack_keep_cached", { packageId: target.id, keep: !was });
+      const after = await read();
+      assert.equal(after?.keep_cached, !was, "keep_cached did not flip");
+      assert.equal(after?.pinned, pinnedWas, "keeping a pack changed whether it is in the Library");
+
+      // …and the Packages screen shows it.
+      await page.getByRole("button", { name: "Packages" }).click();
+      const toggle = page.locator(`[data-testid="pack-keep-${target.id}"]`);
+      await toggle.waitFor({ timeout: 5000 });
+      assert.equal(
+        await toggle.getAttribute("aria-pressed"),
+        String(!was),
+        "the row's toggle disagrees with the catalog",
+      );
+    } finally {
+      await invoke("set_pack_keep_cached", { packageId: target.id, keep: was });
+    }
+    assert.equal((await read())?.keep_cached, was, "the pack was left as it was found");
+  });
+
   await check("LINKED FILES says which side of the pack boundary a link is on", async () => {
     // §13.6's row state. Until 2026-08-29 every resolved edge rendered identically, so the
     // panel could not tell a dependency that travels with its pack from one that resolves

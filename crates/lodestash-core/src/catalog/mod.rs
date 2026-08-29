@@ -373,6 +373,7 @@ impl Catalog {
             (20, MIGRATION_20_UNPROJECTED_STAGING),
             (21, MIGRATION_21_STORE_PACK_LICENSE),
             (22, MIGRATION_22_DROP_BUILTIN_EDGES),
+            (23, MIGRATION_23_KEEP_CACHED),
         ];
 
         for (version, sql) in migrations {
@@ -2079,6 +2080,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_collection_staging_unprojected
   ON collection(is_staging) WHERE is_staging=1 AND project_id IS NULL;
 ";
 
+/// M23 — per-pack workspace retention (UI-SPEC §15 / §4, INGESTION §2 "Workspace retention").
+///
+/// Deliberately **not** `package.pinned`, which already means "Add to Library" (M7): whether a
+/// pack shows in the grid and whether its extracted bytes are worth hundreds of megabytes are
+/// different questions, and one switch answering both would make freeing disk space cost you the
+/// pack's visibility.
+///
+/// A pack that is *not* kept is still fully searchable, filterable and previewable — its payloads
+/// resolve out of the archive by surgical pull instead of off disk, which is slower per open, not
+/// absent.
+const MIGRATION_23_KEEP_CACHED: &str = "
+ALTER TABLE package ADD COLUMN keep_cached INTEGER NOT NULL DEFAULT 0;
+";
+
 /// M22 — drop edges that point at Unity's own built-in resource libraries.
 ///
 /// A prefab painted with Unity's *default* material declares the built-in-resources GUID, and
@@ -2220,6 +2235,8 @@ pub struct PackageListing {
     pub license: Option<String>,
     pub license_url: Option<String>,
     pub attribution: Option<String>,
+    /// M23 — its extracted bytes are worth keeping. Not `pinned`; see the migration.
+    pub keep_cached: bool,
     /// `built_in` | `urp` | `hdrp` | `mixed` (DATA-MODEL §12); `None` = not determined.
     pub pipeline: Option<String>,
 }
@@ -2256,6 +2273,20 @@ pub struct ImportSpec {
 pub enum ImportOutcome {
     Recorded { asset_id: i64, import_id: i64 },
     AlreadyImported { asset_id: i64 },
+}
+
+/// A pack holding extracted bytes in the workspace (M23) — the Settings storage list and the
+/// input to the reclaim sweep.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WorkspacePack {
+    pub id: i64,
+    pub name: String,
+    /// The `.unitypackage` these bytes came out of. When it no longer resolves on disk, the
+    /// extracted copy is the only one left and the sweep must never take it.
+    pub package_path: String,
+    pub keep_cached: bool,
+    /// Workspace files this pack still resolves through.
+    pub files: usize,
 }
 
 /// One pack in an import request whose render pipeline disagrees with the target project's
@@ -2449,7 +2480,7 @@ impl Catalog {
             .prepare(
                 "SELECT id, name, publisher, category, package_path,
                         asset_count, unpacked_at, pinned, version, license,
-                        license_url, attribution, pipeline
+                        license_url, attribution, pipeline, keep_cached
                  FROM package ORDER BY publisher, name",
             )
             .map_err(|e| CoreError::Catalog(format!("pkg list prep: {e}")))?;
@@ -2469,6 +2500,7 @@ impl Catalog {
                     license_url: r.get(10)?,
                     attribution: r.get(11)?,
                     pipeline: r.get(12)?,
+                    keep_cached: r.get::<_, i64>(13)? == 1,
                 })
             })
             .map_err(|e| CoreError::Catalog(format!("pkg list query: {e}")))?;
@@ -4729,6 +4761,126 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("related query: {e}")))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| CoreError::Catalog(format!("related row: {e}")))
+    }
+
+    /// Mark a pack's extracted bytes as worth keeping (M23). See the migration for why this is
+    /// not `pinned`.
+    pub fn set_package_keep_cached(&self, package_id: i64, keep: bool) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE package SET keep_cached = ?2 WHERE id = ?1",
+                params![package_id, keep as i64],
+            )
+            .map(|_| ())
+            .map_err(|e| CoreError::Catalog(format!("set_package_keep_cached: {e}")))
+    }
+
+    /// Every `workspace_rel` a **live** asset still resolves through — the set the workspace
+    /// sweep must not touch.
+    ///
+    /// Live means not soft-deleted: a trashed asset is recoverable (DATA-MODEL §8), so its bytes
+    /// are not garbage. Returned as the stored relative paths; the caller resolves them against
+    /// its workspace dir.
+    pub fn referenced_workspace_paths(&self) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT af.workspace_rel
+                   FROM asset_file af
+                   JOIN asset a ON a.id = af.asset_id
+                  WHERE af.workspace_rel IS NOT NULL AND a.deleted_at IS NULL",
+            )
+            .map_err(|e| CoreError::Catalog(format!("workspace refs prep: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| CoreError::Catalog(format!("workspace refs query: {e}")))?;
+        rows.collect::<std::result::Result<std::collections::HashSet<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("workspace refs row: {e}")))
+    }
+
+    /// Packs holding extracted bytes, for the Settings storage list and the sweep: id, name,
+    /// archive path, whether the user marked it kept, and how many workspace files it holds.
+    ///
+    /// Ordered by file count descending — "what is costing me the most" is the question this list
+    /// exists to answer.
+    pub fn workspace_packs(&self) -> Result<Vec<WorkspacePack>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT p.id, p.name, p.package_path, p.keep_cached, COUNT(af.id)
+                   FROM package p
+                   JOIN asset a       ON a.package_id = p.id AND a.deleted_at IS NULL
+                   JOIN asset_file af ON af.asset_id = a.id AND af.workspace_rel IS NOT NULL
+                  GROUP BY p.id
+                  ORDER BY COUNT(af.id) DESC, p.name",
+            )
+            .map_err(|e| CoreError::Catalog(format!("workspace packs prep: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(WorkspacePack {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    package_path: r.get(2)?,
+                    keep_cached: r.get::<_, i64>(3)? == 1,
+                    files: r.get::<_, i64>(4)? as usize,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("workspace packs query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("workspace packs row: {e}")))
+    }
+
+    /// How many of a pack's recorded entries a candidate archive still accounts for, by GUID —
+    /// the evidence behind §15's **Retarget…** (mirrors `relink_preview` for a moved source root).
+    ///
+    /// Returns `(matched, total)`. A low match is **not** an error: a publisher updating a pack
+    /// legitimately reshuffles GUIDs, so the count is shown and the user decides.
+    pub fn retarget_match(
+        &self,
+        package_id: i64,
+        candidate_guids: &[String],
+    ) -> Result<(usize, usize)> {
+        let total: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM package_entry WHERE package_id = ?1",
+                params![package_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| CoreError::Catalog(format!("retarget total: {e}")))?;
+        if total == 0 || candidate_guids.is_empty() {
+            return Ok((0, total as usize));
+        }
+        let have: std::collections::HashSet<&str> =
+            candidate_guids.iter().map(String::as_str).collect();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT guid FROM package_entry WHERE package_id = ?1")
+            .map_err(|e| CoreError::Catalog(format!("retarget guids prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![package_id], |r| r.get::<_, String>(0))
+            .map_err(|e| CoreError::Catalog(format!("retarget guids query: {e}")))?;
+        let mut matched = 0usize;
+        for g in rows {
+            let g = g.map_err(|e| CoreError::Catalog(format!("retarget guid row: {e}")))?;
+            if have.contains(g.as_str()) {
+                matched += 1;
+            }
+        }
+        Ok((matched, total as usize))
+    }
+
+    /// Point a pack at a different archive on disk (§15 Retarget…). Only `package_path` moves —
+    /// every asset, entry locator and extracted byte stays exactly where it is, because what the
+    /// rows describe has not changed, only where the bytes can be re-read from.
+    pub fn retarget_package(&self, package_id: i64, new_path: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE package SET package_path = ?2 WHERE id = ?1",
+                params![package_id, new_path],
+            )
+            .map(|_| ())
+            .map_err(|e| CoreError::Catalog(format!("retarget_package: {e}")))
     }
 
     /// Mute a dependency edge — UI-SPEC §13.6's **⊘ Ignore link**.

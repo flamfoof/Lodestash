@@ -18,7 +18,7 @@ fn open_in_memory_applies_migrations() {
         .conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 22, "all 22 migrations should have run");
+    assert_eq!(version, 23, "all 23 migrations should have run");
 }
 
 /// The viewer's texture lookup must walk **both** hops. Stopping at the first lands on the
@@ -211,16 +211,27 @@ fn vector_preview_round_trips_and_tracks_staleness() {
     assert_eq!(catalog.vector_preview_bytes().unwrap(), 0);
 }
 
-/// A catalog stopped at schema v4, for exercising M5's data steps.
-fn catalog_at_v4() -> Catalog {
+/// A catalog stopped at a given schema version, for exercising one migration's data steps
+/// against rows that predate it.
+///
+/// This, not rewinding `user_version` on a fully-migrated database: a rewind replays **every**
+/// later migration, so the first one carrying DDL fails on the second pass (`ALTER TABLE … ADD
+/// COLUMN` is not idempotent) and the test breaks the day an unrelated migration lands.
+fn catalog_at(version: u32) -> Catalog {
     let conn = Connection::open_in_memory().expect("open");
     configure_connection(&conn).expect("pragmas");
     let mut c = Catalog {
         conn,
         appraise_focus: AppraiseFocus::default(),
     };
-    c.apply_migrations_up_to(4).expect("migrations to v4");
+    c.apply_migrations_up_to(version)
+        .unwrap_or_else(|e| panic!("migrations to v{version}: {e}"));
     c
+}
+
+/// A catalog stopped at schema v4, for exercising M5's data steps.
+fn catalog_at_v4() -> Catalog {
+    catalog_at(4)
 }
 
 #[test]
@@ -3439,28 +3450,19 @@ fn effective_license_falls_back_to_the_pack() {
 /// them without re-inflating every archive to learn what `publisher` already says.
 #[test]
 fn store_pack_license_backfill() {
-    let dir = tempfile::tempdir().expect("tmp");
-    let path = dir.path().join("catalog.db");
-    {
-        let c = Catalog::open(&path).unwrap();
-        c.conn
-            .execute_batch(
-                "INSERT INTO import_source (id, uuid, name, root_path, kind)
-                     VALUES (1, 'src-1', 's', '/s', 'folder');
-                 INSERT INTO package (id, uuid, source_id, package_path, name, publisher, license) VALUES
-                     (1, 'p1', 1, '/s/a.unitypackage', 'FromStore',   'SICS Games', NULL),
-                     (2, 'p2', 1, '/s/b.unitypackage', 'StatedOwn',   'SICS Games', 'CC0-1.0'),
-                     (3, 'p3', 1, '/s/c.unitypackage', 'LooseFolder', NULL,         NULL);",
-            )
-            .expect("fixture");
-        // Rewind past M21 so reopening replays it over rows that predate it - which is the
-        // situation on every existing catalog.
-        c.conn
-            .pragma_update(None, "user_version", 20i64)
-            .expect("rewind");
-    }
-
-    let c = Catalog::open(&path).unwrap();
+    let mut c = catalog_at(20);
+    c.conn
+        .execute_batch(
+            "INSERT INTO import_source (id, uuid, name, root_path, kind)
+                 VALUES (1, 'src-1', 's', '/s', 'folder');
+             INSERT INTO package (id, uuid, source_id, package_path, name, publisher, license) VALUES
+                 (1, 'p1', 1, '/s/a.unitypackage', 'FromStore',   'SICS Games', NULL),
+                 (2, 'p2', 1, '/s/b.unitypackage', 'StatedOwn',   'SICS Games', 'CC0-1.0'),
+                 (3, 'p3', 1, '/s/c.unitypackage', 'LooseFolder', NULL,         NULL);",
+        )
+        .expect("fixture");
+    // These rows predate M21, which is the situation on every catalog that existed before it.
+    c.apply_migrations_up_to(u32::MAX).expect("migrate");
     let by_name = |n: &str| {
         c.list_packages()
             .unwrap()
@@ -3608,30 +3610,22 @@ fn ignored_edges_survive_a_reharvest() {
 /// export" over a link that is not broken, and offered a relink with nothing to point at.
 #[test]
 fn builtin_resource_edges_are_dropped() {
-    let dir = tempfile::tempdir().expect("tmp");
-    let path = dir.path().join("catalog.db");
-    {
-        let c = Catalog::open(&path).unwrap();
-        c.conn
-            .execute_batch(
-                "INSERT INTO import_source (id, uuid, name, root_path, kind)
-                     VALUES (1, 'src-1', 's', '/s', 'folder');
-                 INSERT INTO media_type (id, code, label) VALUES (1, 'material', 'Material');
-                 INSERT INTO asset (id, uuid, source_id, media_type_id, name, unity_guid, created_at, updated_at)
-                     VALUES (1, 'a1', 1, 1, 'prefab_mat', 'g1', 0, 0),
-                            (2, 'a2', 1, 1, 'real_mat',   'g2', 0, 0);
-                 INSERT INTO asset_relationship (id, from_asset_id, to_asset_id, kind, source, declared_path, state) VALUES
-                     (1, 1, NULL, 'uses_material', 'unity_prefab', '0000000000000000f000000000000000', 'missing'),
-                     (2, 1, NULL, 'uses_texture',  'unity_meta',   'gSOMETHINGREAL',                   'missing'),
-                     (3, 1, 2,    'uses_material', 'unity_prefab', 'g2',                               'resolved');",
-            )
-            .expect("fixture");
-        c.conn
-            .pragma_update(None, "user_version", 21i64)
-            .expect("rewind");
-    }
-
-    let c = Catalog::open(&path).unwrap();
+    let mut c = catalog_at(21);
+    c.conn
+        .execute_batch(
+            "INSERT INTO import_source (id, uuid, name, root_path, kind)
+                 VALUES (1, 'src-1', 's', '/s', 'folder');
+             INSERT INTO media_type (id, code, label) VALUES (1, 'material', 'Material');
+             INSERT INTO asset (id, uuid, source_id, media_type_id, name, unity_guid, created_at, updated_at)
+                 VALUES (1, 'a1', 1, 1, 'prefab_mat', 'g1', 0, 0),
+                        (2, 'a2', 1, 1, 'real_mat',   'g2', 0, 0);
+             INSERT INTO asset_relationship (id, from_asset_id, to_asset_id, kind, source, declared_path, state) VALUES
+                 (1, 1, NULL, 'uses_material', 'unity_prefab', '0000000000000000f000000000000000', 'missing'),
+                 (2, 1, NULL, 'uses_texture',  'unity_meta',   'gSOMETHINGREAL',                   'missing'),
+                 (3, 1, 2,    'uses_material', 'unity_prefab', 'g2',                               'resolved');",
+        )
+        .expect("fixture");
+    c.apply_migrations_up_to(u32::MAX).expect("migrate");
     let rows = c.related_assets(1).unwrap();
     let declared: Vec<Option<&str>> = rows.iter().map(|r| r.declared_path.as_deref()).collect();
     assert!(

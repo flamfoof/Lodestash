@@ -165,6 +165,23 @@ to a single entry; reaching any entry means decompressing from the start. Lodest
   whole-pack-in-RAM). An **in-pack** asset that was never materialized instead reopens the archive for
   a single surgical pull on preview/identify/extract (the grid card and search still come from the
   catalog + derived caches, so browsing stays light either way).
+- **Reclaiming the workspace (2026-08-29).** Extracted payloads are content-addressed under
+  `<workspace>/<hash>/<basename>` and referenced by `asset_file.workspace_rel`. Nothing ever
+  collected the ones that stopped being referenced — a pack re-imported or removed left its bytes
+  behind unreachable — and the **Keep extracted packs cached** / cap / auto-purge settings were
+  loaded, saved, and read by nothing. On the reference machine that was **3.55 GB across 1,179
+  folders, none of it referenced by any catalog row**.
+
+  `storage::plan_reclaim` lists the top-level folders no live asset resolves through, and
+  Settings ▸ Storage (UI-SPEC §11.6) reports the size before removing anything; the reclaim
+  appends the full list to `reclaimed.log` beside the workspace, then deletes. Matching is by
+  **path segment**, because `workspace_rel` is written in two formats — the extract path stores
+  the absolute `workspace_path` verbatim while `crawl_records_in_workspace` stores a
+  workspace-relative path (which is what the column's own doc promises) — and the content-hash
+  directory is a segment of both. A pack marked `keep_cached` (M23) keeps its bytes; a pack whose
+  `.unitypackage` no longer resolves is never reclaimed at all, because the extracted copy is then
+  the only one, and its row offers **Retarget…** (UI-SPEC §15) instead.
+
 - **Workspace retention (warm reopens)** — extracted payloads **persist across sessions**, so a pack
   opened today is still random-access on disk tomorrow with zero re-extraction. Eviction is
   **size-cap first, then age**: within the cap nothing is evicted; under cap pressure, LRU order —

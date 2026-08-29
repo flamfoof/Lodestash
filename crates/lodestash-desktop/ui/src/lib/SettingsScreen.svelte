@@ -8,6 +8,7 @@
    * the engine bridge and Clear-cache actions bind when this shell hosts the engine; the
    * per-source blacklist panel needs the Sources-manager slice (documented in ALIGNMENT-AUDIT).
    */
+  import Icon from "./Icon.svelte";
   import {
     getSettings,
     setSettings,
@@ -34,6 +35,12 @@
     relinkPreview,
     relinkSource,
     type RelinkCount,
+    workspaceUsage,
+    reclaimWorkspace,
+    workspacePacks,
+    setPackKeepCached,
+    fmtSize,
+    type WorkspacePackRow,
   } from "./api";
   import { view } from "./nav.svelte";
 
@@ -292,6 +299,69 @@
       })
       .catch(() => {});
   });
+  // EXTRACTED PACKS (UI-SPEC §11.4). A second store with a different policy: previews are
+  // disposable, extracted payloads regenerate only while their archive is still on disk.
+  //
+  // Every control in this card was inert until 2026-08-29 — `cache_extracted`,
+  // `preview_cache_cap_gb` and `auto_purge_preview_cache` were loaded, saved, and read by
+  // nothing, so the workspace grew unbounded (3.55 GB across 1,179 folders on the reference
+  // machine, none of it referenced by the catalog).
+  let orphanBytes = $state(0);
+  let orphanDirs = $state(0);
+  let keptDirs = $state(0);
+  let reclaiming = $state(false);
+  let reclaimed = $state<string | null>(null);
+  let packRows = $state<WorkspacePackRow[]>([]);
+
+  async function loadStorage() {
+    try {
+      const plan = await workspaceUsage();
+      orphanBytes = plan.bytes;
+      orphanDirs = plan.entries.length;
+      keptDirs = plan.kept_dirs;
+    } catch {
+      // leave the last numbers; the button stays disabled at zero
+    }
+    try {
+      packRows = await workspacePacks();
+    } catch {
+      packRows = [];
+    }
+  }
+  $effect(() => {
+    // Re-read on the app's freshness signal, not only at mount: extracting a pack or
+    // reclaiming one changes these numbers, and a storage screen showing a snapshot from
+    // whenever it was opened is how you end up staring at a size that is no longer true.
+    view.dataVersion;
+    loadStorage();
+  });
+
+  async function reclaim() {
+    if (reclaiming) return;
+    reclaiming = true;
+    try {
+      const out = await reclaimWorkspace();
+      // What actually went, from the server — never the number this screen was showing.
+      reclaimed = `Freed ${fmtSize(out.freed)} from ${out.removed} folders${
+        out.log ? "" : " (no log could be written)"
+      }`;
+      await loadStorage();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      reclaiming = false;
+    }
+  }
+
+  async function toggleKeep(row: WorkspacePackRow) {
+    try {
+      await setPackKeepCached(row.id, !row.keep_cached);
+      packRows = await workspacePacks();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
   async function clearCache() {
     if (cacheBusy) return;
     cacheBusy = true;
@@ -807,12 +877,11 @@
       </section>
 
       <section class="card">
-        <h2>STORAGE CAPS</h2>
-        <label class="check">
-          <input type="checkbox" bind:checked={s.cache_extracted} onchange={save} data-testid="keep-extracted" />
-          Keep extracted packs cached — rehydrate from the workspace at startup instead of
-          re-extracting.
-        </label>
+        <h2>PREVIEW CACHE</h2>
+        <p class="hint">
+          Thumbnails, decimated meshes and in-pack scratch — all regenerable from the source
+          assets.
+        </p>
         <div class="slider-row">
           <span class="mono">Preview cache cap</span>
           <input
@@ -842,9 +911,98 @@
             {cacheBusy ? "Clearing…" : "Clear preview cache"}
           </button>
         </div>
+      </section>
+
+      <!--
+        The second store, split out of the old single STORAGE CAPS card: extracted payloads are
+        not a cap, they are a per-pack choice, and folding both under one heading is what let
+        three inert controls sit unnoticed.
+      -->
+      <section class="card">
+        <h2>EXTRACTED PACKS — WORKSPACE</h2>
         <p class="hint">
-          Previews, decimated meshes and in-pack scratch — all regenerable from the source
-          assets. Extracted pack files (the workspace) are never touched.
+          Payloads pulled out of a <span class="mono">.unitypackage</span>. A pack that is not
+          kept still searches, filters and previews — its assets load from the archive instead of
+          from disk.
+        </p>
+        <label class="check">
+          <input
+            type="checkbox"
+            bind:checked={s.cache_extracted}
+            onchange={save}
+            data-testid="keep-extracted"
+          />
+          Keep every extracted pack cached — never reclaim automatically.
+        </label>
+
+        {#if orphanDirs > 0}
+          <div class="orphans" data-testid="workspace-orphans">
+            <div class="orphan-text">
+              <span>{fmtSize(orphanBytes)} is not referenced by the catalog.</span>
+              <span class="sub">
+                {orphanDirs.toLocaleString()}
+                {orphanDirs === 1 ? "folder" : "folders"} left behind by packs that were re-imported
+                or removed. Nothing can reach these files.
+              </span>
+            </div>
+            <button
+              class="ghost warn"
+              onclick={reclaim}
+              disabled={reclaiming}
+              data-testid="reclaim-workspace"
+            >
+              {reclaiming ? "Reclaiming…" : `Reclaim ${fmtSize(orphanBytes)}`}
+            </button>
+          </div>
+        {:else}
+          <p class="hint" data-testid="workspace-orphans-none">
+            Nothing unreferenced — every extracted file belongs to a pack in the catalog{keptDirs >
+            0
+              ? ` (${keptDirs.toLocaleString()} folders in use)`
+              : ""}.
+          </p>
+        {/if}
+        {#if reclaimed}
+          <p class="ok-line" data-testid="reclaimed">{reclaimed}</p>
+        {/if}
+
+        {#if packRows.length > 0}
+          <div class="cache-row">
+            <span class="mono dim-label">CACHED PACKS · LARGEST FIRST</span>
+            <span class="mono">
+              {packRows.filter((p) => p.keep_cached).length} kept of {packRows.length}
+            </span>
+          </div>
+          <ul class="packlist" data-testid="workspace-packs">
+            {#each packRows as p (p.id)}
+              <li class="packrow">
+                <button
+                  class="keep"
+                  class:on={p.keep_cached}
+                  class:orphaned={!p.archive_present}
+                  onclick={() => toggleKeep(p)}
+                  aria-pressed={p.keep_cached}
+                  title={p.archive_present
+                    ? p.keep_cached
+                      ? "Kept — extracted bytes stay on disk"
+                      : "Evictable — reclaimed when nothing references it"
+                    : "Kept — the source archive is gone, so this copy is the only one"}
+                  data-testid="keep-cached-{p.id}"
+                >
+                  <Icon name="ls-nav-packages" size={14} />
+                </button>
+                <span class="name" title={p.package_path}>{p.name}</span>
+                <span class="num mono">{p.files.toLocaleString()} files</span>
+                {#if !p.archive_present}
+                  <span class="pill gone">archive missing</span>
+                {/if}
+              </li>
+            {/each}
+          </ul>
+        {/if}
+        <p class="hint">
+          A pack whose archive has gone is never reclaimed — the extracted copy is the only one
+          left.
         </p>
       </section>
 
@@ -1362,6 +1520,109 @@
   .tier-field.cap {
     margin-left: var(--sp-2);
   }
+  /* STORAGE — the orphan callout and the per-pack keep list (UI-SPEC §11.4). */
+  .orphans {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--sp-3);
+    padding: var(--sp-3);
+    margin-top: var(--sp-2);
+    background: var(--ls-surface-raised);
+    border: 1px solid var(--ls-border-strong);
+    border-left: 2px solid var(--ls-warning);
+    border-radius: var(--r-md);
+  }
+  .orphan-text {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: var(--fs-sm);
+  }
+  .orphan-text .sub {
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+  }
+  .ghost.warn {
+    border-color: var(--ls-warning);
+    color: var(--ls-warning);
+  }
+  .ghost.warn:hover:not(:disabled) {
+    color: var(--ls-text);
+  }
+  .ghost:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .ok-line {
+    margin: var(--sp-2) 0 0;
+    font-size: var(--fs-sm);
+    color: var(--ls-success);
+  }
+  .dim-label {
+    font-size: var(--fs-xs);
+    letter-spacing: 0.06em;
+    color: var(--ls-text-dim);
+  }
+  .packlist {
+    list-style: none;
+    margin: var(--sp-1) 0 var(--sp-3);
+    padding: 0;
+  }
+  .packrow {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    padding: var(--sp-1) var(--sp-2);
+    border-top: 1px solid var(--ls-border);
+    font-size: var(--fs-sm);
+  }
+  /* The sprite bakes its own stroke colour, so an inactive pack is dimmed with opacity rather
+     than tinted — that is the sprite's design (Icon.svelte), not a limitation to work around. */
+  .keep {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    background: none;
+    border: none;
+    cursor: pointer;
+    opacity: 0.3;
+  }
+  .keep.on {
+    opacity: 1;
+  }
+  .keep.orphaned {
+    opacity: 1;
+  }
+  .keep:hover {
+    opacity: 0.75;
+  }
+  .keep.on:hover {
+    opacity: 0.85;
+  }
+  .packrow .name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .packrow .num {
+    flex: none;
+    color: var(--ls-text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .pill.gone {
+    flex: none;
+    padding: 0 var(--sp-1);
+    border: 1px solid var(--ls-danger);
+    border-radius: var(--r-pill);
+    font-size: var(--fs-xs);
+    color: var(--ls-danger);
+  }
+
   .ghost {
     background: none;
     border: 1px solid var(--ls-border);

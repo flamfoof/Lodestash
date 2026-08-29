@@ -291,26 +291,18 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       a signal rescans every watched source with the **incremental crawl** (unchanged files skip
       BLAKE3) + the standard persist, reloading the UI only when something actually changed;
       the watch re-arms after source-set changes. Skipped under the e2e escape hatch.
-- [ ] **Eviction / keep-extracted.** `unmaterialize_package` zero callers; `cache_extracted` not
-      honored; workspace cap/7-day retention not enforced. **Re-confirmed 2026-08-14:**
-      `workspace_cache_cap_gb` and `workspace_cache_retention_days` (`config.rs:452,460`) have
-      **zero readers outside `config.rs`** — grep the workspace for either name. INGESTION §2
-      "Workspace retention" specifies size-cap-first-then-LRU with a retention window plus a
-      Settings → Storage cap / retention / **Clear workspace** action; none of it exists, and full
-      extraction writes *every* payload (scripts and prefabs included — that part is per spec), so
-      the workspace grows without bound and nothing ever reclaims it. The largest remaining hole in
-      the extraction feature.
-
-## 🔧 Extraction & structure — the 2026-08-14 audit
-
-Its own lane on purpose: these came out of a full read of the per-pack Extract flow plus the max
-review of that work, and they are neither "built but inert" (the code runs) nor purely visual.
-The fixed rows are kept beside the open ones because the open ones are what the fixes *exposed*.
-
-**Extraction defects found and fixed (2026-08-14)** — full read of the per-pack Extract flow
-(`writer.rs` `Op::ExtractPackage` → manifest worker → `mint_in_pack` → `extract_at_offsets` →
-`materialize_extract`):
-
+- [x] **Storage — done 2026-08-29, and it was worse than the card said.** `cache_extracted`,
+      `preview_cache_cap_gb` and `auto_purge_preview_cache` were not merely unenforced: all three
+      were loaded from config, written back to config, and read by **nothing**. The workspace had
+      no collector at all, so it held **3.55 GB across 1,179 folders that no catalog row
+      referenced** on the reference machine. Now: `storage::plan_reclaim` + a **Reclaim** button
+      that reports before it deletes and logs what went (`reclaimed.log`), the preview cap
+      enforced at writer start, and `package.keep_cached` (M23) marking a pack's bytes worth
+      keeping — offered in Pack stats §15, on the Packages row, and in Settings ▸ Storage §11.6.
+      A pack whose archive has gone is never reclaimed and offers **Retarget…** instead.
+      *Still open:* `unmaterialize_package` remains without a production caller — evicting a
+      *referenced* pack (as opposed to collecting unreferenced bytes) is the next slice, and it is
+      what `keep_cached` will gate.
 - [x] **The extract queue could stall for the whole session.** UI-SPEC §5 unpacks ticked packs one
       at a time through `extract_queue`, drained by whichever worker reports back. But an
       `Op::ExtractPackage` can fail *before spawning anything* — package row gone, no workspace

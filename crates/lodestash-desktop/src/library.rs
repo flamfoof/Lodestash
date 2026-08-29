@@ -207,6 +207,19 @@ pub struct AssetDetail {
     pub trashed: bool,
 }
 
+/// A pack holding extracted bytes, for the Settings storage list (UI-SPEC §11.4).
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspacePackRow {
+    pub id: i64,
+    pub name: String,
+    pub package_path: String,
+    pub keep_cached: bool,
+    pub files: usize,
+    /// The `.unitypackage` still resolves on disk. When false the extracted copy is the only one
+    /// left, which is why the sweep skips it and the row offers **Retarget…** instead.
+    pub archive_present: bool,
+}
+
 /// One export run for the Recent-exports list (FEATURES §7.1).
 #[derive(Debug, Clone, Serialize)]
 pub struct ExportBatchRow {
@@ -525,6 +538,13 @@ pub struct PackageRow {
     /// Per-media-type breakdown, same shape as the Stats screen's `TypeStat`.
     pub by_type: Vec<TypeStat>,
     pub pinned: bool,
+    /// M23 — its extracted bytes are worth keeping. Separate from `pinned` (Add to Library).
+    pub keep_cached: bool,
+    /// Where its `.unitypackage` lives — what Retarget… replaces (UI-SPEC §15).
+    pub package_path: String,
+    /// Its `.unitypackage` still resolves on disk. False ⇒ nothing more can be pulled from it,
+    /// and whatever was already extracted is the only copy (UI-SPEC §15 Retarget…).
+    pub archive_present: bool,
     /// The pack has been unpacked to the workspace at some point (DATA-MODEL §7).
     pub extracted: bool,
 }
@@ -1415,6 +1435,9 @@ impl Library {
                     triangles,
                     by_type: types,
                     pinned: p.pinned,
+                    keep_cached: p.keep_cached,
+                    archive_present: Path::new(&p.package_path).is_file(),
+                    package_path: p.package_path,
                     extracted: p.unpacked_at.is_some(),
                 }
             })
@@ -2045,6 +2068,44 @@ impl Library {
             )
             .ok()?;
         Some(ids.into_iter().enumerate().map(|(r, id)| (id, r)).collect())
+    }
+
+    /// Every workspace path a live asset still resolves through — what the reclaim sweep must
+    /// not touch (`storage::plan_reclaim`).
+    pub fn referenced_workspace_paths(&self) -> std::collections::HashSet<String> {
+        self.catalog
+            .as_ref()
+            .and_then(|c| c.referenced_workspace_paths().ok())
+            .unwrap_or_default()
+    }
+
+    /// Packs holding extracted bytes, each with whether its archive still resolves on disk —
+    /// the Settings storage list (UI-SPEC §11.4). A pack whose archive has gone is holding the
+    /// only copy of those files, so it is never reclaimable.
+    pub fn workspace_packs(&self) -> Vec<WorkspacePackRow> {
+        let Some(cat) = self.catalog.as_ref() else {
+            return Vec::new();
+        };
+        cat.workspace_packs()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| WorkspacePackRow {
+                archive_present: Path::new(&p.package_path).is_file(),
+                id: p.id,
+                name: p.name,
+                package_path: p.package_path,
+                keep_cached: p.keep_cached,
+                files: p.files,
+            })
+            .collect()
+    }
+
+    /// How many of a pack's recorded entries a candidate archive accounts for, by GUID
+    /// (UI-SPEC §15 Retarget…). `None` when there is no catalog.
+    pub fn retarget_match(&self, package_id: i64, guids: &[String]) -> Option<(usize, usize)> {
+        self.catalog
+            .as_ref()
+            .and_then(|c| c.retarget_match(package_id, guids).ok())
     }
 
     pub fn thumb_cache_dir(&self) -> Option<&Path> {

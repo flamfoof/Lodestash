@@ -695,15 +695,38 @@ tests (the parity test still asserts MCP↔REST 1:1). Not yet built: the per-too
 card, and the optional Streamable-HTTP transport (stable port 4319, rotating token). Until the UI
 lands, the list is driven by editing `config.mcp_disabled_tools` directly.
 
-### 11.6 STORAGE CAPS
+### 11.6 STORAGE
 
-**Keep extracted packs cached** toggle (default **off**): on, extracted packages rehydrate from
-the workspace + catalog at startup (`asset_file.workspace_rel`, DATA-MODEL §13 M6) — no
-re-extraction; retention-evicted files simply don't return. Off: extractions are session-only.
-**Preview cache limit** slider (1–16 GB) + usage bar (verdant → amber >80% → red over) with
-`used by N thumbnails` / headroom labels; **Auto-purge over cap** toggle (drop least-recently-viewed
-previews). The extracted-archive **workspace** cap + retention (INGESTION §2) and **Clear cache /
-Clear workspace** actions live in this card too (DESIGN-GUIDELINES §7 Storage group).
+**Two cards, not one** (reworked 2026-08-29). They were a single **STORAGE CAPS** card governing
+two unrelated stores, and folding them together is what let three controls sit inert without
+anyone noticing: `cache_extracted`, `preview_cache_cap_gb` and `auto_purge_preview_cache` were
+loaded from config, written back to config, and read by nothing.
+
+**PREVIEW CACHE** — thumbnails, decimated meshes, in-pack scratch. All regenerable from the source
+asset, so it is capped and disposable: a cap slider (1–16 GB), **Auto-purge over cap**, live usage,
+and **Clear preview cache**. Purge is oldest-by-mtime rather than truly
+least-recently-*viewed* — reads do not touch mtime, and recording access times would mean a write
+on every preview read for files that are cheap to rebuild. Applied at startup: the cache grows one
+thumbnail at a time, and checking on that path would stat the whole tree per preview.
+
+**EXTRACTED PACKS — WORKSPACE** — payloads pulled out of a `.unitypackage`. Not a cap but a
+choice, per pack. **Keep every extracted pack cached** governs the sweep globally; each pack also
+carries its own mark (§15, and on the Packages row). A pack that is *not* kept is still fully
+searchable, filterable and previewable — its assets resolve out of the archive by surgical pull
+instead of off disk, which is slower per open, not absent.
+
+When anything in the workspace is unreferenced, the card says so in the size it would free —
+*"3.55 GB is not referenced by the catalog · 1,179 folders left behind by packs that were
+re-imported or removed"* — with a **Reclaim** button. It reports before it removes and appends
+what went to `reclaimed.log` beside the workspace, because deleting gigabytes and keeping no
+record is not something to do quietly. Below it, cached packs largest-first with their marks; a
+pack whose archive has gone reads **archive missing**, is never reclaimed, and offers
+**Retarget…** (§15).
+
+*(The old text promised a workspace **cap** and a **Clear workspace** action. Neither shipped, and
+neither is planned: a size cap needs last-used times the workspace does not record, and "clear
+everything" is the wrong verb for a store where one folder may be a pack's only surviving copy.
+Reclaim-what-is-unreferenced is the safe form of the same intent.)*
 
 ### 11.6b Agent approval prompt (shipped)
 A modal over a dimmed library, warning-bordered: **"An agent is asking to write files"**, the job's
@@ -842,6 +865,19 @@ Cinzel pack name + mono meta line (`library · license · N exported to <project
 click = search that tag *scoped to the pack*; empty → *"no tags yet — assets in this pack are
 Unidentified"*); **HEAVIEST IN PACK** top 3 (tier badge + name + stats, click → select in Library);
 footer **Browse <pack> in Library →** (gold primary).
+
+**Keep cached** row (2026-08-29), beside the size it governs: *kept* — its assets open from
+disk — or *evictable*, reclaimed once nothing references it (§11.6). Marking a pack that is not
+extracted starts **no work**; it promises the bytes survive if you extract later, so one click can
+never begin a gigabyte of disk writes. Backed by `package.keep_cached`, deliberately not `pinned`,
+which already means Add to Library ([`DATA-MODEL.md`](DATA-MODEL.md) §13 M23).
+
+**Retarget…** appears on a pack whose `.unitypackage` no longer resolves (on the Packages row,
+where a missing archive is visible in the list). It counts how many of the pack's recorded entries
+a candidate archive still accounts for **by GUID** and offers the swap — the same shape as the
+source relink in §11.1, and for the same reason the count is *evidence, not a verdict*: a publisher
+updating a pack legitimately reshuffles GUIDs, so a poor match is shown and the user decides. Only
+`package.package_path` moves; every asset, locator and extracted byte stays where it is.
 
 *(Shipped: tiles, CONTENTS, HEAVIEST, footer — opened by a plain **Stats** button on the Packages
 and Unity Assets

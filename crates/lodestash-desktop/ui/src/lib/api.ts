@@ -220,6 +220,12 @@ export type PackageRow = {
   triangles: number;
   by_type: TypeStat[];
   pinned: boolean;
+  /** M23 — its extracted bytes are worth keeping. Separate from `pinned` (Add to Library). */
+  keep_cached: boolean;
+  /** Where its `.unitypackage` lives — what Retarget… replaces (UI-SPEC §15). */
+  package_path: string;
+  /** Its `.unitypackage` still resolves on disk. `false` ⇒ the extracted copy is the only one. */
+  archive_present: boolean;
   extracted: boolean;
 };
 
@@ -323,6 +329,52 @@ export type RelatedAsset = {
 };
 
 export const relatedAssets = (assetId: number) => invoke<RelatedAsset[]>("related_assets", { assetId });
+
+/**
+ * Storage (UI-SPEC §11.4). Two stores, two policies: previews are disposable and capped,
+ * extracted packs are per-pack and chosen.
+ */
+export type ReclaimEntry = { path: string; bytes: number; files: number };
+export type ReclaimPlan = {
+  entries: ReclaimEntry[];
+  bytes: number;
+  files: number;
+  /** Folders left alone because a live asset still resolves through them. */
+  kept_dirs: number;
+};
+
+/** What a reclaim *would* remove. Always a dry run — the button reports before it deletes. */
+export const workspaceUsage = () => invoke<ReclaimPlan>("workspace_usage");
+
+/** Do it. Re-plans server-side rather than trusting a plan this screen was holding. */
+export const reclaimWorkspace = () =>
+  invoke<{ removed: number; freed: number; log: string | null }>("reclaim_workspace");
+
+/** A pack holding extracted bytes. `archive_present: false` ⇒ this copy is the only one. */
+export type WorkspacePackRow = {
+  id: number;
+  name: string;
+  package_path: string;
+  keep_cached: boolean;
+  files: number;
+  archive_present: boolean;
+};
+export const workspacePacks = () => invoke<WorkspacePackRow[]>("workspace_packs");
+
+/**
+ * Keep a pack's extracted bytes (UI-SPEC §15). Not `pinned`, which means "Add to Library" (M7).
+ * A pack that is not kept stays fully searchable and previewable — its assets just load out of
+ * the archive instead of off disk.
+ */
+export const setPackKeepCached = (packageId: number, keep: boolean) =>
+  invoke<WriteResult>("set_pack_keep_cached", { packageId, keep });
+
+/** How much of a pack a candidate archive accounts for, by GUID. Evidence, never a verdict. */
+export const retargetPreview = (packageId: number, path: string) =>
+  invoke<{ matched: number; total: number }>("retarget_preview", { packageId, path });
+
+export const retargetPackage = (packageId: number, path: string) =>
+  invoke<WriteResult>("retarget_package", { packageId, path });
 
 /** ⊘ Ignore / ↺ restore one dependency edge (UI-SPEC §13.6). Muted, not deleted — reversible. */
 export const setLinkIgnored = (edgeId: number, ignored: boolean) =>
@@ -655,6 +707,10 @@ export type DiscoveredPackageRow = {
 
 /** Native folder chooser for the import dialog. `null` = cancelled. */
 export const pickFolder = (title?: string) => invoke<string | null>("pick_folder", { title });
+
+/** Native `.unitypackage` chooser — Retarget… (UI-SPEC §15). `null` = cancelled. */
+export const pickPackageFile = (title?: string) =>
+  invoke<string | null>("pick_package_file", { title });
 
 /** Scan a folder for `.unitypackage` files (read-only) — the dialog's list. */
 export const discoverPackageFolder = (path: string) =>
