@@ -3642,3 +3642,67 @@ fn builtin_resource_edges_are_dropped() {
         "only the built-in edge was dropped: {rows:?}"
     );
 }
+
+/// UI-SPEC 13.9 - where an in-pack asset lives *inside* its archive.
+///
+/// The `workspace_rel IS NULL` guard is the whole point and cannot be exercised against the
+/// reference library, which currently holds no extracted assets at all: an asset that has been
+/// materialized has a real file on disk, so it must report an `abs_path` and NOT an in-archive
+/// path, or the Inspector tells you to look somewhere the bytes are no longer read from.
+#[test]
+fn in_pack_location_is_only_for_assets_still_in_the_archive() {
+    let c = Catalog::open_in_memory().unwrap();
+    c.conn
+        .execute_batch(
+            "INSERT INTO import_source (id, uuid, name, root_path, kind)
+                 VALUES (1, 'src-1', 's', '/s', 'folder');
+             INSERT INTO media_type (id, code, label) VALUES (1, 'image', 'Image');
+             INSERT INTO package (id, uuid, source_id, package_path, name)
+                 VALUES (10, 'p1', 1, 'G:/cache/Pack.unitypackage', 'Pack');
+             INSERT INTO package_entry (id, package_id, guid, pathname, tar_offset, size_bytes) VALUES
+                 (100, 10, 'g-in',  'Assets/Pack/Textures/Rock.png', 0, 10),
+                 (101, 10, 'g-out', 'Assets/Pack/Textures/Moss.png', 0, 10),
+                 (102, 10, 'g-nop', NULL,                            0, 10);
+             INSERT INTO asset (id, uuid, source_id, media_type_id, package_id, name, created_at, updated_at) VALUES
+                 (1, 'a1', 1, 1, 10, 'Rock', 0, 0),
+                 (2, 'a2', 1, 1, 10, 'Moss', 0, 0),
+                 (3, 'a3', 1, 1, 10, 'Nameless', 0, 0),
+                 (4, 'a4', 1, 1, NULL, 'Loose', 0, 0);
+             INSERT INTO asset_file (id, asset_id, rel_path, ext, size_bytes, mtime, package_entry_id, workspace_rel) VALUES
+                 (1, 1, 'Rock.png', 'png', 10, 0, 100, NULL),
+                 (2, 2, 'Moss.png', 'png', 10, 0, 101, 'abc123/Moss.png'),
+                 (3, 3, 'Nameless.png', 'png', 10, 0, 102, NULL),
+                 (4, 4, 'Loose.png', 'png', 10, 0, NULL, NULL);
+             UPDATE asset SET primary_file_id = 1 WHERE id = 1;
+             UPDATE asset SET primary_file_id = 2 WHERE id = 2;
+             UPDATE asset SET primary_file_id = 3 WHERE id = 3;
+             UPDATE asset SET primary_file_id = 4 WHERE id = 4;",
+        )
+        .expect("fixture");
+
+    assert_eq!(
+        c.in_pack_location(1).unwrap(),
+        Some((
+            "Assets/Pack/Textures/Rock.png".to_string(),
+            "G:/cache/Pack.unitypackage".to_string()
+        )),
+        "an asset still inside the archive reports where it sits and which archive holds it"
+    );
+    assert_eq!(
+        c.in_pack_location(2).unwrap(),
+        None,
+        "an extracted asset has a real file on disk - pointing at the archive would send the user \
+         somewhere the bytes are no longer read from"
+    );
+    assert_eq!(
+        c.in_pack_location(3).unwrap(),
+        None,
+        "an entry with no declared pathname has no location to show"
+    );
+    assert_eq!(
+        c.in_pack_location(4).unwrap(),
+        None,
+        "a loose file is not in any pack"
+    );
+    assert_eq!(c.in_pack_location(999).unwrap(), None, "no such asset");
+}

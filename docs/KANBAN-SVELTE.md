@@ -98,9 +98,13 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       which survives `record_dependencies` re-deriving a harvest) and the export-skip warning the
       spec claimed was already there. Name-match suggestions and ⌕ Browse disk… are **dropped as
       unbuildable**, not deferred — every edge declares a GUID, which has no name to match and no
-      disk file that resolves it (UI-SPEC §13.6 records the reasoning). *Still open:* no
-      in-archive provenance block (Path-in-package / Package ⧉-copy rows). *(card ★ was stale —
-      it is a control, corrected 2026-08-27.)*
+      disk file that resolves it (UI-SPEC §13.6 records the reasoning).
+      **In-archive provenance done 2026-08-29** — §13.9 grows **Path in pack** and **Archive**
+      rows for an in-pack asset (`Catalog::in_pack_location`), copyable, and absent for an
+      extracted one whose bytes are on disk. The copy affordance is the sprite's
+      `ls-action-copy`, not the spec's ⧉: U+29C9 is not in the bundled text fonts and would
+      render as tofu, like ⌕ and ◉ before it. *(card ★ was stale — it is a control, corrected
+      2026-08-27.)*
 - [x] **SIMILAR is real similarity — done 2026-08-29.** `Library::similar_assets` does cosine KNN
       in the asset's own embedding space, self and trashed excluded, top 3 with thumb + name +
       pack. **Embeddings, not the shared tags §13.8 first asked for**: 24 of 8,237 assets carry a
@@ -223,7 +227,15 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       *Still open, and moved to its own card below:* `.meta` `labels:` are parsed but never seeded
       into tags.
 - [ ] **`.meta` `labels:` → seed tags.** Parsed by `unitypackage::parse_meta`, never written to
-      `tag`/`asset_tag`. INGESTION §2 lists them as seed tags.
+      `tag`/`asset_tag`. INGESTION §2 lists them as seed tags. **Surveyed 2026-08-29 before
+      building, and deliberately not built yet:** the reference library carries essentially
+      none — **0 of 3,684** on-disk `.meta` sidecars have a `labels:` key, and **1 of ~3,400**
+      sampled in-pack `asset.meta` entries across ten packs (four of them real 3D art packs),
+      that one being DOTween's package-root marker carrying Asset Store *listing keywords*
+      (`Tween, HOTween, iTween, LeanTween`) rather than anything describing an asset. The
+      harvest is small and correct; it simply has no input here. Build it when a library's
+      packs come from publishers who label, or once assets are labelled by hand. The real
+      tagging gap is elsewhere: 7,667 of 8,237 assets are still Unidentified.
 - [ ] **Smart collections / `embedding_meta`.** DDL-only, never written.
 - [x] **Trait-vocabulary teaching — stale card, corrected 2026-08-28.** It *is* wired:
       `writer.rs` reads `teaching_traits()` into `ImageZeroShot`, and `ollama.rs` tests that they

@@ -844,6 +844,14 @@ Selected, one asset — top→bottom:
    license>` (asset → package fallback, DATA-MODEL §9), and when imported: verdant
    `✓ imported in <project> → <dest>/`.
 
+   For an **in-pack** asset, two more rows: **Path in pack** (the `Assets/…` path the pack
+   declared for it) and **Archive** (the `.unitypackage` holding it) — both mono, selectable, each
+   with a copy button. They exist because an in-pack asset has no file to reveal in Explorer, so
+   *"where is this?"* is answerable nowhere else in the app, and that is the majority state (5,963
+   of 7,691 here). An asset that has been **extracted** shows neither: it has a real file on disk,
+   and pointing at the archive would send you where the bytes are no longer read from. The Archive
+   row names the file §15's **Retarget…** repoints when it goes missing.
+
    *(Shipped 2026-08-27: the library · pack row, the pack linking to §15 the way it already does
    from every card and list row — this panel named the library and stopped, so the place you open
    to learn about an asset said less about where it came from than the card you opened it from.

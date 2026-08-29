@@ -4379,6 +4379,30 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("pipeline backfill row: {e}")))
     }
 
+    /// Where an **in-pack** asset lives inside its archive: `(pathname, package_path)` —
+    /// the `Assets/…` path the pack declared for it, and the `.unitypackage` holding it
+    /// (UI-SPEC §13.9).
+    ///
+    /// `None` for anything on disk or in the workspace. That is the point of the row: an in-pack
+    /// asset has no file to reveal in Explorer, so "where is this?" has no answer anywhere else —
+    /// and on this library 5,963 of 7,691 assets are in that state.
+    pub fn in_pack_location(&self, asset_id: i64) -> Result<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT pe.pathname, p.package_path
+                   FROM asset_file af
+                   JOIN package_entry pe ON pe.id = af.package_entry_id
+                   JOIN package p        ON p.id = pe.package_id
+                   JOIN asset a          ON a.primary_file_id = af.id
+                  WHERE a.id = ?1 AND af.workspace_rel IS NULL",
+                params![asset_id],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map(|row| row.and_then(|(name, pack)| name.map(|n| (n, pack))))
+            .map_err(|e| CoreError::Catalog(format!("in_pack_location: {e}")))
+    }
+
     /// The licence that actually applies to an asset: its own override, else its pack's
     /// (DATA-MODEL §9). Returns `(license, license_url)`; `None` when neither states one.
     ///

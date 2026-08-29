@@ -756,6 +756,12 @@ export type AssetDetail = {
   /** The pack it sits in, for §13.9's `Source · <library · pack>` row. `null` for a loose file. */
   package: string | null;
   /**
+   * For an in-pack asset, where it lives *inside* the archive and which `.unitypackage` holds
+   * it (UI-SPEC §13.9). Both `null` for a file on disk, which has `abs_path` instead.
+   */
+  pack_entry_path: string | null;
+  pack_archive_path: string | null;
+  /**
    * The licence that applies — the asset's own override falling back to its pack's
    * (DATA-MODEL §9). `null` when nothing states one, and §13.9 then omits the row entirely.
    */

@@ -351,6 +351,19 @@
     return memberIds[c.id]?.includes(detail.asset_id) ?? false;
   }
 
+  /**
+   * Copy a path to the clipboard (§13.9 ⧉). A webview without clipboard permission says so
+   * rather than failing silently — the text is selectable in the row either way.
+   */
+  async function copy(text: string, what: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      push(`${what} copied`, "ok");
+    } catch {
+      push("Could not reach the clipboard — the path is selectable", "warn");
+    }
+  }
+
   /** Select a related asset — the same lead selection the grid cards use. */
   function pick(id: number | null) {
     if (id != null) view.selected = id;
@@ -543,6 +556,30 @@
               {pack}
             </button>
           {/if}
+        </dd>
+      {/if}
+      <!-- In-archive provenance (§13.9). An in-pack asset has no file to reveal in Explorer, so
+           "where is this?" is answerable nowhere else in the app — and it is the majority state
+           here (5,963 of 7,691). Both rows are selectable and copyable; the archive row names the
+           file Retarget… (§15) repoints when it goes missing. -->
+      {#if detail.pack_entry_path}
+        {@const entry = detail.pack_entry_path}
+        <dt>Path in pack</dt>
+        <dd class="prov copyrow" data-testid="inspector-pack-path">
+          <code class="mono" title={entry}>{entry}</code>
+          <button class="copy" onclick={() => copy(entry, "Path")} aria-label="Copy path in pack">
+            ⧉
+          </button>
+        </dd>
+      {/if}
+      {#if detail.pack_archive_path}
+        {@const archive = detail.pack_archive_path}
+        <dt>Archive</dt>
+        <dd class="prov copyrow" data-testid="inspector-pack-archive">
+          <code class="mono" title={archive}>{archive}</code>
+          <button class="copy" onclick={() => copy(archive, "Archive path")} aria-label="Copy archive path">
+            ⧉
+          </button>
         </dd>
       {/if}
       {#if detail.license}
@@ -1397,6 +1434,51 @@
     margin: var(--sp-2) 0 0;
     font-size: var(--fs-xs);
     color: var(--ls-warning);
+  }
+
+  /* §13.9's License link. Nothing in the app defines an anchor colour, so this shipped as
+     browser-default blue — the one colour the palette does not contain (DESIGN-GUIDELINES §2). */
+  .prov a {
+    color: var(--ls-gold);
+    text-decoration: none;
+  }
+  .prov a:hover {
+    color: var(--ls-gold-bright);
+    text-decoration: underline;
+  }
+
+  /* §13.9's in-archive rows: a long path that must stay readable and copyable. */
+  .copyrow {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-1);
+  }
+  .copyrow code {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    direction: rtl;
+    text-align: left;
+    font-size: var(--fs-xs);
+    color: var(--ls-text-muted);
+    user-select: text;
+  }
+  .copy {
+    flex: none;
+    padding: 0 var(--sp-1);
+    font: inherit;
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+    background: none;
+    border: 1px solid transparent;
+    border-radius: var(--r-sm);
+    cursor: pointer;
+  }
+  .copy:hover {
+    color: var(--ls-gold-bright);
+    border-color: var(--ls-border);
   }
 
   /* SIMILAR (§13.8) — thumb + name + pack, click through to that asset. */

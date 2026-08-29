@@ -186,6 +186,11 @@ pub struct AssetDetail {
     /// `Source · <library · pack>` and link the pack to its stats modal (UI-SPEC §13.9).
     /// `None` for a loose file that belongs to no package.
     pub package: Option<String>,
+    /// For an in-pack asset, where it lives **inside** the archive — the `Assets/…` path the
+    /// pack declared — and the `.unitypackage` holding it (UI-SPEC §13.9). Both `None` for a
+    /// file on disk, which has an `abs_path` instead.
+    pub pack_entry_path: Option<String>,
+    pub pack_archive_path: Option<String>,
     /// The licence that applies here — the asset's own override, else its pack's (DATA-MODEL §9),
     /// with the URL each of them stated. `None` when nothing in the chain says: the Inspector then
     /// omits the row rather than printing "unknown" (UI-SPEC §13.9).
@@ -1995,6 +2000,11 @@ impl Library {
             .as_ref()
             .and_then(|c| c.effective_license(asset_id).ok())
             .flatten();
+        let in_pack = self
+            .catalog
+            .as_ref()
+            .and_then(|c| c.in_pack_location(asset_id).ok())
+            .flatten();
         Some(AssetDetail {
             asset_id,
             name: row.item.name.clone(),
@@ -2014,6 +2024,8 @@ impl Library {
             source: row.source.clone(),
             source_id: row.item.source_id,
             texture_asset_id: self.albedo_texture(asset_id),
+            pack_entry_path: in_pack.as_ref().map(|(p, _)| p.clone()),
+            pack_archive_path: in_pack.map(|(_, a)| a),
             license: license.as_ref().map(|(l, _)| l.clone()),
             license_url: license.and_then(|(_, u)| u),
             favorite: row.item.favorite,

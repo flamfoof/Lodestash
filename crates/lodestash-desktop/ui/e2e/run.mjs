@@ -2023,6 +2023,55 @@ try {
     await page.keyboard.press("Escape");
   });
 
+  await check("an in-pack asset says where inside the archive it lives", async () => {
+    // §13.9. An in-pack asset has no file to reveal in Explorer, so "where is this?" was
+    // answerable nowhere in the app — for 5,963 of 7,691 assets here. Also covers the licence
+    // link's colour indirectly: it sits in the same row group and is the only anchor in the UI.
+    const p = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    let found = null;
+    for (const item of p.items.slice(0, 60)) {
+      const d = await invoke("asset_detail", { assetId: item.asset_id });
+      if (d?.pack_entry_path) { found = { item, d }; break; }
+      if (d && !d.in_pack) continue;
+    }
+    // Most of this library is in-pack, so finding none in sixty means the join is broken.
+    assert.ok(found, "no in-pack asset in the first 60 reports where it lives inside its archive");
+    assert.ok(
+      found.d.pack_archive_path?.toLowerCase().endsWith(".unitypackage"),
+      `archive row is not an archive: ${found.d.pack_archive_path}`,
+    );
+
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.fill('[data-testid="search-input"]', found.item.name);
+    await page.waitForFunction(
+      (id) => !!document.querySelector(`.card[data-asset-id="${id}"]`),
+      found.item.asset_id,
+      { timeout: 5000 },
+    );
+    await page.locator(`.card[data-asset-id="${found.item.asset_id}"]`).click();
+    await page.waitForSelector('[data-testid="inspector-pack-path"]', { timeout: 5000 });
+    const shownPath = (await page.textContent('[data-testid="inspector-pack-path"]'))?.trim();
+    assert.ok(
+      shownPath?.includes(found.d.pack_entry_path.split("/").pop()),
+      `the row does not name the file: ${shownPath}`,
+    );
+    await page.waitForSelector('[data-testid="inspector-pack-archive"]', { timeout: 3000 });
+
+    // An on-disk asset must NOT grow these rows — it has an abs_path instead.
+    for (const item of p.items.slice(0, 60)) {
+      const d = await invoke("asset_detail", { assetId: item.asset_id });
+      if (!d || d.in_pack) continue;
+      assert.equal(d.pack_entry_path, null, "an on-disk asset claims an in-pack path");
+      assert.equal(d.pack_archive_path, null, "an on-disk asset claims an archive");
+      break;
+    }
+    await page.fill('[data-testid="search-input"]', "");
+    await page.keyboard.press("Escape");
+  });
+
   await check("SIMILAR shows neighbours, not the dependency list again", async () => {
     // §13.8. Until 2026-08-29 this panel drew the *dependency* edges — the same rows LINKED FILES
     // shows directly above it — under a SIMILAR heading. It is embeddings now (6,807 of 8,237
