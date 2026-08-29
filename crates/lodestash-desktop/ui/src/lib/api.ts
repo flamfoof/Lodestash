@@ -362,12 +362,38 @@ export type EngineBridge = {
 };
 export const engineBridge = () => invoke<EngineBridge>("engine_bridge");
 
+/**
+ * One pack in an import whose render pipeline disagrees with the target project's
+ * (ENGINE-API §5.4). Advisory — the import proceeds either way.
+ */
+export type PipelineAdvisory = {
+  package_id: number;
+  package: string;
+  package_pipeline: string;
+  project_pipeline: string;
+  asset_ids: number[];
+};
+
 /** `⇢ Add to project` — queue an engine import into the open Unity project (§5.2). */
 export const engineImport = (assetIds: number[]) =>
   invoke<
-    | { kind: "AwaitingApproval"; detail: { job: Record<string, unknown> } }
-    | { kind: "AlreadyImported"; detail: { ids: number[] } }
+    | {
+        kind: "AwaitingApproval";
+        detail: { job: Record<string, unknown>; pipeline_mismatch: PipelineAdvisory[] };
+      }
+    | { kind: "AlreadyImported"; detail: { ids: number[]; pipeline_mismatch: PipelineAdvisory[] } }
   >("engine_import", { assetIds });
+
+/** How ENGINE-API §5.4's advisory reads to a person: which pack, which pipeline, what they'll see. */
+export function pipelineWarning(a: PipelineAdvisory[]): string | null {
+  if (a.length === 0) return null;
+  const name = (p: string) => ({ built_in: "Built-in", urp: "URP", hdrp: "HDRP" })[p] ?? p;
+  const head = a[0];
+  const rest = a.length > 1 ? ` (+${a.length - 1} more)` : "";
+  return `${head.package} targets ${name(head.package_pipeline)}; your project runs ${name(
+    head.project_pipeline,
+  )} — materials may appear pink${rest}`;
+}
 export const engineApprove = (jobId: string) => invoke<boolean>("engine_approve", { jobId });
 export const engineDeny = (jobId: string) => invoke<boolean>("engine_deny", { jobId });
 /** Jobs parked on the human approval gate (ENGINE-API §4) — the tray's Approve/Deny section. */
@@ -652,6 +678,12 @@ export type AssetDetail = {
   source: string | null;
   /** The pack it sits in, for §13.9's `Source · <library · pack>` row. `null` for a loose file. */
   package: string | null;
+  /**
+   * The licence that applies — the asset's own override falling back to its pack's
+   * (DATA-MODEL §9). `null` when nothing states one, and §13.9 then omits the row entirely.
+   */
+  license: string | null;
+  license_url: string | null;
   /** Its source's id — the key into `sources` for the "isn't reachable" panel (UI-SPEC §11.1). */
   source_id: number;
   texture_asset_id: number | null;

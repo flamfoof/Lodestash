@@ -469,8 +469,9 @@
            modal (§15) the way it already does on every card and list row. The Inspector was the
            one surface that named the library and stopped, so the panel you open to learn about an
            asset told you less about where it came from than the card you opened it from.
-           License is the other half of this row and is still missing — it needs the license
-           harvest (`package.license`, DATA-MODEL §9), which is not built. -->
+           License is the other half, and reads the *effective* licence — the asset's own override
+           falling back to its pack's (DATA-MODEL §9). It is omitted, not shown as "unknown", when
+           nothing in that chain states one: a row that always reads unknown is not provenance. -->
       {#if detail.source || detail.package}
         <dt>Source</dt>
         <dd class="prov">
@@ -486,6 +487,17 @@
             >
               {pack}
             </button>
+          {/if}
+        </dd>
+      {/if}
+      {#if detail.license}
+        <dt>License</dt>
+        <dd class="prov" data-testid="inspector-license">
+          {#if detail.license_url}
+            {@const url = detail.license_url}
+            <a href={url} target="_blank" rel="noreferrer noopener" title={url}>{detail.license}</a>
+          {:else}
+            <span>{detail.license}</span>
           {/if}
         </dd>
       {/if}

@@ -159,10 +159,52 @@ pub struct ImportRequest {
 /// What [`ServerState::request_import`] decided (ENGINE-API §5.2/§5.4).
 pub enum ImportKickoff {
     /// Parked on the human approval gate — the returned job is `awaiting_approval` (→ REST `202`).
-    Awaiting(std::sync::Arc<jobs::Job>),
+    Awaiting {
+        job: std::sync::Arc<jobs::Job>,
+        pipeline_mismatch: Vec<lodestash_core::catalog::PipelineAdvisory>,
+    },
     /// Every requested asset is already in the project (dup-guard) — nothing to do (→ REST `200`
     /// with `job_id: null`).
-    AllAlreadyImported(Vec<i64>),
+    AllAlreadyImported {
+        imported_existing: Vec<i64>,
+        pipeline_mismatch: Vec<lodestash_core::catalog::PipelineAdvisory>,
+    },
+}
+
+impl ImportKickoff {
+    /// The agent-facing response body (ENGINE-API §5.2, advisories §5.4).
+    ///
+    /// **One builder for both planes.** MCP and REST are required to be 1:1 on the agent-facing
+    /// surface, and two hand-copied `json!` blocks is exactly how that stops being true — the
+    /// `pipeline_mismatch` list would have landed on one plane and not the other. The status code
+    /// is still the transport's business (`202` awaiting vs `200` nothing-to-do).
+    ///
+    /// The advisory key is **omitted when empty** rather than sent as `[]`: a client that never
+    /// sees it behaves exactly as it did before the advisory existed.
+    pub fn to_json(&self) -> serde_json::Value {
+        let (mut body, advisories) = match self {
+            ImportKickoff::Awaiting {
+                job,
+                pipeline_mismatch,
+            } => (job.to_json(), pipeline_mismatch),
+            ImportKickoff::AllAlreadyImported {
+                imported_existing,
+                pipeline_mismatch,
+            } => (
+                serde_json::json!({ "imported_existing": imported_existing, "job_id": null }),
+                pipeline_mismatch,
+            ),
+        };
+        if !advisories.is_empty() {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "pipeline_mismatch".into(),
+                    serde_json::to_value(advisories).unwrap_or(serde_json::Value::Null),
+                );
+            }
+        }
+        body
+    }
 }
 
 /// Why an import could not even be queued.
@@ -663,8 +705,20 @@ impl ServerState {
             .copied()
             .filter(|id| !already.contains(id))
             .collect();
+        // §5.4 advisory: warn where the pack and the project target different render pipelines.
+        // Computed over what the caller *asked for*, not only what is new — a re-import of an
+        // already-present asset is still worth the warning.
+        let pipeline_mismatch = self
+            .catalog
+            .lock()
+            .unwrap()
+            .pipeline_mismatches(&req.asset_ids, project_id)
+            .unwrap_or_default();
         if fresh.is_empty() {
-            return Ok(ImportKickoff::AllAlreadyImported(already));
+            return Ok(ImportKickoff::AllAlreadyImported {
+                imported_existing: already,
+                pipeline_mismatch,
+            });
         }
         let summary = format!(
             "Import {} asset(s) into project {}",
@@ -681,7 +735,10 @@ impl ServerState {
             .unwrap()
             .insert(job.id.clone(), (stored, project_id));
         self.wake();
-        Ok(ImportKickoff::Awaiting(job))
+        Ok(ImportKickoff::Awaiting {
+            job,
+            pipeline_mismatch,
+        })
     }
 
     /// The approved import is **enqueued** for the plugin here (ENGINE-API §5.3) — not recorded. It

@@ -1243,9 +1243,18 @@ struct EngineBridge {
 #[serde(tag = "kind", content = "detail")]
 enum EngineImportOutcome {
     /// Parked on the human approval gate — the job tray shows Approve / Deny.
-    AwaitingApproval { job: serde_json::Value },
+    AwaitingApproval {
+        job: serde_json::Value,
+        /// ENGINE-API §5.4 — packs whose render pipeline disagrees with the project's. Carried on
+        /// this plane too, not only REST/MCP: an advisory the desktop dropped would be a warning
+        /// the agent gets and the person sitting in front of it does not.
+        pipeline_mismatch: Vec<lodestash_core::catalog::PipelineAdvisory>,
+    },
     /// The dup-guard (§5.4) left nothing new.
-    AlreadyImported { ids: Vec<i64> },
+    AlreadyImported {
+        ids: Vec<i64>,
+        pipeline_mismatch: Vec<lodestash_core::catalog::PipelineAdvisory>,
+    },
 }
 
 /// `⇢ Add to project` (FEATURES §7.2 / ENGINE-API §5.2) — queue an import into the **open**
@@ -1266,12 +1275,20 @@ fn engine_import(
         dest_subfolder: None,
         with_dependencies: true,
     }) {
-        Ok(lodestash_api::ImportKickoff::Awaiting(job)) => Ok(
-            EngineImportOutcome::AwaitingApproval { job: job.to_json() },
-        ),
-        Ok(lodestash_api::ImportKickoff::AllAlreadyImported(ids)) => {
-            Ok(EngineImportOutcome::AlreadyImported { ids })
-        }
+        Ok(lodestash_api::ImportKickoff::Awaiting {
+            job,
+            pipeline_mismatch,
+        }) => Ok(EngineImportOutcome::AwaitingApproval {
+            job: job.to_json(),
+            pipeline_mismatch,
+        }),
+        Ok(lodestash_api::ImportKickoff::AllAlreadyImported {
+            imported_existing,
+            pipeline_mismatch,
+        }) => Ok(EngineImportOutcome::AlreadyImported {
+            ids: imported_existing,
+            pipeline_mismatch,
+        }),
         Err(lodestash_api::ImportError::NoProject) => Err(
             "no Unity project registered — open Lodestash in Unity (Settings → Unity Editors), or export to a folder instead".into(),
         ),

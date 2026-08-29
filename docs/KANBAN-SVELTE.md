@@ -197,10 +197,20 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
 - [ ] **Compiled bundles + UnityPy sidecar.** No implementation; detect is extension-only.
 - [ ] **Format normalization table.** No glTF artifact, no texture→PNG (KTX/ASTC/ETC…), no FSB5→WAV,
       no Aseprite/KRA/.blend/font specimens (INGESTION §4).
-- [ ] **Render-pipeline harvest.** `package.pipeline` never written ⇒ `pipeline_mismatch` advisory
-      (ENGINE-API §5.4) has no data.
-- [ ] **License/attribution harvest.** Columns exist, no setter; `.meta` `labels:` parsed but never
-      seeded into tags.
+- [x] **Render-pipeline harvest — done 2026-08-28.** `lodestash_ingest::pipeline` classifies from
+      the names a pack states (its own, its `package_entry` pathnames, its UPM manifest deps), and
+      `harvest_pack_metadata` writes `package.pipeline` on both import paths. The
+      `pipeline_mismatch` advisory (ENGINE-API §5.4) now fires on REST, MCP and the desktop.
+- [x] **License/attribution harvest — done 2026-08-28, and the card was half-wrong.** The setter
+      (`set_package_metadata`) and the whole harvest (`unitypackage::read_package_meta`) already
+      existed; the Tauri writer simply never called them — it ran `read_package_meta` at discovery,
+      kept `version`, and dropped the licence. Now written at import, with the Asset Store EULA
+      filling a silence for store-cache packs (they have a `publisher`), M21 backfilling the packs
+      already in the catalog, and UI-SPEC §13.9's License row reading the effective licence.
+      *Still open, and moved to its own card below:* `.meta` `labels:` are parsed but never seeded
+      into tags.
+- [ ] **`.meta` `labels:` → seed tags.** Parsed by `unitypackage::parse_meta`, never written to
+      `tag`/`asset_tag`. INGESTION §2 lists them as seed tags.
 - [ ] **Smart collections / `embedding_meta`.** DDL-only, never written.
 - [x] **Trait-vocabulary teaching — stale card, corrected 2026-08-28.** It *is* wired:
       `writer.rs` reads `teaching_traits()` into `ImageZeroShot`, and `ollama.rs` tests that they

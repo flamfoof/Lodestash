@@ -476,11 +476,11 @@ async fn stage_asset(
 /// ENGINE-API §6 — `POST /v1/stage/import` (same approval + queue as import_to_project).
 async fn import_staged(State(state): State<Shared>) -> Response {
     match state.import_staged() {
-        Ok(crate::ImportKickoff::Awaiting(job)) => {
-            (StatusCode::ACCEPTED, Json(job.to_json())).into_response()
+        Ok(k @ crate::ImportKickoff::Awaiting { .. }) => {
+            (StatusCode::ACCEPTED, Json(k.to_json())).into_response()
         }
-        Ok(crate::ImportKickoff::AllAlreadyImported(ids)) => {
-            Json(json!({ "imported_existing": ids, "job_id": null })).into_response()
+        Ok(k @ crate::ImportKickoff::AllAlreadyImported { .. }) => {
+            Json(k.to_json()).into_response()
         }
         Err(crate::ImportError::Empty) => err(
             StatusCode::BAD_REQUEST,
@@ -505,11 +505,11 @@ async fn import_to_project(
     Json(req): Json<crate::ImportRequest>,
 ) -> Response {
     match state.request_import(req) {
-        Ok(crate::ImportKickoff::Awaiting(job)) => {
-            (StatusCode::ACCEPTED, Json(job.to_json())).into_response()
+        Ok(k @ crate::ImportKickoff::Awaiting { .. }) => {
+            (StatusCode::ACCEPTED, Json(k.to_json())).into_response()
         }
-        Ok(crate::ImportKickoff::AllAlreadyImported(ids)) => {
-            Json(json!({ "imported_existing": ids, "job_id": null })).into_response()
+        Ok(k @ crate::ImportKickoff::AllAlreadyImported { .. }) => {
+            Json(k.to_json()).into_response()
         }
         Err(crate::ImportError::Empty) => err(
             StatusCode::BAD_REQUEST,
@@ -657,7 +657,12 @@ pub fn summary_json(r: &AssetSummaryRow) -> Value {
     })
 }
 
-/// ENGINE-API §3 `Package`. `license`/`attribution` land with the P2 license harvest.
+/// ENGINE-API §3 `Package`.
+///
+/// `license`/`attribution` are the harvest's (INGESTION §2) — the pack's own statement, or the
+/// Asset Store EULA where the pack came from the store cache and said nothing itself.
+/// `pipeline` is what the `pipeline_mismatch` advisory compares (§5.4); `null` means undetermined,
+/// which is not the same as Built-in.
 pub fn package_json(p: &lodestash_core::catalog::PackageListing) -> Value {
     json!({
         "id": p.id,
@@ -666,6 +671,11 @@ pub fn package_json(p: &lodestash_core::catalog::PackageListing) -> Value {
         "category": p.category,
         "asset_count": p.asset_count,
         "unpacked_at": p.unpacked_at,
+        "version": p.version,
+        "license": p.license,
+        "license_url": p.license_url,
+        "attribution": p.attribution,
+        "pipeline": p.pipeline,
     })
 }
 
@@ -924,14 +934,14 @@ mod tests {
         // Import parks on the approval gate — nothing recorded yet, proven by a second request also
         // parking rather than reporting the asset already imported.
         let job = match st.request_import(mk(ids[0], None)) {
-            Ok(crate::ImportKickoff::Awaiting(job)) => job,
+            Ok(crate::ImportKickoff::Awaiting { job, .. }) => job,
             _ => panic!("expected an awaiting-approval job"),
         };
         assert_eq!(job.state(), crate::jobs::JobState::AwaitingApproval);
         assert!(
             matches!(
                 st.request_import(mk(ids[0], Some(pid))),
-                Ok(crate::ImportKickoff::Awaiting(_))
+                Ok(crate::ImportKickoff::Awaiting { .. })
             ),
             "nothing is recorded before approval"
         );
@@ -1002,7 +1012,9 @@ mod tests {
 
         // Re-import the same asset into the same project ⇒ dup-guard: nothing new, no job.
         match st.request_import(mk(ids[0], Some(pid))) {
-            Ok(crate::ImportKickoff::AllAlreadyImported(v)) => assert_eq!(v, vec![ids[0]]),
+            Ok(crate::ImportKickoff::AllAlreadyImported {
+                imported_existing, ..
+            }) => assert_eq!(imported_existing, vec![ids[0]]),
             _ => panic!("re-import must be dup-guarded"),
         }
     }
@@ -1092,7 +1104,7 @@ mod tests {
             dest_subfolder: Some("Wildlife".into()),
             with_dependencies: false,
         }) {
-            Ok(crate::ImportKickoff::Awaiting(j)) => j,
+            Ok(crate::ImportKickoff::Awaiting { job, .. }) => job,
             _ => panic!("expected an awaiting-approval job"),
         };
         st.approve_job(&job.id);
@@ -1190,7 +1202,9 @@ mod tests {
             dest_subfolder: None,
             with_dependencies: false,
         }) {
-            Ok(crate::ImportKickoff::AllAlreadyImported(v)) => assert_eq!(v, vec![asset_id]),
+            Ok(crate::ImportKickoff::AllAlreadyImported {
+                imported_existing, ..
+            }) => assert_eq!(imported_existing, vec![asset_id]),
             _ => panic!("the ack did not persist an import_record"),
         }
     }

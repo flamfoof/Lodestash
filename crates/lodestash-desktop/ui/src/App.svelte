@@ -30,6 +30,7 @@ import JobTray from "./lib/JobTray.svelte";
     setFavorite,
     setTrashed,
     engineImport,
+    pipelineWarning,
     addSourceDialog,
     pickFolder,
     exportAssets,
@@ -548,6 +549,10 @@ import JobTray from "./lib/JobTray.svelte";
       } else {
         push(`Already in the project (${r.detail.ids.length} assets)`, "info");
       }
+      // ENGINE-API §5.4 — advisory, so it rides *alongside* the outcome rather than replacing it:
+      // the import still happens, the user just gets told what it will look like.
+      const warn = pipelineWarning(r.detail.pipeline_mismatch ?? []);
+      if (warn) push(warn, "warn");
     } catch (e) {
       push(String(e), "err");
     }

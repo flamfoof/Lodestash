@@ -91,6 +91,10 @@ pub struct PackageMeta {
     /// EULA default, since that is a fact about *where the pack came from*, not about the pack.
     pub license: Option<String>,
     pub license_url: Option<String>,
+    /// Render pipelines the pack names — in its own paths and in any embedded UPM manifest's
+    /// dependencies (`pipeline::from_path` / `from_manifest`). Collapse with `pipeline::resolve`
+    /// to get the single `package.pipeline` value; empty means the pack never said.
+    pub pipeline: std::collections::BTreeSet<&'static str>,
 }
 
 /// Largest text payload worth reading while harvesting: a licence or manifest that exceeds this
@@ -106,6 +110,15 @@ fn is_license_path(path: &str) -> bool {
     matches!(stem, "license" | "licence" | "copying" | "eula")
         || stem.starts_with("third-party")
         || stem.starts_with("third_party")
+}
+
+/// Is this in-pack path something [`read_package_meta`] could learn from?
+///
+/// Callers use it to decide whether to reopen the archive at all: the metadata pass streams until
+/// it has found its candidates, so a pack whose manifest declares none would pay a **full
+/// inflate** to discover there was nothing to read.
+pub fn is_metadata_pathname(path: &str) -> bool {
+    is_package_json(path) || is_license_path(path)
 }
 
 fn is_package_json(path: &str) -> bool {
@@ -163,6 +176,9 @@ fn parse_package_json(text: &str, meta: &mut PackageMeta) {
     if meta.license_url.is_none() {
         meta.license_url = get("licensesUrl");
     }
+    // Unlike the fields above this is a union, not a first-writer-wins: a pack embedding one UPM
+    // package per pipeline is exactly the `mixed` case, and each manifest is evidence.
+    meta.pipeline.extend(crate::pipeline::from_manifest(text));
 }
 
 /// Harvest [`PackageMeta`] from a `.unitypackage`, given the manifest [`read_manifest`] already
@@ -195,6 +211,13 @@ pub fn read_package_meta(path: &Path, entries: &[PackageEntry]) -> io::Result<Pa
         .collect();
 
     let mut meta = PackageMeta::default();
+    // Free: the pathnames are already in hand, and a pack that ships a variant per pipeline says
+    // so in its folder and sub-package names (INGESTION §2 "Wrapper packages").
+    for e in entries {
+        if let Some(p) = e.pathname.as_deref() {
+            meta.pipeline.extend(crate::pipeline::from_path(p));
+        }
+    }
     let file = File::open(path)?;
     let gz = GzDecoder::new(file);
     let mut archive = tar::Archive::new(gz);

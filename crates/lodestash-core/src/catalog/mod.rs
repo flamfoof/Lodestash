@@ -371,6 +371,7 @@ impl Catalog {
             (18, MIGRATION_18_SOURCE_STATE),
             (19, MIGRATION_19_EXPORT_HISTORY),
             (20, MIGRATION_20_UNPROJECTED_STAGING),
+            (21, MIGRATION_21_STORE_PACK_LICENSE),
         ];
 
         for (version, sql) in migrations {
@@ -2068,6 +2069,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_collection_staging_unprojected
   ON collection(is_staging) WHERE is_staging=1 AND project_id IS NULL;
 ";
 
+/// M21 — backfill the Asset Store EULA onto packs that came from the store cache.
+///
+/// The licence harvest (INGESTION.md §2) has always been able to state this: a pack with a
+/// `publisher` was read out of the `<Publisher>/<Category>/` cache tree, and where the pack
+/// itself says nothing, where it came from is the licence. Only the desktop write path never
+/// called the setter, so 87 packs in the reference library recorded no licence at all — and a
+/// re-harvest cannot reach them without re-inflating every archive to learn a fact the
+/// `publisher` column already carries.
+///
+/// Guarded on `license IS NULL`, so a pack that stated its own licence keeps it, and the
+/// migration is a no-op the second time.
+const MIGRATION_21_STORE_PACK_LICENSE: &str = "
+UPDATE package
+   SET license     = 'Unity Asset Store EULA',
+       license_url = 'https://unity.com/legal/as-terms'
+ WHERE publisher IS NOT NULL AND license IS NULL;
+";
+
 const MIGRATION_12_FAVORITES: &str = "
 ALTER TABLE asset ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_asset_favorite ON asset(favorite) WHERE favorite=1;
@@ -2172,6 +2191,10 @@ pub struct PackageListing {
     /// Harvested from the pack (DATA-MODEL §7). `None` = the pack didn't say.
     pub version: Option<String>,
     pub license: Option<String>,
+    pub license_url: Option<String>,
+    pub attribution: Option<String>,
+    /// `built_in` | `urp` | `hdrp` | `mixed` (DATA-MODEL §12); `None` = not determined.
+    pub pipeline: Option<String>,
 }
 
 /// A registered Unity editor (ENGINE-API §5.1 / DATA-MODEL §9). The plugin upserts its row on
@@ -2206,6 +2229,18 @@ pub struct ImportSpec {
 pub enum ImportOutcome {
     Recorded { asset_id: i64, import_id: i64 },
     AlreadyImported { asset_id: i64 },
+}
+
+/// One pack in an import request whose render pipeline disagrees with the target project's
+/// (ENGINE-API §5.4). Grouped per pack: the assets share one cause and one sentence.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PipelineAdvisory {
+    pub package_id: i64,
+    pub package: String,
+    /// `built_in` | `urp` | `hdrp` — never `mixed`, which is not a mismatch.
+    pub package_pipeline: String,
+    pub project_pipeline: String,
+    pub asset_ids: Vec<i64>,
 }
 
 /// One payload's location inside a `.unitypackage` (DATA-MODEL §13 M6; INGESTION §2
@@ -2386,7 +2421,8 @@ impl Catalog {
             .conn
             .prepare(
                 "SELECT id, name, publisher, category, package_path,
-                        asset_count, unpacked_at, pinned, version, license
+                        asset_count, unpacked_at, pinned, version, license,
+                        license_url, attribution, pipeline
                  FROM package ORDER BY publisher, name",
             )
             .map_err(|e| CoreError::Catalog(format!("pkg list prep: {e}")))?;
@@ -2403,6 +2439,9 @@ impl Catalog {
                     pinned: r.get(7)?,
                     version: r.get(8)?,
                     license: r.get(9)?,
+                    license_url: r.get(10)?,
+                    attribution: r.get(11)?,
+                    pipeline: r.get(12)?,
                 })
             })
             .map_err(|e| CoreError::Catalog(format!("pkg list query: {e}")))?;
@@ -4164,6 +4203,154 @@ impl Catalog {
             )
             .map(|_| ())
             .map_err(|e| CoreError::Catalog(format!("set_package_metadata: {e}")))
+    }
+
+    /// Packs among `asset_ids` whose render pipeline disagrees with the target project's —
+    /// the **`pipeline_mismatch`** import advisory (ENGINE-API §5.4). Grouped per pack, because
+    /// that is the sentence a user gets told: "this pack targets Built-in; your project runs URP".
+    ///
+    /// Advisory, never an error, and deliberately silent in every case where the answer is not
+    /// known to be a mismatch:
+    /// - the project's pipeline is unknown (an older plugin registration did not report one),
+    /// - the pack's is unknown (`pipeline::resolve` found nothing to go on), or
+    /// - the pack is `mixed` — it ships a variant per pipeline, so whatever the project runs is
+    ///   in there.
+    ///
+    /// Material *conversion* stays out of scope (DATA-MODEL §12): we warn, we don't rewrite.
+    pub fn pipeline_mismatches(
+        &self,
+        asset_ids: &[i64],
+        project_id: i64,
+    ) -> Result<Vec<PipelineAdvisory>> {
+        if asset_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(project_pipeline): Option<String> = self
+            .conn
+            .query_row(
+                "SELECT pipeline FROM project WHERE id = ?1",
+                params![project_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| CoreError::Catalog(format!("project pipeline: {e}")))?
+            .flatten()
+        else {
+            return Ok(Vec::new());
+        };
+        let placeholders = vec!["?"; asset_ids.len()].join(",");
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT p.id, p.name, p.pipeline, a.id
+                   FROM asset a
+                   JOIN package p ON p.id = a.package_id
+                  WHERE a.id IN ({placeholders})
+                    AND p.pipeline IS NOT NULL
+                    AND p.pipeline NOT IN ('mixed', ?{n})
+                  ORDER BY p.id, a.id",
+                n = asset_ids.len() + 1
+            ))
+            .map_err(|e| CoreError::Catalog(format!("pipeline advisory prep: {e}")))?;
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = asset_ids
+            .iter()
+            .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
+            .collect();
+        args.push(Box::new(project_pipeline.clone()));
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|e| CoreError::Catalog(format!("pipeline advisory query: {e}")))?;
+        let mut out: Vec<PipelineAdvisory> = Vec::new();
+        for row in rows {
+            let (pkg_id, name, pipeline, asset_id) =
+                row.map_err(|e| CoreError::Catalog(format!("pipeline advisory row: {e}")))?;
+            match out.last_mut() {
+                Some(last) if last.package_id == pkg_id => last.asset_ids.push(asset_id),
+                _ => out.push(PipelineAdvisory {
+                    package_id: pkg_id,
+                    package: name,
+                    package_pipeline: pipeline,
+                    project_pipeline: project_pipeline.clone(),
+                    asset_ids: vec![asset_id],
+                }),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Everything a pack whose `pipeline` is still unknown states about itself in *names*:
+    /// one row per `(package_id, package name, entry pathname)`, with a NULL pathname for a pack
+    /// whose manifest was never recorded. Feeds the backfill classifier
+    /// (`lodestash_ingest::pipeline`) — the harvest only runs at import, so packs already in the
+    /// catalog would otherwise stay unknown forever and never raise the §5.4 advisory.
+    ///
+    /// Scoped to `pipeline IS NULL`, so it shrinks as packs are classified; a pack that genuinely
+    /// names no pipeline is re-examined each run, which is a tokenise over strings already in
+    /// memory.
+    pub fn packages_needing_pipeline(&self) -> Result<Vec<(i64, String, Option<String>)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT p.id, p.name, e.pathname
+                   FROM package p
+                   LEFT JOIN package_entry e ON e.package_id = p.id
+                  WHERE p.pipeline IS NULL
+                  ORDER BY p.id",
+            )
+            .map_err(|e| CoreError::Catalog(format!("pipeline backfill prep: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(|e| CoreError::Catalog(format!("pipeline backfill query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("pipeline backfill row: {e}")))
+    }
+
+    /// The licence that actually applies to an asset: its own override, else its pack's
+    /// (DATA-MODEL §9). Returns `(license, license_url)`; `None` when neither states one.
+    ///
+    /// The two fall back **independently**: a pack states the EULA and its URL, an asset can
+    /// override the licence without knowing a URL, and pairing that asset's licence with the
+    /// pack's URL would cite the wrong document.
+    pub fn effective_license(&self, asset_id: i64) -> Result<Option<(String, Option<String>)>> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(a.license, p.license), COALESCE(a.license_url, p.license_url)
+                   FROM asset a
+                   LEFT JOIN package p ON p.id = a.package_id
+                  WHERE a.id = ?1",
+                params![asset_id],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map(|row| row.and_then(|(lic, url)| lic.map(|l| (l, url))))
+            .map_err(|e| CoreError::Catalog(format!("effective_license: {e}")))
+    }
+
+    /// Record which render pipeline a pack targets (DATA-MODEL §12), harvested from what the
+    /// pack names — see `lodestash_ingest::pipeline`.
+    ///
+    /// Same "set only if we learned something" rule as [`Catalog::set_package_metadata`]: `None`
+    /// means the harvest could not tell, which must not erase an answer an earlier pass found.
+    pub fn set_package_pipeline(&self, package_id: i64, pipeline: Option<&str>) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE package SET pipeline = COALESCE(?2, pipeline) WHERE id = ?1",
+                params![package_id, pipeline],
+            )
+            .map(|_| ())
+            .map_err(|e| CoreError::Catalog(format!("set_package_pipeline: {e}")))
     }
 
     /// For every material that resolves a `uses_texture` edge, the **absolute path** of the

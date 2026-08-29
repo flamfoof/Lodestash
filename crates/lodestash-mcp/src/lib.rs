@@ -338,16 +338,9 @@ impl Lodestash {
             with_dependencies: args.with_dependencies.unwrap_or(true),
         };
         match self.state.request_import(req) {
-            Ok(lodestash_api::ImportKickoff::Awaiting(job)) => {
-                Ok(CallToolResult::success(vec![ContentBlock::json(
-                    job.to_json(),
-                )?]))
-            }
-            Ok(lodestash_api::ImportKickoff::AllAlreadyImported(ids)) => {
-                Ok(CallToolResult::success(vec![ContentBlock::json(
-                    serde_json::json!({ "imported_existing": ids, "job_id": null }),
-                )?]))
-            }
+            Ok(k) => Ok(CallToolResult::success(vec![ContentBlock::json(
+                k.to_json(),
+            )?])),
             Err(lodestash_api::ImportError::Empty) => Err(ErrorData::invalid_params(
                 "asset_ids must not be empty",
                 None,
@@ -617,17 +610,9 @@ impl Lodestash {
     pub async fn import_staged(&self) -> Result<CallToolResult, ErrorData> {
         self.gate("import_staged")?;
         match self.state.import_staged() {
-            Ok(lodestash_api::ImportKickoff::Awaiting(job)) => {
-                Ok(CallToolResult::success(vec![ContentBlock::json(
-                    job.to_json(),
-                )?]))
-            }
-            Ok(lodestash_api::ImportKickoff::AllAlreadyImported(ids)) => Ok(
-                CallToolResult::success(vec![ContentBlock::json(serde_json::json!({
-                    "imported_existing": ids,
-                    "job_id": null,
-                }))?]),
-            ),
+            Ok(k) => Ok(CallToolResult::success(vec![ContentBlock::json(
+                k.to_json(),
+            )?])),
             Err(lodestash_api::ImportError::Empty) => Err(ErrorData::invalid_params(
                 "The staging tray is empty — stage_asset first.",
                 None,

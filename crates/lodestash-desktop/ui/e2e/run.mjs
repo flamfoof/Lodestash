@@ -2023,6 +2023,37 @@ try {
     await page.keyboard.press("Escape");
   });
 
+  await check("the Inspector shows the licence a pack carries", async () => {
+    // §13.9's other half. Until 2026-08-28 no pack in the catalog had a licence at all: the
+    // desktop write path read `read_package_meta` at discovery, kept `version`, and threw the
+    // licence away without ever calling `set_package_metadata` - so the row was left out of the
+    // panel on the grounds that it would always read "unknown".
+    const p = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    let licensed = null;
+    for (const item of p.items.filter((i) => i.package).slice(0, 40)) {
+      const d = await invoke("asset_detail", { assetId: item.asset_id });
+      if (d?.license) { licensed = { item, detail: d }; break; }
+    }
+    if (!licensed) return; // no pack in this library states a licence - nothing to render
+
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.fill('[data-testid="search-input"]', licensed.item.name);
+    await page.waitForFunction(
+      (id) => !!document.querySelector(`.card[data-asset-id="${id}"]`),
+      licensed.item.asset_id,
+      { timeout: 5000 },
+    );
+    await page.locator(`.card[data-asset-id="${licensed.item.asset_id}"]`).click();
+    await page.waitForSelector('[data-testid="inspector-license"]', { timeout: 5000 });
+    const shown = (await page.textContent('[data-testid="inspector-license"]'))?.trim();
+    assert.equal(shown, licensed.detail.license, `the Inspector reads the licence as "${shown}"`);
+    await page.fill('[data-testid="search-input"]', "");
+    await page.keyboard.press("Escape");
+  });
+
   /**
    * The tray is one object now, not two (ADR-0010).
    *

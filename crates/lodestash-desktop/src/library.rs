@@ -185,6 +185,11 @@ pub struct AssetDetail {
     /// `Source · <library · pack>` and link the pack to its stats modal (UI-SPEC §13.9).
     /// `None` for a loose file that belongs to no package.
     pub package: Option<String>,
+    /// The licence that applies here — the asset's own override, else its pack's (DATA-MODEL §9),
+    /// with the URL each of them stated. `None` when nothing in the chain says: the Inspector then
+    /// omits the row rather than printing "unknown" (UI-SPEC §13.9).
+    pub license: Option<String>,
+    pub license_url: Option<String>,
     /// …and its id, so Quick Look can read that source's availability out of `sources` and say
     /// *when* it was last seen rather than only that the file will not open (UI-SPEC §11.1).
     pub source_id: i64,
@@ -1944,6 +1949,11 @@ impl Library {
     pub fn detail(&self, asset_id: i64) -> Option<AssetDetail> {
         let row = self.rows.iter().find(|r| r.item.asset_id == asset_id)?;
         let abs = self.paths.get(&asset_id);
+        let license = self
+            .catalog
+            .as_ref()
+            .and_then(|c| c.effective_license(asset_id).ok())
+            .flatten();
         Some(AssetDetail {
             asset_id,
             name: row.item.name.clone(),
@@ -1963,6 +1973,8 @@ impl Library {
             source: row.source.clone(),
             source_id: row.item.source_id,
             texture_asset_id: self.albedo_texture(asset_id),
+            license: license.as_ref().map(|(l, _)| l.clone()),
+            license_url: license.and_then(|(_, u)| u),
             favorite: row.item.favorite,
             trashed: row.trashed,
             in_pack: row.item.in_pack,

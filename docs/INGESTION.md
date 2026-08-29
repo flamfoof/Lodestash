@@ -106,12 +106,32 @@ Selecting one or multiple packages enqueues a **batch unpack+ingest** job (via t
   every pack sampled carries a 16-35 KB icon; `A Pathfinding Project Pro` states its version via
   UPM manifests, the older packs state nothing and are recorded as saying nothing.)* This is surfaced on every export/import
   so credits for bought assets travel with them (an individual asset can override its pack's license).
-- **Harvest the render pipeline** while ingesting: shader GUID references in the pack's `.mat` files
-  (URP/HDRP shaders have well-known GUIDs; `Standard`/custom CG shaders ⇒ `built_in`) and any
-  `com.unity.render-pipelines.*` entries in embedded package manifests → `package.pipeline`
+- **Harvest the render pipeline** while ingesting → `package.pipeline`
   (`built_in`/`urp`/`hdrp`/`mixed`; see [`DATA-MODEL.md`](DATA-MODEL.md) §12). Compared against the
   target project on import to raise the `pipeline_mismatch` advisory
-  ([`ENGINE-API.md`](ENGINE-API.md) §5.4) — warn-only, never converted.
+  ([`ENGINE-API.md`](ENGINE-API.md) §5.4) — warn-only, never converted. *(Shipped 2026-08-28,
+  `lodestash_ingest::pipeline`, written by the desktop import path.)*
+
+  Detection reads **names, not payloads**: the pack's own name, the `pathname`s the browse manifest
+  already recorded (`package_entry` — no archive re-inflate), and `com.unity.render-pipelines.*`
+  dependencies in any embedded UPM manifest the metadata pass above already reads. Matching is
+  whole-token (`URP_10+.unitypackage` names URP; `Burp.wav` and `Highlander.fbx` name nothing), and
+  a pack naming several is `mixed` — which is what a pack shipping an `Upgrade/Built_in` beside an
+  `Upgrade/URP_10+` actually is. A pack naming none is left **NULL**, so no mismatch is ever
+  advised for it. Packs indexed **before** the harvest existed are classified once on writer start
+  (`backfill_package_pipelines`) from the same names, so the advisory works on a library you
+  already have rather than only on the next thing you import.
+
+  **Shader GUIDs are not used, though this doc first proposed them.** A store pack's `.mat` points
+  at *its own* shader asset, so the GUID identifies the pack rather than a pipeline: across the 149
+  real `.mat` files in the reference library, eight distinct custom GUIDs appear and the only
+  recurring well-known one is Unity's default-resources GUID
+  (`0000000000000000f000000000000000`) — which every pipeline uses for UI and legacy materials, so
+  reading it as Built-in would mislabel URP packs and fire a false "materials may appear pink"
+  warning. Resolving a shader GUID through to a `.shadergraph` and reading its target *would*
+  discriminate (Synty's graphs name `UniversalTarget` and `BuiltInTarget` outright), but that costs
+  a surgical payload pull per material to learn what the folder names already say. Revisit if a
+  pack turns up that targets a pipeline and never names it.
 
 ### Archive handling & memory model
 A `.unitypackage` is **gzip+tar** — a *sequential* stream with **no central index**, so you can't seek

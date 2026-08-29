@@ -130,8 +130,10 @@ in-editor import (§5). Both reuse the **same dependency-closure resolution** de
 > loaded** — with SigLIP/CLAP installed it runs the same RRF-fused hybrid search as the desktop
 > grid. `AssetSummary.tags` is always `[]` (tagging is P4) and its `package` carries
 > `{id, name}` without `publisher`.
-> `Package` carries `{id, name, publisher, category, asset_count, unpacked_at}` — `version`,
-> `license` and `attribution` wait on the P2 license harvest. `find_similar` answers `[]` for an
+> `Package` is complete as of 2026-08-28 — `version`, `license`, `license_url`, `attribution` and
+> `pipeline` all ship (the licence harvest, INGESTION §2). `license` is `null` only where the pack
+> stated none **and** did not come from the Asset Store cache; `pipeline` is `null` where detection
+> could not tell, which is not the same as `built_in`. `find_similar` answers `[]` for an
 > asset with no embedding (an un-encoded library is not an error).
 > `export` honours `with_dependencies` over the harvested relationship graph (DATA-MODEL §10) and
 > reports `dependencies_included` plus `dependencies_added`; the graph carries material → texture
@@ -175,7 +177,8 @@ than redefining, so summaries/details never diverge.
 // Package — list_packages (see DATA-MODEL.md §7)
 { "id": 12, "name": "Forest Pack", "publisher": "AcmeArt", "category": "3D/Environments",
   "version": "2.1.0", "asset_count": 412, "unpacked_at": 1716500000,
-  "license": "Unity Asset Store EULA", "attribution": "AcmeArt" }
+  "license": "Unity Asset Store EULA", "license_url": "https://unity.com/legal/as-terms",
+  "attribution": "AcmeArt", "pipeline": "urp" }   // pipeline: built_in|urp|hdrp|mixed|null
 
 // Job — get_job_status (job engine; see ARCHITECTURE.md §3.1)
 { "job_id": "imp_9f…", "kind": "import", "state": "running",   // queued|running|done|error|cancelled
@@ -283,9 +286,30 @@ Before enqueuing, the core checks `import_record` for `(asset_id, project_id)`:
 
 It also compares the asset's `package.pipeline` (Built-in/URP/HDRP, harvested at ingest — see
 [`DATA-MODEL.md`](DATA-MODEL.md) §12) against the target project's pipeline (reported by the plugin at
-registration). A mismatch adds a **`pipeline_mismatch`** advisory list to the same `200` response —
+registration). A mismatch adds a **`pipeline_mismatch`** advisory list to the response —
 "this pack targets Built-in; your project runs URP (materials may appear pink)" — and the import
 proceeds. Advisory, never an error: the user/agent decides.
+
+*(Shipped 2026-08-28.* `Catalog::pipeline_mismatches`, on **both** the `202` awaiting-approval body
+and the `200` nothing-new body, and on the desktop's own `⇢ Add to project` as a second toast
+beside the outcome — an advisory the app dropped would be a warning the agent gets and the person
+looking at the screen does not. Entries are grouped **per pack**, which is the sentence a user is
+told:
+
+```json
+"pipeline_mismatch": [
+  { "package_id": 12, "package": "Forest Pack", "package_pipeline": "built_in",
+    "project_pipeline": "urp", "asset_ids": [4821, 4822] }
+]
+```
+
+The key is **omitted when empty**, so a client that never sees it behaves as it did before the
+advisory existed. It stays silent in all three "we don't know it is a mismatch" cases — the
+project's pipeline unreported, the pack's undetermined, or the pack `mixed` (it ships a variant per
+pipeline, so whatever the project runs is in there). It is computed over what the caller *asked
+for*, not only what is new: re-importing an already-present asset is still worth the warning. Both
+planes render it from one builder (`ImportKickoff::to_json`) rather than two hand-copied bodies,
+which is how §2's 1:1 rule survives a change like this.)*
 
 ### 5.5 Constraints
 - Editor must be **open and polling**; imports run on Unity's **main thread**; large binaries travel
@@ -311,9 +335,9 @@ Still interim until the real **UPM plugin** lands:
   correctness gap (a `tokio::sync::Notify` wait slots in behind the same method).
 - **`get_active_project` is folded into `list_projects`** — active-first, each row carries
   `is_active`, so no separate call. The §2 row keeps both names; only `list_projects` exists.
-- **`pipeline_mismatch` advisory (§5.4) and staging (§6) are not built yet**; the `already_imported`
-  dup-guard advisory **is** live. Only a real editor doing `AssetDatabase.ImportAsset` remains
-  unbuilt — every step it talks to exists and is tested.
+- **Staging (§6) is built** (ADR-0010) and the **`pipeline_mismatch` advisory (§5.4) shipped
+  2026-08-28**, alongside the `already_imported` dup-guard. Only a real editor doing
+  `AssetDatabase.ImportAsset` remains unbuilt — every step it talks to exists and is tested.
 
 ---
 

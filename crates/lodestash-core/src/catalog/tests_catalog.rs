@@ -18,7 +18,7 @@ fn open_in_memory_applies_migrations() {
         .conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 20, "all 20 migrations should have run");
+    assert_eq!(version, 21, "all 21 migrations should have run");
 }
 
 /// The viewer's texture lookup must walk **both** hops. Stopping at the first lands on the
@@ -3320,4 +3320,171 @@ fn foreign_keys_enforced() {
         [],
     );
     assert!(result.is_err(), "FK violation should be rejected");
+}
+
+/// ENGINE-API 5.4 - the advisory fires on a genuine disagreement and stays quiet on every
+/// "we don't actually know" case. A false mismatch tells a user their materials will be pink
+/// when they will not, which is worse than saying nothing.
+#[test]
+fn pipeline_mismatch_advisory() {
+    let c = Catalog::open_in_memory().unwrap();
+    c.conn
+        .execute_batch(
+            "INSERT INTO import_source (id, uuid, name, root_path, kind) VALUES (1, 'src-1', 's', '/s', 'folder');
+             INSERT INTO media_type (id, code, label) VALUES (1, 'image', 'Image');
+             INSERT INTO package (id, uuid, source_id, package_path, name, pipeline) VALUES
+                 (10, 'p-builtin', 1, '/s/a.unitypackage', 'BuiltInPack', 'built_in'),
+                 (11, 'p-urp',     1, '/s/b.unitypackage', 'UrpPack',     'urp'),
+                 (12, 'p-mixed',   1, '/s/c.unitypackage', 'MixedPack',   'mixed'),
+                 (13, 'p-unknown', 1, '/s/d.unitypackage', 'QuietPack',   NULL);
+             INSERT INTO asset (id, uuid, source_id, media_type_id, package_id, name, created_at, updated_at)
+                 VALUES (1, 'a1', 1, 1, 10, 'rock',  0, 0),
+                        (2, 'a2', 1, 1, 10, 'moss',  0, 0),
+                        (3, 'a3', 1, 1, 11, 'tree',  0, 0),
+                        (4, 'a4', 1, 1, 12, 'sword', 0, 0),
+                        (5, 'a5', 1, 1, 13, 'shard', 0, 0),
+                        (6, 'a6', 1, 1, NULL, 'loose', 0, 0);",
+        )
+        .expect("fixture");
+    let urp_project = c
+        .register_project("C:/dev/UrpGame", Some("6000.0.30f1"), Some("urp"))
+        .unwrap();
+
+    let all = [1, 2, 3, 4, 5, 6];
+    let advisories = c.pipeline_mismatches(&all, urp_project).unwrap();
+    assert_eq!(
+        advisories.len(),
+        1,
+        "only the Built-in pack disagrees with a URP project: {advisories:?}"
+    );
+    let a = &advisories[0];
+    assert_eq!(a.package, "BuiltInPack");
+    assert_eq!(a.package_pipeline, "built_in");
+    assert_eq!(a.project_pipeline, "urp");
+    assert_eq!(
+        a.asset_ids,
+        vec![1, 2],
+        "grouped per pack - one cause, one sentence, every asset it covers"
+    );
+
+    // A project whose pipeline was never reported cannot disagree with anything.
+    let unknown_project = c.register_project("C:/dev/Unknown", None, None).unwrap();
+    assert!(
+        c.pipeline_mismatches(&all, unknown_project)
+            .unwrap()
+            .is_empty(),
+        "unknown project pipeline must not advise"
+    );
+
+    // And the matching pack is silent from the other side too.
+    let builtin_project = c
+        .register_project("C:/dev/BuiltInGame", None, Some("built_in"))
+        .unwrap();
+    let from_builtin = c.pipeline_mismatches(&all, builtin_project).unwrap();
+    assert_eq!(from_builtin.len(), 1);
+    assert_eq!(from_builtin[0].package, "UrpPack");
+
+    assert!(
+        c.pipeline_mismatches(&[], urp_project).unwrap().is_empty(),
+        "no assets, no advisory"
+    );
+}
+
+/// DATA-MODEL 9 - the licence an asset actually carries, and the reason the URL falls back
+/// separately: pairing an asset's own licence with its pack's URL cites the wrong document.
+#[test]
+fn effective_license_falls_back_to_the_pack() {
+    let c = Catalog::open_in_memory().unwrap();
+    c.conn
+        .execute_batch(
+            "INSERT INTO import_source (id, uuid, name, root_path, kind) VALUES (1, 'src-1', 's', '/s', 'folder');
+             INSERT INTO media_type (id, code, label) VALUES (1, 'image', 'Image');
+             INSERT INTO package (id, uuid, source_id, package_path, name, license, license_url)
+                 VALUES (10, 'p1', 1, '/s/a.unitypackage', 'Pack',
+                         'Unity Asset Store EULA', 'https://unity.com/legal/as-terms');
+             INSERT INTO asset (id, uuid, source_id, media_type_id, package_id, name, license, license_url, created_at, updated_at)
+                 VALUES (1, 'a1', 1, 1, 10, 'inherits', NULL,      NULL, 0, 0),
+                        (2, 'a2', 1, 1, 10, 'override', 'CC0-1.0', NULL, 0, 0),
+                        (3, 'a3', 1, 1, NULL, 'loose',   NULL,     NULL, 0, 0);",
+        )
+        .expect("fixture");
+
+    assert_eq!(
+        c.effective_license(1).unwrap(),
+        Some((
+            "Unity Asset Store EULA".into(),
+            Some("https://unity.com/legal/as-terms".into())
+        )),
+        "an asset that states nothing carries its pack's licence"
+    );
+    assert_eq!(
+        c.effective_license(2).unwrap(),
+        Some((
+            "CC0-1.0".into(),
+            Some("https://unity.com/legal/as-terms".into())
+        )),
+        "the asset's own licence wins; the URL falls back independently"
+    );
+    assert_eq!(
+        c.effective_license(3).unwrap(),
+        None,
+        "no asset licence and no pack means nothing to show, not the word unknown"
+    );
+    assert_eq!(c.effective_license(999).unwrap(), None, "no such asset");
+}
+
+/// M21 - the Asset Store EULA backfill. The harvest could always state this (a pack with a
+/// publisher came out of the store cache tree); only the desktop write path never called the
+/// setter, leaving 87 packs in the reference library licence-less - and no re-harvest reaches
+/// them without re-inflating every archive to learn what `publisher` already says.
+#[test]
+fn store_pack_license_backfill() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let path = dir.path().join("catalog.db");
+    {
+        let c = Catalog::open(&path).unwrap();
+        c.conn
+            .execute_batch(
+                "INSERT INTO import_source (id, uuid, name, root_path, kind)
+                     VALUES (1, 'src-1', 's', '/s', 'folder');
+                 INSERT INTO package (id, uuid, source_id, package_path, name, publisher, license) VALUES
+                     (1, 'p1', 1, '/s/a.unitypackage', 'FromStore',   'SICS Games', NULL),
+                     (2, 'p2', 1, '/s/b.unitypackage', 'StatedOwn',   'SICS Games', 'CC0-1.0'),
+                     (3, 'p3', 1, '/s/c.unitypackage', 'LooseFolder', NULL,         NULL);",
+            )
+            .expect("fixture");
+        // Rewind past M21 so reopening replays it over rows that predate it - which is the
+        // situation on every existing catalog.
+        c.conn
+            .pragma_update(None, "user_version", 20i64)
+            .expect("rewind");
+    }
+
+    let c = Catalog::open(&path).unwrap();
+    let by_name = |n: &str| {
+        c.list_packages()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == n)
+            .unwrap()
+    };
+    assert_eq!(
+        by_name("FromStore").license.as_deref(),
+        Some("Unity Asset Store EULA"),
+        "a store-cache pack that said nothing is licensed by where it came from"
+    );
+    assert_eq!(
+        by_name("FromStore").license_url.as_deref(),
+        Some("https://unity.com/legal/as-terms")
+    );
+    assert_eq!(
+        by_name("StatedOwn").license.as_deref(),
+        Some("CC0-1.0"),
+        "a pack that stated its own licence keeps it"
+    );
+    assert_eq!(
+        by_name("LooseFolder").license,
+        None,
+        "no publisher means not from the store, so nothing is known about its licence"
+    );
 }

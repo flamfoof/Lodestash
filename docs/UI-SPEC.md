@@ -797,8 +797,11 @@ Selected, one asset — top→bottom:
    *(Shipped 2026-08-27: the library · pack row, the pack linking to §15 the way it already does
    from every card and list row — this panel named the library and stopped, so the place you open
    to learn about an asset said less about where it came from than the card you opened it from.
-   **License is still absent** and stays that way until the license harvest writes `package.license`;
-   a row that would always read "unknown" is not provenance.)*
+   **License landed 2026-08-28** with the harvest behind it ([`INGESTION.md`](INGESTION.md) §2):
+   the row reads the *effective* licence — the asset's own override falling back to its pack's
+   ([`DATA-MODEL.md`](DATA-MODEL.md) §9) — and links it when a URL is known. It is **omitted, not
+   shown as "unknown"**, when nothing in that chain states one; a row that always reads unknown is
+   not provenance, which is why it waited for the harvest rather than shipping empty.)*
 10. **Actions**: Unidentified → full-width **✦ Identify now**. Otherwise: **⟡ Stage / ✓ Staged**
     (gold outline) + **↧ Import / ✓ Imported** (gold primary; dup-guard toast when already in the
     active project) side-by-side, then **✦ Re-identify** (arcane outline; re-queues identification).

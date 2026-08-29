@@ -798,12 +798,15 @@ ALTER TABLE project ADD COLUMN pipeline TEXT;     -- the registered editor's pip
   place rather than migrated away. The egui build's stars remain until B7 deletes that crate.
   Never AI-written in any case — it is pure user curation.
 - **Pipeline** — which Unity render pipeline a pack targets, harvested at ingest
-  ([`INGESTION.md`](INGESTION.md) §2): shader GUID references in `.mat` files (URP/HDRP shaders have
-  well-known GUIDs; custom/`Standard` shaders ⇒ `built_in`) and `com.unity.render-pipelines.*`
-  entries in any embedded package manifest. Packs shipping multiple variants are `mixed`. Compared
-  against the registered project's pipeline on import → the **`pipeline_mismatch` advisory**
-  ([`ENGINE-API.md`](ENGINE-API.md) §5.4). Material *conversion* is explicitly out of scope — we
-  warn, we don't rewrite.
+  ([`INGESTION.md`](INGESTION.md) §2, which owns *how* — names the pack states, not shader GUIDs;
+  see the narrowing recorded there). Packs shipping a variant per pipeline are `mixed`, and a pack
+  we cannot classify stays **NULL**, which is "unknown", not Built-in. Compared against the
+  registered project's pipeline on import → the **`pipeline_mismatch` advisory**
+  ([`ENGINE-API.md`](ENGINE-API.md) §5.4), which is silent whenever either side is unknown or the
+  pack is `mixed`. Material *conversion* is explicitly out of scope — we warn, we don't rewrite.
+
+  *(Shipped 2026-08-28 — `lodestash_ingest::pipeline` + `Catalog::set_package_pipeline`, written by
+  the desktop import path.)*
 
 ---
 
@@ -818,6 +821,7 @@ transaction, in order, on open. Shipped so far:
 | **M2** | Mapping library: `taxonomy`, `category`, `category_alias`, `mapping_rule`, `asset_category` (§4) |
 | **M3** | Engine round-trip: `package` + `asset.package_id`, `project`, `import_record`, `asset.license/attribution/license_url` (§7, §9) |
 | **M4** | `asset.rating`, `package.pipeline`, `project.pipeline` (§12) |
+| **M21** | Asset Store EULA backfill: `UPDATE package SET license/license_url WHERE publisher IS NOT NULL AND license IS NULL`. Data, not DDL — the harvest could always state this (a `publisher` means the pack came out of the store cache tree), but the desktop write path never called the setter, so every pack it imported recorded no licence. Guarded on `license IS NULL`, so a pack that stated its own keeps it |
 | **M20** | One staging tray with no project: `idx_collection_staging_unprojected`. Relaxes M5's rule that a tray must belong to a project, so the shell can stop keeping its own in-memory shortlist beside the catalog's ([ADR-0010](decisions/ADR-0010-one-staging-tray.md)) |
 | **M18** | Source availability: `import_source.state` + `last_seen_at` — the third source state a drive going away needs (UI-SPEC §11.1). `state` is **derived, not authored**: the open/scan health check writes it, `paused` is the user's `watch_enabled` intent surfaced as a state, and nothing in the catalog is deleted because a root went missing |
 | **M5** | UI-SPEC alignment (below) |

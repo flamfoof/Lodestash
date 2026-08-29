@@ -11,6 +11,7 @@ pub mod material;
 pub mod melspec;
 pub mod mesh;
 pub mod metrics;
+pub mod pipeline;
 pub mod raster;
 pub mod render3d;
 pub mod thumb;

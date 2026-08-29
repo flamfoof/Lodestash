@@ -359,6 +359,134 @@ pub struct ImportPack {
     pub entries: Vec<PackageEntryRecord>,
 }
 
+/// Record what a pack says about itself: its version and licence (INGESTION §2 "Harvest
+/// license/attribution") and the render pipeline it targets (DATA-MODEL §12), which is what the
+/// `pipeline_mismatch` import advisory compares against (ENGINE-API §5.4).
+///
+/// Best-effort throughout: a pack whose archive will not open still imports, it just records
+/// less. Nothing here is a guess — an unknown licence or pipeline is left NULL rather than
+/// defaulted, except the one default the origin genuinely licenses (below).
+fn harvest_pack_metadata(
+    catalog: &Catalog,
+    package_id: i64,
+    abs_path: &str,
+    name: &str,
+    publisher: Option<&str>,
+    entries: &[PackageEntryRecord],
+) {
+    // Names first: the pack's own name and the pathnames its manifest already recorded. Free —
+    // no archive read — and it is how a pack that ships a variant per pipeline says so.
+    let mut pipelines = lodestash_ingest::pipeline::from_path(name);
+    for e in entries {
+        if let Some(p) = e.pathname.as_deref() {
+            pipelines.extend(lodestash_ingest::pipeline::from_path(p));
+        }
+    }
+
+    // The archive is reopened **only** when the manifest says there is something in it to read:
+    // `read_package_meta` streams until it has found its candidates, so a pack declaring none
+    // would cost a full inflate to learn nothing. (The desktop wants no pack icon, which is the
+    // other thing that pass reads.)
+    let declares_meta = entries.iter().any(|e| {
+        e.pathname
+            .as_deref()
+            .is_some_and(lodestash_ingest::unitypackage::is_metadata_pathname)
+    });
+    let meta = declares_meta
+        .then(|| {
+            let manifest: Vec<lodestash_ingest::unitypackage::PackageEntry> = entries
+                .iter()
+                .map(|e| lodestash_ingest::unitypackage::PackageEntry {
+                    guid: e.guid.clone(),
+                    pathname: e.pathname.clone(),
+                    asset_size: e.size_bytes.map(|n| n as u64),
+                    ..Default::default()
+                })
+                .collect();
+            lodestash_ingest::unitypackage::read_package_meta(Path::new(abs_path), &manifest)
+                .map_err(|e| tracing::warn!(%e, pack = %name, "pack metadata harvest failed"))
+                .ok()
+        })
+        .flatten();
+    if let Some(m) = &meta {
+        pipelines.extend(m.pipeline.iter().copied());
+    }
+
+    // A pack with a publisher came out of the Asset Store cache tree, which is enough to know its
+    // licence. The pack's own statement wins; the EULA only fills a silence.
+    let store_pack = publisher.is_some();
+    let license = meta
+        .as_ref()
+        .and_then(|m| m.license.clone())
+        .or_else(|| store_pack.then(|| "Unity Asset Store EULA".to_string()));
+    let license_url = meta
+        .as_ref()
+        .and_then(|m| m.license_url.clone())
+        .or_else(|| store_pack.then(|| "https://unity.com/legal/as-terms".to_string()));
+    let version = meta.as_ref().and_then(|m| m.version.clone());
+    if let Err(e) = catalog.set_package_metadata(
+        package_id,
+        version.as_deref(),
+        license.as_deref(),
+        publisher,
+        license_url.as_deref(),
+    ) {
+        tracing::warn!(%e, pack = %name, "pack metadata write failed");
+    }
+    if let Err(e) =
+        catalog.set_package_pipeline(package_id, lodestash_ingest::pipeline::resolve(&pipelines))
+    {
+        tracing::warn!(%e, pack = %name, "pack pipeline write failed");
+    }
+}
+
+/// Classify the packs already in the catalog whose `pipeline` was never determined
+/// (DATA-MODEL §12). The harvest runs at import, so without this every pack indexed before it
+/// existed stays unknown for good — and an advisory that can never fire for the library you
+/// already have is not an advisory.
+///
+/// Reads only names (the pack's own and its recorded `package_entry` pathnames), which are
+/// already in the catalog, so this is a tokenise over strings rather than any archive work.
+/// Returns how many packs it classified.
+fn backfill_package_pipelines(catalog: &Catalog) -> usize {
+    let rows = match catalog.packages_needing_pipeline() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(%e, "pipeline backfill: query failed");
+            return 0;
+        }
+    };
+    let mut written = 0usize;
+    let mut current: Option<(i64, std::collections::BTreeSet<&'static str>)> = None;
+    let flush = |cur: Option<(i64, std::collections::BTreeSet<&'static str>)>| {
+        let Some((id, seen)) = cur else { return 0 };
+        let Some(p) = lodestash_ingest::pipeline::resolve(&seen) else {
+            return 0;
+        };
+        match catalog.set_package_pipeline(id, Some(p)) {
+            Ok(()) => 1,
+            Err(e) => {
+                tracing::warn!(%e, package_id = id, "pipeline backfill: write failed");
+                0
+            }
+        }
+    };
+    for (id, name, pathname) in rows {
+        if current.as_ref().map(|(c, _)| *c) != Some(id) {
+            written += flush(current.take());
+            current = Some((id, lodestash_ingest::pipeline::from_path(&name)));
+        }
+        if let (Some((_, seen)), Some(p)) = (current.as_mut(), pathname.as_deref()) {
+            seen.extend(lodestash_ingest::pipeline::from_path(p));
+        }
+    }
+    written += flush(current.take());
+    if written > 0 {
+        tracing::info!(packs = written, "render pipeline backfilled");
+    }
+    written
+}
+
 // ── Job tray (B2b) ─────────────────────────────────────────────────────────────────────────
 
 /// Shared tray state: active jobs (progress + cooperative cancel) and a session ring of
@@ -584,6 +712,9 @@ impl Writer {
                 // library) and every uncovered model card renders icon-only — the "3D cards
                 // look smaller than audio cards" symptom. Ops preempt it within a few
                 // seconds; the queue is durable, so it converges over idle moments.
+                // One-shot, before the loop: packs indexed before the harvest existed have no
+                // pipeline, and only the writer thread may fix that (single-writer rule).
+                backfill_package_pipelines(&catalog);
                 let (cache_dir, workspace_dir) = default_cache_dirs();
                 let proxy = AppConfig::load().preview_quality.proxy_budget();
                 // B11c: when auto-identify is on and the local models are present, the idle
@@ -1206,6 +1337,14 @@ fn run(
                     catalog
                         .record_package_entries(id, &pack.entries)
                         .map_err(|e| e.to_string())?;
+                    harvest_pack_metadata(
+                        catalog,
+                        id,
+                        &pack.abs_path,
+                        &pack.display_name,
+                        None,
+                        &pack.entries,
+                    );
                 }
                 Ok(WriteResult {
                     changed,
@@ -1235,7 +1374,7 @@ fn run(
                         .upsert_package(
                             source_id,
                             &pack.abs_path,
-                            &pack.name,
+                            &name,
                             pack.publisher.as_deref(),
                             pack.category.as_deref(),
                         )
@@ -1243,6 +1382,14 @@ fn run(
                     catalog
                         .record_package_entries(id, &pack.entries)
                         .map_err(|e| e.to_string())?;
+                    harvest_pack_metadata(
+                        catalog,
+                        id,
+                        &pack.abs_path,
+                        &pack.name,
+                        pack.publisher.as_deref(),
+                        &pack.entries,
+                    );
                     inserted += mint_in_pack(catalog, id, &pack.entries)?;
                     catalog
                         .set_package_pinned(id, true)
@@ -2238,6 +2385,201 @@ fn delete_from_disk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The backfill exists because the harvest runs at import: 87 packs in the reference library
+    /// were indexed before it and would have stayed pipeline-less for good, so the §5.4 advisory
+    /// could never fire for the library the user already has.
+    #[test]
+    fn existing_packs_get_their_pipeline_backfilled() {
+        let mut c = Catalog::open_in_memory().expect("open");
+        let source_id = c.upsert_import_source("s", "/s", "folder").expect("source");
+        let named = c
+            .upsert_package(
+                source_id,
+                "/s/altos.unitypackage",
+                "Altos ... for Unity URP",
+                None,
+                None,
+            )
+            .expect("pkg");
+        let by_entries = c
+            .upsert_package(
+                source_id,
+                "/s/artificer.unitypackage",
+                "Artificer",
+                None,
+                None,
+            )
+            .expect("pkg");
+        let quiet = c
+            .upsert_package(source_id, "/s/audio.unitypackage", "Sound Pack", None, None)
+            .expect("pkg");
+        let settled = c
+            .upsert_package(
+                source_id,
+                "/s/settled.unitypackage",
+                "Already Known URP",
+                None,
+                None,
+            )
+            .expect("pkg");
+        c.set_package_pipeline(settled, Some("hdrp")).expect("set");
+        let entry = |p: &str| PackageEntryRecord {
+            guid: format!("g{p}"),
+            pathname: Some(p.to_string()),
+            tar_offset: Some(0),
+            size_bytes: Some(16),
+        };
+        c.record_package_entries(
+            by_entries,
+            &[
+                entry("Assets/Artificer/Other Bits/Artificer Double Sided HDRP.unitypackage"),
+                entry("Assets/Artificer/Other Bits/Artificer Builtin Double Sided.unitypackage"),
+            ],
+        )
+        .expect("entries");
+        c.record_package_entries(quiet, &[entry("Assets/Sound Pack/Audio/Burp.wav")])
+            .expect("entries");
+
+        assert_eq!(
+            backfill_package_pipelines(&c),
+            2,
+            "two packs name a pipeline"
+        );
+        let of = |id: i64| {
+            c.list_packages()
+                .unwrap()
+                .into_iter()
+                .find(|p| p.id == id)
+                .unwrap()
+                .pipeline
+        };
+        assert_eq!(
+            of(named).as_deref(),
+            Some("urp"),
+            "the pack name alone names it"
+        );
+        assert_eq!(
+            of(by_entries).as_deref(),
+            Some("mixed"),
+            "an HDRP variant beside a Built-in one is mixed"
+        );
+        assert_eq!(of(quiet), None, "a pack that names none stays unknown");
+        assert_eq!(
+            of(settled).as_deref(),
+            Some("hdrp"),
+            "a pack already classified is not revisited, even when its name says otherwise"
+        );
+
+        assert_eq!(
+            backfill_package_pipelines(&c),
+            0,
+            "a second run has nothing left to classify"
+        );
+    }
+
+    /// The desktop write path records what a pack says about itself. Before this, every pack the
+    /// Tauri app imported recorded no licence and no pipeline at all: `read_package_meta` ran at
+    /// discovery and everything but `version` was thrown away, and `set_package_metadata` was
+    /// never called from this crate.
+    ///
+    /// Also pins the cost fence - a pack whose manifest declares no licence or UPM manifest must
+    /// not reopen the archive, because `read_package_meta` streams until it finds candidates and
+    /// would pay a full inflate to learn nothing. The archive path here does not exist, so a read
+    /// attempt would surface as a missing licence rather than a hang.
+    #[test]
+    fn pack_metadata_is_harvested_on_import() {
+        let c = Catalog::open_in_memory().expect("open");
+        let source_id = c.upsert_import_source("s", "/s", "folder").expect("source");
+        let entry = |p: &str| PackageEntryRecord {
+            guid: format!("g{p}"),
+            pathname: Some(p.to_string()),
+            tar_offset: Some(0),
+            size_bytes: Some(16),
+        };
+
+        // A store-cache pack (it has a publisher) shipping a URP variant and a Built-in one.
+        let id = c
+            .upsert_package(
+                source_id,
+                "/s/variants.unitypackage",
+                "Variants",
+                Some("SICS Games"),
+                None,
+            )
+            .expect("pkg");
+        harvest_pack_metadata(
+            &c,
+            id,
+            "/s/does-not-exist.unitypackage",
+            "Variants",
+            Some("SICS Games"),
+            &[
+                entry("Assets/Variants/Upgrade/URP_10+.unitypackage"),
+                entry("Assets/Variants/Upgrade/Built_in.unitypackage"),
+                entry("Assets/Variants/Models/Rock.fbx"),
+            ],
+        );
+
+        // A folder pack with no publisher that names one pipeline and nothing else.
+        let urp = c
+            .upsert_package(source_id, "/s/urp.unitypackage", "ToonFX URP", None, None)
+            .expect("pkg");
+        harvest_pack_metadata(
+            &c,
+            urp,
+            "/s/does-not-exist.unitypackage",
+            "ToonFX URP",
+            None,
+            &[entry("Assets/ToonFX/Shaders/Toon.shadergraph")],
+        );
+
+        // A pack that names no pipeline at all.
+        let quiet = c
+            .upsert_package(source_id, "/s/quiet.unitypackage", "Sound Pack", None, None)
+            .expect("pkg");
+        harvest_pack_metadata(
+            &c,
+            quiet,
+            "/s/does-not-exist.unitypackage",
+            "Sound Pack",
+            None,
+            &[entry("Assets/Sound Pack/Audio/Burp.wav")],
+        );
+
+        let by_name = |n: &str| {
+            c.list_packages()
+                .unwrap()
+                .into_iter()
+                .find(|p| p.name == n)
+                .unwrap()
+        };
+        assert_eq!(
+            by_name("Variants").license.as_deref(),
+            Some("Unity Asset Store EULA"),
+            "a pack with a publisher came from the store cache, which licenses it"
+        );
+        assert_eq!(
+            by_name("Variants").pipeline.as_deref(),
+            Some("mixed"),
+            "a variant per pipeline is exactly the mixed case"
+        );
+        assert_eq!(
+            by_name("ToonFX URP").pipeline.as_deref(),
+            Some("urp"),
+            "the pack name alone names it"
+        );
+        assert_eq!(
+            by_name("ToonFX URP").license,
+            None,
+            "no publisher means nothing is known about the licence - not a default"
+        );
+        assert_eq!(
+            by_name("Sound Pack").pipeline,
+            None,
+            "a pack that names no pipeline stays unknown, so no mismatch is ever advised for it"
+        );
+    }
+
     /// Undoing an export (FEATURES §7.1) deletes files the user chose the location of, which makes
     /// it the most dangerous delete in the app. Mutation-checked on the four fences that keep it
     /// pointed at its own copies:
