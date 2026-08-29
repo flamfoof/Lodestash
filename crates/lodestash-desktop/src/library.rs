@@ -226,6 +226,17 @@ pub struct WorkspacePackRow {
     pub archive_present: bool,
 }
 
+/// Lifecycle rank for the Status sort (DATA-MODEL §8). Unidentified first: the point of sorting
+/// by status is to bring the work to the top, not to alphabetise a code.
+fn status_key(s: AssetStatus) -> u8 {
+    match s {
+        AssetStatus::Discovered => 0,
+        AssetStatus::Indexed => 1,
+        AssetStatus::Identified => 2,
+        AssetStatus::Confirmed => 3,
+    }
+}
+
 /// One export run for the Recent-exports list (FEATURES §7.1).
 #[derive(Debug, Clone, Serialize)]
 pub struct ExportBatchRow {
@@ -1296,6 +1307,17 @@ impl Library {
                 matched.sort_by(|a, b| by(a.item.size_bytes.cmp(&b.item.size_bytes), a, b))
             }
             SortBy::Modified => matched.sort_by(|a, b| by(a.mtime.cmp(&b.mtime), a, b)),
+            // Insert order. See the variant's own note: `asset.id` is what "date added" means
+            // here, and it costs nothing to read.
+            SortBy::Added => {
+                matched.sort_by(|a, b| by(a.item.asset_id.cmp(&b.item.asset_id), a, b))
+            }
+            // Lifecycle order, not the code string: `discovered` and `indexed` both read as
+            // Unidentified to the user (DATA-MODEL §8) and must sort together, which alphabetical
+            // order on the code would break by putting `confirmed` between them.
+            SortBy::Status => {
+                matched.sort_by(|a, b| by(status_key(a.status).cmp(&status_key(b.status)), a, b))
+            }
             // Enum order, not alphabetical on the code string — `grid::media_key` owns that rule.
             SortBy::Type => matched.sort_by(|a, b| {
                 by(

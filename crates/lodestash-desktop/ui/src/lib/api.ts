@@ -794,7 +794,11 @@ export const SORTS = [
   { id: "name", label: "Name" },
   { id: "type", label: "Type" },
   { id: "size", label: "Size" },
-  { id: "modified", label: "Date" },
+  { id: "modified", label: "Date modified" },
+  /** When Lodestash first indexed it — insert order, not the file's mtime. */
+  { id: "added", label: "Date added" },
+  /** Lifecycle order (DATA-MODEL §8), Unidentified first — the work sorts to the top. */
+  { id: "status", label: "Status" },
 ] as const;
 
 /** STATUS facet (UI-SPEC §0.2). `discovered`/`indexed` both read as Unidentified. */

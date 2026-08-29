@@ -785,9 +785,17 @@ facet-group owner call).
       — the card was the odd one out. `Card.svelte`'s own comment claimed size had "moved to the
       tier chip"; both rendered it.
 - [ ] **Icon sizes diverge** — nav 18 (DG 24), toolbar 14–16 (DG 20), type marks 28–40 (DG 32).
-- [ ] **Sort options** — SORTS = Relevance/Name/Type/Size/**Date**; DG also wants *Date added*
-      and *Status*. (Partly stale: "Date modified" shipped as `Date`.)
-- [ ] **No identify shimmer** on Unidentified→Identified (≤400ms, reduced-motion-gated).
+- [x] **Sort options — done 2026-08-29.** *Date added* (`asset.id`, which is insert order, so no
+      timestamp column was needed) and *Status* (lifecycle rank, Unidentified first — not the code
+      string, which would sort `confirmed` between `discovered` and `indexed`). Both
+      mutation-checked in e2e; the first version of that check was dead, because page 0 of this
+      library is all one status.
+- [x] **Identify shimmer — done 2026-08-29.** 400ms ring in the status colour on the
+      Unidentified → Identified edge only, driven off the status the card is handed (identification
+      is a catalog write the grid re-reads; there is no event to hang it on). Found and fixed
+      underneath it: the global `prefers-reduced-motion` block neutralised `transition-duration`
+      only, so any keyframe animation would have run at full length for someone who asked for less
+      motion.
       *(The other half of this card was stale, corrected 2026-08-28: there **is** a global
       `prefers-reduced-motion` block in `app.css` killing transitions and decorative transforms
       — it is not "one DropZone gate".)*

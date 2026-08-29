@@ -168,6 +168,20 @@ that changes state. **The grid is never what shrinks to make room for a control.
 - **Style:** 24×24 grid, **stroke-width 1.8**, round caps/joins, minimal fill.
   A faint **gem/diamond motif** ties the set to the theme (status gems, logo star).
 - **Sizes:** 16 (inline/rows), 20 (toolbar), 24 (nav), 32 (empty states).
+- **Glyphs are not the fallback for a missing icon — and they are not missing.** Several notes in
+  [`UI-SPEC.md`](UI-SPEC.md) (§1's ⌕, §15's ◉, §13.9's ⧉, §13.6's chain glyph) record a symbol being
+  dropped *because the bundled fonts render it as tofu*. **Measured in the running app on
+  2026-08-29, that premise is false**: rendering ⧉ ⌕ ◉ ⟡ ⊘ ↺ ⤷ ✕ ✓ ◆ ◇ ✦ ⤢ ⇢ ↧ ⚑ ⧗ ▶ ◼ ★ ✎ ⌗ at
+  26px in all three stacks (UI / mono / display) and comparing each bitmap against the `.notdef`
+  box produced **no misses** — a browser's last-resort fallback covers what Inter does not, and
+  there is no way to opt out of it. (A width comparison says otherwise and is wrong: plenty of real
+  glyphs share `.notdef`'s advance, which is how the claim survived.)
+
+  The **decisions stand** — those places use the sprite, and should: one icon system, scalable,
+  recolourable, consistent. But the *reason* is design, not capability. Do not drop a glyph on the
+  grounds that the font lacks it without re-measuring; that shortcut has already been copied into
+  four sections and three commit messages from a single mistaken reading.
+
 - **Color:** each icon's stroke is **baked as its theme-token hex** in the SVG source (the sprite has
   no viewer context to inherit from); an icon that must follow the surrounding text color swaps the
   baked hex for `currentColor` at the point of use.
@@ -439,8 +453,16 @@ import.
 A strip above the grid: a **⚑ Filters** button (opens the content-filter popover below; gold fill +
 count badge when any filter is active) · a **view toggle** (grid / list / detail) · a **grid-size
 selector** (Compact / Cozy / Large segmented control, grid only — the discrete-stop equivalent of a
-zoom slider, driving the single persisted `thumb_size`) · a **sort** dropdown (Name · Date added ·
-Date modified · Size · Type · Status) with an asc/desc caret. View, sort, and grid size **persist**
+zoom slider, driving the single persisted `thumb_size`) · a **sort** dropdown (Relevance · Name ·
+Type · Size · Date modified · Date added · Status) with an asc/desc caret.
+
+*(Date added and Status shipped 2026-08-29; the dropdown had offered neither. **Date added is
+`asset.id`** — the row is assigned its id on insert, so that ordering already *is* "when Lodestash
+first saw it", and a timestamp column would carry the same information at the cost of three hydrate
+queries and a struct field. **Status sorts by lifecycle rank**, not the code string: `discovered`
+and `indexed` both read as Unidentified to the user and must sort together, which alphabetical order
+would break by putting `confirmed` between them. Unidentified comes first — the point of the sort is
+to bring the work to the top.)* View, sort, and grid size **persist**
 (app config) so a library reopens the way you left it.
 
 ### Content filter popover (⚑ Filters)

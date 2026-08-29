@@ -19,6 +19,13 @@ pub enum SortBy {
     Type,
     Size,
     Modified,
+    /// When Lodestash first indexed it — **not** the file's mtime, which `Modified` already
+    /// sorts by. Ordered by `asset.id`, which is assigned on insert and therefore *is* that
+    /// order: a timestamp column would carry the same information and need three hydrate
+    /// queries, a struct field and a plumb to say it.
+    Added,
+    /// Lifecycle order (DATA-MODEL §8) — Unidentified first, so the work sorts to the top.
+    Status,
     Rating,
     /// BM25 match quality for the active Tags query (IDENTIFICATION-AND-SEARCH §5.A).
     /// Falls back to name order when no query is active.
@@ -31,7 +38,9 @@ impl SortBy {
         (SortBy::Name, "Name"),
         (SortBy::Type, "Type"),
         (SortBy::Size, "Size"),
-        (SortBy::Modified, "Date"),
+        (SortBy::Modified, "Date modified"),
+        (SortBy::Added, "Date added"),
+        (SortBy::Status, "Status"),
         (SortBy::Rating, "Rating"),
     ];
 

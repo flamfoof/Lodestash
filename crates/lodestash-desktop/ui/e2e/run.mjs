@@ -2127,6 +2127,50 @@ try {
     await page.keyboard.press("Escape");
   });
 
+  await check("Date added and Status are real orderings, not labels", async () => {
+    // DESIGN-GUIDELINES §7 asked for both and neither existed. They are cheap to fake — a select
+    // option that changes nothing looks identical until you read the grid — so this asserts the
+    // order actually changes and matches what the sort claims.
+    const q = (sort_by) => ({
+      tab: "all", search: "", status: "all", sort_by, sort_asc: true,
+      // The whole library, not a page: page 0 of a name-ordered library is all one status
+      // here (7,667 of 8,237 are Unidentified), which makes every ordering assertion below
+      // trivially true and the check dead. Proven by mutation — an inert Status sort passed
+      // the paged version.
+      favorites_only: false, page: 0, page_size: 100000,
+    });
+    const added = await invoke("grid_page", { query: q("added") });
+    assert.ok(added.items.length > 1, "not enough assets to order");
+    const ids = added.items.map((i) => i.asset_id);
+    assert.deepEqual(
+      ids,
+      [...ids].sort((a, b) => a - b),
+      "Date added must be insert order — that is what asset id means here",
+    );
+
+    const byStatus = await invoke("grid_page", { query: q("status") });
+    const rank = { discovered: 0, indexed: 1, identified: 2, confirmed: 3 };
+    const ranks = byStatus.items.map((i) => rank[i.status] ?? 9);
+    assert.deepEqual(
+      ranks,
+      [...ranks].sort((a, b) => a - b),
+      "Status must sort by lifecycle, so the unidentified work comes first",
+    );
+    // …and it must be a different order from name, or it is not sorting at all.
+    const byName = await invoke("grid_page", { query: q("name") });
+    assert.ok(
+      new Set(byStatus.items.map((i) => i.status)).size > 1,
+      "every asset shares one status — this check cannot see whether the sort works",
+    );
+    {
+      assert.notDeepEqual(
+        byStatus.items.map((i) => i.asset_id),
+        byName.items.map((i) => i.asset_id),
+        "Status ordering is identical to Name — the sort is inert",
+      );
+    }
+  });
+
   await check("Settings storage says what the workspace actually holds", async () => {
     // The three STORAGE CAPS controls were inert until 2026-08-29: loaded from config, written
     // back to config, read by nothing. The workspace grew to 3.55 GB across 1,179 folders that no

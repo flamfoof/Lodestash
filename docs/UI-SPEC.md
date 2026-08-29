@@ -322,8 +322,18 @@ The browse-everything grid. Composition top→bottom:
      mini-waveform (slate when Unidentified, aqua otherwise); while that card is the active audio,
      an inline scrubber + mono time readout appears. One asset plays at a time (§13.2).
    - **Unidentified cards**: thumbnail at 30% opacity + grayscale behind a large slate mono `?`;
-     chips replaced by a single `???` chip. The **identify shimmer** (gold sweep, ~0.6s) plays when
-     an asset flips to Identified (respects reduced-motion by flipping instantly).
+     chips replaced by a single `???` chip. The **identify shimmer** plays when an asset flips to
+     Identified (respects reduced-motion by flipping instantly).
+
+     *(Shipped 2026-08-29 — **400ms**, not the 0.6s written here: it fires per card and a grid
+     that has just appraised a page has dozens going at once, where six-tenths of a second reads
+     as the grid stuttering rather than as one card reporting. A ring in the status colour rather
+     than a sweep across the card, for the same reason. Driven off the status the card is handed,
+     not off an event: identification lands as a catalog write the grid re-reads, so there is no
+     click to hang it on. Only the Unidentified → Identified edge fires — a re-identify queueing
+     an asset back to `indexed` is not an accomplishment. Reduced motion is honoured globally, and
+     that block **had to be fixed to honour it**: it neutralised `transition-duration` only, so a
+     keyframe animation would have played in full for someone who asked for less motion.)*
    - **List rows** (32–38px, zebra): thumb 26px · type diamond · name · pack (link) · size badge ·
      stats · status gem+label · ⤢ · stage. Same selection/ring behavior.
    - Selected card/row: 2px gold ring. Confirmed cards: faint 1px gold ring at rest.
@@ -805,7 +815,9 @@ Selected, one asset — top→bottom:
    uses this asset) and the linked name; clicking a row selects that asset in the grid, and when
    the current filter hides it, a toast says so rather than silently doing nothing. A `missing`
    edge rendered `✕ missing` and nothing else. Glyphs are limited to ◆/◇/• because the bundled
-   text fonts have no chain glyph — see §15's dropped ◉.)*
+   text fonts have no chain glyph — see §15's dropped ◉, and the correction in
+   [`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §5: the glyphs are **not** missing, the sprite is
+   simply the icon system.)*
 
    *(Completed 2026-08-29. The **four row states** ship — `same_pack` on `related_assets` answers
    ✓ vs ⤷, and that is not decoration: a dependency inside the pack travels with it, while one
@@ -908,6 +920,11 @@ has been measured yet (DATA-MODEL §14: unknown, not zero). Not yet: the license
 (needs the license harvest + `import_record` join) and TAGS, which shows the empty state above
 until P4 tagging. The spec's ◉ prefix is dropped for now: the bundled text fonts have no glyph
 for it and it renders as tofu — it returns with the icon sprite, DESIGN-GUIDELINES §5.)*
+
+> **The tofu premise was wrong** (measured 2026-08-29 — see
+> [`DESIGN-GUIDELINES.md`](DESIGN-GUIDELINES.md) §5). ◉, ⌕ and ⧉ all render. The sprite is still
+> the right call for these — one icon system, scalable, themeable — but "the font cannot show it"
+> is not the reason, and must not be cited as one for the next glyph.
 
 ---
 

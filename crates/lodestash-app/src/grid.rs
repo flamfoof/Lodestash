@@ -108,6 +108,16 @@ pub fn sort_indices<T>(
         SortBy::Modified => {
             idxs.sort_by(|&a, &b| dir(entries[a].file.mtime.cmp(&entries[b].file.mtime), asc))
         }
+        // The Tauri grid owns these two (`Library::page`): they read `asset.id` and the
+        // lifecycle rank, neither of which this pre-catalog entry list carries. Sorting
+        // by id here would order by *scan* order, which is not the same thing, so they
+        // fall back to name rather than quietly meaning something else.
+        SortBy::Added | SortBy::Status => {
+            let keys: Vec<String> = idxs.iter().map(|&i| name_key(&entries[i])).collect();
+            let mut paired: Vec<(usize, usize)> = idxs.iter().copied().zip(0..).collect();
+            paired.sort_by(|&(_, ka), &(_, kb)| dir(keys[ka].cmp(&keys[kb]), asc));
+            *idxs = paired.into_iter().map(|(i, _)| i).collect();
+        }
         // Unrated sorts as 0 so rated assets lead when descending (the common use).
         SortBy::Rating => idxs.sort_by(|&a, &b| {
             dir(

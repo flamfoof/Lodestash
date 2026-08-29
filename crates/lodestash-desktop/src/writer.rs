@@ -2282,12 +2282,23 @@ fn materialize_extract(
     cancelled: bool,
 ) -> Result<WriteResult, String> {
     let extracted = outcome?;
+    // `workspace_rel` is **relative to the workspace dir** — that is what the column's own doc
+    // promises and what `crawl_records_in_workspace` writes. This path stored the extractor's
+    // absolute `workspace_path` verbatim, so the column held two different formats depending on
+    // which pass wrote the row. It survived only because `Path::join` with an absolute path
+    // *replaces* on Windows, making the wrong form accidentally resolve — until the cache dir
+    // moves, at which point every extracted row points at a directory that no longer exists.
+    let workspace = default_cache_dirs().1;
     let pairs: Vec<(String, String)> = extracted
         .iter()
         .filter_map(|a| {
+            let rel = workspace
+                .as_deref()
+                .and_then(|ws| a.workspace_path.strip_prefix(ws).ok())
+                .unwrap_or(a.workspace_path.as_path());
             a.pathname
                 .clone()
-                .map(|p| (p, a.workspace_path.to_string_lossy().into_owned()))
+                .map(|p| (p, rel.to_string_lossy().replace('\\', "/")))
         })
         .collect();
     let matched = catalog

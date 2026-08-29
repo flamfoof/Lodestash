@@ -210,11 +210,38 @@
   const SHOWN = 3;
   let chips = $derived(item.traits.slice(0, SHOWN));
   let overflow = $derived(Math.max(0, item.traits.length - SHOWN));
+
+  /**
+   * The identify shimmer (UI-SPEC §2.5): a card that has *just* stopped being Unidentified says
+   * so once, briefly, then settles.
+   *
+   * Driven off the status the card is handed, not off an event, because identification lands as a
+   * catalog write the grid re-reads — there is no click to hang an animation on. Only the
+   * Unidentified → identified edge fires; the reverse (a re-identify queueing an asset back to
+   * `indexed`) is not an accomplishment to celebrate. Reduced motion is handled globally in
+   * `app.css`, which now covers animations and not only transitions.
+   */
+  let justIdentified = $state(false);
+  // Seeded on the effect's first run, not at init: reading a `$derived` here would capture
+  // only its initial value, and a card that mounts already identified must not shimmer.
+  let wasUnidentified: boolean | undefined;
+  let shimmerTimer: ReturnType<typeof setTimeout> | undefined;
+  $effect(() => {
+    const now = unidentified;
+    if (wasUnidentified === true && !now) {
+      justIdentified = true;
+      clearTimeout(shimmerTimer);
+      shimmerTimer = setTimeout(() => (justIdentified = false), 400);
+    }
+    wasUnidentified = now;
+    return () => clearTimeout(shimmerTimer);
+  });
 </script>
 
 <button
   class="card"
   class:identified={!unidentified}
+  class:justIdentified
   class:confirmed
   class:unidentified
   class:selected
@@ -523,6 +550,19 @@
 </button>
 
 <style>
+  /* §2.5's identify shimmer: one 400ms sweep in the status colour, then gone. */
+  @keyframes ls-identify-shimmer {
+    from {
+      box-shadow: 0 0 0 0 color-mix(in srgb, var(--ls-status-identified) 55%, transparent);
+    }
+    to {
+      box-shadow: 0 0 0 10px transparent;
+    }
+  }
+  .card.justIdentified {
+    animation: ls-identify-shimmer 400ms ease-out 1;
+  }
+
   .card {
     display: flex;
     flex-direction: column;

@@ -121,6 +121,11 @@ button {
   *::after {
     transition-duration: 0.01ms !important;
     transition-delay: 0ms !important;
+    /* Keyframe animations too — the block covered transitions only, so an @keyframes ran
+       at full length for someone who had asked for less motion. */
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
     scroll-behavior: auto !important;
   }
 
