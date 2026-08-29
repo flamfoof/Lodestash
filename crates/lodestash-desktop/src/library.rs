@@ -13,6 +13,7 @@ use lodestash_app::grid;
 use lodestash_app::types::{Category, ContentFilter, StatusFilter, TriBucket};
 use lodestash_core::catalog::{AppraiseFocus, Catalog, TagAssignment};
 use lodestash_core::types::{AssetStatus, MediaType};
+use lodestash_core::vector::{BruteForceIndex, VectorIndex};
 use serde::{Deserialize, Serialize};
 
 /// One asset as the grid needs it. Carries a `preview_key`, never bytes — the frontend fetches
@@ -659,6 +660,16 @@ pub struct Library {
     ai_embedder: std::sync::Mutex<
         Option<std::sync::Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
     >,
+    /// The similarity index behind UI-SPEC §13.8, keyed by embedding model and built on first
+    /// use — same shape as `ai_embedder` above, and for the same reason.
+    ///
+    /// ponytail: brute force over every embedding, held in memory, rebuilt only on `reload`.
+    /// On this library that is ~6,400 vectors × 768 f32 ≈ 20 MB and a few ms per query. It is
+    /// cached because the Inspector asks on **every selection change**: rebuilding per click
+    /// would re-read every embedding out of SQLite to answer one panel. Swap in a real ANN index
+    /// (TECH-STACK §6 lists `sqlite-vec`/LanceDB) if a library ever makes the scan itself the
+    /// cost rather than the load.
+    similar_index: std::sync::Mutex<HashMap<String, std::sync::Arc<BruteForceIndex>>>,
 }
 
 struct Row {
@@ -723,6 +734,7 @@ impl Library {
                         .size_tiers
                         .normalized(),
                     ai_embedder: Default::default(),
+                    similar_index: Default::default(),
                 };
                 lib.reload();
                 lib
@@ -744,11 +756,17 @@ impl Library {
             paths: HashMap::new(),
             tiers: SizeTiers::default(),
             ai_embedder: Default::default(),
+            similar_index: Default::default(),
         }
     }
 
     /// Re-read sources and their assets from the catalog.
     pub fn reload(&mut self) {
+        // The similarity index is a snapshot of the embeddings; a reload means new rows, new
+        // embeddings, or both, so drop it rather than answering §13.8 out of a stale one.
+        if let Ok(mut cache) = self.similar_index.lock() {
+            cache.clear();
+        }
         // Size tiers feed the S/M/L/XL badges and the ⚑ size facet; they come from config, which
         // Settings edits — re-read here so a change lands without a restart (the grid never holds
         // a second copy to go stale).
@@ -2100,6 +2118,59 @@ impl Library {
             .collect()
     }
 
+    /// "More like this" (UI-SPEC §13.8) — the nearest neighbours of an asset in its own
+    /// embedding space, best first, excluding itself.
+    ///
+    /// **This panel used to render the asset's dependency edges** under a SIMILAR heading — the
+    /// same rows LINKED FILES showed directly above it. §13.8 asks for shared tags "backed by
+    /// `find_similar` (embeddings) once available"; tags reach 24 of 8,237 assets here while
+    /// embeddings reach 6,807, so the tag half would be empty almost everywhere and this is the
+    /// half worth having.
+    ///
+    /// Empty when the asset has no embedding — a library that has not been encoded yet is not an
+    /// error, it simply has no neighbours. Trashed rows are excluded by `embeddings_for_knn`'s
+    /// own `deleted_at IS NULL`, and again here, because a row can be trashed after the index was
+    /// built and the index is held until `reload`.
+    pub fn similar_assets(&self, asset_id: i64, limit: usize) -> Vec<GridItem> {
+        let Some(cat) = self.catalog.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(Some((model_id, query))) = cat.embedding_of(asset_id) else {
+            return Vec::new();
+        };
+        let index = {
+            let mut cache = match self.similar_index.lock() {
+                Ok(c) => c,
+                Err(_) => return Vec::new(),
+            };
+            match cache.get(&model_id) {
+                Some(idx) => idx.clone(),
+                None => {
+                    let Ok(items) = cat.embeddings_for_knn(&model_id, None) else {
+                        return Vec::new();
+                    };
+                    let idx = std::sync::Arc::new(BruteForceIndex::new(items));
+                    cache.insert(model_id.clone(), idx.clone());
+                    tracing::debug!(model = %model_id, vectors = idx.len(), "similarity index built");
+                    idx
+                }
+            }
+        };
+        let live: HashMap<i64, &Row> = self
+            .rows
+            .iter()
+            .filter(|r| !r.trashed)
+            .map(|r| (r.item.asset_id, r))
+            .collect();
+        index
+            .knn(&query, limit + 1)
+            .into_iter()
+            .filter(|(id, _)| *id != asset_id)
+            .filter_map(|(id, _)| live.get(&id).map(|r| r.item.clone()))
+            .take(limit)
+            .collect()
+    }
+
     /// How many of a pack's recorded entries a candidate archive accounts for, by GUID
     /// (UI-SPEC §15 Retarget…). `None` when there is no catalog.
     pub fn retarget_match(&self, package_id: i64, guids: &[String]) -> Option<(usize, usize)> {
@@ -2471,6 +2542,7 @@ mod tests {
             paths: HashMap::new(),
             tiers: SizeTiers::default(),
             ai_embedder: Default::default(),
+            similar_index: Default::default(),
         }
     }
 

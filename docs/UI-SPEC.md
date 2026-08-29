@@ -824,8 +824,22 @@ Selected, one asset — top→bottom:
    `declared_path` forms); until then ⊘ is the honest action, and it is reversible.)*
 
 7. **COLLECTIONS**: toggle chips (`+ name` / `✓ name` gold) — membership per §6.
-8. **SIMILAR IN YOUR HOARD**: top 3 by shared tags + same-type bonus (thumb + name + pack, → that
-   asset). Backed by `find_similar` (embeddings) once available.
+8. **SIMILAR IN YOUR HOARD**: top 3 (thumb + name + pack, → that asset).
+
+   *(Shipped 2026-08-29, and it is **embeddings, not shared tags**. The spec offered tags with
+   "backed by `find_similar` (embeddings) once available" as the upgrade; the embeddings arrived
+   first, and on a real library the tag half cannot work — 24 of 8,237 assets carry a tag against
+   6,807 carrying an embedding, so a tag ranking would render this panel empty almost everywhere.
+   Cosine KNN in the asset's own embedding space, self excluded, trashed rows excluded.
+
+   The index is built once per embedding model and held in `Library`, dropped on reload: this
+   panel fires on **every selection change**, and rebuilding per click would re-read every
+   embedding out of SQLite to answer it — measured 221 ms cold against ~47 ms warm here. Brute
+   force is deliberate at this size (`TECH-STACK.md` §6 has `sqlite-vec`/LanceDB for when the
+   scan itself becomes the cost rather than the load).
+
+   Before this the panel drew the asset's **dependency edges** — the same rows LINKED FILES shows
+   directly above it — under a SIMILAR heading.)*
 9. **Provenance footer**: `Source · <library · pack>` (pack → Pack stats), `License · <effective
    license>` (asset → package fallback, DATA-MODEL §9), and when imported: verdant
    `✓ imported in <project> → <dest>/`.

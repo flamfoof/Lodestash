@@ -331,6 +331,13 @@ export type RelatedAsset = {
 export const relatedAssets = (assetId: number) => invoke<RelatedAsset[]>("related_assets", { assetId });
 
 /**
+ * "More like this" (UI-SPEC §13.8) — nearest neighbours in the asset's own embedding space,
+ * best first. Empty when the asset has no embedding yet.
+ */
+export const similarAssets = (assetId: number, limit = 3) =>
+  invoke<GridItem[]>("similar_assets", { assetId, limit });
+
+/**
  * Storage (UI-SPEC §11.4). Two stores, two policies: previews are disposable and capped,
  * extracted packs are per-pack and chosen.
  */

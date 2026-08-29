@@ -101,13 +101,13 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       disk file that resolves it (UI-SPEC §13.6 records the reasoning). *Still open:* no
       in-archive provenance block (Path-in-package / Package ⧉-copy rows). *(card ★ was stale —
       it is a control, corrected 2026-08-27.)*
-- [ ] **SIMILAR is not similarity (UI-SPEC §13.8).** The panel draws the *dependency* edges — the
-      same rows LINKED FILES shows directly above it. §13.8 asks for top-3 by shared tags with a
-      same-type bonus, "backed by `find_similar` (embeddings) once available"; embeddings now
-      exist (`asset_embedding`, 6,395 SigLIP + 412 CLAP rows on the reference library) and
-      `Engine::similar` already does the cosine KNN, so the real version is a wiring job. Watch
-      the cost: a brute-force index rebuilt per selection reads every embedding, so it wants
-      caching in `Library` invalidated on reload, not a rebuild per Inspector click.
+- [x] **SIMILAR is real similarity — done 2026-08-29.** `Library::similar_assets` does cosine KNN
+      in the asset's own embedding space, self and trashed excluded, top 3 with thumb + name +
+      pack. **Embeddings, not the shared tags §13.8 first asked for**: 24 of 8,237 assets carry a
+      tag against 6,807 carrying an embedding, so a tag ranking would be empty almost everywhere
+      (recorded in §13.8). The index is built once per model and held in `Library`, cleared on
+      `reload` — 221 ms cold, ~47 ms warm on this library; a rebuild per selection would re-read
+      every embedding out of SQLite to answer one panel.
 - [x] **Duplicates — exact hash wired (2026-08-08).** The crawl now BLAKE3s browseable files
       (`CrawledFile.hash` → `CrawlRecord.content_hash` → `asset.content_hash` on insert) — the
       Duplicates screen's groups are real. `needs_rehash` (size/mtime-gated re-hash for

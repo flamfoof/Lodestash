@@ -13,6 +13,7 @@
     statusLabel,
     bulkTag,
     relatedAssets,
+    similarAssets,
     setLinkIgnored,
     collections,
     collectionMembers,
@@ -21,6 +22,7 @@
     type AssetDetail,
     type CompareRow,
     type RelatedAsset,
+    type GridItem,
     type CollectionRow,
   } from "./api";
   import { view } from "./nav.svelte";
@@ -254,6 +256,7 @@
   $effect(() => {
     const id = assetId;
     related = null;
+    similar = [];
     collectionsRows = [];
     sessionTags = [];
     memberIds = {};
@@ -267,6 +270,13 @@
     view.dataVersion;
     if (id == null) return;
     let stale = false;
+    similarAssets(id, 3)
+      .then((s) => {
+        if (!stale) similar = s;
+      })
+      .catch(() => {
+        if (!stale) similar = [];
+      });
     relatedAssets(id)
       .then((r) => {
         if (!stale) related = r;
@@ -369,8 +379,14 @@
     (related ?? []).filter((r) => r.state !== "ignored" && r.asset_id == null).length,
   );
 
-  /** See the panel's comment: dependency edges standing in for §13.8, minus the unresolved. */
-  let similarish = $derived((related ?? []).filter((r) => r.asset_id != null));
+  /**
+   * §13.8 — the real thing now: nearest neighbours in the asset's own embedding space, not the
+   * dependency edges this panel used to repeat from LINKED FILES directly above it.
+   *
+   * The index is built once and held in `Library` (see `similar_assets`), because this fires on
+   * every selection change and a rebuild per click would re-read every embedding out of SQLite.
+   */
+  let similar = $state<GridItem[]>([]);
 
   /** The edge a write is in flight for, so its button cannot be double-fired. */
   let linkBusy = $state<number | null>(null);
@@ -674,26 +690,37 @@
     </section>
 
     <!--
-      NOT §13.8. This panel is still drawing the *dependency* edges under a "SIMILAR" heading —
-      the same rows LINKED FILES shows directly above it. §13.8 asks for top-3 by shared tags
-      with a same-type bonus, "backed by `find_similar` (embeddings) once available"; embeddings
-      now exist (6,395 SigLIP rows on the reference library), so the real version is buildable and
-      is its own card. Until then it at least stops repeating unresolved rows, which are not
-      similar assets by any reading.
+      §13.8 "SIMILAR IN YOUR HOARD": top 3 by embedding distance, each with its thumb, name and
+      pack, clicking through to that asset.
+
+      Until 2026-08-29 this drew the *dependency* edges — the same rows LINKED FILES shows
+      directly above it — under a SIMILAR heading. The spec says "backed by `find_similar`
+      (embeddings) once available", and they are: 6,807 of 8,237 assets carry one, against 24
+      that carry a tag, so the embedding half is the one that answers.
     -->
-    {#if similarish.length > 0}
+    {#if similar.length > 0}
       <section class="panel" data-testid="inspector-similar">
         <h3>SIMILAR</h3>
-        <ul class="links">
-          {#each similarish as r, i (r.edge_id)}
+        <ul class="simlist">
+          {#each similar as s, i (s.asset_id)}
             <li>
               <button
-                class="link"
-                onclick={() => pick(r.asset_id)}
-                title={`${r.kind} · ${r.state}`}
+                class="simrow"
+                onclick={() => pick(s.asset_id)}
+                title={s.rel_path}
                 data-testid="inspector-similar-{i}"
               >
-                <span class="nm">{relLabel(r)}</span>
+                <img
+                  class="simthumb"
+                  src={thumbUrl(s.asset_id)}
+                  alt=""
+                  loading="lazy"
+                  draggable="false"
+                />
+                <span class="simtext">
+                  <span class="nm">{s.name}</span>
+                  {#if s.package}<span class="simpack">{s.package}</span>{/if}
+                </span>
               </button>
             </li>
           {/each}
@@ -1370,6 +1397,55 @@
     margin: var(--sp-2) 0 0;
     font-size: var(--fs-xs);
     color: var(--ls-warning);
+  }
+
+  /* SIMILAR (§13.8) — thumb + name + pack, click through to that asset. */
+  .simlist {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-1);
+  }
+  .simrow {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    width: 100%;
+    padding: 3px var(--sp-2);
+    text-align: left;
+    font: inherit;
+    font-size: var(--fs-sm);
+    color: var(--ls-text);
+    background: var(--ls-overlay);
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-sm);
+    cursor: pointer;
+  }
+  .simrow:hover {
+    border-color: var(--ls-gold);
+  }
+  .simthumb {
+    flex: none;
+    width: 28px;
+    height: 28px;
+    object-fit: cover;
+    border-radius: var(--r-sm);
+    background: var(--ls-bg);
+  }
+  .simtext {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .simpack {
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   /* COLLECTIONS — `+ name` / `✓ name` toggle chips, gold when the asset is in. */

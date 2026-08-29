@@ -2023,6 +2023,61 @@ try {
     await page.keyboard.press("Escape");
   });
 
+  await check("SIMILAR shows neighbours, not the dependency list again", async () => {
+    // §13.8. Until 2026-08-29 this panel drew the *dependency* edges — the same rows LINKED FILES
+    // shows directly above it — under a SIMILAR heading. It is embeddings now (6,807 of 8,237
+    // assets carry one here, against 24 carrying a tag), with the index cached in `Library`
+    // because this fires on every selection change.
+    const p = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    let found = null;
+    for (const item of p.items.slice(0, 40)) {
+      const sim = await invoke("similar_assets", { assetId: item.asset_id, limit: 3 });
+      if (sim.length > 0) { found = { item, sim }; break; }
+    }
+    // Not an early return: most of this library is encoded, so finding nothing in forty assets
+    // means the embedding read is broken, not that the library is unencoded.
+    assert.ok(found, "no asset in the first 40 has any neighbour — is the index reading anything?");
+
+    assert.ok(found.sim.length <= 3, "§13.8 asks for top 3");
+    assert.ok(
+      !found.sim.some((s) => s.asset_id === found.item.asset_id),
+      "an asset is its own nearest neighbour — self must be dropped",
+    );
+    // The old bug in one assertion: neighbours are not the asset's dependency edges.
+    const edges = await invoke("related_assets", { assetId: found.item.asset_id });
+    const edgeIds = new Set(edges.map((e) => e.asset_id).filter((x) => x != null));
+    if (edgeIds.size > 0) {
+      assert.notDeepEqual(
+        found.sim.map((s) => s.asset_id),
+        [...edgeIds].slice(0, found.sim.length),
+        "SIMILAR is repeating LINKED FILES",
+      );
+    }
+
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.fill('[data-testid="search-input"]', found.item.name);
+    await page.waitForFunction(
+      (id) => !!document.querySelector(`.card[data-asset-id="${id}"]`),
+      found.item.asset_id,
+      { timeout: 5000 },
+    );
+    await page.locator(`.card[data-asset-id="${found.item.asset_id}"]`).click();
+    await page.waitForSelector('[data-testid="inspector-similar-0"]', { timeout: 5000 });
+    const shown = await page.$$eval('[data-testid^="inspector-similar-"]', (els) =>
+      els.map((e) => e.textContent.replace(/\s+/g, " ").trim()),
+    );
+    assert.equal(shown.length, found.sim.length, "the panel and the command disagree on how many");
+    assert.ok(
+      shown[0].includes(found.sim[0].name),
+      `the panel's first row is not the nearest neighbour: ${shown[0]}`,
+    );
+    await page.fill('[data-testid="search-input"]', "");
+    await page.keyboard.press("Escape");
+  });
+
   await check("Settings storage says what the workspace actually holds", async () => {
     // The three STORAGE CAPS controls were inert until 2026-08-29: loaded from config, written
     // back to config, read by nothing. The workspace grew to 3.55 GB across 1,179 folders that no

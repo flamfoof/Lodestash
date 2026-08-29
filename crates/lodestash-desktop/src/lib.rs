@@ -342,6 +342,23 @@ fn set_favorite(
     state.write(Op::SetFavorite { ids: asset_ids, on })
 }
 
+/// "More like this" (UI-SPEC §13.8) — nearest neighbours in the asset's own embedding space.
+///
+/// Read-only, and empty when the asset has no embedding: a library that has not been encoded yet
+/// is not an error, it just has no neighbours.
+#[tauri::command]
+fn similar_assets(
+    state: tauri::State<'_, AppState>,
+    asset_id: i64,
+    limit: Option<usize>,
+) -> Result<Vec<crate::library::GridItem>, String> {
+    state
+        .library
+        .lock()
+        .map(|l| l.similar_assets(asset_id, limit.unwrap_or(3)))
+        .map_err(|_| "library lock poisoned".to_string())
+}
+
 /// What a workspace reclaim would remove, without removing it (UI-SPEC §11.4).
 ///
 /// Always a dry run. The button that calls it reports the size first, because the sweep deletes
@@ -2160,6 +2177,7 @@ pub fn run() {
             reload_library,
             set_favorite,
             set_link_ignored,
+            similar_assets,
             workspace_usage,
             reclaim_workspace,
             workspace_packs,
