@@ -304,15 +304,29 @@ export const setPackagePinned = (id: number, pinned: boolean) =>
 
 /** One related asset (DATA-MODEL §10): a dependency edge endpoint from the inspector's view. */
 export type RelatedAsset = {
+  /** `asset_relationship.id` — what ⊘ Ignore acts on (UI-SPEC §13.6). */
+  edge_id: number;
   outbound: boolean;
   kind: string;
+  /** `resolved` | `missing` | `ignored`. */
   state: string;
   declared_path: string | null;
   asset_id: number | null;
   name: string | null;
+  media_code: string | null;
+  /**
+   * §13.6's **✓ in pack** vs **⤷ in library**: is the other end in the *same* package?
+   * `null` when the edge resolves to nothing. A cross-pack dependency is what ENGINE-API §5.5
+   * flags — Unity reassigns GUIDs per import, so that reference will not survive the trip.
+   */
+  same_pack: boolean | null;
 };
 
 export const relatedAssets = (assetId: number) => invoke<RelatedAsset[]>("related_assets", { assetId });
+
+/** ⊘ Ignore / ↺ restore one dependency edge (UI-SPEC §13.6). Muted, not deleted — reversible. */
+export const setLinkIgnored = (edgeId: number, ignored: boolean) =>
+  invoke<WriteResult>("set_link_ignored", { edgeId, ignored });
 
 /** The staging tray (I6) — in-memory ids, order-preserving. */
 /**

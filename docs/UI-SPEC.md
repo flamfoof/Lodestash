@@ -773,19 +773,32 @@ Selected, one asset — top→bottom:
    caption notes the parse source (`parsed from FBX bindings` / `.mtl sidecar` / `.meta GUID refs`);
    rows: kind glyph (◇ material violet / ▦ texture sapphire, textures indented) + mono name +
    state: **✓ in pack** (verdant) · **⤷ in library** (arcane; click opens that asset) ·
-   **✕ missing** (red). Missing rows expand a **relink panel**: declared path, name-match
-   suggestions from the library (`NN% · use →`), **⌕ Browse disk…**, **⊘ Ignore link** (drops the
-   edge). Footer warning when any missing: *"✕ missing links are skipped on export — click one to
-   relink."* (⚖ requires the unresolved-reference delta, §20.)
+   **✕ missing** (red) · **⊘ ignored** (dim). Unresolved rows expand a **relink panel**: the
+   declared reference and **⊘ Ignore link** / **↺ Restore link**. Footer warning when any missing.
+   (⚖ requires the unresolved-reference delta, §20.)
 
    *(Shipped 2026-07-22: the read-only panel — caption `parsed from .meta GUID refs · prefab
    bindings`, one row per edge with a type glyph, direction arrow (`→` this asset uses it, `←` it
    uses this asset) and the linked name; clicking a row selects that asset in the grid, and when
    the current filter hides it, a toast says so rather than silently doing nothing. A `missing`
-   edge renders `✕ missing · <declared GUID>` with the export-skip warning under the list. Not yet:
-   the relink panel (name-match suggestions, ⌕ Browse disk…, ⊘ Ignore link) and the `in pack` vs
-   `in library` distinction — both need the §20 unresolved-reference delta. Glyphs are limited to
-   ◆/◇/• because the bundled text fonts have no chain glyph — see §15's dropped ◉.)*
+   edge rendered `✕ missing` and nothing else. Glyphs are limited to ◆/◇/• because the bundled
+   text fonts have no chain glyph — see §15's dropped ◉.)*
+
+   *(Completed 2026-08-29. The **four row states** ship — `same_pack` on `related_assets` answers
+   ✓ vs ⤷, and that is not decoration: a dependency inside the pack travels with it, while one
+   resolving across packs is what [`ENGINE-API.md`](ENGINE-API.md) §5.5 flags, since Unity
+   reassigns GUIDs per import. The **relink panel** ships showing the declared reference and
+   ⊘ Ignore / ↺ Restore, and the export-skip warning — which this note claimed was already there
+   and was not — now exists and stops counting ignored rows.*
+
+   ***Narrowed:*** *name-match suggestions (`NN% · use →`) and ⌕ Browse disk… are **not
+   implementable as specified**, and are dropped rather than faked. Every edge in the harvest
+   declares a **GUID**, not a path — `unity_meta` and `unity_prefab` are the only sources, and both
+   record the referenced GUID in `declared_path`. A GUID has no name to match against the library,
+   and no file chosen off disk resolves it, because what makes an asset the right target is its own
+   `.meta` GUID, not where it sits. They become buildable the day an edge is declared by path (an
+   `.mtl` sidecar or an FBX binding, [`DATA-MODEL.md`](DATA-MODEL.md) §10 lists both as intended
+   `declared_path` forms); until then ⊘ is the honest action, and it is reversible.)*
 
 7. **COLLECTIONS**: toggle chips (`+ name` / `✓ name` gold) — membership per §6.
 8. **SIMILAR IN YOUR HOARD**: top 3 by shared tags + same-type bonus (thumb + name + pack, → that
@@ -979,8 +992,13 @@ in the owning doc** (same-change rule):
 6. **Identify profiles** — presentation tiers bind to AI-MODELS-BY-GPU model sets; cloud steps only
    under per-modality cloud opt-in. Prototype model names are placeholders.
 7. **Unresolved dependencies** — `asset_relationship` gains an unresolved form: `to_asset_id`
-   nullable + `declared_path TEXT` + `state ('resolved'|'library'|'missing')` so the Linked-Files
-   UI (ok / in library / missing + relink/ignore) has backing rows. *(DATA-MODEL §10 updated.)*
+   nullable + `declared_path TEXT` + `state` so the Linked-Files UI (ok / in library / missing +
+   relink/ignore) has backing rows. **Amended 2026-08-29:** the state enum is
+   `('resolved'|'missing'|'ignored')`, not `'library'` — whether a resolved edge is *in pack* or
+   *in library* is a fact about the two ends' packages, derived per query (`same_pack`), not a
+   state an edge can be stored in; it would go stale the moment either end moved. `'ignored'`
+   replaces it, carrying §13.6's ⊘ mute, which must be a state rather than a `DELETE` because
+   `record_dependencies` re-derives a harvest wholesale. *(DATA-MODEL §10 updated.)*
 8. **Traits** — `tag` gains `scope`, `usage_note`, `teach`, `icon` (color exists); teaching traits
    are injected into the identifier vocabulary. Trait Library supersedes the bare "Tag manager"
    naming; mapping library unchanged. *(DATA-MODEL §2 note + AI-PIPELINE §6 updated.)*

@@ -13,6 +13,7 @@
     statusLabel,
     bulkTag,
     relatedAssets,
+    setLinkIgnored,
     collections,
     collectionMembers,
     collectionAddAsset,
@@ -26,6 +27,7 @@
   import { traitColor } from "./traits.svelte";
   import { sources } from "./sources.svelte";
   import { player, fmtClock } from "./audio.svelte";
+  import { push } from "./toasts.svelte";
 
   /**
    * The staging tray, through the same context the cards use (App.svelte `setContext("ls:staging")`).
@@ -348,6 +350,43 @@
   function relLabel(r: RelatedAsset): string {
     return r.name ?? r.declared_path ?? "(unresolved)";
   }
+
+  /**
+   * UI-SPEC §13.6's four row states. `in pack` vs `in library` is not cosmetic: a dependency
+   * inside the same package travels with it, while one that resolves across packs is exactly
+   * what ENGINE-API §5.5 flags, because Unity reassigns GUIDs on import.
+   */
+  function linkState(r: RelatedAsset): { label: string; cls: string } {
+    if (r.state === "ignored") return { label: "⊘ ignored", cls: "ignored" };
+    if (r.asset_id == null) return { label: "✕ missing", cls: "missing" };
+    return r.same_pack
+      ? { label: "✓ in pack", cls: "inpack" }
+      : { label: "⤷ in library", cls: "inlib" };
+  }
+
+  /** Ignored edges are muted, not broken, so they must not keep the export warning up. */
+  let missingCount = $derived(
+    (related ?? []).filter((r) => r.state !== "ignored" && r.asset_id == null).length,
+  );
+
+  /** See the panel's comment: dependency edges standing in for §13.8, minus the unresolved. */
+  let similarish = $derived((related ?? []).filter((r) => r.asset_id != null));
+
+  /** The edge a write is in flight for, so its button cannot be double-fired. */
+  let linkBusy = $state<number | null>(null);
+
+  async function toggleIgnored(r: RelatedAsset) {
+    linkBusy = r.edge_id;
+    try {
+      await setLinkIgnored(r.edge_id, r.state !== "ignored");
+      const id = assetId;
+      if (id != null) related = await relatedAssets(id);
+    } catch (e) {
+      push(String(e), "err");
+    } finally {
+      linkBusy = null;
+    }
+  }
 </script>
 
 {#if collapsed}
@@ -567,10 +606,11 @@
         <p class="hint">no linked files</p>
       {:else}
         <ul class="links">
-          {#each related as r, i (i)}
+          {#each related as r, i (r.edge_id)}
             <li>
               <button
                 class="link"
+                class:muted={r.state === "ignored"}
                 onclick={() => pick(r.asset_id)}
                 disabled={r.asset_id == null}
                 title={`${r.outbound ? "uses" : "used by"} · ${r.kind} · ${r.state}`}
@@ -578,11 +618,37 @@
               >
                 <span class="dir" class:out={r.outbound} aria-hidden="true">{r.outbound ? "→" : "←"}</span>
                 <span class="nm">{relLabel(r)}</span>
-                {#if r.asset_id == null}<span class="missing">✕ missing</span>{/if}
+                <span class="edgestate {linkState(r).cls}" data-testid="inspector-link-state-{i}">
+                  {linkState(r).label}
+                </span>
               </button>
+              <!-- §13.6's relink panel, narrowed to what a GUID-declared edge can honestly
+                   offer: the declaration itself, and ⊘ Ignore. Name-match suggestions and
+                   ⌕ Browse disk… are not implementable while every edge declares a GUID —
+                   there is no name to match and no disk file that would resolve it (§20.7). -->
+              {#if r.state === "missing" || r.state === "ignored"}
+                <div class="relink" data-testid="inspector-relink-{i}">
+                  {#if r.declared_path}
+                    <code class="declared" title="declared reference">{r.declared_path}</code>
+                  {/if}
+                  <button
+                    class="ghost"
+                    onclick={() => toggleIgnored(r)}
+                    disabled={linkBusy === r.edge_id}
+                    data-testid="inspector-link-ignore-{i}"
+                  >
+                    {r.state === "ignored" ? "↺ Restore link" : "⊘ Ignore link"}
+                  </button>
+                </div>
+              {/if}
             </li>
           {/each}
         </ul>
+        {#if missingCount > 0}
+          <p class="warn" data-testid="inspector-links-warning">
+            ✕ missing links are skipped on export — ignore one to stop being told.
+          </p>
+        {/if}
       {/if}
     </section>
 
@@ -607,21 +673,27 @@
       {/if}
     </section>
 
-    {#if related && related.length > 0}
+    <!--
+      NOT §13.8. This panel is still drawing the *dependency* edges under a "SIMILAR" heading —
+      the same rows LINKED FILES shows directly above it. §13.8 asks for top-3 by shared tags
+      with a same-type bonus, "backed by `find_similar` (embeddings) once available"; embeddings
+      now exist (6,395 SigLIP rows on the reference library), so the real version is buildable and
+      is its own card. Until then it at least stops repeating unresolved rows, which are not
+      similar assets by any reading.
+    -->
+    {#if similarish.length > 0}
       <section class="panel" data-testid="inspector-similar">
         <h3>SIMILAR</h3>
         <ul class="links">
-          {#each related as r, i (i)}
+          {#each similarish as r, i (r.edge_id)}
             <li>
               <button
                 class="link"
                 onclick={() => pick(r.asset_id)}
-                disabled={r.asset_id == null}
                 title={`${r.kind} · ${r.state}`}
                 data-testid="inspector-similar-{i}"
               >
                 <span class="nm">{relLabel(r)}</span>
-                {#if r.asset_id == null}<span class="missing">✕ missing</span>{/if}
               </button>
             </li>
           {/each}
@@ -1233,10 +1305,71 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .link .missing {
+  .link.muted {
+    opacity: 0.55;
+  }
+  /* §13.6's row state. Four values, four colours: in-pack is safe, in-library is the
+     cross-package case ENGINE-API §5.5 flags, missing is broken, ignored is muted by hand. */
+  .link .edgestate {
     flex: none;
     font-size: var(--fs-xs);
+    white-space: nowrap;
+  }
+  .link .edgestate.missing {
     color: var(--ls-danger);
+  }
+  .link .edgestate.inpack {
+    color: var(--ls-success);
+  }
+  .link .edgestate.inlib {
+    color: var(--ls-arcane);
+  }
+  .link .edgestate.ignored {
+    color: var(--ls-text-dim);
+  }
+
+  /* The relink panel under an unresolved row: what was declared, and the one action a
+     GUID-declared edge can honestly offer. */
+  .relink {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    padding: 3px var(--sp-2) 0 calc(var(--sp-2) + 18px);
+  }
+  .relink .declared {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--ff-mono);
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+    user-select: text;
+  }
+  .relink .ghost {
+    flex: none;
+    padding: 1px var(--sp-2);
+    font: inherit;
+    font-size: var(--fs-xs);
+    color: var(--ls-text-dim);
+    background: transparent;
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-sm);
+    cursor: pointer;
+  }
+  .relink .ghost:hover:not(:disabled) {
+    color: var(--ls-text);
+    border-color: var(--ls-gold);
+  }
+  .relink .ghost:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .links + .warn {
+    margin: var(--sp-2) 0 0;
+    font-size: var(--fs-xs);
+    color: var(--ls-warning);
   }
 
   /* COLLECTIONS — `+ name` / `✓ name` toggle chips, gold when the asset is in. */

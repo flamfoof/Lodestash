@@ -18,7 +18,7 @@ fn open_in_memory_applies_migrations() {
         .conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 21, "all 21 migrations should have run");
+    assert_eq!(version, 22, "all 22 migrations should have run");
 }
 
 /// The viewer's texture lookup must walk **both** hops. Stopping at the first lands on the
@@ -3486,5 +3486,165 @@ fn store_pack_license_backfill() {
         by_name("LooseFolder").license,
         None,
         "no publisher means not from the store, so nothing is known about its licence"
+    );
+}
+
+/// UI-SPEC 13.6 - the row states. `in pack` vs `in library` is not decoration: a dependency
+/// inside the pack travels with it, while one that resolves across packs is what ENGINE-API 5.5
+/// flags, because Unity reassigns GUIDs on import.
+#[test]
+fn related_assets_tells_in_pack_from_in_library() {
+    let mut c = Catalog::open_in_memory().unwrap();
+    c.conn
+        .execute_batch(
+            "INSERT INTO import_source (id, uuid, name, root_path, kind) VALUES (1, 'src-1', 's', '/s', 'folder');
+             INSERT INTO media_type (id, code, label) VALUES (1, 'material', 'Material'), (2, 'texture', 'Texture');
+             INSERT INTO package (id, uuid, source_id, package_path, name) VALUES
+                 (10, 'p1', 1, '/s/a.unitypackage', 'PackA'),
+                 (11, 'p2', 1, '/s/b.unitypackage', 'PackB');
+             INSERT INTO asset (id, uuid, source_id, media_type_id, package_id, name, unity_guid, created_at, updated_at) VALUES
+                 (1, 'a1', 1, 1, 10, 'rock_mat',  'g1', 0, 0),
+                 (2, 'a2', 1, 2, 10, 'rock_albedo', 'g2', 0, 0),
+                 (3, 'a3', 1, 2, 11, 'shared_noise', 'g3', 0, 0);",
+        )
+        .expect("fixture");
+
+    c.record_dependencies(
+        1,
+        Some("g1"),
+        "uses_texture",
+        &["g2".to_string(), "g3".to_string(), "gMISSING".to_string()],
+    )
+    .expect("deps");
+
+    let rows = c.related_assets(1).unwrap();
+    let by_name = |n: &str| {
+        rows.iter()
+            .find(|r| r.name.as_deref() == Some(n))
+            .unwrap_or_else(|| panic!("no row for {n}: {rows:?}"))
+    };
+    assert_eq!(
+        by_name("rock_albedo").same_pack,
+        Some(true),
+        "same pack - the dependency travels with it"
+    );
+    assert_eq!(
+        by_name("shared_noise").same_pack,
+        Some(false),
+        "another pack - the reference will not survive an import"
+    );
+    let missing = rows
+        .iter()
+        .find(|r| r.asset_id.is_none())
+        .expect("missing row");
+    assert_eq!(missing.same_pack, None, "nothing to be in the same pack as");
+    assert_eq!(missing.declared_path.as_deref(), Some("gMISSING"));
+    assert!(missing.edge_id > 0, "the row carries the id Ignore acts on");
+}
+
+/// An ignore has to survive the next dependency scan. `record_dependencies` re-derives an
+/// asset's edges wholesale, so without the two guards here every muted link would come back the
+/// moment the file's bytes changed - and SQLite cannot dedupe the re-insert, because a `missing`
+/// edge has a NULL `to_asset_id` and NULLs are distinct under UNIQUE.
+#[test]
+fn ignored_edges_survive_a_reharvest() {
+    let mut c = Catalog::open_in_memory().unwrap();
+    c.conn
+        .execute_batch(
+            "INSERT INTO import_source (id, uuid, name, root_path, kind) VALUES (1, 'src-1', 's', '/s', 'folder');
+             INSERT INTO media_type (id, code, label) VALUES (1, 'material', 'Material'), (2, 'texture', 'Texture');
+             INSERT INTO asset (id, uuid, source_id, media_type_id, name, unity_guid, created_at, updated_at) VALUES
+                 (1, 'a1', 1, 1, 'rock_mat', 'g1', 0, 0);",
+        )
+        .expect("fixture");
+    let refs = ["gGONE".to_string()];
+    c.record_dependencies(1, Some("g1"), "uses_texture", &refs)
+        .expect("deps");
+
+    let edge = c.related_assets(1).unwrap()[0].edge_id;
+    assert!(c.ignore_relationship(edge).unwrap(), "first ignore takes");
+    assert!(
+        !c.ignore_relationship(edge).unwrap(),
+        "ignoring twice changes nothing"
+    );
+
+    // The scan that would otherwise resurrect it.
+    c.record_dependencies(1, Some("g1"), "uses_texture", &refs)
+        .expect("re-harvest");
+    let rows = c.related_assets(1).unwrap();
+    assert_eq!(rows.len(), 1, "no duplicate edge was minted: {rows:?}");
+    assert_eq!(rows[0].state, "ignored", "the mute survived the re-harvest");
+
+    // And it stays out of the late-binding pass even once the target exists.
+    c.conn
+        .execute_batch(
+            "INSERT INTO asset (id, uuid, source_id, media_type_id, name, unity_guid, created_at, updated_at)
+                 VALUES (2, 'a2', 1, 2, 'found_it', 'gGONE', 0, 0);",
+        )
+        .expect("target appears");
+    c.resolve_pending_relationships().expect("resolve");
+    assert_eq!(
+        c.related_assets(1).unwrap()[0].state,
+        "ignored",
+        "an ignored edge is not silently re-resolved"
+    );
+
+    // Restore hands it back, and the ordinary resolve then binds it.
+    assert!(c.restore_relationship(edge).unwrap(), "restore takes");
+    let rows = c.related_assets(1).unwrap();
+    assert_eq!(
+        rows[0].state, "resolved",
+        "restore re-binds through the normal path"
+    );
+    assert_eq!(rows[0].name.as_deref(), Some("found_it"));
+    assert!(
+        !c.restore_relationship(edge).unwrap(),
+        "restoring a live edge changes nothing"
+    );
+}
+
+/// M22 - edges pointing at Unity's own built-in resources. Nothing in any catalog will ever be
+/// that file, so the edge is `missing` for good: the Inspector warned that links "are skipped on
+/// export" over a link that is not broken, and offered a relink with nothing to point at.
+#[test]
+fn builtin_resource_edges_are_dropped() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let path = dir.path().join("catalog.db");
+    {
+        let c = Catalog::open(&path).unwrap();
+        c.conn
+            .execute_batch(
+                "INSERT INTO import_source (id, uuid, name, root_path, kind)
+                     VALUES (1, 'src-1', 's', '/s', 'folder');
+                 INSERT INTO media_type (id, code, label) VALUES (1, 'material', 'Material');
+                 INSERT INTO asset (id, uuid, source_id, media_type_id, name, unity_guid, created_at, updated_at)
+                     VALUES (1, 'a1', 1, 1, 'prefab_mat', 'g1', 0, 0),
+                            (2, 'a2', 1, 1, 'real_mat',   'g2', 0, 0);
+                 INSERT INTO asset_relationship (id, from_asset_id, to_asset_id, kind, source, declared_path, state) VALUES
+                     (1, 1, NULL, 'uses_material', 'unity_prefab', '0000000000000000f000000000000000', 'missing'),
+                     (2, 1, NULL, 'uses_texture',  'unity_meta',   'gSOMETHINGREAL',                   'missing'),
+                     (3, 1, 2,    'uses_material', 'unity_prefab', 'g2',                               'resolved');",
+            )
+            .expect("fixture");
+        c.conn
+            .pragma_update(None, "user_version", 21i64)
+            .expect("rewind");
+    }
+
+    let c = Catalog::open(&path).unwrap();
+    let rows = c.related_assets(1).unwrap();
+    let declared: Vec<Option<&str>> = rows.iter().map(|r| r.declared_path.as_deref()).collect();
+    assert!(
+        !declared.contains(&Some("0000000000000000f000000000000000")),
+        "the built-in resource edge is gone: {rows:?}"
+    );
+    assert!(
+        declared.contains(&Some("gSOMETHINGREAL")),
+        "a genuinely broken link is left alone"
+    );
+    assert_eq!(
+        rows.len(),
+        2,
+        "only the built-in edge was dropped: {rows:?}"
     );
 }

@@ -2023,6 +2023,107 @@ try {
     await page.keyboard.press("Escape");
   });
 
+  await check("LINKED FILES says which side of the pack boundary a link is on", async () => {
+    // §13.6's row state. Until 2026-08-29 every resolved edge rendered identically, so the
+    // panel could not tell a dependency that travels with its pack from one that resolves
+    // across packs — which is exactly what ENGINE-API §5.5 flags, because Unity reassigns
+    // GUIDs on import and that reference does not survive the trip.
+    const p = await invoke("grid_page", {
+      query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    // Ask the catalog which asset has edges rather than sampling the grid. A name-sorted scan of
+    // the first N items finds nothing in this library — the first asset with a dependency sits
+    // well past any sane N — so the sampling version of this check asserted nothing at all while
+    // reporting ok, which is the failure mode the onboarding check spent months in.
+    const edges = await invoke("asset_edges");
+    if (edges.length === 0) return; // a library with no harvested edges
+    const byId = new Map(p.items.map((i) => [i.asset_id, i]));
+    // Prefer an asset that owns a **same-pack** edge, so the ✓/⤷ distinction is actually
+    // exercised. Both ends' packs are already on the grid rows, so this is a map lookup, not a
+    // scan — and picking any old edge would leave the `in pack` branch unasserted in a library
+    // where cross-pack edges outnumber it 1428 to 4.
+    const samePack = edges.find((e) => {
+      const f = byId.get(e.from);
+      const t = byId.get(e.to);
+      return f && t && f.package && f.package === t.package;
+    });
+    const chosen = samePack ?? edges[0];
+    const item = byId.get(chosen.from);
+    assert.ok(item, `asset ${chosen.from} has edges but is not in the grid`);
+    const rows = await invoke("related_assets", { assetId: item.asset_id });
+    assert.ok(rows.length > 0, "the edge list and related_assets disagree");
+    if (samePack) {
+      assert.ok(
+        rows.some((r) => r.same_pack === true),
+        "picked an asset for its same-pack edge but related_assets reports none",
+      );
+    }
+    const linked = { item, rows };
+
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.fill('[data-testid="search-input"]', linked.item.name);
+    await page.waitForFunction(
+      (id) => !!document.querySelector(`.card[data-asset-id="${id}"]`),
+      linked.item.asset_id,
+      { timeout: 5000 },
+    );
+    await page.locator(`.card[data-asset-id="${linked.item.asset_id}"]`).click();
+    await page.waitForSelector('[data-testid="inspector-link-state-0"]', { timeout: 5000 });
+
+    const shown = await page.$$eval('[data-testid^="inspector-link-state-"]', (els) =>
+      els.map((e) => e.textContent.trim()),
+    );
+    assert.equal(shown.length, linked.rows.length, "one state chip per edge");
+    const allowed = ["✓ in pack", "⤷ in library", "✕ missing", "⊘ ignored"];
+    for (const s of shown) assert.ok(allowed.includes(s), `unknown link state "${s}"`);
+    // The chip must agree with the row it came from, not just be one of the four.
+    const expected = linked.rows.map((r) =>
+      r.state === "ignored"
+        ? "⊘ ignored"
+        : r.asset_id == null
+          ? "✕ missing"
+          : r.same_pack
+            ? "✓ in pack"
+            : "⤷ in library",
+    );
+    assert.deepEqual(shown, expected, "the chips do not match the edges they render");
+
+    await page.fill('[data-testid="search-input"]', "");
+    await page.keyboard.press("Escape");
+  });
+
+  await check("⊘ Ignore mutes a link and ↺ restore puts it back", async () => {
+    // Deliberately over **any** edge, not a broken one. A real library has thousands of resolved
+    // edges and a handful of broken ones — the reference library's two sit at sorted position
+    // 2414, so a check that hunted for a missing edge in the first N items would quietly assert
+    // nothing, which is how the onboarding check spent months passing over a screen it could not
+    // see. The mute path is identical either way, and the properties a broken edge adds (an
+    // ignore surviving `record_dependencies` re-deriving the harvest, and staying out of the
+    // late-binding pass) are unit-tested and mutation-checked in `ignored_edges_survive_a_reharvest`.
+    const edges = await invoke("asset_edges");
+    if (edges.length === 0) return; // a library with no harvested edges
+    const assetId = edges[0].from;
+    const live = (await invoke("related_assets", { assetId })).find((r) => r.state !== "ignored");
+    assert.ok(live, `asset ${assetId} has edges but related_assets shows none live`);
+    const target = { edge: live.edge_id, was: live.state, outbound: live.outbound };
+    assert.ok(target.outbound, "expected an outbound edge — mute clears the *target* end");
+
+    const stateOf = async () =>
+      (await invoke("related_assets", { assetId })).find((r) => r.edge_id === target.edge);
+    try {
+      await invoke("set_link_ignored", { edgeId: target.edge, ignored: true });
+      const muted = await stateOf();
+      assert.equal(muted?.state, "ignored", "the edge was not muted");
+      assert.equal(muted?.asset_id, null, "a muted edge must resolve to nothing");
+      assert.equal(muted?.same_pack, null, "and so has no side of the pack boundary");
+    } finally {
+      // Always hand the user's catalog back the way it was found.
+      await invoke("set_link_ignored", { edgeId: target.edge, ignored: false });
+    }
+    assert.equal((await stateOf())?.state, target.was, "restore did not put the edge back");
+  });
+
   await check("the Inspector shows the licence a pack carries", async () => {
     // §13.9's other half. Until 2026-08-28 no pack in the catalog had a licence at all: the
     // desktop write path read `read_package_meta` at discovery, kept `version`, and threw the

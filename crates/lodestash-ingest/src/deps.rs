@@ -164,7 +164,27 @@ fn push_unique(v: &mut Vec<String>, item: String) {
     }
 }
 
+/// Unity's own asset libraries, which ship with the editor and are never files in anyone's
+/// project — the default material a fresh prefab paints with, the white/bump fallback textures,
+/// the editor's own icons. A reference to one is not a dependency Lodestash can catalogue.
+///
+/// `f000…` is *unity default resources*, `e000…` *unity builtin extra*, `d000…` *unity editor
+/// resources*.
+const BUILTIN_RESOURCE_GUIDS: [&str; 3] = [
+    "0000000000000000f000000000000000",
+    "0000000000000000e000000000000000",
+    "0000000000000000d000000000000000",
+];
+
 /// The `guid: <32 hex>` value inside one inline YAML mapping, if present.
+///
+/// **Built-in resource GUIDs are dropped here**, at the one place every harvester reads a GUID.
+/// Nothing in the catalog can ever resolve them, so an edge minted from one is `missing` forever:
+/// it fires §13.6's "✕ missing links are skipped on export" warning about a link that is not
+/// broken, and offers a relink to something the user cannot supply. The `m_Shader` exclusion in
+/// [`material_texture_guids`] is the same reasoning applied one level up; this catches the case
+/// that slipped past it — a prefab whose `m_Materials` list names Unity's default material
+/// (one such edge existed in the reference library).
 fn guid_in(fragment: &str) -> Option<String> {
     let after = fragment.split_once("guid:")?.1;
     let guid: String = after
@@ -172,12 +192,49 @@ fn guid_in(fragment: &str) -> Option<String> {
         .chars()
         .take_while(|c| c.is_ascii_hexdigit())
         .collect();
-    (guid.len() == 32).then_some(guid)
+    (guid.len() == 32 && !BUILTIN_RESOURCE_GUIDS.contains(&guid.as_str())).then_some(guid)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A prefab painted with Unity's *default* material names the built-in resources GUID, which
+    /// nothing in any library will ever be. Harvesting it mints an edge that is `missing` for
+    /// good - so the Inspector warns that links "are skipped on export" over a link that is not
+    /// broken, and offers a relink the user has nothing to point at. One such edge existed in the
+    /// reference library before this filter.
+    #[test]
+    fn builtin_resource_refs_are_not_dependencies() {
+        const PREFAB: &str = "\
+GameObject:
+  m_Mesh: {fileID: 4300000, guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb, type: 3}
+  m_Materials:
+  - {fileID: 10303, guid: 0000000000000000f000000000000000, type: 0}
+  - {fileID: 2100000, guid: cccccccccccccccccccccccccccccccc, type: 2}
+";
+        let refs = prefab_refs(PREFAB);
+        assert_eq!(refs.meshes, vec!["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]);
+        assert_eq!(
+            refs.materials,
+            vec!["cccccccccccccccccccccccccccccccc"],
+            "Unity's default material is not a file to link to"
+        );
+
+        const MAT: &str = "\
+Material:
+  m_SavedProperties:
+    m_TexEnvs:
+    - _BumpMap:
+        m_Texture: {fileID: 0, guid: 0000000000000000e000000000000000, type: 0}
+    - _BaseMap:
+        m_Texture: {fileID: 2800000, guid: dddddddddddddddddddddddddddddddd, type: 3}
+";
+        assert_eq!(
+            material_texture_guids(MAT),
+            vec!["dddddddddddddddddddddddddddddddd"],
+            "the built-in fallback texture is not a dependency either"
+        );
+    }
 
     const MAT: &str = "\
 Material:

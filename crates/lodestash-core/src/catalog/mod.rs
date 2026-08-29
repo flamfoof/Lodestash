@@ -372,6 +372,7 @@ impl Catalog {
             (19, MIGRATION_19_EXPORT_HISTORY),
             (20, MIGRATION_20_UNPROJECTED_STAGING),
             (21, MIGRATION_21_STORE_PACK_LICENSE),
+            (22, MIGRATION_22_DROP_BUILTIN_EDGES),
         ];
 
         for (version, sql) in migrations {
@@ -1921,6 +1922,8 @@ CREATE INDEX IF NOT EXISTS idx_asset_metrics_dirty ON asset(metrics_dirty) WHERE
 /// library — the `missing` case the panel calls out.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RelatedAsset {
+    /// `asset_relationship.id` — what ⊘ Ignore link drops (UI-SPEC §13.6).
+    pub edge_id: i64,
     /// True: the selected asset *uses* this one. False: this one uses the selected asset.
     pub outbound: bool,
     pub kind: String,
@@ -1930,6 +1933,13 @@ pub struct RelatedAsset {
     pub asset_id: Option<i64>,
     pub name: Option<String>,
     pub media_code: Option<String>,
+    /// UI-SPEC §13.6's **✓ in pack** vs **⤷ in library**: does the other end live in the *same*
+    /// package as the selected asset? `None` when the edge resolves to nothing (✕ missing).
+    ///
+    /// It is not decoration. A dependency inside the pack travels with it; one that resolves
+    /// across packs is exactly what ENGINE-API §5.5 flags, because Unity reassigns GUIDs per
+    /// import and the reference will not survive the trip.
+    pub same_pack: Option<bool>,
 }
 
 /// M10 — dependency-graph queue (§10). `deps_dirty` is the third drain flag, next to
@@ -2067,6 +2077,23 @@ CREATE INDEX IF NOT EXISTS idx_export_batch ON export_record(batch_id);
 const MIGRATION_20_UNPROJECTED_STAGING: &str = "
 CREATE UNIQUE INDEX IF NOT EXISTS idx_collection_staging_unprojected
   ON collection(is_staging) WHERE is_staging=1 AND project_id IS NULL;
+";
+
+/// M22 — drop edges that point at Unity's own built-in resource libraries.
+///
+/// A prefab painted with Unity's *default* material declares the built-in-resources GUID, and
+/// nothing in any catalog will ever be that file — so the edge is `missing` for good. It made the
+/// Inspector warn that "missing links are skipped on export" about a link that is not broken, and
+/// offered a relink the user has nothing to point at. `deps::guid_in` now filters these at harvest;
+/// this clears the ones already minted (one in the reference library).
+///
+/// Scoped to unresolved rows, so a real asset that somehow carries such a GUID is left alone.
+const MIGRATION_22_DROP_BUILTIN_EDGES: &str = "
+DELETE FROM asset_relationship
+ WHERE to_asset_id IS NULL
+   AND declared_path IN ('0000000000000000f000000000000000',
+                         '0000000000000000e000000000000000',
+                         '0000000000000000d000000000000000');
 ";
 
 /// M21 — backfill the Asset Store EULA onto packs that came from the store cache.
@@ -2740,22 +2767,30 @@ impl Catalog {
         // Refs are re-derived from the file, so the old harvest is replaced wholesale. This is
         // also what keeps a rescan from duplicating `missing` edges: SQLite treats NULL
         // `to_asset_id`s as distinct, so UNIQUE can't dedupe them.
+        // …except the ones the user muted (UI-SPEC §13.6 ⊘). Re-deriving from the file would
+        // otherwise resurrect every ignored link the moment the asset's bytes changed, which is
+        // the one thing "ignore" has to survive.
         tx.execute(
-            "DELETE FROM asset_relationship WHERE from_asset_id = ?1 AND source = 'unity_meta'",
+            "DELETE FROM asset_relationship
+              WHERE from_asset_id = ?1 AND source = 'unity_meta' AND state <> 'ignored'",
             params![asset_id],
         )
         .map_err(|e| CoreError::Catalog(format!("deps clear edges: {e}")))?;
         for reference in ref_guids {
+            // The `WHERE NOT EXISTS` is what keeps an ignored edge ignored: its `to_asset_id`
+            // is NULL, and SQLite treats NULLs as distinct, so `ON CONFLICT` cannot dedupe it.
             tx.execute(
                 "INSERT INTO asset_relationship
                     (from_asset_id, to_asset_id, kind, source, declared_path, state)
-                 VALUES (
-                    ?1,
+                 SELECT ?1,
                     (SELECT id FROM asset WHERE unity_guid = ?2 AND deleted_at IS NULL),
                     ?3, 'unity_meta', ?2,
                     CASE WHEN EXISTS (SELECT 1 FROM asset
                                        WHERE unity_guid = ?2 AND deleted_at IS NULL)
-                         THEN 'resolved' ELSE 'missing' END)
+                         THEN 'resolved' ELSE 'missing' END
+                  WHERE NOT EXISTS (SELECT 1 FROM asset_relationship
+                                     WHERE from_asset_id = ?1 AND declared_path = ?2
+                                       AND state = 'ignored')
                  ON CONFLICT(from_asset_id, to_asset_id, kind) DO NOTHING",
                 params![asset_id, reference, kind],
             )
@@ -4656,13 +4691,20 @@ impl Catalog {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT 1, r.kind, r.state, r.declared_path, t.id, t.name, mt.code
+                "SELECT 1, r.kind, r.state, r.declared_path, t.id, t.name, mt.code, r.id,
+                        CASE WHEN t.id IS NULL THEN NULL
+                             WHEN t.package_id IS NOT NULL
+                              AND t.package_id = (SELECT package_id FROM asset WHERE id = ?1)
+                             THEN 1 ELSE 0 END
                    FROM asset_relationship r
                    LEFT JOIN asset t      ON t.id = r.to_asset_id AND t.deleted_at IS NULL
                    LEFT JOIN media_type mt ON mt.id = t.media_type_id
                   WHERE r.from_asset_id = ?1
                  UNION ALL
-                 SELECT 0, r.kind, r.state, r.declared_path, f.id, f.name, mt.code
+                 SELECT 0, r.kind, r.state, r.declared_path, f.id, f.name, mt.code, r.id,
+                        CASE WHEN f.package_id IS NOT NULL
+                              AND f.package_id = (SELECT package_id FROM asset WHERE id = ?1)
+                             THEN 1 ELSE 0 END
                    FROM asset_relationship r
                    JOIN asset f            ON f.id = r.from_asset_id AND f.deleted_at IS NULL
                    LEFT JOIN media_type mt ON mt.id = f.media_type_id
@@ -4680,11 +4722,49 @@ impl Catalog {
                     asset_id: r.get(4)?,
                     name: r.get(5)?,
                     media_code: r.get(6)?,
+                    edge_id: r.get(7)?,
+                    same_pack: r.get::<_, Option<i64>>(8)?.map(|n| n == 1),
                 })
             })
             .map_err(|e| CoreError::Catalog(format!("related query: {e}")))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| CoreError::Catalog(format!("related row: {e}")))
+    }
+
+    /// Mute a dependency edge — UI-SPEC §13.6's **⊘ Ignore link**.
+    ///
+    /// The row is kept, not deleted, for two reasons: a deleted edge is re-derived from the file
+    /// on the next dependency scan (`record_dependencies` replaces a harvest wholesale), and the
+    /// panel needs somewhere to offer **restore** — an ignore with no way back is a one-way door
+    /// over a parse result the user may have misread. `to_asset_id` is cleared so a muted edge
+    /// stops counting as a dependency anywhere else (export closure, the LINKS filter).
+    pub fn ignore_relationship(&self, edge_id: i64) -> Result<bool> {
+        self.conn
+            .execute(
+                "UPDATE asset_relationship SET state = 'ignored', to_asset_id = NULL
+                  WHERE id = ?1 AND state <> 'ignored'",
+                params![edge_id],
+            )
+            .map(|n| n > 0)
+            .map_err(|e| CoreError::Catalog(format!("ignore_relationship: {e}")))
+    }
+
+    /// Undo an ⊘ Ignore. Back to `missing`, then the ordinary late-binding pass
+    /// ([`Self::resolve_pending_relationships`]) re-resolves it if the target is catalogued —
+    /// so restoring never has to guess what the edge pointed at.
+    pub fn restore_relationship(&self, edge_id: i64) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE asset_relationship SET state = 'missing'
+                  WHERE id = ?1 AND state = 'ignored'",
+                params![edge_id],
+            )
+            .map_err(|e| CoreError::Catalog(format!("restore_relationship: {e}")))?;
+        if changed > 0 {
+            self.resolve_pending_relationships()?;
+        }
+        Ok(changed > 0)
     }
 
     /// The two id sets behind the `has_dependencies` / `has_dependents` filter chips
@@ -4806,6 +4886,7 @@ impl Catalog {
                                           AND deleted_at IS NULL),
                         state = 'resolved'
                   WHERE to_asset_id IS NULL
+                    AND state <> 'ignored'
                     AND EXISTS (SELECT 1 FROM asset
                                  WHERE unity_guid = asset_relationship.declared_path
                                    AND deleted_at IS NULL)",

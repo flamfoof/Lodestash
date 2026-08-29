@@ -92,9 +92,22 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       the asset's real tag set with AI confidence % and a ✕ reject (same undoable `bulkTag` op);
       accept/promote-to-trait stays on the Traits screen where the design owns it.
       confidence underbars, or trait quick-add.
-- [ ] **Inspector gaps.** No dependency **relink** interaction (edges render, nothing re-resolves a
-      `missing` edge); no in-archive provenance block (Path-in-package / Package ⧉-copy rows);
-      card ★ is display-only (only the inspector toggles favourites).
+- [ ] **Inspector gaps — relink done 2026-08-29, the rest open.** §13.6's four row states ship
+      (`same_pack` on `related_assets` separates ✓ in pack from ⤷ in library) along with the
+      relink panel's ⊘ Ignore / ↺ Restore (`Catalog::ignore_relationship`, `state='ignored'`,
+      which survives `record_dependencies` re-deriving a harvest) and the export-skip warning the
+      spec claimed was already there. Name-match suggestions and ⌕ Browse disk… are **dropped as
+      unbuildable**, not deferred — every edge declares a GUID, which has no name to match and no
+      disk file that resolves it (UI-SPEC §13.6 records the reasoning). *Still open:* no
+      in-archive provenance block (Path-in-package / Package ⧉-copy rows). *(card ★ was stale —
+      it is a control, corrected 2026-08-27.)*
+- [ ] **SIMILAR is not similarity (UI-SPEC §13.8).** The panel draws the *dependency* edges — the
+      same rows LINKED FILES shows directly above it. §13.8 asks for top-3 by shared tags with a
+      same-type bonus, "backed by `find_similar` (embeddings) once available"; embeddings now
+      exist (`asset_embedding`, 6,395 SigLIP + 412 CLAP rows on the reference library) and
+      `Engine::similar` already does the cosine KNN, so the real version is a wiring job. Watch
+      the cost: a brute-force index rebuilt per selection reads every embedding, so it wants
+      caching in `Library` invalidated on reload, not a rebuild per Inspector click.
 - [x] **Duplicates — exact hash wired (2026-08-08).** The crawl now BLAKE3s browseable files
       (`CrawledFile.hash` → `CrawlRecord.content_hash` → `asset.content_hash` on insert) — the
       Duplicates screen's groups are real. `needs_rehash` (size/mtime-gated re-hash for

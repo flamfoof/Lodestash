@@ -341,6 +341,18 @@ fn set_favorite(
     state.write(Op::SetFavorite { ids: asset_ids, on })
 }
 
+/// ⊘ Ignore / ↺ restore one dependency edge (UI-SPEC §13.6). Catalog-only, and reversible: the
+/// row is muted rather than deleted, so the panel can offer it back and the next dependency scan
+/// cannot resurrect it.
+#[tauri::command]
+fn set_link_ignored(
+    state: tauri::State<'_, AppState>,
+    edge_id: i64,
+    ignored: bool,
+) -> Result<WriteResult, String> {
+    state.write(Op::SetLinkIgnored { edge_id, ignored })
+}
+
 /// Move to Trash, or restore from it. **Catalog-only** — the file on disk is never touched, and a
 /// later scan can still find it (DATA-MODEL §8). This is the recoverable middle option between
 /// `remove_from_library` and `delete_from_disk`.
@@ -1993,6 +2005,7 @@ pub fn run() {
             asset_detail,
             reload_library,
             set_favorite,
+            set_link_ignored,
             refresh_source_health,
             relink_preview,
             relink_source,

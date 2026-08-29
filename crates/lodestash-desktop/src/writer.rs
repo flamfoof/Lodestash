@@ -66,6 +66,13 @@ pub enum Op {
         ids: Vec<i64>,
         on: bool,
     },
+    /// Mute or unmute one dependency edge — UI-SPEC §13.6's **⊘ Ignore link** / **↺ restore**.
+    /// A muted edge keeps its row (an ignore has to survive the next dependency scan, which
+    /// re-derives the harvest wholesale) and stops resolving to anything.
+    SetLinkIgnored {
+        edge_id: i64,
+        ignored: bool,
+    },
     /// Re-derive every source's availability from disk (UI-SPEC §11.1, M18).
     ///
     /// It writes `import_source.state`, so it belongs on the writer thread rather than on a read
@@ -1252,6 +1259,19 @@ fn run(
                 ..Default::default()
             })
             .map_err(|e| e.to_string()),
+
+        Op::SetLinkIgnored { edge_id, ignored } => {
+            let r = if ignored {
+                catalog.ignore_relationship(edge_id)
+            } else {
+                catalog.restore_relationship(edge_id)
+            };
+            r.map(|did| WriteResult {
+                changed: did as usize,
+                ..Default::default()
+            })
+            .map_err(|e| e.to_string())
+        }
 
         // `changed` is how many sources *moved* state, so a caller can tell "nothing to see" from
         // "a drive just came back" without diffing the whole list.

@@ -674,7 +674,7 @@ CREATE TABLE asset_relationship (
   source        TEXT NOT NULL DEFAULT 'unity_meta',
   confidence    REAL,                     -- 0..1; null for unity_meta (deterministic)
   declared_path TEXT,                     -- the path/name the parent declared (FBX binding, .mtl, GUID)
-  state         TEXT NOT NULL DEFAULT 'resolved',  -- 'resolved' (in pack) | 'library' (cross-source) | 'missing'
+  state         TEXT NOT NULL DEFAULT 'resolved',  -- 'resolved' | 'missing' | 'ignored' (muted by hand)
   UNIQUE(from_asset_id, to_asset_id, kind)
 );
 CREATE INDEX idx_rel_from ON asset_relationship(from_asset_id);
@@ -738,6 +738,17 @@ An edge is recorded even when its target isn't catalogued yet — `to_asset_id N
 the material that uses it, or live in a package extracted later). `Catalog::resolve_pending_relationships`
 late-binds those in one statement after every drain, which is why a `missing` edge is kept rather than
 dropped. An edge that never resolves is an honest record of a reference the library doesn't hold.
+
+**Two exceptions to "record it and let it resolve later".** A reference to Unity's own built-in
+resource libraries — the default material a fresh prefab paints with, the white/bump fallback
+textures — is dropped at harvest (`deps::guid_in`, three well-known GUIDs), because nothing in any
+catalog will ever *be* that file: the edge would be `missing` for good and would make the Inspector
+warn about a link that is not broken (M22 cleared the ones already minted). And a user can **mute**
+an edge — `state='ignored'`, UI-SPEC §13.6's ⊘ — which keeps the row but clears `to_asset_id`, so a
+muted link counts as a dependency nowhere. Muting is a state rather than a `DELETE` because
+`record_dependencies` re-derives an asset's whole harvest from the file: a deleted edge would come
+back the moment the bytes changed. `resolve_pending_relationships` skips ignored rows, and restoring
+one returns it to `missing` and lets the ordinary late-binding pass re-resolve it.
 
 `Catalog::dependency_closure` walks the resolved edges transitively (recursive `UNION`, so a
 reference cycle terminates) and is the single definition of "with dependencies" for both
@@ -821,6 +832,7 @@ transaction, in order, on open. Shipped so far:
 | **M2** | Mapping library: `taxonomy`, `category`, `category_alias`, `mapping_rule`, `asset_category` (§4) |
 | **M3** | Engine round-trip: `package` + `asset.package_id`, `project`, `import_record`, `asset.license/attribution/license_url` (§7, §9) |
 | **M4** | `asset.rating`, `package.pipeline`, `project.pipeline` (§12) |
+| **M22** | Drop unresolved edges declaring a Unity built-in resource GUID (`f000…`/`e000…`/`d000…`). A prefab painted with Unity's *default* material minted an edge nothing could ever resolve, so §13.6 warned "missing links are skipped on export" about a link that is not broken. `deps::guid_in` now filters these at harvest; this clears the already-minted ones |
 | **M21** | Asset Store EULA backfill: `UPDATE package SET license/license_url WHERE publisher IS NOT NULL AND license IS NULL`. Data, not DDL — the harvest could always state this (a `publisher` means the pack came out of the store cache tree), but the desktop write path never called the setter, so every pack it imported recorded no licence. Guarded on `license IS NULL`, so a pack that stated its own keeps it |
 | **M20** | One staging tray with no project: `idx_collection_staging_unprojected`. Relaxes M5's rule that a tray must belong to a project, so the shell can stop keeping its own in-memory shortlist beside the catalog's ([ADR-0010](decisions/ADR-0010-one-staging-tray.md)) |
 | **M18** | Source availability: `import_source.state` + `last_seen_at` — the third source state a drive going away needs (UI-SPEC §11.1). `state` is **derived, not authored**: the open/scan health check writes it, `paused` is the user's `watch_enabled` intent surfaced as a state, and nothing in the catalog is deleted because a root went missing |
