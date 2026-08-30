@@ -322,15 +322,15 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       matters now that an agent can write tags: a wrong label can only be removed in the app.
       Adding the tool requires adding the route first — MCP↔REST 1:1.
 - [ ] **`.meta` `labels:` → seed tags.** Parsed by `unitypackage::parse_meta`, never written to
-      `tag`/`asset_tag`. INGESTION §2 lists them as seed tags. **Surveyed 2026-08-29 before
-      building, and deliberately not built yet:** the reference library carries essentially
-      none — **0 of 3,684** on-disk `.meta` sidecars have a `labels:` key, and **1 of ~3,400**
-      sampled in-pack `asset.meta` entries across ten packs (four of them real 3D art packs),
-      that one being DOTween's package-root marker carrying Asset Store *listing keywords*
-      (`Tween, HOTween, iTween, LeanTween`) rather than anything describing an asset. The
-      harvest is small and correct; it simply has no input here. Build it when a library's
-      packs come from publishers who label, or once assets are labelled by hand. The real
-      tagging gap is elsewhere: 7,667 of 8,237 assets are still Unidentified.
+      `asset_tag`. **Measured 2026-08-30** before building it, because "Unity labels exist" is not
+      the same as "your packs use them": 12 packs sampled at random, 7,442 `asset.meta` entries,
+      **185 carry labels (2.5%)** — and they cluster, three packs holding nearly all of them
+      (Artificer: 161 metas, zero labels). Small, but the content is exactly what search wants and
+      no model can invent it: `FIRE_BLAST_10.prefab` → *Fire, Toon, Effect, Blast, Explosion,
+      Light, Impact, Collision*; `Palette_NES_lookup.png` → *Palette*. Human-authored, free, and
+      higher confidence than anything the tagger produces. The work is a write at ingest **plus a
+      backfill** over the packs already indexed — without the backfill the feature does nothing for
+      this library, since everything is already ingested.
 - [ ] **Smart collections / `embedding_meta`.** DDL-only, never written.
 - [x] **Trait-vocabulary teaching — stale card, corrected 2026-08-28.** It *is* wired:
       `writer.rs` reads `teaching_traits()` into `ImageZeroShot`, and `ollama.rs` tests that they
