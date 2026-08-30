@@ -311,6 +311,24 @@ pub struct Catalog {
     appraise_focus: AppraiseFocus,
 }
 
+/// What an **Identify** kick may do to `embedding_dirty`, as one SQL fragment.
+///
+/// `embedding_dirty = 1` means *the vector is stale because the bytes changed*
+/// ([`DATA-MODEL.md`](../../../docs/DATA-MODEL.md) §8) — and an asset only leaves `indexed` for
+/// `identified` once it has an embedding with the flag **clear** plus a tag. Asking to re-identify
+/// does not change any bytes, so raising the flag on an asset that already has a good vector
+/// invalidates it for no reason, and nothing lowers it again until an embedder runs.
+///
+/// That is not hypothetical. On a machine where ONNX Runtime will not load (see `HANDOFF.md` §6),
+/// a 200-asset agent-driven identify pass tagged 195 of them and promoted **none**: every one had
+/// a usable embedding before the kick, the kick dirtied it, and no embedder existed to clean it —
+/// so the flag stuck at 1 forever and the assets were *less* promotable after being identified
+/// than before. The queue in [`Catalog::assets_needing_embedding`] still keys on the flag, so an
+/// asset with **no** vector must still be flagged: that is exactly what this expression preserves.
+const KEEP_GOOD_VECTOR: &str = "embedding_dirty = CASE
+     WHEN EXISTS (SELECT 1 FROM asset_embedding e WHERE e.asset_id = asset.id)
+             THEN embedding_dirty ELSE 1 END";
+
 impl Catalog {
     /// Open (or create) the catalog at `path`. Runs all pending migrations.
     pub fn open(path: &Path) -> Result<Self> {
@@ -447,8 +465,10 @@ impl Catalog {
     pub fn mark_for_identify(&self, asset_id: i64) -> Result<()> {
         self.conn
             .execute(
-                "UPDATE asset SET embedding_dirty = 1, tags_dirty = 1, updated_at = ?2
-                 WHERE id = ?1 AND deleted_at IS NULL",
+                &format!(
+                    "UPDATE asset SET {KEEP_GOOD_VECTOR}, tags_dirty = 1, updated_at = ?2
+                     WHERE id = ?1 AND deleted_at IS NULL"
+                ),
                 params![asset_id, unix_now()],
             )
             .map_err(|e| CoreError::Catalog(format!("mark_for_identify: {e}")))?;
@@ -4211,7 +4231,9 @@ impl Catalog {
     pub fn flag_identify_all(&self) -> Result<usize> {
         self.conn
             .execute(
-                "UPDATE asset SET embedding_dirty = 1, tags_dirty = 1 WHERE deleted_at IS NULL",
+                &format!(
+                    "UPDATE asset SET {KEEP_GOOD_VECTOR}, tags_dirty = 1 WHERE deleted_at IS NULL"
+                ),
                 [],
             )
             .map_err(|e| CoreError::Catalog(format!("flag identify all: {e}")))
@@ -4220,9 +4242,11 @@ impl Catalog {
     pub fn flag_identify_untagged(&self) -> Result<usize> {
         self.conn
             .execute(
-                "UPDATE asset SET embedding_dirty = 1, tags_dirty = 1
-                 WHERE deleted_at IS NULL
-                   AND NOT EXISTS (SELECT 1 FROM asset_tag t WHERE t.asset_id = asset.id)",
+                &format!(
+                    "UPDATE asset SET {KEEP_GOOD_VECTOR}, tags_dirty = 1
+                     WHERE deleted_at IS NULL
+                       AND NOT EXISTS (SELECT 1 FROM asset_tag t WHERE t.asset_id = asset.id)"
+                ),
                 [],
             )
             .map_err(|e| CoreError::Catalog(format!("flag identify untagged: {e}")))
@@ -4239,7 +4263,7 @@ impl Catalog {
                 .conn
                 .execute(
                     &format!(
-                        "UPDATE asset SET embedding_dirty = 1, tags_dirty = 1
+                        "UPDATE asset SET {KEEP_GOOD_VECTOR}, tags_dirty = 1
                          WHERE deleted_at IS NULL AND id IN ({placeholders})"
                     ),
                     [],

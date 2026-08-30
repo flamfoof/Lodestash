@@ -298,6 +298,29 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       `door` → `crates`, `bucket` `crate` → `bucket`. Unit-tested both directions — a 3D model must
       **not** get the clause, since its preview is a render of the object and the pixels are the
       better evidence. Written up in [`AI-PIPELINE.md`](AI-PIPELINE.md) §2.
+- [x] **An Identify kick invalidated the vector it could not replace — fixed 2026-08-30.** Ran the
+      200-asset batch the tagging work was building toward: **195 tagged**, and **zero promoted**.
+      All four flag entry points (`mark_for_identify`, `flag_identify_all`, `flag_identify_untagged`,
+      `flag_identify_assets`) set `embedding_dirty = 1` alongside `tags_dirty = 1`, but
+      `embedding_dirty` means *the bytes changed* ([`DATA-MODEL.md`](DATA-MODEL.md) §8) and
+      `discovered`/`indexed` → `identified` requires the flag **clear**. Identifying an asset made
+      it less promotable than before, and with ONNX Runtime dead here nothing ever lowered the flag
+      again — 200 assets with good vectors and fresh tags, stuck at `indexed` permanently. One
+      shared `KEEP_GOOD_VECTOR` fragment now flags only an asset with no `asset_embedding` row (the
+      embed queue selects on the flag, so a *missing* vector must still be queued). Tested across
+      all four entry points and mutation-checked: restoring the plain `= 1` fails it. The 200 rows
+      the kick had dirtied were repaired, and one kick then promoted them — the library went from
+      **24 to 219 identified**.
+- [x] **The 200-asset tag batch — run 2026-08-30.** 195 tagged, 423 distinct values, ~20 s/asset
+      (13 s captioning + 7.5 s facets, two models alternating per 16-asset chunk). Quality on **3D
+      models is good** and this is the case the library is mostly made of: `FX_Fog_01_Breakup` →
+      `subject:fog, material:mist, mood:atmospheric, style:particle`; `Ice_01` → `material:ice,
+      mood:cold`. Two defects came out of reading the output rather than the counts: promotion was
+      broken (card above), and a model that is told to omit a facet sometimes fills it with
+      *nothing* instead — `material:none`, `mood:none`, `free:unspecified`, 14 rows of 1,498. A
+      value that says nothing is worse than an absent one: it reads as a claim and lands in the
+      trait cloud as something a user can click. `says_nothing` now drops those at the shared
+      `validate` seam, so every backend is covered, and the 14 already written were purged.
 - [x] **Icon ladder — settled on DESIGN-GUIDELINES §5 (2026-08-30).** DG said 16/20/24/32, UI-SPEC
       §0.1 said the nav glyph is 16, and the shell shipped nine sizes with nav at 18 — three
       sources, three answers, so "conform to the spec" was not a well-defined action. Both ladders

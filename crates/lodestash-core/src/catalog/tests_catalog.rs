@@ -21,6 +21,74 @@ fn open_in_memory_applies_migrations() {
     assert_eq!(version, 23, "all 23 migrations should have run");
 }
 
+/// An **Identify** kick must not invalidate a vector it cannot replace.
+///
+/// `embedding_dirty = 1` means "the bytes changed" (DATA-MODEL §8) and promotion to `identified`
+/// needs the flag clear. Raising it on an asset that already has a good embedding made a
+/// re-identify *reduce* how identified an asset could be — permanently, on any machine with no
+/// working embedder. An asset with **no** vector must still be flagged, or the embed queue
+/// (`assets_needing_embedding`, which selects on the flag) would never see it.
+#[test]
+fn identify_flags_keep_a_good_vector_and_still_queue_a_missing_one() {
+    let mut c = Catalog::open_in_memory().expect("open");
+    c.seed_media_types().expect("seed");
+    let src = c
+        .upsert_import_source("Lib", "C:/lib", "folder")
+        .expect("source");
+    c.record_crawl(src, None, &[rec("a.png", 1, 1), rec("b.png", 2, 2)])
+        .expect("crawl");
+    let ids: Vec<i64> = c
+        .conn
+        .prepare("SELECT id FROM asset ORDER BY id")
+        .and_then(|mut s| s.query_map([], |r| r.get(0)).and_then(Iterator::collect))
+        .expect("ids");
+    let (embedded, bare) = (ids[0], ids[1]);
+    c.upsert_embedding(embedded, "m", "image", None, None, &[0.1, 0.2])
+        .expect("embed");
+    c.conn
+        .execute("UPDATE asset SET embedding_dirty = 0", [])
+        .expect("settle");
+
+    let dirty = |c: &Catalog, id: i64| -> i64 {
+        c.conn
+            .query_row(
+                "SELECT embedding_dirty FROM asset WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .expect("read")
+    };
+
+    for id in [embedded, bare] {
+        c.mark_for_identify(id).expect("mark");
+    }
+    assert_eq!(dirty(&c, embedded), 0, "a good vector survives the kick");
+    assert_eq!(dirty(&c, bare), 1, "a missing vector still gets queued");
+
+    // Every flag entry point shares the rule — the bulk ones are how a library-wide re-identify
+    // would have dirtied thousands of usable vectors at once.
+    c.conn
+        .execute("UPDATE asset SET embedding_dirty = 0", [])
+        .expect("settle");
+    c.flag_identify_assets(&[embedded, bare]).expect("flag set");
+    assert_eq!(dirty(&c, embedded), 0);
+    assert_eq!(dirty(&c, bare), 1);
+
+    c.conn
+        .execute("UPDATE asset SET embedding_dirty = 0", [])
+        .expect("settle");
+    c.flag_identify_all().expect("flag all");
+    assert_eq!(dirty(&c, embedded), 0);
+    assert_eq!(dirty(&c, bare), 1);
+
+    c.conn
+        .execute("UPDATE asset SET embedding_dirty = 0", [])
+        .expect("settle");
+    c.flag_identify_untagged().expect("flag untagged");
+    assert_eq!(dirty(&c, embedded), 0);
+    assert_eq!(dirty(&c, bare), 1);
+}
+
 /// The viewer's texture lookup must walk **both** hops. Stopping at the first lands on the
 /// material — not an image — which the viewer would hand to an image loader and render blank,
 /// with no error anywhere. Also checks that an unresolved edge is not followed.

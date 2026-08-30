@@ -472,6 +472,14 @@ all land the same transitions:
 | `discovered`/`indexed` → `identified` | a row in `asset_embedding` (with `embedding_dirty = 0`) **and** at least one `asset_tag` |
 | `identified → indexed` | `embedding_dirty = 1` again (the file's bytes changed, so the vector is stale), **or** the asset has no tags |
 
+**`embedding_dirty` means the bytes changed — nothing else may raise it.** An **Identify** kick
+(`mark_for_identify`, `flag_identify_all` / `_untagged` / `_assets`) re-tags; it does not alter a
+single byte, so it leaves an existing vector alone and flags only an asset that has **no**
+`asset_embedding` row — which the embed queue selects on, so a missing vector still gets built.
+Raising it on a good vector makes an asset *less* promotable for having been identified, and on a
+machine with no working embedder nothing ever lowers it again: a 200-asset agent-driven pass on
+2026-08-30 tagged 195 and promoted **zero** for exactly that reason.
+
 `confirmed` is human-set (the P4 accept/reject flow) and the reconcile never touches it. The pass is
 idempotent, so it is safe to run after every drain.
 

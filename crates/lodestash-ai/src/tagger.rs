@@ -92,12 +92,26 @@ pub const MODEL_FACETS: &[&str] = &["subject", "style", "material", "mood", "usa
 /// Per-facet value cap (IDENTIFICATION-AND-SEARCH §2 "validate then write").
 pub const MAX_VALUES_PER_FACET: usize = 8;
 
+/// A value that fills a facet without saying anything.
+///
+/// The prompt asks a model to *omit* a facet rather than guess, and it mostly does — but not
+/// always: a 200-asset run wrote `material:none`, `mood:none` and `free:unspecified` (14 rows
+/// of 1,498). Those are worse than absent. A tag is a claim, they claim nothing, and they land
+/// in the trait cloud as facets a user can click and filter by — `none` is not a material.
+/// Dropped here rather than in one tagger, so every backend is covered by the same rule.
+fn says_nothing(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "none" | "n/a" | "na" | "null" | "unknown" | "unspecified" | "undefined" | "no" | ""
+    )
+}
+
 /// Drop what a model isn't allowed to say and cap what it says too much of, keeping the
 /// highest-confidence values per facet. Runs between [`Tagger::tag`] and the catalog write.
 pub fn validate(tags: Vec<TagAssignment>) -> Vec<TagAssignment> {
     let mut kept: Vec<TagAssignment> = tags
         .into_iter()
-        .filter(|t| MODEL_FACETS.contains(&t.namespace.as_str()))
+        .filter(|t| MODEL_FACETS.contains(&t.namespace.as_str()) && !says_nothing(&t.value))
         .collect();
     // Highest confidence first so the cap keeps the model's best guesses; `None` sorts last but
     // a model-produced tag normally carries a score.
@@ -224,6 +238,25 @@ mod tests {
             )
             .tags
             .is_empty());
+    }
+
+    /// A facet filled with `none` is worse than an empty facet: it reads as a claim, and it
+    /// shows up in the trait cloud as something a user can click. Seen in a real 200-asset run.
+    #[test]
+    fn validate_drops_values_that_say_nothing() {
+        let kept = validate(vec![
+            TagAssignment::exact("material", "none"),
+            TagAssignment::exact("mood", "N/A"),
+            TagAssignment::exact("style", " Unspecified "),
+            TagAssignment::exact("subject", "fog"),
+        ]);
+        assert_eq!(
+            kept.iter()
+                .map(|t| (t.namespace.as_str(), t.value.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("subject", "fog")],
+            "only the tag that says something survives"
+        );
     }
 
     #[test]
