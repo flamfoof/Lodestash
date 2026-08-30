@@ -185,7 +185,7 @@
                       : "Evictable — reclaimed once nothing references it"}
                     data-testid="pack-keep-{p.id}"
                   >
-                    <Icon name="ls-nav-packages" size={14} />
+                    <Icon name="ls-nav-packages" size={16} />
                   </button>
                   <span class="name" title={p.category ?? ""}>{p.name}</span>
                   {#if p.unidentified > 0}

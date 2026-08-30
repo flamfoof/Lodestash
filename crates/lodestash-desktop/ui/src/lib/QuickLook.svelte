@@ -169,7 +169,7 @@
       <Viewer3D assetId={detail.asset_id} textureAssetId={detail.texture_asset_id} />
     {:else if kind === "audio"}
         <div class="audio">
-          <Icon name="ls-type-sound" size={40} />
+          <Icon name="ls-type-sound" size={32} />
           <!-- svelte-ignore a11y_media_has_caption -->
           <audio src={fileUrl(assetId)} controls preload="metadata"></audio>
           <p class="dim">Scrubbing issues Range requests against <code>lodestash://file</code>.</p>
@@ -178,7 +178,7 @@
         <img src={previewUrl(assetId)} alt="" class="vector" />
       {:else}
         <div class="msg stack">
-          <Icon name={typeIcon(detail?.media_type ?? "")} size={40} />
+          <Icon name={typeIcon(detail?.media_type ?? "")} size={32} />
           <p class="dim">No viewer for this type yet.</p>
         </div>
       {/if}

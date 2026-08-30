@@ -162,7 +162,7 @@
 {#if ids.length > 0}
   <div class="tray num" data-testid="staging-tray" role="region" aria-label="Staging tray">
     <span class="count" data-testid="staged-count">
-      <Icon name="ls-action-stage" size={14} />
+      <Icon name="ls-action-stage" size={16} />
       {ids.length} staged
     </span>
     <div class="list">

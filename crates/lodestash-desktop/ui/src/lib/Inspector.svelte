@@ -444,7 +444,7 @@
             {:else if d.media_type !== "model_3d" && !d.in_pack}
               <img src={thumbUrl(d.asset_id)} alt="" onerror={hideBroken} />
             {:else}
-              <Icon name={typeIcon(d.media_type)} size={28} />
+              <Icon name={typeIcon(d.media_type)} size={32} />
             {/if}
           </div>
           <div class="cmp-name" title={d.rel_path}>{d.name}</div>
@@ -474,7 +474,7 @@
       {:else if detail.media_type !== "model_3d" && !detail.in_pack}
         <img src={thumbUrl(detail.asset_id)} alt="" onerror={hideBroken} />
       {:else}
-        <Icon name={typeIcon(detail.media_type)} size={40} />
+        <Icon name={typeIcon(detail.media_type)} size={32} />
       {/if}
     </div>
 

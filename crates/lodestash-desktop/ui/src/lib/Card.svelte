@@ -286,7 +286,7 @@
         {/each}
       </span>
     {:else}
-      <Icon name={typeIcon(item.media_type)} size={28} />
+      <Icon name={typeIcon(item.media_type)} size={32} />
     {/if}
 
     {#if isSound && !unreachable}
@@ -394,7 +394,7 @@
         class:unknown={unidentified}
         title={unidentified ? "Unidentified" : item.status}
       >
-        <Icon name={gem} size={14} />
+        <Icon name={gem} size={16} />
       </span>
     </span>
 

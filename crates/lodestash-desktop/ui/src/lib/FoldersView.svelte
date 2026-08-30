@@ -141,7 +141,7 @@
     >→</button>
     <button class="navbtn" onclick={up} aria-label="Up one level" title="Up one level">↑</button>
     <!-- Pack-rooted breadcrumb (PACK-DIRECTORY-NAV §4): the pack is a gold pill, never a link. -->
-    <span class="packpill"><Icon name="ls-unitypackage" size={13} /> {view.packageFilter}</span>
+    <span class="packpill"><Icon name="ls-unitypackage" size={16} /> {view.packageFilter}</span>
     {#each segments as s, i (i)}
       <span class="sep">/</span>
       <button class:on={i === segments.length - 1} onclick={() => view.navDir(segments.slice(0, i + 1).join("/"))}>
@@ -196,10 +196,10 @@
             >
               <span class="chev" aria-hidden="true">
                 {#if node.has_children}
-                  <Icon name={expanded(node.path) ? "ls-action-expand-open" : "ls-action-expand-closed"} size={12} />
+                  <Icon name={expanded(node.path) ? "ls-action-expand-open" : "ls-action-expand-closed"} size={16} />
                 {/if}
               </span>
-              <Icon name={expanded(node.path) ? "ls-folder-open" : "ls-folder"} size={13} />
+              <Icon name={expanded(node.path) ? "ls-folder-open" : "ls-folder"} size={16} />
               <span class="tname">{node.name}</span>
               <span class="tcount num">
                 {node.direct} · {node.recursive}
@@ -222,7 +222,7 @@
           {#each result.tiles as t (t.name)}
             <button class="frow folder" role="row" onclick={() => enter(t.name)}>
               <span class="gdot" aria-hidden="true"></span>
-              <Icon name="ls-folder" size={14} />
+              <Icon name="ls-folder" size={16} />
               <span class="fname">{t.name}</span>
               <span class="num dim" role="cell">—</span>
               <span class="num dim" role="cell">{t.direct} ({t.recursive})</span>
@@ -237,7 +237,7 @@
               ondblclick={() => onopen(item.asset_id)}
             >
               <span class="swatch" aria-hidden="true"></span>
-              <Icon name={typeIcon(item.media_type)} size={14} />
+              <Icon name={typeIcon(item.media_type)} size={16} />
               <span class="fname">{item.name}</span>
               <span class="num" role="cell">{fmtSize(item.size_bytes)}</span>
               <span class="num dim" role="cell">{result.third[i] ?? "—"}</span>
@@ -249,7 +249,7 @@
           <div class="tiles" data-testid="folder-tiles">
             {#each result.tiles as t (t.name)}
               <button class="tile" ondblclick={() => enter(t.name)} onclick={() => enter(t.name)}>
-                <Icon name="ls-folder" size={22} />
+                <Icon name="ls-folder" size={24} />
                 <span class="name">{t.name}</span>
                 <span class="count num">
                   {t.recursive.toLocaleString()}

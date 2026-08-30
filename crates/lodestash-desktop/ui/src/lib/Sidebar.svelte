@@ -102,7 +102,7 @@
         aria-current={view.route === item.route ? "page" : undefined}
         onclick={() => (item.route === "library" ? view.goLibrary() : view.go(item.route))}
       >
-        <Icon name={item.icon} size={18} />
+        <Icon name={item.icon} size={24} />
         <span class="label">{item.label}</span>
         {#if badge > 0}
           <!-- Clamped: the rail is 210px and a real first scan puts 7,667 in this pill, which

@@ -138,10 +138,11 @@ pub(crate) fn build_prompt(
     let evidence = match caption {
         Some(c) => format!(
             "A {} asset in a game-asset library is named \"{}\".\n\
-             A vision model describes it as: \"{}\".",
+             A vision model describes it as: \"{}\".{}",
             media_word(input.media_code),
             input.name,
-            c
+            c,
+            flat_art_caveat(input.media_code)
         ),
         None => format!(
             "A {} asset in a game-asset library is named \"{}\". \
@@ -228,6 +229,29 @@ fn reads_as_prose(text: &str) -> bool {
         .count();
     let digits = text.chars().filter(char::is_ascii_digit).count();
     words >= 2 && digits * 2 < text.len()
+}
+
+/// What a flat asset's pixels can and cannot settle.
+///
+/// A texture is usually an **atlas**: `round crates.png` in the Artificer pack is wood planks
+/// and two rope strips laid out for UVs, with no crate anywhere in the image. A vision model
+/// reads that honestly and answers "a wooden door with horizontal planks and rope accents" —
+/// and the facet model, handed the name *and* that caption, took the caption's word for what
+/// the object **is** and wrote `subject:wooden door`. Four of five samples failed exactly that
+/// way (`sacks` → seed packet, `wheelbarow` and `bucket` → wooden crate), while the one 3D
+/// model in the set — whose preview is a render of the thing itself — came out right.
+///
+/// So this is not model quality and a bigger VLM does not fix it: for flat art the pixels are
+/// evidence about the **surface** and the filename is the evidence about the **subject**. A
+/// game library names its textures after what they clothe, which is exactly the fact the
+/// picture cannot carry.
+fn flat_art_caveat(code: &str) -> &'static str {
+    match code {
+        "texture" | "image" | "sprite" => {
+            " This is flat art and may be a texture atlas or an unwrapped sheet rather than a picture of the object, so trust the name for what the asset is, and the description for what it is made of and how it looks."
+        }
+        _ => "",
+    }
 }
 
 fn media_word(code: &str) -> &str {
@@ -460,6 +484,33 @@ mod tests {
             "array, not object"
         );
         assert!(parse_facets("", 0.7).is_empty());
+    }
+
+    /// A texture atlas does not picture the object it clothes, so the caption cannot settle
+    /// what the asset is — the prompt has to say so. This is the whole reason
+    /// `subject:wooden door` was written onto an asset named `round crates`.
+    #[test]
+    fn flat_art_tells_the_model_the_name_owns_the_subject() {
+        let flat = TagInput {
+            media_code: "image",
+            name: "round crates",
+            image: None,
+        };
+        let p = build_prompt(&flat, Some("a wooden door with rope accents"), &[]);
+        assert!(p.contains("trust the name"), "flat art gets the caveat");
+
+        // A 3D model's preview *is* a render of the object, so its pixels are the better
+        // evidence and the caveat must not appear — it would teach the model to discount them.
+        let solid = TagInput {
+            media_code: "model_3d",
+            name: "SM_Wep_BrokenSword_01",
+            image: None,
+        };
+        let p = build_prompt(&solid, Some("a broken sword"), &[]);
+        assert!(
+            !p.contains("trust the name"),
+            "a rendered model keeps its pixels"
+        );
     }
 
     #[test]

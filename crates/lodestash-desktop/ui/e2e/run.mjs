@@ -3270,6 +3270,32 @@ try {
   // accepts. `links` is top-level on GridQuery while the frontend keeps it inside `filter`, so a
   // browse call that silently 400s would leave the queue in its default order forever — with
   // nothing on screen to show for it.
+  // DESIGN-GUIDELINES §5 names four icon rungs and the shell shipped nine sizes, none of which
+  // were three of the four. Docs cannot police that on their own — `check-docs` reads prose, not
+  // rendered pixels — so the ladder is asserted where it is actually visible.
+  await check("every icon on screen sits on one of the four sizes the guidelines name", async () => {
+    await page.getByRole("button", { name: "Library", exact: true }).click();
+    await page.waitForSelector(".card", { timeout: 5000 });
+    const sizes = await page.$$eval("svg.icon", (els) =>
+      els
+        .filter((e) => e.getBoundingClientRect().width > 0) // a hidden icon measures 0, not a rung
+        .map((e) => Math.round(e.getBoundingClientRect().width)),
+    );
+    assert.ok(sizes.length > 0, "no icons rendered — the check would pass on an empty page");
+    const ladder = new Set([16, 20, 24, 32]);
+    const strays = [...new Set(sizes.filter((w) => !ladder.has(w)))].sort((a, b) => a - b);
+    assert.deepEqual(strays, [], `off-ladder icon width(s): ${strays.join(", ")}`);
+    // The nav rung is the one the three specs disagreed about, so name it outright.
+    // `nav[aria-label="Main"]` — the sidebar. A bare `nav` matches TopBar's category tabs first,
+    // which sit on the 20px toolbar rung and would have made this assert the wrong element.
+    const nav = await page
+      .locator('nav[aria-label="Main"] svg.icon')
+      .first()
+      .evaluate((e) => Math.round(e.getBoundingClientRect().width))
+      .catch(() => null);
+    if (nav !== null) assert.equal(nav, 24, "the nav glyph is not the 24px DESIGN-GUIDELINES §5 rung");
+  });
+
   await check("the grid's own query is a shape set_appraise_focus accepts", async () => {
     const query = {
       tab: "all", search: "", search_mode: "tags", ids: [], status: "all",

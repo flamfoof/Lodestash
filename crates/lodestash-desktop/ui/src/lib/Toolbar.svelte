@@ -192,7 +192,7 @@
         data-testid="fav-toggle"
         title="Show only starred assets"
       >
-        <Icon name="ls-nav-favorites" size={14} />
+        <Icon name="ls-nav-favorites" size={20} />
         Favorites
         {#if favorites > 0}
           <span class="badge num" data-testid="fav-badge">{favorites}</span>
@@ -227,7 +227,7 @@
         title="Grid"
         aria-label="Grid view"
       >
-        <Icon name="ls-view-grid" size={16} />
+        <Icon name="ls-view-grid" size={20} />
       </button>
       <button
         class="icon-btn"
@@ -239,7 +239,7 @@
         title="List"
         aria-label="List view"
       >
-        <Icon name="ls-view-list" size={16} />
+        <Icon name="ls-view-list" size={20} />
       </button>
       <button
         class="icon-btn"
@@ -251,7 +251,7 @@
         title="Folders"
         aria-label="Folders view"
       >
-        <Icon name="ls-nav-packages" size={16} />
+        <Icon name="ls-nav-packages" size={20} />
       </button>
     </div>
 
@@ -265,7 +265,7 @@
           title={d.label}
           aria-label={d.label}
         >
-          <Icon name={d.icon} size={16} />
+          <Icon name={d.icon} size={20} />
         </button>
       {/each}
     </div>
@@ -301,7 +301,7 @@
       title="Inspector"
       aria-label="Toggle inspector"
     >
-      <Icon name="ls-action-filters" size={16} />
+      <Icon name="ls-action-filters" size={20} />
     </button>
   </div>
 </div>

@@ -276,18 +276,39 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       **Model quality is now the limit, not the pipeline.** moondream called a labelled beer crate
       an *urn* (the source of the old `subject:urn` across all four facets) and a bucket a *wooden
       board*. A stronger vision model is the next lever.
-- [ ] **`identify_asset`'s job finishes before its work does.** The engine job flips `done` in ~5 s
-      while the writer's appraise pass runs ~80 s. Everything downstream believes it: an agent
-      reads empty tags, a caller that treats `done` as "safe to exit" kills the pass mid-flight.
-      The job should finish when the writer op returns.
-- [ ] **Icon ladder — three specs, three answers.** DESIGN-GUIDELINES §5 says 16/20/24/32,
-      UI-SPEC §0.1 says the nav glyph is 16 ("32px row: 16px glyph"), and the code uses a coherent
-      14/18/22/28/40. Neither doc matches the app and they do not match each other — the same
-      shape of bug as the §0.4-vs-§9 keyboard-map disagreement. Screenshotted both ladders in the
-      running app (2026-08-30): DG's 24px nav icons nearly fill the 32px row and shift every label
-      right; the shipped 18px reads lighter. Nothing is visually broken either way, so this is a
-      weight decision, not a defect — but one of the three has to become the answer and the other
-      two have to be corrected in the same change.
+- [x] **`identify_asset`'s job finished before its work did — fixed 2026-08-30.** Two nested jobs:
+      the headless MCP server created one, its thread POSTed `/v1/identify` to the running app, and
+      the app answered `202` with a job of *its own* and started the writer pass. The bridge took
+      that `202` as completion, so the outer job flipped `done` in about five seconds while the
+      writer ran on for eighty. An agent that polled `get_job_status`, saw `done` and read the asset
+      back got the tags as they were before it asked; a caller that exited on `done` killed the app
+      mid-pass (it fooled three of this session's own diagnostic runs). `changed_from` now
+      recognises a job body and `await_job` polls `/v1/jobs/{id}` to a terminal state before
+      returning, reporting the inner job's `changed` — so the outer job ends when the inner one
+      does. 30-minute backstop, and blowing it says so with the job id rather than pretending
+      failure.
+- [x] **Local tagging: the vision model was not the bottleneck — fixed 2026-08-30.** Pulled
+      `qwen2.5vl:7b` (6 GB) and re-tagged the moondream sample. The 3D case improved outright: a
+      labelled beer crate went from `subject:urn` to `subject:wooden crate`. The four **image**
+      cases stayed wrong, and pulling the bytes out of the pack said why — `round crates.png` is a
+      texture *atlas*, wood planks and rope strips laid out for UVs, with no crate in the picture.
+      The model was reading it correctly; the facet model was then trusting the caption over the
+      artist's own filename. One clause added to the facet prompt for `texture`/`image`/`sprite`
+      (`flat_art_caveat`), A/B'd against the live model with the caption held fixed: `round crates`
+      `door` → `crates`, `bucket` `crate` → `bucket`. Unit-tested both directions — a 3D model must
+      **not** get the clause, since its preview is a render of the object and the pixels are the
+      better evidence. Written up in [`AI-PIPELINE.md`](AI-PIPELINE.md) §2.
+- [x] **Icon ladder — settled on DESIGN-GUIDELINES §5 (2026-08-30).** DG said 16/20/24/32, UI-SPEC
+      §0.1 said the nav glyph is 16, and the shell shipped nine sizes with nav at 18 — three
+      sources, three answers, so "conform to the spec" was not a well-defined action. Both ladders
+      were rendered and compared in the running app; DG's wins, UI-SPEC §0.1 is corrected to 24, and
+      every `<Icon size>` in the shell is now one of the four rungs (17×16, 12×20, 4×24, 7×32). The
+      32 rung gained *art placeholders* — the card / Inspector / Quick Look type mark, previously 28
+      and 40 — because that role was real and unnamed. Recorded as
+      [ADR-0012](decisions/ADR-0012-one-icon-ladder.md), and **checked**: an e2e case measures every
+      rendered `svg.icon` and asserts the widths are a subset of the ladder, with the nav glyph
+      pinned at 24 (a bare `nav` selector matches TopBar's tabs first, which are 20 — the check
+      names `nav[aria-label="Main"]` for that reason).
 - [ ] **In-pack materials get no preview.** `ServerState::preview_subject` resolves a material's
       shader ball from the material's own `disk_path`, which an in-pack material does not have, so
       `engine_preview_fn` bails before it renders. 21 of the Artificer pack's 52 assets, and every
@@ -847,7 +868,8 @@ facet-group owner call).
       and only the letter; exact size is on hover, which is what the **list row** has always done
       — the card was the odd one out. `Card.svelte`'s own comment claimed size had "moved to the
       tier chip"; both rendered it.
-- [ ] **Icon sizes diverge** — nav 18 (DG 24), toolbar 14–16 (DG 20), type marks 28–40 (DG 32).
+- [x] **Icon sizes diverge** — closed by [ADR-0012](decisions/ADR-0012-one-icon-ladder.md); the
+      same defect as the "Icon ladder" card above, filed twice on one board.
 - [x] **Sort options — done 2026-08-29.** *Date added* (`asset.id`, which is insert order, so no
       timestamp column was needed) and *Status* (lifecycle rank, Unidentified first — not the code
       string, which would sort `confirmed` between `discovered` and `indexed`). Both

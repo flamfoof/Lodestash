@@ -167,7 +167,12 @@ that changes state. **The grid is never what shrinks to make room for a control.
 
 - **Style:** 24×24 grid, **stroke-width 1.8**, round caps/joins, minimal fill.
   A faint **gem/diamond motif** ties the set to the theme (status gems, logo star).
-- **Sizes:** 16 (inline/rows), 20 (toolbar), 24 (nav), 32 (empty states).
+- **Sizes:** 16 (inline/rows), 20 (toolbar), 24 (nav), 32 (empty states **and art placeholders** —
+  the type mark a card, the Inspector or Quick Look draws where a preview would go).
+  **This ladder is the answer** (2026-08-30): the shell shipped a parallel 14/18/22/28/40 and
+  `UI-SPEC.md` §0.1 a third reading (nav 16), so all three disagreed. Every `<Icon size>` in the
+  shell is now one of these four rungs and nothing else — a fifth value in a diff is a bug, not a
+  refinement.
 - **Glyphs are not the fallback for a missing icon — and they are not missing.** Several notes in
   [`UI-SPEC.md`](UI-SPEC.md) (§1's ⌕, §15's ◉, §13.9's ⧉, §13.6's chain glyph) record a symbol being
   dropped *because the bundled fonts render it as tofu*. **Measured in the running app on

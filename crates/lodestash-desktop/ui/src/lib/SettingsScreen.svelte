@@ -989,7 +989,7 @@
                     : "Kept — the source archive is gone, so this copy is the only one"}
                   data-testid="keep-cached-{p.id}"
                 >
-                  <Icon name="ls-nav-packages" size={14} />
+                  <Icon name="ls-nav-packages" size={16} />
                 </button>
                 <span class="name" title={p.package_path}>{p.name}</span>
                 <span class="num mono">{p.files.toLocaleString()} files</span>

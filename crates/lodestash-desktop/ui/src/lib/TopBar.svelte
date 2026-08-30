@@ -167,7 +167,7 @@
 
 <header class="topbar">
   <div class="brand">
-    <Icon name="ls-logo" size={22} />
+    <Icon name="ls-logo" size={24} />
     <span class="wordmark">LODESTASH</span>
   </div>
 
@@ -175,7 +175,7 @@
        escalation offered inside the results (LibraryScreen), reachable from here with Enter. The
        arcane border is a read-out of which engine answered, not a switch you set first. -->
   <div class="search" class:ai={view.searchMode === "ai"}>
-    <Icon name={view.searchMode === "ai" ? "ls-search-ai" : "ls-search-tags"} size={16} />
+    <Icon name={view.searchMode === "ai" ? "ls-search-ai" : "ls-search-tags"} size={20} />
     <input
       type="text"
       placeholder="Search your hoard"
@@ -190,7 +190,7 @@
     {/if}
     {#if view.search.trim() && view.searchMode !== "ai"}
       <button class="ask" onclick={() => view.askAi()} data-testid="search-ask-ai">
-        <Icon name="ls-search-ai" size={12} /> Enter to ask AI
+        <Icon name="ls-search-ai" size={16} /> Enter to ask AI
       </button>
     {/if}
   </div>
@@ -207,7 +207,7 @@
           onclick={() => (view.tab = tab.id)}
           data-testid="tab-{tab.id}"
         >
-          <Icon name={tab.icon} size={14} />
+          <Icon name={tab.icon} size={20} />
           {tab.label}
           <span class="count num">{count.toLocaleString()}</span>
         </button>
@@ -242,7 +242,7 @@
       onclick={toggle}
     >
       <span class="dot" class:on={activeProject !== null}></span>
-      <Icon name="ls-project" size={14} />
+      <Icon name="ls-project" size={16} />
       <!-- UI-SPEC §0.1.6: the chip is `Name · Engine`. Which editor an export lands in is half
            the fact; a bare project name leaves the Unity version to be guessed. -->
       <span class="label">

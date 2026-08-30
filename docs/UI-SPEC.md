@@ -77,7 +77,7 @@ One window, three fixed regions plus overlays:
 **⚖ Resolution:** the prototype's single labeled sidebar **replaces** the earlier icon-only nav rail.
 One vertical panel, three stacked groups:
 
-1. **Navigation** — 10 destinations, each a 32px row: 16px glyph + label + optional warn-badge
+1. **Navigation** — 10 destinations, each a 32px row: 24px glyph + label + optional warn-badge
    (amber pill, mono count). Active row: `--ls-overlay` fill + 2px gold left-border.
 
    | Destination | Icon (`ls-*`) | Badge |

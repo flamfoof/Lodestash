@@ -90,7 +90,7 @@ fn post(
         .set("authorization", &format!("Bearer {}", h.token))
         .send_json(body.clone());
     match resp {
-        Ok(r) => changed_from(r),
+        Ok(r) => changed_from(h, r),
         // A 4xx/5xx carries the engine's own error body, which says more than the status.
         Err(ureq::Error::Status(code, r)) => {
             let text = r.into_string().unwrap_or_default();
@@ -102,20 +102,75 @@ fn post(
     }
 }
 
-/// `{"changed": n}` for the synchronous writes; a job body for the long-running ones
-/// (`identify`, `unpack`), which report **1 job accepted** rather than a row count the caller
-/// cannot have yet. Reporting 0 there would read as "nothing happened".
-fn changed_from(r: ureq::Response) -> Result<usize, String> {
+/// `{"changed": n}` for the synchronous writes; for the long-running ones (`identify`, `unpack`)
+/// the app answers `202` with a **job body**, and this waits for that job.
+///
+/// The wait is the point. Without it a forwarded `identify_asset` reported success in about five
+/// seconds while the app's writer was eighty seconds into the pass: the headless server's own job
+/// finished when the *POST* returned, not when the work did. An agent that polls `get_job_status`,
+/// sees `done` and reads the asset back then gets the tags as they were before it asked — and a
+/// caller that exits on `done` kills the app mid-pass. Two nested jobs, one of which knew nothing
+/// about the other. Now the outer one ends when the inner one does.
+fn changed_from(h: &lodestash_api::Handshake, r: ureq::Response) -> Result<usize, String> {
     let v: serde_json::Value = r
         .into_json()
         .map_err(|e| format!("the app's reply was not JSON: {e}"))?;
     if let Some(n) = v.get("changed").and_then(serde_json::Value::as_u64) {
         return Ok(n as usize);
     }
-    if v.get("job_id").is_some() {
-        return Ok(1);
+    match v.get("job_id").and_then(serde_json::Value::as_str) {
+        Some(id) => await_job(h, id),
+        None => Ok(0),
     }
-    Ok(0)
+}
+
+/// Poll one of the app's jobs to a terminal state and report what it changed.
+///
+/// A second every second: these passes run in tens of seconds and the poll is a loopback GET, so
+/// there is nothing to gain from being cleverer. The cap is a backstop against a wedged pass
+/// holding this thread forever — it is not a work budget, and blowing it is reported as exactly
+/// what it is, with the job id, so the caller can go on polling that job itself.
+fn await_job(h: &lodestash_api::Handshake, id: &str) -> Result<usize, String> {
+    const POLL: std::time::Duration = std::time::Duration::from_secs(1);
+    const CAP: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+    let url = format!("http://127.0.0.1:{}/v1/jobs/{id}", h.port);
+    let started = std::time::Instant::now();
+    loop {
+        let v: serde_json::Value = ureq::get(&url)
+            .set("authorization", &format!("Bearer {}", h.token))
+            .call()
+            .map_err(|e| format!("lost track of job {id} while it ran ({e})"))?
+            .into_json()
+            .map_err(|e| format!("the app's job reply was not JSON: {e}"))?;
+        match v.get("state").and_then(serde_json::Value::as_str) {
+            // `changed` is the row count the pass reconciled; a job that finished without one
+            // still did something, so report the job itself rather than a bare zero.
+            Some("done") => {
+                return Ok(v
+                    .get("result")
+                    .and_then(|r| r.get("changed"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(1) as usize)
+            }
+            Some("error") => {
+                let why = v
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("no reason given");
+                return Err(format!("the app's {id} failed: {why}"));
+            }
+            Some("cancelled") => return Err(format!("the app's {id} was cancelled")),
+            _ => {}
+        }
+        if started.elapsed() > CAP {
+            return Err(format!(
+                "{id} is still running after {} minutes — it was not abandoned, poll it in the app",
+                CAP.as_secs() / 60
+            ));
+        }
+        std::thread::sleep(POLL);
+    }
 }
 
 #[cfg(test)]

@@ -184,7 +184,7 @@
     aria-label="Welcome to Lodestash"
   >
     <header>
-      <span class="gem" aria-hidden="true"><Icon name="ls-logo" size={18} /></span>
+      <span class="gem" aria-hidden="true"><Icon name="ls-logo" size={24} /></span>
       <h1>{step === 1 ? "Point it at your hoard." : "Scanning."}</h1>
       <span class="stepno num">step {step}/2</span>
       <button class="close" onclick={onclose} aria-label="Close" disabled={busy}>✕</button>
@@ -273,7 +273,7 @@
                tofu, exactly as §15's ◉ did. The fonts ship with the app for the offline
                invariant, so "use a font that has it" is not on the table — the icon set is. -->
           <button class="arcane-btn" onclick={scan} disabled={busy} data-testid="onboarding-scan">
-            <Icon name="ls-search" size={14} /> Scan sources
+            <Icon name="ls-search" size={16} /> Scan sources
           </button>
         {/if}
         <button class="go" onclick={done} disabled={busy} data-testid="onboarding-go"

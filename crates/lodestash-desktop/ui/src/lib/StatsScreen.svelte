@@ -205,7 +205,7 @@
         {#each stats.by_type as t (t.media_type)}
           <div class="bar-row">
             <span class="bar-label" style="--tint: var({typeToken(t.media_type)})">
-              <Icon name={typeIcon(t.media_type)} size={14} />
+              <Icon name={typeIcon(t.media_type)} size={16} />
               {t.media_type}
             </span>
             <div class="track">

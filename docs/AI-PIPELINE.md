@@ -81,6 +81,26 @@ which FTS indexes, so a word the model saw but the filename never contained stil
 A machine with no vision model installed still tags from names alone, at a lower confidence (0.4 vs
 0.7) because a name is a weaker claim than pixels.
 
+**For flat art, the name outranks the picture — for a 3D model it does not.** Measured on the
+Artificer pack (2026-08-30): `round crates.png` is a texture **atlas** — wood planks and two rope
+strips laid out for UVs, with no crate in the image at all. `qwen2.5vl:7b` describes it accurately
+as *"a rustic wooden door with horizontal planks and rope accents"*, and the facet model then wrote
+`subject:wooden door` onto an asset the artist named *round crates*. Four of five samples failed
+that way (`sacks` → seed packet, `wheelbarow` and `bucket` → wooden crate); the one **3D model** in
+the set, whose preview is a render of the object itself, came out right. So the facet prompt now
+carries one extra clause for `texture`/`image`/`sprite`: the pixels are evidence about the surface,
+the filename is the evidence about the subject. A/B against the live model, same caption, prompt
+the only variable:
+
+| asset | without the clause | with it |
+|---|---|---|
+| `round crates` | `subject: door` | `subject: crates` |
+| `bucket` | `subject: crate` | `subject: bucket` |
+
+This is **not** a model-size problem and a bigger VLM does not fix it — the information is not in
+the image. It is also why upgrading moondream → `qwen2.5vl:7b` improved the 3D case (a labelled
+beer crate went from *urn* to *wooden crate*) while leaving the texture cases wrong.
+
 The tagger returns **proposals**, never writes: `lodestash_ai::tagger::validate` drops facets a
 model may not fill (`color`/`technical`/`audio` — §2 of IDENTIFICATION-AND-SEARCH) and caps values
 per facet, then `Catalog::set_tags` normalizes and persists. Same "validate then write" seam the
