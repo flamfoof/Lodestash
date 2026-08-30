@@ -227,6 +227,10 @@ pub struct AssetSummaryRow {
     pub disk_path: Option<String>,
     pub workspace_rel: Option<String>,
     pub metrics: AssetMetrics,
+    /// The asset's tags (ENGINE-API §3). Filled by [`Catalog::asset_summaries`] — an agent that
+    /// has just written a tag has to be able to read it back, and this field answered `[]`
+    /// unconditionally while the plane called that "interim, tagging is P4".
+    pub tags: Vec<TagAssignment>,
 }
 
 /// One asset's catalog identity for the UI join (grid read path).
@@ -4732,6 +4736,31 @@ impl Catalog {
     /// Assets still awaiting identification (`tags_dirty`), for the tagging drain. Same job shape
     /// and path rules as the other queues.
     pub fn assets_needing_tags(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
+        self.assets_needing_tags_within(limit, None)
+    }
+
+    /// The tag queue, optionally **restricted to an explicit set** of assets.
+    ///
+    /// `identify_asset(ids)` needs this. Without it the op flagged the requested assets and then
+    /// ran a generic bounded pass, which takes the front of the *global* queue — 8,155 rows deep
+    /// on the reference library, ordered by the appraise focus — so the three assets an agent
+    /// asked about were nowhere near it and came back untouched while the call reported success.
+    pub fn assets_needing_tags_within(
+        &self,
+        limit: usize,
+        only: Option<&[i64]>,
+    ) -> Result<Vec<VisualEmbedJob>> {
+        // Inlined rather than bound: an id list is a variable-length set and these are i64s the
+        // caller already holds, never user text.
+        let scope = match only {
+            Some(ids) if !ids.is_empty() => format!(
+                "AND a.id IN ({})",
+                ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+            ),
+            // An explicit *empty* set asks for nothing, which is not the same as "everything".
+            Some(_) => "AND 0".to_string(),
+            None => String::new(),
+        };
         let mut stmt = self
             .conn
             .prepare(&format!(
@@ -4748,6 +4777,7 @@ impl Catalog {
                  LEFT JOIN package pk       ON pk.id = pe.package_id
                  WHERE a.tags_dirty = 1 AND a.deleted_at IS NULL
                    AND af.missing = 0
+                 {scope}
                  {order} LIMIT ?1",
                 order = self.appraise_focus.order_by("a.id")
             ))
@@ -5448,11 +5478,16 @@ impl Catalog {
                         disk_path: r.get(9)?,
                         workspace_rel: r.get(10)?,
                         metrics: AssetMetrics::from_row(r, 11)?,
+                        tags: Vec::new(),
                     })
                 })
                 .optional()
                 .map_err(|e| CoreError::Catalog(format!("summary query: {e}")))?;
-            if let Some(row) = row {
+            if let Some(mut row) = row {
+                // One small query per row rather than a join: `tags_for_asset` already
+                // exists and the caller has just ranked these ids, so the set is a page,
+                // not the library. Tag read failure is not summary failure.
+                row.tags = self.tags_for_asset(row.id).unwrap_or_default();
                 found.insert(row.id, row);
             }
         }

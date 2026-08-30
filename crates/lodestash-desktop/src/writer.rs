@@ -982,6 +982,7 @@ impl Writer {
                                     std::time::Duration::from_secs(1),
                                     &appraise,
                                     &focus,
+                                    None,
                                 );
                                 pump.store(false, Ordering::Relaxed);
                                 if r.map(|w| w.changed > 0).unwrap_or(false) {
@@ -1098,6 +1099,11 @@ fn appraise_pass(
     budget: std::time::Duration,
     progress: &AppJobProgress,
     focus: &Mutex<AppraiseFocus>,
+    // The explicit set `identify_asset` was asked about, or `None` for the idle slice over
+    // the whole queue. Without it the op flagged the requested assets and then appraised the
+    // front of the global queue instead — 8,155 rows deep here, so the assets an agent asked
+    // about came back untouched while the call reported success.
+    only: Option<&[i64]>,
 ) -> Result<WriteResult, String> {
     // UI-SPEC §3: what the user is looking at goes first. Refreshed here rather than at each call
     // site because every pass — the idle slice, ✦ Identify all, a per-card kick — must read the
@@ -1169,6 +1175,7 @@ fn appraise_pass(
         cache_dir.as_deref(),
         progress,
         TAG_BUDGET_PER_PASS,
+        only,
     );
     if let Some(az) = audio_shot.as_ref() {
         drain_audio_tags(
@@ -1667,6 +1674,7 @@ fn run(
                 std::time::Duration::from_secs(20),
                 progress,
                 focus,
+                None,
             );
             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
             jobs.finish(job.id, result.is_ok(), false, changed);
@@ -1694,6 +1702,7 @@ fn run(
                 std::time::Duration::from_secs(20),
                 progress,
                 focus,
+                None,
             );
             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
             jobs.finish(job.id, result.is_ok(), false, changed);
@@ -1726,6 +1735,7 @@ fn run(
                 std::time::Duration::from_secs(20),
                 progress,
                 focus,
+                Some(&asset_ids),
             );
             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
             jobs.finish(job.id, result.is_ok(), false, changed);

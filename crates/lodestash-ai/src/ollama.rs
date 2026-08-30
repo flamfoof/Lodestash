@@ -193,18 +193,41 @@ fn caption_prompt(media_code: &str) -> String {
     )
 }
 
-/// Trim the noise small captioners prepend (`moondream` emits a literal `!!!IMPORTANT!!!`) and cap
-/// the length, since a caption is a description and not an essay.
+/// Trim the noise small captioners prepend (`moondream` emits a literal `!!!IMPORTANT!!!`, and
+/// `IMAGE!!!`) and cap the length, since a caption is a description and not an essay.
+///
+/// Also **rejects an answer that is not prose**. A caption is written to `asset.description`,
+/// which FTS indexes, so a bad one is not merely useless — it is searchable noise sitting on the
+/// asset for ever. Observed on the reference library: asked to describe a pile of sacks,
+/// `moondream` answered `ids: [0.17, 0.13, 0.83, 0.37]` — bounding boxes, not a sentence. The
+/// same failure fed `mood:"0 71"`-style tags before [`is_label`] started rejecting those.
 fn clean_caption(raw: &str) -> Option<String> {
     let text = raw
         .trim()
         .trim_start_matches(|c: char| c == '!' || c == '*' || c == '#' || c.is_whitespace());
-    let text = text.strip_prefix("IMPORTANT").unwrap_or(text);
+    // Small captioners announce themselves before answering; the words vary, the shape does not.
+    let text = ["IMPORTANT", "IMAGE", "ANSWER", "CAPTION"]
+        .iter()
+        .find_map(|p| text.strip_prefix(p))
+        .unwrap_or(text);
     let text = text.trim_start_matches([':', '!', '-', ' ']).trim();
-    if text.is_empty() {
+    if !reads_as_prose(text) {
         return None;
     }
     Some(text.chars().take(300).collect())
+}
+
+/// Does this look like a sentence about an asset, rather than a machine's scratch output?
+///
+/// Two words of actual letters, and not majority digits. Deliberately crude: the job is to catch
+/// coordinate dumps and empty answers, not to grade English.
+fn reads_as_prose(text: &str) -> bool {
+    let words = text
+        .split_whitespace()
+        .filter(|w| w.chars().any(char::is_alphabetic))
+        .count();
+    let digits = text.chars().filter(char::is_ascii_digit).count();
+    words >= 2 && digits * 2 < text.len()
 }
 
 fn media_word(code: &str) -> &str {
@@ -220,6 +243,16 @@ fn media_word(code: &str) -> &str {
 /// Parse `{"subject": ["rock"], "style": ["low-poly"]}` into assignments. Unknown facets and
 /// non-string values are dropped here; [`crate::tagger::validate`] still runs afterwards, since
 /// this is the model's output and the rule is validate-then-write.
+/// Is this string a label a person would search for?
+///
+/// A small model asked for facets sometimes answers with its own confidence numbers instead —
+/// the reference catalog carried `mood:"0 71"`, `style:"0 67"`, `subject:"0 73"` and
+/// `material:"01"` from exactly that, which are unsearchable and pollute every autocomplete.
+/// A tag has to contain a letter; digits are fine *inside* one (`4k`, `pbr2`).
+fn is_label(value: &str) -> bool {
+    value.chars().any(char::is_alphabetic)
+}
+
 pub(crate) fn parse_facets(json: &str, confidence: f64) -> Vec<TagAssignment> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
         return Vec::new();
@@ -246,7 +279,7 @@ pub(crate) fn parse_facets(json: &str, confidence: f64) -> Vec<TagAssignment> {
                 value: item.trim().to_string(),
                 confidence: Some(confidence),
             };
-            if !tag.value.is_empty() && !out.contains(&tag) {
+            if is_label(&tag.value) && !out.contains(&tag) {
                 out.push(tag);
             }
         }
@@ -345,6 +378,50 @@ mod tests {
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
         // Bytes above 0x7f exercise the 62/63 alphabet entries.
         assert_eq!(base64(&[0xfb, 0xff, 0xfe]), "+//+");
+    }
+
+    /// A caption lands in `asset.description`, which FTS indexes — so a non-answer is not
+    /// harmless, it is permanent searchable noise. Every string here came off the reference
+    /// library or its model.
+    #[test]
+    fn a_caption_has_to_read_as_prose() {
+        // Real `moondream` output when asked to describe a pile of sacks.
+        assert_eq!(clean_caption("ids: [0.17, 0.13, 0.83, 0.37]"), None);
+        assert_eq!(clean_caption("   "), None);
+        assert_eq!(clean_caption("!!!"), None);
+        assert_eq!(clean_caption("0.42"), None);
+        // The announcement prefixes get trimmed, and the sentence survives.
+        assert_eq!(
+            clean_caption("IMAGE!!! is a 2D image of a wooden board").as_deref(),
+            Some("is a 2D image of a wooden board"),
+        );
+        assert_eq!(
+            clean_caption("!!!IMPORTANT!!!: a rusty metal barrel").as_deref(),
+            Some("a rusty metal barrel"),
+        );
+        // A caption with numbers in it is still a caption.
+        assert_eq!(
+            clean_caption("a 4k texture of 2 wooden crates").as_deref(),
+            Some("a 4k texture of 2 wooden crates"),
+        );
+    }
+
+    /// A model that answers with its own confidence numbers must not seed the vocabulary.
+    /// Six such rows existed in the reference catalog before this guard.
+    #[test]
+    fn numeric_answers_are_not_labels() {
+        let json =
+            r#"{"subject":["0 73","crate"],"mood":"0 71","style":["01"],"material":["4k pbr"]}"#;
+        let tags = parse_facets(json, 0.7);
+        let got: Vec<(&str, &str)> = tags
+            .iter()
+            .map(|t| (t.namespace.as_str(), t.value.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("material", "4k pbr"), ("subject", "crate")],
+            "only the values a person could search for survive: {tags:?}"
+        );
     }
 
     #[test]
@@ -454,8 +531,10 @@ mod tests {
             Some("A stone wall.**".to_string())
         );
         assert_eq!(clean_caption("   !!!  "), None);
+        // Real words, because a 400-character single token is not a long caption — it is not
+        // a caption at all, and `reads_as_prose` now says so.
         assert_eq!(
-            clean_caption(&"x".repeat(400)).map(|c| c.len()),
+            clean_caption(&"a wooden crate ".repeat(40)).map(|c| c.len()),
             Some(300),
             "a caption is a description, not an essay"
         );

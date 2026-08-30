@@ -136,8 +136,10 @@ in-editor import (§5). Both reuse the **same dependency-closure resolution** de
 > **Implementation status (interim).** Until the remaining slices land:
 > `GET /v1/search?mode=ai` answers `501 ai_unavailable` **only while no embedding model is
 > loaded** — with SigLIP/CLAP installed it runs the same RRF-fused hybrid search as the desktop
-> grid. `AssetSummary.tags` is always `[]` (tagging is P4) and its `package` carries
-> `{id, name}` without `publisher`.
+> grid. `AssetSummary.tags` **carries the asset's real tags since 2026-08-30** — it answered `[]`
+> unconditionally while this note called it interim, so an agent that wrote a tag through
+> `add_tag` read the asset back and saw none, which makes a write unverifiable from the plane that
+> made it. Its `package` still carries `{id, name}` without `publisher`.
 > `Package` is complete as of 2026-08-28 — `version`, `license`, `license_url`, `attribution` and
 > `pipeline` all ship (the licence harvest, INGESTION §2). `license` is `null` only where the pack
 > stated none **and** did not come from the Asset Store cache; `pipeline` is `null` where detection

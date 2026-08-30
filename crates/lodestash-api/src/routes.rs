@@ -651,7 +651,13 @@ pub fn summary_json(r: &AssetSummaryRow) -> Value {
         "format": r.format,
         "status": r.status,
         "package": r.package_id.map(|id| json!({ "id": id, "name": r.package_name })),
-        "tags": [],
+        // Real tags since 2026-08-30. This answered `[]` unconditionally, so an agent that
+        // wrote a tag through `add_tag` read back an asset that appeared to have none.
+        "tags": r.tags.iter().map(|t| serde_json::json!({
+            "namespace": t.namespace,
+            "value": t.value,
+            "confidence": t.confidence,
+        })).collect::<Vec<_>>(),
         "preview_url": format!("/v1/assets/{}/preview", r.id),
         "file_url": format!("/v1/assets/{}/file", r.id),
     })

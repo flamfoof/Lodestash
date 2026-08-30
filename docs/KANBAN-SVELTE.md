@@ -237,6 +237,69 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       tag written over MCP appears in the app.
       *Still open:* the Streamable-HTTP MCP transport on the stable port 4319 (UI-SPEC §11.5), and
       `remove_tag`/`unstage` have neither a REST route nor a tool.
+- [x] **Two tag-vocabulary defects, found while preparing a tagging batch (2026-08-30).**
+      **171 of 210 tag rows were the e2e suite's own residue.** The NEW TRAIT check named its
+      trait `e2e-trait-${Date.now()}` and "cleaned up" with `unpromote_trait`, which demotes a
+      trait to a plain tag rather than deleting it — so every run left one more row and the
+      comment claimed the opposite of what happened. Now a **fixed** name (`upsert_trait` is
+      idempotent on the normalised name, so the suite costs the vocabulary exactly one row, for
+      ever) plus an assertion that no more than one `e2e-` row exists, so the next leak fails a
+      check instead of accumulating for weeks. The 171 were purged.
+      **And the tagger emitted numbers as labels** — `mood:"0 71"`, `style:"0 67"`,
+      `subject:"0 73"`, `material:"01"`: its own confidences landing in label slots. `parse_facets`
+      validated the *facet* name and never the value. It now requires a tag to contain a letter
+      (digits are fine inside one — `4k`, `pbr2`), which is the guard that keeps a small model's
+      arithmetic out of the autocomplete. Six rows purged.
+- [x] **`identify_asset(ids)` did not identify those ids — fixed 2026-08-30.** The op flagged the
+      requested assets (`mark_for_identify`) and then ran a *generic* bounded appraise pass, which
+      takes the front of the **global** queue in appraise-focus order. With 8,155 dirty rows on the
+      reference library, three assets an agent asked about were nowhere near the front: the call
+      returned a job, the job reported `done` in 5s, and every requested asset came back with
+      `tags_dirty` still 1 and no tags — success by every signal the caller could see.
+      `assets_needing_tags_within` now takes the explicit set, threaded through `drain_tags` and
+      `appraise_pass`; the idle slice still passes `None` for the whole queue. An explicit **empty**
+      set means nothing, not everything (mutation-checked — that inversion is how a scoping bug
+      turns into a full-library appraisal).
+- [x] **Ollama tagging, end to end — proven 2026-08-30, with four defects found doing it.**
+      `qwen3:8b` (facets) + `moondream:latest` (caption) over the MCP plane, writing through the
+      app's single writer: *tagging pass finished tags=17*, then *tags=15* on a second batch.
+      **(1)** `identify_asset`'s job reports `done` in ~5 s while the pass runs ~80 s — an agent
+      that polls `get_job_status`, sees `done` and reads the tags gets an empty answer, and a
+      caller that exits on it kills the work. Fooled three of my own runs before the app log gave
+      it away. *Still open — carded below.*
+      **(2)** `identify_asset(ids)` appraised the front of the global queue, not the ids — fixed.
+      **(3)** `AssetSummary.tags` answered `[]` unconditionally, so a written tag could not be read
+      back through the plane that wrote it — fixed, `asset_summaries` fills it.
+      **(4)** A caption that is not prose landed in `asset.description`, which FTS indexes:
+      `moondream` answered `ids: [0.17, 0.13, 0.83, 0.37]` when asked to describe a pile of sacks —
+      fixed, `clean_caption` requires prose and strips `IMAGE!!!` too.
+      **Model quality is now the limit, not the pipeline.** moondream called a labelled beer crate
+      an *urn* (the source of the old `subject:urn` across all four facets) and a bucket a *wooden
+      board*. A stronger vision model is the next lever.
+- [ ] **`identify_asset`'s job finishes before its work does.** The engine job flips `done` in ~5 s
+      while the writer's appraise pass runs ~80 s. Everything downstream believes it: an agent
+      reads empty tags, a caller that treats `done` as "safe to exit" kills the pass mid-flight.
+      The job should finish when the writer op returns.
+- [ ] **Icon ladder — three specs, three answers.** DESIGN-GUIDELINES §5 says 16/20/24/32,
+      UI-SPEC §0.1 says the nav glyph is 16 ("32px row: 16px glyph"), and the code uses a coherent
+      14/18/22/28/40. Neither doc matches the app and they do not match each other — the same
+      shape of bug as the §0.4-vs-§9 keyboard-map disagreement. Screenshotted both ladders in the
+      running app (2026-08-30): DG's 24px nav icons nearly fill the 32px row and shift every label
+      right; the shipped 18px reads lighter. Nothing is visually broken either way, so this is a
+      weight decision, not a defect — but one of the three has to become the answer and the other
+      two have to be corrected in the same change.
+- [ ] **In-pack materials get no preview.** `ServerState::preview_subject` resolves a material's
+      shader ball from the material's own `disk_path`, which an in-pack material does not have, so
+      `engine_preview_fn` bails before it renders. 21 of the Artificer pack's 52 assets, and every
+      material in every un-extracted pack. The albedo is reachable — `material_albedo_texture` +
+      the in-pack locator — so the fix is to key the render off the locator and pull the albedo
+      through the same scratch the asset preview uses. Regression from the 2026-08-29 preview work,
+      not a pre-existing gap.
+- [ ] **The agent plane can tag but never untag.** `remove_tag` and `unstage` have no REST route
+      and no MCP tool, so `AgentWrite::RemoveTag`/`UnstageAsset` are refused by the forwarding
+      bridge ([ADR-0011](decisions/ADR-0011-headless-mcp-forwards-writes.md)). That asymmetry
+      matters now that an agent can write tags: a wrong label can only be removed in the app.
+      Adding the tool requires adding the route first — MCP↔REST 1:1.
 - [ ] **`.meta` `labels:` → seed tags.** Parsed by `unitypackage::parse_meta`, never written to
       `tag`/`asset_tag`. INGESTION §2 lists them as seed tags. **Surveyed 2026-08-29 before
       building, and deliberately not built yet:** the reference library carries essentially

@@ -1051,6 +1051,9 @@ pub fn drain_tags(
     cache_dir: Option<&std::path::Path>,
     progress: &crate::jobs::JobProgress,
     max_assets: u32,
+    // Restrict the pass to these assets. `None` = the whole queue (the idle slice);
+    // `Some(ids)` = exactly what `identify_asset` was asked about.
+    only: Option<&[i64]>,
 ) {
     use std::sync::atomic::Ordering;
     const BATCH: usize = 16;
@@ -1074,7 +1077,7 @@ pub fn drain_tags(
         if max_assets != 0 && tagged_assets >= max_assets as usize {
             break;
         }
-        let jobs = match cat.assets_needing_tags(BATCH) {
+        let jobs = match cat.assets_needing_tags_within(BATCH, only) {
             Ok(j) => j,
             Err(e) => {
                 tracing::warn!(%e, "tag queue query failed; retries next run");

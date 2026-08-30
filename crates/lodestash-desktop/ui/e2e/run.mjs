@@ -2802,7 +2802,13 @@ try {
   // rejected every create with "missing required key" and only the error bar showed. The full
   // UI path, verified through a separate read call, not the response.
   await check("NEW TRAIT creates a trait through the screen", async () => {
-    const name = `e2e-trait-${Date.now()}`;
+    // A **fixed** name, not a timestamped one. `unpromote_trait` below demotes the row; it
+    // does not delete it, so a per-run name left one plain tag behind every single run —
+    // 171 of the 210 rows in the reference catalog were this check's residue, and the
+    // cleanup comment claimed the opposite. `upsert_trait` is idempotent on the
+    // normalised name, so a fixed one re-promotes the same row and the suite costs the
+    // vocabulary exactly one entry, for ever.
+    const name = "e2e-trait";
     await page.getByRole("button", { name: "Traits" }).click();
     await page.waitForSelector('[data-testid="new-trait"]', { timeout: 5000 });
     await page.fill('[data-testid="new-trait-name"]', name);
@@ -2821,8 +2827,17 @@ try {
     assert.ok(row, `trait ${name} never reached the vocabulary`);
     assert.equal(row.is_trait, true, "created row must be a trait, not a plain tag");
     assert.equal(row.teach, false, "a NEW TRAIT should default to not teaching");
-    // Cleanup: demote so repeated runs do not accumulate vocabulary.
+    // Demote, so the Traits screen is left as it was found. The row itself remains — there
+    // is no delete-tag path on any plane — which is why the name is fixed.
     await invoke("unpromote_trait", { tagId: row.id });
+    // And prove the suite is not seeding vocabulary: exactly one e2e row, this one.
+    const residue = (await invoke("vocabulary")).filter((v) => v.value.startsWith("e2e-"));
+    assert.equal(
+      residue.length,
+      1,
+      `the suite has left ${residue.length} rows in the user's vocabulary: ` +
+        residue.map((r) => r.value).join(", "),
+    );
     await page.getByRole("button", { name: "Library", exact: true }).click();
     await page.waitForSelector(".card", { timeout: 5000 });
   });
@@ -3047,8 +3062,15 @@ try {
       query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
                favorites_only: false, page: 0, page_size: 100000 },
     });
-    const tagged = p.items.find((i) => i.traits.length > 0);
-    if (!tagged) return; // nothing appraised yet — no chips exist to click
+    // Chips are only drawn for an *identified* asset — an unidentified card shows "???" in the
+    // tag row instead (Card.svelte `unidentified`). Tags alone are not enough: promotion also
+    // wants an embedding (DATA-MODEL §8), and on a machine where ONNX will not load a tagged
+    // asset stays `indexed` forever. Picking on traits alone made this check depend on which
+    // asset happened to sort first.
+    const tagged = p.items.find(
+      (i) => i.traits.length > 0 && (i.status === "identified" || i.status === "confirmed"),
+    );
+    if (!tagged) return; // nothing identified yet — no chips exist to click
 
     await page.getByRole("button", { name: "Library", exact: true }).click();
     await page.fill('input[type="text"]', tagged.name);

@@ -3767,3 +3767,62 @@ fn in_pack_locator_answers_only_for_pullable_assets() {
         "a loose file is in no pack"
     );
 }
+
+/// `identify_asset(ids)` must appraise *those* ids. The op flagged them and then ran a generic
+/// bounded pass, which takes the front of the global queue - 8,155 rows deep on the reference
+/// library - so an agent's three assets came back untouched while the call reported success.
+#[test]
+fn the_tag_queue_can_be_restricted_to_an_explicit_set() {
+    let c = Catalog::open_in_memory().unwrap();
+    c.conn
+        .execute_batch(
+            "INSERT INTO import_source (id, uuid, name, root_path, kind)
+                 VALUES (1, 'src-1', 's', '/s', 'folder');
+             INSERT INTO media_type (id, code, label) VALUES (1, 'image', 'Image');
+             INSERT INTO asset (id, uuid, source_id, media_type_id, name, tags_dirty, created_at, updated_at) VALUES
+                 (1, 'a1', 1, 1, 'one',   1, 0, 0),
+                 (2, 'a2', 1, 1, 'two',   1, 0, 0),
+                 (3, 'a3', 1, 1, 'three', 1, 0, 0),
+                 (4, 'a4', 1, 1, 'clean', 0, 0, 0);
+             INSERT INTO asset_file (id, asset_id, rel_path, ext, size_bytes, mtime) VALUES
+                 (1, 1, 'one.png',   'png', 1, 0),
+                 (2, 2, 'two.png',   'png', 1, 0),
+                 (3, 3, 'three.png', 'png', 1, 0),
+                 (4, 4, 'clean.png', 'png', 1, 0);
+             UPDATE asset SET primary_file_id = 1 WHERE id = 1;
+             UPDATE asset SET primary_file_id = 2 WHERE id = 2;
+             UPDATE asset SET primary_file_id = 3 WHERE id = 3;
+             UPDATE asset SET primary_file_id = 4 WHERE id = 4;",
+        )
+        .expect("fixture");
+
+    let all: Vec<i64> = c
+        .assets_needing_tags_within(10, None)
+        .unwrap()
+        .iter()
+        .map(|j| j.asset_id)
+        .collect();
+    assert_eq!(all.len(), 3, "the whole dirty queue: {all:?}");
+
+    let some: Vec<i64> = c
+        .assets_needing_tags_within(10, Some(&[3, 1]))
+        .unwrap()
+        .iter()
+        .map(|j| j.asset_id)
+        .collect();
+    assert_eq!(some.len(), 2, "only what was asked for: {some:?}");
+    assert!(some.contains(&1) && some.contains(&3));
+
+    assert!(
+        c.assets_needing_tags_within(10, Some(&[4]))
+            .unwrap()
+            .is_empty(),
+        "an asset that is not dirty is not appraised just because it was named"
+    );
+    assert!(
+        c.assets_needing_tags_within(10, Some(&[]))
+            .unwrap()
+            .is_empty(),
+        "an explicit empty set asks for nothing - it must not mean everything"
+    );
+}
