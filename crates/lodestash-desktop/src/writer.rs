@@ -1135,57 +1135,71 @@ fn appraise_pass(
     // (opt-in, AI-PIPELINE §5) → local Ollama VLM (AI-PIPELINE §2) → filename stub.
     // Bounded per pass so a writer-thread kick never blocks writes on a long backlog — the
     // remainder stays queued for the next kick / idle auto-identify slice.
-    let teach = catalog
-        .teaching_traits()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(namespace, value, scope, usage_note)| TeachTrait {
-            namespace,
-            value,
-            scope,
-            usage_note,
-        })
-        .collect::<Vec<_>>();
-    let zero_shot = embedder.clone().and_then(|e| ImageZeroShot::new(e, &teach));
-    let audio_shot = audio_embedder.clone().and_then(AudioZeroShot::new);
-    let cfg = AppConfig::load();
-    let api_model = cfg
-        .api_model
-        .clone()
-        .filter(|_| cfg.api_tagging_enabled && !cfg.api_key.is_empty());
-    let tagger: Box<dyn Tagger> = if let Some(model) = api_model {
-        Box::new(
-            OpenAiTagger::new(cfg.api_base_url.clone(), cfg.api_key.clone(), model)
-                .with_teaching(teach.clone()),
-        )
-    } else if let Some(model) = cfg.tagger_model.clone() {
-        let mut t = OllamaTagger::new(model);
-        if let Some(vision) = cfg.tagger_vision_model.clone() {
-            t = t.with_vision(vision);
-        }
-        Box::new(t.with_teaching(teach.clone()))
-    } else {
-        Box::new(FilenameTagger)
-    };
-    drain_tags(
-        catalog,
-        tagger.as_ref(),
-        zero_shot.as_ref(),
-        workspace_dir.as_deref(),
-        cache_dir.as_deref(),
-        progress,
-        TAG_BUDGET_PER_PASS,
-        only,
-    );
-    if let Some(az) = audio_shot.as_ref() {
-        drain_audio_tags(
+    // Nothing to tag → build no taggers. The block below encodes the **whole** zero-shot label
+    // vocabulary (67 labels, one SigLIP text pass each) and it used to run on every pass,
+    // including the once-a-second idle tick that usually has no work at all. That was free while
+    // no embedder would load; the moment one did, a trivial user write — staging an asset —
+    // went from 25 ms to **16.6 s**, because the single writer (ARCHITECTURE §5) was busy
+    // re-encoding the same 67 labels when the op arrived. One `LIMIT 1` query is the whole fix.
+    let has_tag_work = catalog
+        .assets_needing_tags_within(1, only)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    if has_tag_work {
+        let teach = catalog
+            .teaching_traits()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(namespace, value, scope, usage_note)| TeachTrait {
+                namespace,
+                value,
+                scope,
+                usage_note,
+            })
+            .collect::<Vec<_>>();
+        let zero_shot = embedder.clone().and_then(|e| ImageZeroShot::new(e, &teach));
+        let audio_shot = audio_embedder.clone().and_then(AudioZeroShot::new);
+        let cfg = AppConfig::load();
+        let api_model = cfg
+            .api_model
+            .clone()
+            .filter(|_| cfg.api_tagging_enabled && !cfg.api_key.is_empty());
+        let tagger: Box<dyn Tagger> = if let Some(model) = api_model {
+            Box::new(
+                OpenAiTagger::new(cfg.api_base_url.clone(), cfg.api_key.clone(), model)
+                    .with_teaching(teach.clone()),
+            )
+        } else if let Some(model) = cfg.tagger_model.clone() {
+            let mut t = OllamaTagger::new(model);
+            if let Some(vision) = cfg.tagger_vision_model.clone() {
+                t = t.with_vision(vision);
+            }
+            Box::new(t.with_teaching(teach.clone()))
+        } else {
+            Box::new(FilenameTagger)
+        };
+        drain_tags(
             catalog,
-            az,
+            tagger.as_ref(),
+            zero_shot.as_ref(),
             workspace_dir.as_deref(),
+            cache_dir.as_deref(),
             progress,
-            AUDIO_TAG_BUDGET_PER_PASS,
+            TAG_BUDGET_PER_PASS,
+            only,
         );
+        if let Some(az) = audio_shot.as_ref() {
+            drain_audio_tags(
+                catalog,
+                az,
+                workspace_dir.as_deref(),
+                progress,
+                AUDIO_TAG_BUDGET_PER_PASS,
+            );
+        }
     }
+    // Promotion and the vector/preview backfill still run every pass — they are the cheap,
+    // budgeted half, and promotion is what a pass exists to do.
     let (counts, _assets, promoted) = drain_promote_resync(
         catalog,
         embedder,

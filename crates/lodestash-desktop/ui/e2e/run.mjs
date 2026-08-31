@@ -3296,6 +3296,35 @@ try {
     if (nav !== null) assert.equal(nav, 24, "the nav glyph is not the 24px DESIGN-GUIDELINES §5 rung");
   });
 
+  // `ort` is `load-dynamic`: it dlopens `onnxruntime.dll` from `ORT_DYLIB_PATH`, panics when it
+  // cannot, and every loader turns that panic into "ONNX Runtime unavailable or incompatible" —
+  // the same sentence for a missing runtime and an unset variable. `apply_ort_dylib_env()` lost
+  // its only caller in the shell port and nothing noticed for five weeks: the model files were
+  // installed, the DLL was installed, and `mode=ai` quietly answered `ai_unavailable`. The grid
+  // cannot catch this (its AI mode degrades to FTS on purpose), so the check goes through the
+  // engine plane, which is the honest one.
+  await check("with the models installed, AI search is actually live", async () => {
+    const home = process.env.APPDATA;
+    const models = home && path.join(home, "Lodestash", "models", "siglip");
+    const installed =
+      models &&
+      ["vision.onnx", "text.onnx", "tokenizer.json"].every((f) => fs.existsSync(path.join(models, f)));
+    if (!installed) return; // no model on this machine — nothing to assert
+
+    const hs = path.join(process.env.LOCALAPPDATA, "Lodestash", "engine.json");
+    const h = JSON.parse(fs.readFileSync(hs, "utf8"));
+    const res = await fetch(`http://127.0.0.1:${h.port}/v1/search?mode=ai&q=a%20mossy%20stone%20wall`, {
+      headers: { authorization: `Bearer ${h.token}` },
+    });
+    const body = await res.json();
+    assert.notEqual(
+      body?.error?.code, "ai_unavailable",
+      "the models are installed but no embedder loaded — ORT_DYLIB_PATH is probably unset",
+    );
+    assert.equal(res.status, 200, `AI search answered ${res.status}: ${JSON.stringify(body).slice(0, 200)}`);
+    assert.ok(Array.isArray(body.results) && body.results.length > 0, "AI search matched nothing");
+  });
+
   await check("the grid's own query is a shape set_appraise_focus accepts", async () => {
     const query = {
       tab: "all", search: "", search_mode: "tags", ids: [], status: "all",

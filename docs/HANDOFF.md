@@ -933,12 +933,19 @@ fixture.
   over new fields on it, which is what let favourites, tags and dependency edges merge cleanly
   against a rewritten grid.
 - **A tagged asset does not become *Identified* on its own — it needs an embedding too**
-  (`DATA-MODEL.md` §8, enforced in `promote_statuses`). On this machine ONNX Runtime will not load,
-  so no *new* vectors are ever written and anything tagged after that point stays `indexed` and
-  draws `???` in the card's tag row instead of chips. It cost an e2e check, which picked "the first
-  asset carrying traits", clicked a chip that was never rendered, and failed. 6,807 rows already
-  carry embeddings from when ORT did load, so tagging — not embedding — is what moves those out of
-  the Unidentified backlog. Check `status` before assuming tags are visible.
+  (`DATA-MODEL.md` §8, enforced in `promote_statuses`), so a tagged-but-unembedded asset stays
+  `indexed` and draws `???` in the card's tag row instead of chips. It cost an e2e check, which
+  picked "the first asset carrying traits", clicked a chip that was never rendered, and failed.
+  Check `status` before assuming tags are visible.
+- **"ONNX Runtime unavailable or incompatible" usually means nobody set `ORT_DYLIB_PATH`.**
+  `ort` is built with `load-dynamic`, so it dlopens `onnxruntime.dll` and **panics** when it
+  cannot; all three loaders catch that panic and report the same sentence, which reads like a
+  broken or mismatched runtime and is almost never that. From 2026-07-22 to 2026-08-30 this machine
+  had the DLL *and* both model sets on disk while `models::apply_ort_dylib_env()` had **no
+  callers** — the egui `main` called it and the Tauri port dropped the call. Cost: no new
+  embeddings, no SigLIP/CLAP zero-shot tagging, `mode=ai` search answering `ai_unavailable`, and
+  assets that could not be promoted. Before blaming the runtime, check the variable — and note
+  that the message cannot distinguish the two, which is what made this survive five weeks.
 - **A texture's subject is not in its pixels.** Half the images in a Unity pack are atlases:
   `round crates.png` is planks and rope laid out for UVs and contains no crate. Any vision model
   describes what it sees, correctly, and it is not what the asset *is* — see `AI-PIPELINE.md` §2.

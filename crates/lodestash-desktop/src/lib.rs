@@ -2082,6 +2082,22 @@ pub fn run() {
         return;
     }
 
+    // Point `ort` at the runtime the model manager downloaded, before anything tries to load an
+    // embedder. `ort` is built with `load-dynamic` (TECH-STACK §5), so it dlopens
+    // `onnxruntime.dll` from `ORT_DYLIB_PATH` and *panics* when it cannot — which the loaders
+    // catch and report as "ONNX Runtime unavailable or incompatible". That message is what this
+    // machine had been showing since the shell was ported: the DLL and both model sets were on
+    // disk the whole time and `apply_ort_dylib_env` had **no callers**, so nothing ever set the
+    // variable. The egui `main` called it; the port dropped the call and the error text made it
+    // look like a broken runtime rather than an unset path. Consequences: no new embeddings, no
+    // SigLIP/CLAP zero-shot tagging, and — because promotion needs a clean embedding — assets
+    // that could never become Identified.
+    //
+    // Here rather than inside the loaders: setting an environment variable is only sound while
+    // the process is still single-threaded, and this is before the writer, the REST server and
+    // Tauri's own threads exist.
+    lodestash_app::models::apply_ort_dylib_env();
+
     let library = Library::open();
     let status = library.status();
     tracing::info!(
