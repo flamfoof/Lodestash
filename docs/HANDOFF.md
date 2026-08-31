@@ -951,6 +951,15 @@ fixture.
   describes what it sees, correctly, and it is not what the asset *is* — see `AI-PIPELINE.md` §2.
   Do not read a wrong `subject:` tag on a texture as a model-quality problem; a bigger VLM was
   tried (2026-08-30) and changed nothing there.
+- **A time budget checked once per batch is not a time budget.** `drain_previews` took a 1 s slice
+  from the writer's idle tick and tested its deadline between batches of 16 renders — ~17 s of
+  work — so every user write queued behind it: a `POST /v1/stage` measured **16.4 s** on an
+  otherwise idle app against 2 ms before the drain started. Reads were unaffected (3–18 ms), which
+  is the tell: WAL never queues readers, so *writes slow, reads fine* means the writer thread is
+  busy, not the database. And the suite could not see it — `harness.mjs` sets
+  `LODESTASH_NO_PREVIEW_DRAIN=1` so repeated launches don't grind the machine, so the flag that
+  makes e2e bearable is the flag that hid this. **Measure a write on a normally-launched app**, not
+  under the harness. See [ADR-0013](decisions/ADR-0013-inference-off-the-writer.md).
 - **Ollama evicts models between calls.** Alternating two models per asset costs ~6× — batch by
   stage and send `keep_alive`. A small VLM asked for JSON may degenerate into numeric arrays; ask it
   for prose and let a text model do the schema.

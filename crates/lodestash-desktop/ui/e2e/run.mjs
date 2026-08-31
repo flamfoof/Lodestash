@@ -14,7 +14,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { launch } from "./harness.mjs";
+import { launch, BIN, HANDSHAKE } from "./harness.mjs";
 
 /**
  * The viewport every check is entitled to find the app in, captured once the app is up.
@@ -3490,9 +3490,61 @@ try {
     await page.getByRole("button", { name: "Library", exact: true }).click();
     await page.waitForSelector(".card", { timeout: 5000 });
   });
+
 } finally {
   await app.close();
 }
+
+// Runs **after** the suite's app is closed, on purpose: it needs its own app instance (the
+// handshake file is one per machine, so two running apps fight over it) and it must run without
+// `LODESTASH_NO_PREVIEW_DRAIN`, which the harness sets for every other check.
+
+// The flag the rest of the suite sets is precisely what hid the bug this guards: the idle preview
+// backfill checked its time budget once per batch of 16 renders, so a "1 second" slice held the
+// single writer for ~17 s and every user write queued behind it. Measured on the real app, a
+// `POST /v1/stage` took 16.4 s against 2 ms before the drain started. No unit test can see this —
+// it is a latency property of a running writer.
+async function writerLatencyCheck() {
+  // The suite's browser is closed by now, so disarm the per-check viewport guard — it
+  // measures the page, and measuring a closed page is what failed this check the first
+  // time it ran here.
+  baseline = null;
+  await check("a user write stays fast while the preview backfill runs", async () => {
+    const { spawn } = await import("node:child_process");
+    try { fs.rmSync(HANDSHAKE); } catch { /* not running */ }
+    const app = spawn(BIN, { stdio: "ignore" }); // no drain flag — that is the point
+    try {
+      const t0 = Date.now();
+      while (!fs.existsSync(HANDSHAKE) && Date.now() - t0 < 60000) {
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      assert.ok(fs.existsSync(HANDSHAKE), "the app never published engine.json");
+      const h = JSON.parse(fs.readFileSync(HANDSHAKE, "utf8"));
+      const stage = async () => {
+        const started = Date.now();
+        const res = await fetch(`http://127.0.0.1:${h.port}/v1/stage`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${h.token}`, "content-type": "application/json" },
+          body: JSON.stringify({ asset_id: 1 }),
+        });
+        await res.text();
+        return Date.now() - started;
+      };
+      await stage(); // the first write lands before the drain has started — it proves nothing
+      await new Promise((r) => setTimeout(r, 3000)); // let the idle drain get going
+      const worst = Math.max(await stage(), await stage(), await stage());
+      assert.ok(
+        worst < 4000,
+        `a stage write took ${worst} ms with the preview drain running — the idle slice is not ` +
+          `honouring its budget per render`,
+      );
+    } finally {
+      app.kill();
+    }
+  });
+}
+
+await writerLatencyCheck();
 
 const failed = results.filter(([ok]) => !ok);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);

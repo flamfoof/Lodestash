@@ -838,6 +838,14 @@ pub fn drain_previews(
         }
         let n = jobs.len();
         for job in jobs {
+            // **Per render, not per batch.** The check above only ran between batches of 16, and
+            // one render is ~1.1 s here — so a "1 second" idle slice actually held the writer for
+            // ~17 s, and every user write queued behind it (a `POST /v1/stage` measured 16 s on an
+            // idle app, against 2 ms when the drain had not started). The budget is a promise about
+            // latency; checking it once per sixteen units is not keeping it.
+            if started.elapsed() >= budget {
+                break;
+            }
             // Record every id we look at, successful or not, so a model that fails to render
             // cannot wedge the queue ahead of the ones behind it.
             attempted.push(job.asset_id);
@@ -976,12 +984,18 @@ pub fn drain_promote_resync(
     // previews existed is already clean, so without this it stays blank forever. Time-boxed so a
     // few thousand models don't hold the persist thread; the queue is durable and converges over
     // successive passes.
+    //
+    // **The caller's budget wins when it is smaller.** `PREVIEW_BACKFILL_BUDGET` is 90 s, and it
+    // was applied verbatim on the writer's once-a-second idle tick — the pass's own 1 s budget
+    // only ever reached the embedding drains below. That is most of why a trivial user write
+    // measured ~16 s on an idle app: not the model inference it looked like, but a preview
+    // backfill happily rendering for a minute and a half between ops.
     drain_previews(
         cat,
         workspace_dir,
         cache_dir,
         proxy,
-        PREVIEW_BACKFILL_BUDGET,
+        budget.map_or(PREVIEW_BACKFILL_BUDGET, |b| b.min(PREVIEW_BACKFILL_BUDGET)),
     );
     drain_dependencies(cat, workspace_dir);
     if let Some(emb) = embedder {
@@ -1043,6 +1057,134 @@ pub fn resync_after_drain(
 /// Forward progress is unconditional: an asset the tagger refuses (audio), one whose preview can't
 /// be made, and one the model answers nothing for all still clear `tags_dirty` via an empty write.
 /// Otherwise the queue would hand back the same rows forever.
+/// One asset's finished tag proposal, computed away from the writer.
+pub struct ComputedTags {
+    pub asset_id: i64,
+    pub caption: Option<String>,
+    pub tags: Vec<lodestash_core::catalog::TagAssignment>,
+}
+
+/// Phase 1 of tagging: **read** a slice of the queue. Same split, and for the same reason, as
+/// [`visual_embed_batch`] — a caption is a whole VLM inference (~13 s here) and the writer must
+/// not be inside it.
+pub fn tag_batch(
+    cat: &Catalog,
+    limit: usize,
+    only: Option<&[i64]>,
+) -> Vec<lodestash_core::catalog::VisualEmbedJob> {
+    cat.assets_needing_tags_within(limit, only)
+        .unwrap_or_else(|e| {
+            tracing::warn!(%e, "tag queue query failed; retries next run");
+            Vec::new()
+        })
+}
+
+/// Phase 2: **compute**. Takes a `&Catalog` because the 3D zero-shot path reads the asset's
+/// stored vector — a read, which SQLite WAL allows from any connection, so a worker opens its own
+/// rather than borrowing the writer's.
+///
+/// Two passes over the batch, not one pass doing both stages: interleaving the vision and text
+/// models makes Ollama evict and reload multi-GB weights per asset (~50 s/asset, against a few
+/// seconds when each model stays resident for a batch).
+pub fn compute_tags(
+    jobs: Vec<lodestash_core::catalog::VisualEmbedJob>,
+    cat: &Catalog,
+    tagger: &dyn lodestash_ai::tagger::Tagger,
+    zero_shot: Option<&lodestash_ai::image_tags::ImageZeroShot>,
+    workspace_dir: Option<&std::path::Path>,
+    cache_dir: Option<&std::path::Path>,
+) -> Vec<ComputedTags> {
+    /// Fixed preview size, independent of the user's grid-quality setting: tagging results should
+    /// not change because someone moved a slider.
+    const TAG_PX: u32 = 384;
+    let mut prepared = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        // In-pack payloads pull to a scratch file; keep the guard alive while `path` is read.
+        let resolved = resolve_job_path(&job, workspace_dir);
+        let path = resolved.as_ref().map(|(p, _)| p.clone());
+        // A scratch pull (in-pack) has a random temp stem — don't feed it as the asset name; the
+        // caption carries the signal.
+        let is_scratch = resolved.as_ref().is_some_and(|(_, g)| g.is_some());
+        let name = if is_scratch {
+            String::new()
+        } else {
+            path.as_deref()
+                .and_then(|p| p.file_stem())
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        let img = if tagger.supports(&job.media_code) {
+            path.as_deref()
+                .zip(cache_dir)
+                .and_then(|(p, cache)| tag_preview(p, cache, TAG_PX))
+        } else {
+            None
+        };
+        let caption = img.as_ref().and_then(|img| {
+            tagger.caption(&lodestash_ai::tagger::TagInput {
+                media_code: &job.media_code,
+                name: &name,
+                image: Some(img),
+            })
+        });
+        let zs_tags = zero_shot
+            .map(|z| zeroshot_tags(z, cat, job.asset_id, &job.media_code, img.as_ref()))
+            .unwrap_or_default();
+        prepared.push((job, name, caption, zs_tags));
+    }
+
+    prepared
+        .into_iter()
+        .map(|(job, name, caption, zs_tags)| {
+            let result = if tagger.supports(&job.media_code) {
+                tagger.tag(
+                    &lodestash_ai::tagger::TagInput {
+                        media_code: &job.media_code,
+                        name: &name,
+                        image: None,
+                    },
+                    caption.as_deref(),
+                )
+            } else {
+                lodestash_ai::tagger::TagResult::default()
+            };
+            // Union the VLM/name tags with the zero-shot proposals; validate dedupes + caps.
+            let mut merged = result.tags;
+            merged.extend(zs_tags);
+            ComputedTags {
+                asset_id: job.asset_id,
+                caption: result.caption,
+                tags: lodestash_ai::tagger::validate(merged),
+            }
+        })
+        .collect()
+}
+
+/// Phase 3: **write**. Returns the number of tag rows written.
+pub fn store_tags(cat: &mut Catalog, model_id: &str, results: &[ComputedTags]) -> usize {
+    let mut tagged = 0;
+    for r in results {
+        // The caption is the model's own words about the asset; it lands in `description`, which
+        // FTS indexes, so it is searchable rather than decorative.
+        if let Some(caption) = &r.caption {
+            if let Err(e) = cat.set_description(r.asset_id, Some(caption)) {
+                tracing::warn!(%e, "caption write failed");
+            }
+        }
+        match cat.set_tags(r.asset_id, "ai", Some(model_id), &r.tags) {
+            Ok(n) => tagged += n,
+            Err(e) => {
+                tracing::warn!(%e, "set_tags failed; stopping tag store");
+                break;
+            }
+        }
+    }
+    tagged
+}
+
+/// The three phases back-to-back on one thread — the **kick** path, where the user asked for it
+/// and is watching a progress bar. The idle path drives the phases separately so the inference
+/// happens off the writer (see [`tag_batch`]).
 pub fn drain_tags(
     cat: &mut Catalog,
     tagger: &dyn lodestash_ai::tagger::Tagger,
@@ -1057,9 +1199,6 @@ pub fn drain_tags(
 ) {
     use std::sync::atomic::Ordering;
     const BATCH: usize = 16;
-    /// Fixed preview size, independent of the user's grid-quality setting: tagging results should
-    /// not change because someone moved a slider.
-    const TAG_PX: u32 = 384;
 
     if let Ok(total) = cat.count_needing_tags() {
         progress.total.store(total as u64, Ordering::Relaxed);
@@ -1072,112 +1211,31 @@ pub fn drain_tags(
             break;
         }
         // Budget guard (AI-PIPELINE §5.1): stop after `max_assets` assets and leave the rest
-        // queued, so a writer-thread pass (bounded by design) never blocks writes on a long
-        // backlog. `0` = uncapped.
-        if max_assets != 0 && tagged_assets >= max_assets as usize {
-            break;
-        }
-        let jobs = match cat.assets_needing_tags_within(BATCH, only) {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::warn!(%e, "tag queue query failed; retries next run");
-                break;
-            }
+        // queued. `0` = uncapped.
+        let room = if max_assets == 0 {
+            BATCH
+        } else {
+            BATCH.min((max_assets as usize).saturating_sub(tagged_assets))
         };
-        if jobs.is_empty() {
+        if room == 0 {
             break;
         }
-        // Two passes over the batch, not one pass doing both stages. Interleaving the vision and
-        // text models makes Ollama evict and reload multi-GB weights on every asset — measured
-        // ~50 s/asset that way, against a few seconds when each model stays resident for a batch.
-        let mut prepared: Vec<(
-            lodestash_core::catalog::VisualEmbedJob,
-            String,
-            Option<String>,
-            Vec<lodestash_core::catalog::TagAssignment>,
-        )> = Vec::with_capacity(jobs.len());
-        for job in jobs {
-            if progress.is_cancelled() {
-                return;
-            }
-            // In-pack payloads pull to a scratch file; keep the guard alive while `path` is read
-            // (only this first pass touches the file — the caption image is decoded into memory here).
-            let resolved = resolve_job_path(&job, workspace_dir);
-            let path = resolved.as_ref().map(|(p, _)| p.clone());
-            // A scratch pull (in-pack) has a random temp stem — don't feed it as the asset name; the
-            // caption carries the signal. ponytail: real in-pack name needs the job to carry it.
-            let is_scratch = resolved.as_ref().is_some_and(|(_, g)| g.is_some());
-            let name = if is_scratch {
-                String::new()
-            } else {
-                path.as_deref()
-                    .and_then(|p| p.file_stem())
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            };
-            // Decode the preview once, then use it for both the VLM caption and the SigLIP zero-shot
-            // pass (AI-PIPELINE §2.1: the two are a union, run over the same pixels). Only visual
-            // assets get here; audio has no preview and no zero-shot path.
-            let img = if tagger.supports(&job.media_code) {
-                path.as_deref()
-                    .zip(cache_dir)
-                    .and_then(|(p, cache)| tag_preview(p, cache, TAG_PX))
-            } else {
-                None
-            };
-            let caption = img.as_ref().and_then(|img| {
-                tagger.caption(&lodestash_ai::tagger::TagInput {
-                    media_code: &job.media_code,
-                    name: &name,
-                    image: Some(img),
-                })
-            });
-            let zs_tags = zero_shot
-                .map(|z| zeroshot_tags(z, cat, job.asset_id, &job.media_code, img.as_ref()))
-                .unwrap_or_default();
-            prepared.push((job, name, caption, zs_tags));
+        let jobs = tag_batch(cat, room, only);
+        let n = jobs.len();
+        if n == 0 {
+            break;
         }
-
-        for (job, name, caption, zs_tags) in prepared {
-            if progress.is_cancelled() {
-                return;
-            }
-            // Hard per-asset cap inside the batch too, so `max_assets` is exact, not +BATCH.
-            if max_assets != 0 && tagged_assets >= max_assets as usize {
-                return;
-            }
-            let result = if tagger.supports(&job.media_code) {
-                tagger.tag(
-                    &lodestash_ai::tagger::TagInput {
-                        media_code: &job.media_code,
-                        name: &name,
-                        image: None,
-                    },
-                    caption.as_deref(),
-                )
-            } else {
-                lodestash_ai::tagger::TagResult::default()
-            };
-            // Union the VLM/name tags with the zero-shot proposals; validate dedupes + caps per facet.
-            let mut merged = result.tags;
-            merged.extend(zs_tags);
-            let tags = lodestash_ai::tagger::validate(merged);
-            // The caption is the model's own words about the asset; it lands in `description`,
-            // which FTS indexes, so it is searchable rather than decorative.
-            if let Some(caption) = &result.caption {
-                if let Err(e) = cat.set_description(job.asset_id, Some(caption)) {
-                    tracing::warn!(%e, "caption write failed");
-                }
-            }
-            match cat.set_tags(job.asset_id, "ai", Some(&model_id), &tags) {
-                Ok(n) => tagged += n,
-                Err(e) => {
-                    tracing::warn!(%e, "set_tags failed; stopping tag drain");
-                    return;
-                }
-            }
-            progress.done.fetch_add(1, Ordering::Relaxed);
-            tagged_assets += 1;
+        let done = compute_tags(jobs, cat, tagger, zero_shot, workspace_dir, cache_dir);
+        if progress.is_cancelled() {
+            return;
+        }
+        tagged += store_tags(cat, &model_id, &done);
+        tagged_assets += done.len();
+        progress
+            .done
+            .fetch_add(done.len() as u64, Ordering::Relaxed);
+        if n < room {
+            break;
         }
     }
     tracing::info!(tags = tagged, model = %model_id, "tagging pass finished");
@@ -1314,36 +1372,58 @@ pub fn resolve_job_path(
     None
 }
 
-pub fn drain_image_embeddings(
-    cat: &mut Catalog,
-    emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync),
-    workspace_dir: Option<&std::path::Path>,
-    cache_dir: Option<&std::path::Path>,
-    budget: Option<std::time::Duration>,
-) {
-    const BATCH: usize = 64;
-    let mut total = 0usize;
-    let deadline = budget.map(|b| std::time::Instant::now() + b);
-    // A material's albedo lives on the `uses_texture` edges, not on the job row, so it takes one
-    // whole-library read up front — trivial next to a single encoder pass, and materials without a
-    // resolved edge simply render flat.
+/// `asset_id` → albedo texture path, read once per batch (materials only).
+pub type AlbedoPaths = std::collections::HashMap<i64, String>;
+
+/// One finished embedding, computed away from the catalog.
+pub struct ComputedEmbedding {
+    pub asset_id: i64,
+    pub media_type_id: i64,
+    pub source_id: i64,
+    pub modality: &'static str,
+    pub vector: Vec<f32>,
+}
+
+/// Phase 1 of the visual embed drain: **read** a slice of the queue. Fast, catalog-only.
+///
+/// The three phases exist because the compute is not fast and the catalog is single-writer
+/// (ADR-0002). Interleaved read → encode → write meant the writer thread held the catalog for the
+/// whole encode, and one unit is a four-view render plus four SigLIP passes — ~17 s for a 3D model
+/// on this CPU. Every user write queued behind it: a `POST /v1/stage` measured 25 ms on an idle
+/// app and ~18 s once an embedder was actually loaded. Splitting read / compute / write lets the
+/// heavy middle run anywhere, and the writer only ever does the two cheap ends.
+pub fn visual_embed_batch(
+    cat: &Catalog,
+    limit: usize,
+) -> (Vec<lodestash_core::catalog::VisualEmbedJob>, AlbedoPaths) {
+    let jobs = cat
+        .visual_assets_needing_embedding(limit)
+        .unwrap_or_else(|e| {
+            tracing::warn!(%e, "visual embed queue query failed; retries next pass");
+            Vec::new()
+        });
+    if jobs.is_empty() {
+        return (jobs, Default::default());
+    }
+    // A material's albedo lives on the `uses_texture` edges, not on the job row, so it is read
+    // here — with the jobs — and carried into the compute phase, which never sees a catalog.
     let albedo = cat.material_albedo_paths().unwrap_or_else(|e| {
         tracing::warn!(%e, "material albedo lookup failed; shader balls render flat");
         Default::default()
     });
-    loop {
-        let jobs = match cat.visual_assets_needing_embedding(BATCH) {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::warn!(%e, "visual embed queue query failed; retries next scan");
-                break;
-            }
-        };
-        if jobs.is_empty() {
-            break;
-        }
-        let n = jobs.len();
-        for job in jobs {
+    (jobs, albedo)
+}
+
+/// Phase 2: **compute**. No catalog, so this can run on any thread — that is the whole point.
+pub fn compute_visual_embeddings(
+    jobs: Vec<lodestash_core::catalog::VisualEmbedJob>,
+    albedo: &AlbedoPaths,
+    emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync),
+    workspace_dir: Option<&std::path::Path>,
+    cache_dir: Option<&std::path::Path>,
+) -> Vec<ComputedEmbedding> {
+    jobs.into_iter()
+        .map(|job| {
             let modality = if job.media_code == "model_3d" {
                 "model_3d"
             } else {
@@ -1352,9 +1432,8 @@ pub fn drain_image_embeddings(
             let vector = if job.media_code == "model_3d" {
                 // On-disk, workspace-extracted, or an in-pack model pulled to a scratch file — the
                 // multiview renderer is geometry-only, so an isolated (untextured) temp .fbx/.glb
-                // embeds by shape exactly as an on-disk one would. Guard held while the path is read.
-                let resolved = resolve_job_path(&job, workspace_dir);
-                resolved
+                // embeds by shape exactly as an on-disk one would.
+                resolve_job_path(&job, workspace_dir)
                     .as_ref()
                     .and_then(|(p, _)| embed_model_multiview(p, emb, cache_dir))
             } else if job.media_code == "material" {
@@ -1369,29 +1448,73 @@ pub fn drain_image_embeddings(
             // zero vec clears the flag so the drain always advances and never re-queries the
             // same row forever; it scores 0 in KNN so it never surfaces.
             .unwrap_or_else(|| vec![0.0; emb.dim()]);
-            if let Err(e) = cat.upsert_embedding(
-                job.asset_id,
-                emb.model_id(),
+            ComputedEmbedding {
+                asset_id: job.asset_id,
+                media_type_id: job.media_type_id,
+                source_id: job.source_id,
                 modality,
-                Some(job.media_type_id),
-                Some(job.source_id),
-                &vector,
-            ) {
-                tracing::warn!(%e, "upsert_embedding failed; stopping visual drain");
-                return;
+                vector,
             }
-            total += 1;
+        })
+        .collect()
+}
+
+/// Phase 3: **write**. Fast, catalog-only. Returns how many landed.
+pub fn store_visual_embeddings(
+    cat: &mut Catalog,
+    model_id: &str,
+    done: &[ComputedEmbedding],
+) -> usize {
+    let mut n = 0;
+    for d in done {
+        if let Err(e) = cat.upsert_embedding(
+            d.asset_id,
+            model_id,
+            d.modality,
+            Some(d.media_type_id),
+            Some(d.source_id),
+            &d.vector,
+        ) {
+            tracing::warn!(%e, "upsert_embedding failed; stopping visual store");
+            break;
+        }
+        n += 1;
+    }
+    if n > 0 {
+        tracing::info!(embedded = n, "siglip image embeddings written");
+    }
+    n
+}
+
+/// The three phases run back-to-back on one thread — the kick path, where the user asked for it
+/// and expects the app to be busy. The idle path drives the phases separately so the compute
+/// happens off the writer (see [`visual_embed_batch`]).
+pub fn drain_image_embeddings(
+    cat: &mut Catalog,
+    emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync),
+    workspace_dir: Option<&std::path::Path>,
+    cache_dir: Option<&std::path::Path>,
+    budget: Option<std::time::Duration>,
+) {
+    const BATCH: usize = 64;
+    let deadline = budget.map(|b| std::time::Instant::now() + b);
+    loop {
+        let (jobs, albedo) = visual_embed_batch(cat, BATCH);
+        let n = jobs.len();
+        if n == 0 {
+            break;
+        }
+        let done = compute_visual_embeddings(jobs, &albedo, emb, workspace_dir, cache_dir);
+        if store_visual_embeddings(cat, emb.model_id(), &done) < done.len() {
+            break; // a write failed — it logged, and the queue is durable
         }
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-            tracing::debug!(embedded = total, "visual embed pass hit its time budget");
+            tracing::debug!("visual embed pass hit its time budget");
             break;
         }
         if n < BATCH {
             break;
         }
-    }
-    if total > 0 {
-        tracing::info!(embedded = total, "siglip image embeddings written");
     }
 }
 

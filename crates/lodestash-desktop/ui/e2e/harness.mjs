@@ -18,7 +18,8 @@ import { chromium } from "playwright-core";
 
 const UI_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const REPO = path.resolve(UI_DIR, "..", "..", "..");
-const BIN = path.join(REPO, "target", "debug", "lodestash-desktop.exe");
+export const BIN = path.join(REPO, "target", "debug", "lodestash-desktop.exe");
+export const HANDSHAKE = path.join(process.env.LOCALAPPDATA, "Lodestash", "engine.json");
 const CDP_PORT = 9222;
 const VITE_URL = "http://localhost:5173";
 

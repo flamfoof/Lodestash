@@ -298,18 +298,22 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       `door` → `crates`, `bucket` `crate` → `bucket`. Unit-tested both directions — a 3D model must
       **not** get the clause, since its preview is a render of the object and the pixels are the
       better evidence. Written up in [`AI-PIPELINE.md`](AI-PIPELINE.md) §2.
-- [ ] **The single writer runs CPU inference, so every user write waits for it.** Surfaced the
-      moment the embedder started loading (card below): a trivial `POST /v1/stage` went from
-      **25 ms to ~18 s**, measured eight times in a row on an otherwise idle app. The idle tick
-      already budgets itself to 1 s and checks the queue before starting — but the budget only
-      applies *between* units, and one unit is a SigLIP multiview embed of a 3D model (four renders
-      plus four vision passes), ~17 s on this CPU. Not Ollama: clearing `tagger_model` entirely
-      changes nothing. The writer exists to serialise **SQLite writes** ([ADR-0002](decisions/
-      ADR-0002-single-writer-thread.md)); running model inference on it is the mistake, and no
-      budget fixes it because the unit cannot be interrupted mid-inference. Decided 2026-08-30:
-      move the compute to a worker and let the writer persist finished results. Needs an ADR. The
-      e2e "F toggles the star" check flakes on exactly this — the favourite write times out, which
-      is a true report, not a test bug.
+- [x] **A user write took 16 s while the app sat idle — fixed 2026-08-30.** Cause was not the model
+      inference it looked like: `drain_previews` checked its time budget **once per batch of 16
+      renders**, and one render is ~1.1 s, so the writer's "1 second" idle slice ran ~17 s and every
+      write queued behind it (`POST /v1/stage`: 2 ms before the drain starts, 16.4 s after; reads
+      stayed at 3–18 ms, since WAL never queues them). The suite could not see it — `harness.mjs`
+      sets `LODESTASH_NO_PREVIEW_DRAIN=1` so a hundred app launches don't grind the machine, and
+      that flag is exactly what hid this. Budget now checked **per render**: 16.4 s → **0.37 s**.
+      Beyond the one-line fix, the heavy drains were split read/compute/write so the encode runs on
+      a worker and the writer only does the two cheap ends
+      ([ADR-0013](decisions/ADR-0013-inference-off-the-writer.md)) — `visual_embed_batch` →
+      `compute_visual_embeddings` → `store_visual_embeddings`, and the same for tags, posted back
+      as `EmbeddingsDone`/`TagsDone` like the existing extract workers. New e2e case launches its
+      own app *without* the drain flag and asserts a stage write stays under 4 s.
+      **Correction to `9edeb63`'s commit message:** it said the ORT fix exposed this. It did not —
+      the preview backfill has behaved this way for as long as it has existed; measuring a write on
+      a normally-launched app is what exposed it.
 - [x] **ONNX Runtime was never broken — `apply_ort_dylib_env` had no callers (fixed 2026-08-30).**
       Every embedder on this machine had been reporting *"ONNX Runtime unavailable or
       incompatible"* since the shell port, and it was read (by me, repeatedly) as a runtime

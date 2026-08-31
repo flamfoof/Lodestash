@@ -353,6 +353,20 @@ enum WriterMsg {
         outcome: Result<Vec<ExtractedAsset>, String>,
         cancelled: bool,
     },
+    /// A background embed worker finished a slice. The writer only **persists** it — the encode
+    /// happened off-thread, which is the point: a four-view render plus four SigLIP passes is
+    /// ~17 s per 3D model, and doing that on the writer made every user write queue behind it
+    /// (a `POST /v1/stage` went from 25 ms to ~18 s the moment an embedder actually loaded).
+    EmbeddingsDone {
+        model_id: String,
+        done: Vec<lodestash_app::drains::ComputedEmbedding>,
+    },
+    /// A background tag worker finished a slice — same split, same reason: a caption is a whole
+    /// VLM inference (~13 s here) and the writer only persists the result.
+    TagsDone {
+        model_id: String,
+        done: Vec<lodestash_app::drains::ComputedTags>,
+    },
 }
 
 /// A `.unitypackage` a crawl surfaced, with its browse-time manifest locators
@@ -772,6 +786,11 @@ impl Writer {
                 // arrives while a worker is running (or already queued) waits here; each op's
                 // reply resolves to the real outcome when its reconcile runs.
                 let mut extract_queue: VecDeque<Job> = VecDeque::new();
+                // One embed slice in flight at a time. The worker owns the encode; this flag is
+                // how the idle tick knows not to start a second one, and it is cleared when the
+                // slice's `EmbeddingsDone` lands (or when its worker gives up).
+                let embed_inflight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let tag_inflight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 // DATA-MODEL §6 watch: live notify over the watched source roots, debounced by
                 // the ingest helper. A signal means "something changed, rescan when convenient"
                 // — the rescan is the incremental crawl (needs_rehash skips unchanged files), so
@@ -879,6 +898,32 @@ impl Writer {
                                 &focus,
                             );
                         }
+                        Ok(WriterMsg::EmbeddingsDone { model_id, done }) => {
+                            // Cheap: N `upsert_embedding` calls, no inference. Clearing
+                            // `embedding_dirty` here is what lets `promote_statuses` move the
+                            // asset on, so the promote runs on the next idle tick.
+                            let n = lodestash_app::drains::store_visual_embeddings(
+                                &mut catalog,
+                                &model_id,
+                                &done,
+                            );
+                            embed_inflight.store(false, Ordering::Relaxed);
+                            if n > 0 {
+                                emit_changed(&app, "catalog");
+                            }
+                        }
+                        Ok(WriterMsg::TagsDone { model_id, done }) => {
+                            let n = lodestash_app::drains::store_tags(
+                                &mut catalog,
+                                &model_id,
+                                &done,
+                            );
+                            tag_inflight.store(false, Ordering::Relaxed);
+                            if n > 0 {
+                                tracing::info!(tags = n, model = %model_id, "idle tagging slice stored");
+                                emit_changed(&app, "catalog");
+                            }
+                        }
                         Ok(WriterMsg::ManifestDone {
                             job_id,
                             package_id,
@@ -974,15 +1019,87 @@ impl Writer {
                                 }
                             }
                             if idle_appraises {
+                                // The encode goes to a worker; the writer keeps only the two
+                                // cheap ends (read the queue slice here, persist the result when
+                                // `EmbeddingsDone` arrives). Passing `None` for the embedders
+                                // below is what keeps the pass's own embed drain out of this
+                                // thread — the kick paths still run it inline, because there the
+                                // user asked for it and is watching a progress bar.
+                                if let Some(emb) = idle_embedder.clone() {
+                                    if !embed_inflight.load(Ordering::Relaxed) {
+                                        const SLICE: usize = 8;
+                                        let (jobs, albedo) =
+                                            lodestash_app::drains::visual_embed_batch(
+                                                &catalog, SLICE,
+                                            );
+                                        if !jobs.is_empty() {
+                                            embed_inflight.store(true, Ordering::Relaxed);
+                                            let tx = writer_tx.clone();
+                                            let flag = embed_inflight.clone();
+                                            let (ws, cd) =
+                                                (workspace_dir.clone(), cache_dir.clone());
+                                            std::thread::spawn(move || {
+                                                let done =
+                                                    lodestash_app::drains::compute_visual_embeddings(
+                                                        jobs,
+                                                        &albedo,
+                                                        emb.as_ref(),
+                                                        ws.as_deref(),
+                                                        cd.as_deref(),
+                                                    );
+                                                let model_id = emb.model_id().to_string();
+                                                if tx
+                                                    .send(WriterMsg::EmbeddingsDone {
+                                                        model_id,
+                                                        done,
+                                                    })
+                                                    .is_err()
+                                                {
+                                                    // The writer is gone (shutdown) — nothing to
+                                                    // persist into, and nothing will clear the
+                                                    // flag, so clear it here.
+                                                    flag.store(false, Ordering::Relaxed);
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
+                                // Tagging takes the same lane. The worker opens its own
+                                // **read-only** catalog connection for the 3D zero-shot lookup —
+                                // WAL admits any number of readers, and the single-writer rule is
+                                // about writes (ADR-0002), which still all land right here.
+                                if !tag_inflight.load(Ordering::Relaxed) {
+                                    const TAG_SLICE: usize = 4;
+                                    let jobs = lodestash_app::drains::tag_batch(
+                                        &catalog, TAG_SLICE, None,
+                                    );
+                                    if !jobs.is_empty() {
+                                        tag_inflight.store(true, Ordering::Relaxed);
+                                        let tx = writer_tx.clone();
+                                        let flag = tag_inflight.clone();
+                                        let (ws, cd) = (workspace_dir.clone(), cache_dir.clone());
+                                        let db = db_path.clone();
+                                        let emb = idle_embedder.clone();
+                                        std::thread::spawn(move || {
+                                            let sent = tag_worker_slice(&db, jobs, emb, ws, cd, &tx);
+                                            if !sent {
+                                                flag.store(false, Ordering::Relaxed);
+                                            }
+                                        });
+                                    }
+                                }
                                 pump.store(true, Ordering::Relaxed);
                                 let r = appraise_pass(
                                     &mut catalog,
-                                    idle_embedder.clone(),
+                                    None,
                                     idle_audio.clone(),
                                     std::time::Duration::from_secs(1),
                                     &appraise,
                                     &focus,
-                                    None,
+                                    // The idle pass no longer tags inline — the worker above does
+                                    // it. An empty explicit set means "no assets", which is the
+                                    // one thing it cannot be confused with "everything".
+                                    Some(&[]),
                                 );
                                 pump.store(false, Ordering::Relaxed);
                                 if r.map(|w| w.changed > 0).unwrap_or(false) {
@@ -1092,6 +1209,68 @@ fn rescan_watched(catalog: &mut Catalog, db_path: &Path, _app: &Option<tauri::Ap
 /// is re-derived here because it can change between passes. `progress` is the shared
 /// B11d surface the Identify screen polls — reset at pass start, filled by the tag/embed
 /// drains as they work.
+/// Compute one idle tagging slice off the writer thread and post the result back.
+///
+/// Returns whether a `TagsDone` was sent — the caller clears the in-flight flag when it was not,
+/// or the lane would wedge shut for the life of the process.
+fn tag_worker_slice(
+    db_path: &std::path::Path,
+    jobs: Vec<lodestash_core::catalog::VisualEmbedJob>,
+    embedder: Option<std::sync::Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
+    workspace_dir: Option<std::path::PathBuf>,
+    cache_dir: Option<std::path::PathBuf>,
+    tx: &std::sync::mpsc::Sender<WriterMsg>,
+) -> bool {
+    let Ok(cat) = Catalog::open(db_path) else {
+        tracing::warn!("tag worker could not open a read connection; slice skipped");
+        return false;
+    };
+    let teach = cat
+        .teaching_traits()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(namespace, value, scope, usage_note)| TeachTrait {
+            namespace,
+            value,
+            scope,
+            usage_note,
+        })
+        .collect::<Vec<_>>();
+    let zero_shot = embedder.and_then(|e| ImageZeroShot::new(e, &teach));
+    let cfg = AppConfig::load();
+    let api_model = cfg
+        .api_model
+        .clone()
+        .filter(|_| cfg.api_tagging_enabled && !cfg.api_key.is_empty());
+    let tagger: Box<dyn Tagger> = if let Some(model) = api_model {
+        Box::new(
+            OpenAiTagger::new(cfg.api_base_url.clone(), cfg.api_key.clone(), model)
+                .with_teaching(teach.clone()),
+        )
+    } else if let Some(model) = cfg.tagger_model.clone() {
+        let mut t = OllamaTagger::new(model);
+        if let Some(vision) = cfg.tagger_vision_model.clone() {
+            t = t.with_vision(vision);
+        }
+        Box::new(t.with_teaching(teach.clone()))
+    } else {
+        Box::new(FilenameTagger)
+    };
+    let done = lodestash_app::drains::compute_tags(
+        jobs,
+        &cat,
+        tagger.as_ref(),
+        zero_shot.as_ref(),
+        workspace_dir.as_deref(),
+        cache_dir.as_deref(),
+    );
+    tx.send(WriterMsg::TagsDone {
+        model_id: tagger.model_id().to_string(),
+        done,
+    })
+    .is_ok()
+}
+
 fn appraise_pass(
     catalog: &mut Catalog,
     embedder: Option<std::sync::Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
