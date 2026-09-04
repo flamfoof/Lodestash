@@ -157,12 +157,14 @@ pub fn drain_audio_embeddings(
     emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync),
     workspace_dir: Option<&std::path::Path>,
     budget: Option<std::time::Duration>,
+    // The explicit set an `identify_asset` kick named, or `None` for the whole queue.
+    only: Option<&[i64]>,
 ) {
     const BATCH: usize = 32;
     let mut total = 0usize;
     let deadline = budget.map(|b| std::time::Instant::now() + b);
     loop {
-        let jobs = match cat.audio_assets_needing_embedding(BATCH) {
+        let jobs = match cat.audio_assets_needing_embedding_within(BATCH, only) {
             Ok(j) => j,
             Err(e) => {
                 tracing::warn!(%e, "audio embed queue query failed; retries next scan");
@@ -174,6 +176,13 @@ pub fn drain_audio_embeddings(
         }
         let n = jobs.len();
         for job in jobs {
+            // Per clip, not per batch: a decode plus a CLAP pass is seconds, so a 32-unit batch
+            // overruns any budget worth setting. Same defect as the preview and visual-embed
+            // drains had — a deadline tested outside the loop that does the work.
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                tracing::debug!(embedded = total, "audio embed pass hit its time budget");
+                return;
+            }
             // In-pack payloads pull to a scratch file; keep the guard alive while `path` is read.
             let resolved = resolve_job_path(&job, workspace_dir);
             let path = resolved.as_ref().map(|(p, _)| p.clone());
@@ -470,9 +479,15 @@ pub fn drain_audio_tags(
     workspace_dir: Option<&std::path::Path>,
     progress: &crate::jobs::JobProgress,
     max_assets: u32,
+    // The explicit set an `identify_asset` kick was asked about, or `None` for the whole queue.
+    only: Option<&[i64]>,
+    // Wall-clock ceiling for the whole drain, checked **per asset**. A count budget alone is not
+    // a latency bound when one unit is a decode plus a CLAP pass.
+    budget: Option<std::time::Duration>,
 ) {
     use std::sync::atomic::Ordering;
     const BATCH: usize = 32;
+    let deadline = budget.map(|b| std::time::Instant::now() + b);
     let model_id = zero_shot.model_id().to_string();
     let mut tagged_assets = 0usize;
     loop {
@@ -485,7 +500,7 @@ pub fn drain_audio_tags(
         if max_assets != 0 && tagged_assets >= max_assets as usize {
             return;
         }
-        let jobs = match cat.audio_assets_needing_tags(BATCH) {
+        let jobs = match cat.audio_assets_needing_tags_within(BATCH, only) {
             Ok(j) => j,
             Err(e) => {
                 tracing::warn!(%e, "audio tag queue query failed; retries next run");
@@ -502,6 +517,12 @@ pub fn drain_audio_tags(
             }
             // Hard per-asset cap inside the batch too, so `max_assets` is exact, not +BATCH.
             if max_assets != 0 && tagged_assets >= max_assets as usize {
+                return;
+            }
+            // Per asset, not per batch: one unit here is a full decode plus a CLAP pass, and a
+            // count budget says nothing about how long 48 of those take.
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                tracing::debug!("audio tag pass hit its time budget");
                 return;
             }
             let resolved = resolve_job_path(&job, workspace_dir);
@@ -971,8 +992,19 @@ pub fn drain_promote_resync(
     // Bounds one embedding pass (`None` = drain until the queue is empty — the egui pump's
     // behavior). The desktop writer passes a cap so a long Identify-all never blocks writes.
     budget: Option<std::time::Duration>,
+    // The explicit set an `identify_asset` kick was asked about, or `None` for a general pass.
+    //
+    // When it is set, the **library-wide backfills below are skipped**. Metrics, previews and
+    // dependency scans are opportunistic catch-up over the whole catalog; they have nothing to do
+    // with the assets the caller named, and running them made a kick on 64 images spend 20 s
+    // rendering previews for unrelated models (measured 2026-09-03: the requested work itself took
+    // 342 ms). The idle lane owns that catch-up, and it converges there.
+    only: Option<&[i64]>,
 ) -> (Option<StatusCounts>, AssetIdentityMaps, Vec<i64>) {
-    drain_metrics(cat, workspace_dir, cache_dir, proxy);
+    let scoped = only.is_some();
+    if !scoped {
+        drain_metrics(cat, workspace_dir, cache_dir, proxy);
+    }
     // Backfill previews for models the metrics drain will never revisit — anything indexed before
     // previews existed is already clean, so without this it stays blank forever. Time-boxed so a
     // few thousand models don't hold the persist thread; the queue is durable and converges over
@@ -983,19 +1015,23 @@ pub fn drain_promote_resync(
     // only ever reached the embedding drains below. That is most of why a trivial user write
     // measured ~16 s on an idle app: not the model inference it looked like, but a preview
     // backfill happily rendering for a minute and a half between ops.
-    drain_previews(
-        cat,
-        workspace_dir,
-        cache_dir,
-        proxy,
-        budget.map_or(PREVIEW_BACKFILL_BUDGET, |b| b.min(PREVIEW_BACKFILL_BUDGET)),
-    );
-    drain_dependencies(cat, workspace_dir);
+    if !scoped {
+        drain_previews(
+            cat,
+            workspace_dir,
+            cache_dir,
+            proxy,
+            budget.map_or(PREVIEW_BACKFILL_BUDGET, |b| b.min(PREVIEW_BACKFILL_BUDGET)),
+        );
+    }
+    if !scoped {
+        drain_dependencies(cat, workspace_dir);
+    }
     if let Some(emb) = embedder {
-        drain_image_embeddings(cat, emb.as_ref(), workspace_dir, cache_dir, budget);
+        drain_image_embeddings(cat, emb.as_ref(), workspace_dir, cache_dir, budget, only);
     }
     if let Some(emb) = audio_embedder {
-        drain_audio_embeddings(cat, emb.as_ref(), workspace_dir, budget);
+        drain_audio_embeddings(cat, emb.as_ref(), workspace_dir, budget, only);
     }
     let promoted = match cat.promote_statuses() {
         Ok(p) if p.is_empty() => return (None, Vec::new(), Vec::new()), // nothing moved
@@ -1386,8 +1422,18 @@ pub fn visual_embed_batch(
     cat: &Catalog,
     limit: usize,
 ) -> (Vec<lodestash_core::catalog::VisualEmbedJob>, AlbedoPaths) {
+    visual_embed_batch_within(cat, limit, None)
+}
+
+/// [`visual_embed_batch`], restricted to an explicit set — what an `identify_asset` kick needs so
+/// it embeds the assets it was asked about rather than the front of the global queue.
+pub fn visual_embed_batch_within(
+    cat: &Catalog,
+    limit: usize,
+    only: Option<&[i64]>,
+) -> (Vec<lodestash_core::catalog::VisualEmbedJob>, AlbedoPaths) {
     let jobs = cat
-        .visual_assets_needing_embedding(limit)
+        .visual_assets_needing_embedding_within(limit, only)
         .unwrap_or_else(|e| {
             tracing::warn!(%e, "visual embed queue query failed; retries next pass");
             Vec::new()
@@ -1485,11 +1531,21 @@ pub fn drain_image_embeddings(
     workspace_dir: Option<&std::path::Path>,
     cache_dir: Option<&std::path::Path>,
     budget: Option<std::time::Duration>,
+    // The explicit set an `identify_asset` kick named, or `None` for the whole queue.
+    only: Option<&[i64]>,
 ) {
-    const BATCH: usize = 64;
+    // **Slice size follows the budget.** One unit is a four-view render plus four SigLIP passes
+    // (~17 s here), so a fixed batch of 64 overshoots a 20 s budget by minutes no matter where the
+    // deadline is tested — a batch is atomic once started. Measured 2026-09-03: an `identify` kick
+    // on 64 images finished its own tagging in 481 ms and then spent **>3 minutes** in here.
+    // Unbudgeted callers (the old pump, which drains to empty) keep the big batch.
+    let batch = if budget.is_some() { 4 } else { 64 };
     let deadline = budget.map(|b| std::time::Instant::now() + b);
     loop {
-        let (jobs, albedo) = visual_embed_batch(cat, BATCH);
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        let (jobs, albedo) = visual_embed_batch_within(cat, batch, only);
         let n = jobs.len();
         if n == 0 {
             break;
@@ -1502,7 +1558,7 @@ pub fn drain_image_embeddings(
             tracing::debug!("visual embed pass hit its time budget");
             break;
         }
-        if n < BATCH {
+        if n < batch {
             break;
         }
     }

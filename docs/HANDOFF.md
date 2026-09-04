@@ -951,6 +951,13 @@ fixture.
   describes what it sees, correctly, and it is not what the asset *is* — see `AI-PIPELINE.md` §2.
   Do not read a wrong `subject:` tag on a texture as a model-quality problem; a bigger VLM was
   tried (2026-08-30) and changed nothing there.
+- **A scoped request must be scoped in *every* queue it touches.** One appraise pass drains visual
+  tags, audio tags, visual embeddings, audio embeddings, plus the metrics/preview/dependency
+  backfills. `identify_asset(ids)` scoped exactly one of them for a while, so a kick on 64 images
+  ran 20 minutes while its own work took 342 ms — the rest went on unrelated audio and other
+  people's previews. Adding a queue means adding it to `scope_clause` and to the test that covers
+  all four; **grep the sibling queues before declaring a scoping bug fixed**, because this one was
+  found four separate times.
 - **A time budget checked once per batch is not a time budget.** `drain_previews` took a 1 s slice
   from the writer's idle tick and tested its deadline between batches of 16 renders — ~17 s of
   work — so every user write queued behind it: a `POST /v1/stage` measured **16.4 s** on an

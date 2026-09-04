@@ -329,6 +329,27 @@ const KEEP_GOOD_VECTOR: &str = "embedding_dirty = CASE
      WHEN EXISTS (SELECT 1 FROM asset_embedding e WHERE e.asset_id = asset.id)
              THEN embedding_dirty ELSE 1 END";
 
+/// The `AND a.id IN (...)` clause an `identify_asset` kick needs, or empty for a general pass.
+///
+/// Four queues have now needed this — visual tags, audio tags, visual embeddings, audio
+/// embeddings — because one appraise pass drains all of them and a *scoped* kick must not drag the
+/// rest of the library through. Each one was found separately, the expensive way: a kick on 64
+/// images spent 20 minutes on unrelated audio and previews while its own work took 342 ms.
+///
+/// Ids are inlined rather than bound: an id list is a variable-length set of `i64`s the caller
+/// already holds, never user text.
+fn scope_clause(only: Option<&[i64]>) -> String {
+    match only {
+        Some(ids) if !ids.is_empty() => format!(
+            "AND a.id IN ({})",
+            ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+        ),
+        // An explicit *empty* set asks for nothing, which is not the same as "everything".
+        Some(_) => "AND 0".to_string(),
+        None => String::new(),
+    }
+}
+
 impl Catalog {
     /// Open (or create) the catalog at `path`. Runs all pending migrations.
     pub fn open(path: &Path) -> Result<Self> {
@@ -2574,6 +2595,16 @@ impl Catalog {
     /// (`disk_path = root_path/rel_path`) *and* package-extracted files (`workspace_rel` set —
     /// the caller joins it onto the workspace dir). `missing` rows excluded.
     pub fn visual_assets_needing_embedding(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
+        self.visual_assets_needing_embedding_within(limit, None)
+    }
+
+    /// The visual embed queue, optionally restricted to an explicit set — see [`scope_clause`].
+    pub fn visual_assets_needing_embedding_within(
+        &self,
+        limit: usize,
+        only: Option<&[i64]>,
+    ) -> Result<Vec<VisualEmbedJob>> {
+        let scope = scope_clause(only);
         let mut stmt = self
             .conn
             .prepare(&format!(
@@ -2591,6 +2622,7 @@ impl Catalog {
                  WHERE a.embedding_dirty = 1 AND a.deleted_at IS NULL
                    AND af.missing = 0
                    AND mt.code IN ('image', 'texture', 'sprite', 'model_3d', 'material')
+                 {scope}
                  {order} LIMIT ?1",
                 order = self.appraise_focus.order_by("a.id")
             ))
@@ -2622,6 +2654,23 @@ impl Catalog {
     /// §110). Its own queue rather than a filter over `assets_needing_tags`, so the audio pass loops
     /// to completion instead of spinning on a batch of non-audio rows it can't clear.
     pub fn audio_assets_needing_tags(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
+        self.audio_assets_needing_tags_within(limit, None)
+    }
+
+    /// The audio tag queue, optionally **restricted to an explicit set** — the sibling of
+    /// [`Self::assets_needing_tags_within`], and it needs the same treatment for the same reason.
+    ///
+    /// `identify_asset(ids)` runs one appraise pass, and that pass drains audio too. Unscoped, a
+    /// kick on 64 *images* pulled 48 unrelated audio clips through CLAP inference: measured
+    /// 2026-09-03, the visual half of that pass took **328 ms** and the whole slice then ran
+    /// **20 minutes**. Fixing the visual queue alone (c380ad2) left this one, which is the lesson —
+    /// the scoping bug lived in two queues and only one was in front of me.
+    pub fn audio_assets_needing_tags_within(
+        &self,
+        limit: usize,
+        only: Option<&[i64]>,
+    ) -> Result<Vec<VisualEmbedJob>> {
+        let scope = scope_clause(only);
         let mut stmt = self
             .conn
             .prepare(&format!(
@@ -2639,6 +2688,7 @@ impl Catalog {
                  WHERE a.tags_dirty = 1 AND a.deleted_at IS NULL
                    AND af.missing = 0
                    AND mt.code = 'audio'
+                 {scope}
                  {order} LIMIT ?1",
                 order = self.appraise_focus.order_by("a.id")
             ))
@@ -2664,6 +2714,16 @@ impl Catalog {
     }
 
     pub fn audio_assets_needing_embedding(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
+        self.audio_assets_needing_embedding_within(limit, None)
+    }
+
+    /// The audio embed queue, optionally restricted to an explicit set — see [`scope_clause`].
+    pub fn audio_assets_needing_embedding_within(
+        &self,
+        limit: usize,
+        only: Option<&[i64]>,
+    ) -> Result<Vec<VisualEmbedJob>> {
+        let scope = scope_clause(only);
         let mut stmt = self
             .conn
             .prepare(&format!(
@@ -2681,6 +2741,7 @@ impl Catalog {
                  WHERE a.embedding_dirty = 1 AND a.deleted_at IS NULL
                    AND af.missing = 0
                    AND mt.code = 'audio'
+                 {scope}
                  {order} LIMIT ?1",
                 order = self.appraise_focus.order_by("a.id")
             ))
@@ -4774,17 +4835,7 @@ impl Catalog {
         limit: usize,
         only: Option<&[i64]>,
     ) -> Result<Vec<VisualEmbedJob>> {
-        // Inlined rather than bound: an id list is a variable-length set and these are i64s the
-        // caller already holds, never user text.
-        let scope = match only {
-            Some(ids) if !ids.is_empty() => format!(
-                "AND a.id IN ({})",
-                ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
-            ),
-            // An explicit *empty* set asks for nothing, which is not the same as "everything".
-            Some(_) => "AND 0".to_string(),
-            None => String::new(),
-        };
+        let scope = scope_clause(only);
         let mut stmt = self
             .conn
             .prepare(&format!(

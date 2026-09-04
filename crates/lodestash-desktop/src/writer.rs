@@ -1375,6 +1375,10 @@ fn appraise_pass(
                 workspace_dir.as_deref(),
                 progress,
                 AUDIO_TAG_BUDGET_PER_PASS,
+                // Same scope the visual drain gets. A kick on 64 images used to drag 48 unrelated
+                // audio clips through CLAP: the visual half took 328 ms and the slice took 20 min.
+                only,
+                Some(budget),
             );
         }
     }
@@ -1389,6 +1393,7 @@ fn appraise_pass(
         proxy,
         &roots,
         Some(budget),
+        only,
     );
     // changed = the appraised backlog size the pass reconciled; when counts are None
     // (nothing moved) report 1 so the frontend toasts a real kick, not a silent no-op.

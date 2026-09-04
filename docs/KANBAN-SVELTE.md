@@ -308,6 +308,18 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       tracks, then set the temperature (and, if needed, the label vocabulary) from the numbers.
       Nothing here is guessable: the visual fix looked like a threshold problem and turned out to
       be a scale problem, and the reverse is equally possible.
+- [x] **`identify_asset` dragged the whole library through every kick — fixed 2026-09-04.** A kick
+      on 64 images took **20 minutes**; its own tagging took **342 ms**. The scope fix in `c380ad2`
+      covered one queue, and an appraise pass drains several: the audio-tag, visual-embed and
+      audio-embed queues all ignored `only`, and `drain_promote_resync` ran the library-wide
+      metrics, preview and dependency backfills as well. So a request about 64 textures spent its
+      time on 48 unrelated audio clips, a 20-second preview backfill for other models, and the
+      front of the global embed queue. Measured, stage by stage, rather than guessed — three wrong
+      hypotheses came first (Ollama, then the zero-shot vocabulary, then `drain_metrics`), and each
+      was killed by a timing line rather than an argument. All four queues now take a scope through
+      one shared `scope_clause`, and a scoped pass skips the backfills the idle lane owns. Whole
+      pass: **20 min → 0.9 s**. One test covers all four queues at once, including that an explicit
+      *empty* set means nothing rather than everything, and it is mutation-checked.
 - [x] **The visual zero-shot tagger had never written a tag — fixed 2026-08-30.** Not one
       `siglip…-zeroshot` row existed in a catalog holding 1,500 tags, and a whole documented
       pipeline stage ([`AI-PIPELINE.md`](AI-PIPELINE.md) §2.1) was silently inert. Hidden twice:

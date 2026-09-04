@@ -21,6 +21,98 @@ fn open_in_memory_applies_migrations() {
     assert_eq!(version, 23, "all 23 migrations should have run");
 }
 
+/// Every queue an appraise pass drains must respect the set the caller named.
+///
+/// This bug was found four separate times, one queue at a time, and each discovery cost a
+/// measurement: an `identify_asset` kick on 64 images ran **20 minutes** while its own tagging
+/// took 342 ms, because the audio-tag, visual-embed and audio-embed queues all ignored the scope
+/// and happily worked the rest of the library. One test over all four, so a fifth queue added
+/// later has an obvious place to be checked.
+#[test]
+fn every_appraise_queue_respects_an_explicit_scope() {
+    let mut c = Catalog::open_in_memory().expect("open");
+    c.seed_media_types().expect("seed");
+    let src = c
+        .upsert_import_source("Lib", "C:/lib", "folder")
+        .expect("source");
+    let mk = |c: &mut Catalog, rel: &str, code: &str| {
+        c.record_crawl(
+            src,
+            None,
+            &[CrawlRecord {
+                media_type: code.to_string(),
+                ..rec(rel, 1, 1)
+            }],
+        )
+        .expect("crawl");
+        c.conn
+            .query_row("SELECT id FROM asset ORDER BY id DESC LIMIT 1", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .expect("id")
+    };
+    let img = mk(&mut c, "a.png", "image");
+    let other_img = mk(&mut c, "b.png", "image");
+    let snd = mk(&mut c, "a.wav", "audio");
+    let other_snd = mk(&mut c, "b.wav", "audio");
+    c.conn
+        .execute("UPDATE asset SET tags_dirty = 1, embedding_dirty = 1", [])
+        .expect("dirty");
+
+    let ids = |v: Vec<VisualEmbedJob>| -> Vec<i64> {
+        let mut out: Vec<i64> = v.into_iter().map(|j| j.asset_id).collect();
+        out.sort();
+        out
+    };
+    // Scoped to one asset of each kind: the sibling of the same kind must not appear.
+    assert_eq!(
+        ids(c.assets_needing_tags_within(10, Some(&[img])).unwrap()),
+        vec![img]
+    );
+    assert_eq!(
+        ids(c
+            .audio_assets_needing_tags_within(10, Some(&[snd]))
+            .unwrap()),
+        vec![snd]
+    );
+    assert_eq!(
+        ids(c
+            .visual_assets_needing_embedding_within(10, Some(&[img]))
+            .unwrap()),
+        vec![img]
+    );
+    assert_eq!(
+        ids(c
+            .audio_assets_needing_embedding_within(10, Some(&[snd]))
+            .unwrap()),
+        vec![snd]
+    );
+
+    // Unscoped still sees everything — the scope must not leak into the general pass. The visual
+    // tag queue is deliberately *not* media-filtered (audio falls out later, on `Tagger::supports`),
+    // so it returns all four; the audio queues are filtered by `mt.code`.
+    assert_eq!(
+        ids(c.assets_needing_tags(10).unwrap()),
+        vec![img, other_img, snd, other_snd]
+    );
+    assert_eq!(
+        ids(c.audio_assets_needing_tags(10).unwrap()),
+        vec![snd, other_snd]
+    );
+
+    // And an explicit *empty* set means nothing, never everything.
+    for q in [
+        c.assets_needing_tags_within(10, Some(&[])).unwrap(),
+        c.audio_assets_needing_tags_within(10, Some(&[])).unwrap(),
+        c.visual_assets_needing_embedding_within(10, Some(&[]))
+            .unwrap(),
+        c.audio_assets_needing_embedding_within(10, Some(&[]))
+            .unwrap(),
+    ] {
+        assert!(q.is_empty(), "an empty scope asked for nothing");
+    }
+}
+
 /// An **Identify** kick must not invalidate a vector it cannot replace.
 ///
 /// `embedding_dirty = 1` means "the bytes changed" (DATA-MODEL §8) and promotion to `identified`

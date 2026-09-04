@@ -36,12 +36,12 @@ const viewport = () => page.evaluate(() => [window.innerWidth, window.innerHeigh
  * cannot await a Tauri `invoke` from this side; several checks need exactly that — press a key,
  * then wait for the catalog to agree — and a fixed sleep would either be flaky or slow.
  */
-async function waitFor(pred, message, timeout = 5000) {
+async function waitFor(pred, message, timeout = 5000, interval = 50) {
   const until = Date.now() + timeout;
   for (;;) {
     if (await pred()) return;
     if (Date.now() > until) throw new Error(message);
-    await new Promise((r) => setTimeout(r, 50));
+    await new Promise((r) => setTimeout(r, interval));
   }
 }
 
@@ -2517,9 +2517,24 @@ try {
     });
     await page.locator(".card").first().click();
     await page.waitForSelector('[data-testid="inspector-name"]', { timeout: 5000 });
+    // Wait for the *selection* too, not just the Inspector. Reading `.card.selected` before the
+    // class lands gave `id = NaN`, so every later locator matched nothing and the check died on a
+    // 30-second Playwright timeout with no hint of why — which is how this read as a flake in the
+    // toggle rather than a missing wait here.
+    await page.waitForSelector(".card.selected", { timeout: 5000 });
     const id = Number(
       await page.evaluate(() => document.querySelector(".card.selected")?.getAttribute("data-asset-id")),
     );
+    assert.ok(Number.isFinite(id), "no card is selected — the rest of this check cannot mean anything");
+    // The **catalog** is the authority here, not the DOM. Two earlier attempts read the star off
+    // the card and both broke on rendering, not on the toggle: the grid is virtualised to ~100
+    // cards, and a refresh after the write drops the selected card out of the rendered window
+    // ("card 2427 is not in the DOM (100 cards rendered)"). What this check is about is whether a
+    // second F undoes the first, which is a fact about stored state.
+    //
+    // Polled every 250 ms, not the default 50: this predicate is a whole-library query, and firing
+    // ~100 of them inside a five-second window competed with the very write being waited for. That
+    // was the original flake, and it reported itself as "the second F did not toggle it back".
     const starred = async () => {
       const p = await invoke("grid_page", {
         query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
@@ -2530,10 +2545,14 @@ try {
     const was = await starred();
     try {
       await page.keyboard.press("f");
-      await page.waitForFunction(async () => true, undefined, { timeout: 200 }).catch(() => {});
-      await waitFor(async () => (await starred()) !== was, "F did not change the star");
+      await waitFor(async () => (await starred()) !== was, "F did not change the star", 8000, 250);
       await page.keyboard.press("f");
-      await waitFor(async () => (await starred()) === was, "the second F did not toggle it back");
+      await waitFor(
+        async () => (await starred()) === was,
+        "the second F did not toggle it back",
+        8000,
+        250,
+      );
     } finally {
       await invoke("set_favorite", { assetIds: [id], on: was });
     }
