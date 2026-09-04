@@ -298,6 +298,16 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       `door` → `crates`, `bucket` `crate` → `bucket`. Unit-tested both directions — a 3D model must
       **not** get the clause, since its preview is a render of the object and the pixels are the
       better evidence. Written up in [`AI-PIPELINE.md`](AI-PIPELINE.md) §2.
+- [ ] **Audio zero-shot is as inert as the visual one was, and the temperature fix did not reach
+      it.** 4 `clap-htsat-unfused-zeroshot` rows exist in the whole catalog; 2 audio assets carry
+      any tag at all against **1,839** untagged. Spot-checked 8 tracks after `LOGIT_SCALE` went to
+      100 (2026-08-30) — every one still came back empty, so raising the shared constant neither
+      helped nor made audio overconfident. That is the split the `ponytail:` note on `LOGIT_SCALE`
+      anticipated: one temperature for two models, and CLAP's own spread has never been measured.
+      Do for CLAP what was done for SigLIP — log the real per-facet cosines over a handful of
+      tracks, then set the temperature (and, if needed, the label vocabulary) from the numbers.
+      Nothing here is guessable: the visual fix looked like a threshold problem and turned out to
+      be a scale problem, and the reverse is equally possible.
 - [x] **The visual zero-shot tagger had never written a tag — fixed 2026-08-30.** Not one
       `siglip…-zeroshot` row existed in a catalog holding 1,500 tags, and a whole documented
       pipeline stage ([`AI-PIPELINE.md`](AI-PIPELINE.md) §2.1) was silently inert. Hidden twice:
