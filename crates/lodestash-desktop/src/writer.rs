@@ -763,8 +763,17 @@ impl Writer {
                 // preview.
                 {
                     let cfg = AppConfig::load();
-                    if cfg.auto_purge_preview_cache {
-                        if let Some(thumbs) = default_cache_dirs().0 {
+                    if let Some(thumbs) = default_cache_dirs().0 {
+                        // Identity before pressure. A stale-budget proxy, an orphan staging
+                        // mesh and a crash-leftover `.part` are dead the moment they become
+                        // so, and the cap never reaches them: 359 MB against an 8 GB cap
+                        // means the purge below had never once run while 145 MB of that was
+                        // already garbage.
+                        crate::storage::sweep_dead_mesh_cache(
+                            &thumbs,
+                            &cfg.preview_quality.proxy_budget().tag(),
+                        );
+                        if cfg.auto_purge_preview_cache {
                             crate::storage::purge_previews_over_cap(
                                 &thumbs,
                                 u64::from(cfg.preview_cache_cap_gb) * 1024 * 1024 * 1024,

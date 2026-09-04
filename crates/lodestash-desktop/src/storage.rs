@@ -162,6 +162,72 @@ pub fn execute_reclaim(plan: &ReclaimPlan) -> (usize, u64) {
     (removed, freed)
 }
 
+/// Delete the mesh-cache files that are dead by **identity**, before any cap is consulted.
+///
+/// The cap cannot do this job. Three classes of file stop being useful the moment they do, and
+/// gating their removal on cap pressure means they simply accumulate: the reference machine held
+/// 359 MB against an 8 GB cap, so [`purge_previews_over_cap`] had never once fired, and 145 MB of
+/// it was already garbage:
+///
+/// - **Stale-budget proxies** — `<key>-<tag>.lod` whose tag is not the current quality's. A
+///   setting change forks the cache and nothing reaps the loser; the machine held 967 proxies at
+///   Low's budget *and* 1,307 at Medium's.
+/// - **Orphan staging geometry** — `<key>.msh` with no `<key>-*.lod` sibling. The metrics drain
+///   parses every model into one to read the source triangle count, and
+///   `mesh::load_preview_cached` deletes it when it decimates — but only if a preview is ever
+///   generated for that same key. 600 were left, 123 MB, largest 48.6 MB.
+/// - **Crash leftovers** — `*.part` from an interrupted temp-then-rename.
+///
+/// Deliberately **not** catalog-driven: every relation needed is in the filenames, so one
+/// `read_dir` answers all three. A race with a drain mid-write costs one re-parse, which is the
+/// same price a cache miss already pays.
+///
+/// Returns `(files removed, bytes freed)`.
+pub fn sweep_dead_mesh_cache(thumbs: &Path, current_tag: &str) -> (usize, u64) {
+    let mesh = thumbs.join("mesh");
+    let Ok(entries) = std::fs::read_dir(&mesh) else {
+        return (0, 0);
+    };
+    let mut names: Vec<(PathBuf, String, u64)> = Vec::new();
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.is_dir() {
+            continue;
+        }
+        let Ok(meta) = e.metadata() else { continue };
+        let name = e.file_name().to_string_lossy().into_owned();
+        names.push((path, name, meta.len()));
+    }
+    // Which stems still have a proxy the current setting would serve. Built before anything is
+    // deleted, so the `.msh` decision cannot depend on the order the directory happened to list.
+    let live_stems: HashSet<&str> = names
+        .iter()
+        .filter_map(|(_, n, _)| n.strip_suffix(".lod"))
+        .filter(|stem| stem.ends_with(current_tag))
+        .filter_map(|stem| stem.rsplit_once('-').map(|(key, _)| key))
+        .collect();
+
+    let mut removed = 0usize;
+    let mut freed = 0u64;
+    for (path, name, len) in &names {
+        let dead = if let Some(stem) = name.strip_suffix(".lod") {
+            !stem.ends_with(current_tag)
+        } else if let Some(key) = name.strip_suffix(".msh") {
+            !live_stems.contains(key)
+        } else {
+            name.ends_with(".part")
+        };
+        if dead && std::fs::remove_file(path).is_ok() {
+            removed += 1;
+            freed += len;
+        }
+    }
+    if removed > 0 {
+        tracing::info!(removed, freed, current_tag, "dead mesh-cache files swept");
+    }
+    (removed, freed)
+}
+
 /// Trim the preview cache to `cap_bytes`, oldest first (UI-SPEC §11.4 "Auto-purge over cap").
 ///
 /// Oldest by mtime rather than true least-recently-*viewed*: a read does not touch mtime, so the
@@ -302,5 +368,65 @@ mod tests {
             (0, 0),
             "already under the cap — nothing to do"
         );
+    }
+
+    /// The sweep decides by identity, not by pressure — the cap never reaches these.
+    ///
+    /// Reproduces the three classes found on the reference machine: proxies left behind by a
+    /// quality change, staging meshes for models that were parsed for their triangle count but
+    /// never thumbnailed, and `.part` leftovers from an interrupted write.
+    #[test]
+    fn the_sweep_takes_dead_mesh_files_and_leaves_the_live_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let mesh = dir.path().join("mesh");
+        std::fs::create_dir_all(&mesh).unwrap();
+        let now = "r50f600c4000";
+        let then = "r20f300c1500";
+
+        // Two models: `keepme` has a current proxy, `stale` only an old one.
+        touch(&mesh.join(format!("keepme-{now}.lod")), 10);
+        touch(&mesh.join(format!("keepme-{then}.lod")), 20);
+        touch(&mesh.join("keepme.msh"), 40);
+        touch(&mesh.join(format!("stale-{then}.lod")), 80);
+        touch(&mesh.join("stale.msh"), 160);
+        touch(&mesh.join("orphan.msh"), 320);
+        touch(&mesh.join("half.lod.1234-0.part"), 640);
+        // A thumbnail outside `mesh/` is not this sweep's business at any size.
+        touch(&dir.path().join("a_128x128_x.png"), 1280);
+
+        let (removed, freed) = sweep_dead_mesh_cache(dir.path(), now);
+
+        let gone = |n: &str| !mesh.join(n).exists();
+        assert!(
+            gone(&format!("keepme-{then}.lod")),
+            "a stale-budget proxy goes"
+        );
+        assert!(
+            gone(&format!("stale-{then}.lod")),
+            "even when it is the only proxy"
+        );
+        assert!(
+            gone("orphan.msh"),
+            "staging geometry with no proxy at all goes"
+        );
+        assert!(
+            gone("stale.msh"),
+            "its proxy was stale, so the staging mesh is not protected by it either"
+        );
+        assert!(gone("half.lod.1234-0.part"), "a crash leftover goes");
+
+        assert!(
+            mesh.join(format!("keepme-{now}.lod")).exists(),
+            "the current proxy stays"
+        );
+        assert!(
+            mesh.join("keepme.msh").exists(),
+            "staging geometry backing a current proxy stays — the metrics facet reads it"
+        );
+        assert!(
+            dir.path().join("a_128x128_x.png").exists(),
+            "thumbnails are the cap's job"
+        );
+        assert_eq!((removed, freed), (5, 20 + 80 + 160 + 320 + 640));
     }
 }

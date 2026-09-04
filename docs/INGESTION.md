@@ -386,14 +386,106 @@ All three previews share the single **wgpu** device used by the egui UI.
 
 ---
 
-## 6. Thumbnail / preview generation
+## 6. Preview artifacts — what a card renders from
 
-- Generated **asynchronously** into an on-disk cache keyed by `content_hash + params`; the grid shows
-  placeholders and swaps thumbnails in as jobs complete.
-- **3D** → offscreen wgpu render-to-texture (no window needed). **Audio** → waveform PNG.
-  **Image** → downscaled (Lanczos), float tone-mapped first.
-- CPU-bound decode/resize runs on the `rayon` pool; GPU renders on worker tasks feeding the shared
-  device. This pipeline is what keeps large libraries responsive.
+A grid card never touches the asset. It renders from a small **derived artifact** on disk, and the
+full-resolution source is opened only in Quick Look. Two axes, both driven by the single
+`PreviewQuality` setting (Settings ▸ Appearance, UI-SPEC §11.3) — resolution and polygon count are
+separate costs and neither implies the other:
+
+| `PreviewQuality` | `thumb_px()` — raster side | `proxy_budget()` — geometry side |
+|---|---|---|
+| **Low** (default) | 128 px | 2% of source tris, clamped to [300, 1500] |
+| Medium | 256 px | 5%, clamped to [600, 4000] |
+| High | 384 px | 12%, clamped to [1200, 12000] |
+
+A bare ratio leaves a 500k-tri hull heavy and erases a 400-tri prop; a bare fixed count spends the
+same budget on both. Hence ratio-plus-clamp.
+
+### The artifacts
+
+| Artifact | Path | What it is | Keyed on |
+|---|---|---|---|
+| Raster thumbnail | `thumbs/<key>_<w>x<h>_<proxytag>.png` | The card's picture for images, audio waveforms and shader balls | `(path, size, mtime)` + width/height/proxy tag |
+| Low-poly proxy | `thumbs/mesh/<key>-<budget>.lod` | Decimated `MeshData`, the thing a model thumbnail and the multiview embedding both render | `(path, size, mtime)` + budget tag |
+| Staging geometry | `thumbs/mesh/<key>.msh` | Parse-once full-resolution `MeshData` | `(path, size, mtime)` |
+| In-pack scratch | `thumbs/inpack/<key>.<ext>` | One payload pulled out of a `.unitypackage` so a decoder can read it | archive + offset + size |
+| Pack icon | `thumbs/pkgicon-<key>.png` | A pack's own `.icon.png`, harvested from the archive | package path |
+
+The first two are **deliverables** — what cards render from, cheap to keep. The last two are
+**intermediates**: full-resolution, large, and only needed while the deliverable is being made.
+The budget tag on `.lod` is what stops a quality change from serving the old coarse proxy forever;
+without it, raising the setting would keep every cached model at the old fidelity.
+
+### The pipeline
+
+1. **Scan** → the metrics drain parses each model once into `mesh/<key>.msh` and persists
+   `asset.tri_count` from it. The `triangles` facet must be the *source* count, so this reads the
+   full mesh, never the proxy.
+2. **Browse or backfill** → `mesh::load_preview_cached` decimates that into `<key>-<budget>.lod`
+   and **deletes the staging `.msh`**, which is where the disk win comes from. A re-scan re-parses
+   the source; that is the accepted ceiling.
+3. **Render** → `thumb::render_model_thumb` rasterises the proxy at `thumb_px()` on the CPU
+   (TECH-STACK §7: parsing was the cost, not the raster — a GPU path would not help). Images decode
+   through `raster::decode` and downscale (Lanczos3). Audio draws a waveform. Materials paint a
+   shader ball.
+4. **Serve** → `lodestash://thumb/{id}.png`, with `?q=` carrying the quality so a Settings change
+   re-keys the client's cache rather than serving the old size.
+
+Models are refused by the thumb route on purpose: a raster model thumbnail costs a mesh parse, and
+one grid page would trigger a hundred. They draw the stored vector preview instead — a 3-band
+contour in one flat colour (`MODEL_HEX`), so **every model in the library is the same purple**.
+
+> **Known gaps, measured 2026-09-04 and carded, not yet fixed.** Named here because the spec would
+> otherwise read as a description of a system that works better than it does.
+>
+> - The **default quality renders below card size**: `thumb_px()` Low is 128 px against grid card
+>   min-widths of 150 / 205 / 288 px, `object-fit: cover`, before DPI scaling.
+> - **Decimation is a no-op on most of the library**: `decimate` returns `None` when the source is
+>   already under budget, and the low-poly props that dominate asset packs sit under Low's 1500
+>   ceiling. The `.lod` is then a re-encoded copy.
+> - **`LOD1`/`LOD2`/`UCX_` submeshes are not filtered**, so an FBX shipping a LOD group renders
+>   every level stacked and splits the triangle budget across the copies.
+> - **Models carry no colour into the grid.** The shader-ball path resolves a texture through the
+>   `uses_texture` edge; the mesh path does not, so shape is the only signal a card gives.
+> - The **proxy tag is in every PNG name**, including textures, waveforms and shader balls that
+>   contain no geometry, so a geometry-budget change invalidates them too.
+
+### Retention — identity first, then the cap
+
+Two mechanisms, and the split matters: **most of this cache is not a cap problem.** The reference
+machine held 359 MB against an 8 GB cap, so the cap had never once fired — while 145 MB of that
+was already garbage by identity.
+
+**1. The identity sweep** (`storage::sweep_dead_mesh_cache`, at writer startup). Deletes what is
+dead the moment it becomes dead, regardless of pressure, from one `read_dir` of `thumbs/mesh/`:
+
+| Class | Recognised by | Why it is dead |
+|---|---|---|
+| Stale-budget proxy | `<key>-<tag>.lod` where `<tag>` is not the current quality's | A setting change forks the cache; nothing else reaps the loser |
+| Orphan staging geometry | `<key>.msh` with no current `<key>-<tag>.lod` sibling | Step 2 deletes it only *if* a preview is later made for that key |
+| Crash leftover | `*.part` | An interrupted temp-then-rename |
+
+No catalog lookup: every relation needed is already in the filenames. A race with a drain mid-write
+costs one re-parse, the same price a cache miss pays.
+
+**2. The cap** (`storage::purge_previews_over_cap`, same startup block, gated on
+`auto_purge_preview_cache`). A flat recursive walk of the whole `thumbs/` tree, oldest mtime first,
+until under `preview_cache_cap_gb`. Oldest-by-mtime rather than least-recently-*viewed* because a
+read does not touch mtime and recording access times would mean writing on every preview read.
+
+Everything the sweep leaves regenerates on next browse, with two exceptions the cap must respect:
+
+- **`pkgicon-<key>.png`** — a pack's own harvested icon, keyed on the package path. It does not
+  come back from browsing; it needs a re-harvest of the archive.
+- **In-pack scratch whose archive has been deleted** — those bytes are then the only copy, the same
+  invariant `storage`'s module doc states for the extraction workspace.
+
+> **Known gap.** `thumb::evict_cache` implements a size-cap-then-age policy over `*.png` only and
+> has **no callers**; `purge_previews_over_cap` is what runs. The cap's flat ordering will delete
+> live thumbnails alongside anything the sweep missed, since a freshly-minted file is newer than a
+> good thumbnail from last month. Tiering the cap is unearned until a real cache actually crosses
+> it — the sweep is what stops the growth that was observed.
 
 ---
 

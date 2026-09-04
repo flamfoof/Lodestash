@@ -637,6 +637,22 @@ impl AppConfig {
         )
     }
 
+    /// The on-disk config **without** the credential-store round-trip [`Self::load`] makes.
+    ///
+    /// For hot paths that want a display setting and have no interest in the API key. The
+    /// thumbnail route reads `preview_quality` once per card, and going through `load` there
+    /// meant a Windows DPAPI lookup per card on a grid page — the key is blank on disk for
+    /// every user who never set one, which is the branch that reaches the keychain.
+    pub fn load_display_only() -> Self {
+        let Some(path) = config_path() else {
+            return Self::default();
+        };
+        match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            Err(_) => Self::default(),
+        }
+    }
+
     pub fn load() -> Self {
         let path = match config_path() {
             Some(p) => p,

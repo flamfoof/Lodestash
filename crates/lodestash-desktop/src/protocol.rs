@@ -248,17 +248,26 @@ fn thumb(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
     // at the new settings. The client URL carries `?q=` (see api.ts thumbUrl) purely as a
     // cache-buster — a bare id URL with max-age would keep serving the old-size PNG after a
     // Settings change.
-    let quality = lodestash_app::config::AppConfig::load().preview_quality;
+    let quality = lodestash_app::config::AppConfig::load_display_only().preview_quality;
     let side = quality.thumb_px();
     let params = lodestash_ingest::thumb::ThumbParams {
         width: side,
         height: side,
         proxy: quality.proxy_budget(),
     };
+    // `(path, size, mtime)`, all three. Passing 0 for the mtime made a re-exported file at
+    // the same byte size serve its old thumbnail forever — `generate` returns early on
+    // `dest.exists()` and nothing revalidates — and left this route keying the same file
+    // differently from `drains::tag_preview`, which always passed the real one.
+    let meta = std::fs::metadata(&path).ok();
     let key = lodestash_ingest::thumb::meta_key(
         &path,
-        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
-        0,
+        meta.as_ref().map(|m| m.len()).unwrap_or(0),
+        meta.as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
     );
     let made = match job.media_type.as_str() {
         "audio" => lodestash_ingest::thumb::generate_waveform(&cache, &key, params, |bars| {

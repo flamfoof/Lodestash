@@ -54,6 +54,39 @@ pub fn meta_key(path: &Path, size_bytes: u64, mtime: i64) -> String {
     hasher.finalize().to_hex()[..32].to_string()
 }
 
+/// Encode a PNG to a temp sibling and rename it into place.
+///
+/// The only validity check any reader makes is [`Path::exists`], so a half-written PNG is not a
+/// transient glitch — it is served forever, and the next `generate` returns early rather than
+/// repairing it. Two requests for the same asset are trivially concurrent (the grid card and the
+/// inspector both `<img>` the same id), and both miss the `exists` check together.
+///
+/// The temp name carries the process id and a counter, because sharing one `.part` between
+/// threads recreates the tear it exists to prevent.
+fn save_atomic(img: &DynamicImage, dest: &Path) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let Some(name) = dest.file_name() else {
+        return Err(std::io::Error::other(
+            "thumbnail destination has no file name",
+        ));
+    };
+    let tmp = dest.with_file_name(format!(
+        "{}.{}-{}.part",
+        name.to_string_lossy(),
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    img.save_with_format(&tmp, ImageFormat::Png)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    // Rename over an existing file is atomic on both platforms we ship; a racing writer producing
+    // the same pixels means whichever lands last wins, which is the same picture.
+    std::fs::rename(&tmp, dest).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    Ok(())
+}
+
 /// Generate a thumbnail from an image file and write it to the cache.
 /// Returns the path of the written thumbnail.
 /// Skips writing if the cache file already exists (content_hash guarantees freshness).
@@ -85,9 +118,7 @@ pub fn generate(
 
     let thumb = resize_fit(&img, params.width, params.height);
 
-    thumb
-        .save_with_format(&dest, ImageFormat::Png)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    save_atomic(&thumb, &dest)?;
 
     Ok(dest)
 }
@@ -192,8 +223,7 @@ pub fn generate_material(
     let img =
         crate::material::render_sphere(tex.as_ref(), [210, 210, 210, 255], size, [0, 0, 0, 0])
             .ok_or_else(|| std::io::Error::other("material sphere render failed"))?;
-    img.save_with_format(&dest, ImageFormat::Png)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    save_atomic(&DynamicImage::ImageRgba8(img), &dest)?;
     Ok(dest)
 }
 
@@ -222,9 +252,7 @@ pub fn generate_waveform(
     }
     std::fs::create_dir_all(cache_dir)?;
     let peaks = peaks(waveform_bars(params.width)).map_err(std::io::Error::other)?;
-    draw_waveform(&peaks, params.width, params.height)
-        .save_with_format(&dest, ImageFormat::Png)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    save_atomic(&draw_waveform(&peaks, params.width, params.height), &dest)?;
     Ok(dest)
 }
 
