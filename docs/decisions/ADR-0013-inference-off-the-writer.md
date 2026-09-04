@@ -46,9 +46,10 @@ latency was invisible until someone measured a write on a normally-launched app.
 `WriterMsg::EmbeddingsDone` / `TagsDone`, which is the same shape the writer already used for
 `ExtractDone` / `ManifestDone`. One slice of each is in flight at a time.
 
-The compute phase takes `&Catalog`, not `&mut` — the 3D zero-shot path reads the asset's stored
-vector, and WAL admits any number of readers. **The single-writer rule is about writes**, and every
-write still lands on the writer thread.
+The compute phases take no `&mut Catalog`. `compute_tags` needs no catalog at all once zero-shot
+stopped reading stored model vectors; the tag worker still opens a **read** connection for the
+user's taught vocabulary, which WAL admits alongside any number of others. **The single-writer rule
+is about writes**, and every write still lands on the writer thread.
 
 Where a drain does still run inline — the ✦ kick paths, where the user asked for it and is watching
 a progress bar — **the budget is checked per unit, not per batch**.

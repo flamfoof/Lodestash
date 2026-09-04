@@ -225,17 +225,22 @@ pub fn drain_audio_embeddings(
 /// from this tagger's own embedder. Every other case scores the decoded preview.
 fn zeroshot_tags(
     zs: &lodestash_ai::image_tags::ImageZeroShot,
-    cat: &Catalog,
-    asset_id: i64,
     media_code: &str,
     img: Option<&image::RgbaImage>,
 ) -> Vec<lodestash_core::catalog::TagAssignment> {
+    // **Not `model_3d`.** A model's stored vector is a mean-pooled multiview embedding of an
+    // untextured, flat-shaded orthographic render — far outside what SigLIP was trained on, and it
+    // shows. Measured over 20 models (2026-08-30): only ~20% produced any label at all, and half of
+    // those were wrong — `usage:tileable texture` on a wall *mesh*, `material:metal` and
+    // `subject:icon` on a giant mushroom. The same pass over real texture pixels is confident and
+    // right (`usage:tileable texture` 0.96, `material:brick` 0.69 on a Synty dungeon atlas).
+    //
+    // So the labels ride on pixels the artist actually authored, never on our own render. A model
+    // still gets tags — from the captioning tagger, which reads the same preview as prose and does
+    // far better with it (`SM_Env_Pillar_Broken_02` → `subject:pillar, material:stone`). Silence
+    // beats a guess is this module's own rule; a coin-flip tag is a guess.
     if media_code == "model_3d" {
-        if let Ok(Some((mid, v))) = cat.embedding_of(asset_id) {
-            if mid == zs.base_model_id() {
-                return zs.tag_vector(&v);
-            }
-        }
+        return Vec::new();
     }
     img.map(|i| zs.tag(i)).unwrap_or_default()
 }
@@ -335,13 +340,7 @@ pub fn drain_api_tags(
                     .map(|fb| fb.tag(&input, None).tags)
                     .unwrap_or_default();
                 if let Some(z) = zero_shot {
-                    tags.extend(zeroshot_tags(
-                        z,
-                        cat,
-                        job.asset_id,
-                        &job.media_code,
-                        Some(&img),
-                    ));
+                    tags.extend(zeroshot_tags(z, &job.media_code, Some(&img)));
                 }
                 let tags = lodestash_ai::tagger::validate(tags);
                 if let Err(e) = cat.set_tags(job.asset_id, "ai", Some(&model_id), &tags) {
@@ -381,13 +380,7 @@ pub fn drain_api_tags(
             // Union the API tags with the SigLIP zero-shot proposals over the same preview.
             let mut tags = tags;
             if let Some(z) = zero_shot {
-                tags.extend(zeroshot_tags(
-                    z,
-                    cat,
-                    job.asset_id,
-                    &job.media_code,
-                    Some(&img),
-                ));
+                tags.extend(zeroshot_tags(z, &job.media_code, Some(&img)));
             }
             let tags = lodestash_ai::tagger::validate(tags);
             if let Err(e) = cat.set_tags(job.asset_id, "ai", Some(&model_id), &tags) {
@@ -1079,16 +1072,13 @@ pub fn tag_batch(
         })
 }
 
-/// Phase 2: **compute**. Takes a `&Catalog` because the 3D zero-shot path reads the asset's
-/// stored vector — a read, which SQLite WAL allows from any connection, so a worker opens its own
-/// rather than borrowing the writer's.
+/// Phase 2: **compute**. Needs no catalog at all — pixels, a tagger and a label set.
 ///
 /// Two passes over the batch, not one pass doing both stages: interleaving the vision and text
 /// models makes Ollama evict and reload multi-GB weights per asset (~50 s/asset, against a few
 /// seconds when each model stays resident for a batch).
 pub fn compute_tags(
     jobs: Vec<lodestash_core::catalog::VisualEmbedJob>,
-    cat: &Catalog,
     tagger: &dyn lodestash_ai::tagger::Tagger,
     zero_shot: Option<&lodestash_ai::image_tags::ImageZeroShot>,
     workspace_dir: Option<&std::path::Path>,
@@ -1128,7 +1118,7 @@ pub fn compute_tags(
             })
         });
         let zs_tags = zero_shot
-            .map(|z| zeroshot_tags(z, cat, job.asset_id, &job.media_code, img.as_ref()))
+            .map(|z| zeroshot_tags(z, &job.media_code, img.as_ref()))
             .unwrap_or_default();
         prepared.push((job, name, caption, zs_tags));
     }
@@ -1225,7 +1215,7 @@ pub fn drain_tags(
         if n == 0 {
             break;
         }
-        let done = compute_tags(jobs, cat, tagger, zero_shot, workspace_dir, cache_dir);
+        let done = compute_tags(jobs, tagger, zero_shot, workspace_dir, cache_dir);
         if progress.is_cancelled() {
             return;
         }

@@ -13,7 +13,25 @@ use lodestash_core::catalog::TagAssignment;
 ///
 /// ponytail: one shared scale for both modalities; if SigLIP and CLAP need different temperatures in
 /// practice, split this into per-caller args — the score fn already takes everything else by value.
-pub const LOGIT_SCALE: f32 = 30.0;
+pub const LOGIT_SCALE: f32 = 100.0;
+
+// Measured 2026-08-30, and the reason 30.0 was wrong: SigLIP's cosines live in a **narrow band**.
+// Scoring a real Synty dungeon atlas (`PolygonDungeon_01_A`) against the 67-label vocabulary gave
+//
+//     usage:     tileable texture 0.113 | user interface 0.078 | prop     0.063
+//     material:  brick            0.097 | fabric         0.079 | leather  0.071
+//     subject:   floor            0.079 | user interface 0.078 | building 0.074
+//
+// — the *ranking* is right (it is a tileable brick floor texture), but at scale 30 a 0.035 cosine
+// gap is a 1.8x odds ratio, so the softmax came out near-uniform: best_prob was 0.45 for the
+// clearest facet and 0.07 for `subject`, against a 0.55 gate. Nothing ever cleared it. The visual
+// zero-shot tagger had written **zero** tags in the entire catalog — invisible until ORT started
+// loading, because before that it never ran at all.
+//
+// 100.0 is the temperature CLIP-family models are actually trained with (SigLIP's own logit_scale
+// is ~110; its sigmoid bias is constant per label and cancels inside a per-facet softmax). At that
+// scale the same numbers give `usage:tileable texture` ~0.83 — emitted — while `subject`, whose
+// top two differ by 0.001, stays flat and silent. Which is the behaviour the gate was written for.
 
 /// Minimum per-facet softmax probability before a label is trusted. Below this the asset didn't
 /// clearly match any candidate in that facet, and silence beats a guess (the "omit rather than
@@ -95,6 +113,62 @@ mod tests {
         assert_eq!(tags[0].namespace, "subject");
         assert_eq!(tags[0].value, "explosion");
         assert!(tags[0].confidence.unwrap() > 0.45);
+    }
+
+    /// The temperature has to survive **SigLIP's actual cosine spread over a real facet**, which
+    /// is narrow and wide: measured off a Synty dungeon atlas, `usage` held 8 candidates topping
+    /// out at `tileable texture 0.113` against `user interface 0.078`, `prop 0.063` and a tail
+    /// near 0.06; `subject` held 28 whose top three were 0.079 / 0.078 / 0.074.
+    ///
+    /// **Facet size is half the problem**, which is why this test carries the real counts: at the
+    /// old scale of 30 the softmax over 8 candidates put the correct winner at `best_prob = 0.45`,
+    /// under the 0.55 gate, and the visual zero-shot tagger wrote **zero** tags in the entire
+    /// catalog. A three-label toy passes at either temperature and proves nothing.
+    #[test]
+    fn the_temperature_matches_siglips_cosine_spread() {
+        // One dimension per label, so a "cosine" is just that component.
+        type Facet = (Vec<f32>, Vec<(&'static str, String, Vec<f32>)>);
+        fn facet(name: &'static str, cosines: &[f32]) -> Facet {
+            let n = cosines.len();
+            let labels = (0..n)
+                .map(|i| {
+                    let mut v = vec![0.0; n];
+                    v[i] = 1.0;
+                    (name, format!("label{i}"), v)
+                })
+                .collect();
+            (cosines.to_vec(), labels)
+        }
+        let run = |(v, labels): Facet| {
+            score_facets(
+                &v,
+                labels
+                    .iter()
+                    .map(|(f, l, vec)| (*f, l.as_str(), vec.as_slice()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        // usage: 8 candidates, one clear winner. Must be emitted.
+        let tags = run(facet(
+            "usage",
+            &[0.113, 0.078, 0.063, 0.061, 0.060, 0.058, 0.055, 0.052],
+        ));
+        assert_eq!(
+            tags.len(),
+            1,
+            "a real, correct win must clear the gate, not be swallowed"
+        );
+        assert_eq!(tags[0].value, "label0");
+
+        // subject: 28 candidates whose top three are a thousandth apart. Silence is correct here,
+        // and a temperature that makes *this* speak is overconfident.
+        let mut flat = vec![0.079, 0.078, 0.074];
+        flat.extend(std::iter::repeat(0.070).take(25));
+        assert!(
+            run(facet("subject", &flat)).is_empty(),
+            "a flat facet must stay silent"
+        );
     }
 
     #[test]

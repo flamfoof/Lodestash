@@ -1221,6 +1221,8 @@ fn tag_worker_slice(
     cache_dir: Option<std::path::PathBuf>,
     tx: &std::sync::mpsc::Sender<WriterMsg>,
 ) -> bool {
+    // A read connection, only for the user's taught vocabulary — WAL admits any number of
+    // readers, and every write still lands on the writer thread (ADR-0002).
     let Ok(cat) = Catalog::open(db_path) else {
         tracing::warn!("tag worker could not open a read connection; slice skipped");
         return false;
@@ -1258,7 +1260,6 @@ fn tag_worker_slice(
     };
     let done = lodestash_app::drains::compute_tags(
         jobs,
-        &cat,
         tagger.as_ref(),
         zero_shot.as_ref(),
         workspace_dir.as_deref(),

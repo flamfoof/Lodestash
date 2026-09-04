@@ -298,6 +298,28 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       `door` → `crates`, `bucket` `crate` → `bucket`. Unit-tested both directions — a 3D model must
       **not** get the clause, since its preview is a render of the object and the pixels are the
       better evidence. Written up in [`AI-PIPELINE.md`](AI-PIPELINE.md) §2.
+- [x] **The visual zero-shot tagger had never written a tag — fixed 2026-08-30.** Not one
+      `siglip…-zeroshot` row existed in a catalog holding 1,500 tags, and a whole documented
+      pipeline stage ([`AI-PIPELINE.md`](AI-PIPELINE.md) §2.1) was silently inert. Hidden twice:
+      before the `ORT_DYLIB_PATH` fix it never ran at all, and once running it scored nothing.
+      Cause was calibration. SigLIP's cosines sit in a narrow band — measured off a Synty dungeon
+      atlas, `usage` ranked `tileable texture 0.113` over `user interface 0.078` and `prop 0.063`,
+      which is *correct* — but at `LOGIT_SCALE = 30` a 0.035 cosine gap is a 1.8x odds ratio, so the
+      softmax over 8 candidates put the winner at 0.45 against the 0.55 gate. At 100 (the
+      temperature CLIP-family models are trained at; SigLIP's own is ~110, and its sigmoid bias is
+      constant per label so it cancels inside a per-facet softmax) the same numbers give 0.96, while
+      `subject` — top two 0.001 apart — still says nothing. Pinned by a test carrying the **real**
+      facet sizes (8 and 28): the first version used three labels, passed at both temperatures and
+      proved nothing.
+- [x] **Zero-shot no longer runs on 3D models (2026-08-30).** Their stored vector is a mean-pooled
+      multiview of an untextured, flat-shaded orthographic render — outside SigLIP's training
+      distribution, and it shows: over 20 models only ~20% emitted any label and half were wrong
+      (`usage:tileable texture` on a wall *mesh*, `material:metal` + `subject:icon` on a giant
+      mushroom), against 4/4 correct and confident on real texture pixels. `zeroshot_tags` now
+      returns nothing for `model_3d`; models keep the captioning tagger, which reads the same
+      preview as prose and does far better with it (`SM_Env_Pillar_Broken_02` → `subject:pillar,
+      material:stone`). Dropping the vector path also removed the last reason `compute_tags` needed
+      a catalog at all.
 - [x] **A user write took 16 s while the app sat idle — fixed 2026-08-30.** Cause was not the model
       inference it looked like: `drain_previews` checked its time budget **once per batch of 16
       renders**, and one render is ~1.1 s, so the writer's "1 second" idle slice ran ~17 s and every

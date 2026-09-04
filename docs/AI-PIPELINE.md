@@ -81,6 +81,20 @@ which FTS indexes, so a word the model saw but the filename never contained stil
 A machine with no vision model installed still tags from names alone, at a lower confidence (0.4 vs
 0.7) because a name is a weaker claim than pixels.
 
+**Zero-shot rides on authored pixels, never on our own render.** The SigLIP label pass
+(`zeroshot_tags`) runs for images, textures, sprites and materials — not `model_3d`. A model's
+stored vector is a mean-pooled multiview of an untextured, flat-shaded orthographic render, far
+outside SigLIP's training distribution: over 20 models (2026-08-30) only ~20% produced any label
+and half of those were wrong, against 4/4 correct and confident on real texture pixels. Models are
+tagged by the captioning path instead, which reads the same preview as prose and does well with it.
+
+**Calibration is not a detail — it was the difference between working and silent.** `LOGIT_SCALE`
+is 100, the temperature CLIP-family models are trained at. At the earlier 30 the tagger wrote
+**zero** tags in the entire reference catalog: SigLIP's cosines sit in a narrow band (a real facet
+topped out at 0.113 against 0.078 and 0.063), and at that scale the per-facet softmax came out
+near-uniform, so nothing ever cleared `MIN_PROB`. If a future model changes the spread, re-measure
+before assuming the gate is wrong.
+
 **For flat art, the name outranks the picture — for a 3D model it does not.** Measured on the
 Artificer pack (2026-08-30): `round crates.png` is a texture **atlas** — wood planks and two rope
 strips laid out for UVs, with no crate in the image at all. `qwen2.5vl:7b` describes it accurately
