@@ -46,6 +46,14 @@ use lodestash_ingest::unitypackage::{
 const TAG_BUDGET_PER_PASS: u32 = 64;
 const AUDIO_TAG_BUDGET_PER_PASS: u32 = 48;
 
+/// How often the idle backlog lane takes a turn: one tick in four, each tick a second.
+///
+/// Every tick used to do a slice, which is a 100% duty cycle dressed up as "idle work" — an
+/// app showing a grid and being asked for nothing sat at 0.57 cores indefinitely. Four is the
+/// tradeoff: the backlog converges ~4× slower in wall-clock terms, and the machine stays the
+/// user's. Raise it to be politer, lower it to drain faster.
+const IDLE_DUTY_PERIOD: u32 = 4;
+
 /// One asset the write path needs to act on, resolved from the library while its lock is held so
 /// the writer thread never reaches back into it.
 #[derive(Debug, Clone)]
@@ -800,6 +808,17 @@ impl Writer {
                 } else {
                     None
                 };
+                // The backlog lane works one tick in `IDLE_DUTY_PERIOD`, not every tick.
+                //
+                // Measured on the reference library: an idle app — window open, nothing asked of
+                // it — burned **0.57 cores continuously**, forever, because each 1 s timeout
+                // started a 1 s slice. This is an asset viewer; housekeeping does not get half the
+                // machine. Duty-cycling here throttles all three lanes at once: the embed and tag
+                // workers gate on their `*_inflight` flags, and only this thread clears them.
+                //
+                // Op latency is unaffected — a skipped tick still waits on the channel, so a user
+                // write is picked up the moment it arrives (the point of 147d4b5).
+                let mut idle_tick: u32 = 0;
                 loop {
                     match rx.recv_timeout(std::time::Duration::from_secs(1)) {
                         Ok(WriterMsg::Op(job)) => {
@@ -1017,6 +1036,10 @@ impl Writer {
                                 {
                                     emit_changed(&app, "catalog");
                                 }
+                            }
+                            idle_tick = idle_tick.wrapping_add(1);
+                            if idle_tick % IDLE_DUTY_PERIOD != 0 {
+                                continue;
                             }
                             if idle_appraises {
                                 // The encode goes to a worker; the writer keeps only the two

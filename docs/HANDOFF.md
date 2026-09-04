@@ -102,8 +102,9 @@ server is `lodestash-mcp`, its own crate).
 
 **Traps carried forward:** single-writer rule; `set_tags` replaces per-source (UI uses
 `add_asset_tag` for appends); undo tail capped 200; config writes only via `edit_config`;
-preview backfill runs on the persist thread idle in 1s slices — `LODESTASH_NO_PREVIEW_DRAIN=1`
-skips it (e2e sets this); the e2e harness taskkills the app, so geometry persists via the
+preview backfill runs on the persist thread idle in 1s slices, **one tick in four**
+([ADR-0014](decisions/ADR-0014-the-backlog-lane-is-duty-cycled.md)) — `LODESTASH_NO_PREVIEW_DRAIN=1`
+skips it entirely (e2e sets this); the e2e harness taskkills the app, so geometry persists via the
 Moved/Resized save, not exit.
 
 ## 1.9 Next session: the engine build shipped — the open work is the plugin + the shell's second half (2026-08-12)

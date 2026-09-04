@@ -420,6 +420,30 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       `INGESTION.md` already claimed and only `protocol.rs` actually did. Checked by
       `an_in_pack_material_carries_both_its_own_locator_and_its_albedos`, mutation-verified: drop
       the albedo locator and it fails.
+- [x] **An idle viewer burned half a core, forever.** The backlog lane waited 1 s on the writer
+      channel and, on a timeout, did 1 s of work — a 100% duty cycle called "idle". **Measured**
+      (debug build, window open, nothing asked of it, 7,869 assets queued): `lodestash-desktop.exe`
+      at **0.57 cores indefinitely**; the same app with the lane disabled sat at ~0.00, which is
+      what pinned it to this lane rather than to the webview. Now one tick in four
+      (`IDLE_DUTY_PERIOD`, [ADR-0014](decisions/ADR-0014-the-backlog-lane-is-duty-cycled.md)):
+      **0.26 cores**, and op latency is untouched because a skipped tick still waits on the
+      channel. One counter throttles all three lanes — the embed and tag workers gate on their
+      `*_inflight` flags and only the writer clears those. An ORT `with_intra_threads` cap was
+      tried in the same session and **measured to do nothing** (0.58 cores with the cap, no duty
+      cycle) — reverted rather than kept as a plausible-looking knob.
+- [x] **Where the memory actually goes.** Same run, Lodestash's own processes only: **394 MB**
+      across 7 — Rust 60 MB, WebView2 334 MB (browser 118, GPU 83, renderer 60, two utilities 59,
+      crashpad 13). Nothing pathological, and nothing to reclaim without touching Edge's process
+      model. **Recorded because the first measurement was wrong**: matching `msedgewebview2` by
+      process *name* swept in the six that Windows' own SearchHost.exe runs, inflating the figure
+      to ~750 MB. Match on the user-data-dir.
+- [ ] **A 4k texture is decoded at 4k to make a 128 px thumbnail.** `raster::decode` returns the
+      image at native resolution and `thumb::generate` downscales afterwards, so the largest
+      texture in the library costs a **67 MB RGBA transient** to produce a 16 KB PNG. Measured:
+      72 of 419 sized textures are ≥2048 px. Deliberately **not** fixed — the spike is transient,
+      it happens once per asset (the PNG is cached), and the library is 1,825 PNG / 225 PSD /
+      155 TGA, none of which support a scaled decode. Worth revisiting only if DDS or JPEG
+      packs show up, where mip selection and DCT scaling make it nearly free.
 - [ ] **The agent plane can tag but never untag.** `remove_tag` and `unstage` have no REST route
       and no MCP tool, so `AgentWrite::RemoveTag`/`UnstageAsset` are refused by the forwarding
       bridge ([ADR-0011](decisions/ADR-0011-headless-mcp-forwards-writes.md)). That asymmetry

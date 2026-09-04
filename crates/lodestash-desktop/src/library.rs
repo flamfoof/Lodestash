@@ -1021,9 +1021,7 @@ impl Library {
         };
         for r in &mut self.rows {
             if let Some(t) = by_asset.remove(&r.item.asset_id) {
-                // The facet matches on the tag's **value**; its namespace is a grouping for the
-                // Traits screen, not part of the chip's identity.
-                r.traits = t.into_iter().map(|a| a.value).collect();
+                r.traits = distinct_trait_names(t);
                 // The card draws the same list, so it rides along on the serialised item rather
                 // than costing a second round-trip per card.
                 r.item.traits = r.traits.clone();
@@ -2523,6 +2521,25 @@ fn row_from(
     }
 }
 
+/// The distinct trait names in one asset's assignments.
+///
+/// The facet and the card both match on the tag's **value**; its namespace is a grouping for the
+/// Traits screen, not part of the chip's identity. Two assignments can therefore carry one name:
+/// two namespaces (`subject/rock` and `material/rock`), or the *same* tag recorded twice, because
+/// `asset_tag` is keyed on `(asset_id, tag_id, source)` — a tag the user set by hand and the AI
+/// later proposed is two rows.
+///
+/// Mapping rows straight to names counted those twice: the ⚑ trait cloud claimed 33 assets for a
+/// trait that 32 assets have, and the card drew the chip twice. Found by the e2e invariant that
+/// the cloud can never exceed the vocabulary.
+fn distinct_trait_names(tags: Vec<lodestash_core::catalog::TagAssignment>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    tags.into_iter()
+        .map(|a| a.value)
+        .filter(|v| seen.insert(v.clone()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3724,5 +3741,47 @@ mod tests {
         });
         assert_eq!(p.page, 0);
         assert_eq!(p.items.len(), 2);
+    }
+
+    /// The ⚑ cloud counts *assets*, not `asset_tag` rows.
+    ///
+    /// `asset_tag` is keyed on `(asset_id, tag_id, source)`, so one asset can hold the same tag
+    /// twice — set by hand, then proposed by the AI. It can also hold the same *name* under two
+    /// namespaces. Either way the chip is one chip. Counting rows made the cloud claim 33 assets
+    /// for a trait 32 assets have, which the e2e invariant (cloud ≤ vocabulary) caught.
+    #[test]
+    fn one_asset_tagged_the_same_way_twice_is_one_trait() {
+        use lodestash_core::catalog::TagAssignment;
+        let a = |ns: &str, v: &str, c: Option<f64>| TagAssignment {
+            namespace: ns.to_string(),
+            value: v.to_string(),
+            confidence: c,
+        };
+
+        assert_eq!(
+            distinct_trait_names(vec![
+                a("subject", "rock", None),
+                a("subject", "rock", Some(0.5)),
+            ]),
+            vec!["rock".to_string()],
+            "a manual tag and the AI's proposal of it are two rows and one chip"
+        );
+        assert_eq!(
+            distinct_trait_names(vec![
+                a("subject", "rock", None),
+                a("material", "rock", None)
+            ]),
+            vec!["rock".to_string()],
+            "the namespace groups the Traits screen; it is not part of the chip's identity"
+        );
+        assert_eq!(
+            distinct_trait_names(vec![
+                a("subject", "rock", None),
+                a("style", "stylized", None),
+                a("subject", "rock", None),
+            ]),
+            vec!["rock".to_string(), "stylized".to_string()],
+            "distinct names survive in first-seen order"
+        );
     }
 }

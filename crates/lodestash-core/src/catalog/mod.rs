@@ -4660,14 +4660,26 @@ impl Catalog {
     /// The whole tagging vocabulary for the Traits screen (UI-SPEC §9). Every `tag` with its live
     /// usage count and Trait-Library fields, traits first. A trait with no assignments yet (freshly
     /// created) still lists, so the LEFT JOINs keep it; deleted assets never count.
+    ///
+    /// **All three counts are per asset, and the split never exceeds the usage it splits.**
+    /// `asset_tag` is keyed on `(asset_id, tag_id, source)`, so one asset can hold one tag from
+    /// two provenances — set by hand, then proposed again by the AI. Summing rows made
+    /// `manual + ai` exceed `usage_count` on exactly that asset. Manual wins the tie: a tag a
+    /// person set is not an AI tag because the AI later agreed with them.
     pub fn list_vocabulary(&self) -> Result<Vec<VocabTrait>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT t.id, COALESCE(t.namespace, 'free'), t.name,
                         COUNT(DISTINCT CASE WHEN a.id IS NOT NULL THEN at.asset_id END) AS n,
-                        COALESCE(SUM(CASE WHEN at.source='manual' AND a.id IS NOT NULL THEN 1 END), 0),
-                        COALESCE(SUM(CASE WHEN at.source='ai'     AND a.id IS NOT NULL THEN 1 END), 0),
+                        COUNT(DISTINCT CASE WHEN at.source='manual' AND a.id IS NOT NULL
+                                            THEN at.asset_id END),
+                        COUNT(DISTINCT CASE WHEN at.source='ai' AND a.id IS NOT NULL
+                                             AND NOT EXISTS (SELECT 1 FROM asset_tag m
+                                                              WHERE m.asset_id = at.asset_id
+                                                                AND m.tag_id   = at.tag_id
+                                                                AND m.source   = 'manual')
+                                            THEN at.asset_id END),
                         t.is_trait, t.scope, t.usage_note, t.teach, t.color, t.icon
                    FROM tag t
                    LEFT JOIN asset_tag at ON at.tag_id = t.id

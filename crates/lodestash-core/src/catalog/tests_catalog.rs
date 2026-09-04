@@ -3986,3 +3986,43 @@ fn the_tag_queue_can_be_restricted_to_an_explicit_set() {
         "an explicit empty set asks for nothing - it must not mean everything"
     );
 }
+
+/// The Traits screen's three numbers must be about *assets*, and the split must fit inside the
+/// usage it splits.
+///
+/// `asset_tag` is keyed on `(asset_id, tag_id, source)`, so one asset can hold one tag twice — a
+/// person set it, and the AI later proposed it too. Summing rows for the split while counting
+/// distinct assets for the usage made `manual + ai` exceed `usage_count` on exactly that asset,
+/// which is what the e2e vocabulary invariant caught on the real catalog.
+#[test]
+fn the_manual_ai_split_counts_assets_and_never_exceeds_the_usage() {
+    let c = Catalog::open_in_memory().unwrap();
+    c.conn
+        .execute_batch(
+            "INSERT INTO import_source (id, uuid, name, root_path, kind)
+                 VALUES (1, 'src-1', 's', '/s', 'folder');
+             INSERT INTO media_type (id, code, label) VALUES (1, 'image', 'Image');
+             INSERT INTO asset (id, uuid, source_id, media_type_id, name, created_at, updated_at)
+                 VALUES (1, 'a1', 1, 1, 'One', 0, 0), (2, 'a2', 1, 1, 'Two', 0, 0);
+             INSERT INTO tag (id, namespace, name, norm_name, is_trait)
+                 VALUES (7, 'subject', 'rock', 'rock', 1);
+             INSERT INTO asset_tag (asset_id, tag_id, source, created_at) VALUES
+                 (1, 7, 'manual', 0),
+                 (1, 7, 'ai', 0),
+                 (2, 7, 'ai', 0);",
+        )
+        .expect("fixture");
+
+    let v = c.list_vocabulary().unwrap();
+    let rock = v.iter().find(|t| t.value == "rock").expect("the tag lists");
+    assert_eq!(rock.usage_count, 2, "two assets carry it, not three rows");
+    assert_eq!(rock.manual_count, 1, "one asset was tagged by hand");
+    assert_eq!(
+        rock.ai_count, 1,
+        "the asset a person already tagged is not also an AI tag — manual wins the tie"
+    );
+    assert!(
+        rock.manual_count + rock.ai_count <= rock.usage_count,
+        "the split cannot exceed the usage it splits"
+    );
+}
