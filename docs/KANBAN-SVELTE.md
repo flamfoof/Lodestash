@@ -407,13 +407,19 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       rendered `svg.icon` and asserts the widths are a subset of the ladder, with the nav glyph
       pinned at 24 (a bare `nav` selector matches TopBar's tabs first, which are 20 — the check
       names `nav[aria-label="Main"]` for that reason).
-- [ ] **In-pack materials get no preview.** `ServerState::preview_subject` resolves a material's
+- [x] **In-pack materials get no preview.** `ServerState::preview_subject` resolved a material's
       shader ball from the material's own `disk_path`, which an in-pack material does not have, so
-      `engine_preview_fn` bails before it renders. 21 of the Artificer pack's 52 assets, and every
-      material in every un-extracted pack. The albedo is reachable — `material_albedo_texture` +
-      the in-pack locator — so the fix is to key the render off the locator and pull the albedo
-      through the same scratch the asset preview uses. Regression from the 2026-08-29 preview work,
-      not a pre-existing gap.
+      `engine_preview_fn` bailed before it rendered. 21 of the Artificer pack's 52 assets, and every
+      material in every un-extracted pack. Regression from the 2026-08-29 preview work, not a
+      pre-existing gap.
+      **Fixed.** *Both* halves of the picture can be in a pack, and the old shape assumed neither
+      was: `PreviewSubject` now carries `albedo_in_pack` beside `albedo`, and the renderer keys the
+      ball off whichever locator exists — `meta_key(pack, size, offset)`, the same formula
+      `ensure_in_pack_scratch` keys its own scratch with — then pulls the albedo through that
+      scratch. The albedo is now folded into the key on the engine plane too, which
+      `INGESTION.md` already claimed and only `protocol.rs` actually did. Checked by
+      `an_in_pack_material_carries_both_its_own_locator_and_its_albedos`, mutation-verified: drop
+      the albedo locator and it fails.
 - [ ] **The agent plane can tag but never untag.** `remove_tag` and `unstage` have no REST route
       and no MCP tool, so `AgentWrite::RemoveTag`/`UnstageAsset` are refused by the forwarding
       bridge ([ADR-0011](decisions/ADR-0011-headless-mcp-forwards-writes.md)). That asymmetry

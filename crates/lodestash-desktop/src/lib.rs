@@ -1899,11 +1899,43 @@ fn engine_preview_fn(cache_root: Option<std::path::PathBuf>) -> lodestash_api::P
 
         // A material has no pixels of its own — it wears a texture reached through the graph
         // (DATA-MODEL §10), so it is rendered as a shader ball rather than decoded.
+        //
+        // Both halves of that picture can still be inside a pack, and the old shape assumed
+        // neither was: it read the key off the material's own `disk_path`, which an in-pack
+        // material does not have, so it returned `None` before rendering anything — every
+        // material in every un-extracted pack. Key off whichever locator exists, and pull an
+        // in-pack albedo through the same scratch the asset payload uses.
         if subject.media_type == "material" {
-            let albedo = subject.albedo.as_deref();
-            let src = subject.disk_path.as_deref()?;
-            let key = meta_key(src, std::fs::metadata(src).map(|m| m.len()).unwrap_or(0), 0);
-            return generate_material(cache, &key, params, albedo).ok();
+            let albedo = match (&subject.albedo, &subject.albedo_in_pack) {
+                (Some(p), _) => Some(p.clone()),
+                (None, Some((pack, offset, size, ext))) => {
+                    lodestash_app::thumbs::ensure_in_pack_scratch(
+                        Some(cache),
+                        pack,
+                        *offset,
+                        *size,
+                        ext,
+                    )
+                    .map(|(p, _)| p)
+                }
+                _ => None,
+            };
+            let key = match (&subject.disk_path, &subject.in_pack) {
+                (Some(p), _) => meta_key(p, std::fs::metadata(p).map(|m| m.len()).unwrap_or(0), 0),
+                // The same formula `ensure_in_pack_scratch` keys its scratch with: a pack payload
+                // is identified by its archive, offset and size, and there is no file to stat.
+                (None, Some((pack, offset, size, _))) => {
+                    meta_key(std::path::Path::new(pack), *size as u64, *offset)
+                }
+                _ => return None,
+            };
+            // The texture is part of the picture, so it is part of the key (INGESTION
+            // "Material previews"): swapping a material's albedo must not serve the old ball.
+            let key = match &albedo {
+                Some(a) => format!("{key}-{}", meta_key(a, 0, 0)),
+                None => format!("{key}-flat"),
+            };
+            return generate_material(cache, &key, params, albedo.as_deref()).ok();
         }
 
         // On disk: render from the file. Still in a pack: pull just this payload into the shared

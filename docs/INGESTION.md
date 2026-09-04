@@ -291,6 +291,12 @@ projection onto a ball, and a shader ball is read as a preview rather than as a 
 material maps. The cache key includes the texture, so swapping a material's albedo cannot serve the
 old ball.
 
+Both halves can still be **inside a pack**, and both are pulled through the same surgical-pull scratch
+(§2) the asset preview uses: `PreviewSubject` carries the material's own locator *and* its albedo's, so
+a material in an un-extracted pack renders rather than falling back to a type icon. Keyed off the
+locator (archive + offset + size) when there is no file to stat — the same formula the scratch itself
+uses — plus the albedo, on both the grid and the engine plane.
+
 ---
 
 ### Content vs non-content classification

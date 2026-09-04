@@ -110,6 +110,9 @@ pub struct PreviewSubject {
     pub in_pack: Option<(String, i64, i64, String)>,
     /// For a material: the on-disk texture its shader ball wears (DATA-MODEL §10).
     pub albedo: Option<PathBuf>,
+    /// For a material whose albedo is *also* still inside a pack: that texture's locator, so the
+    /// renderer can pull it the same way it pulls an asset's own payload.
+    pub albedo_in_pack: Option<(String, i64, i64, String)>,
 }
 
 /// Resolves one asset to a cached preview PNG, generating it on a miss.
@@ -1139,17 +1142,22 @@ impl ServerState {
         } else {
             None
         };
-        // A material wears a texture reached through the dependency graph (DATA-MODEL §10).
-        let albedo = if row.media_type == "material" {
-            cat.material_albedo_texture(id)
-                .ok()
-                .flatten()
-                .and_then(|tex| cat.asset_summaries(&[tex]).ok())
-                .and_then(|rows| rows.into_iter().next())
-                .and_then(|t| t.disk_path.map(PathBuf::from))
-                .filter(|p| p.is_file())
+        // A material wears a texture reached through the dependency graph (DATA-MODEL §10). That
+        // texture is as often still in a pack as the material is, so resolve *both* shapes — a
+        // locator the renderer can pull, not only a path that happens to already exist.
+        let texture = if row.media_type == "material" {
+            cat.material_albedo_texture(id).ok().flatten()
         } else {
             None
+        };
+        let albedo = texture
+            .and_then(|tex| cat.asset_summaries(&[tex]).ok())
+            .and_then(|rows| rows.into_iter().next())
+            .and_then(|t| t.disk_path.map(PathBuf::from))
+            .filter(|p| p.is_file());
+        let albedo_in_pack = match (texture, &albedo) {
+            (Some(tex), None) => cat.in_pack_locator(tex).ok().flatten(),
+            _ => None,
         };
         drop(cat);
         Some(PreviewSubject {
@@ -1157,6 +1165,7 @@ impl ServerState {
             disk_path,
             in_pack,
             albedo,
+            albedo_in_pack,
         })
     }
 }
@@ -1212,4 +1221,75 @@ pub fn serve(state: std::sync::Arc<ServerState>) -> std::io::Result<Handshake> {
             });
         })?;
     Ok(handshake)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An in-pack material must still resolve to something renderable.
+    ///
+    /// `preview_subject` only ever offered an albedo it could find *on disk*, so a material inside
+    /// an un-extracted pack — whose texture is in the same pack — handed the renderer nothing to
+    /// key off and nothing to paint, and the shader ball was never drawn at all.
+    #[test]
+    fn an_in_pack_material_carries_both_its_own_locator_and_its_albedos() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        {
+            // Create the schema, then seed through a second connection: `Catalog::conn` is
+            // crate-private, and these rows are fixture shapes no public setter builds.
+            lodestash_core::catalog::Catalog::open(&db).unwrap();
+            rusqlite::Connection::open(&db)
+                .unwrap()
+                .execute_batch(
+                    "INSERT INTO import_source (id, uuid, name, root_path, kind)
+                         VALUES (1, 'src-1', 's', '/s', 'folder');
+                     INSERT INTO media_type (id, code, label)
+                         VALUES (1, 'material', 'Material'), (2, 'image', 'Image');
+                     INSERT INTO package (id, uuid, source_id, package_path, name)
+                         VALUES (10, 'p1', 1, 'G:/cache/Pack.unitypackage', 'Pack');
+                     INSERT INTO package_entry (id, package_id, guid, pathname, tar_offset, size_bytes) VALUES
+                         (100, 10, 'g1', 'Assets/Stone.mat', 4096, 512),
+                         (101, 10, 'g2', 'Assets/Stone_albedo.png', 8192, 2048);
+                     INSERT INTO asset (id, uuid, source_id, media_type_id, package_id, name, created_at, updated_at) VALUES
+                         (1, 'a1', 1, 1, 10, 'Stone', 0, 0),
+                         (2, 'a2', 1, 2, 10, 'Stone_albedo', 0, 0);
+                     INSERT INTO asset_file (id, asset_id, rel_path, ext, size_bytes, mtime, package_entry_id, workspace_rel) VALUES
+                         (1, 1, 'Stone.mat', 'mat', 512, 0, 100, NULL),
+                         (2, 2, 'Stone_albedo.png', 'png', 2048, 0, 101, NULL);
+                     UPDATE asset SET primary_file_id = 1 WHERE id = 1;
+                     UPDATE asset SET primary_file_id = 2 WHERE id = 2;
+                     INSERT INTO asset_relationship (from_asset_id, to_asset_id, kind, state)
+                         VALUES (1, 2, 'uses_texture', 'resolved');",
+                )
+                .expect("fixture");
+        }
+        let state = ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap();
+        let s = state.preview_subject(1).expect("the material resolves");
+
+        assert_eq!(s.media_type, "material");
+        assert!(s.disk_path.is_none(), "an in-pack material has no file");
+        assert_eq!(
+            s.in_pack,
+            Some((
+                "G:/cache/Pack.unitypackage".to_string(),
+                4096,
+                512,
+                "mat".to_string()
+            )),
+            "the ball is keyed off the material's own locator when there is no file to stat"
+        );
+        assert!(s.albedo.is_none(), "the texture is not on disk either");
+        assert_eq!(
+            s.albedo_in_pack,
+            Some((
+                "G:/cache/Pack.unitypackage".to_string(),
+                8192,
+                2048,
+                "png".to_string()
+            )),
+            "the albedo is reachable through the graph and pullable through the same scratch"
+        );
+    }
 }
