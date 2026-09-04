@@ -395,12 +395,28 @@ separate costs and neither implies the other:
 
 | `PreviewQuality` | `thumb_px()` — raster side | `proxy_budget()` — geometry side |
 |---|---|---|
-| **Low** (default) | 128 px | 2% of source tris, clamped to [300, 1500] |
-| Medium | 256 px | 5%, clamped to [600, 4000] |
-| High | 384 px | 12%, clamped to [1200, 12000] |
+| **Low** (default) | 256 px | 2% of source tris, clamped to [300, 1500] |
+| Medium | 384 px | 5%, clamped to [600, 4000] |
+| High | 512 px | 12%, clamped to [1200, 12000] |
+
+**Every tier covers the card it draws into.** Grid card min-widths are 150 / 205 / 288 px with
+`object-fit: cover`, so the old ladder's 128 px *default* upscaled on every display before DPI
+scaling entered into it. Low now covers Compact and Cozy at 1×, Medium adds Large, High covers
+Large at 1.5×. Checked by `every_quality_tier_covers_the_card_it_draws_into`.
 
 A bare ratio leaves a 500k-tri hull heavy and erases a 400-tri prop; a bare fixed count spends the
-same budget on both. Hence ratio-plus-clamp.
+same budget on both. Hence ratio-plus-clamp — but note what that means on a real library: the
+reference catalog's **median model is 300 triangles**, so 91% of it is already under Low's
+ceiling and *all* of it under High's. Decimation is the exception, not the rule, and
+`load_preview_cached` therefore writes **no `.lod` at all** when the budget would be a no-op:
+it keeps the staging mesh and renders from that, rather than storing a re-encoded copy and
+deleting the original.
+
+**Collision hulls are dropped** before measuring or rendering (`mesh::is_collision_hull`) — a
+hull is not the prop, it wraps it, and left in it draws a box over the card. Measured first:
+17 of 1,307 cached meshes (1.3%) carry one, and every match was `_Collision` with **zero** LOD
+levels in the library, so LOD groups are deliberately *not* matched — a loose test would also
+eat the asset named `lodestone_gem`.
 
 ### The artifacts
 
@@ -439,15 +455,13 @@ contour in one flat colour (`MODEL_HEX`), so **every model in the library is the
 > **Known gaps, measured 2026-09-04 and carded, not yet fixed.** Named here because the spec would
 > otherwise read as a description of a system that works better than it does.
 >
-> - The **default quality renders below card size**: `thumb_px()` Low is 128 px against grid card
->   min-widths of 150 / 205 / 288 px, `object-fit: cover`, before DPI scaling.
-> - **Decimation is a no-op on most of the library**: `decimate` returns `None` when the source is
->   already under budget, and the low-poly props that dominate asset packs sit under Low's 1500
->   ceiling. The `.lod` is then a re-encoded copy.
-> - **`LOD1`/`LOD2`/`UCX_` submeshes are not filtered**, so an FBX shipping a LOD group renders
->   every level stacked and splits the triangle budget across the copies.
-> - **Models carry no colour into the grid.** The shader-ball path resolves a texture through the
->   `uses_texture` edge; the mesh path does not, so shape is the only signal a card gives.
+> - **Models carry no colour into the grid, and cannot as things stand.** The rasteriser does
+>   sample an albedo when one is attached (`render3d`, `sample_albedo`), but a model card is not
+>   drawn by that path: models are refused by the thumb route, so the card draws the stored
+>   **vector preview** — and `vectorize::to_svg` reduces the render to luminance bands filled
+>   with a single `currentColor`. Colour is discarded one step after it would be sampled, so
+>   every model in the library is the same purple (`MODEL_HEX`). Giving a model card colour
+>   means letting models raster, not attaching a texture to the existing path.
 > - The **proxy tag is in every PNG name**, including textures, waveforms and shader balls that
 >   contain no geometry, so a geometry-budget change invalidates them too.
 

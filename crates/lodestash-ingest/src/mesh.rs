@@ -360,6 +360,24 @@ fn write_cache(dest: &Path, bytes: &[u8]) {
     }
 }
 
+/// Is this submesh a **collision hull** rather than something to look at?
+///
+/// Measured before building (1,307 cached meshes, 1,486 submeshes off the reference library):
+/// **17 files, 1.3%**, carry one — and every single match was a `_Collision` hull, with **zero**
+/// LOD levels anywhere in the library. So this deliberately does *not* try to spot `_LOD1`/`_LOD2`
+/// groups: there were none to spot, and a loose match is a live hazard — a substring test for
+/// "LOD" hits the asset literally named `lodestone_gem`.
+///
+/// 1.3% is small, but those cards are *wrong*, not merely coarse: a hull renders as a box drawn
+/// over the prop it wraps.
+fn is_collision_hull(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.starts_with("ucx_")
+        || n.starts_with("collision")
+        || n.ends_with("_collision")
+        || n.ends_with("_collider")
+}
+
 /// Load `path` as a **low-poly preview proxy** — the geometry every 3D *preview* renders from
 /// (grid/list thumbnails, the multiview embedding), as opposed to [`load_cached`]'s full-fidelity
 /// mesh. Decimates once (`decimate::decimate_meshes` under `budget`), caches the result as
@@ -383,7 +401,29 @@ pub fn load_preview_cached(
             return Ok(meshes);
         }
     }
-    let proxy = crate::decimate::decimate_meshes(&load_cached(path, cache_dir)?, budget);
+    let mut source = load_cached(path, cache_dir)?;
+    // Drop collision hulls before anything measures or renders them: they are not the prop,
+    // they wrap it, and left in they both draw a box over the card and take a share of the
+    // triangle budget away from the geometry the user is looking at. Never drop *everything* —
+    // a model that is only a hull still has to draw something.
+    if source.iter().any(|m| !is_collision_hull(&m.name)) {
+        source.retain(|m| !is_collision_hull(&m.name));
+    }
+    let proxy = crate::decimate::decimate_meshes(&source, budget);
+
+    // A budget most models never reach is not a proxy, it is a second copy.
+    //
+    // `decimate` only returns `Some` when it strictly reduced the index count, so equal totals
+    // mean *every* mesh came back a clone. Writing that would spend a file and a re-encode to
+    // store the staging mesh a second time — and then delete the original, so the next triangle
+    // count has to re-parse the source. Measured on the reference library: median model is 300
+    // triangles against Low's 1500 ceiling, so this is the common case, not the corner — 91% of
+    // models at Low and **all** of them at High.
+    let tris = |ms: &[MeshData]| ms.iter().map(|m| m.indices.len()).sum::<usize>();
+    if tris(&proxy) == tris(&source) {
+        return Ok(source);
+    }
+
     write_cache(&proxy_path, &encode_meshes(&proxy));
     // ponytail: the full mesh is a parse-once staging artifact — once a proxy exists, no preview
     // consumer needs it again, so drop it and let the cache shrink. Ceiling: a re-scan (or a
@@ -755,6 +795,78 @@ mod tests {
             [("rock_albedo.png".to_string(), stash.join("Rock_Albedo.png"))].into();
         let meshes = load_meshes(&dir.path().join("tri.obj"), &lookup).expect("OBJ parses");
         assert!(meshes[0].albedo.is_some(), "basename fallback resolves");
+    }
+
+    /// A model already under budget must not get a `.lod`, and must keep its `.msh`.
+    ///
+    /// The reference library's median model is 300 triangles against Low's 1500 ceiling, so
+    /// `decimate` returns `None` for 91% of it and the old code stored a byte-for-byte re-encode of
+    /// the staging mesh — then deleted the staging mesh, so the next triangle count re-parsed the
+    /// source. Both halves of that are checked here.
+    #[test]
+    fn a_model_already_under_budget_gets_no_proxy_and_keeps_its_staging_mesh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tri.obj");
+        std::fs::write(
+            &path,
+            "v 0 0 0
+v 1 0 0
+v 0 1 0
+f 1 2 3
+",
+        )
+        .unwrap();
+        let cache = dir.path().join("cache");
+        let budget = crate::decimate::Budget::new(0.02, 300, 1500);
+
+        let meshes = load_preview_cached(&path, &cache, budget).expect("loads");
+        assert_eq!(meshes[0].indices, vec![0, 1, 2], "one triangle, undamaged");
+
+        let key = cache_key(&path);
+        let mesh_dir = cache.join("mesh");
+        assert!(
+            !mesh_dir
+                .join(format!("{key}-{}.lod", budget.tag()))
+                .exists(),
+            "a 1-triangle model has nothing to collapse — storing a proxy just doubles the disk"
+        );
+        assert!(
+            mesh_dir.join(format!("{key}.msh")).exists(),
+            "and the staging mesh must survive, since it is now the only cached geometry"
+        );
+
+        // Second call is served from the staging mesh, same answer.
+        let again = load_preview_cached(&path, &cache, budget).expect("loads again");
+        assert_eq!(again[0].indices, meshes[0].indices);
+    }
+
+    /// Hulls out, props in, and never everything — plus the false positive that shaped the match.
+    #[test]
+    fn collision_hulls_are_recognised_without_eating_the_asset_named_lodestone() {
+        for hull in [
+            "UCX_Crate_01",
+            "SM_Bld_Base_Stairs_02_Collision",
+            "barrel_collider",
+            "Collision",
+        ] {
+            assert!(
+                is_collision_hull(hull),
+                "{hull} wraps the prop, it is not the prop"
+            );
+        }
+        for keep in [
+            "SM_Bld_Base_Stairs_02",
+            // The library really holds this one. A substring test for "lod" would delete it, which
+            // is why the match is anchored and why LOD levels are not matched at all.
+            "lodestone_gem",
+            "Collider_Housing_Mesh",
+            "rock_LOD0",
+        ] {
+            assert!(
+                !is_collision_hull(keep),
+                "{keep} is geometry the user wants to see"
+            );
+        }
     }
 }
 

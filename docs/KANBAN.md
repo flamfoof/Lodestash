@@ -624,7 +624,7 @@ translation. The port removes the translation; the egui build stayed buildable a
   - [x] **B10e — pack stats modal (I7)** — ◉ per pack row, focused on open, Esc/✕/scrim close.
   - [x] **B10f — pinned libraries in the sidebar LIBRARIES facet (C6)**.
   - [x] **B10g — preview_quality render-path wiring** — thumb route honors `thumb_px()`
-        (128/256/384) + `proxy_budget()`; `?q=` cache-buster on Settings save.
+        (256/384/512 since 2026-09-04) + `proxy_budget()`; `?q=` cache-buster on Settings save.
   - [x] **B10h — model hover-spin (F5)** — subtle rotate+scale on card artwork hover.
   - [x] **B10i — Mapping rule authoring (B9b follow-up)** — add-rule row + per-rule delete with
         confirm (add_rule/delete_rule on the writer).

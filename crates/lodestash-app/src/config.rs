@@ -352,9 +352,9 @@ impl Default for SizeTiers {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PreviewQuality {
-    // Default to the low-fidelity grid the design shows (FEATURES §1.1/§5.2): grid cards are a
-    // browse view, so render them cheap (128px) and reserve full detail for Quick Look. Raise it in
-    // Settings ▸ Appearance for sharper cards at more VRAM / raster cost.
+    // Grid cards are a browse view: render them cheap and reserve full detail for Quick Look
+    // (FEATURES §1.1/§5.2). Raise it in Settings ▸ Appearance for sharper cards at more raster
+    // cost — but every tier now at least *covers* the card it draws into; see `thumb_px`.
     #[default]
     Low,
     Medium,
@@ -369,11 +369,26 @@ impl PreviewQuality {
     ];
 
     /// Grid thumbnail generation size (px) for this quality. Quick Look ignores this.
+    ///
+    /// **Every tier covers the card it draws into.** The ladder used to start below the grid:
+    /// 128 px against card min-widths of 150 / 205 / 288 (`api.ts` grid density stops), with
+    /// `object-fit: cover`, so the *default* setting upscaled on every display before DPI
+    /// scaling even entered into it. Each tier now covers one density at 1× and the one below
+    /// it at 1.5×:
+    ///
+    /// | | covers at 1× | covers at 1.5× |
+    /// |---|---|---|
+    /// | Low 256 | Compact 150, Cozy 205 | Compact (225) |
+    /// | Medium 384 | + Large 288 | Cozy (308) |
+    /// | High 512 | — | Large (432) |
+    ///
+    /// The bytes are not the constraint they look like: the whole PNG cache was 40 MB against
+    /// an 8 GB cap, so a 4× at the low end is ~2% of the budget.
     pub fn thumb_px(self) -> u32 {
         match self {
-            PreviewQuality::Low => 128,
-            PreviewQuality::Medium => 256,
-            PreviewQuality::High => 384,
+            PreviewQuality::Low => 256,
+            PreviewQuality::Medium => 384,
+            PreviewQuality::High => 512,
         }
     }
 
@@ -1123,11 +1138,41 @@ mod tests {
         assert!(proj.excludes_for(&p("/a")).is_empty());
     }
 
+    /// Grid density stops, from `ui/src/lib/api.ts` — card **min-widths** in CSS px. Repeated
+    /// here because the ladder is meaningless without the thing it has to cover, and nothing
+    /// else in Rust knows this number.
+    const CARD_MIN_PX: [(&str, u32); 3] = [("compact", 150), ("cozy", 205), ("large", 288)];
+
+    /// A tier must never render *below* the card it draws into.
+    ///
+    /// The ladder used to start at 128 px against a 150 px minimum card with `object-fit:
+    /// cover`, so the default setting upscaled on every display — an ordering assert could not
+    /// see it, because 128 < 256 < 384 is perfectly ordered and still wrong. This asserts the
+    /// property that actually matters.
     #[test]
-    fn preview_quality_px_increases_with_quality() {
+    fn every_quality_tier_covers_the_card_it_draws_into() {
         assert!(PreviewQuality::Low.thumb_px() < PreviewQuality::Medium.thumb_px());
         assert!(PreviewQuality::Medium.thumb_px() < PreviewQuality::High.thumb_px());
         // The grid defaults to the low-fidelity preview the design shows (FEATURES §1.1/§5.2).
         assert_eq!(PreviewQuality::default(), PreviewQuality::Low);
+
+        let (name, widest) = CARD_MIN_PX
+            .iter()
+            .max_by_key(|(_, px)| *px)
+            .copied()
+            .expect("density stops");
+        for (q, label) in PreviewQuality::OPTIONS {
+            let px = q.thumb_px();
+            // Even the cheapest tier has to fill the *smallest* card without upscaling.
+            let (small_name, smallest) = CARD_MIN_PX[0];
+            assert!(
+                px >= smallest,
+                "{label} renders {px}px into the {small_name} card's {smallest}px — an upscale"
+            );
+        }
+        assert!(
+            PreviewQuality::High.thumb_px() >= widest * 3 / 2,
+            "High must still cover the {name} card ({widest}px) on a 1.5× display"
+        );
     }
 }

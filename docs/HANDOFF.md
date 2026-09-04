@@ -89,7 +89,7 @@ the Svelte side does not have yet.
 
 **The small follow-ups pass shipped** (KANBAN B10a–k, commits `1ae9175` backend / `c26aa84` UI /
 `7d49aca` e2e+board): health meter, toasts, Space→Quick Look, nudge banner, card status border,
-pack stats modal, pinned-libs facet, preview_quality wiring (thumb_px 128/256/384 + `?q=`
+pack stats modal, pinned-libs facet, preview_quality wiring (thumb_px 256/384/512 + `?q=`
 cache-buster), hover-spin, Mapping rule authoring, Inspector membership read, and the
 card-uniformity e2e regression. Verified: Rust green, svelte-check 0/0, e2e **51/51**.
 
