@@ -865,6 +865,15 @@ export type WriteResult = {
 export const setFavorite = (assetIds: number[], on: boolean) =>
   invoke<WriteResult>("set_favorite", { assetIds, on });
 
+/**
+ * Mark assets **confirmed** — "I checked these tags" (DATA-MODEL §8, AI-PIPELINE §6). The one
+ * status a person sets: `promote_statuses` never writes or clears it, and un-confirming recomputes
+ * the status the ingest work actually earned. No agent-plane equivalent, deliberately — an MCP
+ * client must not be able to sign off as the user.
+ */
+export const setConfirmed = (assetIds: number[], on: boolean) =>
+  invoke<WriteResult>("set_confirmed", { assetIds, on });
+
 /** Soft delete / restore. The file on disk is never touched. */
 export const setTrashed = (assetIds: number[], trashed: boolean) =>
   invoke<WriteResult>("set_trashed", { assetIds, trashed });

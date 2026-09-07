@@ -343,6 +343,20 @@ fn set_favorite(
     state.write(Op::SetFavorite { ids: asset_ids, on })
 }
 
+/// Mark assets **confirmed**, or clear that back to the status the ingest work earned
+/// (DATA-MODEL §8, AI-PIPELINE §6 human-in-the-loop).
+///
+/// The one status a person sets. Deliberately **not** on the agent planes: an MCP client must not
+/// be able to sign off as the user, because "confirmed" is precisely the claim that a human looked.
+#[tauri::command]
+fn set_confirmed(
+    state: tauri::State<'_, AppState>,
+    asset_ids: Vec<i64>,
+    on: bool,
+) -> Result<WriteResult, String> {
+    state.write(Op::SetConfirmed { ids: asset_ids, on })
+}
+
 /// "More like this" (UI-SPEC §13.8) — nearest neighbours in the asset's own embedding space.
 ///
 /// Read-only, and empty when the asset has no embedding: a library that has not been encoded yet
@@ -2343,6 +2357,7 @@ pub fn run() {
             asset_detail,
             reload_library,
             set_favorite,
+            set_confirmed,
             set_link_ignored,
             similar_assets,
             workspace_usage,

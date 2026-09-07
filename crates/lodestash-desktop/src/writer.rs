@@ -74,6 +74,15 @@ pub enum Op {
         ids: Vec<i64>,
         on: bool,
     },
+    /// Mark assets **confirmed** — the human's "I checked these tags" (DATA-MODEL §8,
+    /// AI-PIPELINE §6). The one status a person sets: `promote_statuses` never writes or clears it,
+    /// and un-confirming recomputes the status the ingest work actually earned rather than leaving
+    /// the row stale. Matters most right after a bulk AI pass, which is exactly when "which of
+    /// these did I actually look at" stops being answerable any other way.
+    SetConfirmed {
+        ids: Vec<i64>,
+        on: bool,
+    },
     /// Mute or unmute one dependency edge — UI-SPEC §13.6's **⊘ Ignore link** / **↺ restore**.
     /// A muted edge keeps its row (an ignore has to survive the next dependency scan, which
     /// re-derives the harvest wholesale) and stops resolving to anything.
@@ -1546,6 +1555,20 @@ fn run(
                 ..Default::default()
             })
             .map_err(|e| e.to_string()),
+
+        // Per asset, because `set_confirmed`'s un-confirm branch recomputes each row's earned
+        // status from its own embedding/tag/metrics state — there is no set-wide answer to fold.
+        Op::SetConfirmed { ids, on } => {
+            let mut changed = 0usize;
+            for id in ids {
+                catalog.set_confirmed(id, on).map_err(|e| e.to_string())?;
+                changed += 1;
+            }
+            Ok(WriteResult {
+                changed,
+                ..Default::default()
+            })
+        }
 
         Op::SetLinkIgnored { edge_id, ignored } => {
             let r = if ignored {

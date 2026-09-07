@@ -260,6 +260,14 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       `appraise_pass`; the idle slice still passes `None` for the whole queue. An explicit **empty**
       set means nothing, not everything (mutation-checked — that inversion is how a scoping bug
       turns into a full-library appraisal).
+- [x] **`confirmed` was unreachable — wired 2026-09-06.** `Catalog::set_confirmed` had **no
+      non-test caller**, so the one status a human sets could not be set: the P4 accept/reject flow
+      DATA-MODEL §8 and AI-PIPELINE §6 both describe existed only as a primitive. Identify's session
+      set now offers **✓ Confirm all** over the batch just appraised, through `Op::SetConfirmed` and
+      the single writer. Per-asset confirm on the card is still open.
+      Deliberately **not** on the agent planes: `confirmed` is the claim that a *human* checked the
+      tags, and an MCP client able to sign off as the user would empty the word. It matters more now
+      that a cloud pass can tag thousands in a run — it is the only record of which were looked at.
 - [x] **Cloud tagging was a data-destroying no-op — fixed 2026-09-06.** Turning on the CLOUD card
       marked every asset *AI-tagged, zero tags* and drained the Identify backlog **without one API
       call**. `OpenAiTagger` reads `TagInput::image`; `compute_tags` passes `image: None` on purpose

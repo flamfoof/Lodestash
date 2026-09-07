@@ -483,6 +483,13 @@ machine with no working embedder nothing ever lowers it again: a 200-asset agent
 `confirmed` is human-set (the P4 accept/reject flow) and the reconcile never touches it. The pass is
 idempotent, so it is safe to run after every drain.
 
+**Reachable since 2026-09-06** — `set_confirmed` had no non-test caller for months, so the one
+status a person sets could not be set. Identify's session set now offers **✓ Confirm all** over the
+batch just appraised (`Op::SetConfirmed` → the single writer). It stays off both agent planes on
+purpose: `confirmed` is the claim that a *human* checked the tags, and an MCP client signing off as
+the user would empty the word. That matters more once a bulk cloud pass can tag thousands of assets
+in a run — it is then the only record of which of them anyone actually looked at.
+
 Both halves are required, and that is not pedantry: an embedding makes an asset *findable*, but
 nothing has been **said** about it until it is tagged. While `identified` was earned by embeddings
 alone (2026-07-22 → 07-23), the health meter reported 2067 of 2274 identified for a library where

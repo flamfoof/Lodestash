@@ -19,6 +19,7 @@
     setSettings,
     libraryStatus,
     cloudRunEstimate,
+    setConfirmed,
     type CloudRunEstimate,
     DENSITIES,
     type GridItem,
@@ -159,6 +160,23 @@
    */
   let pendingPaidRun = $state<CloudRunEstimate | null>(null);
 
+  let confirming = $state(false);
+
+  /** Mark the just-appraised set confirmed — human-in-the-loop, never an agent's to claim. */
+  async function confirmSession() {
+    if (confirming || session.length === 0) return;
+    confirming = true;
+    try {
+      const r = await setConfirmed(session, true);
+      outcome = `Confirmed ${r.changed.toLocaleString()} assets.`;
+      view.dataVersion += 1;
+    } catch (e) {
+      outcome = `Confirm failed: ${String(e)}`;
+    } finally {
+      confirming = false;
+    }
+  }
+
   /** Cancel takes focus — spending must never be one stray Enter away. */
   function autofocus(node: HTMLElement) {
     node.focus();
@@ -245,6 +263,21 @@
       {#if sessionOn}
         <span class="count mono" data-testid="session-count">{session.length.toLocaleString()}</span>
         <span class="count-label">just appraised</span>
+        <!--
+          The human half of the loop (DATA-MODEL §8, AI-PIPELINE §6). `confirmed` is the one status
+          a person sets, and it is the only record of which AI tags were actually checked — which
+          matters most right after a bulk pass, when "did I look at these?" stops being answerable
+          any other way. Offered on the session set because that is the batch just reviewed.
+        -->
+        <button
+          class="link"
+          disabled={confirming || session.length === 0}
+          onclick={confirmSession}
+          data-testid="confirm-session"
+          title="Mark these as checked — the tags are trusted, and they leave the review backlog"
+        >
+          {confirming ? "Confirming…" : "✓ Confirm all"}
+        </button>
         <button class="link" onclick={() => (sessionOn = false)}>back to backlog</button>
       {:else}
         <span class="count mono">{total.toLocaleString()}</span>
