@@ -136,6 +136,36 @@ impl OpenAiTagger {
         self
     }
 
+    /// One round trip against a generated sample image — the CLOUD card's **Test** action
+    /// (AI-PIPELINE §5.1), "the single cheapest fix for the #1 failure mode".
+    ///
+    /// A wrong `base_url`, a non-vision model id or a dead key all produce *nothing* from a bulk
+    /// run and no signal at all, and a full pass is hours long. This exercises the real path — same
+    /// prompt, same `image_url` body, same error classification — so the answer is the whole
+    /// configuration's verdict rather than a reachability ping. The raw assistant text comes back
+    /// unparsed on purpose: a model that replies in prose instead of the facet object is
+    /// *reachable but useless here*, and only the raw reply shows that.
+    ///
+    /// Deliberately short-timeout: a preflight the user is watching must not hang for two minutes.
+    pub fn probe(&self) -> Result<String, ApiError> {
+        let png = encode_png(&probe_image()).map_err(|e| ApiError::Hard(format!("png encode: {e}")))?;
+        let input = TagInput {
+            media_code: "image",
+            name: "sample",
+            image: None,
+        };
+        let prompt = build_prompt(&input, None, &self.teach);
+        // A preflight the user is watching must not hang for the tagging timeout.
+        let quick = Self {
+            timeout: Duration::from_secs(30),
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+            teach: self.teach.clone(),
+        };
+        quick.complete(&prompt, &png)
+    }
+
     /// One blocking chat-completions call with the image inline. Returns the assistant's text, which
     /// [`parse_facets`] then reads as the facet object. Errors are classified ([`ApiError`]) so the
     /// caller can back off a throttle but not a dead key.
@@ -182,6 +212,25 @@ impl OpenAiTagger {
         let text = self.complete(&prompt, &png)?;
         Ok(TagResult::from_tags(parse_facets(&text, 0.85)))
     }
+}
+
+/// The Test action's subject: a red disc on white.
+///
+/// Generated rather than bundled — no asset to ship, no path to resolve, and it works on a fresh
+/// install with an empty library. A flat colour would not do: a model can answer "white" about a
+/// broken decode, so the picture carries a shape *and* a colour that a working vision model names
+/// and a text-only one cannot.
+fn probe_image() -> image::RgbaImage {
+    const N: u32 = 256;
+    let (c, r2) = (N as f32 / 2.0, (N as f32 * 0.35).powi(2));
+    image::RgbaImage::from_fn(N, N, |x, y| {
+        let (dx, dy) = (x as f32 - c, y as f32 - c);
+        if dx * dx + dy * dy <= r2 {
+            image::Rgba([200, 40, 40, 255])
+        } else {
+            image::Rgba([255, 255, 255, 255])
+        }
+    })
 }
 
 /// Map a `ureq` failure to the retry/no-retry split. `429`/`503` are worth backing off; everything
@@ -249,6 +298,25 @@ mod tests {
             image: None,
         };
         assert!(t.tag(&input, None).tags.is_empty());
+    }
+
+    /// The Test preflight's subject must carry a shape *and* a colour.
+    ///
+    /// A flat image would make the check worthless: a model answering "white" proves nothing about
+    /// whether it saw pixels at all, which is the one thing this action exists to establish.
+    #[test]
+    fn the_probe_image_is_not_a_flat_colour() {
+        let img = probe_image();
+        let centre = img.get_pixel(img.width() / 2, img.height() / 2);
+        let corner = img.get_pixel(0, 0);
+        assert_ne!(
+            centre, corner,
+            "a preflight image a vision model cannot describe tests nothing"
+        );
+        assert!(
+            img.pixels().all(|p| p[3] == 255),
+            "fully opaque, or a provider that drops alpha sees a different picture"
+        );
     }
 
     #[test]

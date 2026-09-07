@@ -291,10 +291,27 @@ export type Settings = {
   api_base_url: string;
   api_model: string | null;
   api_key: string;
+  /** Hard per-run cap on cloud-tagged assets (AI-PIPELINE §5.1). 0 = uncapped. */
+  api_max_per_run: number;
 };
 
 export const getSettings = () => invoke<Settings>("get_settings");
 export const setSettings = (settings: Settings) => invoke<void>("set_settings", { settings });
+
+/**
+ * One CLOUD-card endpoint preset (AI-PIPELINE §5). `model_hint` is guidance, never a committed
+ * value — providers rename models often, so only `base_url` is prefilled. `free` drives the
+ * budget confirm: a paid endpoint gets one before a run, a free/local one does not.
+ */
+export type ApiPreset = { label: string; base_url: string; model_hint: string; free: boolean };
+export const apiPresets = () => invoke<ApiPreset[]>("api_presets");
+
+/**
+ * Test the saved cloud config against a generated sample image (AI-PIPELINE §5.1). Resolves with
+ * the model's **raw** reply, rejects with the raw error — a wrong base URL, a non-vision model id
+ * or a dead key otherwise produce nothing from a run that takes hours, with no signal at all.
+ */
+export const testApiTagger = () => invoke<string>("test_api_tagger");
 export const setSourceWatch = (id: number, watch: boolean) => invoke("set_source_watch", { id, watch });
 
 /** One row of the Collections screen (UI-SPEC §6). */

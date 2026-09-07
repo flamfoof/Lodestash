@@ -284,9 +284,20 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       the swallowed assets cannot be identified precisely: the migration re-queues every asset marked
       done with no tags at all. It over-covers by honest empty local results — the right way to be
       wrong, since those cost one local pass while a swallowed asset is invisible for ever.
-      *Still open:* the CLOUD card is a raw base-URL form — the preset picker, the **Test** vision
-      preflight (AI-PIPELINE §5.1 calls it "the single cheapest fix for the #1 failure mode") and the
-      paid-preset budget confirm are all specified and unbuilt.
+- [x] **The CLOUD card came back — 2026-09-06.** `KANBAN.md:189` records the preset picker, the
+      Test action, the budget guard and key-at-rest as **shipped 2026-07-26** — in the egui app,
+      deleted at the B7 cutover. The Rust half survived (`PRESETS`, `preset_for`,
+      `is_free_endpoint`, `api_max_per_run`, the keyring); only the UI was lost, which is why those
+      symbols had no callers. Rebuilt in Svelte: an **Endpoint** preset picker fed from the Rust
+      `PRESETS` through `api_presets` (one source of truth — a TypeScript copy would drift from the
+      list the budget guard reads), the model field showing the preset's hint rather than a
+      committed id, a **Max assets per run** field now that `drain_api_tags` actually honours it,
+      and **Test** — `OpenAiTagger::probe` runs the real prompt and body against a generated red
+      disc and shows the model's raw reply or the raw error. The picture is a shape *and* a colour
+      on purpose: a model answering "white" to a flat image proves nothing about whether it saw
+      pixels, which is the one thing the action exists to establish.
+      *Still open:* the paid-endpoint pre-run confirm (`endpointIsFree` is computed and rendered as
+      a hint, but nothing gates a Run on it yet) and scoped cloud Run buttons.
 - [x] **Ollama tagging, end to end — proven 2026-08-30, with four defects found doing it.**
       `qwen3:8b` (facets) + `moondream:latest` (caption) over the MCP plane, writing through the
       app's single writer: *tagging pass finished tags=17*, then *tags=15* on a second batch.

@@ -12,6 +12,9 @@
   import {
     getSettings,
     setSettings,
+    apiPresets,
+    testApiTagger,
+    type ApiPreset,
     setSourceWatch,
     libraryStatus,
     sourceExcludes as fetchSourceExcludes,
@@ -64,6 +67,9 @@
     api_base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
     api_model: null,
     api_key: "",
+    // Matches config.rs's `default_api_max_per_run` — the budget guard must not read as uncapped
+    // before the real settings land.
+    api_max_per_run: 500,
   };
 
   let s = $state<Settings>({ ...DEFAULTS });
@@ -115,6 +121,39 @@
       })
       .catch(() => {});
   });
+
+  // ── CLOUD card: presets + the Test preflight (AI-PIPELINE §5, §5.1) ───────────────────────────
+  let presets = $state<ApiPreset[]>([]);
+  $effect(() => {
+    apiPresets()
+      .then((p) => (presets = p))
+      .catch(() => {});
+  });
+  /** The preset whose base_url matches, or "" for Custom — same trailing-slash rule as Rust's `preset_for`. */
+  let activePreset = $derived(
+    presets.find((p) => p.base_url.replace(/\/$/, "") === (s.api_base_url ?? "").trim().replace(/\/$/, ""))
+      ?.base_url ?? "",
+  );
+  /** An unknown remote is treated as **paid**, so the budget guard asks before spending. */
+  let endpointIsFree = $derived(
+    presets.find((p) => p.base_url === activePreset)?.free ??
+      /^https?:\/\/(127\.0\.0\.1|localhost)\b/.test(s.api_base_url ?? ""),
+  );
+  let testing = $state(false);
+  /** `ok` carries the model's raw reply; `err` the raw error. Both shown verbatim — that is the point. */
+  let testResult = $state<{ ok: string } | { err: string } | null>(null);
+
+  async function runApiTest() {
+    testing = true;
+    testResult = null;
+    try {
+      testResult = { ok: await testApiTagger() };
+    } catch (e) {
+      testResult = { err: String(e) };
+    } finally {
+      testing = false;
+    }
+  }
 
   async function save() {
     saved = false;
@@ -698,6 +737,25 @@
           Use an OpenAI-compatible API for the visual tag pass instead of local Ollama
         </label>
         <label class="field">
+          <span>Endpoint</span>
+          <select
+            value={activePreset}
+            onchange={(e) => {
+              // Only `base_url` is committed. Model ids are hints: providers rename them, so the
+              // picker prefills the URL (stable) and leaves the id to the field below.
+              const url = (e.currentTarget as HTMLSelectElement).value;
+              if (url) s.api_base_url = url;
+              save();
+            }}
+            data-testid="api-preset"
+          >
+            {#each presets as p (p.base_url)}
+              <option value={p.base_url}>{p.label}{p.free ? "" : " — paid"}</option>
+            {/each}
+            <option value="">Custom…</option>
+          </select>
+        </label>
+        <label class="field">
           <span>API base URL</span>
           <input type="text" bind:value={s.api_base_url} onchange={save} data-testid="api-base" />
         </label>
@@ -705,7 +763,8 @@
           <span>API model</span>
           <input
             type="text"
-            placeholder="e.g. gemini-2.0-flash"
+            placeholder={presets.find((p) => p.base_url === activePreset)?.model_hint ??
+              "the vision model id at this endpoint"}
             bind:value={s.api_model}
             onchange={save}
             data-testid="api-model"
@@ -722,6 +781,42 @@
             data-testid="api-key"
           />
         </label>
+        <label class="field">
+          <span>Max assets per run</span>
+          <input
+            type="number"
+            min="0"
+            bind:value={s.api_max_per_run}
+            onchange={save}
+            data-testid="api-max-per-run"
+          />
+        </label>
+        <p class="hint">
+          The budget guard (AI-PIPELINE §5.1): a run stops after this many API calls and leaves the
+          rest queued, so a mis-scoped pass on a paid endpoint can't become a surprise bill.
+          <span class="mono">0</span> is uncapped — only sensible on a free or local endpoint.
+        </p>
+        <!--
+          Test (AI-PIPELINE §5.1): one call against a generated sample image. A wrong base URL, a
+          non-vision model id or a dead key otherwise produce *nothing* from a pass that runs for
+          hours, with no signal — this surfaces it in one click, before any spend.
+        -->
+        <div class="row">
+          <button onclick={runApiTest} disabled={testing} data-testid="api-test">
+            {testing ? "Testing…" : "Test"}
+          </button>
+          {#if !endpointIsFree}
+            <span class="hint">Paid endpoint — a run asks before it spends.</span>
+          {/if}
+        </div>
+        {#if testResult}
+          <pre
+            class="test-result"
+            class:bad={"err" in testResult}
+            data-testid="api-test-result">{"ok" in testResult
+              ? testResult.ok
+              : testResult.err}</pre>
+        {/if}
       </section>
 
       <section class="card" data-testid="models-card">
@@ -1155,6 +1250,35 @@
   .mono {
     font-family: var(--ff-mono);
     font-variant-numeric: tabular-nums;
+  }
+
+  /* CLOUD card Test (AI-PIPELINE §5.1). The reply is shown verbatim, wrapped rather than
+     truncated: a provider's error body is often the only thing that names the real problem. */
+  .row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    margin-bottom: var(--sp-2);
+  }
+  .row .hint {
+    margin: 0;
+  }
+  .test-result {
+    margin: 0 0 var(--sp-3);
+    padding: var(--sp-2);
+    max-height: 12em;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-family: var(--ff-mono);
+    font-size: var(--fs-xs);
+    color: var(--ls-text-muted);
+    background: var(--ls-surface-2, transparent);
+    border: 1px solid var(--ls-border);
+    border-radius: 6px;
+  }
+  .test-result.bad {
+    color: var(--ls-danger);
   }
   .num {
     font-variant-numeric: tabular-nums;

@@ -1053,6 +1053,48 @@ fn get_settings() -> Result<Settings, String> {
     lodestash_app::config::edit_config(|c| Settings::from_config(c))
 }
 
+/// The CLOUD card's endpoint presets (AI-PIPELINE §5 "Endpoint presets").
+///
+/// Served from the Rust `PRESETS` rather than restated in the frontend: `preset_for` and
+/// `is_free_endpoint` already read that list to decide whether a run needs the budget confirm, and
+/// a second copy in TypeScript would drift from the one the guard consults.
+#[tauri::command]
+fn api_presets() -> Vec<serde_json::Value> {
+    lodestash_ai::openai::PRESETS
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "label": p.label,
+                "base_url": p.base_url,
+                "model_hint": p.model_hint,
+                "free": p.free,
+            })
+        })
+        .collect()
+}
+
+/// The CLOUD card's **Test** action (AI-PIPELINE §5.1): one call against a generated sample image,
+/// showing the model's raw reply or the raw error.
+///
+/// Runs against the **saved** config — the card writes on change, so what is tested is what a run
+/// would use. `Ok` carries the assistant's unparsed text: a model that answers in prose rather than
+/// the facet object is reachable but useless for tagging, and only the raw reply shows that.
+/// A blocking call on the command thread is right here — the user pressed a button and is waiting,
+/// and the probe carries its own 30 s timeout.
+#[tauri::command]
+fn test_api_tagger() -> Result<String, String> {
+    let cfg = lodestash_app::config::AppConfig::load();
+    let Some(model) = cfg.api_model.clone().filter(|m| !m.trim().is_empty()) else {
+        return Err("No API model set — fill in the model id first.".into());
+    };
+    if cfg.api_key.trim().is_empty() {
+        return Err("No API key set.".into());
+    }
+    lodestash_ai::openai::OpenAiTagger::new(cfg.api_base_url.clone(), cfg.api_key.clone(), model)
+        .probe()
+        .map_err(|e| e.to_string())
+}
+
 /// Bytes + file count under the preview cache root (Settings' CACHE card).
 #[tauri::command]
 fn preview_cache_usage(state: tauri::State<'_, AppState>) -> Result<(u64, usize), String> {
@@ -2294,6 +2336,8 @@ pub fn run() {
             set_trait_style,
             get_settings,
             set_settings,
+            test_api_tagger,
+            api_presets,
             preview_cache_usage,
             clear_preview_cache,
             set_source_watch,

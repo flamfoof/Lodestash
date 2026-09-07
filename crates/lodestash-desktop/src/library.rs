@@ -417,6 +417,10 @@ pub struct Settings {
     /// API key for the endpoint — a secret, never logged. Empty = not configured.
     #[serde(default)]
     pub api_key: String,
+    /// Hard per-run cap on cloud-tagged assets (AI-PIPELINE §5.1 budget guard). `0` = uncapped,
+    /// which is only sensible on a free or local endpoint.
+    #[serde(default)]
+    pub api_max_per_run: u32,
 }
 
 impl Settings {
@@ -447,6 +451,7 @@ impl Settings {
             api_base_url: c.api_base_url.clone(),
             api_model: c.api_model.clone(),
             api_key: c.api_key.clone(),
+            api_max_per_run: c.api_max_per_run,
         }
     }
 
@@ -478,6 +483,7 @@ impl Settings {
         c.api_base_url = self.api_base_url;
         c.api_model = self.api_model;
         c.api_key = self.api_key;
+        c.api_max_per_run = self.api_max_per_run;
     }
 }
 
