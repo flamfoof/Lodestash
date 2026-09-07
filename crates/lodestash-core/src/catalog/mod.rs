@@ -417,6 +417,7 @@ impl Catalog {
             (21, MIGRATION_21_STORE_PACK_LICENSE),
             (22, MIGRATION_22_DROP_BUILTIN_EDGES),
             (23, MIGRATION_23_KEEP_CACHED),
+            (24, MIGRATION_24_REDIRTY_SWALLOWED_TAGS),
         ];
 
         for (version, sql) in migrations {
@@ -2137,6 +2138,28 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_collection_staging_unprojected
 /// absent.
 const MIGRATION_23_KEEP_CACHED: &str = "
 ALTER TABLE package ADD COLUMN keep_cached INTEGER NOT NULL DEFAULT 0;
+";
+
+/// M24 — put back the assets the broken API tagger swallowed (AI-PIPELINE §5).
+///
+/// `OpenAiTagger` never overrode `Tagger::caption`, and `compute_tags` passes `image: None` on
+/// purpose because the caption phase is meant to carry the picture. So `try_tag` short-circuited on
+/// the missing image, returned an empty result without making one HTTP request, and `store_tags`
+/// wrote `set_tags(id, "ai", Some(model), &[])` — which clears `tags_dirty`. Switching on cloud
+/// tagging therefore marked every asset *done, no tags* and drained the Identify backlog for good.
+///
+/// The empty write leaves **no trace of who did it**: an empty set writes no `asset_tag` row, so
+/// there is no `model_id` to match on. The honest repair is every asset marked done that carries no
+/// tags at all. That over-covers by the assets a local pass genuinely found nothing for — the right
+/// way to be wrong here, since those cost one local pass to redo, while a swallowed asset is
+/// invisible for ever.
+///
+/// Safe against the `asset_fts_au` trigger, which re-indexes with `tags_concat = ''`: every row
+/// this touches has no tags, so `''` is already what the index holds.
+const MIGRATION_24_REDIRTY_SWALLOWED_TAGS: &str = "
+UPDATE asset SET tags_dirty = 1
+ WHERE deleted_at IS NULL AND tags_dirty = 0
+   AND NOT EXISTS (SELECT 1 FROM asset_tag t WHERE t.asset_id = asset.id);
 ";
 
 /// M22 — drop edges that point at Unity's own built-in resource libraries.

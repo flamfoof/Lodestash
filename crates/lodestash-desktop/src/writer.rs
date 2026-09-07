@@ -1272,16 +1272,16 @@ fn tag_worker_slice(
         .collect::<Vec<_>>();
     let zero_shot = embedder.and_then(|e| ImageZeroShot::new(e, &teach));
     let cfg = AppConfig::load();
-    let api_model = cfg
-        .api_model
-        .clone()
-        .filter(|_| cfg.api_tagging_enabled && !cfg.api_key.is_empty());
-    let tagger: Box<dyn Tagger> = if let Some(model) = api_model {
-        Box::new(
-            OpenAiTagger::new(cfg.api_base_url.clone(), cfg.api_key.clone(), model)
-                .with_teaching(teach.clone()),
-        )
-    } else if let Some(model) = cfg.tagger_model.clone() {
+    // **The idle lane never spends money.** Cloud tagging needs `drain_api_tags` (backoff, local
+    // fallback, per-run cap) and that drain writes through `&mut Catalog`, so it belongs to the
+    // writer's kick path — this slice runs off-writer and can only reach `compute_tags`, which
+    // hands `OpenAiTagger` no image and would write empty tags. Beyond correctness it is the rule
+    // AI-PIPELINE §5.1 wants anyway: a background lane must not quietly bill an API, so a cloud
+    // pass is always an explicit, scoped, capped kick.
+    if cfg.api_tagging_enabled && !cfg.api_key.is_empty() && cfg.api_model.is_some() {
+        return false;
+    }
+    let tagger: Box<dyn Tagger> = if let Some(model) = cfg.tagger_model.clone() {
         let mut t = OllamaTagger::new(model);
         if let Some(vision) = cfg.tagger_vision_model.clone() {
             t = t.with_vision(vision);
@@ -1376,12 +1376,9 @@ fn appraise_pass(
             .api_model
             .clone()
             .filter(|_| cfg.api_tagging_enabled && !cfg.api_key.is_empty());
-        let tagger: Box<dyn Tagger> = if let Some(model) = api_model {
-            Box::new(
-                OpenAiTagger::new(cfg.api_base_url.clone(), cfg.api_key.clone(), model)
-                    .with_teaching(teach.clone()),
-            )
-        } else if let Some(model) = cfg.tagger_model.clone() {
+        // The local tagger, built either way: on its own when no API model is configured, or as the
+        // cloud drain's per-asset fallback (AI-PIPELINE §5.1 "Local fallback on failure").
+        let local: Box<dyn Tagger> = if let Some(model) = cfg.tagger_model.clone() {
             let mut t = OllamaTagger::new(model);
             if let Some(vision) = cfg.tagger_vision_model.clone() {
                 t = t.with_vision(vision);
@@ -1390,16 +1387,40 @@ fn appraise_pass(
         } else {
             Box::new(FilenameTagger)
         };
-        drain_tags(
-            catalog,
-            tagger.as_ref(),
-            zero_shot.as_ref(),
-            workspace_dir.as_deref(),
-            cache_dir.as_deref(),
-            progress,
-            TAG_BUDGET_PER_PASS,
-            only,
-        );
+        match api_model {
+            // Cloud tagging goes through `drain_api_tags`, **not** the generic `drain_tags`.
+            // `drain_tags` → `compute_tags` passes `image: None` (the two-phase shape expects
+            // `caption()` to carry the picture) and `OpenAiTagger` has no `caption()` override, so
+            // that path made no HTTP request at all and wrote an empty tag set that cleared
+            // `tags_dirty` — assets marked done, never seen by any model. `drain_api_tags` is the
+            // drain written for this: it passes the image, honours `Retry-After` with backoff, falls
+            // back to the local model on a hard error, and caps the run.
+            Some(model) => {
+                let api = OpenAiTagger::new(cfg.api_base_url.clone(), cfg.api_key.clone(), model)
+                    .with_teaching(teach.clone());
+                lodestash_app::drains::drain_api_tags(
+                    catalog,
+                    &api,
+                    Some(local.as_ref()),
+                    zero_shot.as_ref(),
+                    cfg.api_max_per_run,
+                    workspace_dir.as_deref(),
+                    cache_dir.as_deref(),
+                    progress,
+                    only,
+                );
+            }
+            None => drain_tags(
+                catalog,
+                local.as_ref(),
+                zero_shot.as_ref(),
+                workspace_dir.as_deref(),
+                cache_dir.as_deref(),
+                progress,
+                TAG_BUDGET_PER_PASS,
+                only,
+            ),
+        }
         if let Some(az) = audio_shot.as_ref() {
             drain_audio_tags(
                 catalog,

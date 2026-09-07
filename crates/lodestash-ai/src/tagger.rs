@@ -80,6 +80,19 @@ pub trait Tagger {
     /// result is a valid answer — "nothing recognisable" is information, and the caller still
     /// clears the queue flag so the asset isn't re-run forever.
     fn tag(&self, input: &TagInput<'_>, caption: Option<&str>) -> TagResult;
+
+    /// Does this tagger read `TagInput::image` directly, rather than through a caption it produced
+    /// in [`Self::caption`]?
+    ///
+    /// The two-phase shape above means the *generic* batch path never fills `image` — the caption
+    /// is supposed to carry the picture. A tagger that reads the pixels itself is therefore unusable
+    /// on that path, and saying so is the difference between "refused" and "silently tagged
+    /// nothing": the API tagger was routed through it for weeks, returned an empty result without
+    /// making one HTTP request, and the caller wrote that emptiness to the catalog as a finished
+    /// answer. Such a tagger needs the drain built for it (`drains::drain_api_tags`).
+    fn needs_image(&self) -> bool {
+        false
+    }
 }
 
 /// The facet namespaces a *model* is allowed to fill (IDENTIFICATION-AND-SEARCH §2).

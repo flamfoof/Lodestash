@@ -213,6 +213,12 @@ impl Tagger for OpenAiTagger {
         media_code != "audio"
     }
 
+    /// This tagger sends the pixels itself, so the generic two-phase batch path — which never fills
+    /// `TagInput::image` — cannot drive it. `drains::drain_api_tags` is the drain that can.
+    fn needs_image(&self) -> bool {
+        true
+    }
+
     /// Single-call facet tagging: the image goes with the prompt and the model returns the JSON. The
     /// `caption` argument is ignored — a cloud VLM doesn't need the local caption pre-step.
     ///

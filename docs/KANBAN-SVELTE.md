@@ -260,6 +260,33 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       `appraise_pass`; the idle slice still passes `None` for the whole queue. An explicit **empty**
       set means nothing, not everything (mutation-checked — that inversion is how a scoping bug
       turns into a full-library appraisal).
+- [x] **Cloud tagging was a data-destroying no-op — fixed 2026-09-06.** Turning on the CLOUD card
+      marked every asset *AI-tagged, zero tags* and drained the Identify backlog **without one API
+      call**. `OpenAiTagger` reads `TagInput::image`; `compute_tags` passes `image: None` on purpose
+      because the two-phase shape expects `caption()` to carry the picture (`tagger.rs:70` — the
+      reason is real: alternating two Ollama models per asset measured ~50 s/asset), and the API
+      tagger never overrode `caption()`. So `try_tag` short-circuited, returned empty, and
+      `store_tags` wrote `set_tags(id, "ai", Some(model), &[])`, which clears `tags_dirty`.
+      Every reliability mandate in AI-PIPELINE §5.1 was already **implemented** in
+      `drains::drain_api_tags` — `Retry-After` backoff with jitter, cancel-polled sleep, local
+      fallback, the `api_max_per_run` cap — and that function had **zero callers**.
+      Three parts to the fix. The kick path routes to `drain_api_tags` when an API model is
+      configured (which also makes `api_max_per_run` load-bearing for the first time). That drain
+      queried the **global** queue, so it inherited the scoping bug fixed once already on the local
+      path — it now takes `only` and uses `assets_needing_tags_within`, because a wrong asset here is
+      a paid call. And the root cause is guarded at the shared function: `Tagger::needs_image()`
+      marks a tagger that reads pixels directly, and `compute_tags` refuses it and returns no rows,
+      so assets stay queued instead of being stored as finished.
+      The idle lane now **never tags when an API model is configured** — correctness (it runs
+      off-writer and can only reach the batch path) and policy (a background lane must not bill an
+      endpoint unwatched), so a cloud pass is always an explicit scoped kick.
+      **M24 repairs the queue.** An empty write leaves no `asset_tag` row and hence no `model_id`, so
+      the swallowed assets cannot be identified precisely: the migration re-queues every asset marked
+      done with no tags at all. It over-covers by honest empty local results — the right way to be
+      wrong, since those cost one local pass while a swallowed asset is invisible for ever.
+      *Still open:* the CLOUD card is a raw base-URL form — the preset picker, the **Test** vision
+      preflight (AI-PIPELINE §5.1 calls it "the single cheapest fix for the #1 failure mode") and the
+      paid-preset budget confirm are all specified and unbuilt.
 - [x] **Ollama tagging, end to end — proven 2026-08-30, with four defects found doing it.**
       `qwen3:8b` (facets) + `moondream:latest` (caption) over the MCP plane, writing through the
       app's single writer: *tagging pass finished tags=17*, then *tags=15* on a second batch.
@@ -273,7 +300,9 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       **(4)** A caption that is not prose landed in `asset.description`, which FTS indexes:
       `moondream` answered `ids: [0.17, 0.13, 0.83, 0.37]` when asked to describe a pile of sacks —
       fixed, `clean_caption` requires prose and strips `IMAGE!!!` too.
-      **Model quality is now the limit, not the pipeline.** moondream called a labelled beer crate
+      **Model quality is now the limit, not the pipeline** — *for the local path.* The API path
+      beside it had never sent an image at all; see the cloud card above (2026-09-06).
+      moondream called a labelled beer crate
       an *urn* (the source of the old `subject:urn` across all four facets) and a bucket a *wooden
       board*. A stronger vision model is the next lever.
 - [x] **`identify_asset`'s job finished before its work did — fixed 2026-08-30.** Two nested jobs:
@@ -1113,7 +1142,8 @@ and the Materials tab — `FEATURES.md` wins on both, do not "fix" the app to ma
       deleted egui crate, so its 14 dead citations are history, reported as notes rather than
       failures. Deleting those cards would be tidier and would lose the record; leaving them
       unmarked made the checker cry wolf 14 times, which is how a checker stops being read.
-      **Caught while writing it:** the parser matched **zero** cards — the repo is CRLF, `` is a
+      **Caught while writing it:** the parser matched **zero** cards — the repo is CRLF, `
+` is a
       line terminator, so a per-line `/^- \[([ x])\] (.*)$/` never matches and the script reports a
       clean board. A silent zero that reads exactly like success, in the tool built to catch exactly
       that.

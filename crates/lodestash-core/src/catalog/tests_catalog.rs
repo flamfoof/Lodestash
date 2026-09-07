@@ -18,7 +18,7 @@ fn open_in_memory_applies_migrations() {
         .conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 23, "all 23 migrations should have run");
+    assert_eq!(version, 24, "all 24 migrations should have run");
 }
 
 /// Every queue an appraise pass drains must respect the set the caller named.
@@ -392,6 +392,61 @@ fn catalog_at(version: u32) -> Catalog {
 /// A catalog stopped at schema v4, for exercising M5's data steps.
 fn catalog_at_v4() -> Catalog {
     catalog_at(4)
+}
+
+/// M24 puts back the assets the broken API tagger swallowed.
+///
+/// `OpenAiTagger` reads `TagInput::image`, the batch path never fills it, so the tagger answered
+/// "no tags" without one HTTP request and the caller stored that as finished — `tags_dirty = 0` on
+/// an asset no model had seen, gone from the Identify backlog for good. An empty write leaves no
+/// `asset_tag` row and therefore no `model_id`, so the repair cannot target the guilty rows
+/// precisely: it takes every asset marked done that carries no tags at all.
+///
+/// The second assertion is the one that matters — a real tagging result must **not** be re-queued,
+/// or every run would redo the whole library for ever.
+#[test]
+fn m24_requeues_assets_marked_done_with_no_tags() {
+    let mut c = catalog_at(23);
+    c.seed_media_types().expect("seed");
+    let src = c
+        .upsert_import_source("Lib", "C:/lib", "folder")
+        .expect("source");
+    let mk = |c: &mut Catalog, rel: &str| {
+        c.record_crawl(src, None, &[rec(rel, 1, 1)]).expect("crawl");
+        c.conn
+            .query_row("SELECT id FROM asset ORDER BY id DESC LIMIT 1", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .expect("id")
+    };
+    let swallowed = mk(&mut c, "swallowed.png");
+    let genuinely_tagged = mk(&mut c, "tagged.png");
+    c.add_asset_tag(genuinely_tagged, "ai", "subject", "rock")
+        .expect("tag");
+    // Both look "done" to the queue; only one of them ever saw a model.
+    c.conn
+        .execute("UPDATE asset SET tags_dirty = 0", [])
+        .expect("clear");
+
+    c.apply_migrations_up_to(24).expect("m24");
+
+    let dirty = |c: &Catalog, id: i64| -> i64 {
+        c.conn
+            .query_row("SELECT tags_dirty FROM asset WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .expect("read")
+    };
+    assert_eq!(
+        dirty(&c, swallowed),
+        1,
+        "an asset marked done with no tags was never actually tagged — requeue it"
+    );
+    assert_eq!(
+        dirty(&c, genuinely_tagged),
+        0,
+        "a real result must stay done, or every run re-tags the whole library"
+    );
 }
 
 #[test]

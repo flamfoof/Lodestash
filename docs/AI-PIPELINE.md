@@ -268,6 +268,24 @@ throttle hard — Gemini free is on the order of ~15 requests/minute. A naive ti
 - **Key at rest.** `api_key` is the one secret this local-first app holds; store it in the **OS
   credential store** (Windows Credential Manager) when available, with a plaintext-config fallback so
   the app still works headless. Never logged, never sent anywhere but the chosen endpoint.
+- **The idle lane never spends money.** A cloud pass is always an explicit, scoped, capped kick —
+  the background auto-identify slice does not tag when an API model is configured. Two reasons, and
+  either alone is sufficient: a lane that bills an endpoint while the user is not looking is not
+  something a budget guard can bound, and the off-writer slice can only reach the generic batch path,
+  which cannot drive an image-reading tagger (below).
+- **A tagger that reads the pixels itself cannot run on the generic batch path.** The two-phase shape
+  above means that path never fills `TagInput::image` — the caption carries the picture — so
+  `Tagger::needs_image()` marks the taggers that must go through `drain_api_tags` instead, and the
+  batch path refuses them rather than storing their emptiness as an answer.
+
+> **The defect this section was written against, made real (2026-09-06).** `OpenAiTagger` never
+> overrode `caption()`, and the live drain was the generic one, so the cloud path short-circuited on
+> the missing image and returned an empty result **without making a single HTTP request** — which the
+> caller then wrote as a finished tagging, clearing `tags_dirty`. Switching on cloud tagging marked
+> every asset *done, no tags* and drained the Identify backlog for good. Every mandate above already
+> existed; `drain_api_tags` implemented backoff, resume, fallback and the cap, and had **no callers**.
+> The fix routes the kick path to that drain, marks the tagger `needs_image()`, and M24 re-queues
+> what was swallowed (`DATA-MODEL.md` §13).
 
 ---
 

@@ -263,6 +263,11 @@ pub fn drain_api_tags(
     workspace_dir: Option<&std::path::Path>,
     cache_dir: Option<&std::path::Path>,
     progress: &crate::jobs::JobProgress,
+    // Restrict the pass to these assets, exactly as [`drain_tags`] does. `None` = the whole queue.
+    // Without this an `identify_asset(ids)` routed to the cloud would take the front of the
+    // **global** queue instead of the ids asked about — the same defect already fixed once on the
+    // local path, and far more expensive here because every wrong asset is a paid API call.
+    only: Option<&[i64]>,
 ) {
     use lodestash_ai::openai::ApiError;
     use lodestash_ai::tagger::{TagInput, Tagger};
@@ -281,7 +286,7 @@ pub fn drain_api_tags(
         if progress.is_cancelled() {
             return;
         }
-        let jobs = match cat.assets_needing_tags(BATCH) {
+        let jobs = match cat.assets_needing_tags_within(BATCH, only) {
             Ok(j) => j,
             Err(e) => {
                 tracing::warn!(%e, "tag queue query failed; retries next run");
@@ -1123,6 +1128,18 @@ pub fn compute_tags(
     /// Fixed preview size, independent of the user's grid-quality setting: tagging results should
     /// not change because someone moved a slider.
     const TAG_PX: u32 = 384;
+    // This path never fills `TagInput::image` — the caption phase is what carries the picture. A
+    // tagger that reads the pixels directly therefore sees nothing here and answers "no tags",
+    // which the caller stores as a finished result, clearing `tags_dirty` on an asset no model ever
+    // looked at. Refuse instead: an empty return writes nothing, so the assets stay queued for the
+    // drain that can actually serve them.
+    if tagger.needs_image() {
+        tracing::warn!(
+            model = %tagger.model_id(),
+            "this tagger reads the image directly and cannot run on the batch path; assets stay queued"
+        );
+        return Vec::new();
+    }
     let mut prepared = Vec::with_capacity(jobs.len());
     for job in jobs {
         // In-pack payloads pull to a scratch file; keep the guard alive while `path` is read.
@@ -1582,6 +1599,34 @@ mod tests {
             pack_size: Some(pack_size),
             ext: Some("png".into()),
         }
+    }
+
+    /// The defect that made cloud tagging a data-destroying no-op: `OpenAiTagger` reads
+    /// `TagInput::image`, `compute_tags` never fills it, so the tagger short-circuited to an empty
+    /// result with no HTTP request and the caller stored that as a finished answer — clearing
+    /// `tags_dirty` on assets no model had seen. Returning **no rows** is the point: `store_tags`
+    /// then writes nothing and the assets stay queued for `drain_api_tags`.
+    #[test]
+    fn compute_tags_refuses_a_tagger_that_reads_the_image_itself() {
+        let api = lodestash_ai::openai::OpenAiTagger::new("http://127.0.0.1:0", "k", "m");
+        assert!(
+            lodestash_ai::tagger::Tagger::needs_image(&api),
+            "the API tagger sends pixels itself"
+        );
+        let out = compute_tags(vec![in_pack_job(1024)], &api, None, None, None);
+        assert!(
+            out.is_empty(),
+            "an image-reading tagger must produce no writes on the batch path, \
+             or its emptiness is stored as a finished result"
+        );
+    }
+
+    /// The local tagger is the one this path was built for and must stay usable on it.
+    #[test]
+    fn the_local_tagger_still_runs_on_the_batch_path() {
+        assert!(!lodestash_ai::tagger::Tagger::needs_image(
+            &lodestash_ai::tagger::FilenameTagger
+        ));
     }
 
     /// An in-pack payload over the pull cap must be refused *before* `read_payload_at` buffers it —
