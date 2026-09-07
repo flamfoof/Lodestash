@@ -296,8 +296,16 @@ B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-deskto
       disc and shows the model's raw reply or the raw error. The picture is a shape *and* a colour
       on purpose: a model answering "white" to a flat image proves nothing about whether it saw
       pixels, which is the one thing the action exists to establish.
-      *Still open:* the paid-endpoint pre-run confirm (`endpointIsFree` is computed and rendered as
-      a hint, but nothing gates a Run on it yet) and scoped cloud Run buttons.
+      **The budget guard's confirm landed with it.** `cloud_run_estimate` answers, from Rust, whether
+      a run would spend and on how many assets; ✦ Identify all raises a confirm when it does. The
+      free/paid call stays server-side because `is_free_endpoint` already owns it and treats an
+      unknown remote as **paid** — deciding it in the frontend would give the confirm a different
+      opinion from the drain it guards. The dialog quotes `calls` (queue depth bounded by the cap),
+      not the raw backlog: a confirm naming a bigger number than the run performs is one people
+      learn to dismiss unread. Cancel takes focus, Escape cancels, and a free or local pass never
+      sees it.
+      *Still open:* scoped cloud Run buttons (New / Unidentified / Selected), and a cost line — the
+      spec asks for one "when the provider's pricing is known", and nothing in the app knows it.
 - [x] **Ollama tagging, end to end — proven 2026-08-30, with four defects found doing it.**
       `qwen3:8b` (facets) + `moondream:latest` (caption) over the MCP plane, writing through the
       app's single writer: *tagging pass finished tags=17*, then *tags=15* on a second batch.

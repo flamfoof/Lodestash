@@ -1053,6 +1053,45 @@ fn get_settings() -> Result<Settings, String> {
     lodestash_app::config::edit_config(|c| Settings::from_config(c))
 }
 
+/// The budget guard's pre-run question (AI-PIPELINE §5.1): would this Identify run spend money,
+/// and on how many assets?
+///
+/// `None` means *no confirm* — the pass is local, or the endpoint is free/loopback. `Some` carries
+/// what the confirm must say: the queue depth, the cap that will actually bound the run, and the
+/// endpoint being billed.
+///
+/// The free/paid decision stays in Rust because `is_free_endpoint` already owns it, and it treats
+/// an **unknown** remote as paid — the safe direction for a guard whose whole job is to ask before
+/// spending. Deciding it in the frontend would give the confirm a different opinion from the drain.
+#[tauri::command]
+fn cloud_run_estimate(state: tauri::State<'_, AppState>) -> Result<Option<serde_json::Value>, String> {
+    let cfg = lodestash_app::config::AppConfig::load();
+    let configured =
+        cfg.api_tagging_enabled && !cfg.api_key.trim().is_empty() && cfg.api_model.is_some();
+    if !configured || lodestash_ai::openai::is_free_endpoint(&cfg.api_base_url) {
+        return Ok(None);
+    }
+    let queued = state
+        .library
+        .lock()
+        .map_err(|_| "library lock poisoned".to_string())?
+        .count_needing_tags();
+    // One API call per asset (the cloud path is single-call — no caption pre-step), so the cap and
+    // the queue depth together are the honest ceiling.
+    let calls = if cfg.api_max_per_run == 0 {
+        queued
+    } else {
+        queued.min(cfg.api_max_per_run as usize)
+    };
+    Ok(Some(serde_json::json!({
+        "queued": queued,
+        "calls": calls,
+        "capped": cfg.api_max_per_run != 0 && queued > cfg.api_max_per_run as usize,
+        "endpoint": cfg.api_base_url,
+        "model": cfg.api_model,
+    })))
+}
+
 /// The CLOUD card's endpoint presets (AI-PIPELINE §5 "Endpoint presets").
 ///
 /// Served from the Rust `PRESETS` rather than restated in the frontend: `preset_for` and
@@ -2338,6 +2377,7 @@ pub fn run() {
             set_settings,
             test_api_tagger,
             api_presets,
+            cloud_run_estimate,
             preview_cache_usage,
             clear_preview_cache,
             set_source_watch,

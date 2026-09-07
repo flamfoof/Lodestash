@@ -899,6 +899,16 @@ impl Library {
         self.mark_imported();
     }
 
+    /// How many assets are queued for tagging — what the budget guard's "N assets ≈ N API calls"
+    /// counts (AI-PIPELINE §5.1). The same `tags_dirty` queue the drain walks, so the number the
+    /// confirm shows is the number the run would actually bill.
+    pub fn count_needing_tags(&self) -> usize {
+        self.catalog
+            .as_ref()
+            .and_then(|c| c.count_needing_tags().ok())
+            .unwrap_or(0) as usize
+    }
+
     /// The recent export runs (FEATURES §7.1). A thin pass-through — the grouping is the catalog's.
     pub fn recent_exports(&self, limit: usize) -> Result<Vec<ExportBatchRow>, String> {
         let cat = self.catalog.as_ref().ok_or("no catalog open")?;

@@ -18,6 +18,8 @@
     getSettings,
     setSettings,
     libraryStatus,
+    cloudRunEstimate,
+    type CloudRunEstimate,
     DENSITIES,
     type GridItem,
     type PumpProgress,
@@ -148,7 +150,39 @@
 
   // ✦ Identify all (B11): one bounded appraise pass on the persist thread; the backlog count
   // shrinks as assets get embeddings + tags, and the grid re-reads on completion.
+  /**
+   * The budget guard's pre-run confirm (AI-PIPELINE §5.1). `null` while nothing is pending.
+   *
+   * Only a **paid** endpoint raises it — a local pass or a free/loopback endpoint runs straight
+   * through, because a confirm that appears when nothing is at stake is a confirm people learn to
+   * dismiss without reading.
+   */
+  let pendingPaidRun = $state<CloudRunEstimate | null>(null);
+
+  /** Cancel takes focus — spending must never be one stray Enter away. */
+  function autofocus(node: HTMLElement) {
+    node.focus();
+  }
+
+  /** ✦ Identify all, after the guard has had its say. */
   async function appraise() {
+    if (running) return;
+    // Ask Rust, not the local settings: `is_free_endpoint` treats an unknown remote as paid, and
+    // the guard must agree with the drain it is guarding.
+    try {
+      const estimate = await cloudRunEstimate();
+      if (estimate) {
+        pendingPaidRun = estimate;
+        return;
+      }
+    } catch {
+      // A guard that cannot answer must not block the run — the cap in `drain_api_tags` still
+      // bounds it, and a local pass is the common case.
+    }
+    await runAppraise();
+  }
+
+  async function runAppraise() {
     if (running) return;
     running = true;
     outcome = null;
@@ -357,7 +391,105 @@
   </div>
 </section>
 
+<!--
+  Budget guard (AI-PIPELINE §5.1). Shown only for a paid endpoint, and it names the number that
+  will actually be billed — `calls`, not the queue depth — because the per-run cap is what bounds
+  the spend and a confirm quoting a bigger number than the run performs teaches people to ignore it.
+  Cancel takes focus and Escape cancels: spending is not the default.
+-->
+<svelte:window
+  on:keydown={(e) => {
+    if (e.key === "Escape" && pendingPaidRun) {
+      pendingPaidRun = null;
+      e.preventDefault();
+    }
+  }}
+/>
+
+{#if pendingPaidRun}
+  <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+  <div class="scrim" onclick={() => (pendingPaidRun = null)} data-testid="paid-run-confirm">
+    <div
+      class="dialog"
+      role="dialog"
+      tabindex="-1"
+      aria-modal="true"
+      aria-label="Confirm a paid tagging run"
+      onclick={(e) => e.stopPropagation()}
+    >
+      <h2>This run costs money</h2>
+      <p>
+        <strong>{pendingPaidRun.calls.toLocaleString()}</strong> assets, one API call each, against
+        <span class="mono">{pendingPaidRun.endpoint}</span>{#if pendingPaidRun.model}
+          using <span class="mono">{pendingPaidRun.model}</span>{/if}.
+      </p>
+      {#if pendingPaidRun.capped}
+        <p class="hint">
+          {pendingPaidRun.queued.toLocaleString()} are queued; the per-run cap stops this pass at
+          {pendingPaidRun.calls.toLocaleString()} and leaves the rest for the next one.
+        </p>
+      {/if}
+      <div class="actions">
+        <button
+          data-testid="paid-run-cancel"
+          onclick={() => (pendingPaidRun = null)}
+          use:autofocus>Cancel</button
+        >
+        <button
+          class="primary"
+          data-testid="paid-run-go"
+          onclick={() => {
+            pendingPaidRun = null;
+            runAppraise();
+          }}>Run anyway</button
+        >
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style>
+  /* Budget-guard confirm (AI-PIPELINE §5.1) — same shape as ConfirmDelete, without the danger
+     colouring: spending money is reversible in a way deleting a file is not. */
+  .scrim {
+    position: fixed;
+    inset: 0;
+    background: rgb(0 0 0 / 0.6);
+    display: grid;
+    place-items: center;
+    z-index: 100;
+  }
+  .dialog {
+    width: min(520px, 92vw);
+    background: var(--ls-surface);
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-lg);
+    padding: var(--sp-4);
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-3);
+  }
+  .dialog h2 {
+    margin: 0;
+    font-size: var(--fs-lg);
+  }
+  .dialog p {
+    margin: 0;
+  }
+  .dialog .hint {
+    color: var(--ls-text-muted);
+    font-size: var(--fs-sm);
+  }
+  .actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--sp-2);
+  }
+  .actions .primary {
+    border-color: var(--ls-accent);
+    color: var(--ls-accent);
+  }
+
   .screen {
     display: flex;
     flex-direction: column;

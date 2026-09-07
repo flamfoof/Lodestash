@@ -312,6 +312,26 @@ export const apiPresets = () => invoke<ApiPreset[]>("api_presets");
  * or a dead key otherwise produce nothing from a run that takes hours, with no signal at all.
  */
 export const testApiTagger = () => invoke<string>("test_api_tagger");
+
+/**
+ * What a paid cloud Identify run would cost, or `null` when no confirm is needed (AI-PIPELINE
+ * §5.1 budget guard). `null` covers both a local pass and a free/loopback endpoint.
+ *
+ * The free/paid call is made in Rust, where `is_free_endpoint` already owns it and treats an
+ * unknown remote as **paid** — deciding it here would give the confirm a different opinion from
+ * the drain it is guarding.
+ */
+export type CloudRunEstimate = {
+  /** Assets on the tagging queue right now. */
+  queued: number;
+  /** What the run would actually bill: `queued`, bounded by the per-run cap. One call per asset. */
+  calls: number;
+  /** The cap bit — there is more queued than this run will take. */
+  capped: boolean;
+  endpoint: string;
+  model: string | null;
+};
+export const cloudRunEstimate = () => invoke<CloudRunEstimate | null>("cloud_run_estimate");
 export const setSourceWatch = (id: number, watch: boolean) => invoke("set_source_watch", { id, watch });
 
 /** One row of the Collections screen (UI-SPEC §6). */
