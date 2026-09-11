@@ -4,6 +4,10 @@ The implementation-ready parts list. The *why* (language decision, alternatives)
 [`ARCHITECTURE.md`](ARCHITECTURE.md); this doc is the concrete dependency selection that governs the
 build. **New dependencies require updating this doc** (see `CLAUDE.md` rule).
 
+**MCP analysis plan (2026-09-10):** [MCP-ASSET-ANALYSIS](MCP-ASSET-ANALYSIS.md) reuses rmcp,
+axum, rusqlite, Tokio, the existing renderer/archive helpers and Node test tooling. No new runtime
+dependency, browser transport, provider SDK or public server is planned for the interactive loop.
+
 Recap: **Rust** single-binary core · optional bundled **Python sidecar** (UnityPy) · AI via **ONNX
 Runtime + Ollama + opt-in cloud**. Targets: Windows 10+, macOS 11+, Ubuntu 20.04+. GPU optional
 (CPU fallback).

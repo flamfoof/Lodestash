@@ -46,3 +46,8 @@ node_modules/
 # helpers) installs here too — without a root rule a single `git add .` stages tens of
 # thousands of dependency files onto main.
 node_modules/
+
+# Root lockfile: the root package.json is a task runner with no dependencies, so a stray
+# `bun install` here would write a second lockfile next to the real one in
+# crates/lodestash-desktop/ui/bun.lock (TECH-STACK §5 says there is exactly one).
+/bun.lock

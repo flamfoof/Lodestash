@@ -106,6 +106,19 @@ alternatives (Tauri+three.js, pure-Python/PySide6).
 
 ---
 
+## Running it
+
+```sh
+bun run setup   # once — installs the frontend deps into crates/lodestash-desktop/ui
+bun run dev     # Vite on :5173 + the desktop app, one terminal, from this directory
+```
+
+`dev:release`, `build`, `check` and `e2e` are the other root scripts. The sequencing, and the
+manual two-process form, are in
+[`crates/lodestash-desktop/README.md`](crates/lodestash-desktop/README.md).
+
+---
+
 ## Documentation map
 
 | Doc | Contents |
@@ -124,6 +137,7 @@ alternatives (Tauri+three.js, pure-Python/PySide6).
 | [`docs/DATA-MODEL.md`](docs/DATA-MODEL.md) | SQLite schema, hybrid search, the mapping library, dedup |
 | [`docs/IDENTIFICATION-AND-SEARCH.md`](docs/IDENTIFICATION-AND-SEARCH.md) | The identification engine + the **three ways to search** (tags / plain language / AI-MCP), faceted schema, query understanding |
 | [`docs/MCP-AND-ENGINES.md`](docs/MCP-AND-ENGINES.md) | MCP surface, the closed Unity import round-trip, Unity-side MCP-client topology, Unreal (planned) |
+| [`docs/MCP-ASSET-ANALYSIS.md`](docs/MCP-ASSET-ANALYSIS.md) | **Proposed design:** library/search → single/list evidence and file access → LLM tags/description → verified writeback; links the implementation handoff |
 | [`docs/ENGINE-API.md`](docs/ENGINE-API.md) | **The interface layer:** loopback HTTP/JSON contract — endpoints (1:1 with MCP), token handshake, project registration & import queue, staging |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Phased build plan, milestones, risks |
 | [`docs/TECH-STACK.md`](docs/TECH-STACK.md) | Implementation-ready stack — crates/libraries per module, AI runtime, sidecar, build/test/CI/packaging |

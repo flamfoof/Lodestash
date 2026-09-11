@@ -25,27 +25,32 @@ canonical path so there is exactly one token file in the repo.
 
 ## Running it
 
+Everything runs **from the repo root**. The root `package.json` is a task runner with no
+dependencies of its own, and `scripts/dev.mjs` does the one piece of sequencing a debug build
+needs: Vite has to be answering on :5173 *before* the window opens, because `tauri.conf.json`
+points `devUrl` at it — that ordering is the whole reason this used to want two terminals.
+
 **Bun** is the package manager and script runner — `bun.lock` is the committed lockfile and there is
-no `package-lock.json`. Two terminals; no Tauri CLI is installed, deliberately (see
-`docs/TECH-STACK.md` §1 on keeping the frontend to four dependencies).
+no `package-lock.json`. No Tauri CLI is installed, deliberately (see `docs/TECH-STACK.md` §1 on
+keeping the frontend to four dependencies).
 
 ```sh
 # once
-bun install --cwd crates/lodestash-desktop/ui
+bun run setup         # bun install into ui/
 
-# terminal 1 — the frontend dev server on :5173 (debug builds load devUrl)
-bun run --cwd crates/lodestash-desktop/ui dev
-
-# terminal 2
-cargo run -p lodestash-desktop
+bun run dev           # vite on :5173 + cargo run -p lodestash-desktop, one terminal
+bun run dev:release   # bun run build, then cargo run --release — serves ui/dist, no dev server
 ```
 
-For a build that runs standalone, compile the frontend first — release builds load `ui/dist`
-from the bundle rather than the dev server:
+`bun run dev` reuses a Vite already answering on :5173 rather than starting a second one, and takes
+down the one it started when the app exits. `npm run` works the same — the root scripts only shell
+out, so nothing is installed there.
+
+The two halves stay separately runnable when you want them apart; this is all the root scripts do:
 
 ```sh
-bun run --cwd crates/lodestash-desktop/ui build
-cargo run --release -p lodestash-desktop
+bun run --cwd crates/lodestash-desktop/ui dev
+cargo run -p lodestash-desktop
 ```
 
 `bun run build` runs `svelte-check` first, so a type error fails the build rather than shipping.

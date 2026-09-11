@@ -12,6 +12,23 @@ surface by [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md) / [`ENGINE-API.md`](ENGINE
 [`INGESTION.md`](INGESTION.md); AI by [`AI-PIPELINE.md`](AI-PIPELINE.md). This doc owns **what each
 screen shows and does**.
 
+**Proposed MCP analysis controls (2026-09-10):**
+[MCP-ASSET-ANALYSIS](MCP-ASSET-ANALYSIS.md) adds a focused workflow to the existing MCP settings,
+approval and inspector surfaces. Show configured producer/destination and per-modality evidence
+consent; expose actual tool/connection/writer availability separately. A batch-tag approval shows
+selected asset IDs/names, AI producer, tag changes and optional description replacements before any
+annotation write. Approval grants that operation, not human-confirmed status. Inspector readback must
+show stored AI provenance even when confidence is null. No shell redesign is planned; exact wire
+fields and approval lifecycle belong to ENGINE-API §8. These controls are not yet implemented.
+
+The clarified workflow also needs vocabulary reads, tag accept/reject review and approved new
+traits/categories (ENGINE-API §8.5). Reuse Vocabulary §9's distinct Traits/Mapping views. Show the
+canonical match, usage guidance, evidence limitations and reason for each review decision; protected
+manual/imported tags are flagged for human action. Vocabulary proposals show scope, parent taxonomy
+and any future teaching effect separately from asset assignments. Creating a category never silently
+remaps the library. Present existing tags, identification output and final reviewed assignments as
+distinct stages; all remain AI-authored unless a human authored the underlying assignment.
+
 Vocabulary used throughout (see the owning docs): **Library Source** ("library" in UI copy — e.g.
 Synty, Asset Store cache) → DATA-MODEL §10; **package** (publisher → pack) → DATA-MODEL §7;
 **status** `discovered/indexed` = **Unidentified**, `identified`, `confirmed` → DATA-MODEL §8;

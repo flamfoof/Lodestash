@@ -4,6 +4,13 @@ How AI clients (Claude, Claude Code, IDEs) and the **Unity editor** find and ret
 catalog. This is where "identify and retrieve into the engine" is delivered. **Unity is the primary
 integration target;** Unreal editor integration is planned for a later phase (§4).
 
+> Reviewed for the analysis workflow 2026-09-10. The proposed
+> [asset-analysis design](MCP-ASSET-ANALYSIS.md) extends the existing server; its exact tool/REST
+> contracts live in [ENGINE-API §8](ENGINE-API.md#8-proposed-asset-analysis-contract).
+> New analysis operations are planned, not enabled by this documentation change.
+> The clarified scope includes vocabulary reads, identification followed by association review,
+> and approved trait/category proposals; ENGINE-API §8.5 owns those additional tool/REST pairs.
+
 Verify MCP protocol specifics against the current spec (revision **2025-11-25**) and Claude specifics
 against the `claude-api` skill before implementing.
 
@@ -39,25 +46,32 @@ against the `claude-api` skill before implementing.
 
 - **SDK**: **`rmcp`** (official Rust SDK) — matches the core language, mature, `#[tool]` macros
   generate JSON Schema from function signatures, built-in stdio + Streamable HTTP transports.
-- **In-process**, sharing the catalog DB/index handle — a desktop tool is single-user and local; a
-  separate microservice would add a hop and a second failure mode for no benefit.
+- **Shared Rust services.** The desktop embeds the API. An LLM host starts a separate
+  `lodestash-desktop --mcp` child for stdio, with local catalog reads and writes forwarded to the app
+  under [ADR-0011](decisions/ADR-0011-headless-mcp-forwards-writes.md). The design requires a
+  genuinely read-only headless connection; the current constructor's `Catalog::open` is a known
+  startup gap tracked by the asset-analysis plan.
 - **Transport**: **stdio by default** (zero network surface, lowest latency, exactly what Claude
   Desktop/Code expect). Optional **Streamable HTTP** for multiple/remote clients (same loopback +
   token + origin rules): bound to a **stable configurable port (default 4319)** — unlike the engine
   API's ephemeral port — since MCP clients configure a URL by hand. The Settings → MCP card
   ([`UI-SPEC.md`](UI-SPEC.md) §11.5) toggles this transport, shows endpoint + rotating token, and
-  gates tools by **permission group** (search&read / tag&traits / identify); side-effecting
+  gates tools by **literal per-tool allow-list**; side-effecting
   import/export tools stay confirm-gated per call regardless. The old HTTP+SSE transport is
   deprecated — do not build on it.
-- **Registration**: `claude mcp add --transport stdio lodestash -- <lodestash --mcp>` for Claude Code;
-  JSON config entry for Claude Desktop. **Shipped**: `lodestash --mcp` runs the stdio server in the
-  desktop binary with no window; logs go to **stderr** because stdout carries the protocol.
+- **Registration**: configure the host to spawn the built `lodestash-desktop` executable with
+  `--mcp`; see [USER-GUIDE](USER-GUIDE.md#using-an-llm-through-mcp). The branch runs without a window.
+  Logs **must** go to stderr because stdout carries the protocol; explicit routing and a spawned
+  protocol test are required by the new plan. Do not configure Vite's port as an MCP endpoint.
 
-> **Implementation status (interim).** Four read tools exist — `get_server_info`, `search_assets`,
-> `get_asset`, `get_asset_preview`. The rest of the table below lands with the matching REST route,
-> one operation at a time, so the 1:1 rule holds at every commit (a parity test enforces it).
-> `search_assets` is structural-only today; `semantic_search` waits on the query embedder being
-> reachable from this plane.
+> **Implementation status (code inspected 2026-09-10).** There are 23 registered tool names in
+> `crates/lodestash-mcp/src/lib.rs`, matching `AGENT_OPERATIONS` in
+> `crates/lodestash-api/src/lib.rs`. They include semantic search, stored-tag reads, previews,
+> single-tag writes and identify jobs. `suggest_tags` currently returns stored tags/confidences;
+> it does not generate new proposals. The table below mixes shipped operations with broader target
+> aliases (such as `retag` and `get_active_project`), which are not separate registered tools.
+> Library-scoped enumeration, batch reads, bounded evidence manifests and attributed batch writes
+> are the explicit additions in ENGINE-API §8. Registration in the actual host is still required.
 
 ### Proposed MCP surface
 

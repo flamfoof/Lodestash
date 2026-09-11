@@ -8,6 +8,12 @@ is built around; it ties together [`AI-PIPELINE.md`](AI-PIPELINE.md) (models),
 [`DATA-MODEL.md`](DATA-MODEL.md) (schema + hybrid search), [`AI-MODELS-BY-GPU.md`](AI-MODELS-BY-GPU.md)
 (local model choice), and [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md) (the agent surface).
 
+**Proposed agent search/analysis slice (2026-09-10):** see
+[MCP-ASSET-ANALYSIS](MCP-ASSET-ANALYSIS.md) and the exact filters/cursor rules in ENGINE-API §8.1.
+Library source, package, media and tag eligibility must be applied before search limits and ranking.
+Search returns candidates; ordered browsing covers a library, and random auditing samples the full
+eligible source. Tag/structural inspection does not require embeddings; semantic search still does.
+
 > Claude-specific facts below (model IDs, structured outputs, batch, caching) were verified against the
 > `claude-api` reference; re-verify in-app before shipping, as they move.
 

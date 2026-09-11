@@ -8,6 +8,21 @@ The storage backbone, the schema, hybrid search, the user-defined "mapping libra
 
 ## 1. Storage stack
 
+**Planned MCP annotation work (2026-09-10):** [MCP-ASSET-ANALYSIS](MCP-ASSET-ANALYSIS.md)
+refines S04/S05 of the v1 architecture plan. Reuse `tag`, `asset_tag`, the scalar asset description
+and `op_log`; model-authored associations use that plan's producer-specific AI source convention.
+Full provenance readback, atomic tags/description/FTS/history, conflict revisions and durable
+idempotency receipts are requirements, not claims about the current schema. Migrations/retention
+and conflict-aware undo remain owned by S03/S04; allocate actual migration numbers at implementation.
+ENGINE-API §8 defines the wire fields. Human-only confirmation and embedding lifecycle rules in §8
+below remain intact. No catalog migration is performed by this design update.
+
+The clarified review flow (ENGINE-API §8.5) also records agent accept/reject decisions in the shared
+versioned operation history, retaining original assignment provenance and reviewed revisions.
+Reuse trait columns on `tag` and existing taxonomy/category tables for approved vocabulary changes;
+do not conflate categories with namespaces or build another vocabulary database. History retention
+still applies; an association rejection is not a persistent negative-training/suppression rule.
+
 | Concern | Choice | Why |
 |---|---|---|
 | Relational backbone | **SQLite** (WAL) | Single file, transactional, OLTP-shaped (insert on scan, update tags, fetch one asset, filter) — exactly this workload. Standard for desktop local storage; `rusqlite` in Rust. |

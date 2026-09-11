@@ -28,6 +28,14 @@ in place and is **never destructive**.
 
 ## 2. Asset Store Library integration (direct Unity download-cache access)
 
+**Proposed analysis access (2026-09-10):** [MCP-ASSET-ANALYSIS](MCP-ASSET-ANALYSIS.md) adds
+catalog-ID-based evidence/file access for one or a selected list of in-pack assets. ENGINE-API §8.2
+owns the request bounds, access rules and cache effects. Reuse the manifest locator and surgical
+payload reader; extract only the selected member and explicitly necessary preview dependencies to
+Lodestash-owned scratch. This does not invoke whole-package unpack/import, create duplicate asset
+rows or modify the Unity cache. It covers `.unitypackage` manifest payloads; compiled-bundle analysis
+continues to depend on supported extraction rather than pretending every bundle is a tar archive.
+
 The user's **downloaded Unity Asset Store library is a first-class import source** — point Lodestash at it
 once and it browses everything you own and unpacks/ingests any package(s) on demand. This needs **no
 running Unity Editor**: Lodestash reads the on-disk download cache directly, and `.unitypackage` is just

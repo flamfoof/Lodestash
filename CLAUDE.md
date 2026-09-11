@@ -67,3 +67,31 @@ truth**. This file is the rule set for working in this repo.
   against the `claude-api` reference before writing them — don't rely on memory.
 
 When in doubt, the relevant `docs/` file wins over assumptions.
+
+## MCP asset-analysis work (2026-09-10)
+
+For agent search, library selection, evidence/file access, Unity-package analysis and LLM-authored
+tags, start with [`docs/MCP-ASSET-ANALYSIS.md`](docs/MCP-ASSET-ANALYSIS.md). It links the owning
+contracts and the implementation handoff. Exact wire shapes belong only in `docs/ENGINE-API.md` §8;
+do not duplicate them in prompts or this file. The existing v1 architecture plan remains the owner
+of shared FTS, provenance/history, privacy and startup prerequisites.
+
+The design and implementation plan are **proposed, not shipped**. This session authorized planning
+and documentation only; runtime implementation, MCP registration and real asset writes are deferred.
+On a later implementation request, confirm board claims against the current code, implement the
+corresponding MCP/REST operation together, and prove the real host can call it. Equal tool-name sets
+alone do not establish behavioral parity or successful persistence.
+
+Keep three connections distinct: Vite serves the UI, the Engine API serves authenticated `/v1/`
+operations, and `lodestash-desktop --mcp` is the host-spawned stdio service. A computer-use helper
+pipe failure is not evidence of a Lodestash MCP failure. Use the existing launch guide in
+[`crates/lodestash-desktop/README.md`](crates/lodestash-desktop/README.md) for the GUI.
+
+For completed analysis, independently read back the selected asset IDs and report persisted values
+and evidence limitations. Never substitute proposed tags for stored tags, a file link for an image
+actually inspected, or an agent mutation approval for human confirmation of tag correctness.
+
+The confirmed first host is Codex, consuming 3D preview images and metadata and writing tags plus
+a short description. The plan must include existing-tag reporting, identification and vocabulary-
+guided accept/reject review, with approved proposals for new traits/categories (ENGINE-API §8.5).
+Traits, taxonomy categories and schema namespaces are distinct; agent review never sets human confirmation.

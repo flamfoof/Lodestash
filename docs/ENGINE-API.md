@@ -390,3 +390,287 @@ Unity panel instantly, and vice-versa.
   flow ([`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md) §3).
 - **Provenance, dup-guard, staging, and license** are first-class in the payloads, so the deterministic
   plane carries the asset-management state the GUI and AI both rely on.
+
+## 8. Proposed asset-analysis contract
+
+Drafted 2026-09-10; **not implemented by this documentation change**. This section owns the wire
+contract for [MCP asset analysis](MCP-ASSET-ANALYSIS.md). It refines the v1 architecture plan's
+S04/S05/S10/S11/S12. Existing §2 operations retain their current containers and required parameters;
+the rows below are additive unless explicitly described as an extension. New fields are not evidence
+that current binaries implement them. The implementation must add each tool, route, permission
+mapping and behavioral parity check together.
+
+### 8.1 Discovery, selection and detail
+
+| MCP tool | REST endpoint | Shared request and response |
+|---|---|---|
+| `list_libraries` (new) | `GET /v1/libraries` | Optional `limit` (25, maximum 200), `cursor`; `{libraries:[{id,name,kind,asset_count}],next_cursor}` ordered by source ID. IDs are `import_source.id`. No root paths needed for discovery. |
+| `search_assets` (extend) | `GET /v1/search` | Existing MCP `query` / REST `q`, `limit`, `media_type`; add optional `source_id`, `package_id`, `tags` (canonical `namespace:value`, AND semantics). Apply all supplied filters before ranking/LIMIT. Keep MCP's array and REST's `{results}` containers. |
+| `semantic_search` (extend) | `GET /v1/search?mode=ai` | Same optional scope filters; apply them before candidate scoring/top-K on both retrieval branches. Missing embedder remains `ai_unavailable`; do not silently substitute keyword search. |
+| `list_assets` (new) | `GET /v1/assets` | `source_id` required, optional `package_id`, `media_type`, `status`, `tag_state` (`any`, `tagged`, `untagged`; default `any`), `selection` (`ordered`, `random`; default `ordered`), `limit` (25, maximum 200), `cursor`. Returns `{assets,next_cursor,selection,upper_id}`. |
+| `get_assets` (new) | `POST /v1/assets/read` | Read-only despite HTTP method: `{asset_ids:[...],source_id?}`, 1–100 unique positive IDs. Returns `{assets,unavailable:[{id,code}]}` in requested order within each array; `source_id` mismatch is unavailable. |
+| `get_asset` (extend) | `GET /v1/assets/{id}` | Same detail additions as `get_assets`; unknown/trashed asset is not returned as live content. |
+
+REST tags use repeated `tags=namespace:value` parameters. Invalid enum, nonpositive IDs, out-of-range
+limits, empty ID lists and duplicate explicit IDs produce `invalid_argument`, rather than silent
+widening. Existing search callers retain their historical defaults/caps; new filters must mean the
+same thing for every accepted limit. A supplied package must belong to the supplied source.
+
+All selection excludes trashed, excluded and non-content assets. Search returns ranked candidates,
+not a complete traversal. For ordered browse, use ascending ID keyset pagination with a captured
+upper ID bound; encode cursor version, last ID, upper ID, catalog identity and filter signature.
+Reject malformed/cross-catalog/filter-mismatched cursors as `invalid_cursor`. New insertions beyond
+the upper bound wait for a new walk; mutable eligibility is evaluated per page, so this is not a
+snapshot of all tags across the entire walk. Never collect all result objects into one tool response.
+
+Random selection uses a single eligible-ID query with `ORDER BY random() LIMIT ?`, then hydrates
+those IDs. It samples without replacement across the entire scoped population, not the first
+search page. `cursor` is invalid for random selection and `next_cursor` is null. Repeated requests
+are fresh samples; save returned IDs for replay. If fewer matches exist, return all and let the
+caller report the shortfall. This intentionally accepts an O(N) eligible-ID scan for occasional
+small audits; profile before replacing it with a maintained sampling index.
+
+Summary/detail additions: `source_id`, `package_id` (retain existing `package`), `evidence_url`,
+`file_url`, `file_resource_uri`, and explicit `file_availability` (`available`, `in_pack`, `missing`,
+`denied`). URLs are relative authenticated `/v1/` paths, resolved against the current handshake by
+the local host. They never include bearer tokens. `asset://{id}/file` is a resource reference, not
+a promise that a remote provider can fetch the local machine's files.
+
+Detail also exposes `description`, `analysis_revision` and each tag's existing namespace/value/
+confidence plus `source` and nullable `model_id`. Preserve the tag-object array already shipped
+by `summary_json` (the old string-tag example in §3 describes the target-era shorthand, not the
+current JSON). `analysis_revision` is an opaque versioned fingerprint of the source/preview input
+identity, sorted complete tag associations, description and review state; generate it in one read
+snapshot. It must change when the evidence or edited annotations change, even without a new asset ID.
+
+### 8.2 Evidence and file access
+
+`get_asset_evidence` (new) ↔ `GET /v1/assets/{id}/evidence` accepts `id` (REST path), optional
+`kind` (`auto`, `thumbnail`, `model_views`, `text`; default `auto`), `max_dimension` (512, maximum
+1024) and `views` (1, maximum 4, only for models). Invalid media/kind pairs fail explicitly.
+The JSON manifest is shared by REST and MCP:
+
+```json
+{
+  "asset_id": 4821,
+  "analysis_revision": "opaque-v1-revision",
+  "status": "ready",
+  "representations": [
+    {"kind":"model_views","mime_type":"image/png","url":"/v1/assets/4821/preview?kind=model_views&view=0&max_dimension=512","width":512,"height":512}
+  ],
+  "file_url": "/v1/assets/4821/file",
+  "file_resource_uri": "asset://4821/file",
+  "dependencies_used": [],
+  "limitations": []
+}
+```
+
+Status is `ready`, `partial`, `unavailable` or `denied`. `limitations` contains machine codes and
+plain explanations (e.g. missing texture, geometry-only proxy, unavailable archive, unsupported
+format). Never label a silhouette proxy as a textured render. Add the view parameters above to
+the existing preview operation on both planes, keeping the existing no-argument behavior.
+
+MCP sends this manifest as `structuredContent` and JSON text, plus bounded `image` blocks for
+available raster views and a resource link for file access. REST sends the manifest and uses its
+authenticated representation URLs for the same bytes. Resource reads revalidate source identity,
+visibility and byte policy; link possession does not bypass these checks. An LLM host must actually
+deliver the image blocks to a vision-capable model; raw FBX/GLB bytes or base64 text are not a substitute.
+
+Initial ceilings: at most four images and 4 MiB total decoded image-file bytes per evidence call;
+at most 64 KiB UTF-8 extracted text, with `truncated`/original size disclosed. One asset per evidence
+call avoids a large batch of images exhausting the host context. Render/archive work runs in a
+bounded blocking worker (initial maximum two), outside the catalog lock; enforce a 30-second
+deadline and cooperative cancellation between extraction/render stages. Busy/deadline results
+are explicit retryable errors, never fabricated evidence. Reuse cached previews where possible.
+
+`GET /v1/assets/{id}/file` remains REST-only transport; MCP `asset://{id}/file` reads use the same
+resolver. A direct file request materializes only the requested payload when it is in a Unity
+package. It does not unpack the package, ingest a second asset, or write `workspace_rel` just for
+analysis. Bound an extracted payload at the existing 256 MiB preview-payload ceiling. Evidence
+dependencies share that aggregate byte ceiling and a maximum of 32 resolved entries per call;
+only necessary mesh/material/albedo inputs are pulled. Above those bounds return `asset_too_large`
+or partial evidence, with no partial file advertised as complete. Raw file reads have no automatic
+dependency expansion. Large binary resources remain links/streamed HTTP responses, never inline
+MCP text; inline binary resource reads exceeding the evidence byte limit return `resource_too_large`.
+
+Resolve the entry exclusively from the catalog's package locator/manifest. Validate offsets, sizes,
+archive identity, output containment and any external dependency path. Reuse surgical/cache helpers;
+concurrent requests must not publish partially written cache entries. On archive revision mismatch
+return `source_changed` and require rescan; no full-extract fallback. Report missing local data as
+`not_local`/`archive_missing`, and unsupported compiled bundles separately. Existing `Range` support
+must remain correct after materialization. Cache creation is a derived artifact side effect only.
+
+Byte release requires configured destination/per-modality consent, including dependency modalities.
+Apply it to MCP images, resource reads, preview URLs and raw files. Unknown destination defaults to
+metadata only; deny remote audio bytes. Use an app-configured producer profile for the stdio child,
+and authenticated REST policy on the shared server; request arguments cannot widen permission.
+The token protects the API against unauthenticated clients, not malicious software running as the
+same OS user. Hosts remain responsible for what they do with bytes after authorized delivery.
+
+### 8.3 Attributed result writes
+
+`write_tags` (new) ↔ `POST /v1/tags/batch`. A single item uses the same batch envelope:
+
+```json
+{
+  "request_id": "730a3a8b-61d4-4c29-9253-f96c50a12848",
+  "vocabulary_revision": "opaque-vocabulary-revision",
+  "assets": [{
+    "asset_id": 4821,
+    "expected_revision": "opaque-v1-revision",
+    "producer_id": "configured-analysis-host",
+    "model_id": null,
+    "mode": "replace_producer",
+    "tags": [{"namespace":"subject","value":"stone arch","confidence":null}],
+    "description": "A weathered stone arch with a broken upper edge."
+  }]
+}
+```
+
+Require 1–100 unique asset IDs, at most 1 MiB serialized UTF-8 request bytes, a UUID `request_id`,
+the applicable `vocabulary_revision` (§8.5),
+nonempty revision and configured producer ID. `mode` is `append` or `replace_producer`; no global
+replace/delete. The submitted producer must match trusted host configuration; the server records
+`source=ai:<producer_id>`, actor=agent and transport separately. Model ID is reported provenance,
+nullable when the host cannot establish it; never invent a model/version or accept `source=manual`.
+
+Tag policy: model-authored namespaces follow IDENTIFICATION-AND-SEARCH §2 and the shared
+validator (`subject`, `style`, `material`, `mood`, `usage`, `free` for the initial 3D/image path;
+modality-specific audio facets follow that owning schema). AI-PIPELINE §6 owns normalization policy.
+Tag values are nonempty strings up to 128 Unicode scalar values after normalization,
+at most 32 assignments and 8 per namespace after normalization/deduplication. Normalize through
+the existing canonical tag policy before limits. Confidence is null or finite in [0,1]. Reject
+unknown fields, invalid types and unsupported namespaces; do not stringify arbitrary model objects.
+Description is optional, up to 2,048 Unicode scalar values; omitted means preserve. Empty text/null
+is invalid (clearing is not in this slice). Only an app-configured caption producer can replace it,
+and its proposed replacement must appear in approval. Other fields cannot be updated by this tool.
+
+Return the existing job envelope with `state=awaiting_approval` (HTTP 202); one batch is one approval
+showing source/IDs, producer, tag diff and description diff. Extend the existing app approval flow,
+not a new agent authority system. Denial changes no catalog annotations. Revalidate permission,
+asset visibility and all revisions at execution time. The entire batch commits or rolls back.
+No agent call can create human confirmation. Preserve existing lifecycle rules; external tags alone
+do not complete embeddings or clear another producer's work queue. Status promotion still requires
+the existing DATA-MODEL §8 prerequisites; never assign `identified` unconditionally after a write.
+
+At completion, `job.result` includes `operation_id`, `changed_assets`, `unchanged_assets` and
+`asset_ids`. The client separately calls `get_assets` for authoritative final tags/description and
+revision. Record tags, optional description, FTS maintenance, history and durable request identity
+in the single writer transaction. Manual/imported/other producer associations survive replacement;
+a no-op does not consume undo history or publish a change. Conflict-aware undo follows S04.
+
+Idempotency is catalog-scoped: persist request ID plus a canonical validated-body digest and terminal
+receipt independently of the capped undo tail. Same ID/body returns the original pending/terminal
+result; same ID/different body is `request_conflict`. At least the mutation receipt survives restart
+so an ambiguous retry cannot apply twice. Uncommitted approvals lost on restart fail visibly and may
+be resubmitted with the same ID for fresh approval. Never automatically replay an unknown write.
+
+The headless bridge re-reads the handshake for each new operation, checks catalog identity/API
+version and forwards to the app. Status/cancel use the app's job identity, not a nested local job;
+completed receipts remain discoverable after restart. An old missing job is `job_not_found`, never
+assumed successful. An app-closed write is `app_unavailable`; catalog reads continue where safe.
+
+### 8.4 Failures and parity
+
+Use §4's error envelope. New errors have stable codes: `invalid_argument`/`invalid_cursor` (400),
+`asset_not_found`/`job_not_found` (404), `revision_conflict`/`request_conflict`/`source_changed` (409),
+`asset_too_large`/`resource_too_large` (413), `unsupported_evidence` (422), `busy` (429),
+`deadline_exceeded` (504), `app_unavailable`/`archive_missing`/`not_local` (503), and
+`evidence_denied` (403). Existing auth and `tool_disabled` behavior stays intact. MCP exposes domain
+failures as `isError=true` with the same code/details; malformed protocol calls remain protocol errors.
+
+New structured MCP outputs include a JSON-text fallback. Name-set parity is necessary but insufficient:
+compare normalized responses, eligibility, provenance, authorization, cache effects, persistence,
+limits and failures. Batch reads may report individual unavailable IDs; batch writes never partly
+succeed. Check capability fields in `get_server_info` (catalog identity, enabled analysis operations,
+writer availability and byte policy) instead of assuming support from a saved example.
+
+MCP content blocks, structured-output schemas and domain-error handling are based on the
+[MCP tools specification](https://modelcontextprotocol.io/specification/2025-11-25/server/tools),
+checked 2026-09-10. Structured tool output describes the server's result; the write input schema
+separately constrains the LLM's proposed annotations. Revalidate host support during implementation.
+
+### 8.5 Vocabulary-guided identification and review
+
+Clarified 2026-09-10: the complete workflow includes existing tag/preview reporting, identification,
+then vocabulary-based acceptance/rejection, with approved vocabulary growth. Codex is the first host;
+analysis receives 3D preview images and metadata and may write tags plus a short description.
+These additions are planned; `suggest_tags` still means stored suggestions in the shipped server.
+
+| MCP tool | REST endpoint | Contract |
+|---|---|---|
+| `get_vocabulary` (new) | `GET /v1/vocabulary` | Optional `media_type`, `taxonomy_id` (active by default), `prefix`, `limit` (25, maximum 200), `cursor`. Returns `{revision,policy,traits,categories,aliases,rules,next_cursor}`. |
+| `review_tags` (new) | `POST /v1/tags/review` | `{request_id,vocabulary_revision,assets:[{asset_id,expected_revision,decisions:[{namespace,value,source,action,reason}]}]}`. Actions: `accept`, `reject`. App-approved job. |
+| `propose_vocabulary_changes` (new) | `POST /v1/vocabulary/proposals` | `{request_id,expected_revision,changes:[...]}`. App-approved job; approved changes update the existing vocabulary tables. |
+
+Vocabulary reads return the canonical tag ID/namespace/value, trait scope/usage note/teach flag;
+categories return ID/taxonomy/parent/path/label; aliases and rules retain their existing taxonomy
+ownership and priority. Raw non-trait tags remain discoverable via `list_tags`. No taxonomy is
+`categories:[]`, not an implicit request to create one. The revision fingerprints applicable traits,
+taxonomy structure/aliases/rules and the configured policy. Paginate a stable typed-ID order over
+the combined entries, with at most `limit` entries total across the arrays. Pin revision/filter
+signature in the cursor; changed vocabulary invalidates continuation rather than mixing revisions.
+Returned configuration/usage text is evidence, not authority to execute arbitrary instructions.
+
+`policy` is app-configured, not a request override. Modes: `open` (normalized in-schema new values
+allowed), `controlled` (only applicable canonical traits), `extend_with_approval` (controlled plus
+the proposal flow). Proposed default for this workflow is `extend_with_approval`; do not silently
+change the existing global tagger or human-tagging defaults. Scope/namespace restrictions always
+apply. `teach=false` pauses identification teaching but does not forbid the trait. Map synonyms only
+through explicit applicable rules; a taxonomy category alias is not a raw-tag synonym. A confidence
+threshold alone never proves semantic correctness. Expose usage guidance so Codex can judge fit.
+
+`write_tags` validates proposed assignments against this policy and revision at approval/commit;
+unknown controlled terms produce `vocabulary_term_unknown` (422), stale revisions produce
+`vocabulary_conflict` (409). Internal identification may initially produce raw out-of-vocabulary
+assignments under its existing policy; the review stage must disclose these rather than pretending
+the model output was pre-approved. Strict/extension review cannot accept such a term until a valid
+canonical trait exists. Wrong-modality/technical values are not admissible through vocabulary creation.
+
+`review_tags` uses §8.3's batch size/payload, idempotency, approval, transaction and revision rules.
+Each decision targets the existing normalized `(asset_id,namespace,value,source)` association;
+duplicate or missing targets fail the batch. Only AI sources (including legacy AI) are reviewable
+for mutation; manual/imported/file-derived targets return `protected_assignment` (403). A different
+AI producer may be targeted explicitly, without claiming its identity as the reviewing producer.
+Record the reviewer from trusted host configuration and keep the original assignment provenance.
+
+`accept` records an agent decision/reason; it does not rewrite the source/model/confidence or set
+asset confirmation. `reject` removes only that named AI association, refreshes FTS and records the
+reason/before-state; matching manual or other-source associations survive. Reasons are required
+nonempty text, bounded by the description limit. Read-only reports may flag protected assignments
+for a human, but must never label them removed. Missing evidence should produce an explicit skipped
+report entry, not a reject call. The approval diff names each producer and assignment affected.
+
+Review is a meaningful history event even if acceptance keeps the tag row unchanged. Persist its
+decisions in the shared versioned operation history; normal retention applies, so permanent review
+history is not promised. Retry receipts follow §8.3 independently of undo retention. Readback exposes
+retained review decisions with their reviewed revision; stale decisions are not claims about current
+assignments. Rejection is not a global blacklist or a durable per-model suppression rule. A later
+identify run may propose the tag again and must be reviewed as new output. Undo restores only the
+touched association/review event when conflict checks permit it.
+
+Vocabulary proposals have 1–100 changes, the same request byte bound, and explicit `kind`:
+
+- `trait`: `{kind,namespace,value,scope,usage_note,teach}`. Use supported namespaces, existing media
+  scope or null, and tag/description text bounds from §8.3. `teach` defaults false; enabling it is
+  an explicit approval of future candidate-vocabulary expansion. Promote an existing raw tag when
+  its canonical key matches; do not create a duplicate or overwrite an existing trait's guidance.
+- `category`: `{kind,taxonomy_id,parent_id,label,reason}`. Taxonomy must already exist; parent must
+  belong to it or be null for a root. Label uses tag text bounds, has no path separators, and path
+  is computed by the server. Duplicate canonical sibling/path resolves to the existing node;
+  incompatible requests fail. Category creation does not assign assets or create mapping rules.
+
+Approval displays vocabulary scope and downstream teaching effects. Denial leaves vocabulary and
+asset assignments unchanged. All approved changes in a proposal commit atomically through the single
+writer, advance vocabulary revision and return real created/reused IDs in the job result. Follow with
+a fresh vocabulary read and a separate asset write/review; no temporary IDs or names-as-identities.
+No namespace/schema expansion, merges, renames, global rule edits or whole-library remapping here.
+Nested tag grouping beyond trait promotion is a separate design; taxonomy categories are not silently
+written into `tag.parent_id`.
+
+For the ten-model pilot, save a before-state, call `identify_asset` only on those IDs, poll completion,
+then read new assignments/revisions and perform this review flow. Internal identification writes are
+not rolled back when a later review batch fails; report the completed and failed stages separately.
+Reuse configured models, privacy/budget controls and app-owned job/cancel handling. The final report
+must distinguish pre-existing tags, identification output, vocabulary proposals, accepted/rejected
+associations with reasons, and final persisted tags/description.

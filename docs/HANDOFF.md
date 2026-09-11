@@ -1,5 +1,12 @@
 # Handoff — picking up Lodestash
 
+> **2026-09-10 planning handoff:** [MCP-ASSET-ANALYSIS](MCP-ASSET-ANALYSIS.md) and its linked
+> implementation plan cover library/search selection, evidence and file access, surgical Unity
+> extraction and LLM-authored tags/description. This turn changed documentation only; implementation,
+> host registration and the ten-model pilot are deferred. The earlier computer-use native-pipe
+> failure did not test the separate Lodestash stdio MCP connection. Read the design's source audit
+> before treating older MCP status notes below as current.
+
 Working notes for whoever (or whatever) continues the build. Unlike the rest of `docs/`, this file
 is **not** a design spec — it's the state of play, the decisions already settled, and the traps.
 The design docs still win on any question of what the software *should* do.
@@ -315,7 +322,7 @@ Read it before touching anything.
 ### How to verify
 
 `cargo test -p lodestash-core --lib` && `cargo test -p lodestash-app --lib` &&
-`cargo test -p lodestash-desktop --lib` (150/150), then in `crates/lodestash-desktop/ui`:
+`cargo test -p lodestash-desktop --lib` (150/150), then from the repo root:
 `bun run check` (0/0), `bun run build`, `bun run e2e` (50/50). Full sanity per §1:
 `cargo test --workspace`, `cargo clippy --workspace --tests`, `cargo fmt --all`.
 

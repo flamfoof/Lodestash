@@ -73,6 +73,19 @@ source → render-pipeline harvest (cheap now that `.mat` files are parsed).
 
 ## ✅ Done — Design & spec
 
+- [x] **MCP vocabulary-review plan clarification (2026-09-10)** — [design](MCP-ASSET-ANALYSIS.md),
+  ENGINE-API §8.5 and the implementation handoff now include the confirmed Codex host,
+  tags/short-description output, existing-tag inspection, identification, vocabulary-guided
+  accept/reject review and approved traits/categories. Reviewed as a documentation-only extension;
+  checks pass with existing board warnings. Runtime implementation and live asset changes remain deferred.
+
+- [x] **MCP asset-analysis design (2026-09-10)** — [design](MCP-ASSET-ANALYSIS.md), proposed
+  ENGINE-API §8 contract, CLAUDE.md guidance and
+  [implementation handoff](superpowers/plans/2026-09-10-mcp-asset-analysis.md) completed and
+  reviewed for documentation conformance. This checkbox covers planning only. Runtime integration,
+  host registration and the ten-model tag-writing pilot remain deferred; task checkboxes in the
+  handoff are open. Documentation checks pass; the board checker retains older absence warnings.
+
 - [x] Architecture + language decision ([`ARCHITECTURE.md`](ARCHITECTURE.md))
 - [x] Ingestion / formats / viewers, Asset Store cache, archive memory model ([`INGESTION.md`](INGESTION.md))
 - [x] AI tagging & embeddings, local↔API abstraction ([`AI-PIPELINE.md`](AI-PIPELINE.md))
@@ -233,6 +246,10 @@ translation. The port removes the translation; the egui build stayed buildable a
 - [x] **B2a — desktop scaffold + shell.** Tauri 2 + Svelte 5 / Vite / TS on Bun.
       `docs/design/tokens.css` as the single token source, bundled `@font-face` with no webfont
       link, the real `icons.svg` sprite, app frame, 11 nav destinations, 12 routes.
+- [x] **Root task runner.** `bun run dev` from the repo root starts Vite and `cargo run` together
+      (`scripts/dev.mjs`, which waits for :5173 because a debug build loads `devUrl`, and reaps
+      Vite when the app exits); `setup`/`build`/`check`/`e2e`/`dev:release` delegate into `ui/`.
+      Retires the two-terminal instructions in `crates/lodestash-desktop/README.md`.
 - [x] **e2e harness.** `bun run e2e` drives the *real* binary over CDP with `playwright-core`
       (TECH-STACK §5.2). 22 checks, each named after the failure it prevents.
 - [x] **`lodestash://` protocol — `preview`, `file`, `mesh`.** Range-capable, read-only by construction,

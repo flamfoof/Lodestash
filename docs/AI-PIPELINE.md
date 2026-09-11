@@ -10,6 +10,16 @@ so this subsystem exists to serve search.
 
 ## 1. Shape of the pipeline
 
+**External LLM authoring (proposed 2026-09-10):** the connected MCP host can analyze selected
+asset evidence and submit tags plus an optional scalar description. This complements the app's
+internal `identify_asset` pipeline; it does not run embeddings or require Lodestash to call a second
+LLM. [MCP-ASSET-ANALYSIS](MCP-ASSET-ANALYSIS.md) owns the workflow and ENGINE-API §8 owns validation,
+producer attribution and byte consent. Stored `suggest_tags` results are not newly inferred labels.
+External annotations must not clear internal model work or manufacture human confirmation. Model
+confidence may be unknown/null; provenance, rather than a confidence value, determines AI authorship.
+Remote audio-byte exclusion and destination-based consent follow S10 of the existing v1 plan;
+these proposed checks must cover resource/file delivery as well as preview images.
+
 Every asset yields two AI outputs, regardless of modality or backend:
 
 1. **Tags** — discrete labels (free-form and/or controlled), each with a confidence score.
@@ -290,6 +300,14 @@ throttle hard — Gemini free is on the order of ~15 requests/minute. A naive ti
 ---
 
 ## 6. Tag taxonomy & human-in-the-loop
+
+**Proposed MCP review (2026-09-10 clarification):** Codex reads current assignments/previews and
+vocabulary, runs identification for selected IDs, then assesses assigned tags using trait scope and
+usage guidance. Acceptance/rejection is an agent review, not human-confirmed status. Unknown concepts
+can become approved traits or taxonomy categories through ENGINE-API §8.5; they cannot silently
+create new namespaces. `teach` governs future model candidates, not whether a trait is permitted.
+Open, controlled and approved-extension policies are app-selected; rejection of one AI association
+does not blacklist a term or suppress future model output. See [MCP-ASSET-ANALYSIS](MCP-ASSET-ANALYSIS.md).
 
 - **Two tiers**: free-form tags (high recall, messy) from WD/VLM/Claude, and a **controlled
   vocabulary** mapped onto them for clean faceting (the "mapping library" — see
