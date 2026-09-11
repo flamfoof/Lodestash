@@ -211,13 +211,20 @@ CREATE TABLE asset_embedding (
   PRIMARY KEY (asset_id, model_id)
 );
 
--- Full-text search (FTS5 external-content over asset)
+-- Full-text search (M25): one canonical definition of an asset's searchable text…
+CREATE VIEW asset_search_text AS
+  SELECT a.id, a.name, a.description,
+         <distinct tag names, sorted, space-joined> AS tags_concat
+    FROM asset a;
+-- …indexed by a plain FTS5 table. It keeps its own copy of the text, so a re-index is "delete the
+-- rowid, insert the view's row" and no writer ever has to supply the old values.
 CREATE VIRTUAL TABLE asset_fts USING fts5(
-  name, description, tags_concat,         -- denormalized tag string
-  content='asset', content_rowid='id',
+  name, description, tags_concat,
   tokenize='unicode61 remove_diacritics 2'
 );
--- AFTER INSERT/UPDATE/DELETE triggers keep asset_fts in lockstep (omitted for brevity).
+-- Triggers: asset INSERT; UPDATE OF name, description (only those — status, dirty-flag and
+-- timestamp updates do no FTS work); DELETE (by rowid); tag rename. Tag writes re-index once per
+-- asset, in the same transaction.
 ```
 
 Filter + ANN in one query:
@@ -257,7 +264,8 @@ WHERE embedding MATCH :query_vec
 4. **(Optional) cross-encoder rerank** of the top-N for the final 10–20 — opt-in (cost/latency).
 
 **Index sync:** because FTS5 and sqlite-vec are in the same file, every asset/tag mutation runs in one
-transaction updating base table + FTS (via triggers) together. Embeddings are produced async: mark
+transaction updating base table + FTS together — asset rows through triggers, tag writes through one re-index per
+asset in the same transaction (M25). Embeddings are produced async: mark
 `embedding_dirty=1` on content change; the embed worker computes + upserts the vector and clears the
 flag in its own transaction. There is a reference SQLite BM25+vector+RRF implementation to mirror.
 
@@ -862,6 +870,7 @@ transaction, in order, on open. Shipped so far:
 | **M2** | Mapping library: `taxonomy`, `category`, `category_alias`, `mapping_rule`, `asset_category` (§4) |
 | **M3** | Engine round-trip: `package` + `asset.package_id`, `project`, `import_record`, `asset.license/attribution/license_url` (§7, §9) |
 | **M4** | `asset.rating`, `package.pipeline`, `project.pipeline` (§12) |
+| **M25** | FTS over a canonical view (v1 plan S03). `asset_search_text` (id, name, description, distinct sorted tag names) is the one definition of searchable text, and `asset_fts` becomes a plain FTS5 table populated from it. M1 had named `asset` as the external-content table while `tags_concat` is not an `asset` column: MATCH returned rowids while reading the text back and FTS5's `rebuild` both failed (`no such column: T.tags_concat`). Triggers narrowed to `UPDATE OF name, description`, so status, flag and timestamp updates do no FTS work; an asset delete is a rowid delete; a tag rename re-indexes its assets. Derived state only — 20 ms on the 8,237-asset reference catalog, where it also dropped a stale `metal` token M24 had kept for an asset whose tags no longer said so. *Divergence from the plan's wording:* the plan asked for external content over the view; a plain table was chosen so that no writer has to supply the old values, which is the requirement behind M11's stale tokens |
 | **M24** | Re-queue the assets the broken API tagger swallowed: `UPDATE asset SET tags_dirty = 1 WHERE tags_dirty = 0 AND NOT EXISTS (asset_tag)`. `OpenAiTagger` reads `TagInput::image`, the generic batch path never fills it (the caption phase is meant to carry the picture), so it short-circuited to an empty result **without one HTTP request** and the caller stored that as finished — clearing `tags_dirty` on assets no model had seen. An empty write leaves no `asset_tag` row and therefore no `model_id`, so the guilty rows cannot be targeted precisely; the repair takes every asset marked done with no tags. It over-covers by the assets a local pass honestly found nothing for, which cost one pass to redo, while a swallowed asset is invisible for ever. Safe against `asset_fts_au` (which re-indexes `tags_concat = ''`): every row it touches has no tags |
 | **M23** | `package.keep_cached` — per-pack workspace retention (UI-SPEC §11.6 / §15). Deliberately **not** `pinned`, which already means "Add to Library" (M7): whether a pack appears in the grid and whether its extracted bytes are worth hundreds of megabytes are different questions, and one switch answering both would make freeing disk space cost the pack its visibility |
 | **M22** | Drop unresolved edges declaring a Unity built-in resource GUID (`f000…`/`e000…`/`d000…`). A prefab painted with Unity's *default* material minted an edge nothing could ever resolve, so §13.6 warned "missing links are skipped on export" about a link that is not broken. `deps::guid_in` now filters these at harvest; this clears the already-minted ones |

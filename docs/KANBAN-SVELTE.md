@@ -40,7 +40,12 @@ this file stays the live board.
       events and the job tray's subscription were inert since `d23ddfe`.
       `capabilities/default.json` fixes it; the e2e check above is the first to depend on an event
       arriving.
-- [ ] **R2 · S03 — FTS external-content repair.**
+- [x] **R2 · S03 — FTS over a canonical view (M25).** Reading indexed text back and FTS5's rebuild
+      work again; status/flag/timestamp updates do no FTS work; no edit strands a token (it dropped a
+      stale one from the reference catalog on upgrade). Checks in `tests_catalog.rs`:
+      `m25_makes_the_index_readable_and_rebuildable`, `no_edit_leaves_a_stale_token_in_the_index`,
+      `lifecycle_and_flag_updates_do_no_fts_work`, `the_index_follows_rollback_and_survives_reopen` —
+      the first three mutation-killed.
 - [ ] **R2 · S04 — one atomic, provenanced tag batch with conflict-aware undo.**
 - [ ] **R2 · S05 — the batch tag write on every adapter** (MCP handoff Task 4, then 4a).
 - [ ] **R3 · S06–S08 — component-scoped prefab evidence, native material inputs, textured previews.**

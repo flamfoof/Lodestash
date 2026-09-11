@@ -425,6 +425,7 @@ impl Catalog {
             (22, MIGRATION_22_DROP_BUILTIN_EDGES),
             (23, MIGRATION_23_KEEP_CACHED),
             (24, MIGRATION_24_REDIRTY_SWALLOWED_TAGS),
+            (25, MIGRATION_25_FTS_OVER_A_VIEW),
         ];
 
         for (version, sql) in migrations {
@@ -1534,41 +1535,16 @@ pub const MAPPING_MATCH_TYPES: &[&str] = &[
 /// priority, enabled)`.
 pub type MappingRuleRow = (i64, i64, String, String, String, i64, bool);
 
-/// The space-joined tag text FTS indexes for an asset — the same expression the triggers use.
-fn tags_concat_in(conn: &Connection, asset_id: i64) -> Result<String> {
-    conn.query_row(
-        "SELECT COALESCE(group_concat(t.name, ' '), '')
-           FROM asset_tag at JOIN tag t ON t.id = at.tag_id
-          WHERE at.asset_id = ?1",
-        params![asset_id],
-        |r| r.get(0),
-    )
-    .map_err(|e| CoreError::Catalog(format!("tags_concat: {e}")))
-}
-
-/// Re-index one asset in `asset_fts`, removing the entry written under `old_concat` first.
-/// External-content FTS5 stores no copy of the old row, so a `delete` carrying the wrong text
-/// leaves its tokens behind — which is exactly how a renamed or re-tagged asset would start
-/// matching terms it no longer has.
-fn refresh_fts(conn: &Connection, asset_id: i64, old_concat: &str) -> Result<()> {
-    let (name, description): (String, Option<String>) = conn
-        .query_row(
-            "SELECT name, description FROM asset WHERE id = ?1",
-            params![asset_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .map_err(|e| CoreError::Catalog(format!("fts row: {e}")))?;
-    conn.execute(
-        "INSERT INTO asset_fts(asset_fts, rowid, name, description, tags_concat)
-         VALUES ('delete', ?1, ?2, ?3, ?4)",
-        params![asset_id, name, description, old_concat],
-    )
-    .map_err(|e| CoreError::Catalog(format!("fts delete: {e}")))?;
-    let new_concat = tags_concat_in(conn, asset_id)?;
+/// Re-index one asset from the canonical `asset_search_text` view (M25). `asset_fts` keeps its own
+/// copy of the text, so deleting the rowid removes exactly what was indexed — no caller has to
+/// remember the old tag string, which external content demanded and where stale tokens came from.
+fn refresh_fts(conn: &Connection, asset_id: i64) -> Result<()> {
+    conn.execute("DELETE FROM asset_fts WHERE rowid = ?1", params![asset_id])
+        .map_err(|e| CoreError::Catalog(format!("fts delete: {e}")))?;
     conn.execute(
         "INSERT INTO asset_fts(rowid, name, description, tags_concat)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![asset_id, name, description, new_concat],
+         SELECT id, name, description, tags_concat FROM asset_search_text WHERE id = ?1",
+        params![asset_id],
     )
     .map_err(|e| CoreError::Catalog(format!("fts insert: {e}")))?;
     Ok(())
@@ -2219,6 +2195,63 @@ const MIGRATION_14_IN_PACK_ASSETS: &str = "
 ALTER TABLE asset_file ADD COLUMN package_entry_id INTEGER REFERENCES package_entry(id);
 CREATE INDEX IF NOT EXISTS idx_file_pkgentry
   ON asset_file(package_entry_id) WHERE package_entry_id IS NOT NULL;
+";
+
+/// M25 — FTS over a canonical view, and only the searchable columns re-index (v1 plan S03).
+///
+/// M1 declared `asset` the external-content table of `asset_fts`, but `tags_concat` is not an
+/// `asset` column. Ordinary MATCH still returned rowids, so nothing looked wrong — while reading the
+/// indexed text back and FTS5's own `rebuild` both failed with "no such column: T.tags_concat". And
+/// every UPDATE of `asset` — a status promotion, the four dirty flags, `updated_at` — rewrote the
+/// row's index entry, because the trigger fired on any column.
+///
+/// The text now lives in one view, `asset_search_text` (deterministic: distinct tag names, sorted),
+/// and `asset_fts` is a plain FTS5 table populated from it. A plain table keeps its own copy of the
+/// text — a few MB at this scale — and that is the point: a re-index is "delete this rowid, insert
+/// the view's row", so no writer has to remember the old tag string. External content demanded
+/// exactly that, and forgetting it is how tokens got stranded (see M11). The asset trigger fires only
+/// on `name`/`description`; tag writes re-index once per asset in Rust ([`refresh_fts`]); renaming a
+/// tag re-indexes every asset carrying it. Derived state only — no source, tag or embedding row is
+/// touched.
+const MIGRATION_25_FTS_OVER_A_VIEW: &str = "
+DROP TRIGGER IF EXISTS asset_fts_ai;
+DROP TRIGGER IF EXISTS asset_fts_ad;
+DROP TRIGGER IF EXISTS asset_fts_au;
+DROP TABLE IF EXISTS asset_fts;
+
+CREATE VIEW asset_search_text AS
+SELECT a.id, a.name, a.description,
+       COALESCE((SELECT group_concat(name, ' ' ORDER BY name)
+                   FROM (SELECT DISTINCT t.name
+                           FROM asset_tag at JOIN tag t ON t.id = at.tag_id
+                          WHERE at.asset_id = a.id)), '') AS tags_concat
+  FROM asset a;
+
+CREATE VIRTUAL TABLE asset_fts USING fts5(
+    name, description, tags_concat,
+    tokenize='unicode61 remove_diacritics 2'
+);
+INSERT INTO asset_fts(rowid, name, description, tags_concat)
+    SELECT id, name, description, tags_concat FROM asset_search_text;
+
+CREATE TRIGGER asset_fts_ai AFTER INSERT ON asset BEGIN
+    INSERT INTO asset_fts(rowid, name, description, tags_concat)
+        SELECT id, name, description, tags_concat FROM asset_search_text WHERE id = new.id;
+END;
+CREATE TRIGGER asset_fts_au AFTER UPDATE OF name, description ON asset BEGIN
+    DELETE FROM asset_fts WHERE rowid = old.id;
+    INSERT INTO asset_fts(rowid, name, description, tags_concat)
+        SELECT id, name, description, tags_concat FROM asset_search_text WHERE id = new.id;
+END;
+CREATE TRIGGER asset_fts_ad AFTER DELETE ON asset BEGIN
+    DELETE FROM asset_fts WHERE rowid = old.id;
+END;
+CREATE TRIGGER tag_fts_rename AFTER UPDATE OF name ON tag BEGIN
+    DELETE FROM asset_fts WHERE rowid IN (SELECT asset_id FROM asset_tag WHERE tag_id = new.id);
+    INSERT INTO asset_fts(rowid, name, description, tags_concat)
+        SELECT id, name, description, tags_concat FROM asset_search_text
+         WHERE id IN (SELECT asset_id FROM asset_tag WHERE tag_id = new.id);
+END;
 ";
 
 /// M11 — tagging queue + working FTS tag column (§2 facets, IDENTIFICATION-AND-SEARCH §2).
@@ -3043,12 +3076,6 @@ impl Catalog {
             .conn
             .transaction()
             .map_err(|e| CoreError::Catalog(format!("tags begin: {e}")))?;
-        // FTS5 external-content tables need the *old* row removed with its old column values,
-        // so capture the pre-write tag text before touching anything.
-        let old_concat = tags_concat_in(&tx, asset_id)?;
-        // Clear the flag *before* the tags change: the FTS update trigger fires on any UPDATE to
-        // `asset`, and while the old tags are still in place its delete+insert cancel out. Doing it
-        // afterwards would have the trigger delete under the new text and leave the old tokens.
         tx.execute(
             "UPDATE asset SET tags_dirty = 0 WHERE id = ?1",
             params![asset_id],
@@ -3096,7 +3123,7 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("asset_tag insert: {e}")))?;
             written += 1;
         }
-        refresh_fts(&tx, asset_id, &old_concat)?;
+        refresh_fts(&tx, asset_id)?;
         tx.commit()
             .map_err(|e| CoreError::Catalog(format!("tags commit: {e}")))?;
         Ok(written)
@@ -3104,7 +3131,7 @@ impl Catalog {
 
     /// Reject a single facet value on an asset (P4 accept/reject, DATA-MODEL §8): delete every
     /// `asset_tag` row for this (asset, tag) pair regardless of source — the user is saying the term
-    /// is wrong, not that one model guessed it. Re-indexes FTS with the pre-write text so the
+    /// is wrong, not that one model guessed it. Re-indexes FTS from the canonical view so the
     /// rejected term stops matching. The `tag` vocabulary row is left in place (other assets use it).
     /// Returns the number of rows removed.
     pub fn remove_asset_tag(
@@ -3120,7 +3147,6 @@ impl Catalog {
             .conn
             .transaction()
             .map_err(|e| CoreError::Catalog(format!("reject begin: {e}")))?;
-        let old_concat = tags_concat_in(&tx, asset_id)?;
         let n = tx
             .execute(
                 "DELETE FROM asset_tag
@@ -3129,7 +3155,7 @@ impl Catalog {
                 params![asset_id, norm],
             )
             .map_err(|e| CoreError::Catalog(format!("reject delete: {e}")))?;
-        refresh_fts(&tx, asset_id, &old_concat)?;
+        refresh_fts(&tx, asset_id)?;
         tx.commit()
             .map_err(|e| CoreError::Catalog(format!("reject commit: {e}")))?;
         Ok(n)
@@ -3154,7 +3180,6 @@ impl Catalog {
             .conn
             .transaction()
             .map_err(|e| CoreError::Catalog(format!("tag add begin: {e}")))?;
-        let old_concat = tags_concat_in(&tx, asset_id)?;
         tx.execute(
             "INSERT INTO tag (name, norm_name, namespace) VALUES (?1, ?2, ?3)
              ON CONFLICT(norm_name) DO NOTHING",
@@ -3176,7 +3201,7 @@ impl Catalog {
                 params![asset_id, tag_id, source, unix_now()],
             )
             .map_err(|e| CoreError::Catalog(format!("asset_tag insert: {e}")))?;
-        refresh_fts(&tx, asset_id, &old_concat)?;
+        refresh_fts(&tx, asset_id)?;
         tx.commit()
             .map_err(|e| CoreError::Catalog(format!("tag add commit: {e}")))?;
         Ok(written)

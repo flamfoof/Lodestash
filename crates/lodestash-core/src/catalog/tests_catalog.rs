@@ -18,7 +18,7 @@ fn open_in_memory_applies_migrations() {
         .conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 24, "all 24 migrations should have run");
+    assert_eq!(version, 25, "all 25 migrations should have run");
 }
 
 /// Every queue an appraise pass drains must respect the set the caller named.
@@ -421,12 +421,26 @@ fn m24_requeues_assets_marked_done_with_no_tags() {
     };
     let swallowed = mk(&mut c, "swallowed.png");
     let genuinely_tagged = mk(&mut c, "tagged.png");
-    c.add_asset_tag(genuinely_tagged, "ai", "subject", "rock")
-        .expect("tag");
-    // Both look "done" to the queue; only one of them ever saw a model.
+    // Both look "done" to the queue; only one of them ever saw a model. Cleared *before* the tag
+    // rows go in: at v23, M11's trigger re-indexes on any asset UPDATE by deleting under the current
+    // tag text, and rows written directly were never indexed under it.
     c.conn
         .execute("UPDATE asset SET tags_dirty = 0", [])
         .expect("clear");
+    // Written directly: the tag writers re-index through M25's view, which a v23 catalog lacks.
+    c.conn
+        .execute(
+            "INSERT INTO tag (name, norm_name, namespace) VALUES ('rock', 'subject:rock', 'subject')",
+            [],
+        )
+        .expect("tag");
+    c.conn
+        .execute(
+            "INSERT INTO asset_tag (asset_id, tag_id, source, created_at)
+             SELECT ?1, id, 'ai', 0 FROM tag WHERE name = 'rock'",
+            [genuinely_tagged],
+        )
+        .expect("asset_tag");
 
     c.apply_migrations_up_to(24).expect("m24");
 
@@ -4079,5 +4093,265 @@ fn the_manual_ai_split_counts_assets_and_never_exceeds_the_usage() {
     assert!(
         rock.manual_count + rock.ai_count <= rock.usage_count,
         "the split cannot exceed the usage it splits"
+    );
+}
+
+/// Rows an FTS5 MATCH returns, read from the index itself rather than through `search_assets` —
+/// whose join to `asset` would hide a stale token belonging to a deleted row.
+fn fts_hits(c: &Catalog, term: &str) -> Vec<i64> {
+    let mut stmt = c
+        .conn
+        .prepare("SELECT rowid FROM asset_fts WHERE asset_fts MATCH ?1 ORDER BY rowid")
+        .expect("prep");
+    stmt.query_map([term], |r| r.get(0))
+        .expect("query")
+        .collect::<std::result::Result<Vec<i64>, _>>()
+        .expect("rows")
+}
+
+fn tag_of(namespace: &str, value: &str) -> TagAssignment {
+    TagAssignment {
+        namespace: namespace.into(),
+        value: value.into(),
+        confidence: None,
+    }
+}
+
+fn asset_named(c: &Catalog, name: &str) -> i64 {
+    c.conn
+        .query_row("SELECT id FROM asset WHERE name = ?1", [name], |r| r.get(0))
+        .expect("asset id")
+}
+
+/// M25's reproduction. M1 made `asset` the FTS external-content table, but `tags_concat` is not an
+/// `asset` column — so MATCH returned rowids while reading the indexed text back, and FTS5's own
+/// `rebuild`, failed with "no such column: T.tags_concat". Checked on the M24 schema first, so the
+/// test proves the defect it claims, then on M25.
+#[test]
+fn m25_makes_the_index_readable_and_rebuildable() {
+    let mut c = catalog_at(24);
+    c.seed_media_types().expect("seed");
+    let src = c
+        .upsert_import_source("Lib", "C:/lib", "folder")
+        .expect("source");
+    c.record_crawl(src, None, &[rec("dragon.png", 1, 1)])
+        .expect("crawl");
+    let id = asset_named(&c, "dragon.png");
+    // Tag rows as M24 stored them. M24's writer is gone, so they are written directly.
+    c.conn
+        .execute(
+            "INSERT INTO tag (name, norm_name, namespace) VALUES ('scales', 'subject:scales', 'subject')",
+            [],
+        )
+        .expect("tag");
+    c.conn
+        .execute(
+            "INSERT INTO asset_tag (asset_id, tag_id, source, created_at)
+             SELECT ?1, id, 'ai', 0 FROM tag WHERE name = 'scales'",
+            [id],
+        )
+        .expect("asset_tag");
+    let content = |c: &Catalog| {
+        c.conn.query_row(
+            "SELECT tags_concat FROM asset_fts WHERE asset_fts MATCH 'dragon'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+    };
+    let err = content(&c)
+        .expect_err("M24 cannot read back what it indexed")
+        .to_string();
+    assert!(
+        err.contains("tags_concat"),
+        "the defect, not another failure: {err}"
+    );
+
+    c.apply_migrations_up_to(25).expect("m25");
+
+    assert_eq!(content(&c).expect("content read"), "scales");
+    assert_eq!(
+        fts_hits(&c, "scales"),
+        vec![id],
+        "the tag M24 never indexed now matches"
+    );
+    c.conn
+        .execute("INSERT INTO asset_fts(asset_fts) VALUES('rebuild')", [])
+        .expect("rebuild");
+    c.conn
+        .execute(
+            "INSERT INTO asset_fts(asset_fts) VALUES('integrity-check')",
+            [],
+        )
+        .expect("integrity-check");
+    let drift: i64 = c
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM asset_search_text v LEFT JOIN asset_fts f ON f.rowid = v.id
+              WHERE f.rowid IS NULL OR f.name IS NOT v.name OR f.tags_concat IS NOT v.tags_concat",
+            [],
+            |r| r.get(0),
+        )
+        .expect("drift");
+    assert_eq!(drift, 0, "the index is the canonical view, row for row");
+}
+
+/// With a plain FTS5 table holding its own copy of the text, every re-index is "delete this rowid,
+/// insert the view's row", so no caller has to remember the old tag string — which external content
+/// demanded, and where stranded tokens came from. These are the edits that used to strand them.
+#[test]
+fn no_edit_leaves_a_stale_token_in_the_index() {
+    let mut c = Catalog::open_in_memory().expect("open");
+    c.seed_media_types().expect("seed");
+    let src = c
+        .upsert_import_source("Lib", "C:/lib", "folder")
+        .expect("source");
+    c.record_crawl(
+        src,
+        None,
+        &[rec("dragon.png", 1, 1), rec("knight.png", 1, 1)],
+    )
+    .expect("crawl");
+    let (dragon, knight) = (asset_named(&c, "dragon.png"), asset_named(&c, "knight.png"));
+
+    c.set_tags(
+        dragon,
+        "ai",
+        Some("m"),
+        &[tag_of("subject", "scales"), tag_of("subject", "horns")],
+    )
+    .expect("tags");
+    c.add_asset_tag(dragon, "manual", "subject", "horns")
+        .expect("same tag, second source");
+    let text: String = c
+        .conn
+        .query_row(
+            "SELECT tags_concat FROM asset_fts WHERE rowid = ?1",
+            [dragon],
+            |r| r.get(0),
+        )
+        .expect("text");
+    assert_eq!(
+        text, "horns scales",
+        "tag text is distinct and sorted, whatever the sources"
+    );
+
+    c.set_tags(dragon, "ai", Some("m"), &[tag_of("subject", "wings")])
+        .expect("retag");
+    assert!(
+        fts_hits(&c, "scales").is_empty(),
+        "a replaced tag still matches"
+    );
+    assert_eq!(fts_hits(&c, "wings"), vec![dragon]);
+    assert_eq!(
+        fts_hits(&c, "horns"),
+        vec![dragon],
+        "the manual copy of a tag survives a re-tag"
+    );
+
+    c.remove_asset_tag(dragon, "subject", "wings")
+        .expect("reject");
+    assert!(
+        fts_hits(&c, "wings").is_empty(),
+        "a rejected tag still matches"
+    );
+
+    c.conn
+        .execute("UPDATE asset SET name = 'wyrm.png' WHERE id = ?1", [dragon])
+        .expect("rename");
+    assert!(
+        fts_hits(&c, "dragon").is_empty(),
+        "the old name still matches"
+    );
+    assert_eq!(fts_hits(&c, "wyrm"), vec![dragon]);
+
+    c.add_asset_tag(knight, "manual", "subject", "armor")
+        .expect("tag");
+    c.conn
+        .execute("UPDATE tag SET name = 'plate' WHERE name = 'armor'", [])
+        .expect("rename tag");
+    assert!(
+        fts_hits(&c, "armor").is_empty(),
+        "a renamed tag's old name still matches"
+    );
+    assert_eq!(fts_hits(&c, "plate"), vec![knight]);
+
+    c.conn
+        .execute("DELETE FROM asset WHERE id = ?1", [knight])
+        .expect("delete");
+    assert!(
+        fts_hits(&c, "plate").is_empty() && fts_hits(&c, "knight").is_empty(),
+        "a deleted asset still matches"
+    );
+}
+
+/// M25 narrows the asset trigger to the two searchable columns. Before it, every lifecycle,
+/// dirty-flag and timestamp update rewrote the row's index entry — promoting the library was a full
+/// FTS rewrite of it. `total_changes` counts trigger writes too, so an update that costs exactly one
+/// change did no FTS work. The caption at the end is the control.
+#[test]
+fn lifecycle_and_flag_updates_do_no_fts_work() {
+    let mut c = Catalog::open_in_memory().expect("open");
+    c.seed_media_types().expect("seed");
+    let src = c
+        .upsert_import_source("Lib", "C:/lib", "folder")
+        .expect("source");
+    c.record_crawl(src, None, &[rec("wall.png", 1, 1)])
+        .expect("crawl");
+    let id = asset_named(&c, "wall.png");
+    for sql in [
+        "UPDATE asset SET status = 'identified' WHERE id = ?1",
+        "UPDATE asset SET embedding_dirty = 0, tags_dirty = 0, metrics_dirty = 0 WHERE id = ?1",
+        "UPDATE asset SET updated_at = updated_at + 1 WHERE id = ?1",
+        "UPDATE asset SET favorite = 1 WHERE id = ?1",
+    ] {
+        let before = c.total_changes();
+        c.conn.execute(sql, [id]).expect(sql);
+        assert_eq!(c.total_changes() - before, 1, "{sql} touched the index");
+    }
+    let before = c.total_changes();
+    c.set_description(id, Some("a mossy stone wall"))
+        .expect("caption");
+    assert!(
+        c.total_changes() - before > 1,
+        "a caption must re-index — the control for the updates above"
+    );
+    assert_eq!(fts_hits(&c, "mossy"), vec![id]);
+}
+
+/// The index is ordinary transactional state: a rolled-back rename leaves it as it was, and it is on
+/// disk — not rebuilt in memory on open.
+#[test]
+fn the_index_follows_rollback_and_survives_reopen() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let path = dir.path().join("catalog.db");
+    let id = {
+        let mut c = Catalog::open(&path).expect("open");
+        c.seed_media_types().expect("seed");
+        let src = c
+            .upsert_import_source("Lib", "C:/lib", "folder")
+            .expect("source");
+        c.record_crawl(src, None, &[rec("dragon.png", 1, 1)])
+            .expect("crawl");
+        let id = asset_named(&c, "dragon.png");
+        c.add_asset_tag(id, "manual", "subject", "scales")
+            .expect("tag");
+        {
+            let tx = c.conn.transaction().expect("tx");
+            tx.execute("UPDATE asset SET name = 'wyrm.png' WHERE id = ?1", [id])
+                .expect("rename");
+        } // dropped uncommitted: rolled back
+        assert_eq!(
+            fts_hits(&c, "dragon"),
+            vec![id],
+            "a rolled-back rename moved the index"
+        );
+        assert!(fts_hits(&c, "wyrm").is_empty());
+        id
+    };
+    let c = Catalog::open(&path).expect("reopen");
+    assert_eq!(
+        fts_hits(&c, "scales"),
+        vec![id],
+        "the index did not survive a reopen"
     );
 }
