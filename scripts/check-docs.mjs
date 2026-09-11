@@ -61,7 +61,7 @@ const flag = (kind, file, msg) => {
 };
 
 const citRe = /([A-Za-z0-9_./-]+\.(?:rs|svelte|ts|mjs|js|css|py|toml|md|html)):(\d+)\b/g;
-const bareRe = /(?:`)?((?:crates|docs|scripts|src)\/[A-Za-z0-9_./-]+\.(?:rs|svelte|ts|mjs|js|css|py|toml|md|html))/g;
+const bareRe = /(?:`)?((?:crates|docs|scripts|src)\/[A-Za-z0-9_./-]+\.(?:rs|svelte|ts|mjs|json|js|css|py|toml|md|html)\b)/g;
 
 // Resolve a cited path to a real file. The docs use short names a lot:
 //   `writer.rs`        → crates/lodestash-core/src/ | .../lodestash-app/src/ | ui/src/lib/ | ui/src/
