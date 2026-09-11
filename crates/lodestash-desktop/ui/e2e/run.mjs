@@ -2543,16 +2543,31 @@ try {
       return p.items.some((i) => i.asset_id === id);
     };
     const was = await starred();
+    // Record what each F actually sends, so a failure names the culprit: a stale `on` means the
+    // shell's view of the star lagged; the right `on` with no effect means the write did not land.
+    await page.evaluate(() => {
+      window.__favSent = [];
+      const prev = window.fetch.bind(window);
+      window.fetch = (input, init) => {
+        const url = String(input && input.url ? input.url : input);
+        if (url.startsWith("http://ipc.localhost/set_favorite")) {
+          window.__favSent.push(typeof init?.body === "string" ? init.body : "?");
+        }
+        return prev(input, init);
+      };
+    });
+    const sent = () => page.evaluate(() => JSON.stringify(window.__favSent));
     try {
       await page.keyboard.press("f");
-      await waitFor(async () => (await starred()) !== was, "F did not change the star", 8000, 250);
+      await waitFor(async () => (await starred()) !== was, "F did not change the star", 8000, 250)
+        .catch(async (e) => { throw new Error(`${e.message}; set_favorite sent ${await sent()}`); });
       await page.keyboard.press("f");
       await waitFor(
         async () => (await starred()) === was,
         "the second F did not toggle it back",
         8000,
         250,
-      );
+      ).catch(async (e) => { throw new Error(`${e.message}; set_favorite sent ${await sent()}`); });
     } finally {
       await invoke("set_favorite", { assetIds: [id], on: was });
     }
