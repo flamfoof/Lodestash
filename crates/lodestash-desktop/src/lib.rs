@@ -1078,7 +1078,9 @@ fn get_settings() -> Result<Settings, String> {
 /// an **unknown** remote as paid — the safe direction for a guard whose whole job is to ask before
 /// spending. Deciding it in the frontend would give the confirm a different opinion from the drain.
 #[tauri::command]
-fn cloud_run_estimate(state: tauri::State<'_, AppState>) -> Result<Option<serde_json::Value>, String> {
+fn cloud_run_estimate(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<serde_json::Value>, String> {
     let cfg = lodestash_app::config::AppConfig::load();
     let configured =
         cfg.api_tagging_enabled && !cfg.api_key.trim().is_empty() && cfg.api_model.is_some();
@@ -2077,50 +2079,47 @@ fn apply_allow_list(state: &lodestash_api::ServerState) -> Option<usize> {
 /// single-writer `Op` and blocks on its reply — the API crate never touches the catalog itself.
 fn engine_write_bridge(writer: Writer) -> lodestash_api::AgentWriteFn {
     use lodestash_api::AgentWrite;
+    // Everything through here is an agent's write — the shell shows it as a pending update
+    // instead of re-reading under the user (ADR-0016).
+    let run = move |op: Op| writer.run_as(op, crate::writer::Origin::Agent);
     Box::new(move |w: AgentWrite| match w {
         AgentWrite::AddTag {
             asset_id,
             namespace,
             value,
-        } => writer
-            .run(Op::BulkTag {
-                asset_ids: vec![asset_id],
-                namespace,
-                value,
-                on: true,
-            })
-            .map(|r| r.changed),
+        } => run(Op::BulkTag {
+            asset_ids: vec![asset_id],
+            namespace,
+            value,
+            on: true,
+        })
+        .map(|r| r.changed),
         AgentWrite::RemoveTag {
             asset_id,
             namespace,
             value,
-        } => writer
-            .run(Op::BulkTag {
-                asset_ids: vec![asset_id],
-                namespace,
-                value,
-                on: false,
-            })
-            .map(|r| r.changed),
-        AgentWrite::ApplyMapping { taxonomy_id } => writer
-            .run(Op::ApplyMapping { taxonomy_id })
-            .map(|r| r.changed),
-        AgentWrite::Identify { asset_ids } => {
-            writer.run(Op::IdentifyIds { asset_ids }).map(|r| r.changed)
+        } => run(Op::BulkTag {
+            asset_ids: vec![asset_id],
+            namespace,
+            value,
+            on: false,
+        })
+        .map(|r| r.changed),
+        AgentWrite::ApplyMapping { taxonomy_id } => {
+            run(Op::ApplyMapping { taxonomy_id }).map(|r| r.changed)
         }
-        AgentWrite::UnpackPackage { package_id } => writer
-            .run(Op::ExtractPackage { package_id })
-            .map(|r| r.changed),
-        AgentWrite::StageAsset { asset_id } => writer
-            .run(Op::StageAssets {
-                asset_ids: vec![asset_id],
-            })
-            .map(|r| r.changed),
-        AgentWrite::UnstageAsset { asset_id } => writer
-            .run(Op::UnstageAssets {
-                asset_ids: vec![asset_id],
-            })
-            .map(|r| r.changed),
+        AgentWrite::Identify { asset_ids } => run(Op::IdentifyIds { asset_ids }).map(|r| r.changed),
+        AgentWrite::UnpackPackage { package_id } => {
+            run(Op::ExtractPackage { package_id }).map(|r| r.changed)
+        }
+        AgentWrite::StageAsset { asset_id } => run(Op::StageAssets {
+            asset_ids: vec![asset_id],
+        })
+        .map(|r| r.changed),
+        AgentWrite::UnstageAsset { asset_id } => run(Op::UnstageAssets {
+            asset_ids: vec![asset_id],
+        })
+        .map(|r| r.changed),
     })
 }
 
@@ -2284,11 +2283,14 @@ pub fn run() {
                         p,
                         pump.clone(),
                         job_registry.clone(),
-                        Some(app.handle().clone()),
                         appraise.clone(),
                         focus.clone(),
                     )
                 });
+            // Change publication (ADR-0016): the writer and the job registry only mark what
+            // changed; this thread tells the shell, at most once per window. Started with or
+            // without a catalog — model downloads use the tray too.
+            job_registry.changes().start_publisher(app.handle().clone());
 
             // B12 — the agent plane (ENGINE-API §1–2, MCP↔REST 1:1) lives in this process:
             // the REST server binds an ephemeral loopback port and writes engine.json for the

@@ -3,6 +3,8 @@
 - **Status:** accepted
 - **Date:** 2026-09-04
 - **Amends:** [ADR-0008](ADR-0008-appraisal-is-a-background-job.md) (appraisal is a background job)
+- **Amended by:** [ADR-0016](ADR-0016-coalesced-change-publication.md) (how the lane's results reach
+  the shell)
 
 ## Context
 

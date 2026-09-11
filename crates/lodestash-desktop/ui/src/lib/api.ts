@@ -605,12 +605,33 @@ export const undoFolderExport = (batchId: string) =>
  * Subscribe to writer-side change events (`ls:changed`). `kind` is "catalog" (re-read status
  * + the current page) or "jobs" (refetch the tray). Returns an unsubscribe function.
  */
-export function onChanged(kind: string, cb: () => void): () => void {
+/**
+ * What `ls:changed` carries (ADR-0016): the domains that changed since the last publication, who
+ * changed the catalog in that window, and the per-domain generations a refresh reconciles against.
+ * At most one event per window (250 ms), however many commits it covers.
+ */
+export type ChangedEvent = {
+  catalog: boolean;
+  jobs: boolean;
+  origins: ("user" | "agent" | "background")[];
+  catalog_gen: number;
+  jobs_gen: number;
+};
+
+export function onChanged(kind: "catalog" | "jobs", cb: (e: ChangedEvent) => void): () => void {
   let unlisten: (() => void) | null = null;
-  listen<{ kind: string }>("ls:changed", (e) => {
-    if (e.payload.kind === kind) cb();
-  }).then((u) => (unlisten = u));
-  return () => unlisten?.();
+  let disposed = false;
+  listen<ChangedEvent>("ls:changed", (e) => {
+    if (e.payload[kind]) cb(e.payload);
+  }).then((u) => {
+    // An effect torn down before `listen` resolved must still unsubscribe, or it leaks a listener.
+    if (disposed) u();
+    else unlisten = u;
+  });
+  return () => {
+    disposed = true;
+    unlisten?.();
+  };
 }
 export const addCategory = (
   taxonomyId: number,

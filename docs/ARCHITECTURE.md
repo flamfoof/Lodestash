@@ -230,6 +230,13 @@ User edits tags (accept/reject chips) → recorded as training signal + immediat
   **one dedicated writer** (a thread/actor owning the connection, fed by a channel); reads use
   short-lived per-task connections (WAL makes concurrent readers cheap). Do not reach for a pool of
   writers — SQLite serializes writes anyway.
+- **Change publication** ([ADR-0016](decisions/ADR-0016-coalesced-change-publication.md)): nothing
+  is emitted from inside a write. The writer marks what a committed turn changed — `catalog` only
+  when SQLite's `total_changes` moved, tagged `user` / `agent` / `background`; `jobs` whenever the
+  registry starts, advances or finishes a job — and one publisher thread sends at most one
+  `ls:changed` per 250 ms window, carrying every origin in that window and a generation per domain.
+  Fifty writes inside a window are one event; a continuous drain is one event per window, never one
+  per commit. Headless (no window) publishes nothing.
 - **Job engine** with bounded queues and progress events; the UI shows placeholders and swaps in
   results as jobs finish (what makes a 10k-grid feel instant).
 - **GPU work** (live viewport + offscreen thumbnail render-to-texture + image texture upload) shares

@@ -384,6 +384,13 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("user_version query: {e}")))
     }
 
+    /// Rows this connection has changed since it opened (SQLite's `total_changes`). The writer
+    /// compares it across a turn to tell a committed write from a turn that changed nothing
+    /// (ADR-0016).
+    pub fn total_changes(&self) -> u64 {
+        self.conn.total_changes()
+    }
+
     fn apply_migrations(&mut self) -> Result<()> {
         self.apply_migrations_up_to(u32::MAX)
     }

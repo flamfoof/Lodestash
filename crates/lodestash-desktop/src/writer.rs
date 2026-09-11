@@ -350,6 +350,8 @@ pub struct WriteResult {
 pub struct Job {
     pub op: Op,
     pub reply: Sender<Result<WriteResult, String>>,
+    /// Who asked — decides how the shell hears about it (ADR-0016).
+    pub origin: Origin,
 }
 
 /// What the writer thread's channel carries: an external op (with its reply), or a worker
@@ -545,6 +547,9 @@ fn backfill_package_pipelines(catalog: &Catalog) -> usize {
 #[derive(Clone, Default)]
 pub struct JobRegistry {
     inner: std::sync::Arc<std::sync::Mutex<JobState>>,
+    /// Marked on every start and finish, and by workers as their progress moves — the tray is
+    /// one of the two domains the shell is told about.
+    changes: Changes,
 }
 
 #[derive(Default)]
@@ -621,6 +626,8 @@ impl JobRegistry {
             cancel: cancel.clone(),
             progress: progress.clone(),
         });
+        drop(state);
+        self.changes.jobs();
         JobHandles {
             id,
             cancel,
@@ -646,6 +653,8 @@ impl JobRegistry {
             at_unix: unix_now(),
         });
         state.recent.truncate(RECENT_CAP);
+        drop(state);
+        self.changes.jobs();
     }
 
     fn has_active_extract(&self) -> bool {
@@ -655,6 +664,17 @@ impl JobRegistry {
             .active
             .iter()
             .any(|j| j.kind == "extract")
+    }
+
+    /// The process's change publication, which this registry marks whenever the tray changes.
+    pub fn changes(&self) -> &Changes {
+        &self.changes
+    }
+
+    /// A running job's progress moved. Coalesced by the publisher, so a worker can call this per
+    /// chunk read without flooding the shell.
+    pub fn progressed(&self) {
+        self.changes.jobs();
     }
 
     /// Request cancellation. The extract worker checks the flag between reads; everything
@@ -700,18 +720,178 @@ pub struct Writer {
     tx: Sender<WriterMsg>,
 }
 
-/// One writer-side change, pushed to the Svelte shell (pump events, B2b) so the UI stops
-/// polling. `catalog` = the library changed (re-read status + the current page); `jobs` =
-/// the tray changed (refetch the snapshot).
-#[derive(Clone, serde::Serialize)]
-struct ChangedEvent {
-    kind: &'static str,
+/// Who caused a catalog change. The shell treats them differently (ADR-0016): the user's own
+/// write refreshes what they are looking at; an agent's or the background lane's only says that
+/// something moved, so a drain can never pull the grid out from under someone browsing it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    User,
+    Agent,
+    Background,
 }
 
-fn emit_changed(app: &Option<tauri::AppHandle>, kind: &'static str) {
-    if let Some(handle) = app {
-        use tauri::Emitter;
-        let _ = handle.emit("ls:changed", ChangedEvent { kind });
+/// What the shell hears on `ls:changed`: which domains changed since the last publication, every
+/// origin that touched the catalog in that window, and the per-domain generations. A refresh that
+/// read the catalog at generation G clears only what was pending through G.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ChangedEvent {
+    pub catalog: bool,
+    pub jobs: bool,
+    pub origins: Vec<&'static str>,
+    pub catalog_gen: u64,
+    pub jobs_gen: u64,
+}
+
+#[derive(Default)]
+struct Pending {
+    catalog: bool,
+    jobs: bool,
+    user: bool,
+    agent: bool,
+    background: bool,
+    catalog_gen: u64,
+    jobs_gen: u64,
+}
+
+impl Pending {
+    fn dirty(&self) -> bool {
+        self.catalog || self.jobs
+    }
+
+    /// Everything pending, as one event. The flags reset; the generations only ever climb.
+    fn take(&mut self) -> ChangedEvent {
+        let origins = [
+            (self.user, "user"),
+            (self.agent, "agent"),
+            (self.background, "background"),
+        ]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect();
+        let event = ChangedEvent {
+            catalog: self.catalog,
+            jobs: self.jobs,
+            origins,
+            catalog_gen: self.catalog_gen,
+            jobs_gen: self.jobs_gen,
+        };
+        self.catalog = false;
+        self.jobs = false;
+        self.user = false;
+        self.agent = false;
+        self.background = false;
+        event
+    }
+}
+
+/// The longest a committed change waits before the shell hears of it. A fixed window, not a
+/// trailing debounce: the preview drain commits continuously, and a debounce waiting for quiet
+/// would never fire while it ran. Fifty tag writes inside one window publish once; a longer burst
+/// publishes once per window — never once per commit, which is what it used to be.
+const PUBLISH_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The process's change publication (ADR-0016).
+///
+/// Marking is a mutex flip — the writer never waits on the shell, and nothing is emitted from
+/// inside a transaction. A publisher thread, started once there is a window to tell, drains the
+/// marks at most once per [`PUBLISH_WINDOW`]. Until then — and forever, headless — marks only
+/// accumulate: no events and no growth, since a mark is a flag and a counter.
+#[derive(Clone, Default)]
+pub struct Changes {
+    inner: Arc<(Mutex<Pending>, std::sync::Condvar)>,
+}
+
+impl Changes {
+    pub fn catalog(&self, origin: Origin) {
+        let (lock, cv) = &*self.inner;
+        let mut p = lock.lock().expect("changes lock");
+        p.catalog = true;
+        p.catalog_gen += 1;
+        match origin {
+            Origin::User => p.user = true,
+            Origin::Agent => p.agent = true,
+            Origin::Background => p.background = true,
+        }
+        cv.notify_one();
+    }
+
+    pub fn jobs(&self) {
+        let (lock, cv) = &*self.inner;
+        let mut p = lock.lock().expect("changes lock");
+        p.jobs = true;
+        p.jobs_gen += 1;
+        cv.notify_one();
+    }
+
+    /// Tell the shell, as `ls:changed`. Called once, when the window exists.
+    pub fn start_publisher(&self, app: tauri::AppHandle) {
+        self.spawn_publisher(PUBLISH_WINDOW, move |event| {
+            use tauri::Emitter;
+            let _ = app.emit("ls:changed", event);
+        });
+    }
+
+    fn spawn_publisher(
+        &self,
+        window: std::time::Duration,
+        mut sink: impl FnMut(ChangedEvent) + Send + 'static,
+    ) {
+        let inner = self.inner.clone();
+        std::thread::Builder::new()
+            .name("lodestash-changes".into())
+            .spawn(move || {
+                let (lock, cv) = &*inner;
+                loop {
+                    let mut p = lock.lock().expect("changes lock");
+                    while !p.dirty() {
+                        p = cv.wait(p).expect("changes lock");
+                    }
+                    drop(p);
+                    // The window opens at the first mark; everything landing inside it rides along.
+                    std::thread::sleep(window);
+                    let event = lock.lock().expect("changes lock").take();
+                    sink(event);
+                }
+            })
+            .expect("change publisher spawns");
+    }
+}
+
+/// Publish a catalog change iff this turn committed rows. `total_changes` is SQLite's own count,
+/// so a turn that ran and wrote nothing is not reported as a change.
+fn mark_committed(changes: &Changes, catalog: &Catalog, before: u64, origin: Origin) {
+    if catalog.total_changes() > before {
+        changes.catalog(origin);
+    }
+}
+
+/// The writer's channel, plus the one message the idle probe may have taken out of it.
+///
+/// The probe used to be `rx.recv_timeout(ZERO).is_ok()`: a receive whose message was then dropped
+/// on the floor. A dropped `Op` never runs and never replies — its caller got "writer thread
+/// dropped the job" for a write whose only fault was arriving at the idle boundary.
+struct Inbox {
+    rx: mpsc::Receiver<WriterMsg>,
+    held: Option<WriterMsg>,
+}
+
+impl Inbox {
+    fn next(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<WriterMsg, std::sync::mpsc::RecvTimeoutError> {
+        match self.held.take() {
+            Some(msg) => Ok(msg),
+            None => self.rx.recv_timeout(timeout),
+        }
+    }
+
+    /// Is a message waiting? One found here is held for [`Inbox::next`], never discarded.
+    fn waiting(&mut self) -> bool {
+        if self.held.is_none() {
+            self.held = self.rx.try_recv().ok();
+        }
+        self.held.is_some()
     }
 }
 
@@ -729,7 +909,6 @@ impl Writer {
         db_path: PathBuf,
         pump: Arc<AtomicBool>,
         jobs: JobRegistry,
-        app: Option<tauri::AppHandle>,
         appraise: Arc<AppJobProgress>,
         // `focus` is where the user is looking (UI-SPEC §3). Shared with the app rather than sent
         // as an op: it changes on every scroll, and a browse must never queue behind a running
@@ -837,8 +1016,10 @@ impl Writer {
                 // Op latency is unaffected — a skipped tick still waits on the channel, so a user
                 // write is picked up the moment it arrives (the point of 147d4b5).
                 let mut idle_tick: u32 = 0;
+                let changes = jobs.changes().clone();
+                let mut inbox = Inbox { rx, held: None };
                 loop {
-                    match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                    match inbox.next(std::time::Duration::from_secs(1)) {
                         Ok(WriterMsg::Op(job)) => {
                             if matches!(job.op, Op::ExtractPackage { .. }) {
                                 // Extract answers **"accepted"**, not "finished" — the unpack runs
@@ -854,7 +1035,6 @@ impl Writer {
                                         job.op,
                                         &writer_tx,
                                         &jobs,
-                                        &app,
                                         &appraise,
                                         &focus,
                                     );
@@ -882,22 +1062,25 @@ impl Writer {
                                 job.op,
                                 Op::PersistScan { .. } | Op::SetSourceWatch { .. }
                             );
+                            let before = catalog.total_changes();
                             let result = run(
                                 &mut catalog,
                                 &db_path,
                                 job.op,
                                 &writer_tx,
                                 &jobs,
-                                &app,
                                 &appraise,
                                 &focus,
                             );
                             if appraising {
                                 pump.store(false, Ordering::Relaxed);
                             }
+                            // A failed op publishes nothing: its caller learns from the reply,
+                            // and an event must never read as a success.
+                            if result.is_ok() {
+                                mark_committed(&changes, &catalog, before, job.origin);
+                            }
                             let _ = job.reply.send(result);
-                            emit_changed(&app, "catalog");
-                            emit_changed(&app, "jobs");
                             // A source set (or its watch flags) changed — re-arm the watch so
                             // new roots are covered and unwatched ones stop firing.
                             if source_set_changed {
@@ -917,23 +1100,24 @@ impl Writer {
                             // The payloads landed on disk off-thread; materialize them here —
                             // the catalog stays single-writer. Then the next queued pack gets
                             // its worker.
+                            let before = catalog.total_changes();
                             let result =
                                 materialize_extract(&mut catalog, package_id, outcome, cancelled);
                             let ok = result.is_ok();
                             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
                             jobs.finish(job_id, ok, cancelled, changed);
-                            emit_changed(&app, "catalog");
-                            emit_changed(&app, "jobs");
                             start_next_extract(
                                 &mut catalog,
                                 &mut extract_queue,
                                 &db_path,
                                 &writer_tx,
                                 &jobs,
-                                &app,
                                 &appraise,
                                 &focus,
                             );
+                            // Background: the unpack was asked for minutes ago, and its outcome
+                            // is in the tray — not a reason to re-read the page under the user.
+                            mark_committed(&changes, &catalog, before, Origin::Background);
                         }
                         Ok(WriterMsg::EmbeddingsDone { model_id, done }) => {
                             // Cheap: N `upsert_embedding` calls, no inference. Clearing
@@ -946,7 +1130,7 @@ impl Writer {
                             );
                             embed_inflight.store(false, Ordering::Relaxed);
                             if n > 0 {
-                                emit_changed(&app, "catalog");
+                                changes.catalog(Origin::Background);
                             }
                         }
                         Ok(WriterMsg::TagsDone { model_id, done }) => {
@@ -958,7 +1142,7 @@ impl Writer {
                             tag_inflight.store(false, Ordering::Relaxed);
                             if n > 0 {
                                 tracing::info!(tags = n, model = %model_id, "idle tagging slice stored");
-                                emit_changed(&app, "catalog");
+                                changes.catalog(Origin::Background);
                             }
                         }
                         Ok(WriterMsg::ManifestDone {
@@ -976,6 +1160,7 @@ impl Writer {
                             // drains the queue. Anything else — an error, or a cancel that stops
                             // after the analyze phase — has to settle here, or the queue behind it
                             // never moves again.
+                            let before = catalog.total_changes();
                             let mut spawned = false;
                             // Annotated: nothing consumes this as a reply any more (the tray is
                             // the reporting surface), so the error type has no inference source.
@@ -1007,7 +1192,6 @@ impl Writer {
                                     &entries,
                                     &writer_tx,
                                     &jobs,
-                                    &app,
                                 )?;
                                 spawned = true;
                                 Ok(WriteResult {
@@ -1019,8 +1203,6 @@ impl Writer {
                             let ok = result.is_ok();
                             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
                             jobs.finish(job_id, ok, cancelled, changed);
-                            emit_changed(&app, "catalog");
-                            emit_changed(&app, "jobs");
                             if !spawned {
                                 start_next_extract(
                                     &mut catalog,
@@ -1028,11 +1210,11 @@ impl Writer {
                                     &db_path,
                                     &writer_tx,
                                     &jobs,
-                                    &app,
                                     &appraise,
                                     &focus,
                                 );
                             }
+                            mark_committed(&changes, &catalog, before, Origin::Background);
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                             // Quiet for a second. Backfill previews in short slices, and only
@@ -1043,16 +1225,16 @@ impl Writer {
                             if !drain_enabled {
                                 continue;
                             }
-                            if rx.recv_timeout(std::time::Duration::ZERO).is_ok() {
-                                continue; // an op is waiting — let the loop pick it up
+                            if inbox.waiting() {
+                                continue; // an op is waiting — held, and run on the next turn
                             }
                             // Watch signal (debounced upstream): rescan every watched source with
                             // the incremental crawl. The writer is idle here by construction.
                             if let Some(w) = &watch {
                                 if w.rx.recv_timeout(std::time::Duration::ZERO).is_ok()
-                                    && rescan_watched(&mut catalog, &db_path, &app)
+                                    && rescan_watched(&mut catalog, &db_path)
                                 {
-                                    emit_changed(&app, "catalog");
+                                    changes.catalog(Origin::Background);
                                 }
                             }
                             idle_tick = idle_tick.wrapping_add(1);
@@ -1144,7 +1326,7 @@ impl Writer {
                                 );
                                 pump.store(false, Ordering::Relaxed);
                                 if r.map(|w| w.changed > 0).unwrap_or(false) {
-                                    emit_changed(&app, "catalog");
+                                    changes.catalog(Origin::Background);
                                 }
                             } else {
                                 let n = drain_previews(
@@ -1155,7 +1337,7 @@ impl Writer {
                                     std::time::Duration::from_secs(1),
                                 );
                                 if n > 0 {
-                                    emit_changed(&app, "catalog");
+                                    changes.catalog(Origin::Background);
                                 }
                             }
                         }
@@ -1170,9 +1352,15 @@ impl Writer {
 
     /// Run one op and wait for it. `Err` carries a message the frontend can show verbatim.
     pub fn run(&self, op: Op) -> Result<WriteResult, String> {
+        self.run_as(op, Origin::User)
+    }
+
+    /// [`Writer::run`] on someone else's behalf. The agent bridge says so, and the shell then
+    /// shows a pending update rather than re-reading under the user (ADR-0016).
+    pub fn run_as(&self, op: Op, origin: Origin) -> Result<WriteResult, String> {
         let (reply, wait) = mpsc::channel();
         self.tx
-            .send(WriterMsg::Op(Job { op, reply }))
+            .send(WriterMsg::Op(Job { op, reply, origin }))
             .map_err(|_| "writer thread is gone".to_string())?;
         wait.recv()
             .map_err(|_| "writer thread dropped the job".to_string())?
@@ -1200,7 +1388,7 @@ fn rebuild_watch(catalog: &Catalog) -> Option<lodestash_ingest::watch::RootWatch
 /// BLAKE3 via `needs_rehash`), then the standard persist on this thread (single-writer rule —
 /// `persist_to_catalog` opens its own connection here exactly as `Op::PersistScan` does).
 /// Returns whether anything actually changed, so the UI only reloads when it did.
-fn rescan_watched(catalog: &mut Catalog, db_path: &Path, _app: &Option<tauri::AppHandle>) -> bool {
+fn rescan_watched(catalog: &mut Catalog, db_path: &Path) -> bool {
     let cfg = AppConfig::load();
     let project = cfg.last_project_name.as_deref();
     let mut changed = false;
@@ -1482,23 +1670,19 @@ fn appraise_pass(
 /// to travel back on. It is recorded as a **failed job** instead: the tray is where this feature
 /// reports, and a pack that silently never unpacks is the exact failure this whole path exists to
 /// stop being invisible.
-#[allow(clippy::too_many_arguments)]
 fn start_next_extract(
     catalog: &mut Catalog,
     queue: &mut VecDeque<Job>,
     db_path: &Path,
     tx: &Sender<WriterMsg>,
     jobs: &JobRegistry,
-    app: &Option<tauri::AppHandle>,
     progress: &AppJobProgress,
     focus: &Mutex<AppraiseFocus>,
 ) {
-    let failures = drain_to_first_spawn(queue, jobs, |op| {
-        run(catalog, db_path, op, tx, jobs, app, progress, focus).map(|_| ())
+    // Each failure is recorded as a failed job, and the registry publishes that itself.
+    drain_to_first_spawn(queue, jobs, |op| {
+        run(catalog, db_path, op, tx, jobs, progress, focus).map(|_| ())
     });
-    if failures > 0 {
-        emit_changed(app, "jobs");
-    }
 }
 
 /// The queue invariant itself, with the writer's dependencies handed in.
@@ -1531,19 +1715,12 @@ fn drain_to_first_spawn(
     failures
 }
 
-// Eight arguments is over clippy's default, and deliberately so: every one is a distinct
-// capability the writer thread owns (the catalog, the db path, the op, the reply channel, the job
-// registry, the app handle, the progress cell, the appraisal focus). Bundling them into a context
-// struct would rename the problem, not remove it — the same eight things would still have to be
-// threaded here, and one indirection further from the call sites that read them.
-#[allow(clippy::too_many_arguments)]
 fn run(
     catalog: &mut Catalog,
     db_path: &Path,
     op: Op,
     tx: &Sender<WriterMsg>,
     jobs: &JobRegistry,
-    app: &Option<tauri::AppHandle>,
     progress: &AppJobProgress,
     focus: &Mutex<AppraiseFocus>,
 ) -> Result<WriteResult, String> {
@@ -2109,7 +2286,7 @@ fn run(
                 let wcancel = handles.cancel;
                 let wprogress = handles.progress.expect("manifest jobs carry progress");
                 let wpath = PathBuf::from(&pkg.package_path);
-                let wapp = app.clone();
+                let wjobs = jobs.clone();
                 std::thread::Builder::new()
                     .name("manifest-worker".into())
                     .spawn(move || {
@@ -2118,20 +2295,10 @@ fn run(
                         let work =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                                 let report_cancel = wcancel.clone();
-                                let last_progress = AtomicU64::new(0);
                                 let report = move |done: u64, total: u64| {
                                     wprogress.done.store(done, Ordering::Relaxed);
                                     wprogress.total.store(total, Ordering::Relaxed);
-                                    let now_ms = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_millis() as u64)
-                                        .unwrap_or(0);
-                                    if now_ms.saturating_sub(last_progress.load(Ordering::Relaxed))
-                                        >= 250
-                                    {
-                                        last_progress.store(now_ms, Ordering::Relaxed);
-                                        emit_changed(&wapp, "jobs");
-                                    }
+                                    wjobs.progressed();
                                     !report_cancel.load(Ordering::Relaxed)
                                 };
                                 let read = read_manifest_with_progress(&wpath, &report)
@@ -2185,7 +2352,7 @@ fn run(
             } else {
                 // Locators already recorded (browse persistence) — mint + extract right away.
                 mint_in_pack(catalog, package_id, &entries)?;
-                spawn_extract_worker(&pkg, &workspace_dir, &entries, tx, jobs, app)?;
+                spawn_extract_worker(&pkg, &workspace_dir, &entries, tx, jobs)?;
             }
             Ok(WriteResult {
                 changed: 0, // queued — the tray reports the real changed count
@@ -2477,7 +2644,6 @@ fn spawn_extract_worker(
     entries: &[PackageEntryRecord],
     tx: &Sender<WriterMsg>,
     jobs: &JobRegistry,
-    app: &Option<tauri::AppHandle>,
 ) -> Result<(), String> {
     let wanted: Vec<EntryLocator> = entries
         .iter()
@@ -2499,7 +2665,7 @@ fn spawn_extract_worker(
     let wprogress = handles.progress.expect("extract jobs carry progress");
     let wpath = PathBuf::from(&pkg.package_path);
     let wworkspace = workspace_dir.to_path_buf();
-    let wapp = app.clone();
+    let wjobs = jobs.clone();
     let wpkg_id = pkg.id;
     std::thread::Builder::new()
         .name("extract-worker".into())
@@ -2511,18 +2677,10 @@ fn spawn_extract_worker(
             // `start_next_extract` fixes for the error path, by a different road.
             let work = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                 let report_cancel = wcancel.clone();
-                let last_progress = AtomicU64::new(0);
                 let report = move |done: u64, total: u64| {
                     wprogress.done.store(done, Ordering::Relaxed);
                     wprogress.total.store(total, Ordering::Relaxed);
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-                    if now_ms.saturating_sub(last_progress.load(Ordering::Relaxed)) >= 250 {
-                        last_progress.store(now_ms, Ordering::Relaxed);
-                        emit_changed(&wapp, "jobs");
-                    }
+                    wjobs.progressed();
                     !report_cancel.load(Ordering::Relaxed)
                 };
                 let placed = extract_at_offsets_with_progress(&wpath, &wworkspace, wanted, &report)
@@ -3040,6 +3198,7 @@ mod tests {
                         package_id: 900 + i,
                     },
                     reply,
+                    origin: Origin::User,
                 });
                 wait
             })
@@ -3152,6 +3311,172 @@ mod tests {
         assert!(
             deletable(&target(inside.to_str()), std::slice::from_ref(&root), None),
             "a file under a source root must pass the fence"
+        );
+    }
+
+    /// Drain whatever is pending right now, as the publisher would at the end of a window.
+    fn take(changes: &Changes) -> ChangedEvent {
+        changes.inner.0.lock().expect("changes lock").take()
+    }
+
+    /// ADR-0016's headline: fifty writes landing inside one window reach the shell as one event.
+    /// Before, every op emitted `catalog` *and* `jobs` — a hundred IPC events and fifty status
+    /// re-reads for fifty tag writes, and a `jobs` event for ops that never touched the tray.
+    #[test]
+    fn fifty_writes_in_one_window_publish_once() {
+        let changes = Changes::default();
+        let (tx, rx) = mpsc::channel();
+        changes.spawn_publisher(std::time::Duration::from_millis(60), move |e| {
+            let _ = tx.send(e);
+        });
+        for _ in 0..50 {
+            changes.catalog(Origin::User);
+        }
+        let event = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the window closes and publishes");
+        assert_eq!(
+            event,
+            ChangedEvent {
+                catalog: true,
+                jobs: false,
+                origins: vec!["user"],
+                catalog_gen: 50,
+                jobs_gen: 0,
+            },
+            "one event carrying every write's generation, and no jobs change nobody caused"
+        );
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "nothing after it: the fifty were one publication"
+        );
+    }
+
+    /// A fixed window, not a trailing debounce: a producer that never pauses (the preview drain)
+    /// still publishes every window, where a debounce waiting for quiet would starve forever. And a
+    /// window that mixes origins keeps all of them — the shell must not take an agent's write for
+    /// the user's own because the two happened to share 250 ms.
+    #[test]
+    fn a_continuous_producer_publishes_every_window_and_loses_no_origin() {
+        let changes = Changes::default();
+        let (tx, rx) = mpsc::channel();
+        changes.spawn_publisher(std::time::Duration::from_millis(20), move |e| {
+            let _ = tx.send(e);
+        });
+        let origins = [Origin::User, Origin::Agent, Origin::Background];
+        let started = std::time::Instant::now();
+        let mut marks = 0u64;
+        while started.elapsed() < std::time::Duration::from_millis(300) {
+            changes.catalog(origins[(marks % 3) as usize]);
+            marks += 1;
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mut events = Vec::new();
+        while let Ok(e) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            events.push(e);
+        }
+        assert!(
+            events.len() >= 5,
+            "300 ms of continuous writes over a 20 ms window published {} time(s) — starved",
+            events.len()
+        );
+        assert!(
+            events
+                .windows(2)
+                .all(|p| p[0].catalog_gen < p[1].catalog_gen),
+            "generations only climb"
+        );
+        assert_eq!(
+            events.last().map(|e| e.catalog_gen),
+            Some(marks),
+            "the last event accounts for every write — none lost, none deferred forever"
+        );
+        let seen: std::collections::HashSet<&str> = events
+            .iter()
+            .flat_map(|e| e.origins.iter().copied())
+            .collect();
+        assert_eq!(seen.len(), 3, "every origin survives coalescing: {seen:?}");
+    }
+
+    /// The tray is its own domain: a job starting, moving or finishing publishes `jobs`, never
+    /// `catalog` — the grid has no reason to re-read because a download began.
+    #[test]
+    fn the_job_registry_publishes_its_own_changes_and_only_those() {
+        let jobs = JobRegistry::default();
+        let h = jobs.start("Extract X".into(), "extract", true);
+        let started = take(jobs.changes());
+        assert!(
+            started.jobs && !started.catalog,
+            "start is a jobs change: {started:?}"
+        );
+        jobs.progressed();
+        jobs.finish(h.id, true, false, 3);
+        let finished = take(jobs.changes());
+        assert!(finished.jobs && !finished.catalog, "{finished:?}");
+        assert_eq!(
+            finished.jobs_gen, 3,
+            "start, progress and finish each count"
+        );
+        assert!(
+            finished.origins.is_empty(),
+            "a tray change has no catalog origin"
+        );
+    }
+
+    /// Only a turn that committed rows is a catalog change. `total_changes` is SQLite's own count,
+    /// so a turn that only read stays silent and a write says so, under the origin that caused it.
+    #[test]
+    fn only_a_committed_write_marks_the_catalog() {
+        let c = Catalog::open_in_memory().expect("open");
+        let changes = Changes::default();
+
+        let before = c.total_changes();
+        let _ = c.source_infos().expect("read");
+        mark_committed(&changes, &c, before, Origin::User);
+        assert!(!take(&changes).catalog, "a read is not a change");
+
+        let before = c.total_changes();
+        c.upsert_import_source("s", "/s", "folder").expect("write");
+        mark_committed(&changes, &c, before, Origin::Agent);
+        let event = take(&changes);
+        assert!(event.catalog, "a committed write is a change");
+        assert_eq!(
+            event.origins,
+            vec!["agent"],
+            "under the origin that caused it"
+        );
+    }
+
+    /// The idle probe used to *receive and discard* whatever it found, so a write arriving at that
+    /// instant never ran and never replied. It is held now, delivered next, and delivered once.
+    #[test]
+    fn a_write_found_by_the_idle_probe_is_run_next_not_dropped() {
+        let (tx, rx) = mpsc::channel();
+        let mut inbox = Inbox { rx, held: None };
+        let (reply, wait) = mpsc::channel();
+        tx.send(WriterMsg::Op(Job {
+            op: Op::ClearStaged,
+            reply,
+            origin: Origin::User,
+        }))
+        .expect("send");
+        assert!(inbox.waiting(), "the probe sees the queued write");
+        assert!(
+            inbox.waiting(),
+            "probing again still holds exactly that one"
+        );
+        match inbox.next(std::time::Duration::ZERO) {
+            Ok(WriterMsg::Op(job)) => job.reply.send(Ok(WriteResult::default())).expect("reply"),
+            _ => panic!("the held write must come out next, ahead of any idle work"),
+        }
+        assert!(wait.recv().is_ok(), "its caller is answered");
+        assert!(
+            matches!(
+                inbox.next(std::time::Duration::ZERO),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "and it is delivered once, not twice"
         );
     }
 }

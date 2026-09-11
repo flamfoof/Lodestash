@@ -1,5 +1,10 @@
 # Lodestash — Svelte re-write board (B-series status)
 
+> **Planning follow-up (2026-09-10):** [MCP-ASSET-ANALYSIS](MCP-ASSET-ANALYSIS.md) refines the
+> existing agent-plane work into a scoped analysis/writeback workflow. Its documentation card and
+> deferred implementation handoff are tracked in [KANBAN](KANBAN.md); the new operations are not
+> shipped by that plan. Existing completed MCP cards remain historical evidence of their own scope.
+
 Status board compiled 2026-08-07 from a six-way audit (UI-SPEC / DATA-MODEL / ENGINE-API+MCP /
 INGESTION / AI-PIPELINE / KANBAN truth-check) against the live code. The egui crate
 (`crates/lodestash-ui`) was deleted at the B7 cutover — the Svelte shell +
@@ -11,6 +16,34 @@ Lanes: 🟢 Done · 🟡 Partial (delta named) · 🔴 Missing · ⚪ Built but 
 🟠 Visual conformance & doc drift · 🔵 Engine-project / deferred. The main board
 ([`KANBAN.md`](KANBAN.md)) holds the full history; the card titles here match the main board's
 B-card ids where they exist. Evidence is `file:line` in `crates/lodestash-desktop/`.
+
+---
+
+## ▶ v1 architecture program (kicked off 2026-09-10)
+
+Implementing [the v1 plan](superpowers/plans/2026-09-07-v1-architecture.md), with the
+[MCP asset-analysis handoff](superpowers/plans/2026-09-10-mcp-asset-analysis.md) folded into the
+slices it refines (S04/S05/S10–S12). Acceptance criteria live in the plan, once; a card here only
+records state and evidence. The plan's board consolidation is its own slice (S19) — until it lands
+this file stays the live board.
+
+- [x] **R1 · S01 — coalesced change publication, lossless idle probe.** One publisher thread, a
+      250 ms fixed window, domain + origin + generation per event
+      ([ADR-0016](decisions/ADR-0016-coalesced-change-publication.md)); the idle probe holds the
+      message it finds instead of dropping it. Checks in `writer.rs` `mod tests`.
+- [ ] **R1 · S02 — stable browsing with a pending-update indication.**
+- [ ] **R2 · S03 — FTS external-content repair.**
+- [ ] **R2 · S04 — one atomic, provenanced tag batch with conflict-aware undo.**
+- [ ] **R2 · S05 — the batch tag write on every adapter** (MCP handoff Task 4, then 4a).
+- [ ] **R3 · S06–S08 — component-scoped prefab evidence, native material inputs, textured previews.**
+- [ ] **R4 · S09 — resident embedding snapshots with generation invalidation.**
+- [ ] **R5 · S10–S13 — endpoint egress policy, headless startup, bounded library walk, app-owned
+      bulk runs** (MCP handoff Tasks 1–3 and 5).
+- [ ] **Proxies/packs · S14–S18 — pre-extraction identity, one cache policy, visual tiers, font
+      specimens, batched inflate.**
+- [ ] **Records · S19 — one board, one rules source, release evidence.**
+- [ ] **MCP handoff Task 6 — register Codex and run the ten-model pilot.** Needs the user's host,
+      library and consent choices; not something this repo can do on its own.
 
 ---
 

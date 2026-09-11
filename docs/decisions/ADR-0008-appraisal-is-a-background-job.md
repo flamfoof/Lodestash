@@ -4,6 +4,8 @@
 - **Date:** 2026-08-22
 - **Supersedes:** the Identify screen as the only path out of the backlog (UI-SPEC §3's
   `✦ Identify all (N)` as a foreground batch), and §1's step-2 completion fork
+- **Amended by:** [ADR-0014](ADR-0014-the-backlog-lane-is-duty-cycled.md) (the lane is duty-cycled)
+  and [ADR-0016](ADR-0016-coalesced-change-publication.md) (how its results reach the shell)
 
 ## Context
 
