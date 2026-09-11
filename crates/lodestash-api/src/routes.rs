@@ -38,6 +38,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/v1/tags", get(tags))
         .route("/v1/assets/{id}/tags", post(add_tag))
+        .route("/v1/tags/batch", post(write_tags))
         .route("/v1/collections", get(collections))
         .route("/v1/mapping/apply", post(apply_mapping))
         .route("/v1/identify", post(identify_asset))
@@ -79,6 +80,7 @@ fn tool_for(method: &Method, path: &str, query: Option<&str>) -> Option<&'static
         ("POST", "/v1/jobs/{id}/cancel") => "cancel_job",
         ("GET", "/v1/tags") => "list_tags",
         ("POST", "/v1/assets/{id}/tags") => "add_tag",
+        ("POST", "/v1/tags/batch") => "write_tags",
         ("GET", "/v1/collections") => "list_collections",
         ("POST", "/v1/mapping/apply") => "apply_mapping",
         ("POST", "/v1/identify") => "identify_asset",
@@ -225,22 +227,55 @@ async fn search(State(state): State<Shared>, Query(p): Query<SearchParams>) -> R
 }
 
 async fn asset_detail(State(state): State<Shared>, Path(id): Path<i64>) -> Response {
-    let Some(row) = (match state.asset(id) {
-        Ok(row) => row,
-        Err(e) => return db_err(e),
-    }) else {
-        return not_found();
+    match state.asset_detail_json(id) {
+        Ok(Some(body)) => Json(body).into_response(),
+        Ok(None) => not_found(),
+        Err(e) => db_err(e),
+    }
+}
+
+/// ENGINE-API §8.3 `write_tags` — `POST /v1/tags/batch`. Read raw so the 1 MiB limit is held
+/// before anything is parsed; unknown fields refuse the request.
+async fn write_tags(State(state): State<Shared>, body: axum::body::Bytes) -> Response {
+    if body.len() > crate::MAX_TAG_BATCH_BYTES {
+        let (status, code, message) = crate::TagBatchError::TooLarge(body.len()).parts();
+        return err(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::PAYLOAD_TOO_LARGE),
+            code,
+            &message,
+            "",
+        );
+    }
+    let req: crate::TagBatchRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                "The tag batch is malformed.",
+                &e.to_string(),
+            )
+        }
     };
-    let mut body = summary_json(&row);
-    let m = row.metrics;
-    body["size_bytes"] = json!(row.size_bytes);
-    body["stats"] = json!({
-        "tris": m.tri_count, "width_px": m.width_px,
-        "height_px": m.height_px, "duration_ms": m.duration_ms,
-    });
-    let deps = state.dependencies(id).unwrap_or_default();
-    body["dependencies"] = json!({ "count": deps.len(), "asset_ids": deps });
-    Json(body).into_response()
+    match state.request_tag_batch(req, body.len()) {
+        Ok(k) => {
+            let (status, v) = k.to_response();
+            (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+                Json(v),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let (status, code, message) = e.parts();
+            err(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+                code,
+                &message,
+                "",
+            )
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1312,5 +1347,278 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::NOT_IMPLEMENTED);
         assert_eq!(b["error"]["code"], "ai_unavailable");
+    }
+
+    /// A catalog file with one image asset, and the state serving it with a write bridge that
+    /// applies approved batches through a second connection — the app's writer, in miniature.
+    fn tag_state() -> (tempfile::TempDir, Shared, i64) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        let id = {
+            let mut c = lodestash_core::catalog::Catalog::open(&db).unwrap();
+            c.seed_media_types().unwrap();
+            let src = c.upsert_import_source("Lib", "C:/lib", "folder").unwrap();
+            c.record_crawl(
+                src,
+                None,
+                &[lodestash_core::catalog::CrawlRecord {
+                    workspace_rel: None,
+                    content_hash: None,
+                    rel_path: "wall.png".into(),
+                    name: "wall.png".into(),
+                    media_type: "image".into(),
+                    size_bytes: 1,
+                    mtime: 1,
+                }],
+            )
+            .unwrap();
+            c.assets_needing_tags_within(1, None).unwrap()[0].asset_id
+        };
+        let s =
+            Arc::new(ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap());
+        let writer_db = db.clone();
+        s.set_write(Box::new(move |w| match w {
+            crate::AgentWrite::TagBatch { request, digest } => {
+                lodestash_core::catalog::Catalog::open(&writer_db)
+                    .map_err(|e| e.to_string())?
+                    .apply_tag_batch(&request.to_core_batch(&digest))
+                    .map(|o| o.changed_assets.len())
+                    .map_err(|e| e.to_string())
+            }
+            other => Err(format!("unexpected write {other:?}")),
+        }));
+        (dir, s, id)
+    }
+
+    fn batch_body(
+        request_id: &str,
+        asset_id: i64,
+        revision: &str,
+        producer: &str,
+        value: &str,
+    ) -> Value {
+        json!({
+            "request_id": request_id,
+            "assets": [{
+                "asset_id": asset_id,
+                "expected_revision": revision,
+                "producer_id": producer,
+                "model_id": "gpt-5-codex",
+                "mode": "append",
+                "tags": [{ "namespace": "subject", "value": value, "confidence": 0.8 }],
+            }],
+        })
+    }
+
+    async fn settle(st: &Shared, job_id: &str) -> Value {
+        for _ in 0..250 {
+            let j = st.jobs.get(job_id).expect("job").to_json();
+            if !matches!(
+                j["state"].as_str(),
+                Some("awaiting_approval" | "queued" | "running")
+            ) {
+                return j;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("job {job_id} never settled");
+    }
+
+    const RID_A: &str = "0b4ad2c7-6c1a-4c5e-9a0f-1f2b3c4d5e6a";
+    const RID_B: &str = "1c5be3d8-7d2b-4d6f-8b10-2a3c4d5e6f7b";
+
+    /// Everything that can be refused is refused before a request is parked — so the person at the
+    /// machine is never asked to approve something that could not be written.
+    #[tokio::test]
+    async fn write_tags_refuses_before_it_parks() {
+        let (_d, st, id) = tag_state();
+        let token = st.token.clone();
+        let app = || router(st.clone());
+        let rev = st.asset_detail_json(id).unwrap().unwrap()["annotation_revision"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let post = |body: Value| post_req("/v1/tags/batch", Some(&token), body);
+
+        let (s, v) = send(
+            app(),
+            post(batch_body(RID_A, id, &rev, "codex@test", "stone")),
+        )
+        .await;
+        assert_eq!(
+            (s, v["error"]["code"].as_str()),
+            (StatusCode::CONFLICT, Some("producer_not_configured"))
+        );
+        st.set_agent_producer(Some("codex@test".into()));
+
+        let mut unknown = batch_body(RID_A, id, &rev, "codex@test", "stone");
+        unknown["assets"][0]["confirmed"] = json!(true);
+        let mut many = batch_body(RID_A, id, &rev, "codex@test", "stone");
+        many["assets"] = json!((0..101)
+            .map(|i| json!({"asset_id": i, "expected_revision": "r", "producer_id": "codex@test", "mode": "append"}))
+            .collect::<Vec<_>>());
+        let mut no_revision = batch_body(RID_A, id, &rev, "codex@test", "stone");
+        no_revision["assets"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_revision");
+        for (body, status, code) in [
+            (unknown, StatusCode::BAD_REQUEST, "invalid_argument"),
+            (
+                batch_body("not-a-uuid", id, &rev, "codex@test", "stone"),
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+            ),
+            (
+                batch_body(RID_A, id, &rev, "someone-else", "stone"),
+                StatusCode::FORBIDDEN,
+                "producer_mismatch",
+            ),
+            (many, StatusCode::BAD_REQUEST, "invalid_argument"),
+            (no_revision, StatusCode::BAD_REQUEST, "invalid_argument"),
+            (
+                batch_body(RID_A, id, &rev, "codex@test", "0.93"),
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+            ),
+            (
+                batch_body(RID_A, 999_999, &rev, "codex@test", "stone"),
+                StatusCode::NOT_FOUND,
+                "asset_not_found",
+            ),
+        ] {
+            let (s, v) = send(app(), post(body)).await;
+            assert_eq!(
+                (s, v["error"]["code"].as_str()),
+                (status, Some(code)),
+                "{v}"
+            );
+        }
+        assert!(
+            st.jobs.awaiting_approval().is_empty(),
+            "a refused request was parked"
+        );
+    }
+
+    /// The whole contract end to end: parked with its diff, written once on approval as the agent's
+    /// producer, answered from its receipt on retry, refused on a reused id, refused when the asset
+    /// moved under it — and a denial writes nothing.
+    #[tokio::test]
+    async fn an_approved_batch_writes_once_and_a_retry_gets_the_same_answer() {
+        let (_d, st, id) = tag_state();
+        st.set_agent_producer(Some("codex@test".into()));
+        let token = st.token.clone();
+        let app = || router(st.clone());
+        let rev = |st: &Shared| {
+            st.asset_detail_json(id).unwrap().unwrap()["annotation_revision"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let first = rev(&st);
+        let body = batch_body(RID_A, id, &first, "codex@test", "stone");
+
+        let (s, parked) = send(
+            app(),
+            post_req("/v1/tags/batch", Some(&token), body.clone()),
+        )
+        .await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{parked}");
+        assert_eq!(parked["state"], "awaiting_approval");
+        assert_eq!(
+            parked["detail"]["assets"][0]["proposed"],
+            json!(["subject:stone"])
+        );
+        let job_id = parked["job_id"].as_str().unwrap().to_string();
+        let (_, again) = send(
+            app(),
+            post_req("/v1/tags/batch", Some(&token), body.clone()),
+        )
+        .await;
+        assert_eq!(
+            again["job_id"], parked["job_id"],
+            "a parked request answers with its job"
+        );
+
+        st.approve_job(&job_id);
+        let done = settle(&st, &job_id).await;
+        assert_eq!(done["state"], "done", "{done}");
+        assert_eq!(done["result"]["changed_assets"], json!([id]));
+        let detail = st.asset_detail_json(id).unwrap().unwrap();
+        assert_eq!(detail["tag_provenance"][0]["source"], "ai:codex@test");
+        assert_eq!(detail["tag_provenance"][0]["model_id"], "gpt-5-codex");
+
+        let (s, replay) = send(app(), post_req("/v1/tags/batch", Some(&token), body)).await;
+        assert_eq!(
+            (s, replay["replayed"].as_bool()),
+            (StatusCode::OK, Some(true))
+        );
+        assert_eq!(
+            replay["result"], done["result"],
+            "a retry gets the original answer"
+        );
+        let (s, conflict) = send(
+            app(),
+            post_req(
+                "/v1/tags/batch",
+                Some(&token),
+                batch_body(RID_A, id, &first, "codex@test", "moss"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            (s, conflict["error"]["code"].as_str()),
+            (StatusCode::CONFLICT, Some("request_conflict"))
+        );
+
+        let (_, stale) = send(
+            app(),
+            post_req(
+                "/v1/tags/batch",
+                Some(&token),
+                batch_body(RID_B, id, &first, "codex@test", "moss"),
+            ),
+        )
+        .await;
+        let stale_id = stale["job_id"].as_str().unwrap().to_string();
+        st.approve_job(&stale_id);
+        let failed = settle(&st, &stale_id).await;
+        assert_eq!(failed["state"], "error");
+        assert!(
+            failed["error"]
+                .as_str()
+                .unwrap()
+                .contains("revision_conflict"),
+            "{failed}"
+        );
+
+        let (_, denied) = send(
+            app(),
+            post_req(
+                "/v1/tags/batch",
+                Some(&token),
+                batch_body(
+                    "2d6cf4e9-8e3c-4e70-9c21-3b4d5e6f7a8c",
+                    id,
+                    &rev(&st),
+                    "codex@test",
+                    "ivy",
+                ),
+            ),
+        )
+        .await;
+        let denied_id = denied["job_id"].as_str().unwrap().to_string();
+        st.deny_job(&denied_id);
+        assert_eq!(
+            st.jobs.get(&denied_id).unwrap().to_json()["state"],
+            "cancelled"
+        );
+        let values: Vec<String> = st.asset_detail_json(id).unwrap().unwrap()["tag_provenance"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["value"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(values, vec!["stone"], "only the approved write landed");
     }
 }

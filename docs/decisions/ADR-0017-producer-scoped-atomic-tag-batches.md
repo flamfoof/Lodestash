@@ -56,7 +56,7 @@ Four findings, each checked against the code:
   distinct labels (the M25 view); showing provenance in the Inspector is S05's work.
 - Every model result now records background history. Retention bounds it.
 - A write that changes nothing writes and publishes nothing.
-- The agent bridge's existing add/remove-tag operations still write as the person until S05 gives
-  agent writes their own producer.
+- The agent bridge's add/remove-tag operations wrote as the person until S05 (2026-09-11) gave them
+  `ai:legacy-agent`; an agent's attributed batches use its configured producer.
 - Reverse the retention strategy only on a measured size or latency failure — never by giving up
   attribution.

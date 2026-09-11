@@ -54,6 +54,7 @@ fn item(
         mode,
         tags,
         description: None,
+        expected_revision: None,
     }
 }
 
@@ -66,6 +67,7 @@ fn batch(
         items,
         completes_queue,
         history,
+        receipt: None,
     }
 }
 
@@ -862,5 +864,118 @@ fn m26_marks_old_ai_rows_legacy_and_keeps_their_model() {
         c.recent_ops(10).expect("recent").len(),
         1,
         "old history is still undoable"
+    );
+}
+
+/// A writer that names the revision it read is refused if anything moved since — tags or caption —
+/// and the refusal is the whole batch. The revision itself only moves when an annotation does.
+#[test]
+fn a_stale_revision_refuses_the_batch_and_a_fresh_one_passes() {
+    let (mut c, ids) = catalog_with(&[("a.png", "image"), ("b.png", "image")]);
+    let (a, b) = (ids[0], ids[1]);
+    let seen = c.annotation_revision(a).expect("revision");
+    assert_eq!(
+        seen,
+        c.annotation_revision(a).expect("again"),
+        "a read does not move it"
+    );
+
+    c.apply_tag_batch(&batch(
+        vec![item(a, "ai:m", Some("m"), Append, vec![ai("stone", 0.5)])],
+        true,
+        None,
+    ))
+    .expect("someone else writes");
+    let moved = c.annotation_revision(a).expect("moved");
+    assert_ne!(seen, moved, "a tag write moves the revision");
+
+    let mut stale = item(a, "ai:host", None, Append, vec![ai("granite", 0.4)]);
+    stale.expected_revision = Some(seen);
+    let err = c
+        .apply_tag_batch(&batch(
+            vec![
+                item(b, "ai:host", None, Append, vec![ai("moss", 0.4)]),
+                stale,
+            ],
+            false,
+            Some(Agent),
+        ))
+        .expect_err("a stale revision");
+    assert!(
+        err.to_string()
+            .starts_with("catalog error: revision_conflict"),
+        "{err}"
+    );
+    assert!(
+        rows(&c, b).is_empty(),
+        "the other asset in the batch was written anyway"
+    );
+
+    let mut fresh = item(a, "ai:host", None, Append, vec![ai("granite", 0.4)]);
+    fresh.expected_revision = Some(moved.clone());
+    c.apply_tag_batch(&batch(vec![fresh], false, Some(Agent)))
+        .expect("a fresh revision passes");
+
+    let before_caption = c.annotation_revision(a).expect("rev");
+    let mut captioned = item(a, "ai:vlm", None, Append, vec![]);
+    captioned.description = Some("A stone.".into());
+    c.apply_tag_batch(&batch(vec![captioned], false, None))
+        .expect("caption");
+    assert_ne!(
+        before_caption,
+        c.annotation_revision(a).expect("rev"),
+        "a caption moves it too"
+    );
+}
+
+/// A receipt is written in the batch's own transaction: it exists exactly when the write does. A
+/// refused batch leaves none, and a no-op still leaves one — a retry must find its answer.
+#[test]
+fn a_request_receipt_commits_with_its_batch_and_only_then() {
+    let (mut c, ids) = catalog_with(&[("a.png", "image")]);
+    let a = ids[0];
+    let key = |id: &str| TagReceiptKey {
+        request_id: id.into(),
+        digest: format!("digest-{id}"),
+    };
+    let mut refused = batch(
+        vec![item(a, "ai:host", None, Append, vec![ai("0.9", 0.5)])],
+        false,
+        Some(Agent),
+    );
+    refused.receipt = Some(key("r1"));
+    assert!(c.apply_tag_batch(&refused).is_err());
+    assert_eq!(
+        c.tag_request_receipt("r1").expect("read"),
+        None,
+        "a refused batch left a receipt"
+    );
+
+    let mut ok = batch(
+        vec![item(a, "ai:host", None, Append, vec![ai("stone", 0.5)])],
+        false,
+        Some(Agent),
+    );
+    ok.receipt = Some(key("r2"));
+    let out = c.apply_tag_batch(&ok).expect("write");
+    let receipt = c.tag_request_receipt("r2").expect("read").expect("receipt");
+    assert_eq!(receipt.digest, "digest-r2");
+    assert_eq!(receipt.result["operation_id"], serde_json::json!(out.op_id));
+    assert_eq!(receipt.result["changed_assets"], serde_json::json!([a]));
+
+    let mut again = ok.clone();
+    again.receipt = Some(key("r3"));
+    c.apply_tag_batch(&again).expect("no-op");
+    let noop = c
+        .tag_request_receipt("r3")
+        .expect("read")
+        .expect("a no-op still answers");
+    assert_eq!(noop.result["unchanged_assets"], serde_json::json!([a]));
+
+    let mut reused = ok.clone();
+    reused.receipt = Some(key("r2"));
+    assert!(
+        c.apply_tag_batch(&reused).is_err(),
+        "one request id, one write"
     );
 }

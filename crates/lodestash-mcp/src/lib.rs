@@ -96,6 +96,47 @@ pub struct TagsArgs {
     pub limit: Option<usize>,
 }
 
+/// One proposed assignment (ENGINE-API §8.3).
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WriteTagsTag {
+    /// A facet a model may write: subject | style | material | mood | usage | free.
+    pub namespace: String,
+    pub value: String,
+    /// Your confidence in [0, 1], or null.
+    pub confidence: Option<f64>,
+}
+
+/// One asset's part of a `write_tags` request.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WriteTagsAsset {
+    pub asset_id: i64,
+    /// The `annotation_revision` get_asset reported. If anything changed since, the batch is refused.
+    pub expected_revision: String,
+    /// The producer id configured for this host in Lodestash.
+    pub producer_id: String,
+    /// The model you are, when you know it; null otherwise. Never guess.
+    pub model_id: Option<String>,
+    /// `append` (add to this producer's tags) or `replace_producer` (replace them).
+    pub mode: String,
+    pub tags: Vec<WriteTagsTag>,
+    /// A short description; omit to leave the caption as it is.
+    pub description: Option<String>,
+}
+
+/// `write_tags` — the same request `POST /v1/tags/batch` takes.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WriteTagsArgs {
+    /// A fresh UUID per request. Reuse it only to retry the same body after a lost response.
+    pub request_id: String,
+    /// The vocabulary revision the proposals were checked against (enforced once review lands).
+    pub vocabulary_revision: Option<String>,
+    /// 1 to 100 assets.
+    pub assets: Vec<WriteTagsAsset>,
+}
+
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AddTagArgs {
     /// The asset to tag.
@@ -225,17 +266,11 @@ impl Lodestash {
         Parameters(args): Parameters<AssetArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.gate("get_asset")?;
-        let Some(row) = self.state.asset(args.id).map_err(internal)? else {
+        // The same builder as REST's `GET /v1/assets/{id}`: provenance and revision included, and
+        // no second copy of the response to drift.
+        let Some(body) = self.state.asset_detail_json(args.id).map_err(internal)? else {
             return Err(ErrorData::invalid_params("no such asset", None));
         };
-        let mut body = lodestash_api::summary_json(&row);
-        body["size_bytes"] = serde_json::json!(row.size_bytes);
-        body["stats"] = serde_json::json!({
-            "tris": row.metrics.tri_count, "width_px": row.metrics.width_px,
-            "height_px": row.metrics.height_px, "duration_ms": row.metrics.duration_ms,
-        });
-        let deps = self.state.dependencies(args.id).unwrap_or_default();
-        body["dependencies"] = serde_json::json!({ "count": deps.len(), "asset_ids": deps });
         Ok(CallToolResult::success(vec![ContentBlock::json(body)?]))
     }
 
@@ -508,6 +543,41 @@ impl Lodestash {
         )?]))
     }
 
+    /// ENGINE-API §8.3 `write_tags` — an attributed batch of tags and captions, parked for the
+    /// person at the machine to approve. Parsed into the very request type REST uses, so the two
+    /// planes validate identically; a refusal is a tool error carrying the same code.
+    #[tool(
+        name = "write_tags",
+        description = "Write tags (and optionally a short description) on 1-100 assets as this host's \
+                       configured producer. Read each asset's annotation_revision with get_asset \
+                       first. Returns a job in state 'awaiting_approval' until the desktop owner \
+                       approves (poll get_job_status); retrying the same request_id and body returns \
+                       the original result. Never confirms an asset."
+    )]
+    pub async fn write_tags(
+        &self,
+        Parameters(args): Parameters<WriteTagsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.gate("write_tags")?;
+        let bytes = serde_json::to_vec(&args)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let req: lodestash_api::TagBatchRequest = serde_json::from_slice(&bytes)
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        match self.state.request_tag_batch(req, bytes.len()) {
+            Ok(k) => Ok(CallToolResult::success(vec![ContentBlock::json(
+                k.to_response().1,
+            )?])),
+            Err(e) => {
+                let (status, code, message) = e.parts();
+                Ok(CallToolResult::error(vec![ContentBlock::json(
+                    serde_json::json!({
+                        "error": { "code": code, "message": message, "status": status }
+                    }),
+                )?]))
+            }
+        }
+    }
+
     /// ENGINE-API §2 `list_collections` — named collections + the active project's staging tray.
     #[tool(
         name = "list_collections",
@@ -739,5 +809,98 @@ mod tests {
         let lode = Lodestash::new(state);
         assert!(lode.gate("search_assets").is_ok(), "enabled tool passes");
         assert!(lode.gate("export_asset").is_err(), "disabled tool refused");
+    }
+
+    /// `write_tags` is one contract on both planes (ENGINE-API §8.4): the tool parses into the REST
+    /// request type and runs the same validation, so a refusal carries the same code and an
+    /// accepted request parks the same kind of job on the same gate.
+    #[test]
+    fn write_tags_is_one_contract_on_both_planes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        let id = {
+            let mut c = lodestash_core::catalog::Catalog::open(&db).unwrap();
+            c.seed_media_types().unwrap();
+            let src = c.upsert_import_source("Lib", "C:/lib", "folder").unwrap();
+            c.record_crawl(
+                src,
+                None,
+                &[lodestash_core::catalog::CrawlRecord {
+                    workspace_rel: None,
+                    content_hash: None,
+                    rel_path: "a.png".into(),
+                    name: "a.png".into(),
+                    media_type: "image".into(),
+                    size_bytes: 1,
+                    mtime: 1,
+                }],
+            )
+            .unwrap();
+            c.assets_needing_tags_within(1, None).unwrap()[0].asset_id
+        };
+        let state =
+            Arc::new(ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap());
+        state.set_agent_producer(Some("codex@test".into()));
+        let mcp = Lodestash::new(state.clone());
+        let rev = state.asset_detail_json(id).unwrap().unwrap()["annotation_revision"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let body = |rid: &str, producer: &str, value: &str| {
+            serde_json::json!({
+                "request_id": rid,
+                "assets": [{ "asset_id": id, "expected_revision": rev, "producer_id": producer,
+                             "mode": "append",
+                             "tags": [{ "namespace": "subject", "value": value, "confidence": 0.5 }] }]
+            })
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for (b, code) in [
+            (
+                body(
+                    "6f1c1e0e-1111-4111-8111-111111111111",
+                    "someone-else",
+                    "stone",
+                ),
+                "producer_mismatch",
+            ),
+            (
+                body("6f1c1e0e-2222-4222-8222-222222222222", "codex@test", "0.9"),
+                "invalid_argument",
+            ),
+        ] {
+            let rest = state
+                .request_tag_batch(serde_json::from_value(b.clone()).unwrap(), 100)
+                .err()
+                .map(|e| e.parts().1);
+            let out = rt
+                .block_on(mcp.write_tags(Parameters(serde_json::from_value(b).unwrap())))
+                .expect("a domain refusal is a tool result, not a protocol error");
+            let text = serde_json::to_string(&out).unwrap();
+            assert_eq!(rest, Some(code));
+            assert_eq!(out.is_error, Some(true), "{text}");
+            assert!(text.contains(code), "MCP said {text}");
+        }
+        let ok = body(
+            "6f1c1e0e-3333-4333-8333-333333333333",
+            "codex@test",
+            "stone",
+        );
+        let out = rt
+            .block_on(mcp.write_tags(Parameters(serde_json::from_value(ok).unwrap())))
+            .expect("tool call");
+        let text = serde_json::to_string(&out).unwrap();
+        assert!(
+            text.contains("awaiting_approval") && text.contains("write_tags"),
+            "{text}"
+        );
+        assert_eq!(
+            state.jobs.awaiting_approval().len(),
+            1,
+            "parked on the one gate"
+        );
     }
 }

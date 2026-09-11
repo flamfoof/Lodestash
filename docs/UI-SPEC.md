@@ -775,6 +775,10 @@ oldest first; the window repaints itself when a request arrives rather than wait
 Approving or denying raises a toast. This is the desktop half of ENGINE-API's server-side
 confirmation gate.
 
+Agent tag writes (`write_tags`, ENGINE-API §8.3) wait on the same gate. The job tray's approval row
+lists, per asset, that producer's current tags → the proposal, and any proposed caption, so the
+person approves what will actually be written. Approving never confirms an asset.
+
 ### 11.7 ENGINE BRIDGE
 Live status row (verdant dot glow when bridged): `Live — bridged to <project>` / `Bridge paused`,
 sub-line `<engine> · imports sync to <dest> as you stage them`; enable toggle (paused ⇒ staged

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use lodestash_app::config::{SizeTier, SizeTiers, SortBy};
 use lodestash_app::grid;
 use lodestash_app::types::{Category, ContentFilter, StatusFilter, TriBucket};
-use lodestash_core::catalog::{AppraiseFocus, Catalog, TagAssignment};
+use lodestash_core::catalog::{AppraiseFocus, Catalog};
 use lodestash_core::types::{AssetStatus, MediaType};
 use lodestash_core::vector::{BruteForceIndex, VectorIndex};
 use serde::{Deserialize, Serialize};
@@ -206,7 +206,7 @@ pub struct AssetDetail {
     pub in_pack: bool,
     /// This asset's tags (UI-SPEC §9): `confidence` is set for AI-tagged rows, so the Inspector
     /// can show which labels were guessed vs hand-added.
-    pub tags: Vec<TagAssignment>,
+    pub tags: Vec<lodestash_core::catalog::AssetTagRow>,
     /// Starred, and soft-deleted. The Inspector draws its actions from these — a trashed asset
     /// offers Restore, not another Trash button.
     pub favorite: bool,
@@ -2070,7 +2070,7 @@ impl Library {
             tags: self
                 .catalog
                 .as_ref()
-                .and_then(|c| c.tags_for_asset(asset_id).ok())
+                .and_then(|c| c.asset_tag_rows(asset_id).ok())
                 .unwrap_or_default(),
         })
     }

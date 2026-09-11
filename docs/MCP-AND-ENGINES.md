@@ -85,7 +85,8 @@ against the `claude-api` skill before implementing.
 | `get_asset` | `id` | full metadata (paths, dims/poly-count/duration, formats, tags, collections, category, license) |
 | `get_asset_preview` | `id`, `kind?` (thumbnail/turntable-frame/waveform) | **image content block** (base64+mimeType); audio → waveform image or `resource_link` |
 | `list_tags` | `prefix?` | tags with counts |
-| `add_tag` / `retag` | `id`, `tags[]` | updated asset *(mutating — confirm)* |
+| `add_tag` / `retag` | `id`, `tags[]` | updated asset *(mutating — confirm)*; written as `ai:legacy-agent` |
+| `write_tags` | `request_id`, `assets[]` (revision, producer, mode, tags, description) | job `awaiting_approval` → receipt; same contract as `POST /v1/tags/batch` ([ENGINE-API §8.3](ENGINE-API.md#83-attributed-result-writes)) |
 | `list_collections` | — | collections (id, name, count) |
 | `apply_mapping` | `id`/`scope`, `taxonomy_id` | resulting category assignments |
 | `identify_asset` | `id`(s), `tiers?` | runs/refreshes identification (tiers 0–4, [`IDENTIFICATION-AND-SEARCH.md`](IDENTIFICATION-AND-SEARCH.md) §3) for the asset(s) → `job_id` *(long-running)* |

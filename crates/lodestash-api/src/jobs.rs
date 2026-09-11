@@ -66,6 +66,9 @@ pub struct Job {
     cancelled: AtomicBool,
     error: Mutex<Option<String>>,
     result: Mutex<Option<Value>>,
+    /// What the approval prompt shows beyond the one-line summary — for `write_tags`, the tag and
+    /// caption diff (ENGINE-API §8.3). `null` for every other job.
+    detail: Mutex<Option<Value>>,
 }
 
 impl Job {
@@ -104,6 +107,10 @@ impl Job {
         self.set_state(JobState::Done);
     }
 
+    pub fn set_detail(&self, detail: Value) {
+        *self.detail.lock().unwrap() = Some(detail);
+    }
+
     pub fn fail(&self, message: impl Into<String>) {
         *self.error.lock().unwrap() = Some(message.into());
         self.set_state(JobState::Error);
@@ -119,6 +126,7 @@ impl Job {
             "progress": self.progress(),
             "result": self.result.lock().unwrap().clone(),
             "error": self.error.lock().unwrap().clone(),
+            "detail": self.detail.lock().unwrap().clone(),
         })
     }
 }
@@ -143,6 +151,7 @@ impl Jobs {
             cancelled: AtomicBool::new(false),
             error: Mutex::new(None),
             result: Mutex::new(None),
+            detail: Mutex::new(None),
         });
         self.jobs
             .lock()

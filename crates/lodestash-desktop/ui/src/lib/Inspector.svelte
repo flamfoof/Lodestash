@@ -225,6 +225,32 @@
   let tagMsg = $state<string | null>(null);
 
   /** Reject a tag on the selected asset (UI-SPEC §9): removes it via the same undoable op. */
+  // One chip per label, whoever wrote it (v1 plan S05). A person's own tag stays theirs even when a
+  // model agrees; otherwise the chip is AI — decided by provenance, not by whether a score exists —
+  // and its tooltip names every producer and model behind it.
+  let chips = $derived.by(() => {
+    const byLabel = new Map<
+      string,
+      { namespace: string; value: string; confidence: number | null; ai: boolean; sources: string[] }
+    >();
+    for (const t of detail?.tags ?? []) {
+      const key = t.namespace + ":" + t.value;
+      const ai = t.source.startsWith("ai");
+      const chip = byLabel.get(key) ?? {
+        namespace: t.namespace,
+        value: t.value,
+        confidence: null,
+        ai: true,
+        sources: [],
+      };
+      chip.sources.push(t.model_id ? `${t.source} (${t.model_id})` : t.source);
+      if (!ai) chip.ai = false;
+      if (ai && t.confidence != null) chip.confidence = Math.max(chip.confidence ?? 0, t.confidence);
+      byLabel.set(key, chip);
+    }
+    return [...byLabel.values()];
+  });
+
   async function rejectTag(namespace: string, value: string) {
     const id = detail?.asset_id;
     if (id == null || tagBusy) return;
@@ -601,13 +627,14 @@
         <p class="hint">No tags yet — add one below, or run Identify to propose labels.</p>
       {:else}
         <div class="tagchips" data-testid="inspector-tagchips">
-          {#each detail?.tags ?? [] as t (t.namespace + ":" + t.value)}
+          {#each chips as t (t.namespace + ":" + t.value)}
             <span
               class="tag"
+              data-provenance={t.ai ? "ai" : "person"}
               style={traitColor.has(t.value) ? `--chip: var(${traitColor.get(t.value)})` : ""}
-              title={t.namespace === "free" ? "hand-added" : `${t.namespace} · ${Math.round((t.confidence ?? 0) * 100)}%`}
+              title={`${t.namespace} · ${t.sources.join(" · ")}`}
             >
-              {t.value}{#if t.confidence != null}<em class="conf" aria-label="confidence"
+              {t.value}{#if t.ai && t.confidence != null}<em class="conf" aria-label="confidence"
                   >{Math.round(t.confidence * 100)}%</em
                 >{/if}
               <button

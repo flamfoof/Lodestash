@@ -1169,12 +1169,14 @@ fn write_groups(
             mode: TagMode::ReplaceSource,
             tags,
             description: None,
+            expected_revision: None,
         })
         .collect();
     match cat.apply_tag_batch(&TagBatch {
         items,
         completes_queue: true,
         history: Some(HistoryOrigin::Background),
+        receipt: None,
     }) {
         Ok(_) => true,
         Err(e) => {
@@ -1313,6 +1315,7 @@ pub fn store_tags(cat: &mut Catalog, producers: &TagProducers, results: &[Comput
             mode: TagMode::ReplaceSource,
             tags: r.tags.clone(),
             description: caption,
+            expected_revision: None,
         });
         if let Some((producer, model)) = &producers.zero_shot {
             items.push(TagBatchItem {
@@ -1322,6 +1325,7 @@ pub fn store_tags(cat: &mut Catalog, producers: &TagProducers, results: &[Comput
                 mode: TagMode::ReplaceSource,
                 tags: r.zero_shot.clone(),
                 description: None,
+                expected_revision: None,
             });
         }
     }
@@ -1329,6 +1333,7 @@ pub fn store_tags(cat: &mut Catalog, producers: &TagProducers, results: &[Comput
         items,
         completes_queue: true,
         history: Some(HistoryOrigin::Background),
+        receipt: None,
     }) {
         Ok(_) => results
             .iter()

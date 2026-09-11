@@ -2662,6 +2662,7 @@ name = "lodestash-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "blake3",
  "dirs 5.0.1",
  "lodestash-core",
  "rusqlite",
@@ -2768,6 +2769,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

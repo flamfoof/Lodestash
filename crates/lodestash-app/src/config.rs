@@ -535,6 +535,11 @@ pub struct AppConfig {
     /// are [`lodestash_api::AGENT_OPERATIONS`] tool ids.
     #[serde(default)]
     pub mcp_disabled_tools: Vec<String>,
+    /// The producer this host's agent writes tags under — `ai:<producer>` (ENGINE-API §8.3), e.g.
+    /// `codex@this-pc`. `None` (the default) refuses `write_tags`, so nothing an agent writes is
+    /// credited to a producer nobody chose; the legacy `add_tag` then writes as `ai:legacy-agent`.
+    #[serde(default)]
+    pub agent_producer_id: Option<String>,
 }
 
 fn default_api_max_per_run() -> u32 {
@@ -625,6 +630,7 @@ impl Default for AppConfig {
             api_key: String::new(),
             api_max_per_run: default_api_max_per_run(),
             mcp_disabled_tools: Vec::new(),
+            agent_producer_id: None,
         }
     }
 }

@@ -97,6 +97,7 @@ pub const AGENT_OPERATIONS: &[(&str, &str)] = &[
     ("stage_asset", "POST /v1/stage"),
     ("list_staged", "GET /v1/stage"),
     ("import_staged", "POST /v1/stage/import"),
+    ("write_tags", "POST /v1/tags/batch"),
 ];
 
 /// Everything a preview renderer needs for one asset, resolved from the catalog by
@@ -155,6 +156,176 @@ pub enum AgentWrite {
     UnstageAsset {
         asset_id: i64,
     },
+    /// An approved `write_tags` request (ENGINE-API §8.3) and its body digest — applied as one
+    /// batch with its durable receipt. The desktop turns it into the core batch.
+    TagBatch {
+        request: TagBatchRequest,
+        digest: String,
+    },
+}
+
+/// Most bytes one `write_tags` request may carry (ENGINE-API §8.3).
+pub const MAX_TAG_BATCH_BYTES: usize = 1 << 20;
+
+/// One assignment as an agent submits it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TagIn {
+    pub namespace: String,
+    pub value: String,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+}
+
+/// One asset's part of a `write_tags` request.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TagBatchAsset {
+    pub asset_id: i64,
+    /// The `annotation_revision` `get_asset` reported — anything changed since refuses the batch.
+    pub expected_revision: String,
+    pub producer_id: String,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    /// `append` | `replace_producer`.
+    pub mode: String,
+    #[serde(default)]
+    pub tags: Vec<TagIn>,
+    /// Omitted preserves the caption.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// `write_tags` ↔ `POST /v1/tags/batch` (ENGINE-API §8.3). One type for both planes: the MCP tool
+/// parses into it too, so the two cannot validate differently.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TagBatchRequest {
+    pub request_id: String,
+    /// Accepted and recorded; enforced once vocabulary review (§8.5) lands.
+    #[serde(default)]
+    pub vocabulary_revision: Option<String>,
+    pub assets: Vec<TagBatchAsset>,
+}
+
+impl TagBatchRequest {
+    /// The core batch an approved request becomes: every item under `ai:<producer>`, the
+    /// revisions the agent read, the agent's history, and the durable receipt.
+    pub fn to_core_batch(&self, digest: &str) -> lodestash_core::catalog::TagBatch {
+        use lodestash_core::catalog::{
+            ai_source, HistoryOrigin, TagAssignment, TagBatch, TagBatchItem, TagMode, TagReceiptKey,
+        };
+        TagBatch {
+            items: self
+                .assets
+                .iter()
+                .map(|a| TagBatchItem {
+                    asset_id: a.asset_id,
+                    source: ai_source(&a.producer_id),
+                    model_id: a.model_id.clone(),
+                    mode: if a.mode == "replace_producer" {
+                        TagMode::ReplaceSource
+                    } else {
+                        TagMode::Append
+                    },
+                    tags: a
+                        .tags
+                        .iter()
+                        .map(|t| TagAssignment {
+                            namespace: t.namespace.clone(),
+                            value: t.value.clone(),
+                            confidence: t.confidence,
+                        })
+                        .collect(),
+                    description: a.description.clone(),
+                    expected_revision: Some(a.expected_revision.clone()),
+                })
+                .collect(),
+            completes_queue: false,
+            history: Some(HistoryOrigin::Agent),
+            receipt: Some(TagReceiptKey {
+                request_id: self.request_id.clone(),
+                digest: digest.to_string(),
+            }),
+        }
+    }
+}
+
+/// Why a `write_tags` request was refused, with the stable code and HTTP status both planes
+/// report (ENGINE-API §8.4).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TagBatchError {
+    Invalid(String),
+    TooLarge(usize),
+    ProducerNotConfigured,
+    ProducerMismatch(String),
+    AssetNotFound(i64),
+    RequestConflict(String),
+    Catalog(String),
+}
+
+impl TagBatchError {
+    /// `(HTTP status, code, message)`.
+    pub fn parts(&self) -> (u16, &'static str, String) {
+        match self {
+            Self::Invalid(m) => (400, "invalid_argument", m.clone()),
+            Self::TooLarge(n) => (
+                413,
+                "resource_too_large",
+                format!("{n} bytes; a tag batch holds at most {MAX_TAG_BATCH_BYTES}"),
+            ),
+            Self::ProducerNotConfigured => (
+                409,
+                "producer_not_configured",
+                "no agent producer is configured in Lodestash (agent_producer_id), so there is no \
+                 producer to attribute these tags to"
+                    .into(),
+            ),
+            Self::ProducerMismatch(p) => (
+                403,
+                "producer_mismatch",
+                format!("producer {p:?} is not the one configured for this host"),
+            ),
+            Self::AssetNotFound(id) => {
+                (404, "asset_not_found", format!("asset {id} does not exist"))
+            }
+            Self::RequestConflict(id) => (
+                409,
+                "request_conflict",
+                format!("request {id} was already used with a different body"),
+            ),
+            Self::Catalog(m) => (500, "job_failed", m.clone()),
+        }
+    }
+}
+
+/// What [`ServerState::request_tag_batch`] decided.
+pub enum TagBatchKickoff {
+    /// Parked on the approval gate (→ `202`).
+    Awaiting(std::sync::Arc<jobs::Job>),
+    /// The same request already committed: its recorded result (→ `200`).
+    Replayed {
+        request_id: String,
+        result: serde_json::Value,
+    },
+}
+
+impl TagBatchKickoff {
+    /// `(HTTP status, body)` — one builder for both planes.
+    pub fn to_response(&self) -> (u16, serde_json::Value) {
+        match self {
+            Self::Awaiting(job) => (202, job.to_json()),
+            Self::Replayed { request_id, result } => (
+                200,
+                serde_json::json!({
+                    "request_id": request_id,
+                    "state": "done",
+                    "replayed": true,
+                    "result": result,
+                }),
+            ),
+        }
+    }
 }
 
 /// The desktop's write bridge — [`AgentWrite`] → writer `Op` → changed rows.
@@ -318,6 +489,13 @@ pub struct ServerState {
     /// The desktop's single-writer bridge (ADR-0002): `None` until `set_write` is called at
     /// startup. Mutating agent ops error honestly when it is missing.
     write: Mutex<Option<Arc<AgentWriteFn>>>,
+    /// Parked `write_tags` requests and their body digests, keyed by job id. In memory like the
+    /// rest of the queue: a restart loses an unapproved request visibly, never a committed one —
+    /// committed requests have their receipt in the catalog.
+    pending_tag_batches: Mutex<std::collections::HashMap<String, (TagBatchRequest, String)>>,
+    /// The producer this host's agent writes tags under (`agent_producer_id`). `None` refuses
+    /// `write_tags` rather than attribute an agent's tags to a producer nobody chose.
+    agent_producer: Mutex<Option<String>>,
 }
 
 impl ServerState {
@@ -339,6 +517,8 @@ impl ServerState {
             import_queue: Mutex::new(Vec::new()),
             wake: Mutex::new(None),
             write: Mutex::new(None),
+            pending_tag_batches: Mutex::new(std::collections::HashMap::new()),
+            agent_producer: Mutex::new(None),
         })
     }
 
@@ -526,6 +706,230 @@ impl ServerState {
     /// read-only, which is the correct default).
     pub fn set_write(&self, f: AgentWriteFn) {
         *self.write.lock().unwrap() = Some(Arc::new(f));
+    }
+
+    /// The producer this host's agent writes under (ENGINE-API §8.3). A blank id is no id.
+    pub fn set_agent_producer(&self, producer: Option<String>) {
+        *self.agent_producer.lock().unwrap() = producer.filter(|p| !p.trim().is_empty());
+    }
+
+    /// ENGINE-API §8.3 `write_tags`: validate the whole request, answer a replay from its durable
+    /// receipt or its pending job, and otherwise park it for the person at the machine to approve.
+    /// Nothing is written here — the write happens on approval, in the app's single writer.
+    pub fn request_tag_batch(
+        &self,
+        req: TagBatchRequest,
+        body_len: usize,
+    ) -> Result<TagBatchKickoff, TagBatchError> {
+        use lodestash_core::catalog::{
+            ai_source, validate_assignments, TagAssignment, MAX_BATCH_ASSETS, MAX_DESCRIPTION_CHARS,
+        };
+        if body_len > MAX_TAG_BATCH_BYTES {
+            return Err(TagBatchError::TooLarge(body_len));
+        }
+        if uuid::Uuid::parse_str(&req.request_id).is_err() {
+            return Err(TagBatchError::Invalid(format!(
+                "request_id {:?} is not a UUID",
+                req.request_id
+            )));
+        }
+        let producer = self
+            .agent_producer
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(TagBatchError::ProducerNotConfigured)?;
+        if req.assets.is_empty() || req.assets.len() > MAX_BATCH_ASSETS {
+            return Err(TagBatchError::Invalid(format!(
+                "{} assets; a batch holds 1 to {MAX_BATCH_ASSETS}",
+                req.assets.len()
+            )));
+        }
+        let source = ai_source(&producer);
+        let mut seen = HashSet::new();
+        for a in &req.assets {
+            if !seen.insert(a.asset_id) {
+                return Err(TagBatchError::Invalid(format!(
+                    "asset {} appears twice",
+                    a.asset_id
+                )));
+            }
+            if a.producer_id != producer {
+                return Err(TagBatchError::ProducerMismatch(a.producer_id.clone()));
+            }
+            if a.mode != "append" && a.mode != "replace_producer" {
+                return Err(TagBatchError::Invalid(format!(
+                    "mode {:?} is not append or replace_producer",
+                    a.mode
+                )));
+            }
+            if a.expected_revision.trim().is_empty() {
+                return Err(TagBatchError::Invalid(
+                    "expected_revision is required — read it from get_asset".into(),
+                ));
+            }
+            if let Some(d) = &a.description {
+                let text = d.trim();
+                if text.is_empty() || text.chars().count() > MAX_DESCRIPTION_CHARS {
+                    return Err(TagBatchError::Invalid(format!(
+                        "asset {}: a description is 1 to {MAX_DESCRIPTION_CHARS} characters",
+                        a.asset_id
+                    )));
+                }
+            }
+            let tags: Vec<TagAssignment> = a
+                .tags
+                .iter()
+                .map(|t| TagAssignment {
+                    namespace: t.namespace.clone(),
+                    value: t.value.clone(),
+                    confidence: t.confidence,
+                })
+                .collect();
+            validate_assignments(&source, &tags)
+                .map_err(|e| TagBatchError::Invalid(format!("asset {}: {e}", a.asset_id)))?;
+        }
+        for a in &req.assets {
+            if self
+                .asset(a.asset_id)
+                .map_err(|e| TagBatchError::Catalog(e.to_string()))?
+                .is_none()
+            {
+                return Err(TagBatchError::AssetNotFound(a.asset_id));
+            }
+        }
+        let digest = blake3::hash(
+            serde_json::to_string(&req)
+                .expect("a parsed request serializes")
+                .as_bytes(),
+        )
+        .to_hex()
+        .to_string();
+        // A committed request answers from its receipt, however long ago it committed.
+        if let Some(r) = self
+            .catalog
+            .lock()
+            .unwrap()
+            .tag_request_receipt(&req.request_id)
+            .map_err(|e| TagBatchError::Catalog(e.to_string()))?
+        {
+            return if r.digest == digest {
+                Ok(TagBatchKickoff::Replayed {
+                    request_id: req.request_id,
+                    result: r.result,
+                })
+            } else {
+                Err(TagBatchError::RequestConflict(req.request_id))
+            };
+        }
+        // A parked one answers with its job.
+        {
+            let pending = self.pending_tag_batches.lock().unwrap();
+            if let Some((job_id, (_, d))) = pending
+                .iter()
+                .find(|(_, (p, _))| p.request_id == req.request_id)
+            {
+                return if *d == digest {
+                    self.jobs
+                        .get(job_id)
+                        .map(TagBatchKickoff::Awaiting)
+                        .ok_or_else(|| TagBatchError::Catalog("the parked job is gone".into()))
+                } else {
+                    Err(TagBatchError::RequestConflict(req.request_id))
+                };
+            }
+        }
+        let detail = self.tag_batch_detail(&req, &source);
+        let job = self.jobs.create(
+            "write_tags",
+            format!("Write tags on {} asset(s) as {source}", req.assets.len()),
+            jobs::JobState::AwaitingApproval,
+        );
+        job.set_detail(detail);
+        self.pending_tag_batches
+            .lock()
+            .unwrap()
+            .insert(job.id.clone(), (req, digest));
+        self.wake();
+        Ok(TagBatchKickoff::Awaiting(job))
+    }
+
+    /// What the approval prompt shows: per asset, this producer's current tags and the proposal,
+    /// and the proposed caption.
+    fn tag_batch_detail(&self, req: &TagBatchRequest, source: &str) -> serde_json::Value {
+        let cat = self.catalog.lock().unwrap();
+        let assets: Vec<serde_json::Value> = req
+            .assets
+            .iter()
+            .map(|a| {
+                let current: Vec<String> = cat
+                    .asset_tag_rows(a.asset_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|r| r.source == source)
+                    .map(|r| format!("{}:{}", r.namespace, r.value))
+                    .collect();
+                let proposed: Vec<String> = a
+                    .tags
+                    .iter()
+                    .map(|t| format!("{}:{}", t.namespace, t.value))
+                    .collect();
+                serde_json::json!({
+                    "asset_id": a.asset_id,
+                    "mode": a.mode,
+                    "current": current,
+                    "proposed": proposed,
+                    "description": a.description,
+                })
+            })
+            .collect();
+        serde_json::json!({ "producer": source, "assets": assets })
+    }
+
+    /// Run an approved request through the app's writer, then answer from its receipt — the
+    /// catalog's own record of what committed, not this process's memory of it.
+    fn run_tag_batch(&self, job: Arc<jobs::Job>, req: TagBatchRequest, digest: String) {
+        job.set_state(jobs::JobState::Running);
+        let request_id = req.request_id.clone();
+        if let Err(e) = self.write(AgentWrite::TagBatch {
+            request: req,
+            digest,
+        }) {
+            return job.fail(e);
+        }
+        match self
+            .catalog
+            .lock()
+            .unwrap()
+            .tag_request_receipt(&request_id)
+        {
+            Ok(Some(r)) => job.finish(r.result),
+            Ok(None) => job.fail("the write reported success but left no receipt"),
+            Err(e) => job.fail(e.to_string()),
+        }
+    }
+
+    /// ENGINE-API §3 asset detail — one builder for both planes, carrying each tag's provenance
+    /// and the `annotation_revision` a `write_tags` item must name.
+    pub fn asset_detail_json(
+        &self,
+        id: i64,
+    ) -> lodestash_core::error::Result<Option<serde_json::Value>> {
+        let Some(row) = self.asset(id)? else {
+            return Ok(None);
+        };
+        let deps = self.dependencies(id).unwrap_or_default();
+        let mut body = routes::summary_json(&row);
+        body["size_bytes"] = serde_json::json!(row.size_bytes);
+        body["stats"] = serde_json::json!({
+            "tris": row.metrics.tri_count, "width_px": row.metrics.width_px,
+            "height_px": row.metrics.height_px, "duration_ms": row.metrics.duration_ms,
+        });
+        body["dependencies"] = serde_json::json!({ "count": deps.len(), "asset_ids": deps });
+        let cat = self.catalog.lock().unwrap();
+        body["annotation_revision"] = serde_json::json!(cat.annotation_revision(id)?);
+        body["tag_provenance"] = serde_json::to_value(cat.asset_tag_rows(id)?)?;
+        Ok(Some(body))
     }
 
     fn write(&self, w: AgentWrite) -> Result<usize, String> {
@@ -952,6 +1356,11 @@ impl ServerState {
         if let Some((req, project_id)) = self.pending_imports.lock().unwrap().remove(job_id) {
             let state = self.clone();
             std::thread::spawn(move || state.enqueue_import(job, req, project_id));
+            return;
+        }
+        if let Some((req, digest)) = self.pending_tag_batches.lock().unwrap().remove(job_id) {
+            let state = self.clone();
+            std::thread::spawn(move || state.run_tag_batch(job, req, digest));
         }
     }
 
@@ -959,6 +1368,7 @@ impl ServerState {
     pub fn deny_job(&self, job_id: &str) {
         self.pending_exports.lock().unwrap().remove(job_id);
         self.pending_imports.lock().unwrap().remove(job_id);
+        self.pending_tag_batches.lock().unwrap().remove(job_id);
         if let Some(job) = self.jobs.get(job_id) {
             if job.state() == jobs::JobState::AwaitingApproval {
                 job.set_state(jobs::JobState::Cancelled);

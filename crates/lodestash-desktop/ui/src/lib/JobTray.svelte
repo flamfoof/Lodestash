@@ -159,6 +159,17 @@
             <span class="label">{String(a.summary ?? a.kind)}</span>
             <button class="mini ok" onclick={() => approve(a.id)}>Approve</button>
             <button class="mini cancel" onclick={() => deny(a.id)}>Deny</button>
+            {#if Array.isArray((a.detail as { assets?: unknown[] } | null)?.assets)}
+              <!-- write_tags (ENGINE-API §8.3): what approving actually writes, per asset. -->
+              <ul class="diff" data-testid="approval-detail">
+                {#each (a.detail as { assets: { asset_id: number; current: string[]; proposed: string[]; description?: string | null }[] }).assets as d (d.asset_id)}
+                  <li>
+                    #{d.asset_id}: {d.current.join(", ") || "—"} → {d.proposed.join(", ") || "—"}{#if d.description}
+                      · “{d.description}”{/if}
+                  </li>
+                {/each}
+              </ul>
+            {/if}
           </div>
         {/each}
       </div>
@@ -167,6 +178,16 @@
 {/if}
 
 <style>
+  .approval {
+    flex-wrap: wrap;
+  }
+  .diff {
+    flex-basis: 100%;
+    margin: 0;
+    padding-left: var(--sp-4);
+    font-size: var(--fs-xs);
+    color: var(--ls-text-muted);
+  }
   .tray {
     position: fixed;
     left: var(--sp-2);

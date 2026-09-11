@@ -333,6 +333,11 @@ pub enum Op {
         value: String,
         on: bool,
     },
+    /// One validated, attributed tag batch (v1 plan S04/S05) — an approved agent request or a
+    /// legacy agent add/remove — applied atomically with its history and receipt.
+    TagBatch {
+        batch: lodestash_core::catalog::TagBatch,
+    },
 }
 
 /// What a write did, in the terms the frontend reports to the user.
@@ -2467,6 +2472,7 @@ fn run(
                     mode,
                     tags: vec![tag.clone()],
                     description: None,
+                    expected_revision: None,
                 })
                 .collect();
             catalog
@@ -2474,6 +2480,7 @@ fn run(
                     items,
                     completes_queue: false,
                     history: Some(HistoryOrigin::User),
+                    receipt: None,
                 })
                 .map(|out| WriteResult {
                     changed: out.changed_assets.len(),
@@ -2481,6 +2488,13 @@ fn run(
                 })
                 .map_err(|e| e.to_string())
         }
+        Op::TagBatch { batch } => catalog
+            .apply_tag_batch(&batch)
+            .map(|out| WriteResult {
+                changed: out.changed_assets.len(),
+                ..Default::default()
+            })
+            .map_err(|e| e.to_string()),
     }
 }
 

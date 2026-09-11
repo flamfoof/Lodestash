@@ -51,7 +51,14 @@ this file stays the live board.
       drains write per producer (fallback and zero-shot under their own); `BulkTag` is a manual
       append or an explicit reject-across-sources; history is partitioned by origin. Checks:
       `tests_tagbatch.rs` (every item the plan names).
-- [ ] **R2 · S05 — the batch tag write on every adapter** (MCP handoff Task 4, then 4a).
+- [x] **R2 · S05 — the batch tag write on every adapter** (MCP handoff Task 4). `write_tags` ↔
+      `POST /v1/tags/batch`: one request type for both planes, validated by core's
+      `validate_assignments`, the producer taken from `agent_producer_id`, parked on the existing
+      approval gate with a per-asset diff, applied as one agent-origin batch with an in-transaction
+      revision check and a durable receipt (M27). The legacy `add_tag` writes as
+      `ai:legacy-agent`; `get_asset` (one builder for both planes) reports provenance and
+      `annotation_revision`; the Inspector styles AI by provenance. *Open:* vocabulary revisions
+      (Task 4a) and headless approvals (S11).
 - [ ] **R3 · S06–S08 — component-scoped prefab evidence, native material inputs, textured previews.**
 - [ ] **R4 · S09 — resident embedding snapshots with generation invalidation.**
 - [ ] **R5 · S10–S13 — endpoint egress policy, headless startup, bounded library walk, app-owned

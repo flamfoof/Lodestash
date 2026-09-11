@@ -94,6 +94,10 @@ pub struct TagBatchItem {
     pub tags: Vec<TagAssignment>,
     /// `Some` replaces the caption, atomically with the tags; `None` leaves it alone.
     pub description: Option<String>,
+    /// The [`Catalog::annotation_revision`] the writer last saw. Checked inside the transaction:
+    /// anything changed since refuses the whole batch with `revision_conflict`, rather than
+    /// writing over a change the writer never saw. `None` for writers that own their own state.
+    pub expected_revision: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +108,23 @@ pub struct TagBatch {
     pub completes_queue: bool,
     /// Record one undoable history row under this origin. `None` records nothing.
     pub history: Option<HistoryOrigin>,
+    /// Record a durable receipt for this request in the same transaction (ENGINE-API §8.3), so a
+    /// retry after a lost response finds the result instead of applying the batch twice.
+    pub receipt: Option<TagReceiptKey>,
+}
+
+/// A request's identity: the id its caller chose and a digest of the validated body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagReceiptKey {
+    pub request_id: String,
+    pub digest: String,
+}
+
+/// What a committed request left behind: its body digest and its terminal result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TagReceipt {
+    pub digest: String,
+    pub result: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
@@ -236,6 +257,16 @@ fn normalize_item(
         }
     }
     Ok(out)
+}
+
+/// Validate one item's assignments exactly as [`Catalog::apply_tag_batch`] will — normalisation,
+/// deduplication, caps, per-author policy — so an API can refuse a request before it is parked for
+/// approval, with the same words the batch would use.
+pub fn validate_assignments(
+    source: &str,
+    tags: &[TagAssignment],
+) -> std::result::Result<(), String> {
+    normalize_item(source, tags).map(|_| ())
 }
 
 fn invalid(why: impl std::fmt::Display) -> CoreError {
@@ -402,6 +433,38 @@ fn write_rows(conn: &Connection, asset_id: i64, current: &[Row], target: &[Row])
     Ok(())
 }
 
+fn annotation_revision_in(conn: &Connection, asset_id: i64) -> Result<String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT source, tag_id, confidence, model_id FROM asset_tag
+              WHERE asset_id = ?1 ORDER BY source, tag_id",
+        )
+        .map_err(|e| CoreError::Catalog(format!("revision prep: {e}")))?;
+    let mut hasher = blake3::Hasher::new();
+    let rows = stmt
+        .query_map(params![asset_id], |r| {
+            Ok(format!(
+                "{}\t{}\t{:?}\t{:?}\n",
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<f64>>(2)?,
+                r.get::<_, Option<String>>(3)?
+            ))
+        })
+        .map_err(|e| CoreError::Catalog(format!("revision rows: {e}")))?;
+    for row in rows {
+        hasher.update(
+            row.map_err(|e| CoreError::Catalog(format!("revision row: {e}")))?
+                .as_bytes(),
+        );
+    }
+    hasher.update(b"\ncaption:");
+    if let Some(caption) = description_of(conn, asset_id)? {
+        hasher.update(caption.as_bytes());
+    }
+    Ok(hasher.finalize().to_hex()[..32].to_string())
+}
+
 fn description_of(conn: &Connection, asset_id: i64) -> Result<Option<String>> {
     conn.query_row(
         "SELECT description FROM asset WHERE id = ?1",
@@ -491,6 +554,20 @@ impl Catalog {
                 .map_err(|e| CoreError::Catalog(format!("asset lookup: {e}")))?;
             if !exists {
                 return Err(invalid(format!("asset {id} does not exist")));
+            }
+        }
+
+        // Revisions are checked inside the transaction too: a revision read outside it could
+        // change between the check and the write.
+        for it in &batch.items {
+            if let Some(expected) = &it.expected_revision {
+                let current = annotation_revision_in(&tx, it.asset_id)?;
+                if &current != expected {
+                    return Err(CoreError::Catalog(format!(
+                        "revision_conflict: asset {} changed since revision {expected}",
+                        it.asset_id
+                    )));
+                }
             }
         }
 
@@ -629,9 +706,56 @@ impl Catalog {
                 origin.as_str(),
             )?);
         }
+        if let Some(key) = &batch.receipt {
+            let result = serde_json::json!({
+                "operation_id": outcome.op_id,
+                "changed_assets": outcome.changed_assets,
+                "unchanged_assets": outcome.unchanged_assets,
+                "asset_ids": assets,
+            });
+            tx.execute(
+                "INSERT INTO tag_request (request_id, body_digest, op_id, result_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    key.request_id,
+                    key.digest,
+                    outcome.op_id,
+                    result.to_string(),
+                    now
+                ],
+            )
+            .map_err(|e| CoreError::Catalog(format!("request receipt: {e}")))?;
+        }
         tx.commit()
             .map_err(|e| CoreError::Catalog(format!("tag batch commit: {e}")))?;
         Ok(outcome)
+    }
+
+    /// The opaque revision of one asset's annotations — every association (source, tag, score,
+    /// model) and the caption. Reads report it; a batch item that names it is refused if anything
+    /// moved since. A digest, so it is stable across processes and builds.
+    pub fn annotation_revision(&self, asset_id: i64) -> Result<String> {
+        annotation_revision_in(&self.conn, asset_id)
+    }
+
+    /// The receipt a committed request left, if any.
+    pub fn tag_request_receipt(&self, request_id: &str) -> Result<Option<TagReceipt>> {
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT body_digest, result_json FROM tag_request WHERE request_id = ?1",
+                params![request_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| CoreError::Catalog(format!("receipt read: {e}")))?;
+        row.map(|(digest, result)| {
+            Ok(TagReceipt {
+                digest,
+                result: serde_json::from_str(&result)?,
+            })
+        })
+        .transpose()
     }
 
     /// Undo a `tag_batch` op: put back the recorded `before` state of every association it

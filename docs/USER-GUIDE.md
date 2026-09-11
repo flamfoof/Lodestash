@@ -32,6 +32,13 @@ cwd = 'G:\GameDev\asset_viewer'
 enabled_tools = ['get_server_info', 'search_assets', 'get_asset', 'list_tags']
 ```
 
+**To let the agent write tags** (`write_tags`, shipped 2026-09-11), name the producer it writes
+under in Lodestash's config — `{os_config_dir}/Lodestash/config.json`, e.g.
+`"agent_producer_id": "codex@this-pc"` — and add `write_tags` and `get_job_status` to
+`enabled_tools`. Without a producer every `write_tags` call is refused (`producer_not_configured`);
+the older `add_tag` writes as `ai:legacy-agent`, never as you. Each batch waits for your approval
+in the job tray and is written only by the running app.
+
 Use the actual built path on another machine. Codex supports local stdio commands and tool
 allow-lists in its MCP configuration; reconnect the configured server and check its active tool
 list. This example does not edit your host configuration or grant byte-transfer/write permission.

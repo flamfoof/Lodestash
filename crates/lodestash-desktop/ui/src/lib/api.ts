@@ -835,9 +835,12 @@ export type AssetDetail = {
   in_pack: boolean;
   favorite: boolean;
   trashed: boolean;
-  /** This asset's tags; `confidence` is set for AI-tagged rows (UI-SPEC §9). */
-  tags: TagAssignment[];
+  /** This asset's associations with who wrote each one (v1 plan S05). */
+  tags: TagRow[];
 };
+
+/** One association and its provenance: `source` is `manual`, `imported` or `ai:<producer>`. */
+export type TagRow = TagAssignment & { source: string; model_id: string | null };
 
 export type TagAssignment = {
   namespace: string;

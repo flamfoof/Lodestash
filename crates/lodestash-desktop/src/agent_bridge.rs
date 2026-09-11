@@ -66,6 +66,16 @@ fn forward(h: &lodestash_api::Handshake, w: AgentWrite) -> Result<usize, String>
             "/v1/stage".to_string(),
             serde_json::json!({ "asset_id": asset_id }),
         ),
+        // An approved batch commits in the app that approved it. A headless server holds no
+        // approvals of its own to forward — routing agent requests to the owning app's gate is
+        // the plan's S11.
+        AgentWrite::TagBatch { .. } => {
+            return Err(
+                "an approved tag batch commits in the app that approved it; a headless server \
+                 has none to forward — submit write_tags to the running app"
+                    .into(),
+            )
+        }
         // Neither has a REST route today, so neither can be forwarded — and the MCP surface
         // exposes no tool for either (`add_tag` has no `remove` counterpart, `stage_asset` no
         // unstage). Refused loudly rather than silently reporting zero rows changed.

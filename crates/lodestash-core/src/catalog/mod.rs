@@ -427,6 +427,7 @@ impl Catalog {
             (24, MIGRATION_24_REDIRTY_SWALLOWED_TAGS),
             (25, MIGRATION_25_FTS_OVER_A_VIEW),
             (26, MIGRATION_26_TAG_PROVENANCE),
+            (27, MIGRATION_27_TAG_REQUEST_RECEIPTS),
         ];
 
         for (version, sql) in migrations {
@@ -2196,6 +2197,23 @@ const MIGRATION_14_IN_PACK_ASSETS: &str = "
 ALTER TABLE asset_file ADD COLUMN package_entry_id INTEGER REFERENCES package_entry(id);
 CREATE INDEX IF NOT EXISTS idx_file_pkgentry
   ON asset_file(package_entry_id) WHERE package_entry_id IS NOT NULL;
+";
+
+/// M27 — durable receipts for agent tag requests (v1 plan S05, ENGINE-API §8.3).
+///
+/// One row per committed `write_tags` request: the id the caller chose, a digest of its validated
+/// body, the history row it recorded and its terminal result. Written in the batch's own
+/// transaction, so a receipt exists exactly when the write does. Deliberately not the undo log:
+/// that tail is capped at 200 and a retry must still find its receipt after it has scrolled away.
+/// Same id and body returns the recorded result; same id with a different body is a conflict.
+const MIGRATION_27_TAG_REQUEST_RECEIPTS: &str = "
+CREATE TABLE tag_request (
+    request_id  TEXT PRIMARY KEY,
+    body_digest TEXT NOT NULL,
+    op_id       INTEGER,
+    result_json TEXT NOT NULL,
+    created_at  INTEGER NOT NULL
+);
 ";
 
 /// M26 — who wrote an association, and whose history it is (v1 plan S04, ADR-0017).
@@ -6114,8 +6132,8 @@ mod tests_slices;
 mod tests_tagbatch;
 
 pub use tagbatch::{
-    ai_source, assignment_problem, is_ai_source, source_problem, AssetTagRow, HistoryOrigin,
-    TagBatch, TagBatchItem, TagBatchOutcome, TagMode, AI_NAMESPACES, HUMAN_NAMESPACES,
-    LEGACY_AI_SOURCE, MAX_AI_ASSIGNMENTS, MAX_AI_PER_NAMESPACE, MAX_BATCH_ASSETS,
-    MAX_DESCRIPTION_CHARS, MAX_LABEL_CHARS,
+    ai_source, assignment_problem, is_ai_source, source_problem, validate_assignments, AssetTagRow,
+    HistoryOrigin, TagBatch, TagBatchItem, TagBatchOutcome, TagMode, TagReceipt, TagReceiptKey,
+    AI_NAMESPACES, HUMAN_NAMESPACES, LEGACY_AI_SOURCE, MAX_AI_ASSIGNMENTS, MAX_AI_PER_NAMESPACE,
+    MAX_BATCH_ASSETS, MAX_DESCRIPTION_CHARS, MAX_LABEL_CHARS,
 };

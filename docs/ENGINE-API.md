@@ -79,7 +79,8 @@ Each row is the **same core operation** as the matching MCP tool in
 | `get_asset_preview` | `GET /v1/assets/{id}/preview?kind=` | streams PNG/JPEG (thumbnail/turntable/waveform) |
 | — | `GET /v1/assets/{id}/file` | streams the on-disk source bytes (the MCP `resource_link` target) |
 | `list_tags` | `GET /v1/tags?prefix=` | tags + counts |
-| `add_tag` / `retag` | `POST /v1/assets/{id}/tags` | *mutating* |
+| `add_tag` / `retag` | `POST /v1/assets/{id}/tags` | *mutating*; writes as `ai:legacy-agent`, never as the person (S05) |
+| `write_tags` | `POST /v1/tags/batch` | *mutating, approval-gated* → `202` job; attributed batch of tags + caption (§8.3) |
 | `list_collections` | `GET /v1/collections` | incl. the staging collection (§staging) |
 | `apply_mapping` | `POST /v1/mapping/apply` | *mutating*; `{scope, taxonomy_id}` |
 | `identify_asset` | `POST /v1/identify` | *long-running* → `job_id`; `{asset_ids, tiers?}` |
@@ -192,7 +193,8 @@ than redefining, so summaries/details never diverge.
 
 // Job — get_job_status (job engine; see ARCHITECTURE.md §3.1)
 { "job_id": "imp_9f…", "kind": "import", "state": "running",   // queued|running|done|error|cancelled
-  "progress": 0.66, "result": null, "error": null }
+  "progress": 0.66, "result": null, "error": null,
+  "detail": null }                  // what an approval shows beyond the summary (write_tags: the diff)
 ```
 
 `media_type`, `status`, and `content_kind` use the exact enums in [`DATA-MODEL.md`](DATA-MODEL.md) §2.
@@ -393,7 +395,11 @@ Unity panel instantly, and vice-versa.
 
 ## 8. Proposed asset-analysis contract
 
-Drafted 2026-09-10; **not implemented by this documentation change**. This section owns the wire
+Drafted 2026-09-10. **§8.3 `write_tags` shipped 2026-09-11 (v1 plan S05)** — REST, MCP and the
+approval gate, with durable receipts (M27). Still open within it: `vocabulary_revision` is accepted
+and recorded but enforced only once §8.5 lands, and a headless `--mcp` process parks approvals in
+its own memory, where the desktop tray cannot see them, until S11 routes requests to the app that
+owns the gate. The rest of this section is still proposed. This section owns the wire
 contract for [MCP asset analysis](MCP-ASSET-ANALYSIS.md). It refines the v1 architecture plan's
 S04/S05/S10/S11/S12. Existing §2 operations retain their current containers and required parameters;
 the rows below are additive unless explicitly described as an extension. New fields are not evidence
@@ -573,6 +579,7 @@ assumed successful. An app-closed write is `app_unavailable`; catalog reads cont
 ### 8.4 Failures and parity
 
 Use §4's error envelope. New errors have stable codes: `invalid_argument`/`invalid_cursor` (400),
+`producer_mismatch` (403), `producer_not_configured` (409, no `agent_producer_id` set),
 `asset_not_found`/`job_not_found` (404), `revision_conflict`/`request_conflict`/`source_changed` (409),
 `asset_too_large`/`resource_too_large` (413), `unsupported_evidence` (422), `busy` (429),
 `deadline_exceeded` (504), `app_unavailable`/`archive_missing`/`not_local` (503), and

@@ -1,6 +1,7 @@
 # MCP asset analysis and tag authoring
 
-Design drafted 2026-09-10. **Proposed implementation contract; not shipped by this document.**
+Design drafted 2026-09-10. **Proposed implementation contract; not shipped by this document** —
+except the attributed write, `write_tags`, which shipped 2026-09-11 (v1 plan S05; ENGINE-API §8.3).
 The user requested this design and plan, including search, single/list retrieval, evidence and
 file access, surgical Unity-package extraction, and LLM-authored tag updates.
 

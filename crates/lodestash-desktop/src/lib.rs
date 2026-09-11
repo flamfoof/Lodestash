@@ -2079,30 +2079,32 @@ fn apply_allow_list(state: &lodestash_api::ServerState) -> Option<usize> {
 /// single-writer `Op` and blocks on its reply — the API crate never touches the catalog itself.
 fn engine_write_bridge(writer: Writer) -> lodestash_api::AgentWriteFn {
     use lodestash_api::AgentWrite;
+    use lodestash_core::catalog::TagMode;
     // Everything through here is an agent's write — the shell shows it as a pending update
     // instead of re-reading under the user (ADR-0016).
     let run = move |op: Op| writer.run_as(op, crate::writer::Origin::Agent);
     Box::new(move |w: AgentWrite| match w {
+        // The legacy one-tag operations write as the agent they are — never as the person at the
+        // machine (v1 plan S05). They carry no producer of their own, so they land under
+        // `ai:legacy-agent`, and a removal reaches only what that producer added.
         AgentWrite::AddTag {
             asset_id,
             namespace,
             value,
-        } => run(Op::BulkTag {
-            asset_ids: vec![asset_id],
-            namespace,
-            value,
-            on: true,
+        } => run(Op::TagBatch {
+            batch: legacy_agent_batch(asset_id, namespace, value, TagMode::Append),
         })
         .map(|r| r.changed),
         AgentWrite::RemoveTag {
             asset_id,
             namespace,
             value,
-        } => run(Op::BulkTag {
-            asset_ids: vec![asset_id],
-            namespace,
-            value,
-            on: false,
+        } => run(Op::TagBatch {
+            batch: legacy_agent_batch(asset_id, namespace, value, TagMode::RemoveScoped),
+        })
+        .map(|r| r.changed),
+        AgentWrite::TagBatch { request, digest } => run(Op::TagBatch {
+            batch: request.to_core_batch(&digest),
         })
         .map(|r| r.changed),
         AgentWrite::ApplyMapping { taxonomy_id } => {
@@ -2121,6 +2123,36 @@ fn engine_write_bridge(writer: Writer) -> lodestash_api::AgentWriteFn {
         })
         .map(|r| r.changed),
     })
+}
+
+/// A legacy agent tag operation as a batch under `ai:legacy-agent` (v1 plan S05).
+fn legacy_agent_batch(
+    asset_id: i64,
+    namespace: String,
+    value: String,
+    mode: lodestash_core::catalog::TagMode,
+) -> lodestash_core::catalog::TagBatch {
+    use lodestash_core::catalog::{
+        ai_source, HistoryOrigin, TagAssignment, TagBatch, TagBatchItem,
+    };
+    TagBatch {
+        items: vec![TagBatchItem {
+            asset_id,
+            source: ai_source("legacy-agent"),
+            model_id: None,
+            mode,
+            tags: vec![TagAssignment {
+                namespace,
+                value,
+                confidence: None,
+            }],
+            description: None,
+            expected_revision: None,
+        }],
+        completes_queue: false,
+        history: Some(HistoryOrigin::Agent),
+        receipt: None,
+    }
 }
 
 /// Build the shared engine `ServerState` (B12) — one read-only catalog connection, the allow-list
@@ -2143,6 +2175,11 @@ fn build_engine_state() -> Option<(
     .ok()?;
     let state = std::sync::Arc::new(state);
     let allowed = apply_allow_list(&state);
+    // ENGINE-API §8.3: `write_tags` writes under the producer the user configured for this host,
+    // and refuses without one.
+    state.set_agent_producer(
+        lodestash_app::config::AppConfig::load_display_only().agent_producer_id,
+    );
     // The REST/MCP semantic-search plane (ENGINE-API §2 `mode=ai`) needs the query embedder —
     // the same local SigLIP the grid's AI mode uses, resolved lazily on the first ai search
     // (model load is seconds; a startup resolve would slow every launch). `Vec::new()` from the
