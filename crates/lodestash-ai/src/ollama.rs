@@ -316,6 +316,10 @@ impl Tagger for OllamaTagger {
         &self.text_model
     }
 
+    fn producer_id(&self) -> String {
+        format!("ollama@{}", crate::tagger::endpoint_host(&self.host))
+    }
+
     fn supports(&self, media_code: &str) -> bool {
         // Audio needs the CLAP/PANNs path, not a language model guessing from a filename.
         media_code != "audio"

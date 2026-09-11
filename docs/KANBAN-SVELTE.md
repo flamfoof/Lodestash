@@ -46,7 +46,11 @@ this file stays the live board.
       `m25_makes_the_index_readable_and_rebuildable`, `no_edit_leaves_a_stale_token_in_the_index`,
       `lifecycle_and_flag_updates_do_no_fts_work`, `the_index_follows_rollback_and_survives_reopen` —
       the first three mutation-killed.
-- [ ] **R2 · S04 — one atomic, provenanced tag batch with conflict-aware undo.**
+- [x] **R2 · S04 — one atomic, provenanced tag batch with conflict-aware undo.**
+      `Catalog::apply_tag_batch` ([ADR-0017](decisions/ADR-0017-producer-scoped-atomic-tag-batches.md)); M26 marks pre-provenance AI rows `ai:legacy`;
+      drains write per producer (fallback and zero-shot under their own); `BulkTag` is a manual
+      append or an explicit reject-across-sources; history is partitioned by origin. Checks:
+      `tests_tagbatch.rs` (every item the plan names).
 - [ ] **R2 · S05 — the batch tag write on every adapter** (MCP handoff Task 4, then 4a).
 - [ ] **R3 · S06–S08 — component-scoped prefab evidence, native material inputs, textured previews.**
 - [ ] **R4 · S09 — resident embedding snapshots with generation invalidation.**

@@ -18,7 +18,7 @@ fn open_in_memory_applies_migrations() {
         .conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 25, "all 25 migrations should have run");
+    assert_eq!(version, 26, "all 26 migrations should have run");
 }
 
 /// Every queue an appraise pass drains must respect the set the caller named.

@@ -60,7 +60,7 @@ would peg a core for minutes.
   model upgrade).
 
 Right-clicking assets in the grid offers **Identify selected** (`flag_identify_assets`), scoping the
-pass to that selection. AI tags are written `source='ai'`, so any re-run replaces only AI tags and
+pass to that selection. AI tags are written `source='ai:<producer>'` ([ADR-0017](decisions/ADR-0017-producer-scoped-atomic-tag-batches.md)), so any re-run replaces only that producer's tags and
 never the user's own.
 
 ```rust
@@ -260,6 +260,10 @@ throttle hard — Gemini free is on the order of ~15 requests/minute. A naive ti
   asset **`tags_dirty` = 1** so the next run picks it up. An asset is only cleared once it is actually
   tagged — a drain must never mark a rate-limited asset "done, no tags." (Contrast the *unsupported*
   case, e.g. audio through a vision API, which is cleared deliberately to avoid a spin loop.)
+- **Attribution survives the fallback.** When the endpoint fails and a local model substitutes, its
+  tags are stored under the *local* producer and model, never the failed endpoint's; the SigLIP
+  zero-shot proposals always go under their own producer (`ai:siglip-zeroshot`). Before M26 both
+  were merged under the endpoint's model id, which is why those rows are now `ai:legacy`.
 - **Local fallback on failure.** A hard API error (bad key, exhausted quota, network) falls back to
   the **local Ollama VLM** for that asset when a local model is available; if none is, the asset stays
   dirty and a per-run **failure count** surfaces in the job tray. Either way the asset is never left

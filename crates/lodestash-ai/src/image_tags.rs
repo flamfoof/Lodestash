@@ -144,6 +144,12 @@ impl ImageZeroShot {
         &self.model_id
     }
 
+    /// The association source these proposals are stored under: its own producer, never the
+    /// tagger's it runs beside (v1 plan S04).
+    pub fn producer_id(&self) -> &'static str {
+        "siglip-zeroshot"
+    }
+
     /// The underlying embedder's id — the `asset_embedding.model_id` a stored vector must carry to be
     /// scoreable here (same joint space as the label vectors). Lets a caller reuse a precomputed
     /// embedding via [`Self::tag_vector`] instead of re-embedding.

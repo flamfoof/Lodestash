@@ -3,6 +3,8 @@
 - **Status:** accepted
 - **Date:** 2026-08-08
 - **Supersedes:** the pre-image-only op log (undo deleted the row — redo was impossible)
+- **Amended by:** [ADR-0017](ADR-0017-producer-scoped-atomic-tag-batches.md) — tag operations record
+  complete before/after snapshots; the inverse-only tag payloads refuse to replay
 
 ## Context
 

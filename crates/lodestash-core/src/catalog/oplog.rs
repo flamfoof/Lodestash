@@ -24,25 +24,7 @@ impl Catalog {
         payload_json: &str,
         forward_json: Option<&str>,
     ) -> Result<i64> {
-        self.conn
-            .execute(
-                "INSERT INTO op_log (op_kind, payload_json, forward_json, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![op_kind, payload_json, forward_json, unix_now()],
-            )
-            .map_err(|e| CoreError::Catalog(format!("record_op: {e}")))?;
-        // New work invalidates any undone ops.
-        self.conn
-            .execute("DELETE FROM op_log WHERE undone_at IS NOT NULL", [])
-            .map_err(|e| CoreError::Catalog(format!("record_op redo clear: {e}")))?;
-        // The log is a recent-actions tail, not a history — cap it so a 10k-asset bulk write
-        // cannot grow the file forever. The oldest rows go first.
-        let _ = self.conn.execute(
-            "DELETE FROM op_log WHERE id NOT IN (
-                 SELECT id FROM op_log ORDER BY id DESC LIMIT 200)",
-            [],
-        );
-        Ok(self.conn.last_insert_rowid())
+        record_op_in(&self.conn, op_kind, payload_json, forward_json, "user")
     }
 
     /// The newest undo-log rows, newest first, capped at `limit`. Undone ops are hidden — they
@@ -52,7 +34,7 @@ impl Catalog {
             .conn
             .prepare(
                 "SELECT id, op_kind, payload_json, created_at FROM op_log
-                 WHERE undone_at IS NULL
+                 WHERE undone_at IS NULL AND origin != 'background'
                  ORDER BY id DESC LIMIT ?1",
             )
             .map_err(|e| CoreError::Catalog(format!("recent_ops prep: {e}")))?;
@@ -76,7 +58,7 @@ impl Catalog {
             .conn
             .prepare(
                 "SELECT id, op_kind, payload_json, created_at FROM op_log
-                 WHERE undone_at IS NOT NULL
+                 WHERE undone_at IS NOT NULL AND origin != 'background'
                  ORDER BY id DESC LIMIT ?1",
             )
             .map_err(|e| CoreError::Catalog(format!("redo_candidates prep: {e}")))?;
@@ -112,60 +94,6 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("delete_ops: {e}")))
     }
 
-    /// Record a `set_tags` op with the asset's **current** per-source tags snapshotted
-    /// into the payload — call this *before* [`Self::set_tags`] mutates, so
-    /// [`Self::revert_op`] can restore the exact prior set.
-    pub fn record_set_tags_op(
-        &self,
-        asset_id: i64,
-        source: &str,
-        tags: &[TagAssignment],
-    ) -> Result<i64> {
-        let prior = {
-            let mut stmt = self
-                .conn
-                .prepare(
-                    "SELECT COALESCE(t.namespace, 'free'), t.name, at.confidence
-                       FROM asset_tag at JOIN tag t ON t.id = at.tag_id
-                      WHERE at.asset_id = ?1 AND at.source = ?2
-                      ORDER BY t.name",
-                )
-                .map_err(|e| CoreError::Catalog(format!("set_tags snapshot prep: {e}")))?;
-            let rows = stmt
-                .query_map(params![asset_id, source], |r| {
-                    Ok(TagAssignment {
-                        namespace: r.get(0)?,
-                        value: r.get(1)?,
-                        confidence: r.get(2)?,
-                    })
-                })
-                .map_err(|e| CoreError::Catalog(format!("set_tags snapshot query: {e}")))?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| CoreError::Catalog(format!("set_tags snapshot row: {e}")))?
-        };
-        let payload = serde_json::json!({
-            "asset_id": asset_id,
-            "source": source,
-            "tags": prior.into_iter().map(|t| serde_json::json!({
-                "namespace": t.namespace,
-                "value": t.value,
-                "confidence": t.confidence,
-            })).collect::<Vec<_>>(),
-        })
-        .to_string();
-        let forward = serde_json::json!({
-            "asset_id": asset_id,
-            "source": source,
-            "tags": tags.iter().map(|t| serde_json::json!({
-                "namespace": t.namespace,
-                "value": t.value,
-                "confidence": t.confidence,
-            })).collect::<Vec<_>>(),
-        })
-        .to_string();
-        self.record_op("set_tags", &payload, Some(&forward))
-    }
-
     /// Record a trash/untrash op (the direction passed to [`Self::set_trashed`]) so the
     /// toggle can be reverted. Call before mutating.
     pub fn record_trash_op(&self, asset_ids: &[i64], trashed: bool) -> Result<i64> {
@@ -188,41 +116,22 @@ impl Catalog {
         self.record_op("create_collection", &payload, None)
     }
 
-    /// Record one bulk-tag op for the assets that actually changed (a no-op add on an
-    /// already-tagged asset is not recorded — its revert would wrongly remove a pre-existing
-    /// tag). One row per batch, so undoing a 5-asset bulk edit reverts all five.
-    pub fn record_bulk_tag_op(
-        &self,
-        asset_ids: &[i64],
-        namespace: &str,
-        value: &str,
-        on: bool,
-    ) -> Result<i64> {
-        let payload = serde_json::json!({
-            "asset_ids": asset_ids,
-            "namespace": namespace,
-            "value": value,
-            "on": on,
-        })
-        .to_string();
-        self.record_op("bulk_tag", &payload, None)
-    }
-
     /// Undo the operation recorded as `op_id`, then remove the op from the log (a
     /// reverted op is gone — re-undo would double-apply). Dispatches on `op_kind`:
-    /// - `set_tags` → restores the snapshotted per-source tag set (reuses
-    ///   [`Self::set_tags`]);
+    /// - `tag_batch` → puts back the recorded before-state of every association it touched, after
+    ///   checking nothing has changed them since (a conflict is refused, not overwritten);
     /// - `set_trashed` → re-applies [`Self::set_trashed`] with the opposite direction (an
     ///   untrash is undone by trashing again and vice versa);
     /// - `create_collection` → deletes the created collection;
-    /// - `bulk_tag` → applies the exact inverse per asset (add ⇄ remove of the same tag).
+    /// - `set_tags` / `bulk_tag` (recorded before M26) → refused, with the reason: they carry only an
+    ///   inverse that could remove or re-attribute another source's tags.
     pub fn revert_op(&mut self, op_id: i64) -> Result<()> {
-        let (kind, _) = self.op_payload(op_id)?;
+        let (kind, payload) = self.op_payload(op_id)?;
         match kind.as_str() {
-            "set_tags" => self.revert_set_tags(op_id),
+            "tag_batch" => self.revert_tag_batch(op_id, &payload),
             "set_trashed" => self.revert_set_trashed(op_id),
             "create_collection" => self.revert_create_collection(op_id),
-            "bulk_tag" => self.revert_bulk_tag(op_id),
+            "set_tags" | "bulk_tag" => Err(legacy_tag_replay(op_id)),
             other => Err(CoreError::Catalog(format!(
                 "revert_op: no revert registered for op kind {other:?}"
             ))),
@@ -261,10 +170,10 @@ impl Catalog {
         let (kind, payload) = self.op_payload(op_id)?;
         let forward = self.op_forward(op_id)?.unwrap_or(payload);
         match kind.as_str() {
-            "set_tags" => self.redo_set_tags(op_id, &forward),
+            "tag_batch" => self.redo_tag_batch(op_id, &forward),
             "set_trashed" => self.redo_set_trashed(op_id, &forward),
             "create_collection" => self.redo_create_collection(op_id, &forward),
-            "bulk_tag" => self.redo_bulk_tag(op_id, &forward),
+            "set_tags" | "bulk_tag" => Err(legacy_tag_replay(op_id)),
             other => Err(CoreError::Catalog(format!(
                 "redo_op: no redo registered for op kind {other:?}"
             ))),
@@ -279,32 +188,6 @@ impl Catalog {
                 |r| r.get(0),
             )
             .map_err(|e| CoreError::Catalog(format!("op_forward: {e}")))
-    }
-
-    /// Redo a `set_tags` op: write the recorded forward tag set back, then consume the row.
-    pub fn redo_set_tags(&mut self, op_id: i64, payload: &str) -> Result<()> {
-        let v: serde_json::Value = serde_json::from_str(payload)
-            .map_err(|e| CoreError::Catalog(format!("redo_set_tags payload: {e}")))?;
-        let asset_id = v["asset_id"]
-            .as_i64()
-            .ok_or_else(|| CoreError::Catalog("redo_set_tags: missing asset_id".into()))?;
-        let source = v["source"]
-            .as_str()
-            .ok_or_else(|| CoreError::Catalog("redo_set_tags: missing source".into()))?;
-        let mut tags = Vec::new();
-        for t in v["tags"].as_array().unwrap_or(&Vec::new()) {
-            tags.push(TagAssignment {
-                namespace: t["namespace"].as_str().unwrap_or("free").to_string(),
-                value: t["value"]
-                    .as_str()
-                    .ok_or_else(|| CoreError::Catalog("redo_set_tags: tag without value".into()))?
-                    .to_string(),
-                confidence: t["confidence"].as_f64(),
-            });
-        }
-        self.set_tags(asset_id, source, None, &tags)?;
-        self.delete_ops(&[op_id])?;
-        Ok(())
     }
 
     /// Redo a `set_trashed` op: re-apply the recorded direction, then consume the row.
@@ -334,94 +217,6 @@ impl Catalog {
             .ok_or_else(|| CoreError::Catalog("redo_create_collection: missing name".into()))?;
         self.create_collection(name)?;
         self.delete_ops(&[op_id])?;
-        Ok(())
-    }
-
-    /// Redo a `bulk_tag` op: re-apply the recorded change, then consume the row.
-    pub fn redo_bulk_tag(&mut self, op_id: i64, payload: &str) -> Result<()> {
-        let p: serde_json::Value = serde_json::from_str(payload)
-            .map_err(|e| CoreError::Catalog(format!("redo_bulk_tag payload: {e}")))?;
-        let ids: Vec<i64> = p["asset_ids"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
-            .unwrap_or_default();
-        let namespace = p["namespace"].as_str().unwrap_or("free");
-        let value = p["value"].as_str().unwrap_or_default();
-        let on = p["on"].as_bool().unwrap_or(true);
-        for id in &ids {
-            if on {
-                self.add_asset_tag(*id, "manual", namespace, value)?;
-            } else {
-                self.remove_asset_tag(*id, namespace, value)?;
-            }
-        }
-        self.delete_ops(&[op_id])?;
-        Ok(())
-    }
-
-    /// Undo a `bulk_tag` op: apply the exact inverse per recorded asset (an add is undone by
-    /// removing that tag, a removal by re-adding it), then drop the op. Only the assets that
-    /// actually changed are in the payload, so a no-op never gets its pre-existing tag yanked.
-    pub fn revert_bulk_tag(&mut self, op_id: i64) -> Result<()> {
-        let (kind, payload) = self.op_payload(op_id)?;
-        debug_assert_eq!(kind, "bulk_tag");
-        let p: serde_json::Value = serde_json::from_str(&payload)
-            .map_err(|e| CoreError::Catalog(format!("revert_bulk_tag payload: {e}")))?;
-        let ids: Vec<i64> = p["asset_ids"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
-            .unwrap_or_default();
-        let namespace = p["namespace"].as_str().unwrap_or("free");
-        let value = p["value"].as_str().unwrap_or_default();
-        let on = p["on"].as_bool().unwrap_or(true);
-        if ids.is_empty() {
-            return Err(CoreError::Catalog("revert_bulk_tag: empty payload".into()));
-        }
-        for id in &ids {
-            if on {
-                self.remove_asset_tag(*id, namespace, value)?;
-            } else {
-                self.add_asset_tag(*id, "manual", namespace, value)?;
-            }
-        }
-        self.mark_undone(op_id)?;
-        Ok(())
-    }
-
-    /// Undo a `set_tags` op: write the snapshotted prior tag set back for the recorded
-    /// asset + source, then drop the op.
-    pub fn revert_set_tags(&mut self, op_id: i64) -> Result<()> {
-        let (kind, payload) = self.op_payload(op_id)?;
-        if kind != "set_tags" {
-            return Err(CoreError::Catalog(format!(
-                "revert_set_tags: op {op_id} is {kind:?}, not set_tags"
-            )));
-        }
-        let v: serde_json::Value = serde_json::from_str(&payload)?;
-        let asset_id = v["asset_id"]
-            .as_i64()
-            .ok_or_else(|| CoreError::Catalog("set_tags op payload: missing asset_id".into()))?;
-        let source = v["source"]
-            .as_str()
-            .ok_or_else(|| CoreError::Catalog("set_tags op payload: missing source".into()))?;
-        let mut tags = Vec::new();
-        for t in v["tags"]
-            .as_array()
-            .ok_or_else(|| CoreError::Catalog("set_tags op payload: missing tags".into()))?
-        {
-            tags.push(TagAssignment {
-                namespace: t["namespace"].as_str().unwrap_or("free").to_string(),
-                value: t["value"]
-                    .as_str()
-                    .ok_or_else(|| {
-                        CoreError::Catalog("set_tags op payload: tag without value".into())
-                    })?
-                    .to_string(),
-                confidence: t["confidence"].as_f64(),
-            });
-        }
-        self.set_tags(asset_id, source, None, &tags)?;
-        self.mark_undone(op_id)?;
         Ok(())
     }
 
@@ -479,4 +274,14 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("op_payload: {e}")))?
             .ok_or_else(|| CoreError::Catalog(format!("no such op {op_id}")))
     }
+}
+
+/// The refusal a pre-M26 tag op gets instead of a replay. Those rows recorded only an inverse —
+/// "remove this tag", "re-add it as manual" — which could delete another source's copy of the tag
+/// or re-attribute a model's row to the person. Refusing, and saying so, is the honest answer.
+fn legacy_tag_replay(op_id: i64) -> CoreError {
+    CoreError::Catalog(format!(
+        "op {op_id} was recorded before per-source tag history (M26); replaying it could remove \
+         or re-attribute tags another source added, so its undo is disabled — edit the tags directly"
+    ))
 }

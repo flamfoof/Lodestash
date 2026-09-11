@@ -63,6 +63,12 @@ impl TagResult {
 pub trait Tagger {
     /// Stable id recorded on every tag it produces (`asset_tag.model_id`).
     fn model_id(&self) -> &str;
+    /// Who produced the tags — the `ai:<producer>` association source (v1 plan S04). An endpoint
+    /// tagger names its kind and host, so two endpoints serving the same bare model alias stay
+    /// apart; never a key or a credential. The default serves test fakes; real taggers override.
+    fn producer_id(&self) -> String {
+        format!("model-{}", self.model_id())
+    }
     /// Whether this tagger can say anything about a given `media_type.code`. A vision tagger
     /// returns false for audio rather than guessing from the filename.
     fn supports(&self, media_code: &str) -> bool;
@@ -100,10 +106,11 @@ pub trait Tagger {
 /// `color`, `technical` and `audio` are excluded on purpose: colour and technical facts are
 /// derived deterministically from the file, and audio facets come from the audio models — asking
 /// a vision model for them only invites confident nonsense.
-pub const MODEL_FACETS: &[&str] = &["subject", "style", "material", "mood", "usage", "free"];
+/// The core boundary's list (`lodestash_core::catalog::AI_NAMESPACES`) — one list, not two.
+pub const MODEL_FACETS: &[&str] = lodestash_core::catalog::AI_NAMESPACES;
 
 /// Per-facet value cap (IDENTIFICATION-AND-SEARCH §2 "validate then write").
-pub const MAX_VALUES_PER_FACET: usize = 8;
+pub const MAX_VALUES_PER_FACET: usize = lodestash_core::catalog::MAX_AI_PER_NAMESPACE;
 
 /// A value that fills a facet without saying anything.
 ///
@@ -125,6 +132,10 @@ pub fn validate(tags: Vec<TagAssignment>) -> Vec<TagAssignment> {
     let mut kept: Vec<TagAssignment> = tags
         .into_iter()
         .filter(|t| MODEL_FACETS.contains(&t.namespace.as_str()) && !says_nothing(&t.value))
+        // Drop whatever the catalog boundary would refuse — a score in the label slot, a
+        // non-finite confidence, an overlong label — so a drain never hands it a batch it rejects
+        // and leaves the asset queued for ever. Same rules, one place (v1 plan S04).
+        .filter(|t| lodestash_core::catalog::assignment_problem("ai:model", t).is_none())
         .collect();
     // Highest confidence first so the cap keeps the model's best guesses; `None` sorts last but
     // a model-produced tag normally carries a score.
@@ -139,7 +150,18 @@ pub fn validate(tags: Vec<TagAssignment>) -> Vec<TagAssignment> {
         *n += 1;
         *n <= MAX_VALUES_PER_FACET
     });
+    // Highest confidence first (above), so the total cap keeps the best guesses too.
+    kept.truncate(lodestash_core::catalog::MAX_AI_ASSIGNMENTS);
     kept
+}
+
+/// `host[:port]` of an endpoint URL — scheme, userinfo, path and query stripped. Enough to tell two
+/// endpoints apart in a producer id; never a key or a credential (v1 plan S04).
+pub fn endpoint_host(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    host.to_ascii_lowercase()
 }
 
 /// Deterministic, model-free stand-in — the `HashEmbedder` of tagging. It reads the *filename*,
@@ -175,6 +197,10 @@ const KEYWORDS: &[(&str, &str, &str)] = &[
 impl Tagger for FilenameTagger {
     fn model_id(&self) -> &str {
         "filename-stub-v1"
+    }
+
+    fn producer_id(&self) -> String {
+        "filename".to_string()
     }
 
     fn supports(&self, _media_code: &str) -> bool {

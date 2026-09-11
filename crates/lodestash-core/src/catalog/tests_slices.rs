@@ -439,42 +439,6 @@ fn op_log_record_recent_delete_manage_the_tail() {
     assert_eq!(c.delete_ops(&[]).expect("no-op"), 0);
 }
 
-#[test]
-fn revert_set_tags_restores_the_snapshotted_prior_set() {
-    let (mut c, ids) = tagged_catalog(&[("a.fbx", "model_3d")]);
-    let asset = ids[0];
-    let a1 = TagAssignment::exact("subject", "rock");
-    let a2 = TagAssignment::exact("style", "rpg");
-    c.set_tags(asset, "manual", None, &[a1.clone(), a2.clone()])
-        .expect("initial");
-
-    let op = c
-        .record_set_tags_op(asset, "manual", &[])
-        .expect("snapshot");
-    c.set_tags(
-        asset,
-        "manual",
-        None,
-        &[TagAssignment::exact("subject", "changed")],
-    )
-    .expect("mutate");
-    assert_eq!(
-        c.tags_for_asset(asset).expect("tags").len(),
-        1,
-        "now the new tag only"
-    );
-
-    c.revert_op(op).expect("revert");
-    let tags = c.tags_for_asset(asset).expect("tags");
-    assert_eq!(tags.len(), 2);
-    assert!(tags.contains(&a1));
-    assert!(tags.contains(&a2));
-    assert!(
-        c.recent_ops(10).expect("recent").is_empty(),
-        "reverted op is consumed"
-    );
-}
-
 /// `add_asset_tag` appends — adding one manual tag must not delete the asset's other
 /// manual tags (the set_tags replace-per-source trap the bulk bar used to fall into).
 #[test]
@@ -506,48 +470,6 @@ fn add_asset_tag_merges_without_touching_the_existing_set() {
         .add_asset_tag(asset, "manual", "subject", "shiny")
         .expect("again");
     assert_eq!(again, 0, "duplicate insert is a no-op");
-}
-
-/// Bulk-tag undo is the exact inverse per asset: an add is undone by removing that tag
-/// only; a removal by re-adding it. One op row covers the whole batch.
-#[test]
-fn bulk_tag_revert_is_the_exact_inverse_per_asset() {
-    let (mut c, ids) = tagged_catalog(&[("a.fbx", "model_3d"), ("b.png", "image")]);
-    let (a, b) = (ids[0], ids[1]);
-
-    // Add one tag to both, record the affected pair, then revert.
-    assert_eq!(
-        c.add_asset_tag(a, "manual", "subject", "shiny").expect("a"),
-        1
-    );
-    assert_eq!(
-        c.add_asset_tag(b, "manual", "subject", "shiny").expect("b"),
-        1
-    );
-    let op = c
-        .record_bulk_tag_op(&[a, b], "subject", "shiny", true)
-        .expect("record");
-    c.revert_op(op).expect("revert");
-    assert!(
-        c.tags_for_asset(a).expect("tags").is_empty()
-            && c.tags_for_asset(b).expect("tags").is_empty(),
-        "revert removed the added tag from both assets"
-    );
-
-    // Remove-then-revert re-adds it.
-    assert_eq!(
-        c.add_asset_tag(a, "manual", "subject", "dull").expect("a2"),
-        1
-    );
-    let op2 = c
-        .record_bulk_tag_op(&[a], "subject", "dull", false)
-        .expect("record");
-    c.remove_asset_tag(a, "subject", "dull").expect("remove");
-    assert!(c.tags_for_asset(a).expect("tags").is_empty());
-    c.revert_op(op2).expect("revert2");
-    let tags = c.tags_for_asset(a).expect("tags");
-    assert_eq!(tags.len(), 1, "revert re-added the removed tag");
-    assert!(tags.contains(&TagAssignment::exact("subject", "dull")));
 }
 
 #[test]
@@ -637,10 +559,6 @@ fn revert_dispatches_and_rejects_unknown_kinds() {
         "failed revert keeps the op"
     );
     assert!(c.revert_op(999).is_err(), "no such op");
-    assert!(
-        c.revert_set_tags(op).is_err(),
-        "wrong kind for the focused revert"
-    );
 }
 
 #[test]

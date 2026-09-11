@@ -299,6 +299,10 @@ Read it before touching anything.
 
 ### Traps (learned this session — read before building)
 
+- **Every tag write goes through `Catalog::apply_tag_batch`** (ADR-0017): one transaction with its
+  FTS re-index and history, validated by `assignment_problem`. `set_tags`, `add_asset_tag` and
+  `remove_asset_tag` survive only as fixture primitives — a production path that calls them skips
+  validation, attribution and history. A model's source is `ai:<producer>`; bare `ai` is legacy.
 - **Tauri capabilities gate every plugin command the webview calls — including `listen`.**
   `crates/lodestash-desktop/capabilities/default.json` grants `core:event:allow-listen` and
   `allow-unlisten`, nothing more. There was no capabilities file at all until 2026-09-10, so every

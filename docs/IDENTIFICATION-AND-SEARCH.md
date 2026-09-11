@@ -65,9 +65,10 @@ facets are what let "Search by Tags" be precise and "Search with AI" turn langua
   the whole table, and `metal` is a legitimate `material` *and* a legitimate `mood` — without the
   prefix the second facet would silently attach to the first one's row. `tag.name` stays the plain
   display value.
-- **Tags are written per `source`.** `Catalog::set_tags(asset, source, …)` replaces only what that
-  source wrote, so re-running the tagger never touches the user's own tags — which is what the
-  `source` column in `asset_tag`'s primary key is for.
+- **Tags are written per `source`**, and a model's source names its producer: `ai:<producer>`
+  ([ADR-0017](decisions/ADR-0017-producer-scoped-atomic-tag-batches.md)). Every write goes through `Catalog::apply_tag_batch`, which replaces only what
+  that one source wrote — so re-running one tagger never touches the user's own tags or another
+  model's, which is what the `source` column in `asset_tag`'s primary key is for.
 - Facets map onto the existing `tag` table via `tag.namespace` and `asset_tag` — **no new tables**. The
   controlled-vocabulary **mapping library** (DATA-MODEL §4) sits on top, normalizing facet values onto
   canonical project categories.
@@ -100,7 +101,8 @@ Rules the pipeline enforces (never trust the model):
   ([`AI-PIPELINE.md`](AI-PIPELINE.md) §6: lowercase, singularize, de-Booru, alias merge), confidence
   clamped to `[0,1]`, and per-facet value counts capped (≤ ~8) before anything lands in the catalog.
 - **Storage mapping:** each value becomes one `tag` row (`namespace` = facet) + one `asset_tag` row
-  (`source='ai'`, `confidence`, `model_id`); `caption` fills `asset.description` (FTS-searchable).
+  (`source='ai:<producer>'`, `confidence`, `model_id`); `caption` fills `asset.description`
+  (FTS-searchable), in the same transaction as the tags.
 - **Confidence is the model's self-estimate**, calibrated over time by the accept/reject log; the UI
   threshold (~0.35) *hides* low-confidence tags, it never deletes them.
 - Non-schema backends map in: WD's flat scored labels are routed into facets by a static

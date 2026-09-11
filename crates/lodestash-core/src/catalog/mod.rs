@@ -426,6 +426,7 @@ impl Catalog {
             (23, MIGRATION_23_KEEP_CACHED),
             (24, MIGRATION_24_REDIRTY_SWALLOWED_TAGS),
             (25, MIGRATION_25_FTS_OVER_A_VIEW),
+            (26, MIGRATION_26_TAG_PROVENANCE),
         ];
 
         for (version, sql) in migrations {
@@ -2197,6 +2198,22 @@ CREATE INDEX IF NOT EXISTS idx_file_pkgentry
   ON asset_file(package_entry_id) WHERE package_entry_id IS NOT NULL;
 ";
 
+/// M26 — who wrote an association, and whose history it is (v1 plan S04, ADR-0017).
+///
+/// `op_log.origin` partitions undo retention: the interactive tail (`user`, `agent`) and the
+/// background lane each keep their own 200 rows, so a model's backlog can never push a person's
+/// last edit out of reach. Every row already recorded was a person's action, hence the default.
+///
+/// AI associations are keyed per producer from here on (`ai:<producer>`). The bare `ai` rows before
+/// this cannot be attributed: the local drain stored its zero-shot proposals under the VLM's model
+/// id, and a cloud pass stored its local fallback under the cloud model's. So they become
+/// `ai:legacy` — the recorded model id kept exactly as it was, the producer admitted unknown —
+/// rather than receive a producer nobody can vouch for.
+const MIGRATION_26_TAG_PROVENANCE: &str = "
+ALTER TABLE op_log ADD COLUMN origin TEXT NOT NULL DEFAULT 'user';
+UPDATE asset_tag SET source = 'ai:legacy' WHERE source = 'ai';
+";
+
 /// M25 — FTS over a canonical view, and only the searchable columns re-index (v1 plan S03).
 ///
 /// M1 declared `asset` the external-content table of `asset_fts`, but `tags_concat` is not an
@@ -3054,6 +3071,9 @@ impl Catalog {
         Ok(inserted)
     }
 
+    /// **Legacy primitive** — production tag writes go through [`Self::apply_tag_batch`], which is
+    /// atomic with its history and validates its input. This one survives for fixtures.
+    ///
     /// Write one asset's tags for a given `source` (`'ai'|'manual'|'imported'`), replacing
     /// whatever that source wrote before, and clear `tags_dirty` (IDENTIFICATION-AND-SEARCH §2).
     ///
@@ -4729,7 +4749,7 @@ impl Catalog {
                         COUNT(DISTINCT CASE WHEN a.id IS NOT NULL THEN at.asset_id END) AS n,
                         COUNT(DISTINCT CASE WHEN at.source='manual' AND a.id IS NOT NULL
                                             THEN at.asset_id END),
-                        COUNT(DISTINCT CASE WHEN at.source='ai' AND a.id IS NOT NULL
+                        COUNT(DISTINCT CASE WHEN (at.source = 'ai' OR at.source LIKE 'ai:%') AND a.id IS NOT NULL
                                              AND NOT EXISTS (SELECT 1 FROM asset_tag m
                                                               WHERE m.asset_id = at.asset_id
                                                                 AND m.tag_id   = at.tag_id
@@ -6039,6 +6059,40 @@ pub struct OpLogRow {
     pub created_at: i64,
 }
 
+/// Append one operation to the undo log on `conn` — the writer's connection or a transaction on
+/// it, so a mutation and its history commit together (v1 plan S04). `origin` partitions retention:
+/// the interactive tail (`user`, `agent`) and the background lane each keep their 200 newest rows,
+/// so a model working through the backlog can never push a person's last edit out of reach. New
+/// work clears only its own partition's redo stack.
+pub(crate) fn record_op_in(
+    conn: &Connection,
+    op_kind: &str,
+    payload_json: &str,
+    forward_json: Option<&str>,
+    origin: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO op_log (op_kind, payload_json, forward_json, created_at, origin)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![op_kind, payload_json, forward_json, unix_now(), origin],
+    )
+    .map_err(|e| CoreError::Catalog(format!("record_op: {e}")))?;
+    let id = conn.last_insert_rowid();
+    let background = origin == "background";
+    conn.execute(
+        "DELETE FROM op_log WHERE undone_at IS NOT NULL AND (origin = 'background') = ?1",
+        params![background],
+    )
+    .map_err(|e| CoreError::Catalog(format!("record_op redo clear: {e}")))?;
+    conn.execute(
+        "DELETE FROM op_log WHERE (origin = 'background') = ?1 AND id NOT IN (
+             SELECT id FROM op_log WHERE (origin = 'background') = ?1 ORDER BY id DESC LIMIT 200)",
+        params![background],
+    )
+    .map_err(|e| CoreError::Catalog(format!("record_op cap: {e}")))?;
+    Ok(id)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Domain modules, split out 2026-08-22 (see each file's header). Only whole `impl` blocks moved;
 // the types they return stay here because more than one module uses them.
@@ -6050,8 +6104,18 @@ mod collections;
 mod excludes;
 mod graph;
 mod oplog;
+mod tagbatch;
 mod taxonomy;
 #[cfg(test)]
 mod tests_catalog;
 #[cfg(test)]
 mod tests_slices;
+#[cfg(test)]
+mod tests_tagbatch;
+
+pub use tagbatch::{
+    ai_source, assignment_problem, is_ai_source, source_problem, AssetTagRow, HistoryOrigin,
+    TagBatch, TagBatchItem, TagBatchOutcome, TagMode, AI_NAMESPACES, HUMAN_NAMESPACES,
+    LEGACY_AI_SOURCE, MAX_AI_ASSIGNMENTS, MAX_AI_PER_NAMESPACE, MAX_BATCH_ASSETS,
+    MAX_DESCRIPTION_CHARS, MAX_LABEL_CHARS,
+};

@@ -258,6 +258,13 @@ impl Tagger for OpenAiTagger {
         &self.model
     }
 
+    fn producer_id(&self) -> String {
+        format!(
+            "openai-compatible@{}",
+            crate::tagger::endpoint_host(&self.base_url)
+        )
+    }
+
     fn supports(&self, media_code: &str) -> bool {
         // No cloud-audio path (AI-PIPELINE §5) — audio is described locally, never uploaded.
         media_code != "audio"

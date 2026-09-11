@@ -275,6 +275,15 @@ pub fn drain_api_tags(
     const BATCH: usize = 16;
     const TAG_PX: u32 = 384;
     let model_id = tagger.model_id().to_string();
+    // Each producer's tags go under its own source (v1 plan S04): the endpoint's, a local
+    // fallback's, and the zero-shot pass's — never one merged under the endpoint's model.
+    let api_source = lodestash_core::catalog::ai_source(&tagger.producer_id());
+    let zs_source = zero_shot.map(|z| {
+        (
+            lodestash_core::catalog::ai_source(z.producer_id()),
+            z.model_id().to_string(),
+        )
+    });
     // Budget guard (AI-PIPELINE §5.1): stop after `max_assets` API calls and leave the rest queued,
     // so a mis-scoped run on a paid endpoint can't run away. `0` = uncapped (a local/free endpoint).
     let mut tagged: u32 = 0;
@@ -312,8 +321,11 @@ pub fn drain_api_tags(
             // if it couldn't run, clear the flag with an empty set (as the local drain does) rather
             // than skipping — skipping would return the same audio-only batch forever.
             if !tagger.supports(&job.media_code) {
-                if let Err(e) = cat.set_tags(job.asset_id, "ai", Some(&model_id), &[]) {
-                    tracing::warn!(%e, "api audio clear failed; stopping api tag drain");
+                if !write_groups(
+                    cat,
+                    job.asset_id,
+                    vec![(api_source.clone(), Some(model_id.clone()), Vec::new())],
+                ) {
                     return;
                 }
                 progress.done.fetch_add(1, Ordering::Relaxed);
@@ -334,8 +346,11 @@ pub fn drain_api_tags(
             else {
                 // No preview to send. Nothing to look at ⇒ clear (as the local drain does), don't
                 // leave it dirty to re-loop forever.
-                if let Err(e) = cat.set_tags(job.asset_id, "ai", Some(&model_id), &[]) {
-                    tracing::warn!(%e, "api set_tags(empty) failed; stopping api tag drain");
+                if !write_groups(
+                    cat,
+                    job.asset_id,
+                    vec![(api_source.clone(), Some(model_id.clone()), Vec::new())],
+                ) {
                     return;
                 }
                 progress.done.fetch_add(1, Ordering::Relaxed);
@@ -350,15 +365,28 @@ pub fn drain_api_tags(
             // The endpoint already proved dead this pass: skip it and use the local model directly.
             // (`api_dead` is only ever set when a fallback exists — see the error arm.)
             if api_dead {
-                let mut tags = fallback
-                    .map(|fb| fb.tag(&input, None).tags)
-                    .unwrap_or_default();
-                if let Some(z) = zero_shot {
-                    tags.extend(zeroshot_tags(z, &job.media_code, Some(&img)));
+                // The dead endpoint wrote nothing: the fallback's tags go under the fallback's own
+                // producer and model — never the failed remote model's.
+                let mut groups = Vec::new();
+                if let Some(fb) = fallback {
+                    groups.push((
+                        lodestash_core::catalog::ai_source(&fb.producer_id()),
+                        Some(fb.model_id().to_string()),
+                        lodestash_ai::tagger::validate(fb.tag(&input, None).tags),
+                    ));
                 }
-                let tags = lodestash_ai::tagger::validate(tags);
-                if let Err(e) = cat.set_tags(job.asset_id, "ai", Some(&model_id), &tags) {
-                    tracing::warn!(%e, "api(fallback) set_tags failed; stopping api tag drain");
+                if let (Some(z), Some((src, zm))) = (zero_shot, &zs_source) {
+                    groups.push((
+                        src.clone(),
+                        Some(zm.clone()),
+                        lodestash_ai::tagger::validate(zeroshot_tags(
+                            z,
+                            &job.media_code,
+                            Some(&img),
+                        )),
+                    ));
+                }
+                if !write_groups(cat, job.asset_id, groups) {
                     return;
                 }
                 progress.done.fetch_add(1, Ordering::Relaxed);
@@ -366,8 +394,8 @@ pub fn drain_api_tags(
             }
 
             tagged += 1; // one asset went to the API (Ok or fell back after a real attempt)
-            let tags = match attempt_api_tag(tagger, &input, progress) {
-                AttemptOutcome::Ok(tags) => tags,
+            let (source, model, tags) = match attempt_api_tag(tagger, &input, progress) {
+                AttemptOutcome::Ok(tags) => (api_source.clone(), model_id.clone(), tags),
                 AttemptOutcome::Cancelled => return,
                 AttemptOutcome::Failed(err) => {
                     progress.failed.fetch_add(1, Ordering::Relaxed);
@@ -380,7 +408,11 @@ pub fn drain_api_tags(
                                 tracing::warn!(%err, "api tagger failed hard; using local model for the rest of this run");
                                 api_dead = true;
                             }
-                            fb.tag(&input, None).tags
+                            (
+                                lodestash_core::catalog::ai_source(&fb.producer_id()),
+                                fb.model_id().to_string(),
+                                fb.tag(&input, None).tags,
+                            )
                         }
                         // No local model to fall back to: leave this asset **dirty** (never mark it
                         // done-with-no-tags) and stop the pass. The next run resumes here.
@@ -391,14 +423,16 @@ pub fn drain_api_tags(
                     }
                 }
             };
-            // Union the API tags with the SigLIP zero-shot proposals over the same preview.
-            let mut tags = tags;
-            if let Some(z) = zero_shot {
-                tags.extend(zeroshot_tags(z, &job.media_code, Some(&img)));
+            // The SigLIP zero-shot proposals over the same preview stay under their own producer.
+            let mut groups = vec![(source, Some(model), lodestash_ai::tagger::validate(tags))];
+            if let (Some(z), Some((src, zm))) = (zero_shot, &zs_source) {
+                groups.push((
+                    src.clone(),
+                    Some(zm.clone()),
+                    lodestash_ai::tagger::validate(zeroshot_tags(z, &job.media_code, Some(&img))),
+                ));
             }
-            let tags = lodestash_ai::tagger::validate(tags);
-            if let Err(e) = cat.set_tags(job.asset_id, "ai", Some(&model_id), &tags) {
-                tracing::warn!(%e, "api set_tags failed; stopping api tag drain");
+            if !write_groups(cat, job.asset_id, groups) {
                 return;
             }
             progress.done.fetch_add(1, Ordering::Relaxed);
@@ -544,8 +578,12 @@ pub fn drain_audio_tags(
                     zero_shot.tag(&mel, frames)
                 })
                 .unwrap_or_default();
-            if let Err(e) = cat.set_tags(job.asset_id, "ai", Some(&model_id), &tags) {
-                tracing::warn!(%e, "audio set_tags failed; stopping audio tag drain");
+            let source = lodestash_core::catalog::ai_source(zero_shot.producer_id());
+            if !write_groups(
+                cat,
+                job.asset_id,
+                vec![(source, Some(model_id.clone()), tags)],
+            ) {
                 return;
             }
             progress.done.fetch_add(1, Ordering::Relaxed);
@@ -1096,6 +1134,54 @@ pub struct ComputedTags {
     pub asset_id: i64,
     pub caption: Option<String>,
     pub tags: Vec<lodestash_core::catalog::TagAssignment>,
+    /// The zero-shot pass's proposals, kept apart: it is its own producer, and storing them under
+    /// the VLM's model id is the attribution M26 had to mark unrecoverable.
+    pub zero_shot: Vec<lodestash_core::catalog::TagAssignment>,
+}
+
+/// Who wrote a slice's tags: `(producer id, model id)` of the tagger, and of the zero-shot pass
+/// when one ran beside it.
+#[derive(Debug, Clone)]
+pub struct TagProducers {
+    pub tagger: (String, String),
+    pub zero_shot: Option<(String, String)>,
+}
+
+/// One asset's result as one batch: each producer's tags under its own source, and the queue
+/// cleared — a result, a fallback's result or "nothing to look at" all finish the asset. `false`
+/// when the catalog refused it; the caller stops, and the asset stays queued.
+fn write_groups(
+    cat: &mut Catalog,
+    asset_id: i64,
+    groups: Vec<(
+        String,
+        Option<String>,
+        Vec<lodestash_core::catalog::TagAssignment>,
+    )>,
+) -> bool {
+    use lodestash_core::catalog::{HistoryOrigin, TagBatch, TagBatchItem, TagMode};
+    let items = groups
+        .into_iter()
+        .map(|(source, model_id, tags)| TagBatchItem {
+            asset_id,
+            source,
+            model_id,
+            mode: TagMode::ReplaceSource,
+            tags,
+            description: None,
+        })
+        .collect();
+    match cat.apply_tag_batch(&TagBatch {
+        items,
+        completes_queue: true,
+        history: Some(HistoryOrigin::Background),
+    }) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(%e, asset_id, "tag batch refused; the asset stays queued");
+            false
+        }
+    }
 }
 
 /// Phase 1 of tagging: **read** a slice of the queue. Same split, and for the same reason, as
@@ -1191,38 +1277,68 @@ pub fn compute_tags(
             } else {
                 lodestash_ai::tagger::TagResult::default()
             };
-            // Union the VLM/name tags with the zero-shot proposals; validate dedupes + caps.
-            let mut merged = result.tags;
-            merged.extend(zs_tags);
             ComputedTags {
                 asset_id: job.asset_id,
                 caption: result.caption,
-                tags: lodestash_ai::tagger::validate(merged),
+                tags: lodestash_ai::tagger::validate(result.tags),
+                zero_shot: lodestash_ai::tagger::validate(zs_tags),
             }
         })
         .collect()
 }
 
-/// Phase 3: **write**. Returns the number of tag rows written.
-pub fn store_tags(cat: &mut Catalog, model_id: &str, results: &[ComputedTags]) -> usize {
-    let mut tagged = 0;
+/// Phase 3: **write** — the whole slice as one atomic batch, each producer's tags under its own
+/// source, the configured captioner's caption with them. Returns the number of tag rows proposed.
+pub fn store_tags(cat: &mut Catalog, producers: &TagProducers, results: &[ComputedTags]) -> usize {
+    use lodestash_core::catalog::{
+        ai_source, HistoryOrigin, TagBatch, TagBatchItem, TagMode, MAX_DESCRIPTION_CHARS,
+    };
+    if results.is_empty() {
+        return 0;
+    }
+    let mut items = Vec::with_capacity(results.len() * 2);
     for r in results {
         // The caption is the model's own words about the asset; it lands in `description`, which
         // FTS indexes, so it is searchable rather than decorative.
-        if let Some(caption) = &r.caption {
-            if let Err(e) = cat.set_description(r.asset_id, Some(caption)) {
-                tracing::warn!(%e, "caption write failed");
-            }
-        }
-        match cat.set_tags(r.asset_id, "ai", Some(model_id), &r.tags) {
-            Ok(n) => tagged += n,
-            Err(e) => {
-                tracing::warn!(%e, "set_tags failed; stopping tag store");
-                break;
-            }
+        let caption = r
+            .caption
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(|c| c.chars().take(MAX_DESCRIPTION_CHARS).collect::<String>());
+        items.push(TagBatchItem {
+            asset_id: r.asset_id,
+            source: ai_source(&producers.tagger.0),
+            model_id: Some(producers.tagger.1.clone()),
+            mode: TagMode::ReplaceSource,
+            tags: r.tags.clone(),
+            description: caption,
+        });
+        if let Some((producer, model)) = &producers.zero_shot {
+            items.push(TagBatchItem {
+                asset_id: r.asset_id,
+                source: ai_source(producer),
+                model_id: Some(model.clone()),
+                mode: TagMode::ReplaceSource,
+                tags: r.zero_shot.clone(),
+                description: None,
+            });
         }
     }
-    tagged
+    match cat.apply_tag_batch(&TagBatch {
+        items,
+        completes_queue: true,
+        history: Some(HistoryOrigin::Background),
+    }) {
+        Ok(_) => results
+            .iter()
+            .map(|r| r.tags.len() + r.zero_shot.len())
+            .sum(),
+        Err(e) => {
+            tracing::warn!(%e, "tag slice refused; its assets stay queued");
+            0
+        }
+    }
 }
 
 /// The three phases back-to-back on one thread — the **kick** path, where the user asked for it
@@ -1249,6 +1365,10 @@ pub fn drain_tags(
     let mut tagged = 0usize;
     let mut tagged_assets = 0usize;
     let model_id = tagger.model_id().to_string();
+    let producers = TagProducers {
+        tagger: (tagger.producer_id(), model_id.clone()),
+        zero_shot: zero_shot.map(|z| (z.producer_id().to_string(), z.model_id().to_string())),
+    };
     loop {
         if progress.is_cancelled() {
             break;
@@ -1272,7 +1392,7 @@ pub fn drain_tags(
         if progress.is_cancelled() {
             return;
         }
-        tagged += store_tags(cat, &model_id, &done);
+        tagged += store_tags(cat, &producers, &done);
         tagged_assets += done.len();
         progress
             .done
@@ -1642,6 +1762,153 @@ mod tests {
         assert!(
             resolve_job_path(&in_pack_job(IN_PACK_PULL_MAX_BYTES + 1), None).is_none(),
             "an over-cap payload resolves to None rather than being pulled into memory"
+        );
+    }
+
+    fn subject(value: &str, confidence: f64) -> lodestash_core::catalog::TagAssignment {
+        lodestash_core::catalog::TagAssignment {
+            namespace: "subject".into(),
+            value: value.into(),
+            confidence: Some(confidence),
+        }
+    }
+
+    /// A catalog holding one real PNG under a real source root, queued for tagging.
+    fn catalog_with_image(dir: &std::path::Path, name: &str) -> (Catalog, i64) {
+        image::RgbaImage::from_pixel(16, 16, image::Rgba([120, 110, 100, 255]))
+            .save(dir.join(name))
+            .expect("png");
+        let mut cat = Catalog::open_in_memory().expect("open");
+        cat.seed_media_types().expect("seed");
+        let src = cat
+            .upsert_import_source("Lib", dir.to_str().expect("utf-8 path"), "folder")
+            .expect("source");
+        cat.record_crawl(
+            src,
+            None,
+            &[lodestash_core::catalog::CrawlRecord {
+                workspace_rel: None,
+                content_hash: None,
+                rel_path: name.into(),
+                name: name.into(),
+                media_type: "image".into(),
+                size_bytes: 16,
+                mtime: 1,
+            }],
+        )
+        .expect("crawl");
+        let id = cat.assets_needing_tags_within(16, None).expect("queue")[0].asset_id;
+        (cat, id)
+    }
+
+    /// The attribution defect S04 exists for: a cloud pass that fell back to the local model stored
+    /// the local model's tags under the **cloud** model's id. The endpoint here is a closed local
+    /// port, so the attempt fails hard at once and the filename tagger substitutes — and its tags
+    /// land under its own producer and model, with nothing claimed for the endpoint.
+    #[test]
+    fn a_fallback_is_credited_to_the_fallback_not_the_failed_endpoint() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let cache = tempfile::tempdir().expect("cache");
+        let (mut cat, id) = catalog_with_image(dir.path(), "rock.png");
+        let api = lodestash_ai::openai::OpenAiTagger::new("http://127.0.0.1:1", "k", "cloud-model");
+        let progress = crate::jobs::JobProgress::default();
+        drain_api_tags(
+            &mut cat,
+            &api,
+            Some(&lodestash_ai::tagger::FilenameTagger),
+            None,
+            0,
+            None,
+            Some(cache.path()),
+            &progress,
+            None,
+        );
+        let rows = cat.asset_tag_rows(id).expect("rows");
+        assert!(!rows.is_empty(), "the fallback wrote nothing");
+        assert!(
+            rows.iter()
+                .all(|r| r.source == "ai:filename"
+                    && r.model_id.as_deref() == Some("filename-stub-v1")),
+            "the fallback's tags are credited to someone else: {rows:?}"
+        );
+        assert_eq!(
+            progress.failed.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the endpoint's failure is still counted"
+        );
+        assert_eq!(
+            cat.count_needing_tags().expect("queue"),
+            0,
+            "the fallback's result finishes the asset"
+        );
+    }
+
+    /// A slice's VLM tags and zero-shot proposals are two producers, stored as two sources — not the
+    /// zero-shot merged under the VLM's model id, which is what M26 had to mark unrecoverable.
+    #[test]
+    fn a_slice_stores_each_producer_under_its_own_source() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let (mut cat, id) = catalog_with_image(dir.path(), "wall.png");
+        let producers = TagProducers {
+            tagger: ("ollama@localhost:11434".into(), "qwen3:8b".into()),
+            zero_shot: Some(("siglip-zeroshot".into(), "siglip2-base".into())),
+        };
+        let stored = store_tags(
+            &mut cat,
+            &producers,
+            &[ComputedTags {
+                asset_id: id,
+                caption: Some("A mossy wall.".into()),
+                tags: vec![subject("wall", 0.9)],
+                zero_shot: vec![subject("brick", 0.6)],
+            }],
+        );
+        assert_eq!(stored, 2);
+        let rows: Vec<_> = cat
+            .asset_tag_rows(id)
+            .expect("rows")
+            .into_iter()
+            .map(|r| (r.source, r.value, r.model_id))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "ai:ollama@localhost:11434".to_string(),
+                    "wall".to_string(),
+                    Some("qwen3:8b".to_string())
+                ),
+                (
+                    "ai:siglip-zeroshot".to_string(),
+                    "brick".to_string(),
+                    Some("siglip2-base".to_string())
+                ),
+            ]
+        );
+        assert_eq!(cat.count_needing_tags().expect("queue"), 0);
+    }
+
+    /// A producer id names the endpoint's host so two endpoints stay apart — and never carries the
+    /// key a URL can embed.
+    #[test]
+    fn producer_ids_name_the_host_and_never_the_credentials() {
+        assert_eq!(
+            lodestash_ai::tagger::endpoint_host(
+                "https://user:sk-secret@API.example.com:8443/v1/chat?k=1"
+            ),
+            "api.example.com:8443"
+        );
+        let api = lodestash_ai::openai::OpenAiTagger::new(
+            "https://key:secret@api.example.com/v1",
+            "k",
+            "m",
+        );
+        let id = lodestash_ai::tagger::Tagger::producer_id(&api);
+        assert_eq!(id, "openai-compatible@api.example.com");
+        assert!(!id.contains("secret"));
+        assert!(
+            lodestash_core::catalog::source_problem(&lodestash_core::catalog::ai_source(&id))
+                .is_none()
         );
     }
 }

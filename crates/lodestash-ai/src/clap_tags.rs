@@ -85,6 +85,12 @@ impl AudioZeroShot {
         &self.model_id
     }
 
+    /// The association source these proposals are stored under: its own producer, never the
+    /// tagger's it runs beside (v1 plan S04).
+    pub fn producer_id(&self) -> &'static str {
+        "clap-zeroshot"
+    }
+
     /// Tag a clip from its log-mel spectrogram (`[frames][mels]`, the same shape the CLAP embed
     /// drain feeds). Returns validated facet tags — at most one label per facet, only the clear ones.
     pub fn tag(&self, mel: &[f32], frames: usize) -> Vec<TagAssignment> {

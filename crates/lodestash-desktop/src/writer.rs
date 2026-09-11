@@ -35,7 +35,9 @@ use lodestash_app::drains::{
 use lodestash_app::jobs::JobProgress as AppJobProgress;
 use lodestash_app::paths::default_cache_dirs;
 use lodestash_app::types::PersistBatch;
-use lodestash_core::catalog::{AppraiseFocus, Catalog, PackageEntryRecord};
+use lodestash_core::catalog::{
+    AppraiseFocus, Catalog, HistoryOrigin, PackageEntryRecord, TagBatch, TagBatchItem, TagMode,
+};
 use lodestash_core::types::{Exclude, ExcludeKind};
 use lodestash_ingest::unitypackage::{
     extract_at_offsets_with_progress, read_manifest_with_progress, EntryLocator, ExtractedAsset,
@@ -383,7 +385,7 @@ enum WriterMsg {
     /// A background tag worker finished a slice — same split, same reason: a caption is a whole
     /// VLM inference (~13 s here) and the writer only persists the result.
     TagsDone {
-        model_id: String,
+        producers: lodestash_app::drains::TagProducers,
         done: Vec<lodestash_app::drains::ComputedTags>,
     },
 }
@@ -1133,17 +1135,16 @@ impl Writer {
                                 changes.catalog(Origin::Background);
                             }
                         }
-                        Ok(WriterMsg::TagsDone { model_id, done }) => {
-                            let n = lodestash_app::drains::store_tags(
-                                &mut catalog,
-                                &model_id,
-                                &done,
-                            );
+                        Ok(WriterMsg::TagsDone { producers, done }) => {
+                            let before = catalog.total_changes();
+                            let n = lodestash_app::drains::store_tags(&mut catalog, &producers, &done);
                             tag_inflight.store(false, Ordering::Relaxed);
                             if n > 0 {
-                                tracing::info!(tags = n, model = %model_id, "idle tagging slice stored");
-                                changes.catalog(Origin::Background);
+                                tracing::info!(tags = n, producer = %producers.tagger.0, "idle tagging slice stored");
                             }
+                            // An empty result still finishes its assets (the queue flag clears), so
+                            // the catalog changed even when no tag row did.
+                            mark_committed(&changes, &catalog, before, Origin::Background);
                         }
                         Ok(WriterMsg::ManifestDone {
                             job_id,
@@ -1495,7 +1496,12 @@ fn tag_worker_slice(
         cache_dir.as_deref(),
     );
     tx.send(WriterMsg::TagsDone {
-        model_id: tagger.model_id().to_string(),
+        producers: lodestash_app::drains::TagProducers {
+            tagger: (tagger.producer_id(), tagger.model_id().to_string()),
+            zero_shot: zero_shot
+                .as_ref()
+                .map(|z| (z.producer_id().to_string(), z.model_id().to_string())),
+        },
         done,
     })
     .is_ok()
@@ -2439,42 +2445,41 @@ fn run(
             value,
             on,
         } => {
-            const SOURCE: &str = "manual";
-            let mut changed = 0usize;
-            // Only the assets that actually changed go into the undo row — a no-op add on an
-            // already-tagged asset must not be recorded, or its revert would wrongly yank a
-            // pre-existing tag.
-            let mut affected = Vec::new();
-            for asset_id in asset_ids {
-                if on {
-                    // Append, never replace: add_asset_tag leaves the asset's other manual
-                    // tags alone (set_tags would delete-and-insert the whole source set).
-                    let n = catalog
-                        .add_asset_tag(asset_id, SOURCE, &namespace, &value)
-                        .map_err(|e| e.to_string())?;
-                    if n > 0 {
-                        affected.push(asset_id);
-                    }
-                    changed += n;
-                } else {
-                    let n = catalog
-                        .remove_asset_tag(asset_id, &namespace, &value)
-                        .map_err(|e| e.to_string())?;
-                    if n > 0 {
-                        affected.push(asset_id);
-                    }
-                    changed += n;
-                }
-            }
-            if !affected.is_empty() {
-                catalog
-                    .record_bulk_tag_op(&affected, &namespace, &value, on)
-                    .map_err(|e| e.to_string())?;
-            }
-            Ok(WriteResult {
-                changed,
-                ..Default::default()
-            })
+            // A person's edit (v1 plan S04). An add appends to their own tags; a removal is a
+            // rejection of the term across every source — the bulk bar's and the inspector's
+            // "remove" mean "this is wrong" — and its undo restores each source's row exactly.
+            let tag = lodestash_core::catalog::TagAssignment {
+                namespace,
+                value,
+                confidence: None,
+            };
+            let mode = if on {
+                TagMode::Append
+            } else {
+                TagMode::RejectAllSources
+            };
+            let items = asset_ids
+                .into_iter()
+                .map(|asset_id| TagBatchItem {
+                    asset_id,
+                    source: "manual".to_string(),
+                    model_id: None,
+                    mode,
+                    tags: vec![tag.clone()],
+                    description: None,
+                })
+                .collect();
+            catalog
+                .apply_tag_batch(&TagBatch {
+                    items,
+                    completes_queue: false,
+                    history: Some(HistoryOrigin::User),
+                })
+                .map(|out| WriteResult {
+                    changed: out.changed_assets.len(),
+                    ..Default::default()
+                })
+                .map_err(|e| e.to_string())
         }
     }
 }
