@@ -627,6 +627,10 @@ export function onChanged(kind: "catalog" | "jobs", cb: (e: ChangedEvent) => voi
     // An effect torn down before `listen` resolved must still unsubscribe, or it leaks a listener.
     if (disposed) u();
     else unlisten = u;
+  }).catch((e) => {
+    // A missing `core:event:allow-listen` capability rejects here — and did, silently, from the
+    // day these events were added until 2026-09-10, so the shell never heard one. Say so.
+    console.error(`ls:changed: cannot subscribe to ${kind} changes`, e);
   });
   return () => {
     disposed = true;

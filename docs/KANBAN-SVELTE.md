@@ -31,7 +31,15 @@ this file stays the live board.
       250 ms fixed window, domain + origin + generation per event
       ([ADR-0016](decisions/ADR-0016-coalesced-change-publication.md)); the idle probe holds the
       message it finds instead of dropping it. Checks in `writer.rs` `mod tests`.
-- [ ] **R1 · S02 — stable browsing with a pending-update indication.**
+- [x] **R1 · S02 — stable browsing with a pending-update indication.** Agent and background changes
+      raise *Library updated · Refresh* in the status bar ([UI-SPEC §0.5](UI-SPEC.md#05-status-bar))
+      instead of re-reading the grid; the user's own writes are ignored as echoes; a refresh clears
+      only through the generation it saw. e2e: *another writer's change asks for a refresh instead of
+      moving the grid*. **Found while verifying it:** no Tauri capability granted
+      `core:event:allow-listen`, so no `ls:changed` event had ever reached the shell — the B2b pump
+      events and the job tray's subscription were inert since `d23ddfe`.
+      `capabilities/default.json` fixes it; the e2e check above is the first to depend on an event
+      arriving.
 - [ ] **R2 · S03 — FTS external-content repair.**
 - [ ] **R2 · S04 — one atomic, provenanced tag batch with conflict-aware undo.**
 - [ ] **R2 · S05 — the batch tag write on every adapter** (MCP handoff Task 4, then 4a).

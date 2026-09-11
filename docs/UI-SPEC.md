@@ -206,6 +206,18 @@ about what the keyboard does and the app implementing neither answer:
 - **`F` is a toggle**, per §0.3 — it set the star unconditionally until the same audit, so it
   could only ever add, while the card's ☆/★ tile and the context menu both toggled.
 
+### 0.5 Status bar
+
+A 24px strip under everything: asset count · vector-preview count · source count · `reload` · the
+catalog path (right). It is also where **another writer's change** surfaces
+([ADR-0016](decisions/ADR-0016-coalesced-change-publication.md)). When an agent (through the engine
+API) or the background lane (identification, previews, watch rescans, a finished unpack) changes the
+catalog, the grid does **not** re-read under the user; the bar shows **Library updated · Refresh**
+(gold, inside a polite live region, 28px hit target). Refresh re-reads the catalog snapshot, the
+counts and every open screen's query, and clears only what it had seen when it started — a change
+landing mid-read stays pending. The user's own writes refresh where they were made and are never
+announced back. `reload` is the same action, always offered.
+
 ---
 
 ## 1. Onboarding (first-run)

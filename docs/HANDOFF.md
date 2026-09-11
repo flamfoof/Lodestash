@@ -299,6 +299,12 @@ Read it before touching anything.
 
 ### Traps (learned this session — read before building)
 
+- **Tauri capabilities gate every plugin command the webview calls — including `listen`.**
+  `crates/lodestash-desktop/capabilities/default.json` grants `core:event:allow-listen` and
+  `allow-unlisten`, nothing more. There was no capabilities file at all until 2026-09-10, so every
+  `ls:changed` subscription was rejected silently and the shell never heard one pump event. A new
+  frontend call to a plugin command needs its permission added there; app `#[tauri::command]`s are
+  not affected (there is no app manifest). `onChanged` now logs a rejected subscription.
 - **The shell here is cmd**, and the outer runner strips `$var` before PowerShell sees it — write
   `.ps1` files and run with `powershell -File`, or stick to the file tools
   (read_file/edit_file/grep) over shell text munging.

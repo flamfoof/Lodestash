@@ -227,6 +227,7 @@
       await addSourceExclude(id, kind, v);
       draftOf(id).value = "";
       await loadExcludes(id);
+      view.dataVersion += 1; // the sidebar's counts follow — its change event is an echo now
     } catch (e) {
       error = String(e);
     } finally {
@@ -239,6 +240,7 @@
     try {
       await removeSourceExclude(id, kind, value);
       await loadExcludes(id);
+      view.dataVersion += 1;
     } catch (e) {
       error = String(e);
     } finally {

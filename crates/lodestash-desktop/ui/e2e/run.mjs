@@ -3510,6 +3510,107 @@ try {
     await page.waitForSelector(".card", { timeout: 5000 });
   });
 
+  // ADR-0016 (S02): another writer's change raises "Library updated · Refresh" instead of
+  // re-reading the grid under the user; a refresh clears only what it had seen when it started;
+  // and the user's own write is not announced back to them. Every write here is real — two agent
+  // stages through the engine API and one user stage through the command path — and all three
+  // are undone at the end.
+  //
+  // It is also the check that the shell hears `ls:changed` at all. Until 2026-09-10 it never did:
+  // no capability granted `core:event:allow-listen`, so every subscription was rejected, silently,
+  // and nothing in the suite noticed because nothing depended on an event arriving.
+  await check("another writer's change asks for a refresh instead of moving the grid", async () => {
+    // Count the reads a change event used to trigger, and let this check hold a refresh open.
+    await page.evaluate(() => {
+      // Tauri defines both `window.__TAURI_INTERNALS__` and its `invoke` non-writable and
+      // non-configurable, so wrapping either is a silent no-op — which is how this check first
+      // passed its "no re-read" assertion while counting nothing. The IPC itself is a `fetch` to
+      // `http://ipc.localhost/<command>`, and `fetch` is an ordinary writable global: count there,
+      // and hold `reload_library` there.
+      const realFetch = window.fetch.bind(window);
+      window.__lsCalls = {};
+      window.__lsHold = null;
+      window.fetch = async (input, init) => {
+        const url = String(input && input.url ? input.url : input);
+        const m = url.match(/^http:\/\/ipc\.localhost\/([^?#]+)/);
+        if (m) {
+          const cmd = decodeURIComponent(m[1]);
+          window.__lsCalls[cmd] = (window.__lsCalls[cmd] ?? 0) + 1;
+          if (cmd === "reload_library" && window.__lsHold) await window.__lsHold;
+        }
+        return realFetch(input, init);
+      };
+    });
+    const reads = () =>
+      page.evaluate(() => ({
+        grid_page: window.__lsCalls.grid_page ?? 0,
+        library_status: window.__lsCalls.library_status ?? 0,
+      }));
+    const banner = page.locator('[data-testid="library-updated"]');
+    const h = JSON.parse(fs.readFileSync(HANDSHAKE, "utf8"));
+    const agentStage = async (asset_id) => {
+      const res = await fetch(`http://127.0.0.1:${h.port}/v1/stage`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${h.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ asset_id }),
+      });
+      assert.ok(res.ok, `stage through the engine API: ${res.status} ${await res.text()}`);
+    };
+
+    const before = await invoke("staged");
+    assert.ok(
+      await page.evaluate(() => (window.__lsCalls.staged ?? 0) >= 1),
+      "the call counter is not intercepting — every read assertion below would pass vacuously",
+    );
+    const ids = (
+      await page.locator(".card").evaluateAll((els) => els.map((e) => Number(e.dataset.assetId)))
+    ).filter((i) => !before.includes(i));
+    assert.ok(ids.length >= 3, "the page needs three unstaged cards");
+    const [a, b, mine] = ids;
+    try {
+      await agentStage(a);
+      await banner.waitFor({ state: "visible", timeout: 3000 });
+      assert.deepEqual(
+        await reads(),
+        { grid_page: 0, library_status: 0 },
+        "an agent's write re-read the page under the user",
+      );
+      assert.equal(
+        await page.locator('[role="status"]:has([data-testid="library-updated"])').count(),
+        1,
+        "the indication is outside a live region, so a screen reader never hears it",
+      );
+
+      // A change that lands while the refresh is still reading stays pending.
+      await page.evaluate(() => {
+        window.__lsHold = new Promise((r) => (window.__lsRelease = r));
+      });
+      await banner.click();
+      await agentStage(b);
+      await page.waitForTimeout(800); // past one publish window: b's event is in while held
+      await page.evaluate(() => {
+        window.__lsHold = null;
+        window.__lsRelease();
+      });
+      await waitFor(async () => (await reads()).grid_page >= 1, "the refresh never re-read the page");
+      await waitFor(
+        async () => (await banner.count()) === 1 && (await banner.isEnabled()),
+        "a change that landed mid-refresh was cleared along with it",
+      );
+
+      // A second refresh clears it, and the user's own write is not announced back to them.
+      await banner.click();
+      await banner.waitFor({ state: "detached", timeout: 3000 });
+      const settled = await reads();
+      await invoke("stage", { ids: [mine] });
+      await page.waitForTimeout(800);
+      assert.equal(await banner.count(), 0, "the user's own write was announced as someone else's");
+      assert.deepEqual(await reads(), settled, "the user's own write was re-read a second time");
+    } finally {
+      await invoke("unstage", { ids: [a, b, mine] }).catch(() => {});
+    }
+  });
+
 } finally {
   await app.close();
 }

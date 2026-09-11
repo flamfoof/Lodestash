@@ -86,8 +86,8 @@ import JobTray from "./lib/JobTray.svelte";
   // `--row-h` / `--control-h` (32 / 36 / 40 per DESIGN-GUIDELINES §4) — one source of truth.
 
   // Re-ask the sidebar's facet counts whenever the route changes — navigating is the cheap
-  // catch-all. Catalog mutations no longer poll here: the writer pushes `ls:changed` events
-  // (pump events, B2b) and `onCatalogChanged` below refreshes status + the grid page.
+  // catch-all. Catalog mutations do not poll here: the user's own writes re-read where they are
+  // made, and every other writer raises the status bar's refresh below (ADR-0016).
   $effect(() => {
     view.route;
     let stale = false;
@@ -99,16 +99,18 @@ import JobTray from "./lib/JobTray.svelte";
     };
   });
 
-  // Pump events (B2b): the writer's change notification. "catalog" = the library changed —
-  // refresh status and bump the page version so the current grid/list re-reads.
+  // Change events (ADR-0016). The user's own writes already re-read where they were made, so a
+  // `user`-only event is that write's echo and is ignored. Anyone else's change — an agent through
+  // the engine API, the background lane — only raises "Library updated · Refresh": re-reading the
+  // page under someone browsing it is how a draining backlog used to reshuffle the grid every
+  // second. (It re-read a stale snapshot, too: only a user write reloads the backend's rows.)
+  // `pendingGen` is the newest such change; a refresh clears only what it had seen on starting.
+  let pendingGen = $state(0);
+  let clearedGen = $state(0);
+  let libraryUpdated = $derived(pendingGen > clearedGen);
   $effect(() => {
-    const off = onChanged("catalog", async () => {
-      try {
-        status = await libraryStatus();
-      } catch {
-        /* the next event or navigation re-asks */
-      }
-      view.dataVersion += 1;
+    const off = onChanged("catalog", (e) => {
+      if (e.origins.some((o) => o !== "user")) pendingGen = Math.max(pendingGen, e.catalog_gen);
     });
     return off;
   });
@@ -183,10 +185,18 @@ import JobTray from "./lib/JobTray.svelte";
     setWebPrefs(view.snapshot()).catch(() => {});
   });
 
+  /**
+   * Re-read the catalog: the backend's row snapshot, the status counts and — through `dataVersion`
+   * — every mounted screen's query. Clears the pending indication only through the generation it
+   * had seen when it started, so a change landing mid-read stays pending.
+   */
   async function reload() {
+    const through = pendingGen;
     reloading = true;
     try {
       status = await reloadLibrary();
+      view.dataVersion += 1;
+      clearedGen = Math.max(clearedGen, through);
     } finally {
       reloading = false;
     }
@@ -769,6 +779,18 @@ import JobTray from "./lib/JobTray.svelte";
       <button class="reload" onclick={reload} disabled={reloading}>
         {reloading ? "reloading…" : "reload"}
       </button>
+      <!-- A live region that exists before its content does, so the indication is announced. -->
+      <span class="updated" role="status" aria-live="polite">
+        {#if libraryUpdated}
+          <button
+            class="refresh"
+            data-testid="library-updated"
+            onclick={reload}
+            disabled={reloading}
+            title="Another writer changed the library — an agent, or background identification"
+          >Library updated · Refresh</button>
+        {/if}
+      </span>
       <span class="right path" title={status.catalog_path ?? ""}>{status.catalog_path}</span>
     {:else}
       <span>no catalog — shell scaffold</span>
@@ -900,6 +922,16 @@ import JobTray from "./lib/JobTray.svelte";
   }
   .reload:hover:not(:disabled) {
     color: var(--ls-gold);
+  }
+  .refresh {
+    font-size: var(--fs-xs);
+    color: var(--ls-gold);
+    /* A 28px hit target (DESIGN-GUIDELINES §9) inside the 24px bar, without growing it. */
+    padding: 6px var(--sp-2);
+    margin: -6px 0;
+  }
+  .refresh:hover:not(:disabled) {
+    text-decoration: underline;
   }
   .right {
     margin-left: auto;

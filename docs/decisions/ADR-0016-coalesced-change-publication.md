@@ -1,7 +1,7 @@
 # ADR-0016 — Coalesced change publication and explicit external refresh
 
-- **Status:** accepted — publication (S01) landed; the shell's pending-refresh half (S02) lands in
-  its own commit
+- **Status:** accepted — publication (S01) and the shell's pending refresh (S02,
+  [UI-SPEC §0.5](../UI-SPEC.md#05-status-bar)) have both landed
 - **Date:** 2026-09-10
 - **Amends:** [ADR-0008](ADR-0008-appraisal-is-a-background-job.md) and
   [ADR-0014](ADR-0014-the-backlog-lane-is-duty-cycled.md) — how the backlog lane's results reach the
@@ -21,6 +21,14 @@ indefinitely, under whoever was browsing.
 The same loop's idle probe was `rx.recv_timeout(ZERO).is_ok()`: it received a waiting message and
 dropped it. An op arriving at that instant never ran, and its caller was told the writer had dropped
 the job.
+
+None of those events ever reached the screen, it turned out. The shell had no Tauri capability
+granting `core:event:allow-listen`, so every `listen` was rejected — silently, because `onChanged`
+never caught the rejection — from the day the pump events landed (`d23ddfe`). The storm was real in
+the code and absent in practice, and the job tray never heard one of its own events either.
+Verifying S02 against the running app is what found it. The repair is a one-permission capability
+file, `crates/lodestash-desktop/capabilities/default.json` (listen and unlisten, nothing else), and a
+logged rejection in `onChanged`.
 
 ## Decision
 
