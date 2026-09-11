@@ -519,8 +519,8 @@
     gap: var(--sp-2);
   }
   .actions .primary {
-    border-color: var(--ls-accent);
-    color: var(--ls-accent);
+    border-color: var(--ls-gold);
+    color: var(--ls-gold);
   }
 
   .screen {
