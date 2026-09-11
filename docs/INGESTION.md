@@ -291,10 +291,14 @@ CPU rasteriser that renders model thumbnails (`render3d`), on a transparent back
 card shows through.
 
 The texture comes from the **dependency graph** (DATA-MODEL §10): the material's resolved
-`uses_texture` edge names a catalogued texture, and `Catalog::material_albedo_paths` turns that into
-a file path. A material with several textures gets its lowest-id edge — in a Unity `.mat` the albedo
-binding is written before the normal and emissive maps, so insertion order beats any name heuristic.
-A material with no resolved texture still renders, as a neutral ball.
+`uses_texture` edges name catalogued textures, each with the property it fills (M29). The preview —
+grid card, Quick Look and the engine plane — takes the one bound to an albedo property
+(`Catalog::material_albedo_texture`): Unity writes `m_TexEnvs` alphabetically, so a Built-in
+material's `_BumpMap` comes before its `_MainTex`, and the lowest id used to paint the ball with its
+normal map. A normal, mask or emission map is never an albedo; an edge without a property is judged
+by the texture's file name. The embedding render keeps the lowest-id choice
+(`Catalog::material_albedo_paths`) until re-embedding is decided, so no vector moves. A material
+with no resolved texture still renders, as a neutral ball.
 
 UVs are longitude/latitude, not the material's own mapping: a tiling texture has no single correct
 projection onto a ball, and a shader ball is read as a preview rather than as a claim about how the

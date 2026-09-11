@@ -713,6 +713,7 @@ CREATE TABLE asset_relationship (
   confidence    REAL,                     -- 0..1; null for unity_meta (deterministic)
   declared_path TEXT,                     -- the path/name the parent declared (FBX binding, .mtl, GUID)
   state         TEXT NOT NULL DEFAULT 'resolved',  -- 'resolved' | 'missing' | 'ignored' (muted by hand)
+  role          TEXT,                     -- M29: the property a texture binding fills ('_MainTex', '_BumpMap'…)
   UNIQUE(from_asset_id, to_asset_id, kind)
 );
 CREATE INDEX idx_rel_from ON asset_relationship(from_asset_id);
@@ -833,6 +834,20 @@ overrides are counted and left unresolved: an override is a property modificatio
 prefab's renderer, not a binding. A material the model file embeds names the model's own GUID and
 mints no self-edge.
 
+**Which texture paints a preview** (M29, v1 plan S07). A `uses_texture` edge harvested from a
+material records the property it fills (`role`). `Catalog::material_albedo_texture` takes the
+binding to an albedo property (`_BaseMap`, `_MainTex`…); a normal, mask, height or emission map is
+never an albedo, and an edge without a role — name-matched, or harvested before M29 — is judged by
+the texture's file name (`albedo_rank`). A model's inputs come per slot
+(`Catalog::model_material_inputs`): from the prefab renderers that draw its mesh first; when
+several prefabs paint it differently the most common appearance is taken, ties by prefab path, and
+the others are counted as `alternatives`, never merged. Without prefab evidence the resolved
+`uses_material` edges give the slots in edge order, and without those a name-matched texture paints
+slot 0. Only resolved, unmuted links to live textures whose file is present count. The model file's
+own embedded or declared textures (`mesh::load_textured`) outrank all of this where they exist.
+Previews only: the embedding render keeps the lowest-id texture (`material_albedo_paths`), so no
+vector moves until re-embedding is decided.
+
 > **Coverage today.** `uses_texture` (material → texture, from the material YAML) and
 > `uses_material` (mesh → material, from prefabs) — so a model's closure reaches its textures
 > through its material. **Step 2's naming heuristic is in** (2026-07-29): a model with *no* edge at
@@ -907,6 +922,7 @@ transaction, in order, on open. Shipped so far:
 | **M2** | Mapping library: `taxonomy`, `category`, `category_alias`, `mapping_rule`, `asset_category` (§4) |
 | **M3** | Engine round-trip: `package` + `asset.package_id`, `project`, `import_record`, `asset.license/attribution/license_url` (§7, §9) |
 | **M4** | `asset.rating`, `package.pipeline`, `project.pipeline` (§12) |
+| **M29** | Texture roles (v1 plan S07): `asset_relationship.role` holds the material property a `uses_texture` edge fills (`_MainTex`, `_BumpMap`…), so a preview paints with the albedo instead of the lowest-id texture (§10). Every live material is queued for one more dependency scan to fill it; an edge without a role is judged by its texture's file name |
 | **M28** | Prefab evidence (v1 plan S06, [ADR-0018](decisions/ADR-0018-prefabs-are-scoped-evidence.md)): `prefab_file` (scope, path, size/mtime revision) and `prefab_binding` (GameObject, renderer, slot, mesh GUID, material GUID); the `unity_prefab` edges are derived from them (§10). The edges already recorded were whole-file pairings no row attributes to a prefab, so they become the evidence of the reserved scope `legacy`: a source's legacy pairings are retired once a walk of that source completes, and the rest once a walk of every scope does — no edge is deleted before a reharvest has replaced it. In-pack assets take the GUID their package manifest names, and materialized in-pack rows are queued for the dependency scan the archive could not give them |
 | **M27** | `tag_request` — durable receipts for agent `write_tags` requests (ENGINE-API §8.3): request id, digest of the validated body, the history row and the terminal result, written in the batch's own transaction. Not the undo log: that tail is capped, and a retry must find its receipt after its history has scrolled away. Same id and body replays the recorded result; same id with a different body is `request_conflict` |
 | **M26** | Tag provenance ([ADR-0017](decisions/ADR-0017-producer-scoped-atomic-tag-batches.md)). `op_log.origin` (`user` default — every earlier row was a person's) partitions undo retention: the interactive tail and the background lane keep 200 rows each. Every pre-existing `asset_tag.source = 'ai'` row becomes `ai:legacy` with its recorded `model_id` kept: the local drain had stored zero-shot proposals under the VLM's model id and a cloud pass its local fallback under the cloud model's, so the producer is unrecoverable and is not invented. New AI rows are `ai:<producer>`; every write goes through `Catalog::apply_tag_batch` — one transaction with its FTS re-index and a versioned before/after history row |

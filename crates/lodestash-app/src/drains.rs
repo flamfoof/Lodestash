@@ -634,16 +634,27 @@ pub fn drain_dependencies(cat: &mut Catalog, workspace_dir: Option<&std::path::P
             // Materials are the only catalogued type that declares GUIDs today: meshes embed
             // their materials (`externalObjects` is empty on a stock FBX import), and prefabs
             // aren't a `media_type`.
-            let refs = match (job.media_code.as_str(), path.as_deref()) {
-                ("material", Some(p)) => std::fs::read_to_string(p)
-                    .map(|yaml| lodestash_ingest::deps::material_texture_guids(&yaml))
-                    .unwrap_or_default(),
-                _ => Vec::new(),
-            };
+            // Each texture binding keeps the property it fills (M29): that is what tells a preview
+            // the albedo from the normal map declared before it.
+            let refs: Vec<(Option<String>, String)> =
+                match (job.media_code.as_str(), path.as_deref()) {
+                    ("material", Some(p)) => std::fs::read_to_string(p)
+                        .map(|yaml| {
+                            lodestash_ingest::deps::material_texture_bindings(&yaml)
+                                .into_iter()
+                                .map(|(property, g)| (Some(property).filter(|p| !p.is_empty()), g))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                };
             edges += refs.len();
-            if let Err(e) =
-                cat.record_dependencies(job.asset_id, guid.as_deref(), "uses_texture", &refs)
-            {
+            if let Err(e) = cat.record_dependencies_with_roles(
+                job.asset_id,
+                guid.as_deref(),
+                "uses_texture",
+                &refs,
+            ) {
                 tracing::warn!(%e, "record_dependencies failed; stopping dependency drain");
                 return;
             }
@@ -2239,6 +2250,76 @@ mod tests {
             closure(&cat, rock),
             sorted(vec![rock, rock_mat]),
             "every scope walked: the removed source's evidence goes"
+        );
+    }
+
+    /// A material's texture bindings keep the property they fill (M29). Its normal map is declared
+    /// first and has the lower id, and the names say nothing either way — only the property can pick
+    /// the albedo.
+    #[test]
+    fn a_material_harvest_keeps_each_texture_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir(&lib).unwrap();
+        let guid = |c: char| c.to_string().repeat(32);
+        let files = [
+            ("t_a.png", 'b', "image"),
+            ("t_b.png", 'c', "image"),
+            ("rock.mat", 'a', "material"),
+        ];
+        for (name, g, _) in files {
+            std::fs::write(lib.join(name), "x").unwrap();
+            std::fs::write(
+                lib.join(format!("{name}.meta")),
+                format!("fileFormatVersion: 2\nguid: {}\n", guid(g)),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            lib.join("rock.mat"),
+            format!(
+                "Material:\n  m_SavedProperties:\n    m_TexEnvs:\n    - _BumpMap:\n        \
+                 m_Texture: {{fileID: 2800000, guid: {}, type: 3}}\n    - _MainTex:\n        \
+                 m_Texture: {{fileID: 2800000, guid: {}, type: 3}}\n",
+                guid('b'),
+                guid('c')
+            ),
+        )
+        .unwrap();
+        let mut cat = Catalog::open(&dir.path().join("catalog.db")).unwrap();
+        cat.seed_media_types().unwrap();
+        let src = cat
+            .upsert_import_source("Lib", &lib.to_string_lossy(), "folder")
+            .unwrap();
+        cat.record_crawl(
+            src,
+            None,
+            &files.map(|(name, _, media)| lodestash_core::catalog::CrawlRecord {
+                workspace_rel: None,
+                content_hash: None,
+                rel_path: name.into(),
+                name: name.into(),
+                media_type: media.into(),
+                size_bytes: 1,
+                mtime: 1,
+            }),
+        )
+        .unwrap();
+        let ids: std::collections::HashMap<String, i64> = cat
+            .assets_needing_dep_scan(10)
+            .unwrap()
+            .into_iter()
+            .map(|j| {
+                let path = j.disk_path.expect("on disk");
+                let name = path.rsplit(['/', '\\']).next().unwrap().to_string();
+                (name, j.asset_id)
+            })
+            .collect();
+        assert!(ids["t_a.png"] < ids["t_b.png"]);
+        drain_dependencies(&mut cat, None);
+        assert_eq!(
+            cat.material_albedo_texture(ids["rock.mat"]).unwrap(),
+            Some(ids["t_b.png"])
         );
     }
 }

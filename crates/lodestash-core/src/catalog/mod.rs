@@ -429,6 +429,7 @@ impl Catalog {
             (26, MIGRATION_26_TAG_PROVENANCE),
             (27, MIGRATION_27_TAG_REQUEST_RECEIPTS),
             (28, MIGRATION_28_PREFAB_EVIDENCE),
+            (29, MIGRATION_29_TEXTURE_ROLES),
         ];
 
         for (version, sql) in migrations {
@@ -2216,6 +2217,18 @@ CREATE INDEX IF NOT EXISTS idx_file_pkgentry
   ON asset_file(package_entry_id) WHERE package_entry_id IS NOT NULL;
 ";
 
+/// M29 — the role a texture binding fills (v1 plan S07). `asset_relationship.role` holds the material
+/// property a `uses_texture` edge was harvested from (`_MainTex`, `_BumpMap`…), so a preview paints
+/// with the albedo instead of whichever texture has the lowest id. Every live material is queued for
+/// one more dependency scan to fill it; until then, and for every edge without one, the texture's
+/// file name decides (`material_inputs::albedo_rank`).
+const MIGRATION_29_TEXTURE_ROLES: &str = "
+ALTER TABLE asset_relationship ADD COLUMN role TEXT;
+UPDATE asset SET deps_dirty = 1
+ WHERE deleted_at IS NULL
+   AND media_type_id IN (SELECT id FROM media_type WHERE code = 'material');
+";
+
 /// M28 — prefab evidence, per file and per renderer slot (v1 plan S06, ADR-0018).
 ///
 /// `prefab_file` is one `.prefab` as last read: the scope it was walked under (a source root or the
@@ -3040,6 +3053,26 @@ impl Catalog {
         kind: &str,
         ref_guids: &[String],
     ) -> Result<()> {
+        let refs: Vec<(Option<String>, String)> =
+            ref_guids.iter().map(|g| (None, g.clone())).collect();
+        self.record_dependencies_with_roles(asset_id, guid, kind, &refs)
+    }
+
+    /// [`Self::record_dependencies`] for references that fill a named role — a material's texture
+    /// bindings, each with its property (`_MainTex`, `_BumpMap`…; v1 plan S07, M29). A texture bound
+    /// to several properties is still one edge, and it keeps the role a preview can paint with: refs
+    /// are written albedo-first and each GUID once.
+    pub fn record_dependencies_with_roles(
+        &mut self,
+        asset_id: i64,
+        guid: Option<&str>,
+        kind: &str,
+        refs: &[(Option<String>, String)],
+    ) -> Result<()> {
+        let mut ordered: Vec<&(Option<String>, String)> = refs.iter().collect();
+        ordered.sort_by_key(|(role, _)| albedo_rank(role.as_deref(), "").unwrap_or(u8::MAX));
+        let mut seen = HashSet::new();
+        ordered.retain(|(_, g)| seen.insert(g.as_str()));
         let tx = self
             .conn
             .transaction()
@@ -3063,23 +3096,24 @@ impl Catalog {
             params![asset_id],
         )
         .map_err(|e| CoreError::Catalog(format!("deps clear edges: {e}")))?;
-        for reference in ref_guids {
+        for (role, reference) in ordered {
             // The `WHERE NOT EXISTS` is what keeps an ignored edge ignored: its `to_asset_id`
             // is NULL, and SQLite treats NULLs as distinct, so `ON CONFLICT` cannot dedupe it.
             tx.execute(
                 "INSERT INTO asset_relationship
-                    (from_asset_id, to_asset_id, kind, source, declared_path, state)
+                    (from_asset_id, to_asset_id, kind, source, declared_path, state, role)
                  SELECT ?1,
                     (SELECT id FROM asset WHERE unity_guid = ?2 AND deleted_at IS NULL),
                     ?3, 'unity_meta', ?2,
                     CASE WHEN EXISTS (SELECT 1 FROM asset
                                        WHERE unity_guid = ?2 AND deleted_at IS NULL)
-                         THEN 'resolved' ELSE 'missing' END
+                         THEN 'resolved' ELSE 'missing' END,
+                    ?4
                   WHERE NOT EXISTS (SELECT 1 FROM asset_relationship
                                      WHERE from_asset_id = ?1 AND declared_path = ?2
                                        AND state = 'ignored')
                  ON CONFLICT(from_asset_id, to_asset_id, kind) DO NOTHING",
-                params![asset_id, reference, kind],
+                params![asset_id, reference, kind, role],
             )
             .map_err(|e| CoreError::Catalog(format!("deps edge: {e}")))?;
         }
@@ -5566,59 +5600,6 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("preview queue row: {e}")))
     }
 
-    /// The albedo texture a model paints with, via the dependency graph (DATA-MODEL §10):
-    /// `model --uses_material--> material --uses_texture--> image`.
-    ///
-    /// **Two hops on purpose.** One hop lands on the material, which is not an image; a caller that
-    /// stopped there would hand a material id to an image loader and get a silent blank texture.
-    /// Only `resolved` edges count — a `missing` edge names a texture that was never found.
-    /// A model with several materials yields the lowest texture id, deterministically, so repeated
-    /// calls agree (see the one-albedo-per-model limitation in the viewer).
-    pub fn model_albedo_texture(&self, asset_id: i64) -> Result<Option<i64>> {
-        self.conn
-            .query_row(
-                "SELECT MIN(t.id)
-                   FROM asset_relationship m
-                   JOIN asset_relationship x ON x.from_asset_id = m.to_asset_id
-                   JOIN asset t              ON t.id = x.to_asset_id
-                   JOIN media_type mt        ON mt.id = t.media_type_id
-                  WHERE m.from_asset_id = ?1
-                    AND m.kind = 'uses_material' AND m.state = 'resolved'
-                    AND x.kind = 'uses_texture'  AND x.state = 'resolved'
-                    AND t.deleted_at IS NULL
-                    AND mt.code IN ('image', 'texture', 'sprite')",
-                params![asset_id],
-                |r| r.get::<_, Option<i64>>(0),
-            )
-            .optional()
-            .map(Option::flatten)
-            .map_err(|e| CoreError::Catalog(format!("model_albedo_texture: {e}")))
-    }
-
-    /// The texture a **material** paints with — one hop, `material --uses_texture--> image`.
-    ///
-    /// The model variant above needs two hops because a model reaches its texture *through* a
-    /// material; a material is already there. Keeping them separate makes the hop count explicit
-    /// at each call site rather than a parameter someone gets wrong.
-    pub fn material_albedo_texture(&self, material_id: i64) -> Result<Option<i64>> {
-        self.conn
-            .query_row(
-                "SELECT MIN(t.id)
-                   FROM asset_relationship x
-                   JOIN asset t       ON t.id = x.to_asset_id
-                   JOIN media_type mt ON mt.id = t.media_type_id
-                  WHERE x.from_asset_id = ?1
-                    AND x.kind = 'uses_texture' AND x.state = 'resolved'
-                    AND t.deleted_at IS NULL
-                    AND mt.code IN ('image', 'texture', 'sprite')",
-                params![material_id],
-                |r| r.get::<_, Option<i64>>(0),
-            )
-            .optional()
-            .map(Option::flatten)
-            .map_err(|e| CoreError::Catalog(format!("material_albedo_texture: {e}")))
-    }
-
     /// Every asset id carrying a stored preview.
     ///
     /// One query for the whole library rather than `vector_preview` per row: a grid deciding
@@ -6150,6 +6131,7 @@ pub(crate) fn record_op_in(
 mod collections;
 mod excludes;
 mod graph;
+mod material_inputs;
 mod oplog;
 mod prefab;
 mod tagbatch;
@@ -6157,10 +6139,13 @@ mod taxonomy;
 #[cfg(test)]
 mod tests_catalog;
 #[cfg(test)]
+mod tests_material_inputs;
+#[cfg(test)]
 mod tests_slices;
 #[cfg(test)]
 mod tests_tagbatch;
 
+pub use material_inputs::{albedo_rank, MaterialInputSource, MaterialSlot, ModelMaterialInputs};
 pub use prefab::{PrefabBindingRow, PrefabFileScan, LEGACY_PREFAB_SCOPE};
 pub use tagbatch::{
     ai_source, assignment_problem, is_ai_source, source_problem, validate_assignments, AssetTagRow,

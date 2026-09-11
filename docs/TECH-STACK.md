@@ -127,7 +127,10 @@ release.
 orbit camera and one optional albedo texture. **three.js was evaluated and rejected** — it would
 have added ~150 KB gzipped against a 62 KB bundle and a fifth runtime package, to supply a scene
 graph, loaders and a material system none of which this needs. `LSM1` already hands the frontend
-flat `f32`/`u32` arrays, so vertex data goes straight into GPU buffers.
+flat `f32`/`u32` arrays, so vertex data goes straight into GPU buffers. `mesh::load_textured`
+already splits an FBX mesh by material part and reads glTF/GLB base-colour textures (embedded,
+data URI or external), and the catalog resolves an albedo per slot; binding those per-slot inputs
+here is the v1 plan's S08. Until then the viewer paints one albedo per model.
 
 Camera constants mirror the retired egui `viewport3d.rs` so both frontends feel identical, and
 shading mirrors `render3d` so the viewer and the thumbnails agree.

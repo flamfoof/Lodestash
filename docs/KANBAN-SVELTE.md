@@ -68,7 +68,14 @@ this file stays the live board.
       walk completes. Refreshed after dependency drains, watch rescans, manual scans and extraction;
       in-pack assets carry their manifest GUID. *Open:* nested instances and variant overrides are
       counted, not resolved.
-- [ ] **R3 · S07–S08 — native material inputs, textured previews.**
+- [x] **R3 · S07 — native material inputs** (M29). `uses_texture` edges keep the property they
+      fill; previews take the albedo by property (`albedo_rank`), never a normal or mask map, and a
+      model's slots come from its prefab appearances (the most common, others counted), then its
+      edges, then a name-matched texture (`model_material_inputs`). `mesh::load_textured` splits
+      FBX meshes by material part and reads glTF/GLB textures; the default loader and the embedding
+      albedo (`material_albedo_paths`) are unchanged. *Open:* ambiguity is exposed by the core API,
+      not yet shown in the UI (S08).
+- [ ] **R3 · S08 — textured previews through cold and warm rendering.**
 - [ ] **R4 · S09 — resident embedding snapshots with generation invalidation.**
 - [ ] **R5 · S10–S13 — endpoint egress policy, headless startup, bounded library walk, app-owned
       bulk runs** (MCP handoff Tasks 1–3 and 5).

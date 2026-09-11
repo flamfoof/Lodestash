@@ -54,15 +54,7 @@ pub fn load_meshes(
     path: &Path,
     tex_files: &BTreeMap<String, PathBuf>,
 ) -> Result<Vec<MeshData>, String> {
-    let opts = ufbx::LoadOpts {
-        generate_missing_normals: true,
-        // Pull in sidecar files (.mtl for OBJ, .fbm texture folders) so material texture
-        // references materialize; a missing texture must never fail the mesh load.
-        load_external_files: true,
-        ignore_missing_external_files: true,
-        ..Default::default()
-    };
-    let scene = ufbx::load_file(path.to_string_lossy().as_ref(), opts)
+    let scene = ufbx::load_file(path.to_string_lossy().as_ref(), load_opts())
         .map_err(|e| e.description.to_string())?;
 
     let fbx_dir = path.parent().unwrap_or(Path::new("."));
@@ -75,43 +67,20 @@ pub fn load_meshes(
         if mesh.faces.is_empty() {
             continue;
         }
-        let to_world = node.geometry_to_world;
-        let normal_mat = ufbx::matrix_for_normals(&to_world);
-        let has_normals = mesh.vertex_normal.exists;
-        let has_uvs = mesh.vertex_uv.exists;
-
-        let mut positions = Vec::new();
-        let mut normals = Vec::new();
-        let mut uvs = Vec::new();
-        let mut tri = vec![0u32; mesh.max_face_triangles * 3];
-        for &face in &mesh.faces {
-            let n_tris = ufbx::triangulate_face(&mut tri, mesh, face);
-            for &ix in &tri[..(n_tris as usize) * 3] {
-                let p = ufbx::transform_position(&to_world, mesh.vertex_position[ix as usize]);
-                positions.push([p.x as f32, p.y as f32, p.z as f32]);
-                if has_normals {
-                    let nv =
-                        ufbx::transform_direction(&normal_mat, mesh.vertex_normal[ix as usize]);
-                    normals.push([nv.x as f32, nv.y as f32, nv.z as f32]);
-                }
-                if has_uvs {
-                    let uv = mesh.vertex_uv[ix as usize];
-                    uvs.push([uv.x as f32, uv.y as f32]);
-                }
-            }
-        }
-        if positions.is_empty() {
+        let Some((positions, normals, uvs)) = corners(node, mesh, mesh.faces.iter().copied())
+        else {
             continue;
-        }
+        };
         let indices = (0..positions.len() as u32).collect();
+        let first = node.materials.first().map(|m| &**m);
         out.push(MeshData {
             name: node.element.name.to_string(),
             positions,
-            normals: has_normals.then_some(normals),
-            uvs: has_uvs.then_some(uvs),
+            normals,
+            uvs,
             indices,
-            base_color: node_base_color(node),
-            albedo: node_albedo(node, fbx_dir, tex_files, &mut tex_cache),
+            base_color: material_base_color(first),
+            albedo: material_albedo(first, fbx_dir, tex_files, &mut tex_cache),
         });
     }
     if out.is_empty() {
@@ -120,10 +89,132 @@ pub fn load_meshes(
     Ok(out)
 }
 
-/// Base color of the node's first material, if declared.
-fn node_base_color(node: &ufbx::Node) -> [u8; 4] {
+fn load_opts() -> ufbx::LoadOpts<'static> {
+    ufbx::LoadOpts {
+        generate_missing_normals: true,
+        // Pull in sidecar files (.mtl for OBJ, .fbm texture folders) so material texture
+        // references materialize; a missing texture must never fail the mesh load.
+        load_external_files: true,
+        ignore_missing_external_files: true,
+        ..Default::default()
+    }
+}
+
+/// Positions, and normals/UVs when the mesh has them, of every triangle corner of `faces` in world
+/// space — triangle soup. `None` when the faces hold no triangle.
+#[allow(clippy::type_complexity)]
+fn corners(
+    node: &ufbx::Node,
+    mesh: &ufbx::Mesh,
+    faces: impl Iterator<Item = ufbx::Face>,
+) -> Option<(Vec<[f32; 3]>, Option<Vec<[f32; 3]>>, Option<Vec<[f32; 2]>>)> {
+    let to_world = node.geometry_to_world;
+    let normal_mat = ufbx::matrix_for_normals(&to_world);
+    let has_normals = mesh.vertex_normal.exists;
+    let has_uvs = mesh.vertex_uv.exists;
+
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut uvs = Vec::new();
+    let mut tri = vec![0u32; mesh.max_face_triangles * 3];
+    for face in faces {
+        let n_tris = ufbx::triangulate_face(&mut tri, mesh, face);
+        for &ix in &tri[..(n_tris as usize) * 3] {
+            let p = ufbx::transform_position(&to_world, mesh.vertex_position[ix as usize]);
+            positions.push([p.x as f32, p.y as f32, p.z as f32]);
+            if has_normals {
+                let nv = ufbx::transform_direction(&normal_mat, mesh.vertex_normal[ix as usize]);
+                normals.push([nv.x as f32, nv.y as f32, nv.z as f32]);
+            }
+            if has_uvs {
+                let uv = mesh.vertex_uv[ix as usize];
+                uvs.push([uv.x as f32, uv.y as f32]);
+            }
+        }
+    }
+    if positions.is_empty() {
+        return None;
+    }
+    Some((
+        positions,
+        has_normals.then_some(normals),
+        has_uvs.then_some(uvs),
+    ))
+}
+
+/// Load `path` for a **textured preview**: every material slot as its own mesh, tagged with its
+/// slot and painted with that slot's own base colour and declared or embedded albedo (v1 plan S07).
+///
+/// FBX (and OBJ) split each mesh by material part, so a two-material mesh is two meshes rather than
+/// one painted with its first material. glTF/GLB carry each primitive's base-colour texture —
+/// embedded in a buffer view or data URI, or an external image — with its UVs turned to the
+/// bottom-left origin the other loaders emit. [`load_any`] is untouched: the embedding render, the
+/// metrics and the caches keep reading geometry with the first material only, so no vector and no
+/// count moves.
+pub fn load_textured(
+    path: &Path,
+    tex_files: &BTreeMap<String, PathBuf>,
+) -> Result<Vec<(u32, MeshData)>, String> {
+    if is_gltf_model(path) {
+        return load_gltf_with(path, true);
+    }
+    let scene = ufbx::load_file(path.to_string_lossy().as_ref(), load_opts())
+        .map_err(|e| e.description.to_string())?;
+    let fbx_dir = path.parent().unwrap_or(Path::new("."));
+    let mut tex_cache: BTreeMap<String, Option<Arc<AlbedoTex>>> = BTreeMap::new();
+
+    let mut out = Vec::new();
+    for node in &scene.nodes {
+        let Some(mesh) = &node.mesh else { continue };
+        if mesh.faces.is_empty() {
+            continue;
+        }
+        // A mesh with no material is still one part: slot 0.
+        let parts: Vec<(u32, Vec<ufbx::Face>)> = if mesh.material_parts.is_empty() {
+            vec![(0, mesh.faces.iter().copied().collect())]
+        } else {
+            mesh.material_parts
+                .iter()
+                .map(|part| {
+                    let faces = part
+                        .face_indices
+                        .iter()
+                        .map(|&i| mesh.faces[i as usize])
+                        .collect();
+                    (part.index, faces)
+                })
+                .collect()
+        };
+        for (slot, faces) in parts {
+            let Some((positions, normals, uvs)) = corners(node, mesh, faces.into_iter()) else {
+                continue;
+            };
+            let material = node.materials.get(slot as usize).map(|m| &**m);
+            let indices = (0..positions.len() as u32).collect();
+            out.push((
+                slot,
+                MeshData {
+                    name: node.element.name.to_string(),
+                    positions,
+                    normals,
+                    uvs,
+                    indices,
+                    base_color: material_base_color(material),
+                    albedo: material_albedo(material, fbx_dir, tex_files, &mut tex_cache),
+                },
+            ));
+        }
+    }
+    if out.is_empty() {
+        return Err("no triangle meshes in file".into());
+    }
+    Ok(out)
+}
+
+/// Base color of a material, if it declares one.
+fn material_base_color(mat: Option<&ufbx::Material>) -> [u8; 4] {
     const DEFAULT: [u8; 4] = [0xB4, 0xB4, 0xB8, 0xFF];
-    let Some(mat) = node.materials.first() else {
+    let Some(mat) = mat else {
         return DEFAULT;
     };
     // Prefer the normalized PBR view; fall back to the raw FBX diffuse.
@@ -143,16 +234,16 @@ fn node_base_color(node: &ufbx::Node) -> [u8; 4] {
 /// Unity packs; full res buys nothing in a preview and quadruples upload time).
 const TEX_MAX_DIM: u32 = 4096;
 
-/// Resolve + decode the albedo texture of the node's first material, if any.
-fn node_albedo(
-    node: &ufbx::Node,
+/// Resolve + decode a material's albedo texture, if it has one.
+fn material_albedo(
+    mat: Option<&ufbx::Material>,
     fbx_dir: &Path,
     tex_files: &BTreeMap<String, PathBuf>,
     cache: &mut BTreeMap<String, Option<Arc<AlbedoTex>>>,
 ) -> Option<Arc<AlbedoTex>> {
-    let mat = node.materials.first()?;
+    let mat = mat?;
     // Prefer the normalized PBR view; fall back to the raw FBX diffuse (same order as
-    // `node_base_color`).
+    // `material_base_color`).
     let tex = mat
         .pbr
         .base_color
@@ -253,6 +344,16 @@ pub fn is_gltf_model(path: &Path) -> bool {
 }
 
 pub fn load_gltf(path: &Path) -> Result<Vec<MeshData>, String> {
+    Ok(load_gltf_with(path, false)?
+        .into_iter()
+        .map(|(_, m)| m)
+        .collect())
+}
+
+/// [`load_gltf`], each primitive tagged with its material index. `textured` also carries each
+/// primitive's base-colour texture and turns its UVs to the bottom-left origin ([`AlbedoTex`] rows
+/// are bottom-up); without it the UVs stay as the file wrote them and no texture is read.
+fn load_gltf_with(path: &Path, textured: bool) -> Result<Vec<(u32, MeshData)>, String> {
     let mut raw = three_d_asset::io::load(&[path]).map_err(|e| e.to_string())?;
     let model: three_d_asset::Model = raw.deserialize(path).map_err(|e| e.to_string())?;
 
@@ -277,32 +378,80 @@ pub fn load_gltf(path: &Path) -> Result<Vec<MeshData>, String> {
             .indices
             .to_u32()
             .unwrap_or_else(|| (0..positions.len() as u32).collect());
-        let base_color = prim
-            .material_index
-            .and_then(|i| model.materials.get(i))
+        let material = prim.material_index.and_then(|i| model.materials.get(i));
+        let base_color = material
             .map(|mat| {
                 let c = mat.albedo;
                 [c.r, c.g, c.b, c.a]
             })
             .unwrap_or([180, 180, 185, 255]);
-        out.push(MeshData {
-            name: prim.name.clone(),
-            positions,
-            // The renderer derives face normals, so skipping them costs nothing here.
-            normals: None,
-            uvs: tri
-                .uvs
-                .as_ref()
-                .map(|us| us.iter().map(|u| [u.x, u.y]).collect()),
-            indices,
-            base_color,
-            albedo: None,
-        });
+        let albedo = if textured {
+            material
+                .and_then(|mat| mat.albedo_texture.as_ref())
+                .and_then(gltf_albedo)
+                .map(Arc::new)
+        } else {
+            None
+        };
+        out.push((
+            prim.material_index.unwrap_or(0) as u32,
+            MeshData {
+                name: prim.name.clone(),
+                positions,
+                // The renderer derives face normals, so skipping them costs nothing here.
+                normals: None,
+                uvs: tri.uvs.as_ref().map(|us| {
+                    us.iter()
+                        .map(|u| {
+                            if textured {
+                                [u.x, 1.0 - u.y]
+                            } else {
+                                [u.x, u.y]
+                            }
+                        })
+                        .collect()
+                }),
+                indices,
+                base_color,
+                albedo,
+            },
+        ));
     }
     if out.is_empty() {
         return Err("no triangle geometry in model".into());
     }
     Ok(out)
+}
+
+/// A decoded glTF texture as an [`AlbedoTex`]: 8-bit channels only (an HDR base colour is not a
+/// preview's concern), downscaled like the FBX path, rows flipped bottom-up.
+fn gltf_albedo(t: &three_d_asset::Texture2D) -> Option<AlbedoTex> {
+    use three_d_asset::TextureData as D;
+    let rgba: Vec<[u8; 4]> = match &t.data {
+        D::RgbaU8(p) => p.clone(),
+        D::RgbU8(p) => p.iter().map(|&[r, g, b]| [r, g, b, 255]).collect(),
+        D::RgU8(p) => p.iter().map(|&[l, a]| [l, l, l, a]).collect(),
+        D::RU8(p) => p.iter().map(|&l| [l, l, l, 255]).collect(),
+        _ => return None,
+    };
+    let img = image::RgbaImage::from_raw(t.width, t.height, rgba.into_iter().flatten().collect())?;
+    let img = image::DynamicImage::ImageRgba8(img);
+    let img = if img.width().max(img.height()) > TEX_MAX_DIM {
+        img.resize(
+            TEX_MAX_DIM,
+            TEX_MAX_DIM,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        img
+    };
+    let rgba = img.flipv().to_rgba8();
+    let (width, height) = rgba.dimensions();
+    Some(AlbedoTex {
+        width,
+        height,
+        rgba: rgba.pixels().map(|p| p.0).collect(),
+    })
 }
 
 /// Load any supported 3D format into world-space `MeshData`: FBX/OBJ via ufbx, glTF/GLB via
@@ -712,6 +861,141 @@ mod gltf_tests {
             crate::render3d::render_views(&meshes, 64, &crate::render3d::DEFAULT_VIEWS[..1]);
         assert_eq!(views.len(), 1);
     }
+
+    /// A 1x2 PNG: top row red, bottom row blue.
+    fn red_over_blue() -> Vec<u8> {
+        let mut img = image::RgbaImage::new(1, 2);
+        img.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        img.put_pixel(0, 1, image::Rgba([0, 0, 255, 255]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    /// One textured triangle: 36 bytes of positions, then 24 of UVs, then `extra` (an embedded
+    /// image); `buffer` and `images` are the glTF entries that locate them.
+    fn textured_gltf(buffer: &str, images: &str, extra_view: &str) -> String {
+        format!(
+            r#"{{"asset":{{"version":"2.0"}},"scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":0,"TEXCOORD_0":1}},"material":0}}]}}],
+"materials":[{{"pbrMetallicRoughness":{{"baseColorTexture":{{"index":0}}}}}}],
+"textures":[{{"source":0}}],"images":[{images}],"buffers":[{buffer}],
+"bufferViews":[{{"buffer":0,"byteOffset":0,"byteLength":36}},{{"buffer":0,"byteOffset":36,"byteLength":24}}{extra_view}],
+"accessors":[{{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3","min":[0.0,0.0,0.0],"max":[1.0,1.0,0.0]}},
+{{"bufferView":1,"componentType":5126,"count":3,"type":"VEC2"}}]}}"#
+        )
+    }
+
+    fn triangle_bin() -> Vec<u8> {
+        let mut bin = Vec::new();
+        for f in [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0] {
+            bin.extend_from_slice(&f.to_le_bytes());
+        }
+        for f in [0.0f32, 0.0, 1.0, 0.0, 0.0, 1.0] {
+            bin.extend_from_slice(&f.to_le_bytes());
+        }
+        bin
+    }
+
+    /// The texture landed, bottom row first, and the UVs turned with it: a glTF `v = 0` is the top
+    /// of the image. The default loader still reads no texture.
+    fn assert_textured(path: &Path) {
+        let parts = load_textured(path, &BTreeMap::new()).expect("textured load");
+        let (slot, mesh) = &parts[0];
+        assert_eq!(*slot, 0);
+        let albedo = mesh.albedo.as_ref().expect("base-colour texture read");
+        assert_eq!((albedo.width, albedo.height), (1, 2));
+        assert_eq!(albedo.rgba[0], [0, 0, 255, 255], "rows are bottom-up");
+        assert_eq!(albedo.rgba[1], [255, 0, 0, 255]);
+        assert_eq!(
+            mesh.uvs.as_ref().unwrap()[0],
+            [0.0, 1.0],
+            "v turned to bottom-left"
+        );
+        let plain = load_any(path, &BTreeMap::new()).expect("default load");
+        assert!(
+            plain[0].albedo.is_none(),
+            "the default loader reads no texture"
+        );
+        assert_eq!(plain[0].uvs.as_ref().unwrap()[0], [0.0, 0.0]);
+    }
+
+    #[test]
+    fn load_textured_reads_a_data_uri_image() {
+        let bin = triangle_bin();
+        let json = textured_gltf(
+            &format!(
+                r#"{{"byteLength":{},"uri":"data:application/octet-stream;base64,{}"}}"#,
+                bin.len(),
+                b64(&bin)
+            ),
+            &format!(
+                r#"{{"uri":"data:image/png;base64,{}"}}"#,
+                b64(&red_over_blue())
+            ),
+            "",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tri.gltf");
+        std::fs::write(&path, json).unwrap();
+        assert_textured(&path);
+    }
+
+    #[test]
+    fn load_textured_reads_an_external_image() {
+        let bin = triangle_bin();
+        let json = textured_gltf(
+            &format!(
+                r#"{{"byteLength":{},"uri":"data:application/octet-stream;base64,{}"}}"#,
+                bin.len(),
+                b64(&bin)
+            ),
+            r#"{"uri":"tex.png"}"#,
+            "",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("tex.png"), red_over_blue()).unwrap();
+        let path = dir.path().join("tri.gltf");
+        std::fs::write(&path, json).unwrap();
+        assert_textured(&path);
+    }
+
+    /// A GLB: the image lives in the binary chunk, behind a buffer view.
+    #[test]
+    fn load_textured_reads_a_glb_embedded_png() {
+        let png = red_over_blue();
+        let mut bin = triangle_bin();
+        bin.extend_from_slice(&png);
+        while bin.len() % 4 != 0 {
+            bin.push(0);
+        }
+        let mut json = textured_gltf(
+            &format!(r#"{{"byteLength":{}}}"#, bin.len()),
+            r#"{"bufferView":2,"mimeType":"image/png"}"#,
+            &format!(
+                r#",{{"buffer":0,"byteOffset":60,"byteLength":{}}}"#,
+                png.len()
+            ),
+        )
+        .into_bytes();
+        while json.len() % 4 != 0 {
+            json.push(b' ');
+        }
+        let mut glb = Vec::new();
+        glb.extend_from_slice(b"glTF");
+        glb.extend_from_slice(&2u32.to_le_bytes());
+        glb.extend_from_slice(&((12 + 8 + json.len() + 8 + bin.len()) as u32).to_le_bytes());
+        glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"JSON");
+        glb.extend_from_slice(&json);
+        glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"BIN\0");
+        glb.extend_from_slice(&bin);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tri.glb");
+        std::fs::write(&path, glb).unwrap();
+        assert_textured(&path);
+    }
 }
 
 #[cfg(test)]
@@ -767,6 +1051,51 @@ mod tests {
         // Rows are flipped bottom-up: row 0 must be the image's bottom (blue) row.
         assert_eq!(albedo.rgba[0], [0, 0, 255, 255]);
         assert_eq!(albedo.rgba[1], [255, 0, 0, 255]);
+    }
+
+    /// A mesh painted with two materials is two textured meshes, each with its own slot and albedo —
+    /// while the default loader, which the embedding render reads, still gives one mesh.
+    #[test]
+    fn load_textured_splits_a_two_material_mesh_by_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, px) in [
+            ("red.png", [255, 0, 0, 255]),
+            ("green.png", [0, 255, 0, 255]),
+        ] {
+            let mut img = image::RgbaImage::new(1, 1);
+            img.put_pixel(0, 0, image::Rgba(px));
+            img.save(dir.path().join(name)).unwrap();
+        }
+        std::fs::write(
+            dir.path().join("two.mtl"),
+            "newmtl a\nmap_Kd red.png\nnewmtl b\nmap_Kd green.png\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("two.obj"),
+            "mtllib two.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nv 1 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nvt 1 1\n\
+             usemtl a\nf 1/1 2/2 3/3\nusemtl b\nf 2/2 4/4 3/3\n",
+        )
+        .unwrap();
+        let path = dir.path().join("two.obj");
+
+        let parts = load_textured(&path, &BTreeMap::new()).expect("parts");
+        let mut got: Vec<(u32, usize, [u8; 4])> = parts
+            .iter()
+            .map(|(slot, m)| {
+                let albedo = m.albedo.as_ref().expect("each slot has its own albedo");
+                (*slot, m.positions.len(), albedo.rgba[0])
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![(0, 3, [255, 0, 0, 255]), (1, 3, [0, 255, 0, 255])]
+        );
+
+        let plain = load_meshes(&path, &BTreeMap::new()).unwrap();
+        assert_eq!(plain.len(), 1, "the default loader is unchanged");
+        assert_eq!(plain[0].positions.len(), 6);
     }
 
     /// The basename lookup rescues textures whose declared paths don't exist —
