@@ -148,7 +148,8 @@ impl OpenAiTagger {
     ///
     /// Deliberately short-timeout: a preflight the user is watching must not hang for two minutes.
     pub fn probe(&self) -> Result<String, ApiError> {
-        let png = encode_png(&probe_image()).map_err(|e| ApiError::Hard(format!("png encode: {e}")))?;
+        let png =
+            encode_png(&probe_image()).map_err(|e| ApiError::Hard(format!("png encode: {e}")))?;
         let input = TagInput {
             media_code: "image",
             name: "sample",
