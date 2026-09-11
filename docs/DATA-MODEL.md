@@ -741,8 +741,13 @@ CREATE INDEX idx_rel_to   ON asset_relationship(to_asset_id);
    nothing and step 1 can never produce a `uses_material` edge. The `.prefab` is where the binding
    is written down (`m_Mesh` + `m_Materials` GUID refs), so prefabs are read as *evidence about*
    catalogued assets — they are not assets themselves (`prefab` is not a `media_type`). Pairs land
-   as `source = 'unity_prefab'`, `confidence 0.9`: the GUIDs are exact, the pairing is
-   whole-file co-occurrence.
+   as `source = 'unity_prefab'`, `confidence 0.9`. The file is read per YAML document: a
+   `MeshRenderer` pairs with the `MeshFilter` on its own GameObject (`m_GameObject`), a
+   `SkinnedMeshRenderer` with its own `m_Mesh`, and a `ParticleSystemRenderer` in mesh mode
+   paints its meshes with its first material (the second slot is its trail's). A `MeshCollider`'s
+   mesh and a particle system's emission-shape mesh are not painted. Never a whole-file mesh ×
+   material product
+   (superseded 2026-09-11, [ADR-0018](decisions/ADR-0018-prefabs-are-scoped-evidence.md)). Each binding keeps its renderer and slot.
 2. **Path/naming heuristics** — for assets without `.meta` (raw exports): a texture named
    `Human3_Albedo.png` living beside `Human3.fbx` infers `uses_texture` with `source='inferred'`
    and `confidence ≈ 0.7`. Applies only when no `unity_meta` relationship exists.
@@ -792,10 +797,41 @@ one returns it to `missing` and lets the ordinary late-binding pass re-resolve i
 reference cycle terminates) and is the single definition of "with dependencies" for both
 `AssetDetail.dependencies` and `export_asset`.
 
-The prefab pass rebuilds its edges wholesale (delete + reinsert `source='unity_prefab'`) rather than
-diffing: it walks every prefab anyway, and a rebuild is what makes an edited or deleted prefab
-correct. It runs only when the dependency drain scanned something, so a steady-state library
-re-walks nothing.
+**Prefab evidence is kept, and the edges are derived from it** (M28, [ADR-0018](decisions/ADR-0018-prefabs-are-scoped-evidence.md)). Each
+`.prefab` is recorded under the scope it was walked in — a source root or the package workspace —
+with the size/mtime it was read at; what it declares is one row per renderer slot:
+
+```sql
+CREATE TABLE prefab_file (
+  id    INTEGER PRIMARY KEY,
+  scope TEXT NOT NULL,     -- the root walked: a source root, the package workspace, or 'legacy' (M28)
+  path  TEXT NOT NULL,     -- the evidence locator
+  size  INTEGER NOT NULL,  -- (size, mtime) is the revision: only a prefab whose revision moved is re-read
+  mtime INTEGER NOT NULL,
+  UNIQUE(scope, path)
+);
+CREATE TABLE prefab_binding (
+  prefab_id     INTEGER NOT NULL REFERENCES prefab_file(id) ON DELETE CASCADE,
+  game_object   INTEGER NOT NULL,  -- the owning GameObject's fileID within the prefab
+  renderer      INTEGER NOT NULL,  -- the Mesh-, SkinnedMesh- or ParticleSystemRenderer document's fileID
+  slot          INTEGER NOT NULL,  -- index into m_Materials; an empty or built-in slot keeps its index
+  mesh_guid     TEXT NOT NULL,
+  material_guid TEXT NOT NULL,
+  PRIMARY KEY (prefab_id, renderer, slot, mesh_guid)  -- a particle renderer paints up to 4 meshes from one slot
+);
+```
+
+`Catalog::reconcile_prefab_edges` derives one `uses_material` edge per distinct (catalogued mesh,
+material GUID) the bindings name — so a mesh catalogued after its prefab was read gets its edge on
+the next pass — and removes an edge no binding backs any more, except a muted one, which is never
+deleted or duplicated. A walk re-reads only prefabs whose revision moved. A walk that completed
+forgets the prefabs it no longer found; one that did not — a source whose drive is gone, a directory
+it could not open — keeps what it said before. The pass runs after a dependency drain that scanned
+something, after a watch rescan and a manual scan over their roots (a prefab-only edit changes no
+asset row), and after an extraction over the workspace. Nested prefab instances and variant
+overrides are counted and left unresolved: an override is a property modification on another
+prefab's renderer, not a binding. A material the model file embeds names the model's own GUID and
+mints no self-edge.
 
 > **Coverage today.** `uses_texture` (material → texture, from the material YAML) and
 > `uses_material` (mesh → material, from prefabs) — so a model's closure reaches its textures
@@ -805,8 +841,9 @@ re-walks nothing.
 > `source='inferred'`, `confidence 0.7`. It applies only to edge-less models, so it never overrides
 > the deterministic GUID/prefab graph; the name match is `deps::texture_matches_model` (exact stem or
 > stem + separator), run in the dependency drain over `Catalog::edgeless_models` ×
-> `inference_textures`. Not yet: `uses_mesh`/`uses_audio`/`uses_script` from prefabs, and prefabs
-> living inside an extracted package workspace rather than a source root.
+> `inference_textures`. Not yet: `uses_mesh`/`uses_audio`/`uses_script` from prefabs. Prefabs inside
+> the extracted package workspace are read since M28, and in-pack assets take their Unity GUID from
+> the package manifest — an extracted pack has no `.meta` beside its files.
 
 ---
 
@@ -870,6 +907,7 @@ transaction, in order, on open. Shipped so far:
 | **M2** | Mapping library: `taxonomy`, `category`, `category_alias`, `mapping_rule`, `asset_category` (§4) |
 | **M3** | Engine round-trip: `package` + `asset.package_id`, `project`, `import_record`, `asset.license/attribution/license_url` (§7, §9) |
 | **M4** | `asset.rating`, `package.pipeline`, `project.pipeline` (§12) |
+| **M28** | Prefab evidence (v1 plan S06, [ADR-0018](decisions/ADR-0018-prefabs-are-scoped-evidence.md)): `prefab_file` (scope, path, size/mtime revision) and `prefab_binding` (GameObject, renderer, slot, mesh GUID, material GUID); the `unity_prefab` edges are derived from them (§10). The edges already recorded were whole-file pairings no row attributes to a prefab, so they become the evidence of the reserved scope `legacy`: a source's legacy pairings are retired once a walk of that source completes, and the rest once a walk of every scope does — no edge is deleted before a reharvest has replaced it. In-pack assets take the GUID their package manifest names, and materialized in-pack rows are queued for the dependency scan the archive could not give them |
 | **M27** | `tag_request` — durable receipts for agent `write_tags` requests (ENGINE-API §8.3): request id, digest of the validated body, the history row and the terminal result, written in the batch's own transaction. Not the undo log: that tail is capped, and a retry must find its receipt after its history has scrolled away. Same id and body replays the recorded result; same id with a different body is `request_conflict` |
 | **M26** | Tag provenance ([ADR-0017](decisions/ADR-0017-producer-scoped-atomic-tag-batches.md)). `op_log.origin` (`user` default — every earlier row was a person's) partitions undo retention: the interactive tail and the background lane keep 200 rows each. Every pre-existing `asset_tag.source = 'ai'` row becomes `ai:legacy` with its recorded `model_id` kept: the local drain had stored zero-shot proposals under the VLM's model id and a cloud pass its local fallback under the cloud model's, so the producer is unrecoverable and is not invented. New AI rows are `ai:<producer>`; every write goes through `Catalog::apply_tag_batch` — one transaction with its FTS re-index and a versioned before/after history row |
 | **M25** | FTS over a canonical view (v1 plan S03). `asset_search_text` (id, name, description, distinct sorted tag names) is the one definition of searchable text, and `asset_fts` becomes a plain FTS5 table populated from it. M1 had named `asset` as the external-content table while `tags_concat` is not an `asset` column: MATCH returned rowids while reading the text back and FTS5's `rebuild` both failed (`no such column: T.tags_concat`). Triggers narrowed to `UPDATE OF name, description`, so status, flag and timestamp updates do no FTS work; an asset delete is a rowid delete; a tag rename re-indexes its assets. Derived state only — 20 ms on the 8,237-asset reference catalog, where it also dropped a stale `metal` token M24 had kept for an asset whose tags no longer said so. *Divergence from the plan's wording:* the plan asked for external content over the view; a plain table was chosen so that no writer has to supply the old values, which is the requirement behind M11's stale tokens |

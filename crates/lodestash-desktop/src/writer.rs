@@ -1398,11 +1398,16 @@ fn rescan_watched(catalog: &mut Catalog, db_path: &Path) -> bool {
     let cfg = AppConfig::load();
     let project = cfg.last_project_name.as_deref();
     let mut changed = false;
+    let mut prefab_scopes = Vec::new();
     for info in catalog.source_infos().unwrap_or_default() {
         if !info.watch_enabled {
             continue;
         }
         let root = PathBuf::from(&info.root_path);
+        prefab_scopes.push(lodestash_app::drains::PrefabScope {
+            root: root.clone(),
+            absent_is_empty: false,
+        });
         let excludes = project
             .map(|p| cfg.source_excludes(p, &root))
             .unwrap_or_default();
@@ -1435,6 +1440,11 @@ fn rescan_watched(catalog: &mut Catalog, db_path: &Path) -> bool {
             Ok(_) => changed = true,
             Err(e) => tracing::warn!(%e, root = %info.root_path, "watch rescan failed"),
         }
+    }
+    // A prefab is not an asset, so the crawl above never sees one change — yet the watch fired.
+    // Re-read the watched trees' prefab evidence; only files whose revision moved are parsed.
+    if lodestash_app::drains::refresh_prefab_evidence(catalog, &prefab_scopes, false) > 0 {
+        changed = true;
     }
     changed
 }
@@ -1883,6 +1893,16 @@ fn run(
                         &pack.entries,
                     );
                 }
+                // A rescan that found only a prefab edited changes no asset row, so nothing
+                // queued would re-read it: re-read the scanned trees' prefab evidence here.
+                let scopes: Vec<_> = batches
+                    .iter()
+                    .map(|b| lodestash_app::drains::PrefabScope {
+                        root: PathBuf::from(&b.root),
+                        absent_is_empty: false,
+                    })
+                    .collect();
+                lodestash_app::drains::refresh_prefab_evidence(catalog, &scopes, false);
                 Ok(WriteResult {
                     changed,
                     ..Default::default()
@@ -2774,6 +2794,17 @@ fn materialize_extract(
         catalog
             .mark_package_unpacked(package_id, changed)
             .map_err(|e| e.to_string())?;
+    }
+    // The extraction landed prefabs beside the assets, and they are evidence about those assets.
+    if let Some(ws) = workspace {
+        lodestash_app::drains::refresh_prefab_evidence(
+            catalog,
+            &[lodestash_app::drains::PrefabScope {
+                root: ws,
+                absent_is_empty: true,
+            }],
+            false,
+        );
     }
     Ok(WriteResult {
         changed,

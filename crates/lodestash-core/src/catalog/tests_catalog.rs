@@ -18,7 +18,7 @@ fn open_in_memory_applies_migrations() {
         .conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 27, "all 27 migrations should have run");
+    assert_eq!(version, 28, "all 28 migrations should have run");
 }
 
 /// Every queue an appraise pass drains must respect the set the caller named.
@@ -1829,6 +1829,17 @@ fn mint_in_pack_assets_links_locators_and_skips_unclassified() {
 
     let stats = c.mint_in_pack_assets(pid, &classified).expect("mint");
     assert_eq!(stats.inserted, 2, "two classified entries minted");
+    // The manifest's GUID folder is the asset's own Unity GUID: an extracted pack has no `.meta`
+    // beside its files, and a prefab inside it names its meshes by this id (v1 plan S06).
+    let rock_guid: Option<String> = c
+        .conn
+        .query_row(
+            "SELECT unity_guid FROM asset WHERE package_id = ?1 AND name = 'Rock'",
+            params![pid],
+            |r| r.get(0),
+        )
+        .expect("guid");
+    assert_eq!(rock_guid.as_deref(), Some("g_rock"));
     // The owning source_id is derived from the package row, not passed in.
     let minted_source: i64 = c
         .conn
@@ -3276,8 +3287,43 @@ fn dependency_edges_resolve_now_or_later() {
     assert_eq!(dirty, 0);
 }
 
+fn prefab_scan(path: &str, bindings: &[(&str, &str)]) -> PrefabFileScan {
+    PrefabFileScan {
+        path: path.into(),
+        size: 1,
+        mtime: 1,
+        bindings: bindings
+            .iter()
+            .enumerate()
+            .map(|(slot, (mesh, material))| PrefabBindingRow {
+                game_object: 1,
+                renderer: 2,
+                slot: slot as i64,
+                mesh_guid: (*mesh).into(),
+                material_guid: (*material).into(),
+            })
+            .collect(),
+    }
+}
+
+fn prefab_edges_of(c: &Catalog, from: i64) -> Vec<(Option<i64>, String)> {
+    c.conn
+        .prepare(
+            "SELECT to_asset_id, state FROM asset_relationship
+              WHERE from_asset_id = ?1 AND source = 'unity_prefab' ORDER BY id",
+        )
+        .and_then(|mut st| {
+            st.query_map(params![from], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+        })
+        .expect("edges")
+}
+
+/// Prefab evidence is where a mesh's material comes from (DATA-MODEL §10, ADR-0018). The edges are
+/// derived from what each prefab declares: they follow an edit or a deletion of the prefab alone,
+/// wait for a mesh catalogued late, and never undo a person's mute.
 #[test]
-fn prefab_edges_rebuild_and_extend_the_closure() {
+fn prefab_evidence_derives_edges_that_follow_the_prefab() {
     let mut c = Catalog::open_in_memory().expect("open");
     c.seed_media_types().expect("seed");
     let s = c.upsert_import_source("A", "C:/a", "folder").expect("src");
@@ -3288,6 +3334,7 @@ fn prefab_edges_rebuild_and_extend_the_closure() {
             rec("hero.fbx", 1, 1),
             rec("hero.mat", 2, 2),
             rec("t.png", 3, 3),
+            rec("late.fbx", 4, 4),
         ],
     )
     .expect("crawl");
@@ -3298,10 +3345,11 @@ fn prefab_edges_rebuild_and_extend_the_closure() {
             })
             .expect("id")
     };
-    let (mesh, mat, tex) = (
+    let (mesh, mat, tex, late) = (
         id_of(&c, "hero.fbx"),
         id_of(&c, "hero.mat"),
         id_of(&c, "t.png"),
+        id_of(&c, "late.fbx"),
     );
     c.record_dependencies(mesh, Some("meshguid"), "uses_texture", &[])
         .expect("mesh");
@@ -3311,23 +3359,60 @@ fn prefab_edges_rebuild_and_extend_the_closure() {
         .expect("mat");
 
     // A prefab binds the mesh to the material; the mesh's closure now reaches the texture
-    // through it — which is the whole point of the pass.
-    let written = c
-        .replace_prefab_relationships(&[
-            ("meshguid".into(), "matguid".into()),
-            ("nosuchmesh".into(), "matguid".into()),
-        ])
-        .expect("prefab edges");
-    assert_eq!(written, 1, "a pair whose mesh isn't catalogued is dropped");
+    // through it — which is the whole point of the evidence.
+    c.record_prefab_walk(
+        "C:/a",
+        &[prefab_scan(
+            "C:/a/hero.prefab",
+            &[
+                ("meshguid", "matguid"),
+                ("meshguid", "meshguid"),
+                ("lateguid", "matguid"),
+            ],
+        )],
+        &[],
+    )
+    .expect("walk");
+    c.reconcile_prefab_edges().expect("reconcile");
     assert_eq!(
         c.dependency_closure(&[mesh]).expect("closure"),
         vec![mesh, mat, tex],
         "mesh → material → texture, transitively"
     );
+    assert_eq!(
+        prefab_edges_of(&c, mesh),
+        vec![(Some(mat), "resolved".to_string())],
+        "a material the model file embeds is not a dependency on itself"
+    );
+    assert_eq!(
+        c.reconcile_prefab_edges().expect("again"),
+        0,
+        "a second pass changes nothing"
+    );
+    assert!(
+        prefab_edges_of(&c, late).is_empty(),
+        "no edge until the mesh is catalogued"
+    );
 
-    // Rebuilding replaces rather than accumulates, and the `unity_meta` edges survive it.
-    c.replace_prefab_relationships(&[("meshguid".into(), "matguid".into())])
-        .expect("rebuild");
+    // The mesh is catalogued after its prefab was read: the recorded evidence reaches it.
+    c.record_dependencies(late, Some("lateguid"), "uses_texture", &[])
+        .expect("late");
+    c.reconcile_prefab_edges().expect("late reconcile");
+    assert_eq!(
+        prefab_edges_of(&c, late),
+        vec![(Some(mat), "resolved".to_string())]
+    );
+
+    // Only the prefab is edited, and hero is no longer bound: that edge goes, and the
+    // `unity_meta` edge stays.
+    c.record_prefab_walk(
+        "C:/a",
+        &[prefab_scan("C:/a/hero.prefab", &[("lateguid", "matguid")])],
+        &[],
+    )
+    .expect("edit");
+    c.reconcile_prefab_edges().expect("reconcile edit");
+    assert_eq!(c.dependency_closure(&[mesh]).expect("closure"), vec![mesh]);
     let by_source: Vec<(String, i64)> = c
         .conn
         .prepare("SELECT source, COUNT(*) FROM asset_relationship GROUP BY 1 ORDER BY 1")
@@ -3342,6 +3427,35 @@ fn prefab_edges_rebuild_and_extend_the_closure() {
             ("unity_meta".to_string(), 1),
             ("unity_prefab".to_string(), 1)
         ]
+    );
+
+    // A muted edge stays muted while its evidence stands, and outlives the prefab it came from.
+    let edge: i64 = c
+        .conn
+        .query_row(
+            "SELECT id FROM asset_relationship WHERE from_asset_id = ?1",
+            params![late],
+            |r| r.get(0),
+        )
+        .expect("edge");
+    assert!(c.ignore_relationship(edge).expect("ignore"));
+    c.reconcile_prefab_edges().expect("reconcile muted");
+    assert_eq!(
+        prefab_edges_of(&c, late),
+        vec![(None, "ignored".to_string())],
+        "not re-minted beside the mute"
+    );
+    c.record_prefab_walk("C:/a", &[], &["C:/a/hero.prefab".into()])
+        .expect("delete");
+    c.reconcile_prefab_edges().expect("reconcile deleted");
+    assert_eq!(
+        prefab_edges_of(&c, late),
+        vec![(None, "ignored".to_string())],
+        "a mute is never deleted"
+    );
+    assert!(
+        c.prefab_revisions("C:/a").expect("revisions").is_empty(),
+        "the deleted prefab's evidence is gone"
     );
 }
 
@@ -3870,6 +3984,123 @@ fn builtin_resource_edges_are_dropped() {
         2,
         "only the built-in edge was dropped: {rows:?}"
     );
+}
+
+/// M28 - the pre-S06 prefab edges were whole-file pairings that no row attributes to a prefab. They
+/// survive as `legacy` evidence until a completed walk replaces them: a source's own walk retires
+/// its meshes' pairings, and a walk of every scope retires the rest. The pairing no prefab repeats
+/// goes; the one a prefab still declares stays. In-pack assets take the GUID their manifest names,
+/// and a materialized one is queued for a dependency scan.
+#[test]
+fn legacy_prefab_edges_wait_for_a_complete_reharvest() {
+    let mut c = catalog_at(27);
+    c.conn
+        .execute_batch(
+            "INSERT INTO import_source (id, uuid, name, root_path, kind)
+                 VALUES (1, 'src-1', 's', '/s', 'folder'), (2, 'src-2', 't', '/t', 'folder');
+             INSERT INTO media_type (id, code, label) VALUES (1, 'material', 'Material');
+             INSERT INTO asset (id, uuid, source_id, media_type_id, name, unity_guid, created_at, updated_at)
+                 VALUES (1, 'a1', 1, 1, 'rock',     'g-rock',    0, 0),
+                        (2, 'a2', 1, 1, 'rock_mat', 'g-rockmat', 0, 0),
+                        (3, 'a3', 1, 1, 'tree_mat', 'g-treemat', 0, 0),
+                        (5, 'a5', 2, 1, 'bush',     'g-bush',    0, 0),
+                        (6, 'a6', 1, 1, 'ghost',    'g-ghost',   0, 0);
+             INSERT INTO asset_relationship
+                 (id, from_asset_id, to_asset_id, kind, source, confidence, declared_path, state) VALUES
+                 (1, 1, 2, 'uses_material', 'unity_prefab', 0.9, 'g-rockmat', 'resolved'),
+                 (2, 1, 3, 'uses_material', 'unity_prefab', 0.9, 'g-treemat', 'resolved'),
+                 (3, 5, 2, 'uses_material', 'unity_prefab', 0.9, 'g-rockmat', 'resolved'),
+                 (4, 6, 2, 'uses_material', 'unity_prefab', 0.9, 'g-rockmat', 'resolved'),
+                 (5, 1, 1, 'uses_material', 'unity_prefab', 0.9, 'g-rock',    'resolved');
+             INSERT INTO package (id, uuid, source_id, name, package_path)
+                 VALUES (1, 'p1', 1, 'P', '/s/P.unitypackage');
+             INSERT INTO package_entry (id, package_id, guid, pathname)
+                 VALUES (1, 1, 'g-inpack', 'Assets/X.fbx');
+             INSERT INTO asset (id, uuid, source_id, media_type_id, name, package_id, created_at, updated_at)
+                 VALUES (4, 'a4', 1, 1, 'X', 1, 0, 0);
+             INSERT INTO asset_file (id, asset_id, rel_path, package_entry_id, workspace_rel)
+                 VALUES (1, 4, 'Assets/X.fbx', 1, 'ab/X.fbx');
+             UPDATE asset SET primary_file_id = 1, deps_dirty = 0 WHERE id = 4;",
+        )
+        .expect("fixture");
+    c.apply_migrations_up_to(u32::MAX).expect("migrate");
+    // A mesh deleted outright after the upgrade leaves a legacy pairing that backs nothing.
+    c.conn
+        .execute("DELETE FROM asset WHERE id = 6", [])
+        .expect("ghost");
+    let legacy_left = |c: &Catalog| -> i64 {
+        c.conn
+            .query_row(
+                "SELECT COUNT(*) FROM prefab_binding b JOIN prefab_file f ON f.id = b.prefab_id
+                  WHERE f.scope = 'legacy'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("legacy count")
+    };
+    let edges = |c: &Catalog, from: i64| -> Vec<i64> {
+        c.conn
+            .prepare(
+                "SELECT to_asset_id FROM asset_relationship WHERE from_asset_id = ?1
+                  ORDER BY to_asset_id",
+            )
+            .and_then(|mut st| {
+                st.query_map(params![from], |r| r.get(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .expect("edges")
+    };
+    assert!(c.prefab_reharvest_pending().expect("pending"));
+    assert_eq!(
+        c.reconcile_prefab_edges().expect("reconcile"),
+        1,
+        "legacy evidence backs every legacy edge but the self-edge, which is wrong by rule"
+    );
+
+    // A walk of `/s` finds only the rock's own pairing. Recording it deletes nothing by itself.
+    c.record_prefab_walk(
+        "/s",
+        &[prefab_scan("/s/rock.prefab", &[("g-rock", "g-rockmat")])],
+        &[],
+    )
+    .expect("walk");
+    c.reconcile_prefab_edges().expect("reconcile");
+    assert_eq!(edges(&c, 1), vec![2, 3]);
+
+    // That walk completed, so the legacy pairings of the meshes `/s` holds are replaced, and the
+    // one no prefab repeats goes. `/t` has not been walked: its mesh keeps its legacy edge.
+    c.retire_legacy_prefab_evidence("/s").expect("retire /s");
+    c.reconcile_prefab_edges().expect("reconcile");
+    assert_eq!(
+        edges(&c, 1),
+        vec![2],
+        "the whole-file pairing no prefab repeats is gone"
+    );
+    assert_eq!(
+        edges(&c, 5),
+        vec![2],
+        "an unwalked source keeps what it had"
+    );
+    assert_eq!(legacy_left(&c), 1, "the bush's pairing, not the ghost's");
+    assert!(c.prefab_reharvest_pending().expect("still pending"));
+
+    // A walk of every scope that completes retires whatever legacy evidence is left.
+    c.retain_prefab_scopes(&["/s".to_string(), "/t".to_string()])
+        .expect("retain");
+    assert!(!c.prefab_reharvest_pending().expect("done"));
+    c.reconcile_prefab_edges().expect("reconcile");
+    assert!(edges(&c, 5).is_empty());
+
+    let (guid, dirty): (Option<String>, i64) = c
+        .conn
+        .query_row(
+            "SELECT unity_guid, deps_dirty FROM asset WHERE id = 4",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("in-pack row");
+    assert_eq!(guid.as_deref(), Some("g-inpack"));
+    assert_eq!(dirty, 1, "a materialized in-pack row is scanned again");
 }
 
 /// UI-SPEC 13.9 - where an in-pack asset lives *inside* its archive.

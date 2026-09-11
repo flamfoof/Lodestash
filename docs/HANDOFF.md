@@ -476,7 +476,10 @@ drain, so index order doesn't matter. `dependency_closure` backs both `AssetDeta
 resolved edges, 2 missing. Mesh → material comes from a second pass over `.prefab` files: a stock
 FBX embeds its materials, so the model declares nothing and the prefab is the only place the binding
 is written down. Prefabs are read as *evidence*, never catalogued (`prefab` isn't a `media_type`),
-and the pass rebuilds `source='unity_prefab'` edges wholesale — 1228 resolved on this library, so
+and since M28 the evidence is kept per prefab, renderer and slot with the edges derived from it
+(v1 plan S06, [ADR-0018](decisions/ADR-0018-prefabs-are-scoped-evidence.md)). On this library the
+reharvest kept 1,172 of the 1,228 whole-file pairings and dropped 56 no renderer declares (24
+collision meshes, 15 particle emission shapes, 11 cross-renderer pairings, 6 self-edges), so
 `SM_Gen_Env_Ground_Grass_Large_01` now returns material + 3 textures. **Coverage caveat**: an asset
 outside a Unity project has no `.meta`, so no GUID and no edges at all — step 2's naming heuristic
 (DATA-MODEL §10) is what would reach those.

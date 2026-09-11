@@ -59,7 +59,16 @@ this file stays the live board.
       `ai:legacy-agent`; `get_asset` (one builder for both planes) reports provenance and
       `annotation_revision`; the Inspector styles AI by provenance. *Open:* vocabulary revisions
       (Task 4a) and headless approvals (S11).
-- [ ] **R3 · S06–S08 — component-scoped prefab evidence, native material inputs, textured previews.**
+- [x] **R3 · S06 — component-scoped prefab evidence** (M28, [ADR-0018](decisions/ADR-0018-prefabs-are-scoped-evidence.md)). Prefabs are
+      parsed per YAML document: MeshRenderer ↔ MeshFilter joined by `m_GameObject`, a
+      SkinnedMeshRenderer keeps its own mesh and slots; material texture bindings keep their
+      property (`material_texture_bindings`). Evidence is kept per file (scope, path, size/mtime)
+      and renderer slot; `reconcile_prefab_edges` derives the `unity_prefab` edges, keeps mutes,
+      keeps unavailable scopes, and retires the M28 `legacy` pairings per source once that source's
+      walk completes. Refreshed after dependency drains, watch rescans, manual scans and extraction;
+      in-pack assets carry their manifest GUID. *Open:* nested instances and variant overrides are
+      counted, not resolved.
+- [ ] **R3 · S07–S08 — native material inputs, textured previews.**
 - [ ] **R4 · S09 — resident embedding snapshots with generation invalidation.**
 - [ ] **R5 · S10–S13 — endpoint egress policy, headless startup, bounded library walk, app-owned
       bulk runs** (MCP handoff Tasks 1–3 and 5).

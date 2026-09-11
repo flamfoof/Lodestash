@@ -256,8 +256,10 @@ placeholder thumbnail.
 
 - **GUID-ref pass:** Unity `.meta` files and material YAML files contain `fileID`/`guid` references
   to other assets. After step 8 has populated `asset.unity_guid` for every item in the batch, a
-  second pass reads each material/prefab's GUID references and inserts `asset_relationship` rows
-  (`source='unity_meta'`). Cross-source GUIDs (texture in a shared pack, material in a project
+  second pass reads each material's GUID references and inserts `asset_relationship` rows
+  (`source='unity_meta'`). Prefabs are read beside it as evidence of which mesh each renderer paints
+  with which material — per document and slot, kept per file and re-read when the file changes
+  (`source='unity_prefab'`, DATA-MODEL §10). Cross-source GUIDs (texture in a shared pack, material in a project
   folder) are resolved across all sources in the active project — relationship rows may cross
   `source_id` boundaries.
 - **Heuristic pass:** for raw exports without `.meta`, a lighter inference runs: textures sharing a

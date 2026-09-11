@@ -653,8 +653,20 @@ pub fn drain_dependencies(cat: &mut Catalog, workspace_dir: Option<&std::path::P
             break;
         }
     }
+    // M28 left the pre-S06 prefab edges as `legacy` evidence until a walk that completes everywhere
+    // replaces it. That reharvest is tried once per process: a source whose drive stays unplugged
+    // keeps it pending, and re-walking the library on every idle tick for that would cost more than
+    // waiting for the next change.
+    static REHARVEST_TRIED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    let reharvest = !REHARVEST_TRIED.load(std::sync::atomic::Ordering::Relaxed)
+        && cat.prefab_reharvest_pending().unwrap_or(false);
+    if total > 0 || reharvest {
+        REHARVEST_TRIED.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (scopes, whole_library) = library_prefab_scopes(cat, workspace_dir);
+        refresh_prefab_evidence(cat, &scopes, whole_library);
+    }
     if total > 0 {
-        drain_prefab_edges(cat);
         drain_inferred_texture_edges(cat);
     }
     match cat.resolve_pending_relationships() {
@@ -667,30 +679,155 @@ pub fn drain_dependencies(cat: &mut Catalog, workspace_dir: Option<&std::path::P
     }
 }
 
-/// Walk every source root for `.prefab` files and rebuild the **mesh → material** edges from what
-/// they bind (DATA-MODEL §10). Prefabs are not assets — they aren't a `media_type` — so they can't
-/// ride the `deps_dirty` queue; they are read as pure evidence about assets that *are* catalogued.
-///
-/// Runs only when the dependency drain actually scanned something, so a steady-state library
-/// re-walks nothing. ponytail: on-disk sources only — a prefab extracted into the package
-/// workspace is skipped until someone wants that.
-pub fn drain_prefab_edges(cat: &mut Catalog) {
+/// One tree of `.prefab` files the evidence pass walks — a source root, or the package workspace.
+pub struct PrefabScope {
+    pub root: std::path::PathBuf,
+    /// For the workspace, a directory that does not exist yet means nothing was extracted: proof
+    /// of no prefabs. A source root that does not resolve is a drive that is gone: proof of
+    /// nothing.
+    pub absent_is_empty: bool,
+}
+
+/// Every scope the library's prefab evidence comes from, and whether that is all of them — it is
+/// not when there is no workspace directory to walk, or the source list could not be read.
+pub fn library_prefab_scopes(
+    cat: &Catalog,
+    workspace_dir: Option<&std::path::Path>,
+) -> (Vec<PrefabScope>, bool) {
     let roots = match cat.source_roots() {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(%e, "prefab pass: source roots unavailable");
-            return;
+            return (Vec::new(), false);
         }
     };
-    let mut pairs: Vec<(String, String)> = roots
-        .iter()
-        .flat_map(|root| lodestash_ingest::deps::prefab_pairs_under(std::path::Path::new(root)))
+    let mut scopes: Vec<PrefabScope> = roots
+        .into_iter()
+        .map(|root| PrefabScope {
+            root: root.into(),
+            absent_is_empty: false,
+        })
         .collect();
-    pairs.sort();
-    pairs.dedup();
-    match cat.replace_prefab_relationships(&pairs) {
-        Ok(written) => tracing::info!(pairs = pairs.len(), written, "prefab edges rebuilt"),
-        Err(e) => tracing::warn!(%e, "rebuilding prefab edges failed"),
+    if let Some(ws) = workspace_dir {
+        scopes.push(PrefabScope {
+            root: ws.to_path_buf(),
+            absent_is_empty: true,
+        });
+    }
+    (scopes, workspace_dir.is_some())
+}
+
+/// Re-read the prefab evidence under `scopes`, then re-derive the mesh → material edges from it
+/// (DATA-MODEL §10 step 1b, ADR-0018). Prefabs are not assets — not a `media_type` — so they cannot
+/// ride the `deps_dirty` queue; they are read as evidence about assets that are catalogued. Returns
+/// how many edges changed.
+///
+/// Only a prefab whose size or mtime moved is parsed. A scope whose walk completed also forgets the
+/// prefabs it no longer found; one that did not — a source whose drive is gone, a directory the walk
+/// could not open — keeps everything it said before. `whole_library` says `scopes` is every scope
+/// there is: only then, and only when every walk completed, is the evidence of scopes no longer
+/// walked forgotten (a removed source; M28's `legacy` scope).
+pub fn refresh_prefab_evidence(
+    cat: &mut Catalog,
+    scopes: &[PrefabScope],
+    whole_library: bool,
+) -> usize {
+    use lodestash_core::catalog::{PrefabBindingRow, PrefabFileScan};
+    let mut all_complete = true;
+    let mut nested = 0usize;
+    for scope in scopes {
+        let key = scope.root.to_string_lossy().into_owned();
+        let (files, complete) = if scope.absent_is_empty && !scope.root.exists() {
+            (Vec::new(), true)
+        } else {
+            lodestash_ingest::deps::prefab_files_under(&scope.root)
+        };
+        let known = match cat.prefab_revisions(&key) {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::warn!(%e, scope = %key, "prefab revisions unreadable; scope skipped");
+                all_complete = false;
+                continue;
+            }
+        };
+        all_complete &= complete;
+        let mut seen = std::collections::HashSet::new();
+        let mut parsed = Vec::new();
+        for file in files {
+            let path = file.path.to_string_lossy().into_owned();
+            let revision = (file.size as i64, file.mtime_ns);
+            if known.get(&path) != Some(&revision) {
+                // Unreadable right now: what it said before stands, and the next walk retries it.
+                if let Ok(bytes) = std::fs::read(&file.path) {
+                    let evidence =
+                        lodestash_ingest::deps::prefab_evidence(&String::from_utf8_lossy(&bytes));
+                    nested += evidence.nested_instances;
+                    parsed.push(PrefabFileScan {
+                        path: path.clone(),
+                        size: revision.0,
+                        mtime: revision.1,
+                        bindings: evidence
+                            .bindings
+                            .into_iter()
+                            .map(|b| PrefabBindingRow {
+                                game_object: b.game_object,
+                                renderer: b.renderer,
+                                slot: i64::from(b.slot),
+                                mesh_guid: b.mesh,
+                                material_guid: b.material,
+                            })
+                            .collect(),
+                    });
+                }
+            }
+            seen.insert(path);
+        }
+        let removed: Vec<String> = if complete {
+            known.into_keys().filter(|p| !seen.contains(p)).collect()
+        } else {
+            Vec::new()
+        };
+        match cat.record_prefab_walk(&key, &parsed, &removed) {
+            // This scope's evidence is current, so M28's legacy pairings for the meshes it holds
+            // have been replaced (ADR-0018).
+            Ok(_) if complete => {
+                if let Err(e) = cat.retire_legacy_prefab_evidence(&key) {
+                    tracing::warn!(%e, scope = %key, "retiring legacy prefab evidence failed");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(%e, scope = %key, "recording prefab evidence failed");
+                all_complete = false;
+            }
+        }
+    }
+    if whole_library && all_complete {
+        let keys: Vec<String> = scopes
+            .iter()
+            .map(|s| s.root.to_string_lossy().into_owned())
+            .collect();
+        if let Err(e) = cat.retain_prefab_scopes(&keys) {
+            tracing::warn!(%e, "forgetting retired prefab scopes failed");
+        }
+    }
+    if nested > 0 {
+        tracing::info!(
+            nested,
+            "nested prefab instances left unresolved: their overrides are not bindings"
+        );
+    }
+    match cat.reconcile_prefab_edges() {
+        Ok(changed) => {
+            if changed > 0 {
+                tracing::info!(changed, "prefab edges reconciled");
+            }
+            changed
+        }
+        Err(e) => {
+            tracing::warn!(%e, "reconciling prefab edges failed");
+            0
+        }
     }
 }
 
@@ -1914,6 +2051,194 @@ mod tests {
         assert!(
             lodestash_core::catalog::source_problem(&lodestash_core::catalog::ai_source(&id))
                 .is_none()
+        );
+    }
+
+    /// S06 end to end over real files: a prefab's bindings become edges by GameObject, follow an
+    /// edit or a deletion of the prefab alone, survive a source going away, and reach a prefab that
+    /// lives only in the package workspace.
+    #[test]
+    fn prefab_evidence_follows_the_prefab_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir(&lib).unwrap();
+        let guid = |c: char| c.to_string().repeat(32);
+        let files = [
+            ("rock.fbx", 'a', "model_3d"),
+            ("rock.mat", 'c', "material"),
+            ("tree.fbx", 'b', "model_3d"),
+            ("tree.mat", 'd', "material"),
+        ];
+        for (name, g, _) in files {
+            std::fs::write(lib.join(name), "Material:\n").unwrap();
+            std::fs::write(
+                lib.join(format!("{name}.meta")),
+                format!("fileFormatVersion: 2\nguid: {}\n", guid(g)),
+            )
+            .unwrap();
+        }
+        // Two GameObjects, each a MeshFilter + MeshRenderer; `rock_mat` paints the first.
+        let prefab = |rock_mat: char| {
+            format!(
+                "--- !u!33 &101\nMeshFilter:\n  m_GameObject: {{fileID: 100}}\n  \
+                 m_Mesh: {{fileID: 4300000, guid: {}, type: 3}}\n\
+                 --- !u!23 &102\nMeshRenderer:\n  m_GameObject: {{fileID: 100}}\n  \
+                 m_Materials:\n  - {{fileID: 2100000, guid: {}, type: 2}}\n\
+                 --- !u!33 &201\nMeshFilter:\n  m_GameObject: {{fileID: 200}}\n  \
+                 m_Mesh: {{fileID: 4300000, guid: {}, type: 3}}\n\
+                 --- !u!23 &202\nMeshRenderer:\n  m_GameObject: {{fileID: 200}}\n  \
+                 m_Materials:\n  - {{fileID: 2100000, guid: {}, type: 2}}\n",
+                guid('a'),
+                guid(rock_mat),
+                guid('b'),
+                guid('d')
+            )
+        };
+        std::fs::write(lib.join("Scene.prefab"), prefab('c')).unwrap();
+
+        let mut cat = Catalog::open(&dir.path().join("catalog.db")).unwrap();
+        cat.seed_media_types().unwrap();
+        let src = cat
+            .upsert_import_source("Lib", &lib.to_string_lossy(), "folder")
+            .unwrap();
+        cat.record_crawl(
+            src,
+            None,
+            &files.map(|(name, _, media)| lodestash_core::catalog::CrawlRecord {
+                workspace_rel: None,
+                content_hash: None,
+                rel_path: name.into(),
+                name: name.into(),
+                media_type: media.into(),
+                size_bytes: 1,
+                mtime: 1,
+            }),
+        )
+        .unwrap();
+        let ids: std::collections::HashMap<String, i64> = cat
+            .assets_needing_dep_scan(10)
+            .unwrap()
+            .into_iter()
+            .map(|j| {
+                let path = j.disk_path.expect("on disk");
+                let name = path.rsplit(['/', '\\']).next().unwrap().to_string();
+                (name, j.asset_id)
+            })
+            .collect();
+        let (rock, rock_mat, tree, tree_mat) = (
+            ids["rock.fbx"],
+            ids["rock.mat"],
+            ids["tree.fbx"],
+            ids["tree.mat"],
+        );
+        let closure = |cat: &Catalog, id: i64| cat.dependency_closure(&[id]).unwrap();
+        let sorted = |mut v: Vec<i64>| {
+            v.sort();
+            v
+        };
+
+        // The dependency drain harvests the GUIDs and reads the prefab: two pairings, not four.
+        drain_dependencies(&mut cat, None);
+        assert_eq!(closure(&cat, rock), sorted(vec![rock, rock_mat]));
+        assert_eq!(closure(&cat, tree), sorted(vec![tree, tree_mat]));
+        assert!(
+            !cat.prefab_reharvest_pending().unwrap(),
+            "a complete walk of the source retired M28's legacy evidence"
+        );
+
+        // Only the prefab changes, as a watch rescan finds it: rock now wears tree's material.
+        let scope = [PrefabScope {
+            root: lib.clone(),
+            absent_is_empty: false,
+        }];
+        std::fs::write(lib.join("Scene.prefab"), prefab('d') + "\n").unwrap();
+        assert!(refresh_prefab_evidence(&mut cat, &scope, false) > 0);
+        assert_eq!(closure(&cat, rock), sorted(vec![rock, tree_mat]));
+
+        // Deleting the prefab alone takes its edges with it.
+        std::fs::remove_file(lib.join("Scene.prefab")).unwrap();
+        refresh_prefab_evidence(&mut cat, &scope, false);
+        assert_eq!(closure(&cat, rock), vec![rock]);
+
+        // A source that is gone proves nothing: what it said stays.
+        std::fs::write(lib.join("Scene.prefab"), prefab('c')).unwrap();
+        refresh_prefab_evidence(&mut cat, &scope, false);
+        std::fs::rename(&lib, dir.path().join("unplugged")).unwrap();
+        refresh_prefab_evidence(&mut cat, &scope, false);
+        assert_eq!(
+            closure(&cat, rock),
+            sorted(vec![rock, rock_mat]),
+            "unavailable is not deleted"
+        );
+
+        // A prefab that lives only in the package workspace is evidence too, and a workspace
+        // nothing was extracted into yet is simply empty.
+        let ws = dir.path().join("ws");
+        let ws_scope = [PrefabScope {
+            root: ws.clone(),
+            absent_is_empty: true,
+        }];
+        refresh_prefab_evidence(&mut cat, &ws_scope, false);
+        std::fs::create_dir_all(ws.join("ab")).unwrap();
+        std::fs::write(
+            ws.join("ab/Pack.prefab"),
+            format!(
+                "--- !u!137 &1\nSkinnedMeshRenderer:\n  m_GameObject: {{fileID: 2}}\n  \
+                 m_Materials:\n  - {{fileID: 2100000, guid: {}, type: 2}}\n  \
+                 m_Mesh: {{fileID: 4300000, guid: {}, type: 3}}\n",
+                guid('c'),
+                guid('b')
+            ),
+        )
+        .unwrap();
+        refresh_prefab_evidence(&mut cat, &ws_scope, false);
+        assert_eq!(
+            closure(&cat, tree),
+            sorted(vec![tree, rock_mat, tree_mat]),
+            "the workspace prefab adds its pairing; the unplugged source's stands"
+        );
+
+        // Evidence from a scope the library no longer has — a removed source — is forgotten only
+        // by a walk of every scope that completed, never while one of them is unplugged.
+        cat.record_prefab_walk(
+            "C:/removed-source",
+            &[lodestash_core::catalog::PrefabFileScan {
+                path: "C:/removed-source/Old.prefab".into(),
+                size: 1,
+                mtime: 1,
+                bindings: vec![lodestash_core::catalog::PrefabBindingRow {
+                    game_object: 1,
+                    renderer: 2,
+                    slot: 0,
+                    mesh_guid: guid('a'),
+                    material_guid: guid('d'),
+                }],
+            }],
+            &[],
+        )
+        .unwrap();
+        let everything = [
+            PrefabScope {
+                root: lib.clone(),
+                absent_is_empty: false,
+            },
+            PrefabScope {
+                root: ws.clone(),
+                absent_is_empty: true,
+            },
+        ];
+        refresh_prefab_evidence(&mut cat, &everything, true);
+        assert_eq!(
+            closure(&cat, rock),
+            sorted(vec![rock, rock_mat, tree_mat]),
+            "one scope unplugged: nothing is forgotten"
+        );
+        std::fs::rename(dir.path().join("unplugged"), &lib).unwrap();
+        refresh_prefab_evidence(&mut cat, &everything, true);
+        assert_eq!(
+            closure(&cat, rock),
+            sorted(vec![rock, rock_mat]),
+            "every scope walked: the removed source's evidence goes"
         );
     }
 }

@@ -428,6 +428,7 @@ impl Catalog {
             (25, MIGRATION_25_FTS_OVER_A_VIEW),
             (26, MIGRATION_26_TAG_PROVENANCE),
             (27, MIGRATION_27_TAG_REQUEST_RECEIPTS),
+            (28, MIGRATION_28_PREFAB_EVIDENCE),
         ];
 
         for (version, sql) in migrations {
@@ -933,17 +934,21 @@ impl Catalog {
                     // In-pack files have no source-root path; the in-archive pathname is rel_path.
                     let rel_path = pathname.clone().unwrap_or_else(|| guid.clone());
 
+                    // The manifest's GUID folder *is* the asset's Unity GUID. An extracted pack has
+                    // no `.meta` beside its files, so this is the only place it is known — and a
+                    // prefab inside the pack names its meshes by it (v1 plan S06).
                     tx.execute(
                         "INSERT INTO asset (uuid, source_id, media_type_id, name,
-                                            package_id, status, created_at, updated_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, 'discovered', ?6, ?6)",
+                                            package_id, status, created_at, updated_at, unity_guid)
+                         VALUES (?1, ?2, ?3, ?4, ?5, 'discovered', ?6, ?6, ?7)",
                         params![
                             uuid::Uuid::new_v4().to_string(),
                             source_id,
                             media_type_id,
                             class.name,
                             package_id,
-                            now
+                            now,
+                            guid
                         ],
                     )
                     .map_err(|e| CoreError::Catalog(format!("in-pack asset insert: {e}")))?;
@@ -1011,6 +1016,18 @@ impl Catalog {
             tx.commit()
                 .map_err(|e| CoreError::Catalog(format!("materialize commit: {e}")))?;
         }
+        // The files can be read now. What the dependency scan could not see inside the archive —
+        // a material's texture refs, for one — is queued for it again.
+        self.conn
+            .execute(
+                "UPDATE asset SET deps_dirty = 1
+                  WHERE package_id = ?1 AND deleted_at IS NULL
+                    AND EXISTS (SELECT 1 FROM asset_file af
+                                 WHERE af.id = asset.primary_file_id
+                                   AND af.workspace_rel IS NOT NULL)",
+                params![package_id],
+            )
+            .map_err(|e| CoreError::Catalog(format!("materialize re-queue deps: {e}")))?;
         Ok(matched)
     }
 
@@ -2197,6 +2214,61 @@ const MIGRATION_14_IN_PACK_ASSETS: &str = "
 ALTER TABLE asset_file ADD COLUMN package_entry_id INTEGER REFERENCES package_entry(id);
 CREATE INDEX IF NOT EXISTS idx_file_pkgentry
   ON asset_file(package_entry_id) WHERE package_entry_id IS NOT NULL;
+";
+
+/// M28 — prefab evidence, per file and per renderer slot (v1 plan S06, ADR-0018).
+///
+/// `prefab_file` is one `.prefab` as last read: the scope it was walked under (a source root or the
+/// package workspace), its path, and the size/mtime revision it was read at, so a walk re-parses
+/// only what moved. `prefab_binding` is what it declares — one row per renderer slot, paired by the
+/// renderer's own GameObject instead of by whole-file co-occurrence. The `unity_prefab` edges are
+/// derived from these rows (`Catalog::reconcile_prefab_edges`).
+///
+/// The edges already recorded came from whole-file pairings that no row attributes to a prefab.
+/// They become the evidence of the reserved scope `legacy`, so nothing is deleted before a reharvest
+/// has replaced it: a source's legacy pairings are retired when a walk of that source completes,
+/// and whatever is left when a walk of every scope does. The pairings no prefab repeats go then.
+///
+/// In-pack assets take the GUID their package manifest names — the folder a `.unitypackage` files
+/// each asset under — because an extracted pack has no `.meta` to read it from. Materialized rows
+/// are queued for the dependency scan the archive could not give them.
+const MIGRATION_28_PREFAB_EVIDENCE: &str = "
+CREATE TABLE prefab_file (
+    id    INTEGER PRIMARY KEY,
+    scope TEXT    NOT NULL,
+    path  TEXT    NOT NULL,
+    size  INTEGER NOT NULL,
+    mtime INTEGER NOT NULL,
+    UNIQUE(scope, path)
+);
+CREATE TABLE prefab_binding (
+    prefab_id     INTEGER NOT NULL REFERENCES prefab_file(id) ON DELETE CASCADE,
+    game_object   INTEGER NOT NULL,
+    renderer      INTEGER NOT NULL,
+    slot          INTEGER NOT NULL,
+    mesh_guid     TEXT    NOT NULL,
+    material_guid TEXT    NOT NULL,
+    PRIMARY KEY (prefab_id, renderer, slot, mesh_guid)
+);
+CREATE INDEX idx_prefab_binding_pair ON prefab_binding(mesh_guid, material_guid);
+INSERT INTO prefab_file (scope, path, size, mtime) VALUES ('legacy', 'legacy', 0, 0);
+INSERT INTO prefab_binding (prefab_id, game_object, renderer, slot, mesh_guid, material_guid)
+SELECT f.id, 0, 0, r.id, a.unity_guid, r.declared_path
+  FROM asset_relationship r
+  JOIN asset a       ON a.id = r.from_asset_id
+  JOIN prefab_file f ON f.scope = 'legacy'
+ WHERE r.source = 'unity_prefab' AND a.unity_guid IS NOT NULL AND r.declared_path IS NOT NULL;
+UPDATE asset SET unity_guid = (SELECT pe.guid FROM asset_file af
+                                 JOIN package_entry pe ON pe.id = af.package_entry_id
+                                WHERE af.id = asset.primary_file_id)
+ WHERE unity_guid IS NULL
+   AND EXISTS (SELECT 1 FROM asset_file af
+                WHERE af.id = asset.primary_file_id AND af.package_entry_id IS NOT NULL);
+UPDATE asset SET deps_dirty = 1
+ WHERE deleted_at IS NULL
+   AND EXISTS (SELECT 1 FROM asset_file af
+                WHERE af.id = asset.primary_file_id
+                  AND af.package_entry_id IS NOT NULL AND af.workspace_rel IS NOT NULL);
 ";
 
 /// M27 — durable receipts for agent tag requests (v1 plan S05, ENGINE-API §8.3).
@@ -5209,49 +5281,6 @@ impl Catalog {
         Ok((has_deps, has_dependents))
     }
 
-    /// Replace the prefab-derived edges with `pairs` of `(mesh GUID, material GUID)` (§10,
-    /// `source='unity_prefab'`). Pairs whose mesh isn't catalogued are dropped — an edge needs a
-    /// real `from_asset_id` — while an unresolved *material* is kept `missing` like any other,
-    /// so a later extraction can late-bind it.
-    ///
-    /// Rebuild-in-full rather than diff: the pass walks every prefab anyway, and at this scale
-    /// (thousands of prefabs, a handful of pairs each) one delete + reinsert inside a transaction
-    /// is both simpler and correct when a prefab is edited or deleted.
-    pub fn replace_prefab_relationships(&mut self, pairs: &[(String, String)]) -> Result<usize> {
-        let tx = self
-            .conn
-            .transaction()
-            .map_err(|e| CoreError::Catalog(format!("prefab edges begin: {e}")))?;
-        tx.execute(
-            "DELETE FROM asset_relationship WHERE source = 'unity_prefab'",
-            [],
-        )
-        .map_err(|e| CoreError::Catalog(format!("prefab edges clear: {e}")))?;
-        let mut written = 0usize;
-        for (mesh_guid, material_guid) in pairs {
-            written += tx
-                .execute(
-                    "INSERT INTO asset_relationship
-                        (from_asset_id, to_asset_id, kind, source, confidence, declared_path, state)
-                     SELECT a.id,
-                            (SELECT id FROM asset
-                              WHERE unity_guid = ?2 AND deleted_at IS NULL),
-                            'uses_material', 'unity_prefab', 0.9, ?2,
-                            CASE WHEN EXISTS (SELECT 1 FROM asset
-                                               WHERE unity_guid = ?2 AND deleted_at IS NULL)
-                                 THEN 'resolved' ELSE 'missing' END
-                       FROM asset a
-                      WHERE a.unity_guid = ?1 AND a.deleted_at IS NULL
-                     ON CONFLICT(from_asset_id, to_asset_id, kind) DO NOTHING",
-                    params![mesh_guid, material_guid],
-                )
-                .map_err(|e| CoreError::Catalog(format!("prefab edge insert: {e}")))?;
-        }
-        tx.commit()
-            .map_err(|e| CoreError::Catalog(format!("prefab edges commit: {e}")))?;
-        Ok(written)
-    }
-
     /// Every asset reachable from `seeds` over resolved dependency edges, seeds included
     /// (DATA-MODEL §10; ENGINE-API §4 "export with dependencies"). Unresolved (`missing`) edges
     /// point at nothing in the library, so they contribute nothing to a copy.
@@ -6122,6 +6151,7 @@ mod collections;
 mod excludes;
 mod graph;
 mod oplog;
+mod prefab;
 mod tagbatch;
 mod taxonomy;
 #[cfg(test)]
@@ -6131,6 +6161,7 @@ mod tests_slices;
 #[cfg(test)]
 mod tests_tagbatch;
 
+pub use prefab::{PrefabBindingRow, PrefabFileScan, LEGACY_PREFAB_SCOPE};
 pub use tagbatch::{
     ai_source, assignment_problem, is_ai_source, source_problem, validate_assignments, AssetTagRow,
     HistoryOrigin, TagBatch, TagBatchItem, TagBatchOutcome, TagMode, TagReceipt, TagReceiptKey,
