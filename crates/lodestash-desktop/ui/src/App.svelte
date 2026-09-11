@@ -462,13 +462,28 @@ import JobTray from "./lib/JobTray.svelte";
       const id = view.selected;
       if (id == null) return;
       e.preventDefault();
-      const on = favIntent?.id === id ? favIntent.on : (selectedDetail?.favorite ?? false);
-      favIntent = { id, on: !on };
-      write(
-        () => setFavorite([id], !on),
-        () => (on ? "Removed from Favorites" : "Added to Favorites"),
-      );
+      // The Inspector's detail is fetched after the click lands, so for a moment it still describes
+      // the *previous* selection. It answers for `id` only when it is `id`'s; otherwise ask first.
+      const current =
+        favIntent?.id === id
+          ? favIntent.on
+          : selectedDetail?.asset_id === id
+            ? selectedDetail.favorite
+            : undefined;
+      if (current === undefined) {
+        assetDetail(id).then((d) => toggleFavorite(id, d?.favorite ?? false));
+      } else {
+        toggleFavorite(id, current);
+      }
     }
+  }
+
+  function toggleFavorite(id: number, on: boolean) {
+    favIntent = { id, on: !on };
+    write(
+      () => setFavorite([id], !on),
+      () => (on ? "Removed from Favorites" : "Added to Favorites"),
+    );
   }
 
   /**
@@ -477,10 +492,16 @@ import JobTray from "./lib/JobTray.svelte";
    * menu both read the row they are drawn from, which is already current.
    */
   let favIntent = $state<{ id: number; on: boolean } | null>(null);
+  // Only the catalog's answer for *this* asset clears it. A detail still describing the previous
+  // selection says nothing about this one, and clearing on it is exactly how two quick presses both
+  // read the pre-write value and wrote the same thing twice (the e2e F-toggle check, 2026-09-11).
   $effect(() => {
     const d = selectedDetail;
     if (!d || favIntent == null) return;
-    if (d.asset_id !== favIntent.id || d.favorite === favIntent.on) favIntent = null;
+    if (d.asset_id === favIntent.id && d.favorite === favIntent.on) favIntent = null;
+  });
+  $effect(() => {
+    if (favIntent != null && view.selected !== favIntent.id) favIntent = null;
   });
 
   function afterRemoval() {
