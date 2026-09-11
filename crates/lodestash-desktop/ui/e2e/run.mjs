@@ -3614,9 +3614,23 @@ try {
       );
 
       // A second refresh clears it, and the user's own write is not announced back to them.
+      const beforeSecond = (await reads()).grid_page;
       await banner.click();
       await banner.waitFor({ state: "detached", timeout: 3000 });
-      const settled = await reads();
+      // The refresh's own page read is asynchronous and can land after the banner goes. Wait for
+      // it, then for the counters to go quiet, before taking the baseline the user's write is
+      // held to — otherwise that late read is blamed on the user's write.
+      await waitFor(
+        async () => (await reads()).grid_page > beforeSecond,
+        "the second refresh never re-read the page",
+      );
+      let settled = await reads();
+      for (let i = 0; i < 10; i++) {
+        await page.waitForTimeout(300);
+        const now = await reads();
+        if (JSON.stringify(now) === JSON.stringify(settled)) break;
+        settled = now;
+      }
       await invoke("stage", { ids: [mine] });
       await page.waitForTimeout(800);
       assert.equal(await banner.count(), 0, "the user's own write was announced as someone else's");
