@@ -36,6 +36,12 @@ flagged.
 
 ## 2. Subsystem choices
 
+> **Vectors live in memory, once.** The brute-force index (`crate::vector`) is built per
+> `(database, embedding model)` and held for the life of the process, keyed by a durable generation
+> the catalog carries (M30). On the reference library that is 18.7 MiB and a 172 ms load, reused in
+> 66 µs; an ANN index or a DB vector extension is still the answer when the *scan* becomes the cost
+> rather than the load (v1 plan S09).
+
 | Concern | Choice | Notes |
 |---|---|---|
 | **DB / search** | SQLite (WAL) via `rusqlite` (bundled) + **FTS5**; vectors are BLOBs scanned by `BruteForceIndex` behind the `VectorIndex` trait | one file. **`sqlite-vec` is deferred, not shipped** — measured 2026-07-20 (`perf_probe_knn_scaling`): at 50k×768-d a query is 212ms, of which the BLOB reload+decode is ~5.6× the cosine scan, so an ANN index would optimise the cheap half *and* reintroduce a native loadable-extension to bundle. AI search is submit-driven (once per Enter), so this is fine to ~100k. Swap in `sqlite-vec` (or LanceDB past ~500k–1M) behind the trait when a real library shows it's needed |

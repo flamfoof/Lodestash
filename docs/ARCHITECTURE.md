@@ -223,6 +223,12 @@ User edits tags (accept/reject chips) → recorded as training signal + immediat
 
 ## 5. Concurrency & process model
 
+**Resident embedding snapshots cross processes by fact, not by message** (v1 plan S09). The GUI and a
+headless `--mcp` server are independent processes with independent caches; each keeps its own
+snapshot per `(database, model)` and checks the model's generation (M30) — written inside the
+embedding transaction — before trusting it. No event, no invalidation channel, and a rebuild failure
+surfaces as an error rather than a silently stale answer.
+
 - **Single core process**, async runtime (**tokio**) for IO/orchestration + **rayon** for CPU-bound
   batch work (hashing, image decode/resize, offscreen 3D thumbnail renders).
 - **SQLite access**: `rusqlite::Connection` is `!Sync`, so the catalog is **not** shared by handle.

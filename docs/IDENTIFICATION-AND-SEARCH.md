@@ -163,6 +163,11 @@ When a user opts tier-3 tagging to the cloud, the default provider is Claude. Ve
 
 All three reduce to the one hybrid core (DATA-MODEL §3); they differ in how the query is formed.
 
+Whichever path asks, the vector side answers out of a **resident snapshot** of that model's
+embeddings, rebuilt only when the model's generation moves (M30, v1 plan S09), and scores only the
+assets eligible right now — trash, media-type and status are a hard filter applied before ranking,
+never a sieve over the results.
+
 ### A. Search by Tags — exact, structural, explainable
 Pure structural retrieval, **no vector step**: FTS5/BM25 over names + tags + description, plus
 **faceted filters** (`namespace=value`), media-type (Models/Sounds/Images), mapped category, numeric

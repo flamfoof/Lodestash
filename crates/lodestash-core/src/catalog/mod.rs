@@ -13,7 +13,6 @@ use tracing::info;
 
 use crate::error::{CoreError, Result};
 use crate::fusion::rrf_fuse;
-use crate::vector::{BruteForceIndex, VectorIndex};
 
 /// One crawled file to persist — the crawl→catalog handoff (INGESTION.md §1).
 #[derive(Debug, Clone)]
@@ -306,6 +305,10 @@ impl AppraiseFocus {
 /// The fully-opened, migration-applied catalog database.
 pub struct Catalog {
     pub(crate) conn: Connection,
+    /// The database this catalog is, canonicalised — the key its resident vector snapshots are
+    /// cached under (v1 plan S09). `None` for an in-memory catalog, which shares nothing with
+    /// anyone and always builds its own.
+    pub(crate) db_path: Option<std::path::PathBuf>,
     /// Appraisal queue order (UI-SPEC §3). Not persisted: it is where the user is looking, and
     /// that is only true for as long as they are looking there.
     appraise_focus: AppraiseFocus,
@@ -359,6 +362,7 @@ impl Catalog {
         configure_connection(&conn)?;
         let mut catalog = Self {
             conn,
+            db_path: Some(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())),
             appraise_focus: AppraiseFocus::default(),
         };
         catalog.apply_migrations()?;
@@ -372,6 +376,7 @@ impl Catalog {
         configure_connection(&conn)?;
         let mut catalog = Self {
             conn,
+            db_path: None,
             appraise_focus: AppraiseFocus::default(),
         };
         catalog.apply_migrations()?;
@@ -430,6 +435,7 @@ impl Catalog {
             (27, MIGRATION_27_TAG_REQUEST_RECEIPTS),
             (28, MIGRATION_28_PREFAB_EVIDENCE),
             (29, MIGRATION_29_TEXTURE_ROLES),
+            (30, MIGRATION_30_EMBEDDING_GENERATION),
         ];
 
         for (version, sql) in migrations {
@@ -2215,6 +2221,23 @@ const MIGRATION_14_IN_PACK_ASSETS: &str = "
 ALTER TABLE asset_file ADD COLUMN package_entry_id INTEGER REFERENCES package_entry(id);
 CREATE INDEX IF NOT EXISTS idx_file_pkgentry
   ON asset_file(package_entry_id) WHERE package_entry_id IS NOT NULL;
+";
+
+/// M30 — a durable per-model embedding generation (v1 plan S09).
+///
+/// A resident vector snapshot has to know when it is stale, and a GUI process cannot notify a
+/// headless one: the fact has to live in the catalog. Every embedding write bumps its model's
+/// generation inside the same transaction, so a reader that sees the rows also sees the number that
+/// describes them. Existing models start at 1 — no vector is touched, and an empty cache on restart
+/// is the correct starting state.
+const MIGRATION_30_EMBEDDING_GENERATION: &str = "
+CREATE TABLE embedding_generation (
+    model_id   TEXT    PRIMARY KEY,
+    generation INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+INSERT INTO embedding_generation (model_id, generation, updated_at)
+SELECT model_id, 1, COALESCE(MAX(created_at), 0) FROM asset_embedding GROUP BY model_id;
 ";
 
 /// M29 — the role a texture binding fills (v1 plan S07). `asset_relationship.role` holds the material
@@ -5763,6 +5786,8 @@ impl Catalog {
             .transaction()
             .map_err(|e| CoreError::Catalog(format!("embed begin: {e}")))?;
         tx.execute(
+            // The generation moves with the rows, inside this transaction: a reader that sees one
+            // sees the other (v1 plan S09, M30).
             "INSERT INTO asset_embedding
                 (asset_id, model_id, modality, dim, media_type_id, source_id, embedding, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -5787,6 +5812,14 @@ impl Catalog {
             params![asset_id],
         )
         .map_err(|e| CoreError::Catalog(format!("embed clear dirty: {e}")))?;
+        tx.execute(
+            "INSERT INTO embedding_generation (model_id, generation, updated_at)
+                  VALUES (?1, 1, ?2)
+             ON CONFLICT(model_id) DO UPDATE SET
+                generation = generation + 1, updated_at = excluded.updated_at",
+            params![model_id, unix_now()],
+        )
+        .map_err(|e| CoreError::Catalog(format!("embed generation: {e}")))?;
         tx.commit()
             .map_err(|e| CoreError::Catalog(format!("embed commit: {e}")))?;
         Ok(())
@@ -5885,11 +5918,18 @@ impl Catalog {
         let mut rankings = Vec::with_capacity(spaces.len() + 1);
         rankings.push(self.search_assets(query, depth)?.unwrap_or_default());
 
+        // One hard-filter set for both retrievers (v1 plan S09): BM25 ranks ids that are eligible
+        // now, and the vector side scores only those, so neither spends its depth on a candidate the
+        // other side has already excluded — and a trashed asset cannot reach the fused list.
+        let eligible = self.eligible_for_search(media_type_id)?;
+        rankings[0].retain(|id| eligible.contains(id));
         for (model_id, query_vec) in spaces {
-            let candidates = self.embeddings_for_knn(model_id, media_type_id)?;
+            // Resident per generation rather than rebuilt per query.
+            let snapshot = self.embedding_snapshot(model_id)?;
             rankings.push(
-                BruteForceIndex::new(candidates)
-                    .knn(query_vec, depth)
+                snapshot
+                    .index
+                    .knn_eligible(query_vec, depth, &eligible)
                     .into_iter()
                     .map(|(id, _)| id)
                     .collect(),
@@ -6134,6 +6174,7 @@ mod graph;
 mod material_inputs;
 mod oplog;
 mod prefab;
+mod snapshots;
 mod tagbatch;
 mod taxonomy;
 #[cfg(test)]
@@ -6143,10 +6184,13 @@ mod tests_material_inputs;
 #[cfg(test)]
 mod tests_slices;
 #[cfg(test)]
+mod tests_snapshots;
+#[cfg(test)]
 mod tests_tagbatch;
 
 pub use material_inputs::{albedo_rank, MaterialInputSource, MaterialSlot, ModelMaterialInputs};
 pub use prefab::{PrefabBindingRow, PrefabFileScan, LEGACY_PREFAB_SCOPE};
+pub use snapshots::{clear_resident_snapshots, resident_snapshot_count, EmbeddingSnapshot};
 pub use tagbatch::{
     ai_source, assignment_problem, is_ai_source, source_problem, validate_assignments, AssetTagRow,
     HistoryOrigin, TagBatch, TagBatchItem, TagBatchOutcome, TagMode, TagReceipt, TagReceiptKey,

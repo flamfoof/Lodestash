@@ -18,7 +18,7 @@ fn open_in_memory_applies_migrations() {
         .conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 29, "all 29 migrations should have run");
+    assert_eq!(version, 30, "all 30 migrations should have run");
 }
 
 /// Every queue an appraise pass drains must respect the set the caller named.
@@ -382,6 +382,7 @@ fn catalog_at(version: u32) -> Catalog {
     configure_connection(&conn).expect("pragmas");
     let mut c = Catalog {
         conn,
+        db_path: None,
         appraise_focus: AppraiseFocus::default(),
     };
     c.apply_migrations_up_to(version)

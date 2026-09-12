@@ -44,6 +44,32 @@ impl BruteForceIndex {
         Self { items }
     }
 
+    /// Nearest neighbours **among `eligible` only** — the filter is applied before scoring, not
+    /// after (v1 plan S09).
+    ///
+    /// Post-filtering a top-K is how a trashed asset, or one the current facets exclude, silently
+    /// costs a live asset its place in the results: the slot is spent on a candidate the caller
+    /// then drops. Scoring only the eligible set cannot leak a stale candidate and is cheaper.
+    pub fn knn_eligible(
+        &self,
+        query: &[f32],
+        k: usize,
+        eligible: &std::collections::HashSet<i64>,
+    ) -> Vec<(i64, f32)> {
+        if k == 0 {
+            return Vec::new();
+        }
+        let mut scored: Vec<(i64, f32)> = self
+            .items
+            .iter()
+            .filter(|(id, _)| eligible.contains(id))
+            .map(|(id, v)| (*id, cosine_similarity(query, v)))
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        scored.truncate(k);
+        scored
+    }
+
     pub fn len(&self) -> usize {
         self.items.len()
     }

@@ -810,6 +810,7 @@ fn m26_marks_old_ai_rows_legacy_and_keeps_their_model() {
     configure_connection(&conn).expect("pragmas");
     let mut c = Catalog {
         conn,
+        db_path: None,
         appraise_focus: AppraiseFocus::default(),
     };
     c.apply_migrations_up_to(25).expect("m25");

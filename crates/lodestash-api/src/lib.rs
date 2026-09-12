@@ -17,7 +17,6 @@ use std::sync::{Arc, Mutex};
 use lodestash_core::catalog::{
     AssetSummaryRow, Catalog, ImportOutcome, ImportSpec, PackageListing, ProjectRow,
 };
-use lodestash_core::vector::{BruteForceIndex, VectorIndex};
 
 /// ENGINE-API §2 `list_tags` row — `(namespace, value, asset count)`.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -668,9 +667,13 @@ impl ServerState {
         let Some((model_id, query)) = cat.embedding_of(id)? else {
             return Ok(Vec::new());
         };
-        let index = BruteForceIndex::new(cat.embeddings_for_knn(&model_id, None)?);
-        let ids: Vec<i64> = index
-            .knn(&query, limit + 1)
+        // Resident per embedding generation rather than rebuilt per request (v1 plan S09), and
+        // scored over the assets that are eligible *now* — a trashed asset must not spend a slot.
+        let snapshot = cat.embedding_snapshot(&model_id)?;
+        let eligible = cat.eligible_for_search(None)?;
+        let ids: Vec<i64> = snapshot
+            .index
+            .knn_eligible(&query, limit + 1, &eligible)
             .into_iter()
             .map(|(id, _)| id)
             .filter(|&other| other != id)

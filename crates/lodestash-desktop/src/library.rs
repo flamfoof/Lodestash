@@ -13,7 +13,6 @@ use lodestash_app::grid;
 use lodestash_app::types::{Category, ContentFilter, StatusFilter, TriBucket};
 use lodestash_core::catalog::{AppraiseFocus, Catalog};
 use lodestash_core::types::{AssetStatus, MediaType};
-use lodestash_core::vector::{BruteForceIndex, VectorIndex};
 use serde::{Deserialize, Serialize};
 
 /// One asset as the grid needs it. Carries a `preview_key`, never bytes — the frontend fetches
@@ -685,16 +684,6 @@ pub struct Library {
     ai_embedder: std::sync::Mutex<
         Option<std::sync::Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
     >,
-    /// The similarity index behind UI-SPEC §13.8, keyed by embedding model and built on first
-    /// use — same shape as `ai_embedder` above, and for the same reason.
-    ///
-    /// ponytail: brute force over every embedding, held in memory, rebuilt only on `reload`.
-    /// On this library that is ~6,400 vectors × 768 f32 ≈ 20 MB and a few ms per query. It is
-    /// cached because the Inspector asks on **every selection change**: rebuilding per click
-    /// would re-read every embedding out of SQLite to answer one panel. Swap in a real ANN index
-    /// (TECH-STACK §6 lists `sqlite-vec`/LanceDB) if a library ever makes the scan itself the
-    /// cost rather than the load.
-    similar_index: std::sync::Mutex<HashMap<String, std::sync::Arc<BruteForceIndex>>>,
 }
 
 struct Row {
@@ -759,7 +748,6 @@ impl Library {
                         .size_tiers
                         .normalized(),
                     ai_embedder: Default::default(),
-                    similar_index: Default::default(),
                 };
                 lib.reload();
                 lib
@@ -781,17 +769,11 @@ impl Library {
             paths: HashMap::new(),
             tiers: SizeTiers::default(),
             ai_embedder: Default::default(),
-            similar_index: Default::default(),
         }
     }
 
     /// Re-read sources and their assets from the catalog.
     pub fn reload(&mut self) {
-        // The similarity index is a snapshot of the embeddings; a reload means new rows, new
-        // embeddings, or both, so drop it rather than answering §13.8 out of a stale one.
-        if let Ok(mut cache) = self.similar_index.lock() {
-            cache.clear();
-        }
         // Size tiers feed the S/M/L/XL badges and the ⚑ size facet; they come from config, which
         // Settings edits — re-read here so a change lands without a restart (the grid never holds
         // a second copy to go stale).
@@ -2189,23 +2171,10 @@ impl Library {
         let Ok(Some((model_id, query))) = cat.embedding_of(asset_id) else {
             return Vec::new();
         };
-        let index = {
-            let mut cache = match self.similar_index.lock() {
-                Ok(c) => c,
-                Err(_) => return Vec::new(),
-            };
-            match cache.get(&model_id) {
-                Some(idx) => idx.clone(),
-                None => {
-                    let Ok(items) = cat.embeddings_for_knn(&model_id, None) else {
-                        return Vec::new();
-                    };
-                    let idx = std::sync::Arc::new(BruteForceIndex::new(items));
-                    cache.insert(model_id.clone(), idx.clone());
-                    tracing::debug!(model = %model_id, vectors = idx.len(), "similarity index built");
-                    idx
-                }
-            }
+        // The vectors are resident per embedding generation, shared by everything in this process
+        // (v1 plan S09) — this used to hold its own copy and throw it away on every library reload.
+        let Ok(snapshot) = cat.embedding_snapshot(&model_id) else {
+            return Vec::new();
         };
         let live: HashMap<i64, &Row> = self
             .rows
@@ -2213,8 +2182,12 @@ impl Library {
             .filter(|r| !r.trashed)
             .map(|r| (r.item.asset_id, r))
             .collect();
-        index
-            .knn(&query, limit + 1)
+        // What the grid would show, as the filter — applied before scoring, so a trashed neighbour
+        // cannot take a live one's place in the top K.
+        let eligible: std::collections::HashSet<i64> = live.keys().copied().collect();
+        snapshot
+            .index
+            .knn_eligible(&query, limit + 1, &eligible)
             .into_iter()
             .filter(|(id, _)| *id != asset_id)
             .filter_map(|(id, _)| live.get(&id).map(|r| r.item.clone()))
@@ -2628,7 +2601,6 @@ mod tests {
             paths: HashMap::new(),
             tiers: SizeTiers::default(),
             ai_embedder: Default::default(),
-            similar_index: Default::default(),
         }
     }
 

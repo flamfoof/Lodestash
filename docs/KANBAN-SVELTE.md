@@ -84,7 +84,15 @@ this file stays the live board.
       the engine/agent preview paint the same way. The embedding proxy now returns geometry only on
       a cache *miss* as well, so a model's first encode matches every later one. *Open:* the grid
       still shows the vector preview for models — the raster judgment tier is S14–17.
-- [ ] **R4 · S09 — resident embedding snapshots with generation invalidation.**
+- [x] **R4 · S09 — resident embedding snapshots with generation invalidation** (M30). One
+      immutable snapshot per `(database, model)`, shared for the life of the process and rebuilt
+      only when that model's generation moves — bumped inside `upsert_embedding`'s own transaction,
+      so a headless process sees a GUI write with no event to miss. Scoring runs over the ids that
+      are eligible *now* (`knn_eligible`), on both retrievers of the hybrid path, so a trashed asset
+      cannot take a live one's slot. The API rebuilt the whole index per `find_similar` call and the
+      desktop dropped its own on every library reload; both now share the snapshot. Measured on the
+      reference library: 6,395 × 768 = 18.7 MiB, 172 ms cold, 66 µs warm. Checks in
+      `tests_snapshots.rs`.
 - [ ] **R5 · S10–S13 — endpoint egress policy, headless startup, bounded library walk, app-owned
       bulk runs** (MCP handoff Tasks 1–3 and 5).
 - [ ] **Proxies/packs · S14–S18 — pre-extraction identity, one cache policy, visual tiers, font
