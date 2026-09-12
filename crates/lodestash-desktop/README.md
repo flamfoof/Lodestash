@@ -25,10 +25,16 @@ canonical path so there is exactly one token file in the repo.
 
 ## Running it
 
-Everything runs **from the repo root**. The root `package.json` is a task runner with no
-dependencies of its own, and `scripts/dev.mjs` does the one piece of sequencing a debug build
-needs: Vite has to be answering on :5173 *before* the window opens, because `tauri.conf.json`
-points `devUrl` at it — that ordering is the whole reason this used to want two terminals.
+**A debug build starts its own frontend server.** `tauri.conf.json` points `devUrl` at
+`http://localhost:5173`, so a debug window is the browser's "can't reach this page" unless Vite is
+answering. The binary now guarantees it (`src/devserver.rs`): it probes the port, starts
+`bun run dev` when nothing answers, waits for it, and stops the one it started when the app exits.
+That holds however you launch — `cargo run`, an IDE run button, or the built exe — so there is no
+ordering left to get wrong. A server that was already listening is reused and left running.
+
+Everything else runs **from the repo root**. The root `package.json` is a task runner with no
+dependencies of its own, and `scripts/dev.mjs` still exists for the one-command release path and for
+seeing Vite's own output in the terminal.
 
 **Bun** is the package manager and script runner — `bun.lock` is the committed lockfile and there is
 no `package-lock.json`. No Tauri CLI is installed, deliberately (see `docs/TECH-STACK.md` §1 on
@@ -43,7 +49,8 @@ bun run dev:release   # bun run build, then cargo run --release — serves ui/di
 ```
 
 `bun run dev` reuses a Vite already answering on :5173 rather than starting a second one, and takes
-down the one it started when the app exits. `npm run` works the same — the root scripts only shell
+down the one it started when the app exits — the same rule the binary itself follows, so the two
+never fight over the port. `npm run` works the same — the root scripts only shell
 out, so nothing is installed there.
 
 The two halves stay separately runnable when you want them apart; this is all the root scripts do:

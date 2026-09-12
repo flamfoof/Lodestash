@@ -5,6 +5,10 @@
  * the window opens; that ordering is the only reason the two-terminal dance existed. This starts
  * Vite, waits for it, hands the terminal to `cargo run`, and takes Vite back down on the way out.
  *
+ * The binary does the same for itself now (`crates/lodestash-desktop/src/devserver.rs`), so a launch
+ * that skips this script still gets a server. This stays for the release path and for watching
+ * Vite's output in the same terminal; both reuse a server that is already answering.
+ *
  * `--release` skips Vite entirely: a release build loads `ui/dist` from the bundle, so the
  * frontend is compiled first instead and nothing ever listens on :5173.
  *

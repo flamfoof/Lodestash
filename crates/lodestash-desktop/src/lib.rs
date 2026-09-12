@@ -6,6 +6,8 @@
 //! single-writer rule (ARCHITECTURE §5) puts every write on the persist thread.
 
 pub mod agent_bridge;
+#[cfg(debug_assertions)]
+mod devserver;
 pub mod library;
 pub mod protocol;
 pub mod storage;
@@ -2274,6 +2276,11 @@ pub fn run() {
     // the process is still single-threaded, and this is before the writer, the REST server and
     // Tauri's own threads exist.
     lodestash_app::models::apply_ort_dylib_env();
+    // A debug build's window loads the dev server, so the app starts it rather than expecting the
+    // person launching to have started it in another terminal. Release builds serve `ui/dist` from
+    // the bundle and skip this entirely.
+    #[cfg(debug_assertions)]
+    devserver::ensure();
 
     let library = Library::open();
     let status = library.status();
@@ -2505,6 +2512,18 @@ pub fn run() {
             recent_exports,
             undo_import_batch
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Lodestash");
+        // `build` + `run`, not `run` alone: Tauri ends the process when the last window closes, so
+        // anything after a bare `.run(...)` never executes. The exit event is where cleanup lands.
+        .build(tauri::generate_context!())
+        .expect("error while running Lodestash")
+        .run(|_handle, event| {
+            // Only what this process started (`devserver::ensure`) — a server that was already
+            // listening belongs to whoever started it. A hard kill runs nothing, and the next
+            // launch reuses the orphan rather than starting a second one.
+            #[cfg(debug_assertions)]
+            if matches!(event, tauri::RunEvent::Exit) {
+                devserver::shutdown();
+            }
+            let _ = &event;
+        });
 }
