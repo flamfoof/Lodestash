@@ -169,6 +169,19 @@ Rust stays in Rust; this is not a second home for the paging or Range-parsing te
 
 No test framework — plain `node:assert` and one runner, so the package count stays at one.
 
+**A hang is a failure, not a slow pass.** Every Playwright step waits at most 5 s
+(`page.setDefaultTimeout`), and every check gets a 5 s budget. A check whose work is genuinely longer
+— a cold ONNX load, a second app launch, waiting out a toast's lifetime — declares it at the call
+site, `check(name, { budget }, fn)`, with a comment saying why; the number is a claim about that one
+check, not an allowance the next check inherits. Playwright's own 30 s default is what let a selector
+that never existed sit silently inside a passing check.
+
+**Each run writes `test-reports/<month>-<day>-<hour>-<minute>.csv`** (local 24-hour time, git-ignored):
+one row per check with `result`, `seconds`, `origin_fn` and `origin_site` (the enclosing function and
+`e2e/run.mjs:<line>`, read off the call stack) and the first line of any `error`. It exists for the
+questions asked across runs — which check is drifting towards its budget, which one only fails on a
+busy machine — that one run's console cannot answer.
+
 **The debugging port is opened by the harness and nowhere else.** It must never appear in
 `tauri.conf.json`: while open, anything on localhost can drive the app and read the catalog
 through it.

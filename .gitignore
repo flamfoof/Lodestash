@@ -51,3 +51,7 @@ node_modules/
 # `bun install` here would write a second lockfile next to the real one in
 # crates/lodestash-desktop/ui/bun.lock (TECH-STACK §5 says there is exactly one).
 /bun.lock
+
+# Per-run e2e reports (TECH-STACK §5.2) — local evidence, not source.
+/test-reports/
+[INFO] Recording command outcome: printf

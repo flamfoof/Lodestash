@@ -16,6 +16,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { launch, BIN, HANDSHAKE } from "./harness.mjs";
 
+/** Repo root, so a run's report lands next to the code rather than inside the UI package. */
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..");
+
 /**
  * The viewport every check is entitled to find the app in, captured once the app is up.
  *
@@ -46,9 +49,71 @@ async function waitFor(pred, message, timeout = 5000, interval = 50) {
 }
 
 const results = [];
-async function check(name, fn) {
+
+/**
+ * How long a check may take before it counts as a failure rather than a slow pass.
+ *
+ * A check that hangs has stopped telling you anything: the suite sits there, the cause scrolls
+ * away, and a wait that quietly grew from 200 ms to a minute reads as "e2e is slow" rather than
+ * "this regressed". Five seconds is the ceiling for anything driving the UI — every `waitFor` in
+ * this file already polls against a deadline well under it.
+ *
+ * A check that genuinely needs longer says so at its own call site, `check(name, { budget }, fn)`,
+ * with the reason. The number is then a reviewable claim about that one check instead of a blanket
+ * allowance every future check inherits. `E2E_BUDGET_MS` raises the default for a measuring run.
+ */
+const DEFAULT_BUDGET_MS = Number(process.env.E2E_BUDGET_MS) || 5000;
+
+/**
+ * Where a check was written, read off the call stack: the enclosing function and `file:line`.
+ *
+ * The report is read later by someone holding only a check's name, and names describe behaviour,
+ * not location. This makes a row something you can open — and when a check comes from a helper
+ * rather than the top level, it names the helper.
+ */
+function origin() {
+  const frames = (new Error().stack || "").split("\n").slice(1);
+  // Frame 0 is `origin` itself and frame 1 is `check`; the first frame below those is the caller.
+  const frame = frames.find((f) => !/\bat (origin|check)\b/.test(f) && f.includes("run.mjs"));
+  if (!frame) return ["", ""];
+  const named = frame.match(/at\s+(?:async\s+)?([\w$.<>]+)\s+\(/);
+  const at = frame.match(/run\.mjs:(\d+):\d+/);
+  return [named ? named[1] : "top-level", at ? `e2e/run.mjs:${at[1]}` : ""];
+}
+
+// `check(name, fn)`, or `check(name, { budget }, fn)` — options go before the body so a declared
+// budget sits next to the name instead of sixty lines below it.
+async function check(name, ...args) {
+  const fn = args.pop();
+  let run = Promise.resolve();
+  const { budget = DEFAULT_BUDGET_MS } = args[0] ?? {};
+  const [fromFn, site] = origin();
+  const started = performance.now();
+  let timer;
+  let timedOut = false;
+  const record = (ok, error = "") =>
+    results.push({ ok, name, seconds: (performance.now() - started) / 1000, fromFn, site, error });
   try {
-    await fn();
+    // A timed-out check keeps running — nothing here can cancel someone else's `await` — so it is
+    // given a bounded moment to finish (below) before the next check starts. Otherwise its tail —
+    // a toast still up, a selection still changing — lands inside the next check and fails that
+    // one instead, which is the cascade a budget exists to prevent.
+    run = fn();
+    await Promise.race([
+      run,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          reject(
+            new Error(
+              `took longer than ${(budget / 1000).toFixed(1)}s — a check that really needs ` +
+                `longer must say so: check(name, { budget }, fn)`,
+            ),
+          );
+        }, budget);
+      }),
+    ]);
+    clearTimeout(timer);
     if (baseline) {
       const got = await viewport();
       // ±1px, the same slack the restore below settles for — they disagreed until 2026-08-26,
@@ -68,16 +133,54 @@ async function check(name, fn) {
         );
       }
     }
-    results.push([true, name]);
+    record(true);
     console.log(`  ok   ${name}`);
   } catch (e) {
-    results.push([false, name]);
+    clearTimeout(timer);
+    record(false, e.message.split("\n")[0]);
+    if (timedOut) {
+      await Promise.race([run.catch(() => {}), new Promise((r) => setTimeout(r, 10_000))]);
+    }
     console.log(`  FAIL ${name}\n       ${e.message.split("\n")[0]}`);
   }
 }
 
+/**
+ * One CSV per run under `test-reports/`, named `month-day-hour-minute` in local 24-hour time.
+ *
+ * CSV because the interesting question is asked *across* runs — which check is drifting towards
+ * its budget, which one only fails on a busy machine — and that is a spreadsheet question rather
+ * than a log-reading one.
+ */
+function writeReport() {
+  const d = new Date();
+  const p2 = (n) => String(n).padStart(2, "0");
+  const stamp = `${p2(d.getMonth() + 1)}-${p2(d.getDate())}-${p2(d.getHours())}-${p2(d.getMinutes())}`;
+  const dir = path.join(REPO_ROOT, "test-reports");
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `${stamp}.csv`);
+  const cell = (v) => (/[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
+  const rows = [
+    ["check", "result", "seconds", "origin_fn", "origin_site", "error"],
+    ...results.map((r) => [
+      r.name,
+      r.ok ? "pass" : "fail",
+      r.seconds.toFixed(3),
+      r.fromFn,
+      r.site,
+      r.error,
+    ]),
+  ];
+  fs.writeFileSync(file, rows.map((r) => r.map(cell).join(",")).join("\n") + "\n");
+  return file;
+}
+
 const app = await launch();
 const { page, invoke } = app;
+// Playwright's own default is 30 s per step, which is how a selector that matched nothing sat
+// silently for thirty seconds inside a check that then passed. A step that needs longer passes its
+// own `{ timeout }`, where it can be read and questioned.
+page.setDefaultTimeout(5000);
 console.log(`\ndriving ${page.url()}\n`);
 
 // Arm the per-check viewport guard against whatever size the app actually opened at — not a
@@ -2555,22 +2658,35 @@ try {
   });
 
   await check("sort goes inert while AI results are ranked", async () => {
+    // The toolbar's own copy of the sort (the ⋯ popover holds the other, and only when open). This
+    // read `[data-testid="toolbar"] .sort select` until 2026-09-12 — a test id the toolbar never
+    // had — so the first assertion waited out Playwright's 30 s default, was caught, and skipped:
+    // a check that took thirty seconds to assert less than it said.
+    const sort = ".sort-inline .sort select";
     await page.fill('[data-testid="search-input"]', "");
-    const live = await page.isDisabled('[data-testid="toolbar"] .sort select').catch(() => null);
-    if (live !== null) assert.equal(live, false, "sort is disabled with no query at all");
+    assert.equal(await page.isDisabled(sort), false, "sort is disabled with no query at all");
 
-    // Escalate to the AI the way the UI offers it — the row pinned under the filtered results.
+    // Escalate to the AI the way the UI offers it — the row pinned under the filtered results. The
+    // row appears after the substring search settles, so wait for results rather than reading the
+    // DOM on the keystroke; a query with no results is offered the AI by the empty state instead.
     await page.fill('[data-testid="search-input"]', "stone");
-    const escalate = page.locator('[data-testid="escalate"], .escalate').first();
-    if ((await escalate.count()) === 0) return; // no escalation offered for this query; nothing to assert
-    await escalate.click();
+    const offered = await page
+      .waitForSelector('[data-testid="escalate"]', { timeout: 3000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!offered) {
+      const cards = await page.evaluate(() => document.querySelectorAll(".card").length);
+      assert.equal(cards, 0, `"stone" shows ${cards} results and no Ask AI row under them`);
+      return;
+    }
+    await page.click('[data-testid="escalate"]');
     await waitFor(
-      async () => await page.isDisabled(".sort select"),
+      async () => await page.isDisabled(sort),
       "the sort stayed live over AI-ranked results, where changing it throws the ranking away",
     );
     await page.fill('[data-testid="search-input"]', "");
     await waitFor(
-      async () => !(await page.isDisabled(".sort select")),
+      async () => !(await page.isDisabled(sort)),
       "clearing the query left the sort disabled",
     );
   });
@@ -2595,7 +2711,10 @@ try {
     await page.locator("body").click({ position: { x: 5, y: 5 } });
   });
 
-  await check("F toggles the star rather than only adding it", async () => {
+  // Budget: two waits on whole-library favourites queries (page_size 100000), polled every 250 ms
+  // so they do not starve the write they wait for — ~4.6 s on the real library, too close to the
+  // default ceiling to leave on it.
+  await check("F toggles the star rather than only adding it", { budget: 12_000 }, async () => {
     await page.fill('[data-testid="search-input"]', "");
     await page.waitForFunction(() => document.querySelectorAll(".card").length > 0, undefined, {
       timeout: 5000,
@@ -2684,7 +2803,9 @@ try {
     await page.keyboard.press("Escape");
   });
 
-  await check("Delete moves the selection to Trash, through the confirm gate", async () => {
+  // Budget: ends by waiting out the Undo toast's lifetime (up to 8 s) so the next check cannot
+  // mistake this one's toast for its own — ~8.8 s every run.
+  await check("Delete moves the selection to Trash, through the confirm gate", { budget: 15_000 }, async () => {
     const live = () =>
       invoke("grid_page", {
         query: { tab: "all", search: "", status: "all", sort_by: "name", sort_asc: true,
@@ -3422,7 +3543,10 @@ try {
   // installed, the DLL was installed, and `mode=ai` quietly answered `ai_unavailable`. The grid
   // cannot catch this (its AI mode degrades to FTS on purpose), so the check goes through the
   // engine plane, which is the honest one.
-  await check("with the models installed, AI search is actually live", async () => {
+  //
+  // Budget: the first `mode=ai` query of a launch loads the SigLIP text encoder through ONNX
+  // Runtime and builds the resident embedding snapshot — cold work, ~4.5 s on this library.
+  await check("with the models installed, AI search is actually live", { budget: 20_000 }, async () => {
     const home = process.env.APPDATA;
     const models = home && path.join(home, "Lodestash", "models", "siglip");
     const installed =
@@ -3743,7 +3867,9 @@ async function writerLatencyCheck() {
   // measures the page, and measuring a closed page is what failed this check the first
   // time it ran here.
   baseline = null;
-  await check("a user write stays fast while the preview backfill runs", async () => {
+  // Budget: launches a second app and waits for it to publish engine.json (up to 60 s on a cold
+  // start), then deliberately idles 3 s so the preview drain is running before it measures.
+  await check("a user write stays fast while the preview backfill runs", { budget: 75_000 }, async () => {
     const { spawn } = await import("node:child_process");
     try { fs.rmSync(HANDSHAKE); } catch { /* not running */ }
     const app = spawn(BIN, { stdio: "ignore" }); // no drain flag — that is the point
@@ -3780,6 +3906,7 @@ async function writerLatencyCheck() {
 
 await writerLatencyCheck();
 
-const failed = results.filter(([ok]) => !ok);
+const failed = results.filter((r) => !r.ok);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
+console.log(`report: ${path.relative(REPO_ROOT, writeReport())}`);
 process.exit(failed.length === 0 ? 0 : 1);
