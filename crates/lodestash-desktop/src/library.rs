@@ -158,6 +158,9 @@ pub struct ThumbJob {
     pub media_type: String,
     /// Only set for materials: the texture its shader ball wears.
     pub albedo: Option<PathBuf>,
+    /// For a model: the catalog's albedo per material slot (v1 plan S08). Empty for every other
+    /// media type, and for a model the graph paints nothing of.
+    pub slot_textures: std::collections::BTreeMap<u32, PathBuf>,
     /// `Some` when the bytes are still inside a pack — the handler decides whether pulling them
     /// is worth it (see `protocol::in_pack_scratch`).
     pub in_pack: Option<InPackLocator>,
@@ -2381,8 +2384,24 @@ impl Library {
             albedo: (row.item.media_type == "material")
                 .then(|| self.material_texture_path(asset_id))
                 .flatten(),
+            slot_textures: if row.item.media_type == "model_3d" {
+                self.slot_textures(asset_id)
+            } else {
+                Default::default()
+            },
             in_pack: row.locator.clone(),
         })
+    }
+
+    /// What a model's preview paints each material slot with (v1 plan S08) — resolved here because
+    /// only the library holds the catalog and the workspace the textures may live in.
+    pub fn slot_textures(&self, asset_id: i64) -> std::collections::BTreeMap<u32, PathBuf> {
+        let Some(cat) = self.catalog.as_ref() else {
+            return Default::default();
+        };
+        let workspace = lodestash_app::paths::default_cache_dirs().1;
+        cat.model_slot_texture_paths(asset_id, workspace.as_deref())
+            .unwrap_or_default()
     }
 
     /// The on-disk texture a material paints its shader ball with — one hop, unlike a model's two.

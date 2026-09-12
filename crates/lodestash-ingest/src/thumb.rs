@@ -2,6 +2,7 @@
 //! Cache key: `{content_hash}_{width}x{height}.png`
 //! Spec: INGESTION.md §1 (thumbnailing), DATA-MODEL.md §6 (non-destructive).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use image::{DynamicImage, ImageFormat};
@@ -284,9 +285,89 @@ pub fn draw_waveform(peaks: &[f32], width: u32, height: u32) -> DynamicImage {
     DynamicImage::ImageRgba8(img)
 }
 
+/// Preview render identity for textured model previews (v1 plan S08). A textured render is a
+/// different picture from the untextured hero view that came before it, so it keys differently and
+/// regenerates lazily instead of serving what is already cached. Bump when the render changes.
+pub const TEXTURED_MODEL_RENDER: &str = "t1";
+
+/// Past this many source triangles a textured preview is refused rather than rasterised: the caller
+/// falls back to the decimated untextured proxy, which is the honest picture at that size. Full
+/// geometry is deliberate — the simplifier averages UVs across each cluster, which smears a palette
+/// atlas into colours that are in neither cell.
+const TEXTURED_TRI_CAP: usize = 300_000;
+
+/// The cache key of a textured model preview: the model's own key, the render version, and what is
+/// painted on it — swap a slot's texture and the old picture must not be served.
+pub fn textured_model_key(key: &str, slot_textures: &BTreeMap<u32, PathBuf>) -> String {
+    let mut h = blake3::Hasher::new();
+    for (slot, path) in slot_textures {
+        h.update(&slot.to_le_bytes());
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        h.update(meta_key(path, size, 0).as_bytes());
+    }
+    format!(
+        "{key}-{TEXTURED_MODEL_RENDER}-{}",
+        &h.finalize().to_hex()[..16]
+    )
+}
+
+/// Render (or serve from cache) a **textured** model preview (v1 plan S08): every material slot
+/// painted with the model's own texture where it declares one, and with the catalog's resolved
+/// albedo where it does not.
+///
+/// Errors — an unparseable model, or one past [`TEXTURED_TRI_CAP`] — are the caller's cue to fall
+/// back to [`generate`], whose untextured render stays exactly as it was. Nothing here touches the
+/// geometry cache the embedding pipeline reads.
+pub fn generate_model_textured(
+    source: &Path,
+    cache_dir: &Path,
+    key: &str,
+    params: ThumbParams,
+    slot_textures: &BTreeMap<u32, PathBuf>,
+) -> std::io::Result<PathBuf> {
+    let dest = cache_path(cache_dir, &textured_model_key(key, slot_textures), params);
+    if dest.exists() {
+        return Ok(dest);
+    }
+    std::fs::create_dir_all(cache_dir)?;
+    let meshes = crate::mesh::load_textured_with(source, &BTreeMap::new(), slot_textures)
+        .map_err(std::io::Error::other)?;
+    // Collision hulls wrap the prop rather than being it — the same drop the proxy loader makes,
+    // so a textured preview frames what the untextured one framed.
+    let mut meshes: Vec<crate::mesh::MeshData> = meshes.into_iter().map(|(_, m)| m).collect();
+    if meshes
+        .iter()
+        .any(|m| !crate::mesh::is_collision_hull(&m.name))
+    {
+        meshes.retain(|m| !crate::mesh::is_collision_hull(&m.name));
+    }
+    let tris: usize = meshes.iter().map(|m| m.indices.len() / 3).sum();
+    if tris > TEXTURED_TRI_CAP {
+        return Err(std::io::Error::other(format!(
+            "{tris} triangles is past the textured preview cap"
+        )));
+    }
+    if !meshes.iter().any(|m| m.albedo.is_some()) {
+        return Err(std::io::Error::other("no slot of this model is painted"));
+    }
+    let size = params.width.max(params.height);
+    let img = crate::render3d::render_views_on(
+        &meshes,
+        size.max(1),
+        &crate::render3d::DEFAULT_VIEWS[..1],
+        [0, 0, 0, 0],
+    )
+    .into_iter()
+    .next()
+    .ok_or_else(|| std::io::Error::other("model has no renderable geometry"))?;
+    let thumb = resize_fit(&DynamicImage::ImageRgba8(img), params.width, params.height);
+    save_atomic(&thumb, &dest)?;
+    Ok(dest)
+}
+
 /// Formats the mesh loaders handle (`mesh::load_any`): FBX/OBJ via ufbx, glTF/GLB via
 /// three-d-asset.
-fn is_model(path: &Path) -> bool {
+pub fn is_model(path: &Path) -> bool {
     crate::mesh::is_fbx_model(path)
         || crate::mesh::is_gltf_model(path)
         || path
@@ -389,6 +470,65 @@ mod tests {
         assert_eq!(
             mtime1, mtime2,
             "existing thumbnail should not be regenerated"
+        );
+    }
+
+    /// A textured model preview paints the slot's texture, keys apart from the untextured render so
+    /// the old picture is never served for the new one, and refuses a model nothing paints — which
+    /// is the caller's cue to fall back (v1 plan S08).
+    #[test]
+    fn a_textured_model_preview_paints_its_slots_and_keys_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let mut img = image::RgbaImage::new(1, 1);
+        img.put_pixel(0, 0, image::Rgba([0, 0, 255, 255]));
+        let texture = dir.path().join("blue.png");
+        img.save(&texture).unwrap();
+        // A quad facing the camera, with UVs, and no material of its own: the catalog paints it.
+        std::fs::write(
+            dir.path().join("quad.obj"),
+            "v -1 -1 0\nv 1 -1 0\nv 1 1 0\nv -1 1 0\nvt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\n\
+             f 1/1 2/2 3/3\nf 1/1 3/3 4/4\n",
+        )
+        .unwrap();
+        let source = dir.path().join("quad.obj");
+        let params = ThumbParams {
+            width: 64,
+            height: 64,
+            ..Default::default()
+        };
+        let slots: BTreeMap<u32, PathBuf> = [(0, texture.clone())].into_iter().collect();
+
+        let png = generate_model_textured(&source, &cache, "k", params, &slots).expect("textured");
+        let pixels = image::open(&png).unwrap().to_rgba8();
+        let centre = pixels.get_pixel(pixels.width() / 2, pixels.height() / 2).0;
+        assert!(
+            centre[2] > centre[0] && centre[3] > 0,
+            "the quad wears the blue texture, not a flat grey: {centre:?}"
+        );
+
+        // Its key is the textured one: the untextured render for the same asset is a second file.
+        assert_ne!(png, cache_path(&cache, "k", params));
+        assert!(png.to_string_lossy().contains(TEXTURED_MODEL_RENDER));
+        // Swapping what is painted swaps the picture, not just the pixels behind one name.
+        let other = dir.path().join("red.png");
+        let mut red = image::RgbaImage::new(1, 1);
+        red.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        red.save(&other).unwrap();
+        let swapped: BTreeMap<u32, PathBuf> = [(0, other)].into_iter().collect();
+        assert_ne!(
+            png,
+            generate_model_textured(&source, &cache, "k", params, &swapped).expect("swapped")
+        );
+
+        // Nothing to paint: an error the caller answers with the untextured render.
+        assert!(
+            generate_model_textured(&source, &cache, "k", params, &BTreeMap::new()).is_err(),
+            "an unpainted model is not a textured preview"
+        );
+        assert!(
+            generate(&source, &cache, "k", params).is_ok(),
+            "the fallback still renders"
         );
     }
 

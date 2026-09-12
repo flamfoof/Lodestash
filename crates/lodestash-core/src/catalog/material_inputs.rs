@@ -360,6 +360,43 @@ impl Catalog {
         })
     }
 
+    /// The textures a model's preview paints each material slot with, as files that exist
+    /// (v1 plan S08). The loader prefers the model's own declared or embedded texture; this is what
+    /// the graph resolved for the slots it does not paint.
+    ///
+    /// A texture still inside a pack is left out: pulling one per slot is a browse-time cost a
+    /// preview does not carry. `workspace_dir` resolves a package-extracted texture.
+    pub fn model_slot_texture_paths(
+        &self,
+        asset_id: i64,
+        workspace_dir: Option<&std::path::Path>,
+    ) -> Result<std::collections::BTreeMap<u32, std::path::PathBuf>> {
+        let inputs = self.model_material_inputs(asset_id)?;
+        let ids: Vec<i64> = inputs
+            .slots
+            .iter()
+            .filter_map(|s| s.albedo_texture_id)
+            .collect();
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let rows = self.asset_summaries(&ids)?;
+        Ok(inputs
+            .slots
+            .iter()
+            .filter_map(|slot| {
+                let texture = slot.albedo_texture_id?;
+                let row = rows.iter().find(|r| r.id == texture)?;
+                let path = match (&row.disk_path, &row.workspace_rel) {
+                    (Some(p), _) => std::path::PathBuf::from(p),
+                    (None, Some(rel)) => workspace_dir?.join(rel),
+                    _ => return None,
+                };
+                path.is_file().then_some((slot.slot, path))
+            })
+            .collect())
+    }
+
     /// The one albedo a single-texture preview of a model paints with: the first slot of
     /// [`Self::model_material_inputs`] that has one.
     pub fn model_albedo_texture(&self, asset_id: i64) -> Result<Option<i64>> {

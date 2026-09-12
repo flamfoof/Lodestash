@@ -339,10 +339,13 @@ pub fn drain_api_tags(
                 .and_then(|p| p.file_stem())
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            let slots = cat
+                .model_slot_texture_paths(job.asset_id, workspace_dir)
+                .unwrap_or_default();
             let Some(img) = path
                 .as_deref()
                 .zip(cache_dir)
-                .and_then(|(p, cache)| tag_preview(p, cache, TAG_PX))
+                .and_then(|(p, cache)| tag_preview_with(p, cache, TAG_PX, &slots))
             else {
                 // No preview to send. Nothing to look at ⇒ clear (as the local drain does), don't
                 // leave it dirty to re-loop forever.
@@ -1360,6 +1363,9 @@ pub fn compute_tags(
     zero_shot: Option<&lodestash_ai::image_tags::ImageZeroShot>,
     workspace_dir: Option<&std::path::Path>,
     cache_dir: Option<&std::path::Path>,
+    // What each model wears, resolved by the read phase (v1 plan S08): this phase never sees a
+    // catalog, which is the point of the split.
+    slot_textures: &SlotTextures,
 ) -> Vec<ComputedTags> {
     /// Fixed preview size, independent of the user's grid-quality setting: tagging results should
     /// not change because someone moved a slider.
@@ -1393,9 +1399,11 @@ pub fn compute_tags(
                 .unwrap_or_default()
         };
         let img = if tagger.supports(&job.media_code) {
+            let empty = std::collections::BTreeMap::new();
+            let slots = slot_textures.get(&job.asset_id).unwrap_or(&empty);
             path.as_deref()
                 .zip(cache_dir)
-                .and_then(|(p, cache)| tag_preview(p, cache, TAG_PX))
+                .and_then(|(p, cache)| tag_preview_with(p, cache, TAG_PX, slots))
         } else {
             None
         };
@@ -1541,7 +1549,8 @@ pub fn drain_tags(
         if n == 0 {
             break;
         }
-        let done = compute_tags(jobs, tagger, zero_shot, workspace_dir, cache_dir);
+        let slots = slot_textures_for(cat, &jobs, workspace_dir);
+        let done = compute_tags(jobs, tagger, zero_shot, workspace_dir, cache_dir, &slots);
         if progress.is_cancelled() {
             return;
         }
@@ -1564,6 +1573,18 @@ pub fn tag_preview(
     cache_dir: &std::path::Path,
     px: u32,
 ) -> Option<image::RgbaImage> {
+    tag_preview_with(source, cache_dir, px, &std::collections::BTreeMap::new())
+}
+
+/// [`tag_preview`] painted with what the model wears (v1 plan S08): the tagger is looking for
+/// "rusty barrel", and the rust is in the texture. A model nothing paints, or one too big to
+/// rasterise whole, falls back to the untextured render rather than losing its preview.
+pub fn tag_preview_with(
+    source: &std::path::Path,
+    cache_dir: &std::path::Path,
+    px: u32,
+    slot_textures: &std::collections::BTreeMap<u32, std::path::PathBuf>,
+) -> Option<image::RgbaImage> {
     let meta = std::fs::metadata(source).ok()?;
     let mtime = meta
         .modified()
@@ -1577,7 +1598,15 @@ pub fn tag_preview(
         height: px,
         ..Default::default()
     };
-    let png = lodestash_ingest::thumb::generate(source, cache_dir, &key, params).ok()?;
+    let png = lodestash_ingest::thumb::generate_model_textured(
+        source,
+        cache_dir,
+        &key,
+        params,
+        slot_textures,
+    )
+    .or_else(|_| lodestash_ingest::thumb::generate(source, cache_dir, &key, params))
+    .ok()?;
     Some(image::open(png).ok()?.to_rgba8())
 }
 
@@ -1740,6 +1769,29 @@ pub fn visual_embed_batch_within(
     (jobs, albedo)
 }
 
+/// What each asset's model wears, by asset id: the read phase resolves it, the compute phase paints
+/// with it (v1 plan S08).
+pub type SlotTextures =
+    std::collections::HashMap<i64, std::collections::BTreeMap<u32, std::path::PathBuf>>;
+
+/// The textures the models in `jobs` wear, for the compute phase that has no catalog.
+pub fn slot_textures_for(
+    cat: &Catalog,
+    jobs: &[lodestash_core::catalog::VisualEmbedJob],
+    workspace_dir: Option<&std::path::Path>,
+) -> SlotTextures {
+    jobs.iter()
+        .filter(|j| j.media_code == "model_3d")
+        .filter_map(|j| {
+            let slots = cat
+                .model_slot_texture_paths(j.asset_id, workspace_dir)
+                .ok()
+                .filter(|s| !s.is_empty())?;
+            Some((j.asset_id, slots))
+        })
+        .collect()
+}
+
 /// Phase 2: **compute**. No catalog, so this can run on any thread — that is the whole point.
 pub fn compute_visual_embeddings(
     jobs: Vec<lodestash_core::catalog::VisualEmbedJob>,
@@ -1886,7 +1938,14 @@ mod tests {
             lodestash_ai::tagger::Tagger::needs_image(&api),
             "the API tagger sends pixels itself"
         );
-        let out = compute_tags(vec![in_pack_job(1024)], &api, None, None, None);
+        let out = compute_tags(
+            vec![in_pack_job(1024)],
+            &api,
+            None,
+            None,
+            None,
+            &Default::default(),
+        );
         assert!(
             out.is_empty(),
             "an image-reading tagger must produce no writes on the batch path, \

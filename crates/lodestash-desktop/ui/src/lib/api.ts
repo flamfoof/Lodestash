@@ -1021,6 +1021,13 @@ export const setThumbKey = (k: string) => {
 };
 export const thumbUrl = (assetId: number) => `${LODESTASH_BASE}/thumb/${assetId}.png?q=${thumbKey}`;
 
+/**
+ * The texture one material slot of a model is painted with (v1 plan S08) — the model's own where it
+ * declares one, the catalog's resolved albedo where it does not. `204` when the slot is unpainted.
+ */
+export const slotTexUrl = (assetId: number, slot: number) =>
+  `${LODESTASH_BASE}/slottex/${assetId}/${slot}.png`;
+
 /** Decimated geometry as LSM1, for the WebGL viewer. */
 export const meshUrl = (assetId: number) => `${LODESTASH_BASE}/mesh/${assetId}`;
 

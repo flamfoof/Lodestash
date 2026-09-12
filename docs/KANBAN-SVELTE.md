@@ -75,7 +75,15 @@ this file stays the live board.
       FBX meshes by material part and reads glTF/GLB textures; the default loader and the embedding
       albedo (`material_albedo_paths`) are unchanged. *Open:* ambiguity is exposed by the core API,
       not yet shown in the UI (S08).
-- [ ] **R3 · S08 — textured previews through cold and warm rendering.**
+- [x] **R3 · S08 — textured previews through cold and warm rendering** ([ADR-0019](decisions/ADR-0019-textured-previews-keyed-by-what-they-paint.md)).
+      One resolver (`mesh::load_textured_with`) paints each material slot — the model's own texture
+      first, the catalog's resolved albedo behind it — and both paths read it: the cold render
+      (`thumb::generate_model_textured`, full geometry, keyed by render version + what is painted,
+      falling back to the untextured hero view) and the warm viewer (slot trailer on
+      `lodestash://mesh`, one texture per slot from `lodestash://slottex`). The tagging preview and
+      the engine/agent preview paint the same way. The embedding proxy now returns geometry only on
+      a cache *miss* as well, so a model's first encode matches every later one. *Open:* the grid
+      still shows the vector preview for models — the raster judgment tier is S14–17.
 - [ ] **R4 · S09 — resident embedding snapshots with generation invalidation.**
 - [ ] **R5 · S10–S13 — endpoint egress policy, headless startup, bounded library walk, app-owned
       bulk runs** (MCP handoff Tasks 1–3 and 5).

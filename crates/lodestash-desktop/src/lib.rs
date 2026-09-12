@@ -2055,6 +2055,20 @@ fn engine_preview_fn(cache_root: Option<std::path::PathBuf>) -> lodestash_api::P
             _ => return None,
         };
         let key = meta_key(src, std::fs::metadata(src).map(|m| m.len()).unwrap_or(0), 0);
+        // A model is painted the same way here as on the grid (v1 plan S08) — one resolution, so an
+        // agent and the person at the machine are shown the same picture. Anything unpainted, too
+        // big, or unparseable falls back to the untextured hero render.
+        if subject.media_type == "model_3d" {
+            if let Ok(p) = lodestash_ingest::thumb::generate_model_textured(
+                src,
+                cache,
+                &key,
+                params,
+                &subject.slot_textures,
+            ) {
+                return Some(p);
+            }
+        }
         generate(src, cache, &key, params).ok()
     })
 }

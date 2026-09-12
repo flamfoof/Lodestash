@@ -93,7 +93,9 @@ A machine with no vision model installed still tags from names alone, at a lower
 
 **Zero-shot rides on authored pixels, never on our own render.** The SigLIP label pass
 (`zeroshot_tags`) runs for images, textures, sprites and materials — not `model_3d`. A model's
-stored vector is a mean-pooled multiview of an untextured, flat-shaded orthographic render, far
+stored vector is a mean-pooled multiview of an untextured, flat-shaded orthographic render (the
+proxy loader returns geometry only, cache hit or miss, so the same bytes always encode the same
+picture — v1 plan S08), far
 outside SigLIP's training distribution: over 20 models (2026-08-30) only ~20% produced any label
 and half of those were wrong, against 4/4 correct and confident on real texture pixels. Models are
 tagged by the captioning path instead, which reads the same preview as prose and does well with it.

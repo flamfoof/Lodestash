@@ -211,6 +211,35 @@ pub fn load_textured(
     Ok(out)
 }
 
+/// [`load_textured`] with the catalog's per-slot albedo behind it: the model file's own declared or
+/// embedded texture wins, and a slot the file does not paint takes the texture the dependency graph
+/// resolved for it (`Catalog::model_material_inputs`, v1 plan S07 → S08).
+///
+/// One resolver for both preview paths — the cold thumbnail renders these meshes, and the warm
+/// viewer is served the same slot's texture — so the two cannot disagree about what a model wears.
+pub fn load_textured_with(
+    path: &Path,
+    tex_files: &BTreeMap<String, PathBuf>,
+    slot_textures: &BTreeMap<u32, PathBuf>,
+) -> Result<Vec<(u32, MeshData)>, String> {
+    let mut meshes = load_textured(path, tex_files)?;
+    // One decode per slot, however many meshes wear it.
+    let mut decoded: BTreeMap<u32, Option<Arc<AlbedoTex>>> = BTreeMap::new();
+    for (slot, mesh) in &mut meshes {
+        if mesh.albedo.is_some() {
+            continue;
+        }
+        let hit = decoded.entry(*slot).or_insert_with(|| {
+            slot_textures
+                .get(slot)
+                .and_then(|p| albedo_from_file(p))
+                .map(Arc::new)
+        });
+        mesh.albedo = hit.clone();
+    }
+    Ok(meshes)
+}
+
 /// Base color of a material, if it declares one.
 fn material_base_color(mat: Option<&ufbx::Material>) -> [u8; 4] {
     const DEFAULT: [u8; 4] = [0xB4, 0xB4, 0xB8, 0xFF];
@@ -281,6 +310,12 @@ fn decode_texture(
             .ok_or_else(|| "texture file not found".to_string())?;
         crate::raster::decode(&path).map_err(|e| e.to_string())?
     };
+    Ok(albedo_from_image(img))
+}
+
+/// The tail every albedo decode shares: downscale past [`TEX_MAX_DIM`], then flip to bottom-up rows
+/// — GL samples row 0 at `v = 0`, and the loaders emit bottom-left UVs.
+fn albedo_from_image(img: image::DynamicImage) -> AlbedoTex {
     let img = if img.width().max(img.height()) > TEX_MAX_DIM {
         img.resize(
             TEX_MAX_DIM,
@@ -290,14 +325,19 @@ fn decode_texture(
     } else {
         img
     };
-    // Flip to bottom-up rows: GL samples row 0 at v=0, and FBX UVs are bottom-left origin.
     let rgba = img.flipv().to_rgba8();
     let (width, height) = rgba.dimensions();
-    Ok(AlbedoTex {
+    AlbedoTex {
         width,
         height,
         rgba: rgba.pixels().map(|p| p.0).collect(),
-    })
+    }
+}
+
+/// Decode one texture **file** as an albedo — the catalog's answer for a slot the model itself does
+/// not paint (v1 plan S08).
+pub fn albedo_from_file(path: &Path) -> Option<AlbedoTex> {
+    crate::raster::decode(path).ok().map(albedo_from_image)
 }
 
 /// First existing candidate: the FBX's absolute path, its relative path against the FBX's
@@ -435,23 +475,7 @@ fn gltf_albedo(t: &three_d_asset::Texture2D) -> Option<AlbedoTex> {
         _ => return None,
     };
     let img = image::RgbaImage::from_raw(t.width, t.height, rgba.into_iter().flatten().collect())?;
-    let img = image::DynamicImage::ImageRgba8(img);
-    let img = if img.width().max(img.height()) > TEX_MAX_DIM {
-        img.resize(
-            TEX_MAX_DIM,
-            TEX_MAX_DIM,
-            image::imageops::FilterType::Triangle,
-        )
-    } else {
-        img
-    };
-    let rgba = img.flipv().to_rgba8();
-    let (width, height) = rgba.dimensions();
-    Some(AlbedoTex {
-        width,
-        height,
-        rgba: rgba.pixels().map(|p| p.0).collect(),
-    })
+    Some(albedo_from_image(image::DynamicImage::ImageRgba8(img)))
 }
 
 /// Load any supported 3D format into world-space `MeshData`: FBX/OBJ via ufbx, glTF/GLB via
@@ -473,8 +497,10 @@ pub fn load_any(
 /// on every later call read that back instead of re-parsing. Parsing is the expensive part of a 3D
 /// thumbnail/metric/embedding, and metrics (every scan), thumbnails (on browse) and embeddings each
 /// parse the **same** file — so the metrics drain warms the cache and browse-time thumbnails hit it,
-/// which is what removes the browse spike. **Textures are not cached** (thumbnails/embeddings render
-/// untextured base-colour anyway); the textured Quick Look viewport keeps its own uncached path.
+/// which is what removes the browse spike. **Textures are not cached, and not returned** —
+/// thumbnails and embeddings render untextured base-colour, and a cache miss must hand back what a
+/// cache hit would, or the first render of a model differs from every later one. The textured
+/// preview paths (`load_textured`, `thumb::generate_model_textured`) keep their own uncached route.
 ///
 /// The cache is disposable: any read error or format mismatch silently falls back to a fresh parse,
 /// so a stale/corrupt entry can never wedge a load. Keyed by `(path, size, mtime)` so an edited file
@@ -488,8 +514,15 @@ pub fn load_cached(path: &Path, cache_dir: &Path) -> Result<Vec<MeshData>, Strin
             return Ok(meshes);
         }
     }
-    let meshes = load_any(path, &BTreeMap::new())?;
+    let mut meshes = load_any(path, &BTreeMap::new())?;
     write_cache(&cache_path, &encode_meshes(&meshes));
+    // Hand back exactly what the cache would decode next time. A fresh parse resolves the file's
+    // own declared textures, the cache does not carry them, and the embedding render samples an
+    // albedo when one is attached — so before this the very first encode of a model saw a textured
+    // render and every later one saw flat colour, for the same bytes (v1 plan S08).
+    for m in &mut meshes {
+        m.albedo = None;
+    }
     Ok(meshes)
 }
 
@@ -519,7 +552,7 @@ fn write_cache(dest: &Path, bytes: &[u8]) {
 ///
 /// 1.3% is small, but those cards are *wrong*, not merely coarse: a hull renders as a box drawn
 /// over the prop it wraps.
-fn is_collision_hull(name: &str) -> bool {
+pub(crate) fn is_collision_hull(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n.starts_with("ucx_")
         || n.starts_with("collision")
@@ -604,6 +637,38 @@ pub fn cache_key(path: &Path) -> String {
 }
 
 const MESH_CACHE_MAGIC: &[u8; 4] = b"LSM1";
+
+/// Magic of the **slot trailer** — `"SLT1" u32 n n*u32`, appended after the LSM1 meshes when the
+/// wire carries one material slot per mesh (v1 plan S08).
+const SLOT_TRAILER_MAGIC: &[u8; 4] = b"SLT1";
+
+/// Which material slot each mesh belongs to, as a trailer after [`encode_meshes`].
+///
+/// A trailer rather than a field inside each mesh: `decode_meshes` and the frontend parser both stop
+/// at the last mesh, so every existing cache file and reader keeps working, and the geometry caches
+/// stay byte-identical to what they hold today.
+pub fn encode_slots(slots: &[u32]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(8 + slots.len() * 4);
+    b.extend_from_slice(SLOT_TRAILER_MAGIC);
+    b.extend_from_slice(&(slots.len() as u32).to_le_bytes());
+    for slot in slots {
+        b.extend_from_slice(&slot.to_le_bytes());
+    }
+    b
+}
+
+/// One decoded albedo as a PNG, rows top-down again — the form a browser decodes and uploads with
+/// `UNPACK_FLIP_Y`, so the warm viewer samples exactly what the cold rasteriser did (v1 plan S08).
+pub fn albedo_png(tex: &AlbedoTex) -> Option<Vec<u8>> {
+    let raw: Vec<u8> = tex.rgba.iter().flatten().copied().collect();
+    let img = image::RgbaImage::from_raw(tex.width, tex.height, raw)?;
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(img)
+        .flipv()
+        .write_to(&mut out, image::ImageFormat::Png)
+        .ok()?;
+    Some(out.into_inner())
+}
 
 /// Serialize the flattened geometry (no albedo — see [`load_cached`]). Flat `f32`/`u32` arrays, so
 /// read-back is a bounded parse rather than a full mesh re-parse.
@@ -1002,6 +1067,27 @@ mod gltf_tests {
 mod tests {
     use super::*;
 
+    // TEMPORARY probe — never committed.
+    #[test]
+    #[ignore = "probe"]
+    fn probe_load_textured() {
+        let path = std::env::var("LODESTASH_MODEL").expect("LODESTASH_MODEL");
+        let path = Path::new(&path);
+        match load_textured(path, &BTreeMap::new()) {
+            Ok(v) => eprintln!(
+                "PROBE textured meshes={} slots={:?} painted={}",
+                v.len(),
+                v.iter().map(|(s, _)| *s).take(12).collect::<Vec<_>>(),
+                v.iter().filter(|(_, m)| m.albedo.is_some()).count()
+            ),
+            Err(e) => eprintln!("PROBE textured ERR {e}"),
+        }
+        match load_any(path, &BTreeMap::new()) {
+            Ok(v) => eprintln!("PROBE plain meshes={}", v.len()),
+            Err(e) => eprintln!("PROBE plain ERR {e}"),
+        }
+    }
+
     #[test]
     fn fbx_extension_routing() {
         assert!(is_fbx_model(Path::new("Model.FBX")));
@@ -1096,6 +1182,98 @@ mod tests {
         let plain = load_meshes(&path, &BTreeMap::new()).unwrap();
         assert_eq!(plain.len(), 1, "the default loader is unchanged");
         assert_eq!(plain[0].positions.len(), 6);
+    }
+
+    /// The catalog paints the slots the file leaves bare, and never the ones it does not: a model
+    /// that declares its own texture keeps it (v1 plan S08).
+    #[test]
+    fn the_catalog_paints_only_the_slots_the_file_leaves_bare() {
+        let dir = tempfile::tempdir().unwrap();
+        let px = |name: &str, px: [u8; 4]| {
+            let mut img = image::RgbaImage::new(1, 1);
+            img.put_pixel(0, 0, image::Rgba(px));
+            img.save(dir.path().join(name)).unwrap();
+            dir.path().join(name)
+        };
+        let own = px("own.png", [255, 0, 0, 255]);
+        let from_catalog = px("cat.png", [0, 0, 255, 255]);
+        std::fs::write(
+            dir.path().join("two.mtl"),
+            "newmtl a\nmap_Kd own.png\nnewmtl b\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("two.obj"),
+            "mtllib two.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nv 1 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nvt 1 1\n\
+             usemtl a\nf 1/1 2/2 3/3\nusemtl b\nf 2/2 4/4 3/3\n",
+        )
+        .unwrap();
+        let path = dir.path().join("two.obj");
+
+        // Slot 0 declares its own; slot 1 declares none and takes the catalog's.
+        let slots: BTreeMap<u32, PathBuf> = [(0, from_catalog.clone()), (1, from_catalog)]
+            .into_iter()
+            .collect();
+        let painted = load_textured_with(&path, &BTreeMap::new(), &slots).expect("load");
+        let mut got: Vec<(u32, [u8; 4])> = painted
+            .iter()
+            .map(|(slot, m)| (*slot, m.albedo.as_ref().expect("painted").rgba[0]))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![(0, [255, 0, 0, 255]), (1, [0, 0, 255, 255])],
+            "the file's own texture wins its slot; the catalog fills the bare one"
+        );
+        assert!(
+            std::fs::metadata(&own).is_ok(),
+            "the loader reads textures, it does not move them"
+        );
+
+        // Nothing offered for a slot leaves it unpainted rather than borrowing another's.
+        let none = load_textured_with(&path, &BTreeMap::new(), &BTreeMap::new()).expect("load");
+        let bare = none.iter().find(|(slot, _)| *slot == 1).expect("slot 1");
+        assert!(bare.1.albedo.is_none());
+    }
+
+    /// The embedding renders the geometry proxy, and S07/S08 must not have coloured it: the proxy
+    /// loader still returns one mesh per node, with the first material's colour and no texture
+    /// (AI-PIPELINE §3 — a re-coloured input would silently re-embed the library).
+    #[test]
+    fn the_proxy_the_embedding_renders_stays_geometry_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut img = image::RgbaImage::new(1, 1);
+        img.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        img.save(dir.path().join("red.png")).unwrap();
+        std::fs::write(
+            dir.path().join("two.mtl"),
+            "newmtl a\nmap_Kd red.png\nnewmtl b\nmap_Kd red.png\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("two.obj"),
+            "mtllib two.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nv 1 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nvt 1 1\n\
+             usemtl a\nf 1/1 2/2 3/3\nusemtl b\nf 2/2 4/4 3/3\n",
+        )
+        .unwrap();
+        let path = dir.path().join("two.obj");
+        let cache = dir.path().join("cache");
+
+        let proxy = load_preview_cached(&path, &cache, crate::decimate::PREVIEW_BUDGET).unwrap();
+        assert_eq!(
+            proxy.len(),
+            1,
+            "one mesh per node, not one per material slot"
+        );
+        assert_eq!(proxy[0].indices.len() / 3, 2, "both faces, undecimated");
+        assert!(
+            proxy[0].albedo.is_none(),
+            "the embedding's input carries no texture"
+        );
+        // And again from the cache, which is the path a warmed library takes.
+        let again = load_preview_cached(&path, &cache, crate::decimate::PREVIEW_BUDGET).unwrap();
+        assert!(again[0].albedo.is_none());
+        assert_eq!(again[0].base_color, proxy[0].base_color);
     }
 
     /// The basename lookup rescues textures whose declared paths don't exist —

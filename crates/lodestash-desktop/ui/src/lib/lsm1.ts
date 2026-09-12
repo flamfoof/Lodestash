@@ -16,6 +16,11 @@
  *       u8 has_uvs      [u32 n, n*2*f32]
  *       u32 idx_count, idx_count*u32  indices
  *       4*u8                          base_color RGBA
+ *
+ * Optionally followed by the **slot trailer** (v1 plan S08), which the `lodestash://mesh` route
+ * appends and the on-disk caches never carry:
+ *
+ *     "SLT1"  u32 n  n*u32             the material slot of each mesh, in order
  */
 
 export type Lsm1Mesh = {
@@ -26,9 +31,12 @@ export type Lsm1Mesh = {
   indices: Uint32Array;
   /** RGBA 0-255, the flat material colour used when there is no albedo texture. */
   baseColor: [number, number, number, number];
+  /** Material slot this mesh belongs to (v1 plan S08), or `null` when the source carries no trailer. */
+  slot: number | null;
 };
 
 const MAGIC = 0x314d534c; // "LSM1" read as a little-endian u32
+const SLOT_MAGIC = 0x31544c53; // "SLT1", same reading
 
 /**
  * Parse `LSM1` bytes. Throws on a short or malformed buffer rather than returning a partial mesh —
@@ -96,7 +104,17 @@ export function parseLsm1(buf: ArrayBuffer): Lsm1Mesh[] {
     ];
     o += 4;
 
-    meshes.push({ name, positions, normals, uvs, indices, baseColor });
+    meshes.push({ name, positions, normals, uvs, indices, baseColor, slot: null });
+  }
+
+  // The slot trailer, when the server appended one. Absent in every cache file and in older
+  // responses, which is why it is a trailer and not a field: those still parse exactly as before.
+  if (o + 8 <= buf.byteLength && dv.getUint32(o, true) === SLOT_MAGIC) {
+    o += 4;
+    const n = u32();
+    if (n === meshes.length && o + n * 4 <= buf.byteLength) {
+      for (let i = 0; i < n; i++) meshes[i].slot = dv.getUint32(o + i * 4, true);
+    }
   }
   return meshes;
 }

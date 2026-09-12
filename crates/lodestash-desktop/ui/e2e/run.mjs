@@ -1602,6 +1602,91 @@ try {
     );
   });
 
+  // Warm and cold have to agree about what a model wears (v1 plan S08): the viewer binds one
+  // texture per material slot from `lodestash://slottex`, which is the same resolution the CPU
+  // thumbnail renders from. Before this the viewer painted one albedo over every slot, and a model
+  // whose materials the graph resolved showed flat grey.
+  await check("a model wears its textures in Quick Look, one per material slot", async () => {
+    const p = await invoke("grid_page", {
+      query: { tab: "models", search: "", status: "all", sort_by: "name", sort_asc: true,
+               favorites_only: false, page: 0, page_size: 100000 },
+    });
+    // Ask the route itself which models it can actually paint. A model whose textures are still
+    // inside a pack resolves an id but no file, and answers 204 — that is the route working, not a
+    // subject for the viewer check.
+    let subject = null;
+    let served = null;
+    for (const item of p.items.filter((i) => !i.in_pack).slice(0, 120)) {
+      const res = await page.evaluate(async (id) => {
+        const r = await fetch(`http://lodestash.localhost/slottex/${id}/0.png`);
+        const buf = new Uint8Array(await r.arrayBuffer());
+        return { status: r.status, type: r.headers.get("content-type"), bytes: buf.length,
+                 png: buf[0] === 0x89 && buf[1] === 0x50 };
+      }, item.asset_id);
+      if (res.status === 200) {
+        subject = item;
+        served = res;
+        break;
+      }
+    }
+    if (!subject) {
+      console.log("       no on-disk model in this library resolves a texture file — nothing to bind");
+      return;
+    }
+    assert.equal(served.type, "image/png");
+    assert.ok(served.png && served.bytes > 0, `slottex served ${served.bytes} bytes, PNG=${served.png}`);
+    console.log(`       ${subject.name} -> ${served.bytes} bytes of PNG`);
+
+    try {
+      // By id, not by name: three assets in this library are called `Characters`, and opening
+      // whichever card sorted first asked the viewer about a different model than the one probed.
+      await page.fill('input[type="text"]', subject.name);
+      const card = `.card[data-asset-id="${subject.asset_id}"]`;
+      await page.waitForSelector(card, { timeout: 5000 });
+      await page.locator(card).first().dblclick();
+      await page.waitForSelector('[data-testid="viewer3d"][data-status="ready"]', { timeout: 20000 });
+      await waitFor(
+        async () =>
+          Number(await page.getAttribute('[data-testid="viewer3d"]', "data-textures")) > 0,
+        `${subject.name} bound no texture, though slottex serves one`,
+        15000,
+        250,
+      ).catch(async (e) => {
+        // Say which half is missing: the trailer that tells the viewer about slots, or the images.
+        const why = await page.evaluate(async (id) => {
+          const r = await fetch(`http://lodestash.localhost/mesh/${id}`);
+          const buf = new Uint8Array(await r.arrayBuffer());
+          const ascii = new TextDecoder("latin1").decode(buf.slice(-4096));
+          const tex = await fetch(`http://lodestash.localhost/slottex/${id}/0.png`);
+          const img = await new Promise((done) => {
+            const i = new Image();
+            i.crossOrigin = "anonymous";
+            i.onload = () => done(`${i.width}x${i.height}`);
+            i.onerror = () => done("error");
+            i.src = `http://lodestash.localhost/slottex/${id}/0.png`;
+          });
+          return {
+            id,
+            mesh: r.status,
+            bytes: buf.length,
+            trailer: ascii.lastIndexOf("SLT1"),
+            slottex: tex.status,
+            img,
+            attr: document.querySelector('[data-testid="viewer3d"]')?.getAttribute("data-textures"),
+            slots: document.querySelector('[data-testid="viewer3d"]')?.getAttribute("data-slots"),
+            texerr: document.querySelector('[data-testid="viewer3d"]')?.getAttribute("data-texerr"),
+          };
+        }, subject.asset_id);
+        throw new Error(`${e.message}; ${JSON.stringify(why)}`);
+      });
+    } finally {
+      // Whatever happened, hand the next check a closed viewer and an empty search box.
+      await page.keyboard.press("Escape").catch(() => {});
+      await page.fill('input[type="text"]', "").catch(() => {});
+      await page.waitForTimeout(400);
+    }
+  });
+
   await check("a material renders non-blank pixels in Quick Look", async () => {
     const p = await invoke("grid_page", {
       query: { tab: "materials", search: "", status: "all", sort_by: "name", sort_asc: true,

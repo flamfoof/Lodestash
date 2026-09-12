@@ -51,6 +51,7 @@ pub fn handle(lib: &Mutex<Library>, req: &Request<Vec<u8>>) -> Response<Vec<u8>>
     let res = match kind {
         "preview" => preview(lib, rest),
         "mesh" => mesh(lib, rest),
+        "slottex" => slot_texture(lib, rest),
         "thumb" => thumb(lib, rest),
         "file" => file(lib, rest, req),
         _ => status(StatusCode::NOT_FOUND, "unknown lodestash:// kind"),
@@ -282,6 +283,17 @@ fn thumb(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
             };
             lodestash_ingest::thumb::generate_material(&cache, &key, params, job.albedo.as_deref())
         }
+        // A model wears what its own file declares and what the graph resolved for the slots it
+        // does not (v1 plan S08). A model nothing paints, one too big to rasterise whole, or one
+        // that will not parse falls back to the untextured hero render — the picture it had before.
+        "model_3d" => lodestash_ingest::thumb::generate_model_textured(
+            &path,
+            &cache,
+            &key,
+            params,
+            &job.slot_textures,
+        )
+        .or_else(|_| lodestash_ingest::thumb::generate(&path, &cache, &key, params)),
         _ => lodestash_ingest::thumb::generate(&path, &cache, &key, params),
     };
     match made.and_then(std::fs::read) {
@@ -409,7 +421,16 @@ fn mesh(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
         }
     };
 
-    let meshes = match lodestash_ingest::mesh::load_any(&path, &std::collections::BTreeMap::new()) {
+    // Split by material slot (v1 plan S08): the viewer binds one texture per slot, and the trailer
+    // below tells it which mesh wears which. Textures themselves come from `slottex`, one request
+    // per slot, rather than inflating this response with decoded atlases.
+    let slotted = lodestash_ingest::mesh::load_textured(&path, &std::collections::BTreeMap::new());
+    let meshes = match slotted
+        .map(|v| v.into_iter().map(|(s, m)| (Some(s), m)).collect::<Vec<_>>())
+        .or_else(|_| {
+            lodestash_ingest::mesh::load_any(&path, &std::collections::BTreeMap::new())
+                .map(|v| v.into_iter().map(|m| (None, m)).collect::<Vec<_>>())
+        }) {
         Ok(m) if !m.is_empty() => m,
         Ok(_) => return status(StatusCode::NO_CONTENT, "mesh has no geometry"),
         Err(e) => {
@@ -420,6 +441,10 @@ fn mesh(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
             );
         }
     };
+    let slots: Vec<u32> = meshes.iter().filter_map(|(s, _)| *s).collect();
+    let slots = (slots.len() == meshes.len()).then_some(slots);
+    let meshes: Vec<lodestash_ingest::mesh::MeshData> =
+        meshes.into_iter().map(|(_, m)| m).collect();
     let tris: usize = meshes.iter().map(|m| m.indices.len() / 3).sum();
     let served = if tris > MESH_DECIMATE_ABOVE {
         tracing::debug!(
@@ -433,7 +458,10 @@ fn mesh(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
     } else {
         std::borrow::Cow::Borrowed(&meshes)
     };
-    let bytes = lodestash_ingest::mesh::encode_meshes(&served);
+    let mut bytes = lodestash_ingest::mesh::encode_meshes(&served);
+    if let Some(slots) = slots {
+        bytes.extend_from_slice(&lodestash_ingest::mesh::encode_slots(&slots));
+    }
     reply(StatusCode::OK)
         .header("Content-Type", "application/octet-stream")
         // The cache key is `(path, size, mtime)`, so an edited file yields a new URL.
@@ -441,6 +469,94 @@ fn mesh(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
         .header("Content-Length", bytes.len().to_string())
         .body(bytes)
         .unwrap_or_else(|_| status(StatusCode::INTERNAL_SERVER_ERROR, "mesh: build"))
+}
+
+/// `lodestash://slottex/{asset_id}/{slot}` — the texture one material slot of a model is painted
+/// with, as a PNG (v1 plan S08).
+///
+/// The same resolution the cold thumbnail renders from (`mesh::load_textured_with`): the model's own
+/// declared or embedded texture where it has one, the catalog's resolved albedo where it does not.
+/// One route rather than two answers, so the warm viewer cannot paint a model differently from its
+/// own thumbnail. `204` when that slot is unpainted.
+fn slot_texture(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
+    let mut parts = rest.split('/');
+    let (Some(id), Some(slot)) = (
+        parts.next().and_then(|s| s.parse::<i64>().ok()),
+        parts
+            .next()
+            .and_then(|s| s.trim_end_matches(".png").parse::<u32>().ok()),
+    ) else {
+        return status(StatusCode::BAD_REQUEST, "slottex: bad asset id or slot");
+    };
+    let (path, slots, cache) = match lib.lock() {
+        Ok(l) => (
+            l.asset_path(id).map(Path::to_path_buf),
+            l.slot_textures(id),
+            l.thumb_cache_dir().map(Path::to_path_buf),
+        ),
+        Err(_) => return status(StatusCode::INTERNAL_SERVER_ERROR, "library lock poisoned"),
+    };
+    let Some(path) = path.filter(|p| p.exists()) else {
+        return status(StatusCode::SERVICE_UNAVAILABLE, "not_local");
+    };
+    // Cached beside the thumbnails on the same identity: the model's bytes, the slot, and what is
+    // painted on it. Decoding a 4k atlas per orbit would make the viewer feel like the disk.
+    let cached = cache.as_ref().map(|c| {
+        c.join("slottex").join(format!(
+            "{}-{slot}.png",
+            lodestash_ingest::thumb::textured_model_key(
+                &lodestash_ingest::thumb::meta_key(
+                    &path,
+                    std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                    0,
+                ),
+                &slots,
+            )
+        ))
+    });
+    if let Some(hit) = cached.as_ref().filter(|p| p.exists()) {
+        return match std::fs::read(hit) {
+            Ok(bytes) => png(bytes),
+            Err(_) => status(StatusCode::INTERNAL_SERVER_ERROR, "slottex: read"),
+        };
+    }
+    let meshes = match lodestash_ingest::mesh::load_textured_with(
+        &path,
+        &std::collections::BTreeMap::new(),
+        &slots,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!(%e, ?path, "textured load failed");
+            return status(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "mesh could not be parsed",
+            );
+        }
+    };
+    let Some(bytes) = meshes
+        .iter()
+        .find(|(s, m)| *s == slot && m.albedo.is_some())
+        .and_then(|(_, m)| lodestash_ingest::mesh::albedo_png(m.albedo.as_ref()?))
+    else {
+        return status(StatusCode::NO_CONTENT, "slot is unpainted");
+    };
+    if let Some(dest) = cached {
+        if let Some(dir) = dest.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&dest, &bytes);
+    }
+    png(bytes)
+}
+
+fn png(bytes: Vec<u8>) -> Response<Vec<u8>> {
+    reply(StatusCode::OK)
+        .header("Content-Type", "image/png")
+        .header("Cache-Control", "max-age=3600")
+        .header("Content-Length", bytes.len().to_string())
+        .body(bytes)
+        .unwrap_or_else(|_| status(StatusCode::INTERNAL_SERVER_ERROR, "png: build"))
 }
 
 /// `lodestash://file/{asset_id}` — the original bytes, with Range support.

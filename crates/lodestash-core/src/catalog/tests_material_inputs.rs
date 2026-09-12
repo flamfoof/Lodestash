@@ -278,3 +278,98 @@ fn a_name_matched_texture_paints_an_edgeless_model() {
         MaterialInputSource::None
     );
 }
+
+/// The preview paths ask for files, not ids (v1 plan S08): a slot whose texture is on disk resolves
+/// to its path, and one whose texture is only a catalog row — still in a pack, or gone from disk —
+/// is left out rather than handed a path that opens nothing.
+#[test]
+fn slot_textures_resolve_to_files_that_are_there() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let root = dir.path().to_string_lossy().into_owned();
+    let mut c = Catalog::open_in_memory().expect("open");
+    c.seed_media_types().expect("seed");
+    let src = c.upsert_import_source("Lib", &root, "folder").expect("src");
+    std::fs::write(dir.path().join("paint.png"), b"x").expect("texture on disk");
+    for (rel, media, guid) in [
+        ("rock.fbx", "model_3d", "g-rock"),
+        ("paint.png", "image", "g-paint"),
+        ("gone.png", "image", "g-gone"),
+        ("rock.mat", "material", "g-mat"),
+        ("bare.mat", "material", "g-bare"),
+    ] {
+        c.record_crawl(
+            src,
+            None,
+            &[CrawlRecord {
+                workspace_rel: None,
+                content_hash: None,
+                rel_path: rel.into(),
+                name: rel.into(),
+                media_type: media.into(),
+                size_bytes: 1,
+                mtime: 1,
+            }],
+        )
+        .expect("crawl");
+        let id: i64 = c
+            .conn
+            .query_row(
+                "SELECT a.id FROM asset a JOIN asset_file af ON af.id = a.primary_file_id
+                  WHERE af.rel_path = ?1",
+                params![rel],
+                |r| r.get(0),
+            )
+            .expect("id");
+        c.record_dependencies(id, Some(guid), "uses_texture", &[])
+            .expect("guid");
+    }
+    let id_of = |c: &Catalog, rel: &str| -> i64 {
+        c.conn
+            .query_row(
+                "SELECT a.id FROM asset a JOIN asset_file af ON af.id = a.primary_file_id
+                  WHERE af.rel_path = ?1",
+                params![rel],
+                |r| r.get(0),
+            )
+            .expect("id")
+    };
+    let rock = id_of(&c, "rock.fbx");
+    let (mat, bare) = (id_of(&c, "rock.mat"), id_of(&c, "bare.mat"));
+    bind(&mut c, mat, "g-mat", &[("_MainTex", "g-paint")]);
+    bind(&mut c, bare, "g-bare", &[("_MainTex", "g-gone")]);
+    c.record_prefab_walk(
+        &root,
+        &[PrefabFileScan {
+            path: format!("{root}/rock.prefab"),
+            size: 1,
+            mtime: 1,
+            bindings: vec![
+                PrefabBindingRow {
+                    game_object: 1,
+                    renderer: 2,
+                    slot: 0,
+                    mesh_guid: "g-rock".into(),
+                    material_guid: "g-mat".into(),
+                },
+                PrefabBindingRow {
+                    game_object: 1,
+                    renderer: 2,
+                    slot: 1,
+                    mesh_guid: "g-rock".into(),
+                    material_guid: "g-bare".into(),
+                },
+            ],
+        }],
+        &[],
+    )
+    .expect("walk");
+    c.reconcile_prefab_edges().expect("reconcile");
+
+    let paths = c.model_slot_texture_paths(rock, None).expect("slots");
+    assert_eq!(
+        paths.keys().copied().collect::<Vec<_>>(),
+        vec![0],
+        "slot 1's texture has no file, so it offers the renderer nothing"
+    );
+    assert_eq!(paths[&0], dir.path().join("paint.png"));
+}

@@ -1,5 +1,5 @@
 /**
- * Minimal WebGL2 model viewer: orbit, zoom, one optional albedo texture.
+ * Minimal WebGL2 model viewer: orbit, zoom, and one albedo texture per material slot.
  *
  * Hand-rolled rather than three.js on purpose (TECH-STACK §1): the requirement is one mesh, one
  * light, orbit + zoom and a single texture, which is ~300 lines here versus ~150 KB gzipped and a
@@ -54,6 +54,8 @@ void main() {
 }`;
 
 type Batch = {
+  /** Material slot (v1 plan S08), or `null` when the response carried no slot trailer. */
+  slot: number | null;
   vao: WebGLVertexArrayObject;
   count: number;
   base: [number, number, number, number];
@@ -135,6 +137,8 @@ export class Viewer3D {
   private prog: WebGLProgram;
   private batches: Batch[] = [];
   private tex: WebGLTexture | null = null;
+  /** Per-slot albedo (v1 plan S08). A batch with no slot texture falls back to `tex`, then colour. */
+  private slotTex = new Map<number, WebGLTexture>();
   private center: [number, number, number] = [0, 0, 0];
   private radius = 1;
   private yaw = 0.9;
@@ -165,6 +169,15 @@ export class Viewer3D {
 
     this.ro = new ResizeObserver(() => this.render());
     this.ro.observe(canvas);
+  }
+
+  /** The material slots this model is split into, in first-seen order (v1 plan S08). */
+  slots(): number[] {
+    const seen: number[] = [];
+    for (const b of this.batches) {
+      if (b.slot != null && !seen.includes(b.slot)) seen.push(b.slot);
+    }
+    return seen;
   }
 
   /** Upload geometry and frame it. Replaces anything previously loaded. */
@@ -206,17 +219,27 @@ export class Viewer3D {
     gl.bindVertexArray(null);
 
     return {
+      slot: m.slot,
       vao,
       count: m.indices.length,
       base: [m.baseColor[0] / 255, m.baseColor[1] / 255, m.baseColor[2] / 255, 1],
     };
   }
 
-  /** Apply an albedo texture. Safe to call before or after `load`. */
-  setTexture(img: TexImageSource) {
+  /**
+   * Apply an albedo texture — to one material slot, or to the whole model when `slot` is omitted
+   * (a material's shader ball, which is one surface by definition). Safe to call before or after
+   * `load`: a slot with no geometry yet simply has nothing to draw with it.
+   */
+  setTexture(img: TexImageSource, slot?: number) {
     const gl = this.gl;
-    if (!this.tex) this.tex = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, this.tex);
+    let tex = slot == null ? this.tex : this.slotTex.get(slot);
+    if (!tex) {
+      tex = gl.createTexture();
+      if (slot == null) this.tex = tex;
+      else this.slotTex.set(slot, tex);
+    }
+    gl.bindTexture(gl.TEXTURE_2D, tex);
     // Unity/FBX UVs have V pointing up; GL samples from the bottom-left.
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
@@ -278,13 +301,15 @@ export class Viewer3D {
     gl.useProgram(this.prog);
     gl.uniformMatrix4fv(gl.getUniformLocation(this.prog, "u_mvp"), false, mvp);
     gl.uniformMatrix4fv(gl.getUniformLocation(this.prog, "u_model"), false, model);
-    gl.uniform1i(gl.getUniformLocation(this.prog, "u_has_tex"), this.tex ? 1 : 0);
-    if (this.tex) {
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, this.tex);
-      gl.uniform1i(gl.getUniformLocation(this.prog, "u_tex"), 0);
-    }
+    gl.activeTexture(gl.TEXTURE0);
+    gl.uniform1i(gl.getUniformLocation(this.prog, "u_tex"), 0);
     for (const b of this.batches) {
+      // This slot's texture, else the model-wide one, else the flat colour — the same order the
+      // renderer resolves (v1 plan S08), so an unpainted slot stays its own colour rather than
+      // borrowing a neighbour's atlas.
+      const tex = (b.slot != null ? this.slotTex.get(b.slot) : null) ?? this.tex;
+      gl.uniform1i(gl.getUniformLocation(this.prog, "u_has_tex"), tex ? 1 : 0);
+      if (tex) gl.bindTexture(gl.TEXTURE_2D, tex);
       gl.uniform4fv(gl.getUniformLocation(this.prog, "u_base"), b.base);
       gl.bindVertexArray(b.vao);
       gl.drawElements(gl.TRIANGLES, b.count, gl.UNSIGNED_INT, 0);
@@ -301,6 +326,8 @@ export class Viewer3D {
     this.ro.disconnect();
     this.disposeBatches();
     if (this.tex) this.gl.deleteTexture(this.tex);
+    for (const t of this.slotTex.values()) this.gl.deleteTexture(t);
+    this.slotTex.clear();
     this.gl.deleteProgram(this.prog);
   }
 }

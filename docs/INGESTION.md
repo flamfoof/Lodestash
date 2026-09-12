@@ -283,6 +283,33 @@ placeholder thumbnail.
 - **Skinned meshes, animation, materials/shaders** round-trip least reliably; treat as best-effort and
   center the viewer on static geometry + textures + audio first.
 
+### Textured model previews (v1 plan S08, [ADR-0019](decisions/ADR-0019-textured-previews-keyed-by-what-they-paint.md))
+
+A model's preview paints each material slot with the texture that slot actually wears: the model
+file's own declared or embedded texture first, and the albedo the dependency graph resolved for the
+slots it does not paint (`Catalog::model_slot_texture_paths`, DATA-MODEL §10). One resolver —
+`mesh::load_textured_with` — feeds both halves of the app, so the cold render and the warm viewer
+cannot disagree about what a model looks like:
+
+- **Cold** (`thumb::generate_model_textured`): the grid's raster route, the engine/agent preview and
+  the tagging preview. Rendered from **full** source geometry, because the proxy simplifier averages
+  UVs across each vertex cluster and smears a palette atlas into colours that are in neither cell.
+  A model past the triangle cap, one the graph paints nothing of, or one that will not parse falls
+  back to the untextured hero render it had before — the picture is never lost, only improved.
+- **Warm** (`lodestash://mesh` + `lodestash://slottex`): the mesh response carries a slot trailer
+  (`"SLT1"`), and the viewer fetches one texture per slot from the same resolution, cached beside the
+  thumbnails. Textures are not inflated into the geometry response.
+
+The cache key carries the render version and what is painted (`thumb::textured_model_key`), so a
+swapped albedo is a different picture rather than the same file serving the old pixels, and previews
+regenerate lazily instead of being invalidated in bulk.
+
+**The embedding route is deliberately outside all of this.** It renders the geometry proxy
+(`mesh::load_preview_cached`), which returns geometry only — on a cache *miss* too, which it did not
+before S08: a fresh parse resolves the model's own textures, so the first encode of a model saw a
+textured render and every later one saw flat colour, for the same bytes. Vectors stay comparable
+because the input never changes.
+
 ### Material previews (the shader ball)
 
 A `.mat` has no pixels and no geometry, so it is previewed the way every DCC does it: painted onto

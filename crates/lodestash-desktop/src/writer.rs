@@ -1503,12 +1503,16 @@ fn tag_worker_slice(
     } else {
         Box::new(FilenameTagger)
     };
+    // Resolved here, on the read connection: the compute phase below runs off the writer and has
+    // no catalog to ask what a model wears (v1 plan S08).
+    let slots = lodestash_app::drains::slot_textures_for(&cat, &jobs, workspace_dir.as_deref());
     let done = lodestash_app::drains::compute_tags(
         jobs,
         tagger.as_ref(),
         zero_shot.as_ref(),
         workspace_dir.as_deref(),
         cache_dir.as_deref(),
+        &slots,
     );
     tx.send(WriterMsg::TagsDone {
         producers: lodestash_app::drains::TagProducers {

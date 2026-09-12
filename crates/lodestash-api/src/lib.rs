@@ -114,6 +114,10 @@ pub struct PreviewSubject {
     /// For a material whose albedo is *also* still inside a pack: that texture's locator, so the
     /// renderer can pull it the same way it pulls an asset's own payload.
     pub albedo_in_pack: Option<(String, i64, i64, String)>,
+    /// For a model: the texture each material slot is painted with (DATA-MODEL §10, v1 plan S08).
+    /// Empty when the graph paints none of it — the renderer then falls back to the untextured
+    /// hero view.
+    pub slot_textures: std::collections::BTreeMap<u32, PathBuf>,
 }
 
 /// Resolves one asset to a cached preview PNG, generating it on a miss.
@@ -1569,6 +1573,14 @@ impl ServerState {
             (Some(tex), None) => cat.in_pack_locator(tex).ok().flatten(),
             _ => None,
         };
+        // A model wears one texture per material slot; the loader prefers whatever the model file
+        // declares itself, so this is only what the graph resolved for the rest (v1 plan S08).
+        let slot_textures = if row.media_type == "model_3d" {
+            cat.model_slot_texture_paths(id, Some(&self.workspace_dir))
+                .unwrap_or_default()
+        } else {
+            Default::default()
+        };
         drop(cat);
         Some(PreviewSubject {
             media_type: row.media_type,
@@ -1576,6 +1588,7 @@ impl ServerState {
             in_pack,
             albedo,
             albedo_in_pack,
+            slot_textures,
         })
     }
 }
