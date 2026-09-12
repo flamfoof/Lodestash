@@ -1622,6 +1622,7 @@ fn appraise_pass(
                     .with_teaching(teach.clone());
                 lodestash_app::drains::drain_api_tags(
                     catalog,
+                    &cfg,
                     &api,
                     Some(local.as_ref()),
                     zero_shot.as_ref(),

@@ -653,6 +653,9 @@ async fn cancel_job(State(state): State<Shared>, Path(id): Path<String>) -> Resp
 }
 
 async fn preview(State(state): State<Shared>, Path(id): Path<i64>) -> Response {
+    if let Some(denied) = bytes_denied(&state) {
+        return denied;
+    }
     match state.preview_path(id) {
         Some(path) => serve_file(&path, "image/png").await,
         None => not_found(),
@@ -660,6 +663,9 @@ async fn preview(State(state): State<Shared>, Path(id): Path<i64>) -> Response {
 }
 
 async fn file(State(state): State<Shared>, Path(id): Path<i64>) -> Response {
+    if let Some(denied) = bytes_denied(&state) {
+        return denied;
+    }
     let row = match state.asset(id) {
         Ok(Some(row)) => row,
         Ok(None) => return not_found(),
@@ -744,6 +750,23 @@ async fn serve_file(path: &std::path::Path, content_type: &str) -> Response {
             .into_response(),
         Err(_) => not_found(),
     }
+}
+
+/// The one refusal for every byte-serving route (v1 plan S10): metadata and links stay available,
+/// the bytes do not, and the answer says which switch would change that.
+fn bytes_denied(state: &Shared) -> Option<Response> {
+    if state.byte_release() {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": {"code": "bytes_not_released",
+                "message": "this agent may read metadata and links; serving asset bytes needs \
+                            `mcp_bytes_enabled` in Settings"}})),
+        )
+            .into_response(),
+    )
 }
 
 fn not_found() -> Response {
@@ -1314,7 +1337,30 @@ mod tests {
         assert_eq!(s, StatusCode::FORBIDDEN, "semantic_search disabled");
         assert_eq!(b["error"]["code"], "tool_disabled");
 
-        // The REST-only file route has no tool, so the allow-list never blocks it.
+        // The REST-only file route has no tool, so the allow-list never blocks it — but bytes are
+        // their own permission (v1 plan S10) and it is off until the GUI says otherwise.
+        let (s, b) = send(
+            router(st.clone()),
+            get_req("/v1/assets/999/file", Some(&token), None),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "bytes served without consent");
+        assert_eq!(b["error"]["code"], "bytes_not_released");
+
+        // The preview route serves bytes too, and is gated by the same switch.
+        let (s, b) = send(
+            router(st.clone()),
+            get_req("/v1/assets/999/preview", Some(&token), None),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::FORBIDDEN,
+            "preview bytes served without consent"
+        );
+        assert_eq!(b["error"]["code"], "bytes_not_released");
+
+        st.set_byte_release(true);
         let (s, _) = send(
             router(st),
             get_req("/v1/assets/999/file", Some(&token), None),
@@ -1323,7 +1369,7 @@ mod tests {
         assert_eq!(
             s,
             StatusCode::NOT_FOUND,
-            "file route ungated (404, not 403)"
+            "with bytes released the route is ungated (404 for a missing asset, not 403)"
         );
     }
 

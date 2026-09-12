@@ -72,12 +72,14 @@ pub fn preset_for(base_url: &str) -> Option<&'static Preset> {
         .find(|p| p.base_url.trim_end_matches('/') == want)
 }
 
-/// Whether an endpoint is free/local, so the budget-guard confirm can be skipped. A loopback host is
-/// always treated as free (a self-hosted server costs nothing); an unknown/custom remote is treated
-/// as **paid** (confirm) — the safe default when we can't prove otherwise.
+/// Whether an endpoint **bills**, so the budget-guard confirm can be skipped. A self-hosted server
+/// costs nothing, and a preset known to be free costs nothing; an unknown remote is treated as paid
+/// — the safe default when we cannot prove otherwise.
+///
+/// Price is not locality (v1 plan S10). A free remote endpoint is still remote, and whether bytes
+/// may go there at all is [`crate::endpoint::locality`] plus the user's consent, never this.
 pub fn is_free_endpoint(base_url: &str) -> bool {
-    let u = base_url.to_ascii_lowercase();
-    if u.contains("localhost") || u.contains("127.0.0.1") || u.contains("[::1]") {
+    if crate::endpoint::locality(base_url) == crate::endpoint::Locality::Loopback {
         return true;
     }
     preset_for(base_url).is_some_and(|p| p.free)
@@ -116,6 +118,11 @@ pub struct OpenAiTagger {
 }
 
 impl OpenAiTagger {
+    /// Where this tagger sends bytes — what the egress gate is asked about (v1 plan S10).
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     pub fn new(
         base_url: impl Into<String>,
         api_key: impl Into<String>,
@@ -187,11 +194,21 @@ impl OpenAiTagger {
             }]
         });
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let resp = ureq::post(&url)
-            .timeout(self.timeout)
+        // **No redirects** (v1 plan S10). The request carries the key and the image; a 3xx would
+        // hand both to whatever origin the response names, after the fact. A moved endpoint is a
+        // configuration change the user makes knowingly, not one a server announces mid-upload.
+        let agent = ureq::builder().redirects(0).timeout(self.timeout).build();
+        let resp = agent
+            .post(&url)
             .set("Authorization", &format!("Bearer {}", self.api_key))
             .send_json(body)
             .map_err(classify_ureq)?;
+        if (300..400).contains(&resp.status()) {
+            let to = resp.header("location").unwrap_or("elsewhere").to_string();
+            return Err(ApiError::Hard(format!(
+                "endpoint redirected to {to}; nothing was followed — point the setting at the                  final URL if that is where it should go"
+            )));
+        }
         let resp: serde_json::Value = resp
             .into_json()
             .map_err(|e| ApiError::Hard(e.to_string()))?;
@@ -295,6 +312,76 @@ impl Tagger for OpenAiTagger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A redirect is not a route (v1 plan S10): the request carries the API key and the image, so a
+    /// `302` is refused and the origin it names never hears from us.
+    #[test]
+    fn a_redirect_is_refused_and_the_new_origin_is_never_contacted() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Where the redirect would send the key and the picture.
+        let elsewhere = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let elsewhere_port = elsewhere.local_addr().unwrap().port();
+        let reached = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = reached.clone();
+        elsewhere.set_nonblocking(true).expect("nonblocking");
+        let watcher = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if elsewhere.accept().is_ok() {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+
+        let endpoint = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = endpoint.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = endpoint.accept() {
+                // Drain the whole request before answering: closing on a half-sent upload is a
+                // transport error, and this test is about what the *response* does.
+                let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(150)));
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = sock.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                }
+                let _ = sock.write_all(
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{elsewhere_port}/v1/chat/completions\r\nContent-Length: 0\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+                let _ = sock.flush();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+
+        let tagger = OpenAiTagger::new(format!("http://127.0.0.1:{port}/v1"), "secret", "m");
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([200, 40, 40, 255]));
+        let err = tagger
+            .try_tag(&TagInput {
+                media_code: "image",
+                name: "rock",
+                image: Some(&img),
+            })
+            .expect_err("a redirect is not an answer");
+        assert!(
+            format!("{err}").contains("redirected"),
+            "unexpected error: {err}"
+        );
+        let _ = server.join();
+        let _ = watcher.join();
+        assert_eq!(
+            reached.load(Ordering::Relaxed),
+            0,
+            "the redirect target was contacted"
+        );
+    }
 
     #[test]
     fn a_missing_image_yields_no_tags_without_a_request() {

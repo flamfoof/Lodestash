@@ -183,6 +183,12 @@ name. Either way you never import a whole pack.
   imported it, and its **license/attribution** — handy when crediting bought assets in a shipped game.
 - **Owned but not downloaded?** Optional Unity *account sync* can show packs you own but haven't
   downloaded as greyed-out entries — download them in Unity's My Assets to make them usable.
-- **Privacy:** everything runs locally. Cloud AI is opt-in only and never required.
+- **Privacy:** everything runs locally. Cloud AI is opt-in only and never required — and opting in
+  is two separate choices, both off until you make them: *Use an OpenAI-compatible API* picks the
+  endpoint, **Allow image bytes to leave this machine** permits pictures to be sent to it. Without
+  the second, a remote pass stops before it makes a request. A server running on your own machine
+  needs neither. Audio is never uploaded; a remote model only ever sees text about it. Agents (MCP
+  or REST) read metadata and links by default — **Let agents read asset bytes** is what lets them
+  fetch previews and files.
 - **Pick your models:** [`AI-MODELS-BY-GPU.md`](AI-MODELS-BY-GPU.md) tells you exactly what to install
   for your GPU.

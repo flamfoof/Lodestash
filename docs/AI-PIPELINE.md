@@ -251,6 +251,27 @@ The provider is abstracted (`ApiTagger`), so Claude-native / others are drop-in 
 has **no cloud path** in any provider (§5, above): it goes through the local CLAP/Whisper
 description pre-step regardless, and the API only ever enriches text.
 
+### 5.0 What may leave this machine (v1 plan S10, [ADR-0020](decisions/ADR-0020-egress-is-a-parsed-endpoint-and-a-per-modality-consent.md))
+
+Three separate questions, answered separately:
+
+1. **Where is the endpoint?** The host is parsed out of the URL (`lodestash_ai::endpoint`). Loopback
+   literals and the reserved `localhost` name are this machine; everything else is a network someone
+   else runs. `https://localhost.example.com/v1` is remote, and the old substring test called it
+   local.
+2. **Does it bill?** A separate answer (`openai::is_free_endpoint`). A free remote endpoint is still
+   remote; a self-hosted server that costs nothing is still the one place bytes go without asking.
+3. **May these bytes go there?** `lodestash_app::egress::may_send`, per modality, default off.
+   Images — and the pixels derived from models, materials and sprites — need explicit consent
+   (`remote_image_bytes`). **Audio bytes never leave**, consent or not, and neither do pixels derived
+   from audio: a spectrogram is evidence about the clip, so routing it to a remote model would be the
+   prohibition with an extra step. A remote model may receive text about audio, nothing more.
+
+A refusal happens **before any request is built**: the cloud pass stops before it renders a preview,
+so a denied modality produces no outbound traffic to observe. Redirects are refused outright — the
+request carries the key and the picture, and a `3xx` would hand both to whatever origin the response
+names.
+
 ### 5.1 Reliability & cost controls
 
 The cloud path is designed for the **free tiers first** (Gemini/Groq/OpenRouter), and free tiers

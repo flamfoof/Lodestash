@@ -678,6 +678,12 @@ written into `tag.parent_id`.
 For the ten-model pilot, save a before-state, call `identify_asset` only on those IDs, poll completion,
 then read new assignments/revisions and perform this review flow. Internal identification writes are
 not rolled back when a later review batch fails; report the completed and failed stages separately.
+**Bytes are their own permission** (v1 plan S10, [ADR-0020](decisions/ADR-0020-egress-is-a-parsed-endpoint-and-a-per-modality-consent.md)). `GET /v1/assets/{id}/preview`
+and `GET /v1/assets/{id}/file` — and MCP's `get_asset_preview` — serve bytes only when the user has
+switched on `mcp_bytes_enabled`; otherwise they answer `403 bytes_not_released` (the MCP tool returns
+its metadata and links with the image withheld). Metadata access never implied permission to upload
+files, and a local stdio transport says where the client program runs, not where its model does.
+
 Reuse configured models, privacy/budget controls and app-owned job/cancel handling. The final report
 must distinguish pre-existing tags, identification output, vocabulary proposals, accepted/rejected
 associations with reasons, and final persisted tags/description.

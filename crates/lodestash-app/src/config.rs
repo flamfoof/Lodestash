@@ -524,6 +524,17 @@ pub struct AppConfig {
     /// API key for the endpoint. A secret — never logged. Empty = not configured.
     #[serde(default)]
     pub api_key: String,
+    /// May image bytes — and the pixels derived from models, materials and sprites — go to a
+    /// **remote** endpoint (v1 plan S10, `egress::may_send`)? Off by default, and an older config
+    /// that enabled cloud tagging is not read as this consent: the endpoint and the permission are
+    /// separate answers. A loopback endpoint never needs it.
+    #[serde(default)]
+    pub remote_image_bytes: bool,
+    /// May an agent plane (REST or MCP) receive asset **bytes** — previews and originals — rather
+    /// than metadata and links? Off by default: a local stdio transport says nothing about where
+    /// the model behind it runs.
+    #[serde(default)]
+    pub mcp_bytes_enabled: bool,
     /// Hard per-run cap on cloud-tagged assets (AI-PIPELINE §5.1 budget guard): a run stops after
     /// this many API calls and leaves the rest queued, so a mis-scoped Full Run on a paid endpoint
     /// can't become a surprise bill. Applies only to the API path; the local path is free.
@@ -628,6 +639,8 @@ impl Default for AppConfig {
             api_base_url: default_api_base_url(),
             api_model: None,
             api_key: String::new(),
+            remote_image_bytes: false,
+            mcp_bytes_enabled: false,
             api_max_per_run: default_api_max_per_run(),
             mcp_disabled_tools: Vec::new(),
             agent_producer_id: None,

@@ -12,6 +12,7 @@ pub mod routes;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use lodestash_core::catalog::{
@@ -478,6 +479,10 @@ pub struct ServerState {
     /// agent surface to the named tools. Enforced on **both** planes — REST checks it in its
     /// `gate` middleware, MCP checks it per tool — so a disabled tool is disabled 1:1.
     allowed: Mutex<Option<HashSet<String>>>,
+    /// May an agent receive asset **bytes** — previews and originals — or only metadata and links
+    /// (v1 plan S10)? Off until the GUI says otherwise: a local transport says nothing about where
+    /// the model behind it runs, and reading metadata never implied permission to upload files.
+    byte_release: AtomicBool,
     /// Approved-or-not export requests, keyed by job id. Held apart from the job itself so the
     /// job record stays a pure status object.
     pending_exports: Mutex<std::collections::HashMap<String, (export::ExportRequest, PathBuf)>>,
@@ -515,6 +520,7 @@ impl ServerState {
             query_embed: Mutex::new(None),
             token: new_token(),
             allowed: Mutex::new(None),
+            byte_release: AtomicBool::new(false),
             pending_exports: Mutex::new(std::collections::HashMap::new()),
             pending_imports: Mutex::new(std::collections::HashMap::new()),
             import_queue: Mutex::new(Vec::new()),
@@ -535,6 +541,18 @@ impl ServerState {
     /// tool; to re-open everything, call [`Self::allow_all`].
     pub fn set_allowed(&self, enabled: HashSet<String>) {
         *self.allowed.lock().unwrap() = Some(enabled);
+    }
+
+    /// Whether the agent planes may serve asset bytes (v1 plan S10). The GUI sets it from
+    /// `mcp_bytes_enabled`; a headless server without a GUI to ask keeps the default, which is no.
+    pub fn set_byte_release(&self, on: bool) {
+        self.byte_release
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// May bytes be served to an agent right now?
+    pub fn byte_release(&self) -> bool {
+        self.byte_release.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Drop the allow-list — every agent operation is live again (the construction default).

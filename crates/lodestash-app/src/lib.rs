@@ -10,6 +10,7 @@
 pub mod audio;
 pub mod config;
 pub mod drains;
+pub mod egress;
 pub mod grid;
 pub mod jobs;
 pub mod models;

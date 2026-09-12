@@ -256,6 +256,10 @@ fn zeroshot_tags(
 
 pub fn drain_api_tags(
     cat: &mut Catalog,
+    // The consent this pass runs under. Taken from the caller rather than re-read here: the gate
+    // below decides whether any bytes leave, and a pass must be judged by the settings it was
+    // started with, not by whatever the file says by the time it reaches this line.
+    cfg: &crate::config::AppConfig,
     tagger: &lodestash_ai::openai::OpenAiTagger,
     fallback: Option<&dyn lodestash_ai::tagger::Tagger>,
     zero_shot: Option<&lodestash_ai::image_tags::ImageZeroShot>,
@@ -274,6 +278,14 @@ pub fn drain_api_tags(
     use std::sync::atomic::Ordering;
     const BATCH: usize = 16;
     const TAG_PX: u32 = 384;
+    // Asked once, before a single preview is rendered or a request built (v1 plan S10): a remote
+    // endpoint without consent for image bytes means this pass makes no outbound request at all,
+    // rather than sending and reporting an error afterwards.
+    let endpoint = tagger.base_url().to_string();
+    if let Err(denied) = crate::egress::may_send(cfg, &endpoint, crate::egress::Modality::Image) {
+        tracing::warn!(%denied, "cloud tagging pass refused before any request");
+        return;
+    }
     let model_id = tagger.model_id().to_string();
     // Each producer's tags go under its own source (v1 plan S04): the endpoint's, a local
     // fallback's, and the zero-shot pass's — never one merged under the endpoint's model.
@@ -2026,6 +2038,7 @@ mod tests {
         let progress = crate::jobs::JobProgress::default();
         drain_api_tags(
             &mut cat,
+            &crate::config::AppConfig::default(),
             &api,
             Some(&lodestash_ai::tagger::FilenameTagger),
             None,
@@ -2052,6 +2065,58 @@ mod tests {
             cat.count_needing_tags().expect("queue"),
             0,
             "the fallback's result finishes the asset"
+        );
+    }
+
+    /// The refusal happens *before* the pass exists, not after an upload fails (v1 plan S10,
+    /// ADR-0020). Without consent the endpoint is never contacted — so nothing is written, the
+    /// asset stays queued, and **no failure is counted**, because no attempt was made. Granting
+    /// consent is what turns the same call into an attempt, which is how this test knows the gate
+    /// is what stopped it: the host is a `.invalid` name (RFC 2606), so the attempt fails at
+    /// resolution without reaching anyone.
+    #[test]
+    fn a_remote_pass_without_consent_makes_no_attempt_at_all() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let cache = tempfile::tempdir().expect("cache");
+        let (mut cat, id) = catalog_with_image(dir.path(), "rock.png");
+        let api = lodestash_ai::openai::OpenAiTagger::new("https://tagger.invalid/v1", "k", "m");
+        let run = |cat: &mut Catalog, cfg: &crate::config::AppConfig| {
+            let progress = crate::jobs::JobProgress::default();
+            drain_api_tags(
+                cat,
+                cfg,
+                &api,
+                None,
+                None,
+                0,
+                None,
+                Some(cache.path()),
+                &progress,
+                None,
+            );
+            progress.failed.load(std::sync::atomic::Ordering::Relaxed)
+        };
+
+        let refused = run(&mut cat, &crate::config::AppConfig::default());
+        assert_eq!(refused, 0, "a refusal is not a failed request");
+        assert!(
+            cat.asset_tag_rows(id).expect("rows").is_empty(),
+            "a refused pass wrote tags"
+        );
+        assert_eq!(
+            cat.count_needing_tags().expect("queue"),
+            1,
+            "a refused pass must leave the asset queued, not mark it done"
+        );
+
+        let consented = crate::config::AppConfig {
+            remote_image_bytes: true,
+            ..crate::config::AppConfig::default()
+        };
+        assert_eq!(
+            run(&mut cat, &consented),
+            1,
+            "with consent the same call must actually attempt the endpoint"
         );
     }
 

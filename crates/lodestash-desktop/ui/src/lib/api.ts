@@ -293,6 +293,11 @@ export type Settings = {
   api_key: string;
   /** Hard per-run cap on cloud-tagged assets (AI-PIPELINE §5.1). 0 = uncapped. */
   api_max_per_run: number;
+  /** May image bytes go to a **remote** endpoint (v1 plan S10)? Off by default; a loopback
+   * endpoint never needs it, and audio never leaves whatever this says. */
+  remote_image_bytes: boolean;
+  /** May an agent plane receive asset bytes, rather than metadata and links only? */
+  mcp_bytes_enabled: boolean;
 };
 
 export const getSettings = () => invoke<Settings>("get_settings");

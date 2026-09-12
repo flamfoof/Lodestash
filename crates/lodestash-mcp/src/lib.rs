@@ -475,7 +475,14 @@ impl Lodestash {
         // path the summary fabricates, and materials have no pixels of their own), that was every
         // asset in a real library. The tool now returns what it has.
         let mut content = Vec::new();
-        if let Some(png) = self.state.preview_path(args.id) {
+        // Bytes are a separate permission from metadata (v1 plan S10): without it the tool still
+        // answers — name, type, links — and simply carries no image.
+        if !self.state.byte_release() {
+            content.push(ContentBlock::text(
+                "preview bytes withheld: this agent may read metadata and links; serving asset \
+                 bytes needs `mcp_bytes_enabled` in Settings",
+            ));
+        } else if let Some(png) = self.state.preview_path(args.id) {
             // An unreadable cache entry costs the image, not the call.
             if let Ok(bytes) = std::fs::read(&png) {
                 content.push(ContentBlock::image(b64(&bytes), "image/png"));
@@ -809,6 +816,70 @@ mod tests {
         let lode = Lodestash::new(state);
         assert!(lode.gate("search_assets").is_ok(), "enabled tool passes");
         assert!(lode.gate("export_asset").is_err(), "disabled tool refused");
+    }
+
+    /// Bytes are a separate permission from metadata (v1 plan S10, ADR-0020). Without byte release
+    /// the preview tool still answers — the asset's identity, and a link when there is a file — and
+    /// says why it carries no image. It is not an error: an agent that can read metadata has not
+    /// done anything wrong by asking for the picture.
+    #[test]
+    fn a_preview_withholds_bytes_until_they_are_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        let id = {
+            let mut c = lodestash_core::catalog::Catalog::open(&db).unwrap();
+            c.seed_media_types().unwrap();
+            let src = c.upsert_import_source("Lib", "C:/lib", "folder").unwrap();
+            c.record_crawl(
+                src,
+                None,
+                &[lodestash_core::catalog::CrawlRecord {
+                    workspace_rel: None,
+                    content_hash: None,
+                    rel_path: "rock.png".into(),
+                    name: "rock.png".into(),
+                    media_type: "image".into(),
+                    size_bytes: 1,
+                    mtime: 1,
+                }],
+            )
+            .unwrap();
+            c.assets_needing_tags_within(1, None).unwrap()[0].asset_id
+        };
+        let state =
+            Arc::new(ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap());
+        let mcp = Lodestash::new(state.clone());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let call = || {
+            let out = rt
+                .block_on(mcp.get_asset_preview(Parameters(
+                    serde_json::from_value(serde_json::json!({ "id": id })).unwrap(),
+                )))
+                .expect("withholding bytes is not a protocol error");
+            assert_ne!(
+                out.is_error,
+                Some(true),
+                "asking for a preview is not an error"
+            );
+            serde_json::to_string(&out).unwrap()
+        };
+
+        let withheld = call();
+        assert!(withheld.contains("withheld"), "MCP said {withheld}");
+        assert!(
+            withheld.contains("rock.png"),
+            "the tool must still answer with what the asset is: {withheld}"
+        );
+
+        state.set_byte_release(true);
+        let released = call();
+        assert!(
+            !released.contains("withheld"),
+            "bytes released and the tool still refuses: {released}"
+        );
     }
 
     /// `write_tags` is one contract on both planes (ENGINE-API §8.4): the tool parses into the REST

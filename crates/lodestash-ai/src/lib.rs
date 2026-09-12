@@ -4,6 +4,7 @@
 pub mod clap;
 pub mod clap_tags;
 pub mod embedder;
+pub mod endpoint;
 pub mod image_tags;
 pub mod ollama;
 pub mod onnx;

@@ -64,6 +64,8 @@
     tagger_model: null,
     tagger_vision_model: null,
     api_tagging_enabled: false,
+    remote_image_bytes: false,
+    mcp_bytes_enabled: false,
     api_base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
     api_model: null,
     api_key: "",
@@ -738,6 +740,20 @@
           />
           Use an OpenAI-compatible API for the visual tag pass instead of local Ollama
         </label>
+        <label class="check">
+          <input
+            type="checkbox"
+            bind:checked={s.remote_image_bytes}
+            onchange={save}
+            data-testid="remote-image-bytes"
+          />
+          Allow image bytes to leave this machine for a remote endpoint
+        </label>
+        <p class="hint">
+          Off, a remote endpoint is never sent a picture — the pass stops before it makes a request.
+          A server on this machine needs no permission. Audio is never uploaded either way; a remote
+          model only ever sees text about it.
+        </p>
         <label class="field">
           <span>Endpoint</span>
           <select
@@ -947,6 +963,20 @@
         <p class="hint">
           The per-tool allow-list for the engine build's MCP server (MCP ↔ REST stay 1:1). This
           shell hosts the MCP plane from the B7 cutover — the toggles configure it now.
+        </p>
+        <label class="check">
+          <input
+            type="checkbox"
+            bind:checked={s.mcp_bytes_enabled}
+            onchange={save}
+            data-testid="mcp-bytes"
+          />
+          Let agents read asset bytes, not just metadata and links
+        </label>
+        <p class="hint">
+          Off, previews and files are refused on both planes and everything else still answers. A
+          local connection says where the client program runs, not where its model does (v1 plan
+          S10).
         </p>
         <ul class="tools">
           {#each MCP_GROUPS as g (g.id)}

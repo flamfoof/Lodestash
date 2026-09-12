@@ -2193,9 +2193,11 @@ fn build_engine_state() -> Option<(
     let allowed = apply_allow_list(&state);
     // ENGINE-API §8.3: `write_tags` writes under the producer the user configured for this host,
     // and refuses without one.
-    state.set_agent_producer(
-        lodestash_app::config::AppConfig::load_display_only().agent_producer_id,
-    );
+    let cfg = lodestash_app::config::AppConfig::load_display_only();
+    state.set_agent_producer(cfg.agent_producer_id);
+    // Whether an agent may receive bytes at all (v1 plan S10) — metadata and links are always
+    // available, the files are not until the user says so.
+    state.set_byte_release(cfg.mcp_bytes_enabled);
     // The REST/MCP semantic-search plane (ENGINE-API §2 `mode=ai`) needs the query embedder —
     // the same local SigLIP the grid's AI mode uses, resolved lazily on the first ai search
     // (model load is seconds; a startup resolve would slow every launch). `Vec::new()` from the

@@ -93,8 +93,16 @@ this file stays the live board.
       desktop dropped its own on every library reload; both now share the snapshot. Measured on the
       reference library: 6,395 × 768 = 18.7 MiB, 172 ms cold, 66 µs warm. Checks in
       `tests_snapshots.rs`.
-- [ ] **R5 · S10–S13 — endpoint egress policy, headless startup, bounded library walk, app-owned
-      bulk runs** (MCP handoff Tasks 1–3 and 5).
+- [x] **R5 · S10 — endpoint egress and consent** ([ADR-0020](decisions/ADR-0020-egress-is-a-parsed-endpoint-and-a-per-modality-consent.md)). Locality is parsed from the
+      URL's host, not matched as a substring (`localhost.example.com` is remote, `[::1]` is not
+      missed), and price is a separate answer. `egress::may_send` gates every outbound byte per
+      modality, default off: images need consent, audio never leaves, and derived pixels answer for
+      their source. The cloud pass refuses before building a request, and redirects are refused
+      outright — proven by a test where the redirect target gets zero connections. Agent planes
+      serve bytes only under `mcp_bytes_enabled` (`403 bytes_not_released`; the MCP preview withholds
+      the image and still answers). Both toggles are in Settings.
+- [ ] **R5 · S11–S13 — headless startup, bounded library walk, app-owned bulk runs** (MCP handoff
+      Tasks 1–3 and 5).
 - [ ] **Proxies/packs · S14–S18 — pre-extraction identity, one cache policy, visual tiers, font
       specimens, batched inflate.**
 - [ ] **Records · S19 — one board, one rules source, release evidence.**
