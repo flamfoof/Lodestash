@@ -48,11 +48,11 @@ Code inspected 2026-09-10; these are source observations, not a fresh live MCP t
 - `add_tag` accepts one namespace/value. It is not the atomic, attributed multi-asset result
   interface required here. Existing `set_tags` replaces a source's set and clears `tags_dirty`;
   blindly reusing it would confuse an external annotation with completed internal identification.
-- `ServerState::new` uses `Catalog::open`; true read-only headless opening needs verification and
-  repair. Headless startup precedes managed ORT setup. Tracing initialization does not explicitly
-  route to stderr; a spawned protocol test must check stdout cleanliness.
-- The forwarding bridge captures the handshake at startup and waits on nested jobs. That can
-  strand a connection after an app restart and misrepresent job ownership.
+- *Fixed by v1 plan S11 (2026-09-12):* `ServerState::new` used `Catalog::open`, headless startup
+  preceded managed ORT setup, tracing wrote to stdout, and the bridge captured the handshake at
+  startup and waited on nested jobs. The reader is now read-only, ORT is set first, logs go to
+  stderr (a spawned stdio test fails on any stdout line that is not JSON-RPC), and app-owned tools
+  are forwarded whole with the app's job identity ([ADR-0011](decisions/ADR-0011-headless-mcp-forwards-writes.md)).
 - Preview extraction already uses `preview_subject`, `ensure_in_pack_scratch` and `read_payload_at`.
   File links currently depend on a real disk/workspace file, so in-pack assets need an explicit
   evidence/file resolution contract.

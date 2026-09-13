@@ -189,6 +189,11 @@ Two stages, so the embedding does the semantic lift while constraints stay cheap
    fused with **RRF**, optional cross-encoder rerank. Returns ranked matches — *or nothing*, when you
    genuinely own nothing close.
 
+   *As built:* the query is embedded into every installed text space — SigLIP's and CLAP's — by one
+   function (`drains::query_spaces`) that the grid and both agent planes call. Until v1 plan S11 both
+   surfaces embedded it in SigLIP's space only, so audio could be found by name and never by
+   description.
+
 > Why this is fast at 100k+: the parser converts "under 5k tris" into a cheap indexed filter instead of
 > hoping the vector encodes it; pre-filtering means the ANN only scores a small candidate set
 > (sqlite-vec partition keys + metadata filter in one query, DATA-MODEL §2). The query parse itself is

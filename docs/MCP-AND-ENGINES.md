@@ -47,10 +47,12 @@ against the `claude-api` skill before implementing.
 - **SDK**: **`rmcp`** (official Rust SDK) — matches the core language, mature, `#[tool]` macros
   generate JSON Schema from function signatures, built-in stdio + Streamable HTTP transports.
 - **Shared Rust services.** The desktop embeds the API. An LLM host starts a separate
-  `lodestash-desktop --mcp` child for stdio, with local catalog reads and writes forwarded to the app
-  under [ADR-0011](decisions/ADR-0011-headless-mcp-forwards-writes.md). The design requires a
-  genuinely read-only headless connection; the current constructor's `Catalog::open` is a known
-  startup gap tracked by the asset-analysis plan.
+  `lodestash-desktop --mcp` child for stdio: catalog reads are local, through a read-only connection
+  that refuses any schema it would have to migrate, and every app-owned tool is forwarded whole to
+  the app with the same catalog open ([ADR-0011](decisions/ADR-0011-headless-mcp-forwards-writes.md),
+  amended by v1 plan S11; the wire rules are in [`ENGINE-API.md`](ENGINE-API.md) §2 and §4). stdout
+  carries only JSON-RPC — logs go to stderr — and the process exits on stdin EOF. `LODESTASH_CATALOG`
+  points it (or the app) at a catalog file other than the default.
 - **Transport**: **stdio by default** (zero network surface, lowest latency, exactly what Claude
   Desktop/Code expect). Optional **Streamable HTTP** for multiple/remote clients (same loopback +
   token + origin rules): bound to a **stable configurable port (default 4319)** — unlike the engine

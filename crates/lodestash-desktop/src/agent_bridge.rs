@@ -1,18 +1,19 @@
-//! Headless MCP writes, forwarded to the running app (ENGINE-API §1, ADR-0002).
+//! A headless MCP server's line to the running app (ENGINE-API §1, ADR-0002, v1 plan S11).
 //!
 //! `lodestash-desktop --mcp` serves the agent plane over stdio with its own **read-only** catalog
-//! connection. Reads are safe that way — SQLite WAL admits any number of readers — but writes are
-//! not: ARCHITECTURE §5 funnels every write through one dedicated writer thread, and a second
-//! process opening its own writer is exactly the `database is locked` the rule exists to prevent.
+//! connection. Reads are safe that way — SQLite WAL admits any number of readers — but nothing
+//! else is: ARCHITECTURE §5 funnels every write through one writer thread, jobs live in the app's
+//! registry where the app can show and cancel them, and approvals wait on the app's window.
 //!
-//! So the headless server does not write. It **forwards** each mutating op to the running app over
-//! the loopback REST plane the app already serves, using the port and token the app already
-//! publishes in `engine.json`. One writer, in one process, whoever asked.
+//! So a headless server does none of those itself. It **forwards** each app-owned tool to the
+//! running app's loopback REST plane — the same operation, reached the long way round — and relays
+//! the app's answer. The port and token come from the `engine.json` the app publishes, read again
+//! on every call, so an app that started, or restarted onto a new port, after this server did is
+//! still found.
 //!
-//! With no app running the forward fails to connect and the tool answers honestly — the same
-//! read-only behaviour as before, with a message that says what to do about it.
+//! With no app running the call fails to connect and the tool says so; reads keep working.
 
-use lodestash_api::AgentWrite;
+use std::time::Duration;
 
 /// Where the running app publishes its port + token, if it is running at all.
 ///
@@ -26,203 +27,222 @@ fn handshake() -> Option<lodestash_api::Handshake> {
     serde_json::from_slice(&raw).ok()
 }
 
-/// A write bridge that POSTs to the running app, or `None` when no handshake file exists.
-pub fn forwarding_write_fn() -> Option<lodestash_api::AgentWriteFn> {
-    let h = handshake()?;
-    tracing::info!(
-        port = h.port,
-        pid = h.pid,
-        "agent writes forward to the running app"
-    );
-    Some(Box::new(move |w: AgentWrite| forward(&h, w)))
+/// The proxy a headless server installs: the real handshake file, read per call, forwarding only
+/// to an app with `catalog_id` — the catalog this server reads — open.
+pub fn app_proxy(catalog_id: String) -> lodestash_api::AppProxyFn {
+    proxy_with(handshake, catalog_id)
 }
 
-/// One mutating op → one REST call. The mapping is deliberately 1:1 with the route table in
-/// ENGINE-API §2: this is the same operation the GUI's in-process bridge performs, taking the
-/// long way round to reach the same writer.
-fn forward(h: &lodestash_api::Handshake, w: AgentWrite) -> Result<usize, String> {
-    let (path, body) = match &w {
-        AgentWrite::AddTag {
-            asset_id,
-            namespace,
-            value,
-        } => (
-            format!("/v1/assets/{asset_id}/tags"),
-            serde_json::json!({ "namespace": namespace, "value": value }),
-        ),
-        AgentWrite::ApplyMapping { taxonomy_id } => (
-            "/v1/mapping/apply".to_string(),
-            serde_json::json!({ "taxonomy_id": taxonomy_id }),
-        ),
-        AgentWrite::Identify { asset_ids } => (
-            "/v1/identify".to_string(),
-            serde_json::json!({ "asset_ids": asset_ids }),
-        ),
-        AgentWrite::UnpackPackage { package_id } => (
-            "/v1/packages/unpack".to_string(),
-            serde_json::json!({ "package_id": package_id }),
-        ),
-        AgentWrite::StageAsset { asset_id } => (
-            "/v1/stage".to_string(),
-            serde_json::json!({ "asset_id": asset_id }),
-        ),
-        // An approved batch commits in the app that approved it. A headless server holds no
-        // approvals of its own to forward — routing agent requests to the owning app's gate is
-        // the plan's S11.
-        AgentWrite::TagBatch { .. } => {
-            return Err(
-                "an approved tag batch commits in the app that approved it; a headless server \
-                 has none to forward — submit write_tags to the running app"
-                    .into(),
-            )
-        }
-        // Neither has a REST route today, so neither can be forwarded — and the MCP surface
-        // exposes no tool for either (`add_tag` has no `remove` counterpart, `stage_asset` no
-        // unstage). Refused loudly rather than silently reporting zero rows changed.
-        AgentWrite::RemoveTag { .. } | AgentWrite::UnstageAsset { .. } => {
-            return Err(
-                "this operation has no REST route, so a headless server cannot forward it — \
-                 do it in the app"
-                    .into(),
-            )
-        }
-    };
-    post(h, &path, &body)
-}
-
-fn post(
-    h: &lodestash_api::Handshake,
-    path: &str,
-    body: &serde_json::Value,
-) -> Result<usize, String> {
-    let url = format!("http://127.0.0.1:{}{path}", h.port);
-    let resp = ureq::post(&url)
-        .set("authorization", &format!("Bearer {}", h.token))
-        .send_json(body.clone());
-    match resp {
-        Ok(r) => changed_from(h, r),
-        // A 4xx/5xx carries the engine's own error body, which says more than the status.
-        Err(ureq::Error::Status(code, r)) => {
-            let text = r.into_string().unwrap_or_default();
-            Err(format!("the app refused this write ({code}): {text}"))
-        }
-        Err(e) => Err(format!(
-            "no running Lodestash to write through ({e}) — open the app, or use it there"
-        )),
-    }
-}
-
-/// `{"changed": n}` for the synchronous writes; for the long-running ones (`identify`, `unpack`)
-/// the app answers `202` with a **job body**, and this waits for that job.
-///
-/// The wait is the point. Without it a forwarded `identify_asset` reported success in about five
-/// seconds while the app's writer was eighty seconds into the pass: the headless server's own job
-/// finished when the *POST* returned, not when the work did. An agent that polls `get_job_status`,
-/// sees `done` and reads the asset back then gets the tags as they were before it asked — and a
-/// caller that exits on `done` kills the app mid-pass. Two nested jobs, one of which knew nothing
-/// about the other. Now the outer one ends when the inner one does.
-fn changed_from(h: &lodestash_api::Handshake, r: ureq::Response) -> Result<usize, String> {
-    let v: serde_json::Value = r
-        .into_json()
-        .map_err(|e| format!("the app's reply was not JSON: {e}"))?;
-    if let Some(n) = v.get("changed").and_then(serde_json::Value::as_u64) {
-        return Ok(n as usize);
-    }
-    match v.get("job_id").and_then(serde_json::Value::as_str) {
-        Some(id) => await_job(h, id),
-        None => Ok(0),
-    }
-}
-
-/// Poll one of the app's jobs to a terminal state and report what it changed.
-///
-/// A second every second: these passes run in tens of seconds and the poll is a loopback GET, so
-/// there is nothing to gain from being cleverer. The cap is a backstop against a wedged pass
-/// holding this thread forever — it is not a work budget, and blowing it is reported as exactly
-/// what it is, with the job id, so the caller can go on polling that job itself.
-fn await_job(h: &lodestash_api::Handshake, id: &str) -> Result<usize, String> {
-    const POLL: std::time::Duration = std::time::Duration::from_secs(1);
-    const CAP: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-
-    let url = format!("http://127.0.0.1:{}/v1/jobs/{id}", h.port);
-    let started = std::time::Instant::now();
-    loop {
-        let v: serde_json::Value = ureq::get(&url)
-            .set("authorization", &format!("Bearer {}", h.token))
-            .call()
-            .map_err(|e| format!("lost track of job {id} while it ran ({e})"))?
-            .into_json()
-            .map_err(|e| format!("the app's job reply was not JSON: {e}"))?;
-        match v.get("state").and_then(serde_json::Value::as_str) {
-            // `changed` is the row count the pass reconciled; a job that finished without one
-            // still did something, so report the job itself rather than a bare zero.
-            Some("done") => {
-                return Ok(v
-                    .get("result")
-                    .and_then(|r| r.get("changed"))
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(1) as usize)
-            }
-            Some("error") => {
-                let why = v
-                    .get("error")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("no reason given");
-                return Err(format!("the app's {id} failed: {why}"));
-            }
-            Some("cancelled") => return Err(format!("the app's {id} was cancelled")),
-            _ => {}
-        }
-        if started.elapsed() > CAP {
+/// A proxy over any handshake source — the seam that lets a test restart "the app" between calls.
+fn proxy_with(
+    read: impl Fn() -> Option<lodestash_api::Handshake> + Send + Sync + 'static,
+    catalog_id: String,
+) -> lodestash_api::AppProxyFn {
+    Box::new(move |method, path, body| {
+        let h = read().ok_or_else(|| {
+            "no running Lodestash app to hand this to — open the app; searching and reading work \
+             without it"
+                .to_string()
+        })?;
+        if h.api_version != "v1" {
             return Err(format!(
-                "{id} is still running after {} minutes — it was not abandoned, poll it in the app",
-                CAP.as_secs() / 60
+                "the running app serves API {} and this server speaks v1 — run one Lodestash \
+                 version for both",
+                h.api_version
             ));
         }
-        std::thread::sleep(POLL);
+        // What the agent read came from this catalog; a write must land in the same one. An app
+        // with another library open, or an older build that does not say, is not that app.
+        if h.catalog_id.as_deref() != Some(catalog_id.as_str()) {
+            return Err(
+                "the running Lodestash app has a different catalog open than this server reads — \
+                 nothing was sent"
+                    .to_string(),
+            );
+        }
+        call(&h, method, path, body)
+    })
+}
+
+/// How long a forwarded request may take. Generous on purpose: a write waits its turn at the
+/// app's writer, and the handler holding it runs off the async thread, so a long wait costs this
+/// request and nothing else.
+const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// One REST call to the app. A `4xx`/`5xx` is an answer — the app's error body is relayed as it is —
+/// and only a request that got no answer is an `Err`.
+///
+/// **Never retried.** A request that timed out after it was sent may still be applied, and only a
+/// request id (`write_tags`) makes a repeat safe; resending anything else could apply it twice.
+fn call(
+    h: &lodestash_api::Handshake,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<(u16, serde_json::Value), String> {
+    let agent = ureq::AgentBuilder::new()
+        // Loopback: a listening app accepts in well under a millisecond. A closed port on Windows
+        // retries its SYN for seconds before refusing, so the bound is what keeps "is the app
+        // there?" — asked by get_server_info too — from costing two seconds when it is not.
+        .timeout_connect(Duration::from_millis(500))
+        .timeout(CALL_TIMEOUT)
+        // The request carries the session token; a redirect would hand it to whoever is named.
+        .redirects(0)
+        .build();
+    let req = agent
+        .request(method, &format!("http://127.0.0.1:{}{path}", h.port))
+        .set("authorization", &format!("Bearer {}", h.token));
+    let sent = match body {
+        Some(b) => req.send_json(b.clone()),
+        None => req.call(),
+    };
+    match sent {
+        Ok(r) => Ok((r.status(), r.into_json().unwrap_or(serde_json::Value::Null))),
+        Err(ureq::Error::Status(code, r)) => {
+            Ok((code, r.into_json().unwrap_or(serde_json::Value::Null)))
+        }
+        Err(ureq::Error::Transport(t)) => Err(match t.kind() {
+            ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Dns => format!(
+                "no running Lodestash app answered ({t}) — open the app; searching and reading \
+                 work without it"
+            ),
+            _ => format!(
+                "the app did not answer ({t}). If this was a change, it may still have been \
+                 applied — check before asking again"
+            ),
+        }),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
-    /// The two ops with no route must fail loudly. Reporting `Ok(0)` would tell an agent the tag
-    /// was removed and zero rows happened to match, which is a different and wrong story.
-    #[test]
-    fn ops_without_a_route_are_refused_not_silently_zero() {
-        let h = lodestash_api::Handshake::new(1, "t");
-        for w in [
-            AgentWrite::RemoveTag {
-                asset_id: 1,
-                namespace: "subject".into(),
-                value: "rock".into(),
-            },
-            AgentWrite::UnstageAsset { asset_id: 1 },
-        ] {
-            let err = forward(&h, w).expect_err("must refuse");
-            assert!(err.contains("no REST route"), "unhelpful refusal: {err}");
-        }
+    /// A one-request HTTP server that answers `status` with `body` and reports the request line.
+    fn one_shot(status: u16, body: &'static str) -> (u16, std::thread::JoinHandle<String>) {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = l.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = l.accept().expect("accept");
+            sock.set_read_timeout(Some(Duration::from_millis(300))).ok();
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = sock.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                seen.extend_from_slice(&buf[..n]);
+            }
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            String::from_utf8_lossy(&seen)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        });
+        (port, server)
     }
 
-    /// A forward with nothing listening is a plain error, not a panic or a hang — the headless
-    /// server stays usable read-only when the app is closed.
+    /// The app can restart onto a new port between two requests, and the second still reaches it:
+    /// the handshake is read for every call, not once at startup (v1 plan S11).
+    #[test]
+    fn a_restarted_app_is_found_on_the_next_call() {
+        let (first, a) = one_shot(202, r#"{"id":"identify_1","state":"running"}"#);
+        let (second, b) = one_shot(200, r#"{"id":"identify_1","state":"done"}"#);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let proxy = proxy_with(
+            move || {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some(
+                    lodestash_api::Handshake::new(if n == 0 { first } else { second }, "t")
+                        .with_catalog("cat"),
+                )
+            },
+            "cat".into(),
+        );
+
+        let (status, body) = proxy(
+            "POST",
+            "/v1/identify",
+            Some(&serde_json::json!({"asset_ids": [1]})),
+        )
+        .expect("the first app answers");
+        assert_eq!((status, body["state"].as_str()), (202, Some("running")));
+        assert_eq!(a.join().unwrap(), "POST /v1/identify HTTP/1.1");
+
+        let (status, body) =
+            proxy("GET", "/v1/jobs/identify_1", None).expect("the restarted app answers");
+        assert_eq!((status, body["state"].as_str()), (200, Some("done")));
+        assert_eq!(b.join().unwrap(), "GET /v1/jobs/identify_1 HTTP/1.1");
+    }
+
+    /// A refusal is the app's answer and is relayed with its status, not turned into "no app".
+    #[test]
+    fn the_apps_refusal_is_relayed_as_an_answer() {
+        let (port, server) = one_shot(409, r#"{"error":{"code":"project_not_registered"}}"#);
+        let proxy = proxy_with(
+            move || Some(lodestash_api::Handshake::new(port, "t").with_catalog("cat")),
+            "cat".into(),
+        );
+        let (status, body) = proxy("POST", "/v1/stage/import", None).expect("an answer");
+        assert_eq!(status, 409);
+        assert_eq!(body["error"]["code"], "project_not_registered");
+        server.join().unwrap();
+    }
+
+    /// No handshake, or nothing listening: a plain error that says what to do — never a panic or a
+    /// hang, and the server stays usable for reads.
     #[test]
     fn no_running_app_is_an_error_not_a_panic() {
+        let none = proxy_with(|| None, "cat".into());
+        let err = none("GET", "/v1/jobs/x", None).expect_err("no handshake");
+        assert!(err.contains("no running Lodestash"), "unhelpful: {err}");
+
         // Port 1 on loopback: nothing binds it, and connect fails immediately.
-        let h = lodestash_api::Handshake::new(1, "t");
-        let err = forward(
-            &h,
-            AgentWrite::AddTag {
-                asset_id: 1,
-                namespace: "subject".into(),
-                value: "rock".into(),
-            },
-        )
-        .expect_err("must fail");
-        assert!(
-            err.contains("no running Lodestash"),
-            "the error should say what to do: {err}"
+        let closed = proxy_with(
+            || Some(lodestash_api::Handshake::new(1, "t").with_catalog("cat")),
+            "cat".into(),
         );
+        let err = closed("GET", "/v1/jobs/x", None).expect_err("nothing listening");
+        assert!(err.contains("no running Lodestash"), "unhelpful: {err}");
+    }
+
+    /// An app with another catalog open is not this server's app: nothing is sent to it, however
+    /// well it would have answered (v1 plan S11). An app that does not name its catalog is treated
+    /// the same way.
+    #[test]
+    fn an_app_with_another_catalog_is_never_sent_anything() {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.set_nonblocking(true).expect("nonblocking");
+        let port = l.local_addr().unwrap().port();
+        for named in [Some("someone-elses"), None] {
+            let proxy = proxy_with(
+                move || {
+                    let h = lodestash_api::Handshake::new(port, "t");
+                    Some(match named {
+                        Some(id) => h.with_catalog(id),
+                        None => h,
+                    })
+                },
+                "cat".into(),
+            );
+            let err = proxy(
+                "POST",
+                "/v1/stage",
+                Some(&serde_json::json!({"asset_id": 1})),
+            )
+            .expect_err("a different catalog");
+            assert!(err.contains("different catalog"), "unhelpful: {err}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(l.accept().is_err(), "the other app was contacted");
     }
 }

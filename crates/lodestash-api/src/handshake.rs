@@ -12,6 +12,11 @@ pub struct Handshake {
     pub token: String,
     pub pid: u32,
     pub api_version: String,
+    /// The catalog the app serving this port has open (M31). A headless server forwards only to an
+    /// app with *its* catalog — otherwise a write lands in a different library than the one the
+    /// agent just read. Absent from a file written before v1 plan S11.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_id: Option<String>,
 }
 
 impl Handshake {
@@ -22,7 +27,14 @@ impl Handshake {
             token: token.into(),
             pid: std::process::id(),
             api_version: "v1".into(),
+            catalog_id: None,
         }
+    }
+
+    /// The same handshake, naming the catalog the serving app has open.
+    pub fn with_catalog(mut self, id: impl Into<String>) -> Self {
+        self.catalog_id = Some(id.into());
+        self
     }
 }
 

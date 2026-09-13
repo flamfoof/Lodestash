@@ -299,6 +299,26 @@ pub enum Op {
     SetActiveProject {
         project_id: i64,
     },
+    /// Register or refresh an editor and make it active (ENGINE-API §5.1). Written here rather
+    /// than through the engine's own connection, which is read-only (v1 plan S11).
+    RegisterProject {
+        project_path: String,
+        unity_version: Option<String>,
+        pipeline: Option<String>,
+    },
+    /// Durable import records for an acked request (ENGINE-API §5.3); `changed` counts the rows
+    /// recorded, not the ones the dup-guard caught.
+    RecordImports {
+        project_id: i64,
+        specs: Vec<lodestash_core::catalog::ImportSpec>,
+        batch_id: String,
+    },
+    /// Export history for the files an export wrote (FEATURES §7.6).
+    RecordExports {
+        batch_id: String,
+        dest_path: String,
+        files: Vec<(Option<i64>, String)>,
+    },
     /// Undo one import batch (UI-SPEC §16.1): delete the batch's copied files from the project
     /// and its import_record rows — catalog assets are never touched. Runs on this thread like
     /// every catalog write (ADR-0002).
@@ -2407,6 +2427,47 @@ fn run(
             .set_active_project(project_id)
             .map(|_| WriteResult {
                 changed: 1,
+                ..Default::default()
+            })
+            .map_err(|e| e.to_string()),
+
+        Op::RegisterProject {
+            project_path,
+            unity_version,
+            pipeline,
+        } => catalog
+            .register_project(&project_path, unity_version.as_deref(), pipeline.as_deref())
+            .map(|_| WriteResult {
+                changed: 1,
+                ..Default::default()
+            })
+            .map_err(|e| e.to_string()),
+
+        Op::RecordImports {
+            project_id,
+            specs,
+            batch_id,
+        } => catalog
+            .record_imports(project_id, &specs, &batch_id)
+            .map(|outcomes| WriteResult {
+                changed: outcomes
+                    .iter()
+                    .filter(|o| {
+                        matches!(o, lodestash_core::catalog::ImportOutcome::Recorded { .. })
+                    })
+                    .count(),
+                ..Default::default()
+            })
+            .map_err(|e| e.to_string()),
+
+        Op::RecordExports {
+            batch_id,
+            dest_path,
+            files,
+        } => catalog
+            .record_exports(&batch_id, &dest_path, &files)
+            .map(|changed| WriteResult {
+                changed,
                 ..Default::default()
             })
             .map_err(|e| e.to_string()),

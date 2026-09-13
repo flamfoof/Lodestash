@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use lodestash_api::ServerState;
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ContentBlock, ProtocolVersion, Resource, ServerCapabilities, ServerInfo,
@@ -194,6 +195,25 @@ impl Lodestash {
         }
     }
 
+    /// Headless: hand an app-owned operation to the running app and relay its answer (v1 plan S11).
+    ///
+    /// `None` when this server *is* in the app, and the caller runs the operation itself. The REST
+    /// answer is this tool's answer — the planes are 1:1, so the app's body is exactly what the
+    /// tool would have returned in-process — which is why the job id an agent gets back is the
+    /// app's own, and `get_job_status` on it reaches the job that is actually running.
+    ///
+    /// Nothing is retried. A request that timed out after it was sent may still land, and only a
+    /// request id makes a repeat safe; that decision belongs to the caller.
+    fn forward(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Option<Result<CallToolResult, ErrorData>> {
+        let proxy = self.state.app_proxy()?;
+        Some(relay(proxy(method, path, body.as_ref())))
+    }
+
     /// App, schema and API versions of the running Lodestash.
     #[tool(
         name = "get_server_info",
@@ -201,10 +221,8 @@ impl Lodestash {
     )]
     pub async fn get_server_info(&self) -> Result<CallToolResult, ErrorData> {
         self.gate("get_server_info")?;
-        let (app, schema) = self.state.server_info().map_err(internal)?;
-        Ok(CallToolResult::success(vec![ContentBlock::json(
-            serde_json::json!({ "app": app, "schema": schema, "api": "v1" }),
-        )?]))
+        let body = self.state.server_info_json().map_err(internal)?;
+        Ok(CallToolResult::success(vec![ContentBlock::json(body)?]))
     }
 
     /// Search the catalog by text (name, description, tags).
@@ -322,6 +340,17 @@ impl Lodestash {
                 None,
             ));
         }
+        if let Some(r) = self.forward(
+            "POST",
+            "/v1/projects/register",
+            Some(serde_json::json!({
+                "project_path": args.project_path,
+                "unity_version": args.unity_version,
+                "pipeline": args.pipeline,
+            })),
+        ) {
+            return r;
+        }
         let (id, is_active) = self
             .state
             .register_project(
@@ -366,6 +395,18 @@ impl Lodestash {
                 None,
             ));
         }
+        if let Some(r) = self.forward(
+            "POST",
+            "/v1/import",
+            Some(serde_json::json!({
+                "asset_ids": args.asset_ids,
+                "project_id": args.project_id,
+                "dest_subfolder": args.dest_subfolder,
+                "with_dependencies": args.with_dependencies.unwrap_or(true),
+            })),
+        ) {
+            return r;
+        }
         let req = lodestash_api::ImportRequest {
             asset_ids: args.asset_ids,
             project_id: args.project_id,
@@ -405,6 +446,17 @@ impl Lodestash {
                 None,
             ));
         }
+        if let Some(r) = self.forward(
+            "POST",
+            "/v1/export",
+            Some(serde_json::json!({
+                "asset_ids": args.asset_ids,
+                "dest_path": args.dest_path,
+                "with_dependencies": args.with_dependencies.unwrap_or(false),
+            })),
+        ) {
+            return r;
+        }
         let req = lodestash_api::export::ExportRequest {
             asset_ids: args.asset_ids,
             dest_path: args.dest_path,
@@ -429,6 +481,9 @@ impl Lodestash {
         Parameters(args): Parameters<JobArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.gate("get_job_status")?;
+        if let Some(r) = self.forward("GET", &job_path(&args.job_id, "")?, None) {
+            return r;
+        }
         match self.state.jobs.get(&args.job_id) {
             Some(job) => Ok(CallToolResult::success(vec![ContentBlock::json(
                 job.to_json(),
@@ -447,6 +502,9 @@ impl Lodestash {
         Parameters(args): Parameters<JobArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.gate("cancel_job")?;
+        if let Some(r) = self.forward("POST", &job_path(&args.job_id, "/cancel")?, None) {
+            return r;
+        }
         match self.state.jobs.cancel(&args.job_id) {
             Some(job) => Ok(CallToolResult::success(vec![ContentBlock::json(
                 job.to_json(),
@@ -541,6 +599,13 @@ impl Lodestash {
     ) -> Result<CallToolResult, ErrorData> {
         self.gate("add_tag")?;
         let ns = args.namespace.unwrap_or_else(|| "free".into());
+        if let Some(r) = self.forward(
+            "POST",
+            &format!("/v1/assets/{}/tags", args.asset_id),
+            Some(serde_json::json!({ "namespace": ns, "value": args.value })),
+        ) {
+            return r;
+        }
         let changed = self
             .state
             .add_tag(args.asset_id, &ns, &args.value)
@@ -566,6 +631,18 @@ impl Lodestash {
         Parameters(args): Parameters<WriteTagsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.gate("write_tags")?;
+        // Parked on the app's gate, where the person at the machine can see it (closes S05's
+        // headless gap): the body goes as the agent wrote it, and the app validates it.
+        if let Some(r) = self.forward(
+            "POST",
+            "/v1/tags/batch",
+            Some(
+                serde_json::to_value(&args)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
+            ),
+        ) {
+            return r;
+        }
         let bytes = serde_json::to_vec(&args)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let req: lodestash_api::TagBatchRequest = serde_json::from_slice(&bytes)
@@ -606,6 +683,13 @@ impl Lodestash {
         Parameters(args): Parameters<MappingArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.gate("apply_mapping")?;
+        if let Some(r) = self.forward(
+            "POST",
+            "/v1/mapping/apply",
+            Some(serde_json::json!({ "taxonomy_id": args.taxonomy_id })),
+        ) {
+            return r;
+        }
         let changed = self
             .state
             .apply_mapping(args.taxonomy_id)
@@ -625,6 +709,13 @@ impl Lodestash {
         Parameters(args): Parameters<IdentifyArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.gate("identify_asset")?;
+        if let Some(r) = self.forward(
+            "POST",
+            "/v1/identify",
+            Some(serde_json::json!({ "asset_ids": args.asset_ids })),
+        ) {
+            return r;
+        }
         let job = self
             .state
             .identify_asset(args.asset_ids)
@@ -658,6 +749,13 @@ impl Lodestash {
         Parameters(args): Parameters<UnpackArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.gate("unpack_package")?;
+        if let Some(r) = self.forward(
+            "POST",
+            "/v1/packages/unpack",
+            Some(serde_json::json!({ "package_id": args.package_id })),
+        ) {
+            return r;
+        }
         let job = self
             .state
             .unpack_package(args.package_id)
@@ -677,6 +775,13 @@ impl Lodestash {
         Parameters(args): Parameters<StageArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.gate("stage_asset")?;
+        if let Some(r) = self.forward(
+            "POST",
+            "/v1/stage",
+            Some(serde_json::json!({ "asset_id": args.asset_id })),
+        ) {
+            return r;
+        }
         let changed = self
             .state
             .stage_asset(args.asset_id)
@@ -705,6 +810,9 @@ impl Lodestash {
     )]
     pub async fn import_staged(&self) -> Result<CallToolResult, ErrorData> {
         self.gate("import_staged")?;
+        if let Some(r) = self.forward("POST", "/v1/stage/import", None) {
+            return r;
+        }
         match self.state.import_staged() {
             Ok(k) => Ok(CallToolResult::success(vec![ContentBlock::json(
                 k.to_json(),
@@ -723,6 +831,31 @@ impl Lodestash {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Lodestash {
+    /// Every tool runs on the blocking pool (v1 plan S11).
+    ///
+    /// rmcp gives each request its own task, but the headless server is a current-thread runtime
+    /// and every tool body calls synchronous state — the catalog mutex, a preview render, a query
+    /// embedding that loads a model, a forward that waits for the app. One slow call held the only
+    /// thread, so `get_job_status` and `cancel_job` could not answer while the job they asked
+    /// about was the thing being slow. `Handle::block_on` from a pool thread is sound here because
+    /// `serve_stdio`'s own `block_on` keeps driving the runtime.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let me = self.clone();
+        let rt = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            rt.block_on(async move {
+                let tcc = ToolCallContext::new(&me, request, context);
+                me.tool_router.call(tcc).await
+            })
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("the tool worker failed: {e}"), None))?
+    }
+
     fn get_info(&self) -> ServerInfo {
         // `ServerInfo`/`Implementation` are #[non_exhaustive] — build from Default and set fields.
         let mut info = ServerInfo::default();
@@ -751,6 +884,50 @@ pub async fn serve_stdio(state: Arc<ServerState>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The app's REST answer as this tool's answer. A refusal stays a tool result carrying the app's
+/// error body and status — the shape `write_tags` already uses — so an agent reads the same code
+/// whichever plane refused. No app to answer is a domain failure too, `app_unavailable` (ENGINE-API
+/// §8.4): the request was well-formed, and reads still work.
+fn relay(answer: Result<(u16, serde_json::Value), String>) -> Result<CallToolResult, ErrorData> {
+    match answer {
+        Ok((status, body)) if status < 400 => {
+            Ok(CallToolResult::success(vec![ContentBlock::json(body)?]))
+        }
+        Ok((status, mut body)) => {
+            match body
+                .get_mut("error")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                Some(error) => {
+                    error.insert("status".into(), status.into());
+                }
+                None => {
+                    body = serde_json::json!({ "error": { "status": status, "body": body } });
+                }
+            }
+            Ok(CallToolResult::error(vec![ContentBlock::json(body)?]))
+        }
+        Err(e) => Ok(CallToolResult::error(vec![ContentBlock::json(
+            serde_json::json!({
+                "error": { "code": "app_unavailable", "message": e, "status": 503 }
+            }),
+        )?])),
+    }
+}
+
+/// `/v1/jobs/{id}{suffix}`, for a job id an agent supplied. Ids are `kind_hex`; anything else is
+/// refused rather than spliced into a path the app would route somewhere else.
+fn job_path(id: &str, suffix: &str) -> Result<String, ErrorData> {
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(ErrorData::invalid_params("no such job", None));
+    }
+    Ok(format!("/v1/jobs/{id}{suffix}"))
+}
+
 fn internal(e: lodestash_core::error::CoreError) -> ErrorData {
     ErrorData::internal_error(e.to_string(), None)
 }
@@ -773,17 +950,126 @@ fn b64(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// A current catalog on disk and a state reading it — the engine's connection is read-only and
+    /// never creates one (v1 plan S11).
+    fn fixture() -> (tempfile::TempDir, Arc<ServerState>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        lodestash_core::catalog::Catalog::open(&db).unwrap();
+        let state = ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap();
+        (dir, Arc::new(state))
+    }
+
+    /// Headless (v1 plan S11): an app-owned tool is the app's REST operation, forwarded whole. The
+    /// agent gets the app's own job back and polls that job through the app; nothing runs here —
+    /// no local job, no approval parked where no window can show it. A refusal is relayed with its
+    /// code, "no app" is a plain error, and neither a disabled tool nor a malformed job id ever
+    /// reaches the app.
+    #[test]
+    fn a_headless_server_hands_app_owned_tools_to_the_app() {
+        let (_dir, state) = fixture();
+        type Call = (String, String, Option<serde_json::Value>);
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<Call>::new()));
+        let seen = calls.clone();
+        state.set_app_proxy(Box::new(move |method, path, body| {
+            seen.lock()
+                .unwrap()
+                .push((method.into(), path.into(), body.cloned()));
+            match path {
+                "/v1/identify" => Ok((202, serde_json::json!({"id": "identify_abc", "state": "running"}))),
+                "/v1/jobs/identify_abc" => Ok((200, serde_json::json!({"id": "identify_abc", "state": "done"}))),
+                "/v1/stage/import" => Ok((
+                    409,
+                    serde_json::json!({"error": {"code": "project_not_registered", "message": "No Unity project is registered."}}),
+                )),
+                "/v1/mapping/apply" => Err("no running Lodestash app answered".into()),
+                other => panic!("forwarded somewhere unexpected: {other}"),
+            }
+        }));
+        let mcp = Lodestash::new(state.clone());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let text = |r: &CallToolResult| serde_json::to_string(r).unwrap();
+
+        let started = rt
+            .block_on(mcp.identify_asset(Parameters(IdentifyArgs { asset_ids: vec![7] })))
+            .expect("forwarded");
+        assert!(
+            text(&started).contains("identify_abc"),
+            "{}",
+            text(&started)
+        );
+        assert!(
+            state.jobs.get("identify_abc").is_none() && state.jobs.awaiting_approval().is_empty(),
+            "the headless server made a job of its own"
+        );
+
+        let status = rt
+            .block_on(mcp.get_job_status(Parameters(JobArgs {
+                job_id: "identify_abc".into(),
+            })))
+            .expect("forwarded");
+        assert!(text(&status).contains("done"), "{}", text(&status));
+
+        let refused = rt
+            .block_on(mcp.import_staged())
+            .expect("a refusal is a tool result");
+        assert_eq!(refused.is_error, Some(true));
+        assert!(
+            text(&refused).contains("project_not_registered") && text(&refused).contains("409"),
+            "the app's code and status must survive the relay: {}",
+            text(&refused)
+        );
+
+        let absent = rt
+            .block_on(mcp.apply_mapping(Parameters(MappingArgs { taxonomy_id: 1 })))
+            .expect("no app is a domain failure, not a protocol error");
+        assert_eq!(absent.is_error, Some(true));
+        assert!(
+            text(&absent).contains("app_unavailable")
+                && text(&absent).contains("no running Lodestash"),
+            "{}",
+            text(&absent)
+        );
+
+        let before = calls.lock().unwrap().len();
+        assert!(rt
+            .block_on(mcp.cancel_job(Parameters(JobArgs {
+                job_id: "../export".into()
+            })))
+            .is_err());
+        state.set_allowed(["search_assets".to_string()].into());
+        assert!(rt
+            .block_on(mcp.identify_asset(Parameters(IdentifyArgs { asset_ids: vec![7] })))
+            .is_err());
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            before,
+            "a malformed job id or a disabled tool reached the app"
+        );
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls[0],
+            (
+                "POST".to_string(),
+                "/v1/identify".to_string(),
+                Some(serde_json::json!({"asset_ids": [7]}))
+            )
+        );
+    }
+
     /// The MCP↔REST 1:1 invariant (ENGINE-API §2): every agent operation exists on **both**
     /// planes. Adding a route without its tool — or a tool without its route — fails here.
     /// ENGINE-API §2 "1:1 planes" — every AGENT_OPERATION exists as an MCP tool name. The REST
     /// plane's names come from the same list (engine-api §2), so this one test pins both.
     #[test]
     fn tool_set_matches_the_rest_surface() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("catalog.db");
-        let state = ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap();
+        let (_dir, state) = fixture();
 
-        let mut tools: Vec<String> = Lodestash::new(Arc::new(state))
+        let mut tools: Vec<String> = Lodestash::new(state)
             .tool_router
             .list_all()
             .into_iter()
@@ -802,10 +1088,7 @@ mod tests {
     /// everything, a set restricts to its members, and a disabled tool errors.
     #[test]
     fn allow_list_gates_the_mcp_plane() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("catalog.db");
-        let state =
-            Arc::new(ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap());
+        let (_dir, state) = fixture();
 
         // Construction default: no allow-list, every tool live.
         assert!(state.allows("export_asset"), "allow-all by default");
@@ -880,6 +1163,113 @@ mod tests {
             !released.contains("withheld"),
             "bytes released and the tool still refuses: {released}"
         );
+    }
+
+    /// Every tool calls synchronous state on a one-thread runtime (v1 plan S11). A slow tool — a
+    /// preview that takes a second and a half to render — must not stop `get_server_info` from
+    /// answering meanwhile. Driven through the real JSON-RPC service, because the fix is in
+    /// `call_tool` and a direct method call would never reach it.
+    #[test]
+    fn a_slow_tool_does_not_stall_the_others() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        let id = {
+            let mut c = lodestash_core::catalog::Catalog::open(&db).unwrap();
+            c.seed_media_types().unwrap();
+            let src = c.upsert_import_source("Lib", "C:/lib", "folder").unwrap();
+            c.record_crawl(
+                src,
+                None,
+                &[lodestash_core::catalog::CrawlRecord {
+                    workspace_rel: None,
+                    content_hash: None,
+                    rel_path: "rock.png".into(),
+                    name: "rock.png".into(),
+                    media_type: "image".into(),
+                    size_bytes: 1,
+                    mtime: 1,
+                }],
+            )
+            .unwrap();
+            c.assets_needing_tags_within(1, None).unwrap()[0].asset_id
+        };
+        let state = Arc::new(
+            ServerState::new(
+                &db,
+                dir.path().to_path_buf(),
+                Box::new(|_| {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    None
+                }),
+            )
+            .unwrap(),
+        );
+        state.set_byte_release(true);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let (client, server) = tokio::io::duplex(1 << 16);
+            let _service = tokio::spawn(async move {
+                use rmcp::ServiceExt;
+                let running = Lodestash::new(state)
+                    .serve(tokio::io::split(server))
+                    .await
+                    .expect("serve");
+                let _ = running.waiting().await;
+            });
+            let (read, mut write) = tokio::io::split(client);
+            let mut lines = BufReader::new(read).lines();
+            let send = |v: serde_json::Value| {
+                let mut line = v.to_string();
+                line.push('\n');
+                line
+            };
+            let next_id = |line: Option<String>| -> i64 {
+                let v: serde_json::Value = serde_json::from_str(&line.expect("a reply")).unwrap();
+                v["id"].as_i64().unwrap_or(-1)
+            };
+            let wait = std::time::Duration::from_secs(10);
+
+            write
+                .write_all(send(serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                               "clientInfo": {"name": "test", "version": "0"}}})).as_bytes())
+                .await
+                .unwrap();
+            let init = tokio::time::timeout(wait, lines.next_line()).await.unwrap().unwrap();
+            assert_eq!(next_id(init), 1);
+            write
+                .write_all(send(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).as_bytes())
+                .await
+                .unwrap();
+
+            let started = std::time::Instant::now();
+            write
+                .write_all(send(serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "get_asset_preview", "arguments": {"id": id}}})).as_bytes())
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            write
+                .write_all(send(serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                    "params": {"name": "get_server_info", "arguments": {}}})).as_bytes())
+                .await
+                .unwrap();
+
+            let first = tokio::time::timeout(wait, lines.next_line()).await.unwrap().unwrap();
+            let first_at = started.elapsed();
+            assert_eq!(next_id(first), 3, "get_server_info answered after the slow preview");
+            assert!(
+                first_at < std::time::Duration::from_millis(1000),
+                "get_server_info took {first_at:?} behind a preview render"
+            );
+            let second = tokio::time::timeout(wait, lines.next_line()).await.unwrap().unwrap();
+            assert_eq!(next_id(second), 2, "the preview itself still answers");
+        });
     }
 
     /// `write_tags` is one contract on both planes (ENGINE-API §8.4): the tool parses into the REST

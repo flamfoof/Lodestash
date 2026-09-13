@@ -18,7 +18,97 @@ fn open_in_memory_applies_migrations() {
         .conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 30, "all 30 migrations should have run");
+    assert_eq!(version, 31, "all 31 migrations should have run");
+    assert_eq!(
+        version, SCHEMA_VERSION,
+        "SCHEMA_VERSION must name the last migration, or every reader refuses a current catalog"
+    );
+}
+
+/// Every catalog has its own identity, the same through any connection and distinct from every
+/// other catalog's (M31).
+#[test]
+fn a_catalog_has_one_identity_of_its_own() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (a, b) = (dir.path().join("a.db"), dir.path().join("b.db"));
+    let id_a = Catalog::open(&a).expect("a").catalog_id().expect("id");
+    let id_b = Catalog::open(&b).expect("b").catalog_id().expect("id");
+    assert_eq!(id_a.len(), 32, "{id_a}");
+    assert_ne!(id_a, id_b, "two catalogs share an identity");
+    assert_eq!(
+        Catalog::open_reader(&a)
+            .expect("reader")
+            .catalog_id()
+            .expect("id"),
+        id_a
+    );
+    assert_eq!(
+        Catalog::open(&a).expect("reopen").catalog_id().expect("id"),
+        id_a,
+        "reopening reminted it"
+    );
+}
+
+/// The agent planes' connection reads and never writes (v1 plan S11): not a row, not a migration,
+/// not a journal-mode change — and a catalog at another schema is refused rather than read.
+#[test]
+fn a_reader_cannot_write_and_never_migrates() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let db = dir.path().join("catalog.db");
+
+    // Nothing there: a reader does not create a catalog.
+    assert!(
+        Catalog::open_reader(&db).is_err(),
+        "a reader created a catalog"
+    );
+    assert!(!db.exists(), "the refused open left a file behind");
+
+    // A current catalog, closed — the shape a headless server finds when the app is not running.
+    {
+        let c = Catalog::open(&db).expect("writer open");
+        c.seed_media_types().expect("seed");
+    }
+    let reader = Catalog::open_reader(&db).expect("a current catalog opens read-only");
+    assert_eq!(reader.schema_version().expect("version"), SCHEMA_VERSION);
+    assert!(
+        reader
+            .conn
+            .execute("UPDATE media_type SET label = 'x'", [])
+            .is_err(),
+        "the reader connection accepted a write"
+    );
+    drop(reader);
+
+    // An older catalog: refused with the upgrade instruction, and left at its version.
+    rusqlite::Connection::open(&db)
+        .expect("raw")
+        .execute_batch("PRAGMA user_version = 29;")
+        .expect("downgrade marker");
+    let err = Catalog::open_reader(&db)
+        .err()
+        .expect("an old schema must be refused");
+    assert!(
+        err.to_string().contains("open the Lodestash app once"),
+        "unhelpful refusal: {err}"
+    );
+    let version: u32 = rusqlite::Connection::open(&db)
+        .expect("raw")
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .expect("version");
+    assert_eq!(version, 29, "the reader migrated the catalog");
+
+    // A newer one: refused too, with the other instruction.
+    rusqlite::Connection::open(&db)
+        .expect("raw")
+        .execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION + 1))
+        .expect("future marker");
+    let err = Catalog::open_reader(&db)
+        .err()
+        .expect("a newer schema must be refused");
+    assert!(
+        err.to_string().contains("update Lodestash"),
+        "unhelpful refusal: {err}"
+    );
 }
 
 /// Every queue an appraise pass drains must respect the set the caller named.

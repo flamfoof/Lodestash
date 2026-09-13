@@ -679,11 +679,6 @@ pub struct Library {
     /// The user's S/M/L/XL boundaries (§11.4), read from the same config the egui build writes —
     /// so the size badge on a card and the size facet in the popover agree with each other.
     tiers: SizeTiers,
-    /// The local text-capable embedder for AI-mode search (TopBar ⟨Tags⟩/⟨AI⟩), resolved once
-    /// — model load is seconds, so per keystroke would be unusable. `None` until first use.
-    ai_embedder: std::sync::Mutex<
-        Option<std::sync::Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
-    >,
 }
 
 struct Row {
@@ -747,7 +742,6 @@ impl Library {
                     tiers: lodestash_app::config::AppConfig::load()
                         .size_tiers
                         .normalized(),
-                    ai_embedder: Default::default(),
                 };
                 lib.reload();
                 lib
@@ -768,7 +762,6 @@ impl Library {
             rows: Vec::new(),
             paths: HashMap::new(),
             tiers: SizeTiers::default(),
-            ai_embedder: Default::default(),
         }
     }
 
@@ -2087,36 +2080,26 @@ impl Library {
     }
 
     /// AI-mode search (TopBar ⟨Tags⟩/⟨AI⟩): RRF-fuse FTS with query embeddings via
-    /// `catalog::hybrid_search` (AI-PIPELINE §3). The embedder resolves once (model load is
-    /// seconds — per keystroke would be unusable) and the query embeds in its text space, which
-    /// is the same joint space the image/audio embeddings were written into. Returns `None` when
-    /// no local model is installed or the embed is a stub, so `page` falls back to FTS honestly.
+    /// `catalog::hybrid_search` (AI-PIPELINE §3). The query is embedded into every installed text
+    /// space — SigLIP's for pixels, CLAP's for audio — by the same function the agent planes use.
+    /// Returns `None` when no local model is installed, so `page` falls back to FTS honestly.
     fn ai_ranks(&self, needle: &str) -> Option<HashMap<i64, usize>> {
         if needle.is_empty() {
             return None;
         }
-        let embedder = {
-            let mut slot = self.ai_embedder.lock().ok()?;
-            if slot.is_none() {
-                *slot = lodestash_app::drains::resolve_embedder();
-            }
-            slot.clone()?
-        };
-        let vec = embedder.embed_text(needle);
-        if vec.is_empty() {
-            return None; // a stub embedder — no usable text space
+        let spaces = lodestash_app::drains::query_spaces(needle);
+        if spaces.is_empty() {
+            return None;
         }
-        let model_id = embedder.model_id().to_string();
+        let borrowed: Vec<(&str, &[f32])> = spaces
+            .iter()
+            .map(|(m, v)| (m.as_str(), v.as_slice()))
+            .collect();
         const HIT_CAP: usize = 100_000;
         let ids = self
             .catalog
             .as_ref()?
-            .hybrid_search(
-                needle,
-                &[(model_id.as_str(), vec.as_slice())],
-                None,
-                HIT_CAP,
-            )
+            .hybrid_search(needle, &borrowed, None, HIT_CAP)
             .ok()?;
         Some(ids.into_iter().enumerate().map(|(r, id)| (id, r)).collect())
     }
@@ -2600,7 +2583,6 @@ mod tests {
             rows,
             paths: HashMap::new(),
             tiers: SizeTiers::default(),
-            ai_embedder: Default::default(),
         }
     }
 

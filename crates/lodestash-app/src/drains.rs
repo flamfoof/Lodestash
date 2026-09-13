@@ -107,6 +107,58 @@ pub fn resolve_audio_embedder() -> Option<Arc<dyn lodestash_ai::embedder::Embedd
     }
 }
 
+/// A text query embedded into every local space the library was written in: SigLIP's for pixels,
+/// CLAP's for audio (IDENTIFICATION-AND-SEARCH §B "joint SigLIP/CLAP space", v1 plan S11).
+///
+/// Both search surfaces used to embed the query in SigLIP's space only, so audio — whose vectors
+/// are CLAP's — could be found by name and never by description, while the MCP tool promised
+/// "metallic clang". One function, so the grid and the agent planes cannot drift apart again.
+/// Empty when neither model is installed; a space whose model is missing is simply absent.
+///
+/// Each embedder is resolved once and kept. A miss is retried after [`EMBEDDER_RETRY`], so models
+/// installed while the app runs become searchable without a restart, and a missing model does not
+/// cost a failed load on every query.
+pub fn query_spaces(query: &str) -> Vec<(String, Vec<f32>)> {
+    static VISUAL: EmbedderSlot = EmbedderSlot::new();
+    static AUDIO: EmbedderSlot = EmbedderSlot::new();
+    [
+        VISUAL.get(resolve_embedder),
+        AUDIO.get(resolve_audio_embedder),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|e| {
+        let v = e.embed_text(query);
+        // A stub embedder answers empty: it has no text space worth searching.
+        (!v.is_empty()).then(|| (e.model_id().to_string(), v))
+    })
+    .collect()
+}
+
+/// How long a failed embedder resolve is remembered before [`query_spaces`] tries again.
+pub const EMBEDDER_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
+type SharedEmbedder = Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>;
+
+struct EmbedderSlot(std::sync::Mutex<(Option<SharedEmbedder>, Option<std::time::Instant>)>);
+
+impl EmbedderSlot {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new((None, None)))
+    }
+
+    /// The loaded embedder, resolving it on first use or once a remembered miss has aged out. The
+    /// lock is held across the load so concurrent first queries wait for one load, not start two.
+    fn get(&self, resolve: fn() -> Option<SharedEmbedder>) -> Option<SharedEmbedder> {
+        let mut slot = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.0.is_none() && slot.1.map_or(true, |t| t.elapsed() >= EMBEDDER_RETRY) {
+            slot.0 = resolve();
+            slot.1 = Some(std::time::Instant::now());
+        }
+        slot.0.clone()
+    }
+}
+
 /// Decode an audio file to mono f32 at CLAP's 48 kHz. `rodio` bundles symphonia, so this needs
 /// no new dependency. Capped at a little over the 10 s the encoder consumes.
 /// ponytail: linear resampling — inaudible at mel resolution; swap in a windowed-sinc if audio

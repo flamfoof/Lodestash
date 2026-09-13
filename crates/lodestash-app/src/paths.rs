@@ -14,6 +14,11 @@ pub fn default_cache_dirs() -> (Option<PathBuf>, Option<PathBuf>) {
 }
 
 pub fn catalog_db_path() -> Option<PathBuf> {
+    // A catalog somewhere else: an isolated fixture for a spawned-process test, or a second library.
+    // Taken as given — nothing is created for it, so a wrong path is a missing catalog, not a new one.
+    if let Some(path) = std::env::var_os("LODESTASH_CATALOG") {
+        return Some(PathBuf::from(path));
+    }
     let dir = dirs::data_dir()?.join("Lodestash");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("catalog.db"))

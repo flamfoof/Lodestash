@@ -58,7 +58,7 @@ this file stays the live board.
       revision check and a durable receipt (M27). The legacy `add_tag` writes as
       `ai:legacy-agent`; `get_asset` (one builder for both planes) reports provenance and
       `annotation_revision`; the Inspector styles AI by provenance. *Open:* vocabulary revisions
-      (Task 4a) and headless approvals (S11).
+      (Task 4a). Headless approvals landed with S11.
 - [x] **R3 · S06 — component-scoped prefab evidence** (M28, [ADR-0018](decisions/ADR-0018-prefabs-are-scoped-evidence.md)). Prefabs are
       parsed per YAML document: MeshRenderer ↔ MeshFilter joined by `m_GameObject`, a
       SkinnedMeshRenderer keeps its own mesh and slots; material texture bindings keep their
@@ -101,8 +101,18 @@ this file stays the live board.
       outright — proven by a test where the redirect target gets zero connections. Agent planes
       serve bytes only under `mcp_bytes_enabled` (`403 bytes_not_released`; the MCP preview withholds
       the image and still answers). Both toggles are in Settings.
-- [ ] **R5 · S11–S13 — headless startup, bounded library walk, app-owned bulk runs** (MCP handoff
-      Tasks 1–3 and 5).
+- [x] **R5 · S11 — headless startup and nonblocking forwarding** (M31, [ADR-0011](decisions/ADR-0011-headless-mcp-forwards-writes.md)
+      amended; MCP handoff Task 1). The engine reads through `Catalog::open_reader` — read-only,
+      and it refuses any schema it would have to migrate — and its three direct writes moved onto the
+      bridge. A headless server forwards every app-owned tool whole to the app with the same
+      `catalog_id`, re-reading `engine.json` per call, never retrying, relaying the app's job ids and
+      approvals, and answering `app_unavailable` when there is no such app. REST handlers and MCP
+      tools run on the blocking pool (tests prove `server-info` answers while a preview renders);
+      ORT is set before `--mcp` and logs go to stderr (a spawned stdio test fails on any non-JSON-RPC
+      line). Search embeds the query in SigLIP *and* CLAP space on every surface, so audio is found
+      by description. Server info reports `catalog_id`, `writer`, `bytes_released`, `enabled_tools`.
+      *Open:* `job_not_found` is still `not_found`.
+- [ ] **R5 · S12–S13 — bounded library walk, app-owned bulk runs** (MCP handoff Tasks 2–3 and 5).
 - [ ] **Proxies/packs · S14–S18 — pre-extraction identity, one cache policy, visual tiers, font
       specimens, batched inflate.**
 - [ ] **Records · S19 — one board, one rules source, release evidence.**

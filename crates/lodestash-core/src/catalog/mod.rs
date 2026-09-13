@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use tracing::info;
 
 use crate::error::{CoreError, Result};
@@ -353,6 +353,10 @@ fn scope_clause(only: Option<&[i64]>) -> String {
     }
 }
 
+/// The schema version this build writes and reads: the last migration's number. A reader refuses
+/// any other ([`Catalog::open_reader`]); a test pins it to the migration list.
+pub const SCHEMA_VERSION: u32 = 31;
+
 impl Catalog {
     /// Open (or create) the catalog at `path`. Runs all pending migrations.
     pub fn open(path: &Path) -> Result<Self> {
@@ -369,6 +373,53 @@ impl Catalog {
         Ok(catalog)
     }
 
+    /// Open an existing catalog **read-only** — the agent planes' own connection (v1 plan S11).
+    ///
+    /// Schema setup belongs to the one writer (ADR-0002). [`Self::open`] migrates, so a headless
+    /// MCP server that used it could upgrade the live catalog underneath a running app, from a
+    /// process that owns none of the app's state. This connection cannot write at all — the file is
+    /// opened with `SQLITE_OPEN_READ_ONLY`, and no pragma that changes the file is issued — and a
+    /// catalog at any other schema version is refused with what to do, rather than read with
+    /// queries written for a different shape.
+    pub fn open_reader(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|e| CoreError::Catalog(format!("open failed: {e}")))?;
+        // No `journal_mode`: the writer set WAL on the file, and changing it is a write. A reader
+        // needs only its own cache, and to wait on the writer rather than error.
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             PRAGMA cache_size=-32768;
+             PRAGMA temp_store=MEMORY;
+             PRAGMA busy_timeout=15000;",
+        )
+        .map_err(|e| CoreError::Catalog(format!("configure pragmas: {e}")))?;
+        let catalog = Self {
+            conn,
+            db_path: Some(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())),
+            appraise_focus: AppraiseFocus::default(),
+        };
+        let version = catalog.schema_version()?;
+        if version != SCHEMA_VERSION {
+            return Err(CoreError::Catalog(if version < SCHEMA_VERSION {
+                format!(
+                    "the catalog is at schema v{version} and this build reads v{SCHEMA_VERSION} — \
+                     open the Lodestash app once to upgrade it"
+                )
+            } else {
+                format!(
+                    "the catalog is at schema v{version}, newer than this build (v{SCHEMA_VERSION}) \
+                     — update Lodestash"
+                )
+            }));
+        }
+        Ok(catalog)
+    }
+
     /// In-memory catalog (tests / CLI dry-run).
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()
@@ -381,6 +432,18 @@ impl Catalog {
         };
         catalog.apply_migrations()?;
         Ok(catalog)
+    }
+
+    /// This catalog's identity (M31): random, minted when the schema reached v31, stable for the
+    /// life of the file wherever it is moved.
+    pub fn catalog_id(&self) -> Result<String> {
+        self.conn
+            .query_row(
+                "SELECT value FROM catalog_meta WHERE key = 'catalog_id'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| CoreError::Catalog(format!("catalog_id: {e}")))
     }
 
     pub fn schema_version(&self) -> Result<u32> {
@@ -436,6 +499,7 @@ impl Catalog {
             (28, MIGRATION_28_PREFAB_EVIDENCE),
             (29, MIGRATION_29_TEXTURE_ROLES),
             (30, MIGRATION_30_EMBEDDING_GENERATION),
+            (31, MIGRATION_31_CATALOG_IDENTITY),
         ];
 
         for (version, sql) in migrations {
@@ -2223,6 +2287,20 @@ CREATE INDEX IF NOT EXISTS idx_file_pkgentry
   ON asset_file(package_entry_id) WHERE package_entry_id IS NOT NULL;
 ";
 
+/// M31 — the catalog's own identity (v1 plan S11, ENGINE-API §8.4).
+///
+/// Two processes can each hold a catalog and each be "Lodestash": a headless MCP server forwarding a
+/// write has to know the app it reached has the same catalog open, and `get_server_info` reports it
+/// so a client can tell two libraries apart. A path is not an identity — it changes when the file
+/// moves and collides across machines — so the catalog carries a random id, minted once here.
+const MIGRATION_31_CATALOG_IDENTITY: &str = "
+CREATE TABLE catalog_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+INSERT INTO catalog_meta (key, value) VALUES ('catalog_id', lower(hex(randomblob(16))));
+";
+
 /// M30 — a durable per-model embedding generation (v1 plan S09).
 ///
 /// A resident vector snapshot has to know when it is stale, and a GUI process cannot notify a
@@ -2506,7 +2584,7 @@ pub struct ProjectRow {
 }
 
 /// One asset to record as imported into a project (the durable outcome of the ENGINE-API §5 flow).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ImportSpec {
     pub asset_id: i64,
     pub source_package_id: Option<i64>,

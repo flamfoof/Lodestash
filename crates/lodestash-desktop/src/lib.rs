@@ -2138,6 +2138,36 @@ fn engine_write_bridge(writer: Writer) -> lodestash_api::AgentWriteFn {
             asset_ids: vec![asset_id],
         })
         .map(|r| r.changed),
+        AgentWrite::RegisterProject {
+            project_path,
+            unity_version,
+            pipeline,
+        } => run(Op::RegisterProject {
+            project_path,
+            unity_version,
+            pipeline,
+        })
+        .map(|r| r.changed),
+        AgentWrite::RecordImports {
+            project_id,
+            specs,
+            batch_id,
+        } => run(Op::RecordImports {
+            project_id,
+            specs,
+            batch_id,
+        })
+        .map(|r| r.changed),
+        AgentWrite::RecordExports {
+            batch_id,
+            dest_path,
+            files,
+        } => run(Op::RecordExports {
+            batch_id,
+            dest_path,
+            files,
+        })
+        .map(|r| r.changed),
     })
 }
 
@@ -2172,15 +2202,20 @@ fn legacy_agent_batch(
 }
 
 /// Build the shared engine `ServerState` (B12) — one read-only catalog connection, the allow-list
-/// applied, the per-session token minted. `None` when there is no catalog on disk yet.
-fn build_engine_state() -> Option<(
-    std::sync::Arc<lodestash_api::ServerState>,
+/// applied, the per-session token minted. `Err` says why there is none: no catalog on disk yet, or
+/// one this build cannot read without the app upgrading it first (v1 plan S11).
+fn build_engine_state() -> Result<
+    (
+        std::sync::Arc<lodestash_api::ServerState>,
+        String,
+        Option<usize>,
+    ),
     String,
-    Option<usize>,
-)> {
-    let db = lodestash_app::paths::catalog_db_path()?;
+> {
+    let db = lodestash_app::paths::catalog_db_path()
+        .ok_or("no data directory for the catalog on this system")?;
     if !db.exists() {
-        return None;
+        return Err("no catalog on disk yet — open the app once to create it".into());
     }
     let (cache_root, workspace) = lodestash_app::paths::default_cache_dirs();
     let state = lodestash_api::ServerState::new(
@@ -2188,7 +2223,7 @@ fn build_engine_state() -> Option<(
         workspace.unwrap_or_else(|| cache_root.clone().unwrap_or_default()),
         engine_preview_fn(cache_root),
     )
-    .ok()?;
+    .map_err(|e| e.to_string())?;
     let state = std::sync::Arc::new(state);
     let allowed = apply_allow_list(&state);
     // ENGINE-API §8.3: `write_tags` writes under the producer the user configured for this host,
@@ -2198,44 +2233,35 @@ fn build_engine_state() -> Option<(
     // Whether an agent may receive bytes at all (v1 plan S10) — metadata and links are always
     // available, the files are not until the user says so.
     state.set_byte_release(cfg.mcp_bytes_enabled);
-    // The REST/MCP semantic-search plane (ENGINE-API §2 `mode=ai`) needs the query embedder —
-    // the same local SigLIP the grid's AI mode uses, resolved lazily on the first ai search
-    // (model load is seconds; a startup resolve would slow every launch). `Vec::new()` from the
-    // fn means "no embedder" → the route answers `ai_unavailable` instead of degrading.
-    state.set_query_embedder(Box::new(|query: &str| {
-        static EMBEDDER: std::sync::OnceLock<
-            Option<std::sync::Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
-        > = std::sync::OnceLock::new();
-        let embedder = EMBEDDER.get_or_init(lodestash_app::drains::resolve_embedder);
-        let Some(e) = embedder else {
-            return Vec::new();
-        };
-        let v = e.embed_text(query);
-        if v.is_empty() {
-            return Vec::new(); // a stub embedder — no usable text space
-        }
-        vec![(e.model_id().to_string(), v)]
-    }));
+    // The REST/MCP semantic-search plane (ENGINE-API §2 `mode=ai`) embeds the query exactly as the
+    // grid's AI mode does — SigLIP and CLAP, resolved lazily on the first ai search (model load is
+    // seconds; a startup resolve would slow every launch). No spaces means no model → the route
+    // answers `ai_unavailable` instead of degrading.
+    state.set_query_embedder(Box::new(lodestash_app::drains::query_spaces));
     let token = state.token().to_string();
-    Some((state, token, allowed))
+    Ok((state, token, allowed))
 }
 
 /// `--mcp` headless: the MCP stdio server without the GUI. Runs until stdin closes; `tracing`
-/// already initialized by `run()`. Exits non-zero if there is no catalog to serve.
+/// already initialized by `run()`. Exits non-zero if there is no catalog it can serve.
 fn run_mcp_headless() {
-    let Some((state, _token, _allowed)) = build_engine_state() else {
-        eprintln!(
-            "lodestash-desktop --mcp: no catalog on disk yet — open the app once to create it"
-        );
-        std::process::exit(2);
+    let (state, _token, _allowed) = match build_engine_state() {
+        Ok(built) => built,
+        Err(why) => {
+            eprintln!("lodestash-desktop --mcp: {why}");
+            std::process::exit(2);
+        }
     };
-    // Writes go to the running app's single writer, never to a second writer in this process
-    // (ADR-0002). With no app running the forward fails honestly and the server stays read-only.
-    match crate::agent_bridge::forwarding_write_fn() {
-        Some(f) => state.set_write(f),
-        None => tracing::warn!(
-            "no engine.json — this MCP server is read-only until the Lodestash app is running"
-        ),
+    // Everything the app owns — writes, jobs, approvals — goes to the running app, never to a
+    // second writer or a second job registry in this process (ADR-0002, v1 plan S11). The line
+    // re-reads the app's handshake on every call, so an app started (or restarted) after this
+    // server is found; with no app running, those tools say so and reads keep working.
+    match state.catalog_id() {
+        Ok(id) => state.set_app_proxy(crate::agent_bridge::app_proxy(id)),
+        Err(e) => {
+            eprintln!("lodestash-desktop --mcp: {e}");
+            std::process::exit(2);
+        }
     }
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2249,19 +2275,14 @@ fn run_mcp_headless() {
 
 pub fn run() {
     tracing_subscriber::fmt()
+        // stderr, always. Under `--mcp` stdout *is* the JSON-RPC channel, and the fmt layer's
+        // default writer is stdout: one log line there is a malformed message to the host.
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "lodestash_desktop=info".into()),
         )
         .init();
-
-    // `--mcp` (ENGINE-API §2, MCP↔REST 1:1): serve the MCP stdio plane headless — an agent host
-    // spawns `lodestash-desktop --mcp` and speaks JSON-RPC on stdin/stdout. The process owns
-    // stdin until the host closes it; no window, no REST server, no writer thread.
-    if std::env::args().any(|a| a == "--mcp") {
-        run_mcp_headless();
-        return;
-    }
 
     // Point `ort` at the runtime the model manager downloaded, before anything tries to load an
     // embedder. `ort` is built with `load-dynamic` (TECH-STACK §5), so it dlopens
@@ -2278,6 +2299,20 @@ pub fn run() {
     // the process is still single-threaded, and this is before the writer, the REST server and
     // Tauri's own threads exist.
     lodestash_app::models::apply_ort_dylib_env();
+
+    // `--mcp` (ENGINE-API §2, MCP↔REST 1:1): serve the MCP stdio plane headless — an agent host
+    // spawns `lodestash-desktop --mcp` and speaks JSON-RPC on stdin/stdout. The process owns
+    // stdin until the host closes it; no window, no REST server, no writer thread.
+    //
+    // After the runtime path, not before (v1 plan S11): this branch used to return first, so a
+    // host-spawned server — which inherits no `ORT_DYLIB_PATH` from anyone — could never load the
+    // query embedder, and `semantic_search` answered "no embedding model" on a machine that had
+    // every model installed.
+    if std::env::args().any(|a| a == "--mcp") {
+        run_mcp_headless();
+        return;
+    }
+
     // A debug build's window loads the dev server, so the app starts it rather than expecting the
     // person launching to have started it in another terminal. Release builds serve `ui/dist` from
     // the bundle and skip this entirely.
@@ -2360,7 +2395,7 @@ pub fn run() {
             // connection — the API never writes the catalog, so the single-writer rule holds.
             let (engine_state, engine_port, engine_token, engine_allowed) =
                 match build_engine_state() {
-                    Some((state, token, allowed)) => {
+                    Ok((state, token, allowed)) => {
                         // Wire the write bridge before serving: mutating agent ops (add_tag,
                         // apply_mapping, identify, unpack, staging) go through the single writer.
                         if let Some(w) = writer.clone() {
@@ -2384,7 +2419,10 @@ pub fn run() {
                             .ok();
                         (Some(state_arc), port, token, allowed)
                     }
-                    None => (None, None, String::new(), None),
+                    Err(why) => {
+                        tracing::warn!(%why, "agent planes not started");
+                        (None, None, String::new(), None)
+                    }
                 };
             app.manage(AppState {
                 library: Mutex::new(library),

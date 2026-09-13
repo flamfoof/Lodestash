@@ -49,22 +49,30 @@ Create `mcp-analysis-smoke.mjs` inside the existing `scripts/` directory for the
 `forwarding_write_fn`. **Produces:** trustworthy startup/read behavior and capability reporting;
 not yet new authoring operations. Governed by v1 S11, ADR-0011 and ENGINE-API §8.4.
 
-- [ ] Add a spawned stdio test against an isolated temporary catalog: initialize → initialized
+- [x] Add a spawned stdio test against an isolated temporary catalog: initialize → initialized
   notification → tools/list → get_server_info → stdin EOF. Parse every stdout line as JSON-RPC;
   deliberately enable logging so stdout contamination fails the test. Check timely exit and no window.
-- [ ] Add checks that headless startup never migrates/writes a missing, current or older-schema
+- [x] Add checks that headless startup never migrates/writes a missing, current or older-schema
   catalog. Initialize the fixture through the app/core setup path before opening the reader.
-- [ ] Make reader construction truly read-only, initialize managed ORT before headless model use,
+- [x] Make reader construction truly read-only, initialize managed ORT before headless model use,
   explicitly direct tracing to stderr, and keep expensive work off the current-thread async loop.
   Probe capabilities without downloading/loading models as an unconditional startup dependency.
-- [ ] Extend server information with catalog identity, supported/enabled analysis operations and
+- [x] Extend server information with catalog identity, supported/enabled analysis operations and
   writer availability. Report unavailable writer separately from failed MCP connection.
-- [ ] Run `cargo test -p lodestash-mcp`, `cargo test -p lodestash-api`, and the affected desktop/core
+- [x] Run `cargo test -p lodestash-mcp`, `cargo test -p lodestash-api`, and the affected desktop/core
   startup tests. Run the spawned harness against the freshly built executable; record the negotiated
   protocol version and names actually returned, without logging handshake secrets.
 
 **Acceptance:** a local MCP client can connect without Vite, the GUI or the computer-use helper;
 existing catalog reads work and the absence of a writer is explicit. Client registration is Task 6.
+
+*Done with v1 plan S11 (2026-09-12).* The spawned test is `crates/lodestash-desktop/tests/mcp_stdio.rs`
+rather than a script — a Rust integration test builds the executable it spawns and runs in the gate,
+where a `.mjs` would need a separately built binary and a manual step. It isolates the catalog with
+`LODESTASH_CATALOG`, runs with `RUST_LOG=trace`, and records the negotiated protocol version. Server
+info reports `catalog_id`, `writer`, `bytes_released` and `enabled_tools`; "analysis operations"
+are the enabled tools until Tasks 2–5 add their own. Model availability is not probed at startup —
+`semantic_search` still resolves its embedders lazily.
 
 ## Task 2 — Library discovery, correct search, single/list/random selection
 

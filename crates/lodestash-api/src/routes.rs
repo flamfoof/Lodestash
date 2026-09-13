@@ -47,6 +47,8 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/stage", get(list_staged).post(stage_asset))
         .route("/v1/stage/import", post(import_staged))
         .route("/v1/assets/{id}/file", get(file))
+        // Innermost: every handler below runs off the runtime thread (v1 plan S11).
+        .layer(axum::middleware::from_fn(off_runtime))
         // Order matters: `guard` is added last so it wraps outermost and runs **first** — an
         // unauthenticated caller is rejected before `gate` could reveal which tools exist.
         .layer(from_fn_with_state(state.clone(), gate))
@@ -91,6 +93,31 @@ fn tool_for(method: &Method, path: &str, query: Option<&str>) -> Option<&'static
         ("POST", "/v1/stage/import") => "import_staged",
         _ => return None,
     })
+}
+
+/// Run a handler on the blocking pool (v1 plan S11).
+///
+/// The server is one current-thread runtime, and the handlers call synchronous state: a catalog
+/// behind a mutex, a thumbnail render, an ONNX query embedding, a write that waits its turn at the
+/// writer. Any one of those held the only thread, so a preview being rendered stopped `jobs/{id}`
+/// and `cancel` from answering — the two requests whose whole point is to answer while something
+/// else is slow. Here the handler's future runs on a pool thread instead; auth and the allow-list
+/// stay on the runtime thread, where they are cheap.
+///
+/// `Handle::block_on` from a pool thread is sound on a current-thread runtime while that
+/// runtime's own `block_on` is running, which `serve` guarantees — it is what drives the IO and
+/// timers a handler awaits.
+async fn off_runtime(req: Request, next: Next) -> Response {
+    let rt = tokio::runtime::Handle::current();
+    match tokio::task::spawn_blocking(move || rt.block_on(next.run(req))).await {
+        Ok(response) => response,
+        Err(e) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "The request worker failed.",
+            &e.to_string(),
+        ),
+    }
 }
 
 /// Per-tool allow-list check (UI-SPEC §16, card 178). Runs after [`guard`]. A disabled tool is a
@@ -183,11 +210,10 @@ fn is_loopback_authority(authority: &str) -> bool {
 // ---------------------------------------------------------------------------------------------
 
 async fn server_info(State(state): State<Shared>) -> Response {
-    let (app, schema) = match state.server_info() {
-        Ok(v) => v,
-        Err(e) => return db_err(e),
-    };
-    Json(json!({ "app": app, "schema": schema, "api": "v1" })).into_response()
+    match state.server_info_json() {
+        Ok(body) => Json(body).into_response(),
+        Err(e) => db_err(e),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -974,6 +1000,7 @@ mod tests {
         let ids = seed_embedded(&db);
         let st =
             Arc::new(ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap());
+        st.set_write(crate::test_writes(&db));
 
         let mk = |asset: i64, project: Option<i64>| crate::ImportRequest {
             asset_ids: vec![asset],
@@ -1128,6 +1155,7 @@ mod tests {
         };
         let st: Shared =
             Arc::new(ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap());
+        st.set_write(crate::test_writes(&db));
         let token = st.token.clone();
 
         // The plugin registers itself first (§5.1).
@@ -1370,6 +1398,60 @@ mod tests {
             s,
             StatusCode::NOT_FOUND,
             "with bytes released the route is ungated (404 for a missing asset, not 403)"
+        );
+    }
+
+    /// The engine is one current-thread runtime (v1 plan S11). A slow handler — here a preview that
+    /// takes a second and a half to render — must not stop a quick question from being answered
+    /// meanwhile; before `off_runtime`, the render held the only thread and everything queued
+    /// behind it.
+    #[tokio::test]
+    async fn a_slow_handler_does_not_stall_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        let ids = seed_embedded(&db);
+        let st = Arc::new(
+            ServerState::new(
+                &db,
+                dir.path().to_path_buf(),
+                Box::new(|_| {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    None
+                }),
+            )
+            .unwrap(),
+        );
+        st.set_byte_release(true);
+        let token = st.token.clone();
+
+        let started = std::time::Instant::now();
+        let slow = send(
+            router(st.clone()),
+            get_req(
+                &format!("/v1/assets/{}/preview", ids[0]),
+                Some(&token),
+                None,
+            ),
+        );
+        let quick = async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let answer = send(
+                router(st.clone()),
+                get_req("/v1/server-info", Some(&token), None),
+            )
+            .await;
+            (answer, started.elapsed())
+        };
+        let ((slow_status, _), ((quick_status, _), quick_at)) = tokio::join!(slow, quick);
+        assert_eq!(quick_status, StatusCode::OK);
+        assert_eq!(
+            slow_status,
+            StatusCode::NOT_FOUND,
+            "the render produced nothing"
+        );
+        assert!(
+            quick_at < std::time::Duration::from_millis(1000),
+            "server-info waited {quick_at:?} for a preview render"
         );
     }
 

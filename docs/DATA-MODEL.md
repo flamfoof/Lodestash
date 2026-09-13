@@ -38,6 +38,9 @@ would need a reconciliation/outbox job. That atomicity outweighs the raw through
 vector DB at this scale.
 
 Run with `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, a generous page cache.
+The agent planes' connection is the exception: `Catalog::open_reader` opens the file
+`SQLITE_OPEN_READ_ONLY`, issues no pragma that writes, and refuses a schema version other than
+`SCHEMA_VERSION` (v1 plan S11) — migrating is the writer's job.
 
 ---
 
@@ -934,6 +937,7 @@ transaction, in order, on open. Shipped so far:
 | **M2** | Mapping library: `taxonomy`, `category`, `category_alias`, `mapping_rule`, `asset_category` (§4) |
 | **M3** | Engine round-trip: `package` + `asset.package_id`, `project`, `import_record`, `asset.license/attribution/license_url` (§7, §9) |
 | **M4** | `asset.rating`, `package.pipeline`, `project.pipeline` (§12) |
+| **M31** | Catalog identity (v1 plan S11): `catalog_meta(key, value)` holding a random `catalog_id`, minted by the migration. A path is not an identity — it changes when the file moves — and a headless MCP server must only forward to an app serving the same catalog (ENGINE-API §1). Readers refuse any schema but their own (`Catalog::open_reader`), so an agent host connecting first cannot upgrade a catalog the app has not |
 | **M30** | Embedding generations (v1 plan S09): `embedding_generation(model_id, generation, updated_at)`, bumped inside every `upsert_embedding` transaction. A resident vector snapshot (§3) is only safe if staleness is a fact in the catalog — a GUI process cannot notify an independent headless one. Existing models start at generation 1; no vector is touched and the cache starts empty on every restart |
 | **M29** | Texture roles (v1 plan S07): `asset_relationship.role` holds the material property a `uses_texture` edge fills (`_MainTex`, `_BumpMap`…), so a preview paints with the albedo instead of the lowest-id texture (§10). Every live material is queued for one more dependency scan to fill it; an edge without a role is judged by its texture's file name |
 | **M28** | Prefab evidence (v1 plan S06, [ADR-0018](decisions/ADR-0018-prefabs-are-scoped-evidence.md)): `prefab_file` (scope, path, size/mtime revision) and `prefab_binding` (GameObject, renderer, slot, mesh GUID, material GUID); the `unity_prefab` edges are derived from them (§10). The edges already recorded were whole-file pairings no row attributes to a prefab, so they become the evidence of the reserved scope `legacy`: a source's legacy pairings are retired once a walk of that source completes, and the rest once a walk of every scope does — no edge is deleted before a reharvest has replaced it. In-pack assets take the GUID their package manifest names, and materialized in-pack rows are queued for the dependency scan the archive could not give them |

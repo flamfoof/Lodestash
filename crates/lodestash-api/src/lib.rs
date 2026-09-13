@@ -15,9 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use lodestash_core::catalog::{
-    AssetSummaryRow, Catalog, ImportOutcome, ImportSpec, PackageListing, ProjectRow,
-};
+use lodestash_core::catalog::{AssetSummaryRow, Catalog, ImportSpec, PackageListing, ProjectRow};
 
 /// ENGINE-API §2 `list_tags` row — `(namespace, value, asset count)`.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -165,6 +163,25 @@ pub enum AgentWrite {
     TagBatch {
         request: TagBatchRequest,
         digest: String,
+    },
+    /// Register or refresh a Unity editor and make it the active project (ENGINE-API §5.1).
+    RegisterProject {
+        project_path: String,
+        unity_version: Option<String>,
+        pipeline: Option<String>,
+    },
+    /// The durable `import_record` rows for an acked request (ENGINE-API §5.3). Reports how many
+    /// were recorded; the rest were already imported.
+    RecordImports {
+        project_id: i64,
+        specs: Vec<ImportSpec>,
+        batch_id: String,
+    },
+    /// Export history for the files an export wrote (FEATURES §7.6).
+    RecordExports {
+        batch_id: String,
+        dest_path: String,
+        files: Vec<(Option<i64>, String)>,
     },
 }
 
@@ -335,6 +352,18 @@ impl TagBatchKickoff {
 /// The desktop's write bridge — [`AgentWrite`] → writer `Op` → changed rows.
 pub type AgentWriteFn = Box<dyn Fn(AgentWrite) -> Result<usize, String> + Send + Sync>;
 
+/// A headless server's line to the running app (v1 plan S11): one REST request — method, `/v1/`
+/// path, JSON body — answered with the app's status and JSON body, or `Err` when no app answered.
+///
+/// Operations the app owns — writes, jobs, approvals — are forwarded whole rather than run a
+/// second time here: a job this process created would be invisible to the app, and an approval
+/// parked here would wait for a window that does not exist.
+pub type AppProxyFn = Box<
+    dyn Fn(&str, &str, Option<&serde_json::Value>) -> Result<(u16, serde_json::Value), String>
+        + Send
+        + Sync,
+>;
+
 /// Body of `import_to_project` (ENGINE-API §5.2). `project_id` omitted ⇒ the active editor.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ImportRequest {
@@ -504,6 +533,8 @@ pub struct ServerState {
     /// The producer this host's agent writes tags under (`agent_producer_id`). `None` refuses
     /// `write_tags` rather than attribute an agent's tags to a producer nobody chose.
     agent_producer: Mutex<Option<String>>,
+    /// Set only by a headless server: where app-owned operations go ([`AppProxyFn`]).
+    app_proxy: Mutex<Option<Arc<AppProxyFn>>>,
 }
 
 impl ServerState {
@@ -513,7 +544,10 @@ impl ServerState {
         preview: PreviewFn,
     ) -> lodestash_core::error::Result<Self> {
         Ok(Self {
-            catalog: Mutex::new(Catalog::open(catalog_path)?),
+            // Read-only, and refused at any other schema version (v1 plan S11): every write this
+            // state makes goes through the bridge to the one writer, and migrating is the writer's
+            // job, not a side effect of an agent connecting.
+            catalog: Mutex::new(Catalog::open_reader(catalog_path)?),
             jobs: jobs::Jobs::default(),
             workspace_dir,
             preview,
@@ -528,6 +562,7 @@ impl ServerState {
             write: Mutex::new(None),
             pending_tag_batches: Mutex::new(std::collections::HashMap::new()),
             agent_producer: Mutex::new(None),
+            app_proxy: Mutex::new(None),
         })
     }
 
@@ -627,6 +662,52 @@ impl ServerState {
         Ok((env!("CARGO_PKG_VERSION").to_string(), schema))
     }
 
+    /// The catalog this state reads (M31).
+    pub fn catalog_id(&self) -> lodestash_core::error::Result<String> {
+        self.catalog.lock().unwrap().catalog_id()
+    }
+
+    /// `get_server_info` for both planes (ENGINE-API §4, §8.4): the versions, plus the facts a
+    /// client should check rather than assume from a saved example — which catalog this is, who
+    /// can write it, whether asset bytes are released, and which tools are switched on.
+    ///
+    /// `writer` is `in_process` inside the app; for a headless server it is the answer of the app
+    /// it would forward to, asked now — `app` when that app has this catalog open, otherwise
+    /// `app_unavailable` with the reason. `none` is a state with no way to write at all.
+    pub fn server_info_json(&self) -> lodestash_core::error::Result<serde_json::Value> {
+        let (app, schema) = self.server_info()?;
+        let catalog_id = self.catalog_id()?;
+        let (writer, writer_detail) = if self.write.lock().unwrap().is_some() {
+            ("in_process", None)
+        } else if let Some(proxy) = self.app_proxy() {
+            match proxy("GET", "/v1/server-info", None) {
+                Ok((200, _)) => ("app", None),
+                Ok((status, body)) => (
+                    "app_unavailable",
+                    Some(format!("the app answered {status}: {body}")),
+                ),
+                Err(e) => ("app_unavailable", Some(e)),
+            }
+        } else {
+            ("none", None)
+        };
+        let enabled: Vec<&str> = AGENT_OPERATIONS
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| self.allows(name))
+            .collect();
+        Ok(serde_json::json!({
+            "app": app,
+            "schema": schema,
+            "api": "v1",
+            "catalog_id": catalog_id,
+            "writer": writer,
+            "writer_detail": writer_detail,
+            "bytes_released": self.byte_release(),
+            "enabled_tools": enabled,
+        }))
+    }
+
     /// Structural search. An empty/punctuation-only query falls back to the most recent assets so
     /// a client that just connected sees the library rather than nothing.
     pub fn search(
@@ -713,17 +794,44 @@ impl ServerState {
         unity_version: Option<&str>,
         pipeline: Option<&str>,
     ) -> lodestash_core::error::Result<(i64, bool)> {
-        let id =
-            self.catalog
-                .lock()
-                .unwrap()
-                .register_project(project_path, unity_version, pipeline)?;
+        self.write(AgentWrite::RegisterProject {
+            project_path: project_path.to_string(),
+            unity_version: unity_version.map(str::to_string),
+            pipeline: pipeline.map(str::to_string),
+        })
+        .map_err(lodestash_core::error::CoreError::Catalog)?;
+        // The writer committed; this connection reads the row back rather than trusting a number
+        // passed through a bridge built to count changed rows.
+        let id = self
+            .catalog
+            .lock()
+            .unwrap()
+            .list_projects()?
+            .into_iter()
+            .find(|p| p.project_path == project_path)
+            .map(|p| p.id)
+            .ok_or_else(|| {
+                lodestash_core::error::CoreError::Catalog(
+                    "the project was registered but cannot be read back".into(),
+                )
+            })?;
         Ok((id, true))
     }
 
     /// Registered editors, active first (ENGINE-API §5.1 `list_projects`).
     pub fn list_projects(&self) -> lodestash_core::error::Result<Vec<ProjectRow>> {
         self.catalog.lock().unwrap().list_projects()
+    }
+
+    /// Route app-owned operations to the running app (v1 plan S11). A headless server calls this
+    /// at startup; the GUI never does, because it *is* the app.
+    pub fn set_app_proxy(&self, f: AppProxyFn) {
+        *self.app_proxy.lock().unwrap() = Some(Arc::new(f));
+    }
+
+    /// The line to the running app, when this state belongs to a headless server.
+    pub fn app_proxy(&self) -> Option<Arc<AppProxyFn>> {
+        self.app_proxy.lock().unwrap().clone()
     }
 
     /// The desktop's single-writer bridge. Called once at startup, before any mutating op is
@@ -1311,21 +1419,19 @@ impl ServerState {
             })
             .collect();
         let batch_id = format!("imp-{}", entry.job_id);
-        let outcomes = self
-            .catalog
-            .lock()
-            .unwrap()
-            .record_imports(entry.project_id, &specs, &batch_id)
-            .map_err(AckError::Db)?;
+        let requested = specs.len();
+        let recorded = self
+            .write(AgentWrite::RecordImports {
+                project_id: entry.project_id,
+                specs,
+                batch_id: batch_id.clone(),
+            })
+            .map_err(|e| AckError::Db(lodestash_core::error::CoreError::Catalog(e)))?;
         if let Some(job) = self.jobs.get(&entry.job_id) {
-            let recorded = outcomes
-                .iter()
-                .filter(|o| matches!(o, ImportOutcome::Recorded { .. }))
-                .count();
             job.finish(serde_json::json!({
                 "project_id": entry.project_id,
                 "recorded": recorded,
-                "already_imported": outcomes.len() - recorded,
+                "already_imported": requested.saturating_sub(recorded),
                 "batch_id": batch_id,
             }));
         }
@@ -1494,11 +1600,11 @@ impl ServerState {
                 .iter()
                 .map(|n| (owner.get(n).copied(), n.clone()))
                 .collect();
-            if let Err(e) = self.catalog.lock().unwrap().record_exports(
-                &job.id,
-                &dest.display().to_string(),
-                &rows,
-            ) {
+            if let Err(e) = self.write(AgentWrite::RecordExports {
+                batch_id: job.id.clone(),
+                dest_path: dest.display().to_string(),
+                files: rows,
+            }) {
                 tracing::warn!(%e, "export history not recorded; the files were still written");
             }
         }
@@ -1625,6 +1731,44 @@ fn file_name_for(r: &AssetSummaryRow) -> String {
     }
 }
 
+/// A stand-in for the desktop's writer in this crate's tests: its own writable connection, doing
+/// the writes the engine's read-only connection hands to the bridge (v1 plan S11). Not the writer
+/// thread — just enough to prove the state asks for them instead of writing itself.
+#[cfg(test)]
+pub(crate) fn test_writes(db: &Path) -> AgentWriteFn {
+    let cat = Mutex::new(Catalog::open(db).expect("test writer opens"));
+    Box::new(move |w| {
+        let cat = cat.lock().unwrap();
+        match w {
+            AgentWrite::RegisterProject {
+                project_path,
+                unity_version,
+                pipeline,
+            } => cat
+                .register_project(&project_path, unity_version.as_deref(), pipeline.as_deref())
+                .map(|_| 1),
+            AgentWrite::RecordImports {
+                project_id,
+                specs,
+                batch_id,
+            } => cat.record_imports(project_id, &specs, &batch_id).map(|o| {
+                o.iter()
+                    .filter(|o| {
+                        matches!(o, lodestash_core::catalog::ImportOutcome::Recorded { .. })
+                    })
+                    .count()
+            }),
+            AgentWrite::RecordExports {
+                batch_id,
+                dest_path,
+                files,
+            } => cat.record_exports(&batch_id, &dest_path, &files),
+            other => return Err(format!("the test writer does not do {other:?}")),
+        }
+        .map_err(|e| e.to_string())
+    })
+}
+
 /// Per-session bearer token (ENGINE-API §1). A v4 UUID: 122 bits from the OS RNG.
 pub fn new_token() -> String {
     uuid::Uuid::new_v4().simple().to_string()
@@ -1639,7 +1783,8 @@ pub fn serve(state: std::sync::Arc<ServerState>) -> std::io::Result<Handshake> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
     listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();
-    let handshake = Handshake::new(port, state.token());
+    let mut handshake = Handshake::new(port, state.token());
+    handshake.catalog_id = state.catalog_id().ok();
     let path = write_handshake(&handshake)?;
     tracing::info!(port, path = %path.display(), "engine API listening");
 
@@ -1670,6 +1815,55 @@ pub fn serve(state: std::sync::Arc<ServerState>) -> std::io::Result<Handshake> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The engine's state reads through a connection that cannot migrate or write (v1 plan S11):
+    /// a catalog the app has not upgraded yet is refused with the instruction, not upgraded by
+    /// whichever agent host happened to connect first — and the project an agent registers is
+    /// written by the writer it hands the request to.
+    #[test]
+    fn the_engine_state_neither_migrates_nor_writes_the_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        Catalog::open(&db).unwrap();
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 29;")
+            .unwrap();
+        let refused = ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None))
+            .err()
+            .expect("an old catalog must be refused");
+        assert!(
+            refused.to_string().contains("open the Lodestash app once"),
+            "{refused}"
+        );
+        let version: u32 = rusqlite::Connection::open(&db)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 29, "connecting an agent upgraded the catalog");
+
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(&format!(
+                "PRAGMA user_version = {};",
+                lodestash_core::catalog::SCHEMA_VERSION
+            ))
+            .unwrap();
+        let state = ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap();
+        assert!(
+            state.register_project("C:/dev/Game", None, None).is_err(),
+            "with no writer bridge, registering must fail rather than write through the reader"
+        );
+        state.set_write(test_writes(&db));
+        let (id, _) = state
+            .register_project("C:/dev/Game", None, None)
+            .expect("through the bridge");
+        assert_eq!(
+            state.list_projects().unwrap()[0].id,
+            id,
+            "the reader sees the writer's row"
+        );
+    }
 
     /// An in-pack material must still resolve to something renderable.
     ///

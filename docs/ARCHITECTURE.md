@@ -231,6 +231,12 @@ surfaces as an error rather than a silently stale answer.
 
 - **Single core process**, async runtime (**tokio**) for IO/orchestration + **rayon** for CPU-bound
   batch work (hashing, image decode/resize, offscreen 3D thumbnail renders).
+- **The agent planes read, and ask the writer** (v1 plan S11). The engine's `ServerState` holds a
+  read-only connection (`Catalog::open_reader`) and routes its few writes — project registration,
+  import records, export history — through the same bridge as agent writes. A headless `--mcp`
+  process owns no writer, jobs or approvals at all: it forwards those tools to the app
+  ([ADR-0011](decisions/ADR-0011-headless-mcp-forwards-writes.md)). Its REST and MCP handlers run on
+  tokio's blocking pool, because the runtime is one thread and the state they call is synchronous.
 - **SQLite access**: `rusqlite::Connection` is `!Sync`, so the catalog is **not** shared by handle.
   When multiple frontends go live (GUI + REST + MCP + ingest workers, P5), all writes funnel through
   **one dedicated writer** (a thread/actor owning the connection, fed by a channel); reads use

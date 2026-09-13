@@ -30,8 +30,13 @@ client. Startup sequence:
 
    ```json
    // engine.json
-   { "version": 1, "port": 51731, "token": "b3f1…", "pid": 8123, "api_version": "v1" }
+   { "version": 1, "port": 51731, "token": "b3f1…", "pid": 8123, "api_version": "v1",
+     "catalog_id": "e5406dff133f7c9196a15354e6dbbb71" }
    ```
+
+   `catalog_id` names the catalog the app has open (M31, v1 plan S11). It is how a headless MCP
+   server knows the app it would forward to is serving *its* library; a file without it is treated
+   as a different catalog.
 
    | OS | Handshake file |
    |---|---|
@@ -101,13 +106,14 @@ editor needed); **`/v1/import`** routes into the **currently open** Unity projec
 in-editor import (§5). Both reuse the **same dependency-closure resolution** described in
 [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md) §3.
 
-> **Writes from a headless MCP server** are forwarded to the running app over this same loopback
-> plane, using the `engine.json` port + token ([ADR-0011](decisions/ADR-0011-headless-mcp-forwards-writes.md)).
-> `lodestash-desktop --mcp` keeps a read-only catalog connection — WAL admits any number of
-> readers — and posts each mutating op to the app, so ADR-0002's single writer holds across
-> processes without a lock. With no app running the forward fails and the tool says so.
-> `RemoveTag` and `UnstageAsset` cannot be forwarded: neither has a route here (nor an MCP tool),
-> and they are refused rather than reported as zero rows changed.
+> **A headless MCP server hands app-owned operations to the running app** ([ADR-0011](decisions/ADR-0011-headless-mcp-forwards-writes.md),
+> amended by v1 plan S11). `lodestash-desktop --mcp` reads through its own read-only catalog
+> connection — WAL admits any number of readers — and forwards every tool the app owns (writes,
+> jobs, approvals, `get_job_status`, `cancel_job`) as the one route in this table, relaying the
+> app's body and status as the tool result. Job ids are the app's own; approvals park in the app's
+> tray. `engine.json` is read again for every call, and a call is forwarded only to an app with the
+> same `catalog_id`. Nothing is retried. With no such app the tool answers `app_unavailable` (503)
+> and reads keep working.
 
 > **Parity scope.** "1:1" covers the **agent-facing** surface. A few routes are **REST-only by
 > design** — `GET /v1/assets/{id}/file` (the MCP `resource_link` target) and the plugin-transport
@@ -223,6 +229,14 @@ than redefining, so summaries/details never diverge.
 - **Versioning:** path-prefixed (`/v1/`); `GET /v1/server-info` reports `{app, schema, api}` versions.
   Additive changes are safe; breaking changes get `/v2/`. Plugins check `server-info` on connect and
   degrade gracefully. The handshake file's `api_version` lets a client pick the right prefix.
+- **Capabilities** (v1 plan S11, §8.4): `server-info` also reports `catalog_id`; `writer` —
+  `in_process` inside the app, `app` or `app_unavailable` (with `writer_detail`) for a headless
+  server asking the app it would forward to, `none` when nothing can write; `bytes_released`
+  (ADR-0020); and `enabled_tools`, the agent operations the allow-list leaves on. A client checks
+  these instead of assuming support.
+- **Handlers never block the runtime** (v1 plan S11). Both planes run on one current-thread runtime
+  and call synchronous state, so every REST handler and MCP tool runs on the blocking pool: a slow
+  preview render or model load does not delay `jobs/{id}` or `cancel`.
 
 ---
 
@@ -397,9 +411,8 @@ Unity panel instantly, and vice-versa.
 
 Drafted 2026-09-10. **§8.3 `write_tags` shipped 2026-09-11 (v1 plan S05)** — REST, MCP and the
 approval gate, with durable receipts (M27). Still open within it: `vocabulary_revision` is accepted
-and recorded but enforced only once §8.5 lands, and a headless `--mcp` process parks approvals in
-its own memory, where the desktop tray cannot see them, until S11 routes requests to the app that
-owns the gate. The rest of this section is still proposed. This section owns the wire
+and recorded but enforced only once §8.5 lands. A headless `--mcp` process forwards the request to
+the app that owns the gate (S11, 2026-09-12). The rest of this section is still proposed. This section owns the wire
 contract for [MCP asset analysis](MCP-ASSET-ANALYSIS.md). It refines the v1 architecture plan's
 S04/S05/S10/S11/S12. Existing §2 operations retain their current containers and required parameters;
 the rows below are additive unless explicitly described as an extension. New fields are not evidence
@@ -575,6 +588,8 @@ The headless bridge re-reads the handshake for each new operation, checks catalo
 version and forwards to the app. Status/cancel use the app's job identity, not a nested local job;
 completed receipts remain discoverable after restart. An old missing job is `job_not_found`, never
 assumed successful. An app-closed write is `app_unavailable`; catalog reads continue where safe.
+*Shipped with S11 (2026-09-12)* except `job_not_found`: the app still answers a missing job with
+`not_found`.
 
 ### 8.4 Failures and parity
 

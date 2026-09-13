@@ -1,6 +1,7 @@
 # ADR-0011 — The headless MCP server forwards its writes to the running app
 
-- **Status:** accepted (2026-08-29)
+- **Status:** accepted (2026-08-29); **amended 2026-09-12** by v1 plan S11 — see
+  [Amendment](#amendment-2026-09-12--forward-the-operation-not-the-write)
 - **Relates to:** [ADR-0002](ADR-0002-single-writer-thread.md) (single writer),
   [`ENGINE-API.md`](../ENGINE-API.md) §1–2, [`MCP-AND-ENGINES.md`](../MCP-AND-ENGINES.md) §2
 
@@ -65,6 +66,52 @@ read-only behaviour as before, with a message that says what to do about it.
   the MCP↔REST 1:1 invariant doing its job.
 - **Long-running ops report `1`**, meaning one job accepted, not one row changed: `identify` and
   `unpack` answer with a `job_id` the caller polls. Reporting `0` would read as nothing happening.
+
+## Amendment 2026-09-12 — forward the operation, not the write
+
+The first version forwarded **writes**, one `AgentWrite` at a time, and it left three things wrong
+that a real host would hit:
+
+1. **Jobs were nested.** A forwarded `identify_asset` made a job in the headless process, then
+   polled the app's job for up to thirty minutes on a thread. The id the agent held was the wrong
+   one: `cancel_job` cancelled a wrapper, and the app's tray showed a job no agent could name.
+2. **Approvals parked where no window was.** `write_tags`, `export_asset` and the imports waited
+   on a gate in the headless process's memory; nothing could approve them.
+3. **The handshake was read once, at startup.** An app started — or restarted onto a new port — after
+   the server stranded it read-only until the host was restarted.
+
+And two things the decision assumed were not true: the headless catalog connection was opened with
+`Catalog::open`, which **migrates**, and the headless branch returned before the managed ONNX
+Runtime path was set, so `semantic_search` could never load its model there.
+
+**Now:**
+
+- **App-owned tools are forwarded whole.** `add_tag`, `write_tags`, `apply_mapping`,
+  `identify_asset`, `unpack_package`, `stage_asset`, `import_staged`, `import_to_project`,
+  `export_asset`, `register_project`, `get_job_status` and `cancel_job` each become the one REST
+  request for that operation, and the app's answer — body and status — *is* the tool's answer. The
+  planes are 1:1, so this is the same result the tool gives in-process, with the app's own job id.
+  Nothing is run twice, and no job or approval exists in the headless process.
+- **Every call reads `engine.json` again**, and forwards only when the file names API `v1` and the
+  **same catalog** the server reads (M31 `catalog_id`, carried in the handshake). An app with another
+  library open is never sent anything.
+- **Nothing is retried.** A forward that timed out after it was sent may still land; only a request
+  id (`write_tags`) makes a repeat safe, and that decision belongs to the caller.
+- **No app is a domain failure**, `app_unavailable` (503, `isError`), not a protocol error — the
+  request was well-formed and reads still work. `get_server_info` reports `writer` (`in_process`,
+  `app`, `app_unavailable`, `none`) so a client can check before it asks.
+- **The reader is genuinely read-only** (`Catalog::open_reader`): `SQLITE_OPEN_READ_ONLY`, no
+  pragma that writes, and any schema version other than this build's is refused with what to do.
+  The engine's three direct writes (project registration, import records, export history) moved onto
+  the bridge, so the in-process engine obeys the same rule.
+- **Startup order:** the ONNX Runtime path is set before the `--mcp` branch, and `tracing` writes to
+  stderr — stdout is the JSON-RPC channel, and the fmt layer's default writer was stdout.
+- **Tools run off the async thread.** Both planes are current-thread runtimes calling synchronous
+  state; handlers now run on the blocking pool, so `get_job_status` answers while a preview renders
+  or a model loads.
+
+The "two ops cannot be forwarded" and "long-running ops report `1`" consequences above no longer
+apply: there is no per-write mapping, and a long-running tool returns the app's job.
 
 ## Alternatives rejected
 
