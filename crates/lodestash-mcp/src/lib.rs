@@ -13,7 +13,9 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, ProtocolVersion, Resource, ServerCapabilities, ServerInfo,
+    CallToolResult, ContentBlock, ListResourceTemplatesResult, PaginatedRequestParams,
+    ProtocolVersion, ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
+    ResourceTemplate, ServerCapabilities, ServerInfo,
 };
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
 use schemars::JsonSchema;
@@ -962,11 +964,44 @@ impl ServerHandler for Lodestash {
         .map_err(|e| ErrorData::internal_error(format!("the tool worker failed: {e}"), None))?
     }
 
+    /// `asset://{id}/file` — the one resource shape this server has (ENGINE-API §8.2).
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        Ok(ListResourceTemplatesResult::with_all_items(vec![
+            ResourceTemplate::new("asset://{id}/file", "asset_file").with_description(
+                "An asset's source bytes, when this catalog releases bytes to agents. Large files \
+                 are refused here; read them over the authenticated REST file route instead.",
+            ),
+        ]))
+    }
+
+    /// Read `asset://{id}/file` through the same resolver and byte policy as REST's file route —
+    /// never unrestricted filesystem access, and never more than [`MAX_INLINE_RESOURCE_BYTES`]
+    /// inline.
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ReadResourceResult, ErrorData> {
+        let state = self.state.clone();
+        tokio::task::spawn_blocking(move || read_asset_file(&state, &request.uri))
+            .await
+            .map_err(|e| {
+                ErrorData::internal_error(format!("the resource worker failed: {e}"), None)
+            })?
+    }
+
     fn get_info(&self) -> ServerInfo {
         // `ServerInfo`/`Implementation` are #[non_exhaustive] — build from Default and set fields.
         let mut info = ServerInfo::default();
         info.protocol_version = ProtocolVersion::LATEST;
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .build();
         info.server_info.name = "lodestash".into();
         info.server_info.version = env!("CARGO_PKG_VERSION").into();
         info.instructions = Some(
@@ -1034,6 +1069,58 @@ fn job_path(id: &str, suffix: &str) -> Result<String, ErrorData> {
     Ok(format!("/v1/jobs/{id}{suffix}"))
 }
 
+/// Most bytes one resource read returns inline: the evidence ceiling (ENGINE-API §8.2). Bigger files
+/// are a link to the REST route, not base64 in a model's context.
+pub const MAX_INLINE_RESOURCE_BYTES: u64 = 4 * 1024 * 1024;
+
+fn read_asset_file(state: &ServerState, uri: &str) -> Result<ReadResourceResult, ErrorData> {
+    let refuse = |e: lodestash_api::AgentError| {
+        ErrorData::invalid_request(e.message.clone(), Some(e.to_json()))
+    };
+    let id = uri
+        .strip_prefix("asset://")
+        .and_then(|rest| rest.strip_suffix("/file"))
+        .and_then(|id| id.parse::<i64>().ok())
+        .filter(|id| *id > 0)
+        .ok_or_else(|| {
+            ErrorData::resource_not_found(format!("{uri} is not an asset://{{id}}/file URI"), None)
+        })?;
+    let path = state.resolve_file(id).map_err(refuse)?;
+    let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    if len > MAX_INLINE_RESOURCE_BYTES {
+        return Err(refuse(lodestash_api::AgentError::resource_too_large(
+            format!("the file is {len} bytes; read it from /v1/assets/{id}/file instead"),
+        )));
+    }
+    let bytes = std::fs::read(&path)
+        .map_err(|e| ErrorData::internal_error(format!("reading the file failed: {e}"), None))?;
+    Ok(ReadResourceResult::new(vec![ResourceContents::blob(
+        b64(&bytes),
+        uri,
+    )
+    .with_mime_type(mime_for(&path))]))
+}
+
+/// A content type from the extension, for the kinds a model host can use; anything else is bytes.
+fn mime_for(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("tga") => "image/x-tga",
+        Some("wav") => "audio/wav",
+        Some("ogg") => "audio/ogg",
+        Some("mp3") => "audio/mpeg",
+        Some("glb") => "model/gltf-binary",
+        Some("gltf") => "model/gltf+json",
+        _ => "application/octet-stream",
+    }
+}
+
 /// A search's optional scope, as the shared request type.
 fn scope_of(args: &SearchArgs) -> lodestash_api::SearchScope {
     lodestash_api::SearchScope {
@@ -1091,6 +1178,69 @@ mod tests {
         lodestash_core::catalog::Catalog::open(&db).unwrap();
         let state = ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap();
         (dir, Arc::new(state))
+    }
+
+    /// `asset://{id}/file` reads through the shared resolver and byte policy (v1 plan S12b): the
+    /// bytes come back inline under the ceiling, and a refusal says why — bytes not released, too
+    /// large to inline, or not an asset URI at all.
+    #[test]
+    fn an_asset_resource_is_read_through_the_resolver() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        {
+            let mut c = lodestash_core::catalog::Catalog::open(&db).unwrap();
+            c.seed_media_types().unwrap();
+            let src = c
+                .upsert_import_source("Lib", dir.path().to_str().unwrap(), "folder")
+                .unwrap();
+            std::fs::write(dir.path().join("rock.png"), b"png bytes").unwrap();
+            std::fs::write(
+                dir.path().join("huge.png"),
+                vec![0u8; (MAX_INLINE_RESOURCE_BYTES + 1) as usize],
+            )
+            .unwrap();
+            let rec = |n: &str| lodestash_core::catalog::CrawlRecord {
+                workspace_rel: None,
+                content_hash: None,
+                rel_path: n.into(),
+                name: n.into(),
+                media_type: "image".into(),
+                size_bytes: 1,
+                mtime: 1,
+            };
+            c.record_crawl(src, None, &[rec("rock.png"), rec("huge.png")])
+                .unwrap();
+        }
+        let state = ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap();
+        let id = |name: &str| {
+            state
+                .search("", 10, &Default::default())
+                .unwrap()
+                .into_iter()
+                .find(|r| r.name == name)
+                .unwrap()
+                .id
+        };
+        let (rock, huge) = (id("rock.png"), id("huge.png"));
+
+        let denied = read_asset_file(&state, &format!("asset://{rock}/file")).unwrap_err();
+        assert!(serde_json::to_string(&denied)
+            .unwrap()
+            .contains("bytes_not_released"));
+
+        state.set_byte_release(true);
+        let read = read_asset_file(&state, &format!("asset://{rock}/file")).unwrap();
+        let body = serde_json::to_value(&read).unwrap();
+        assert_eq!(body["contents"][0]["blob"], b64(b"png bytes"));
+        assert_eq!(body["contents"][0]["mimeType"], "image/png");
+
+        let big = read_asset_file(&state, &format!("asset://{huge}/file")).unwrap_err();
+        assert!(serde_json::to_string(&big)
+            .unwrap()
+            .contains("resource_too_large"));
+        for uri in ["asset://x/file", "file:///etc/passwd", "asset://0/file"] {
+            assert!(read_asset_file(&state, uri).is_err(), "{uri}");
+        }
     }
 
     /// The discovery tools are the shared operations (v1 plan S12): a tool's JSON is what the

@@ -2218,12 +2218,30 @@ fn build_engine_state() -> Result<
         return Err("no catalog on disk yet — open the app once to create it".into());
     }
     let (cache_root, workspace) = lodestash_app::paths::default_cache_dirs();
+    let payload_cache = cache_root.clone();
     let state = lodestash_api::ServerState::new(
         &db,
         workspace.unwrap_or_else(|| cache_root.clone().unwrap_or_default()),
         engine_preview_fn(cache_root),
     )
     .map_err(|e| e.to_string())?;
+    // In-pack files are served from a verified pull of just their payload (ENGINE-API §8.2, v1 plan
+    // S12b) — never an unpack, never a catalog write.
+    if let Some(cache) = payload_cache {
+        state.set_payload_resolver(Box::new(move |entry| {
+            use lodestash_api::AgentError;
+            use lodestash_ingest::unitypackage::PayloadError;
+            lodestash_app::thumbs::materialize_in_pack_entry(&cache, entry).map_err(|e| {
+                let why = e.to_string();
+                match e {
+                    PayloadError::ArchiveMissing(_) => AgentError::archive_missing(why),
+                    PayloadError::SourceChanged(_) => AgentError::source_changed(why),
+                    PayloadError::TooLarge { .. } => AgentError::asset_too_large(why),
+                    PayloadError::Io(_) => AgentError::not_local(why),
+                }
+            })
+        }));
+    }
     let state = std::sync::Arc::new(state);
     let allowed = apply_allow_list(&state);
     // ENGINE-API §8.3: `write_tags` writes under the producer the user configured for this host,

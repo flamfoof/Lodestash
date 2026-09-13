@@ -124,9 +124,9 @@ preview-view parameters, resource reads and file resolution governed by ENGINE-A
   release. Test metadata-only unknown destinations and denied bytes through every delivery path;
   a caller's `local=true`/producer argument must not grant access. Do not change global defaults to
   allow cloud access. Record permitted host/model capabilities for the pilot.
-- [ ] Create a tiny synthetic Unity package with two unrelated model entries and known payload
+- [x] Create a tiny synthetic Unity package with two unrelated model entries and known payload
   bytes, plus a model/material/albedo dependency set. Reuse existing package fixtures/helpers.
-- [ ] Add failing evidence tests for an ordinary file and an in-pack asset. Compare extracted bytes
+- [x] Add failing evidence tests for an ordinary file and an in-pack asset. Compare extracted bytes
   to the exact fixture payload; assert unrelated entries were not written, originals are unchanged,
   `workspace_rel` was not set and no duplicate asset was inserted.
 - [ ] Implement the shared evidence manifest and bounded byte delivery, using image content blocks
@@ -142,6 +142,17 @@ preview-view parameters, resource reads and file resolution governed by ENGINE-A
 
 **Acceptance:** the host receives actual usable image evidence for models and can retrieve the
 specific authorized source payload. A metadata-only response is never reported as visual analysis.
+
+*Partly done with v1 plan S12b (2026-09-12): the file half.* The shared resolver serves ordinary and
+in-pack files on REST and as `asset://{id}/file` MCP resources, verified against the archive's tar
+header (`source_changed`), capped, bounded (two pulls, 30 s) and atomically cached under the archive's
+identity; tests cover exact bytes, the unrelated entry not written, the archive unchanged, concurrent
+pulls, a replaced/truncated/missing archive, a stale guid, negative offsets and oversize payloads. A
+real 3.6 GB-deep entry pulls in 8.3 s cold. **Still open:** the fixture's model/material/albedo
+dependency set, the evidence manifest (`get_asset_evidence`), preview view parameters, pixel
+comparison across planes, and `Range` on the REST file route. The first checkbox (S10's byte gate)
+holds for these paths — `bytes_not_released` before any pull — but per-destination capability
+records for the pilot belong to Task 6.
 
 ## Task 4 — Safe, attributable tags and optional description
 

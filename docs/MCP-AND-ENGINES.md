@@ -112,6 +112,10 @@ against the `claude-api` skill before implementing.
 - `asset://{id}` → metadata (JSON).
 - `asset://{id}/preview` / `thumbnail://{id}` → image blob.
 - `asset://{id}/file` → **`resource_link`** to the on-disk file (never inline large binaries).
+  *As built (v1 plan S12b):* `resources/read` of it answers with the bytes inline up to 4 MiB,
+  through the same resolver and byte policy as the REST file route — an in-pack asset included,
+  pulled and verified without unpacking ([`ENGINE-API.md`](ENGINE-API.md) §8.2). It is the only
+  template served; `asset://{id}` and the preview URIs above are not.
 
 **Prompts:** a few canned workflows ("find and stage assets matching a brief"; "audit a collection for
 missing tags/licenses").

@@ -416,7 +416,8 @@ Drafted 2026-09-10. **§8.3 `write_tags` shipped 2026-09-11 (v1 plan S05)** — 
 approval gate, with durable receipts (M27). Still open within it: `vocabulary_revision` is accepted
 and recorded but enforced only once §8.5 lands. A headless `--mcp` process forwards the request to
 the app that owns the gate (S11, 2026-09-12). **§8.1 discovery shipped 2026-09-12 (v1 plan S12)**,
-with the notes at the end of §8.1. The rest of this section is still proposed. This section owns the wire
+with the notes at the end of §8.1; **§8.2's file access shipped with S12b** (notes at its end) —
+the evidence manifest and view parameters have not. The rest of this section is still proposed. This section owns the wire
 contract for [MCP asset analysis](MCP-ASSET-ANALYSIS.md). It refines the v1 architecture plan's
 S04/S05/S10/S11/S12. Existing §2 operations retain their current containers and required parameters;
 the rows below are additive unless explicitly described as an extension. New fields are not evidence
@@ -549,6 +550,29 @@ metadata only; deny remote audio bytes. Use an app-configured producer profile f
 and authenticated REST policy on the shared server; request arguments cannot widen permission.
 The token protects the API against unauthenticated clients, not malicious software running as the
 same OS user. Hosts remain responsible for what they do with bytes after authorized delivery.
+
+*As shipped (S12b, 2026-09-12) — file access only:*
+
+- **One resolver** (`ServerState::resolve_file`) behind `GET /v1/assets/{id}/file` and MCP
+  `resources/read` of `asset://{id}/file` (template listed by `resources/templates/list`). Byte
+  release is checked first (`bytes_not_released`, 403); an on-disk file is served in place; an
+  in-pack asset is pulled; anything else is `not_local` (503).
+- **An in-pack pull is verified against the archive itself.** There is no stored archive revision:
+  the 512-byte tar header before the catalogued offset must name `<guid>/asset` with exactly the
+  catalogued size, or the answer is `source_changed` (409). A missing archive is `archive_missing`
+  (503); a payload over 256 MiB is `asset_too_large` (413), refused before the archive is opened.
+  Nothing is unpacked, no `workspace_rel` is set, no asset row is written.
+- The pulled payload is published atomically into the preview cache's `inpack/` scratch under a key
+  of the archive's path, **current** size and mtime, the entry's place and its guid — a replaced
+  archive misses the cache instead of serving the old bytes. (The grid's thumbnail scratch keeps its
+  older key and does not; see INGESTION §2.)
+- **Bounds:** at most two pulls at once — a third is `busy` (429) at once, not queued — and the
+  caller waits at most 30 s before `deadline_exceeded` (504); the pull runs on, keeps its slot until
+  it ends, and leaves its file for the retry. Measured on the library's deepest in-pack model (3.6 GB
+  into the decompressed tar of a 1.3 GB pack): 8.3 s cold, 129 µs warm, release build.
+- MCP resource reads return the bytes inline only up to 4 MiB (`resource_too_large` above it — use
+  the REST route). The REST file route reads the whole file into the response and **has no `Range`
+  support**; that is unchanged from before this slice.
 
 ### 8.3 Attributed result writes
 

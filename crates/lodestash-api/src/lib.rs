@@ -359,6 +359,14 @@ impl TagBatchKickoff {
 /// The desktop's write bridge — [`AgentWrite`] → writer `Op` → changed rows.
 pub type AgentWriteFn = Box<dyn Fn(AgentWrite) -> Result<usize, String> + Send + Sync>;
 
+/// Pulls one in-pack payload into a readable file (ENGINE-API §8.2). Supplied by the app, because
+/// the archive reader and the scratch cache live outside this crate.
+pub type PayloadFn = Box<
+    dyn Fn(&lodestash_core::catalog::InPackEntry) -> Result<PathBuf, discovery::AgentError>
+        + Send
+        + Sync,
+>;
+
 /// A headless server's line to the running app (v1 plan S11): one REST request — method, `/v1/`
 /// path, JSON body — answered with the app's status and JSON body, or `Err` when no app answered.
 ///
@@ -542,6 +550,13 @@ pub struct ServerState {
     agent_producer: Mutex<Option<String>>,
     /// Set only by a headless server: where app-owned operations go ([`AppProxyFn`]).
     app_proxy: Mutex<Option<Arc<AppProxyFn>>>,
+    /// The in-pack payload resolver ([`PayloadFn`]); `None` serves on-disk files only.
+    payload: Mutex<Option<Arc<PayloadFn>>>,
+    /// Archive pulls and renders in flight, bounded by [`discovery::HEAVY_SLOTS`].
+    heavy_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// How long a caller waits for one heavy job (ENGINE-API §8.2: 30 s). A field so a test can
+    /// shorten it; nothing else changes it.
+    heavy_deadline: Mutex<std::time::Duration>,
 }
 
 impl ServerState {
@@ -570,6 +585,9 @@ impl ServerState {
             pending_tag_batches: Mutex::new(std::collections::HashMap::new()),
             agent_producer: Mutex::new(None),
             app_proxy: Mutex::new(None),
+            payload: Mutex::new(None),
+            heavy_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            heavy_deadline: Mutex::new(discovery::HEAVY_DEADLINE),
         })
     }
 
@@ -1871,6 +1889,99 @@ mod tests {
             id,
             "the reader sees the writer's row"
         );
+    }
+
+    /// Every byte path goes through one resolver (v1 plan S12b): an in-pack asset is served from
+    /// the payload the app pulls — handed the entry with its guid, offset and size — and a refusal
+    /// keeps its code on the wire. With bytes not released nothing is pulled at all.
+    #[tokio::test]
+    async fn an_in_pack_file_is_served_through_the_payload_resolver() {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        Catalog::open(&db).unwrap();
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO import_source (id, uuid, name, root_path, kind) VALUES (1, 's', 's', '/nowhere', 'folder');
+                 INSERT INTO media_type (id, code, label) VALUES (1, 'model_3d', 'Model');
+                 INSERT INTO package (id, uuid, source_id, package_path, name) VALUES (10, 'p', 1, 'G:/cache/Pack.unitypackage', 'Pack');
+                 INSERT INTO package_entry (id, package_id, guid, pathname, tar_offset, size_bytes)
+                     VALUES (100, 10, 'feedfacefeedfacefeedfacefeedface', 'Assets/Rock.fbx', 4096, 5);
+                 INSERT INTO asset (id, uuid, source_id, media_type_id, package_id, name, created_at, updated_at)
+                     VALUES (1, 'a', 1, 1, 10, 'Rock', 0, 0);
+                 INSERT INTO asset_file (id, asset_id, rel_path, ext, size_bytes, mtime, package_entry_id, workspace_rel)
+                     VALUES (1, 1, 'Rock.fbx', 'fbx', 5, 0, 100, NULL);
+                 UPDATE asset SET primary_file_id = 1 WHERE id = 1;",
+            )
+            .unwrap();
+        let st =
+            Arc::new(ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap());
+        let pulled = Arc::new(Mutex::new(Vec::new()));
+        let seen = pulled.clone();
+        let payload = dir.path().join("payload.fbx");
+        std::fs::write(&payload, b"bytes").unwrap();
+        st.set_payload_resolver(Box::new(move |entry| {
+            seen.lock().unwrap().push(entry.clone());
+            match entry.guid.as_str() {
+                "feedfacefeedfacefeedfacefeedface" => Ok(payload.clone()),
+                _ => Err(AgentError::source_changed("the pack changed")),
+            }
+        }));
+        let token = st.token().to_string();
+        let fetch = |st: Arc<ServerState>| {
+            let req = Request::get("/v1/assets/1/file")
+                .header(header::HOST, "127.0.0.1:1")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            async move {
+                let res = routes::router(st).oneshot(req).await.unwrap();
+                let status = res.status();
+                (
+                    status,
+                    axum::body::to_bytes(res.into_body(), 1 << 20)
+                        .await
+                        .unwrap(),
+                )
+            }
+        };
+
+        let (status, body) = fetch(st.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(String::from_utf8_lossy(&body).contains("bytes_not_released"));
+        assert!(
+            pulled.lock().unwrap().is_empty(),
+            "a payload was pulled for a refused request"
+        );
+
+        st.set_byte_release(true);
+        let (status, body) = fetch(st.clone()).await;
+        assert_eq!(
+            (status, body.as_ref()),
+            (StatusCode::OK, b"bytes".as_slice())
+        );
+        let entry = pulled.lock().unwrap()[0].clone();
+        assert_eq!(
+            (
+                entry.guid.as_str(),
+                entry.offset,
+                entry.size,
+                entry.ext.as_str()
+            ),
+            ("feedfacefeedfacefeedfacefeedface", 4096, 5, "fbx")
+        );
+
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("UPDATE package_entry SET guid = 'other' WHERE id = 100;")
+            .unwrap();
+        let (status, body) = fetch(st).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(String::from_utf8_lossy(&body).contains("source_changed"));
     }
 
     /// An in-pack material must still resolve to something renderable.

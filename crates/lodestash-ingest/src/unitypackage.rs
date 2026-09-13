@@ -630,6 +630,116 @@ fn extract_at_offsets_from<R: Read>(
     Ok(extracted)
 }
 
+/// Most bytes one in-pack payload may be pulled for analysis or served as a file (ENGINE-API §8.2)
+/// — the same ceiling the identify drain holds.
+pub const PAYLOAD_PULL_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Why an in-pack payload could not be read.
+#[derive(Debug)]
+pub enum PayloadError {
+    /// The archive is not where the catalog says it is.
+    ArchiveMissing(String),
+    /// The archive no longer holds this entry at the catalogued place — replaced, truncated or
+    /// re-exported since it was scanned. A rescan fixes that; nothing here guesses.
+    SourceChanged(String),
+    /// Over the pull ceiling. Refused before the archive is opened.
+    TooLarge {
+        size: u64,
+        cap: u64,
+    },
+    Io(io::Error),
+}
+
+impl std::fmt::Display for PayloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ArchiveMissing(why) => write!(f, "the package archive is missing: {why}"),
+            Self::SourceChanged(why) => {
+                write!(
+                    f,
+                    "the package changed since it was scanned ({why}) — rescan it"
+                )
+            }
+            Self::TooLarge { size, cap } => {
+                write!(
+                    f,
+                    "the payload is {size} bytes, over the {cap}-byte ceiling"
+                )
+            }
+            Self::Io(e) => write!(f, "reading the package failed: {e}"),
+        }
+    }
+}
+
+/// Pull one entry's payload, **verified against the archive's own tar header** (ENGINE-API §8.2).
+///
+/// [`read_payload_at`] trusts the catalogued offset: if the archive was replaced since the scan, the
+/// same offset holds some other entry's bytes — or the middle of one — and they are returned as if
+/// they were this asset. Here the 512-byte header immediately before the payload must name
+/// `<guid>/asset` and carry exactly `size`, or the read is refused as [`PayloadError::SourceChanged`].
+/// The ceiling is checked before the file is opened, so an absurd catalogued size costs nothing.
+pub fn read_entry_payload(
+    path: &Path,
+    guid: &str,
+    offset: u64,
+    size: u64,
+) -> Result<Vec<u8>, PayloadError> {
+    if size > PAYLOAD_PULL_MAX_BYTES {
+        return Err(PayloadError::TooLarge {
+            size,
+            cap: PAYLOAD_PULL_MAX_BYTES,
+        });
+    }
+    if offset < 512 {
+        return Err(PayloadError::SourceChanged(format!(
+            "offset {offset} leaves no room for a tar header"
+        )));
+    }
+    let file = File::open(path).map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound => PayloadError::ArchiveMissing(e.to_string()),
+        _ => PayloadError::Io(e),
+    })?;
+    let mut gz = GzDecoder::new(file);
+    let skipped = io::copy(&mut (&mut gz).take(offset - 512), &mut io::sink()).map_err(|e| {
+        PayloadError::SourceChanged(format!("the archive does not decompress: {e}"))
+    })?;
+    let mut block = [0u8; 512];
+    if skipped != offset - 512 || gz.read_exact(&mut block).is_err() {
+        return Err(PayloadError::SourceChanged(
+            "the archive ends before the catalogued entry".into(),
+        ));
+    }
+    let header = tar::Header::from_byte_slice(&block);
+    let expected = format!("{guid}/asset");
+    let named = header
+        .path()
+        .map(|p| p.to_string_lossy().trim_start_matches("./").to_string())
+        .unwrap_or_default();
+    if named != expected {
+        return Err(PayloadError::SourceChanged(format!(
+            "the entry at that offset is {named:?}, not {expected:?}"
+        )));
+    }
+    match header.entry_size() {
+        Ok(n) if n == size => {}
+        other => {
+            return Err(PayloadError::SourceChanged(format!(
+                "the entry holds {other:?} bytes, the catalog says {size}"
+            )))
+        }
+    }
+    let mut buf = Vec::with_capacity((size as usize).min(PULL_CAP_HINT));
+    let n = (&mut gz).take(size).read_to_end(&mut buf).map_err(|e| {
+        PayloadError::SourceChanged(format!("the payload does not decompress: {e}"))
+    })?;
+    if n as u64 != size {
+        return Err(PayloadError::SourceChanged(format!(
+            "payload truncated: wanted {size} got {n} bytes"
+        )));
+    }
+    Ok(buf)
+}
+
 /// Upper bound on the capacity hint when pulling a payload into memory — guards against a
 /// corrupt manifest size triggering a huge speculative allocation. `take(size)` still limits
 /// the actual read, so a legitimately larger payload simply grows past the hint.
@@ -737,6 +847,83 @@ mod tests {
 
         builder.into_inner().unwrap().finish().unwrap();
         pkg_path
+    }
+
+    /// A payload is read only when the archive still says it is the entry the catalog recorded
+    /// (v1 plan S12b): the right guid and size in the header just before it. A replaced archive,
+    /// a shifted offset, a truncated file and a missing one are each named; an oversized entry is
+    /// refused without opening anything.
+    #[test]
+    fn an_entry_is_read_only_where_the_archive_still_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"model bytes ".repeat(300);
+        let guid = "aaaa1111bbbb2222cccc3333dddd4444";
+        let pkg = build_test_package(dir.path(), guid, "Assets/A.fbx", "guid: x\n", &payload);
+        let entry = read_manifest(&pkg).unwrap().remove(0);
+        let (offset, size) = (entry.asset_offset.unwrap(), entry.asset_size.unwrap());
+
+        assert_eq!(
+            read_entry_payload(&pkg, guid, offset, size).unwrap(),
+            payload
+        );
+
+        let changed =
+            |r: Result<Vec<u8>, PayloadError>| matches!(r, Err(PayloadError::SourceChanged(_)));
+        assert!(
+            changed(read_entry_payload(
+                &pkg,
+                "ffff1111bbbb2222cccc3333dddd4444",
+                offset,
+                size
+            )),
+            "another guid"
+        );
+        assert!(
+            changed(read_entry_payload(&pkg, guid, offset + 512, size)),
+            "a shifted offset"
+        );
+        assert!(
+            changed(read_entry_payload(&pkg, guid, offset, size - 1)),
+            "another size"
+        );
+        assert!(
+            changed(read_entry_payload(&pkg, guid, 100, size)),
+            "no room for a header"
+        );
+
+        // The same place in a re-exported archive now holds a different pack's entry.
+        let other = tempfile::tempdir().unwrap();
+        let replaced = build_test_package(
+            other.path(),
+            "9999888877776666555544443333aaaa",
+            "Assets/B.fbx",
+            "guid: y\n",
+            &payload,
+        );
+        assert!(
+            changed(read_entry_payload(&replaced, guid, offset, size)),
+            "a replaced archive"
+        );
+
+        let bytes = std::fs::read(&pkg).unwrap();
+        std::fs::write(&pkg, &bytes[..bytes.len() / 3]).unwrap();
+        assert!(
+            changed(read_entry_payload(&pkg, guid, offset, size)),
+            "a truncated archive"
+        );
+
+        let gone = dir.path().join("gone.unitypackage");
+        assert!(matches!(
+            read_entry_payload(&gone, guid, offset, size),
+            Err(PayloadError::ArchiveMissing(_))
+        ));
+        assert!(
+            matches!(
+                read_entry_payload(&gone, guid, offset, PAYLOAD_PULL_MAX_BYTES + 1),
+                Err(PayloadError::TooLarge { .. })
+            ),
+            "the ceiling is checked before the archive is opened"
+        );
     }
 
     #[test]

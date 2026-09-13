@@ -120,7 +120,15 @@ this file stays the live board.
       run after the LIMIT. Summaries gain `source_id`, `package_id`, `file_resource_uri` and
       `file_availability`; detail gains `description` and `analysis_revision`. Walked the live
       catalog end to end: 8,237 assets, no duplicates.
-- [ ] **R5 · S12b — evidence and file access** (MCP handoff Task 3; ENGINE-API §8.2).
+- [x] **R5 · S12b — file access** (MCP handoff Task 3, first half; ENGINE-API §8.2). One resolver
+      behind REST `/file` and MCP `asset://{id}/file`: byte release first, on-disk files in place,
+      in-pack payloads pulled and verified against the tar header before their offset
+      (`source_changed`), capped at 256 MiB, two pulls at a time with a 30 s deadline (`busy`,
+      `deadline_exceeded`), published atomically under a key that includes the archive's identity. *Open:* the grid's
+      thumbnail scratch still keys on path/size/offset and keeps a replaced pack's old payload —
+      re-keying it froze the shell (pulls run on the protocol thread) and was reverted; it belongs
+      to S15.
+- [ ] **R5 · S12c — evidence manifest and model views** (MCP handoff Task 3, second half).
 - [ ] **R5 · S13 — app-owned bulk runs** (MCP handoff Task 5).
 - [ ] **Proxies/packs · S14–S18 — pre-extraction identity, one cache policy, visual tiers, font
       specimens, batched inflate.**

@@ -17,6 +17,9 @@ pub const DEFAULT_PAGE: usize = 25;
 pub const MAX_PAGE: usize = 200;
 /// Most ids one `get_assets` call may name.
 pub const MAX_READ: usize = 100;
+/// Archive pulls and renders allowed at once (ENGINE-API §8.2), and how long a caller waits for one.
+pub const HEAVY_SLOTS: usize = 2;
+pub const HEAVY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 const STATUSES: &[&str] = &["discovered", "indexed", "identified", "confirmed"];
 
@@ -44,6 +47,64 @@ impl AgentError {
             code: "invalid_cursor",
             message: message.into(),
         }
+    }
+
+    fn with(status: u16, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// Asset bytes are not released to agents (ADR-0020).
+    pub fn bytes_not_released() -> Self {
+        Self::with(
+            403,
+            "bytes_not_released",
+            "this agent may read metadata and links; serving asset bytes needs `mcp_bytes_enabled` \
+             in Settings",
+        )
+    }
+
+    pub fn asset_not_found(id: i64) -> Self {
+        Self::with(404, "asset_not_found", format!("no live asset has id {id}"))
+    }
+
+    pub fn not_local(message: impl Into<String>) -> Self {
+        Self::with(503, "not_local", message)
+    }
+
+    pub fn archive_missing(message: impl Into<String>) -> Self {
+        Self::with(503, "archive_missing", message)
+    }
+
+    pub fn source_changed(message: impl Into<String>) -> Self {
+        Self::with(409, "source_changed", message)
+    }
+
+    pub fn asset_too_large(message: impl Into<String>) -> Self {
+        Self::with(413, "asset_too_large", message)
+    }
+
+    pub fn busy() -> Self {
+        Self::with(
+            429,
+            "busy",
+            format!("{HEAVY_SLOTS} archive pulls or renders are already running — retry shortly"),
+        )
+    }
+
+    pub fn deadline_exceeded() -> Self {
+        Self::with(
+            504,
+            "deadline_exceeded",
+            "the work did not finish in time; it continues, and a retry may find it done",
+        )
+    }
+
+    pub fn resource_too_large(message: impl Into<String>) -> Self {
+        Self::with(413, "resource_too_large", message)
     }
 
     fn internal(e: lodestash_core::error::CoreError) -> Self {
@@ -365,6 +426,77 @@ impl ServerState {
         }))
     }
 
+    /// Where an asset's bytes can be read right now (ENGINE-API §8.2) — the one resolver behind the
+    /// REST file route and MCP `asset://{id}/file` reads, so no delivery path has a policy of its own.
+    ///
+    /// Byte release is checked first. A file on disk is served where it is; an in-pack asset is
+    /// pulled — verified, capped, into a scratch file — by the resolver the app installs, without
+    /// unpacking the package or changing the catalog. Anything else is `not_local`.
+    pub fn resolve_file(&self, id: i64) -> Result<std::path::PathBuf, AgentError> {
+        if !self.byte_release() {
+            return Err(AgentError::bytes_not_released());
+        }
+        let row = self
+            .asset(id)?
+            .ok_or_else(|| AgentError::asset_not_found(id))?;
+        if let Some(path) = self.source_path(&row).filter(|p| p.is_file()) {
+            return Ok(path);
+        }
+        let entry = self.catalog.lock().unwrap().in_pack_entry(id)?;
+        let pull = self.payload.lock().unwrap().clone();
+        match (entry, pull) {
+            (Some(entry), Some(pull)) => self.heavy(move || pull(&entry)),
+            (Some(_), None) => Err(AgentError::not_local(
+                "the asset is inside a package and this server cannot pull payloads",
+            )),
+            (None, _) => Err(AgentError::not_local(
+                "the asset's file is not on this machine — its drive may be disconnected",
+            )),
+        }
+    }
+
+    /// Install the in-pack payload resolver ([`crate::PayloadFn`]).
+    pub fn set_payload_resolver(&self, f: crate::PayloadFn) {
+        *self.payload.lock().unwrap() = Some(std::sync::Arc::new(f));
+    }
+
+    /// Run archive or render work under the §8.2 bounds: at most [`HEAVY_SLOTS`] at once — a
+    /// request beyond that is `busy` immediately rather than queued behind work of unknown length —
+    /// and an answer within the deadline, or `deadline_exceeded`.
+    ///
+    /// A job that overruns is not abandoned: it keeps its slot until it finishes, so the bound is
+    /// honest about what is really running, and whatever it publishes (a scratch file, a render) is
+    /// there for the retry.
+    fn heavy<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> Result<T, AgentError> + Send + 'static,
+    ) -> Result<T, AgentError> {
+        use std::sync::atomic::Ordering;
+        let slots = self.heavy_in_flight.clone();
+        if slots
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < HEAVY_SLOTS).then_some(n + 1)
+            })
+            .is_err()
+        {
+            return Err(AgentError::busy());
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = work();
+            slots.fetch_sub(1, Ordering::SeqCst);
+            let _ = tx.send(result);
+        });
+        let deadline = *self.heavy_deadline.lock().unwrap();
+        rx.recv_timeout(deadline)
+            .unwrap_or_else(|_| Err(AgentError::deadline_exceeded()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_heavy_deadline(&self, d: std::time::Duration) {
+        *self.heavy_deadline.lock().unwrap() = d;
+    }
+
     /// `get_assets` — full detail for 1–100 named assets, in the order asked, with the ones that
     /// cannot be returned listed separately.
     ///
@@ -632,6 +764,68 @@ mod tests {
             2,
             "the hybrid path must scope before ranking too"
         );
+    }
+
+    /// Heavy work is bounded (v1 plan S12b): two pulls at once, a third is `busy` straight away,
+    /// and a caller waiting past the deadline gets `deadline_exceeded` while the pull runs on — its
+    /// slot held until it really ends, and its result there for the retry.
+    #[test]
+    fn archive_pulls_are_bounded_and_answer_within_a_deadline() {
+        use std::sync::{Arc, Barrier};
+        let (_dir, state, _, _) = fixture(1, 0);
+        let state = Arc::new(state);
+        state.set_heavy_deadline(std::time::Duration::from_millis(300));
+        let release = Arc::new(Barrier::new(3));
+        let (a, b) = (release.clone(), release.clone());
+        let jobs: Vec<_> = [a, b]
+            .into_iter()
+            .map(|gate| {
+                let state = state.clone();
+                std::thread::spawn(move || {
+                    state.heavy(move || {
+                        gate.wait();
+                        Ok(1)
+                    })
+                })
+            })
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state
+            .heavy_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+            < 2
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the two pulls never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(state.heavy(|| Ok(3)).unwrap_err().code, "busy");
+        for job in jobs {
+            assert_eq!(job.join().unwrap().unwrap_err().code, "deadline_exceeded");
+        }
+        assert_eq!(
+            state
+                .heavy_in_flight
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "an overrun gave its slot back while still running"
+        );
+        release.wait();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state
+            .heavy_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pulls never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(state.heavy(|| Ok(4)).unwrap(), 4);
     }
 
     /// `get_assets` answers in the order asked, lists what it cannot return — including an asset

@@ -160,6 +160,15 @@ to a single entry; reaching any entry means decompressing from the start. Lodest
   the drain is done with it) — a decode buffer that lives on disk only because those decoders take a
   path, not the disposable extract cache. Only **preview** and **explicit extraction** write the
   retained cache dir (Settings → Storage, §6). Serial, one file at a time — identify need not be fast.
+- **A pull for an agent is verified** (v1 plan S12b, `read_entry_payload`): the tar header right before
+  the catalogued offset must name the entry's `<guid>/asset` and size, so a pack replaced since its
+  scan answers `source_changed` instead of someone else's bytes. Its scratch is keyed by the
+  archive's current size and mtime and the entry's guid as well as its place. **The thumbnail
+  scratch is not** — it is still path, size and offset, so a pack re-exported with an entry of the
+  same size at the same place keeps its old thumbnail payload. Re-keying it was tried and reverted:
+  it invalidates every in-pack thumbnail at once, and the thumb route pulls on the protocol
+  handler's thread, which froze the shell on the first grid. Dropping a pack's scratch when a rescan
+  sees its archive change is S15's cache policy.
 - **Full extraction (materialize)** = a single streaming pass (gzip-decode → tar-walk) that extracts
   every payload **once** into a content-addressed, LRU/size-capped **workspace** on disk (evict +
   re-extract on demand, idempotent by hash). This is now **optional** — only when a persistent on-disk

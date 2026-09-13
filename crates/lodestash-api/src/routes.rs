@@ -805,18 +805,12 @@ async fn preview(State(state): State<Shared>, Path(id): Path<i64>) -> Response {
     }
 }
 
+/// `GET /v1/assets/{id}/file` — through the shared resolver (ENGINE-API §8.2), so an in-pack asset
+/// is served from a verified pull of just its payload rather than refused.
 async fn file(State(state): State<Shared>, Path(id): Path<i64>) -> Response {
-    if let Some(denied) = bytes_denied(&state) {
-        return denied;
-    }
-    let row = match state.asset(id) {
-        Ok(Some(row)) => row,
-        Ok(None) => return not_found(),
-        Err(e) => return db_err(e),
-    };
-    match state.source_path(&row) {
-        Some(path) => serve_file(&path, "application/octet-stream").await,
-        None => not_found(),
+    match state.resolve_file(id) {
+        Ok(path) => serve_file(&path, "application/octet-stream").await,
+        Err(e) => agent_err(e),
     }
 }
 

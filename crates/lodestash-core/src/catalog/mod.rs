@@ -234,6 +234,18 @@ pub struct AssetSummaryRow {
     pub tags: Vec<TagAssignment>,
 }
 
+/// An in-pack asset's place in its archive (ENGINE-API §8.2): the package file, the entry's guid —
+/// which the tar header before the payload must name — the payload offset in the decompressed tar,
+/// its size, and the primary file's extension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InPackEntry {
+    pub package_path: String,
+    pub guid: String,
+    pub offset: i64,
+    pub size: i64,
+    pub ext: String,
+}
+
 /// One asset's catalog identity for the UI join (grid read path).
 #[derive(Debug, Clone)]
 pub struct AssetIdentity {
@@ -4800,6 +4812,35 @@ impl Catalog {
             )
             .optional()
             .map_err(|e| CoreError::Catalog(format!("in_pack_locator: {e}")))
+    }
+
+    /// One in-pack asset's archive entry, with the guid its tar header must carry — what a verified
+    /// pull needs ([`InPackEntry`], ENGINE-API §8.2). `None` for anything on disk or extracted.
+    pub fn in_pack_entry(&self, asset_id: i64) -> Result<Option<InPackEntry>> {
+        self.conn
+            .query_row(
+                "SELECT p.package_path, pe.guid, pe.tar_offset, pe.size_bytes, af.ext
+                   FROM asset a
+                   JOIN asset_file af    ON af.id = a.primary_file_id
+                   JOIN package_entry pe ON pe.id = af.package_entry_id
+                   JOIN package p        ON p.id = pe.package_id
+                  WHERE a.id = ?1 AND a.deleted_at IS NULL
+                    AND af.workspace_rel IS NULL
+                    AND pe.tar_offset IS NOT NULL
+                    AND pe.size_bytes IS NOT NULL",
+                params![asset_id],
+                |r| {
+                    Ok(InPackEntry {
+                        package_path: r.get(0)?,
+                        guid: r.get(1)?,
+                        offset: r.get(2)?,
+                        size: r.get(3)?,
+                        ext: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| CoreError::Catalog(format!("in_pack_entry: {e}")))
     }
 
     /// Where an **in-pack** asset lives inside its archive: `(pathname, package_path)` —
