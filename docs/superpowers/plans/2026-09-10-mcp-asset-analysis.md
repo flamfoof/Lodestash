@@ -85,21 +85,28 @@ are the enabled tools until Tasks 2–5 add their own. Model availability is not
 `get_asset`/summary output, exactly as ENGINE-API §8.1. Add shared DTOs in the API/core owning
 modules rather than independently validating MCP and REST.
 
-- [ ] Seed a fixture with two sources, more than one page, ten models behind hundreds of images,
+- [x] Seed a fixture with two sources, more than one page, ten models behind hundreds of images,
   duplicate names, missing files, trashed/excluded rows and tags from multiple producers.
-- [ ] Add failing tests for source/media/tag filtering before LIMIT, ordered paging, random
+- [x] Add failing tests for source/media/tag filtering before LIMIT, ordered paging, random
   eligibility/uniqueness, exact-ID read order, partial unavailable results and provenance readback.
   Test both keyword and semantic candidate filtering; use a deterministic embedder fixture.
-- [ ] Reuse the core source/summary queries; implement bounded selection with the spec's cursor
+- [x] Reuse the core source/summary queries; implement bounded selection with the spec's cursor
   contract. Do not require file extraction to return a catalog row.
-- [ ] Extend both search adapters, route permission mapping and `AGENT_OPERATIONS` together. Add
+- [x] Extend both search adapters, route permission mapping and `AGENT_OPERATIONS` together. Add
   new tools/routes and shared detail serialization; preserve old response containers.
-- [ ] Test changed filters, malformed/cross-catalog cursors, concurrent insert/delete, fewer than
+- [x] Test changed filters, malformed/cross-catalog cursors, concurrent insert/delete, fewer than
   ten matches, empty/duplicate explicit IDs, invalid enums/limits and disabled tools on both planes.
-- [ ] Run the affected core/API/MCP tests and `cargo test -p lodestash-mcp tool_set_matches_the_rest_surface`.
+- [x] Run the affected core/API/MCP tests and `cargo test -p lodestash-mcp tool_set_matches_the_rest_surface`.
 
 **Acceptance:** ten qualifying models are selectable even when none appear in the old limited
 search page. Random tests assert membership/uniqueness, not probabilistic frequency or exact order.
+
+*Done with v1 plan S12 (2026-09-12)* — tests in `catalog/tests_browse.rs`, `lodestash-api`
+`discovery.rs`, and a plane test on each side. Not covered by a fixture: duplicate names, a file
+missing from disk (`file_availability: missing` is exercised only by its policy-first `denied`
+branch) and tags from several producers in one read — provenance readback is S05's `get_asset`
+test. Real corpus: a headless server walked all 8,237 assets of the six libraries in 45 pages of
+200, counts equal to `asset_count`, no duplicates, strictly ascending, median page 51 ms (debug).
 
 ## Task 3 — Evidence, access URLs and surgical package analysis
 

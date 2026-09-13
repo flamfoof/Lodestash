@@ -112,7 +112,16 @@ this file stays the live board.
       line). Search embeds the query in SigLIP *and* CLAP space on every surface, so audio is found
       by description. Server info reports `catalog_id`, `writer`, `bytes_released`, `enabled_tools`.
       *Open:* `job_not_found` is still `not_found`.
-- [ ] **R5 · S12–S13 — bounded library walk, app-owned bulk runs** (MCP handoff Tasks 2–3 and 5).
+- [x] **R5 · S12 — a bounded, resumable library walk** (MCP handoff Task 2; ENGINE-API §8.1).
+      `list_libraries`, `list_assets` (keyset walk under a captured upper id, or a random sample) and
+      `get_assets` on both planes, one validation and one error shape (`invalid_argument`,
+      `invalid_cursor`) for both. Cursors carry the catalog id and a filter digest. Keyword and
+      semantic search take library/pack/media/tag scope *before* ranking — the media filter used to
+      run after the LIMIT. Summaries gain `source_id`, `package_id`, `file_resource_uri` and
+      `file_availability`; detail gains `description` and `analysis_revision`. Walked the live
+      catalog end to end: 8,237 assets, no duplicates.
+- [ ] **R5 · S12b — evidence and file access** (MCP handoff Task 3; ENGINE-API §8.2).
+- [ ] **R5 · S13 — app-owned bulk runs** (MCP handoff Task 5).
 - [ ] **Proxies/packs · S14–S18 — pre-extraction identity, one cache policy, visual tiers, font
       specimens, batched inflate.**
 - [ ] **Records · S19 — one board, one rules source, release evidence.**

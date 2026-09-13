@@ -433,7 +433,7 @@ fn write_rows(conn: &Connection, asset_id: i64, current: &[Row], target: &[Row])
     Ok(())
 }
 
-fn annotation_revision_in(conn: &Connection, asset_id: i64) -> Result<String> {
+pub(super) fn annotation_revision_in(conn: &Connection, asset_id: i64) -> Result<String> {
     let mut stmt = conn
         .prepare(
             "SELECT source, tag_id, confidence, model_id FROM asset_tag

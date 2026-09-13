@@ -5,8 +5,12 @@
 //! `assets/{id}`, `preview`, `file`. Mutating routes need the job engine (§4 "Async") and land
 //! with it.
 
+pub mod discovery;
 pub mod export;
 pub mod handshake;
+pub use discovery::{
+    AgentError, LibrariesRequest, ListAssetsRequest, ReadAssetsRequest, SearchScope,
+};
 pub mod jobs;
 pub mod routes;
 
@@ -96,6 +100,9 @@ pub const AGENT_OPERATIONS: &[(&str, &str)] = &[
     ("list_staged", "GET /v1/stage"),
     ("import_staged", "POST /v1/stage/import"),
     ("write_tags", "POST /v1/tags/batch"),
+    ("list_libraries", "GET /v1/libraries"),
+    ("list_assets", "GET /v1/assets"),
+    ("get_assets", "POST /v1/assets/read"),
 ];
 
 /// Everything a preview renderer needs for one asset, resolved from the catalog by
@@ -621,7 +628,7 @@ impl ServerState {
         &self,
         query: &str,
         limit: usize,
-        media_type: Option<&str>,
+        scope: &lodestash_core::catalog::AssetScope,
     ) -> Option<lodestash_core::error::Result<Vec<AssetSummaryRow>>> {
         let spaces = (self.query_embed.lock().unwrap().as_ref()?)(query);
         if spaces.is_empty() {
@@ -629,15 +636,14 @@ impl ServerState {
         }
         Some((|| {
             let cat = self.catalog.lock().unwrap();
-            let media_id = match media_type {
-                Some(code) => cat.media_type_id(code)?,
-                None => None,
-            };
             let borrowed: Vec<(&str, &[f32])> = spaces
                 .iter()
                 .map(|(m, v)| (m.as_str(), v.as_slice()))
                 .collect();
-            let ids = cat.hybrid_search(query, &borrowed, media_id, limit)?;
+            // The scope narrows both retrievers before they rank (ENGINE-API §8.1), so a library
+            // or pack scope is not just a filter over whatever the whole-library top K happened
+            // to contain.
+            let ids = cat.hybrid_search_scoped(query, &borrowed, scope, limit)?;
             cat.asset_summaries(&ids)
         })())
     }
@@ -710,22 +716,22 @@ impl ServerState {
 
     /// Structural search. An empty/punctuation-only query falls back to the most recent assets so
     /// a client that just connected sees the library rather than nothing.
+    ///
+    /// The scope — library, pack, media type, tags — is applied before the LIMIT (v1 plan S12). It
+    /// used to filter media type *after* ranking, so `limit: 25, media_type: model_3d` over a
+    /// library whose top 25 names were images answered with nothing.
     pub fn search(
         &self,
         query: &str,
         limit: usize,
-        media_type: Option<&str>,
+        scope: &lodestash_core::catalog::AssetScope,
     ) -> lodestash_core::error::Result<Vec<AssetSummaryRow>> {
         let cat = self.catalog.lock().unwrap();
-        let ids = match cat.search_assets(query, limit)? {
+        let ids = match cat.search_assets_scoped(query, scope, limit)? {
             Some(ids) => ids,
-            None => cat.recent_asset_ids(limit)?,
+            None => cat.recent_scoped_asset_ids(scope, limit)?,
         };
-        let rows = cat.asset_summaries(&ids)?;
-        Ok(match media_type {
-            Some(m) => rows.into_iter().filter(|r| r.media_type == m).collect(),
-            None => rows,
-        })
+        cat.asset_summaries(&ids)
     }
 
     pub fn asset(&self, id: i64) -> lodestash_core::error::Result<Option<AssetSummaryRow>> {
@@ -1052,7 +1058,7 @@ impl ServerState {
             return Ok(None);
         };
         let deps = self.dependencies(id).unwrap_or_default();
-        let mut body = routes::summary_json(&row);
+        let mut body = self.summary(&row);
         body["size_bytes"] = serde_json::json!(row.size_bytes);
         body["stats"] = serde_json::json!({
             "tris": row.metrics.tri_count, "width_px": row.metrics.width_px,
@@ -1061,6 +1067,8 @@ impl ServerState {
         body["dependencies"] = serde_json::json!({ "count": deps.len(), "asset_ids": deps });
         let cat = self.catalog.lock().unwrap();
         body["annotation_revision"] = serde_json::json!(cat.annotation_revision(id)?);
+        body["analysis_revision"] = serde_json::json!(cat.analysis_revision(id)?);
+        body["description"] = serde_json::json!(cat.asset_description(id)?);
         body["tag_provenance"] = serde_json::to_value(cat.asset_tag_rows(id)?)?;
         Ok(Some(body))
     }

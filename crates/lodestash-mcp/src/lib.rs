@@ -35,6 +35,51 @@ pub struct SearchArgs {
     pub limit: Option<usize>,
     /// Restrict to one media type: model_3d | texture | audio | image | sprite | material | font.
     pub media_type: Option<String>,
+    /// Restrict to one library (`list_libraries` ids).
+    pub source_id: Option<i64>,
+    /// Restrict to one package; it must belong to `source_id` when both are given.
+    pub package_id: Option<i64>,
+    /// Canonical `namespace:value` tags, all of which must be present.
+    pub tags: Option<Vec<String>>,
+}
+
+/// `list_libraries` (ENGINE-API §8.1).
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ListLibrariesArgs {
+    /// Page size (default 25, maximum 200).
+    pub limit: Option<usize>,
+    /// `next_cursor` from the previous page.
+    pub cursor: Option<String>,
+}
+
+/// `list_assets` (ENGINE-API §8.1).
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ListAssetsArgs {
+    /// The library to walk (`list_libraries` ids). Required.
+    pub source_id: i64,
+    /// Only this package's assets; it must belong to the library.
+    pub package_id: Option<i64>,
+    /// model_3d | texture | audio | image | sprite | material | font.
+    pub media_type: Option<String>,
+    /// discovered | indexed | identified | confirmed.
+    pub status: Option<String>,
+    /// any (default) | tagged | untagged.
+    pub tag_state: Option<String>,
+    /// ordered (default): an id-order walk you page with `cursor`. random: a fresh sample; no cursor.
+    pub selection: Option<String>,
+    /// Page size (default 25, maximum 200).
+    pub limit: Option<usize>,
+    /// `next_cursor` from the previous page of the same walk.
+    pub cursor: Option<String>,
+}
+
+/// `get_assets` (ENGINE-API §8.1).
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GetAssetsArgs {
+    /// 1 to 100 distinct asset ids.
+    pub asset_ids: Vec<i64>,
+    /// When given, assets outside this library are reported unavailable.
+    pub source_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -235,15 +280,15 @@ impl Lodestash {
         Parameters(args): Parameters<SearchArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.gate("search_assets")?;
+        let scope = match self.state.search_scope(&scope_of(&args)) {
+            Ok(scope) => scope,
+            Err(e) => return refused(e),
+        };
         let rows = self
             .state
-            .search(
-                &args.query,
-                args.limit.unwrap_or(25).clamp(1, 200),
-                args.media_type.as_deref(),
-            )
+            .search(&args.query, args.limit.unwrap_or(25).clamp(1, 200), &scope)
             .map_err(internal)?;
-        let json: Vec<_> = rows.iter().map(lodestash_api::summary_json).collect();
+        let json: Vec<_> = rows.iter().map(|r| self.state.summary(r)).collect();
         Ok(CallToolResult::success(vec![ContentBlock::json(json)?]))
     }
 
@@ -258,12 +303,13 @@ impl Lodestash {
     ) -> Result<CallToolResult, ErrorData> {
         self.gate("semantic_search")?;
         let limit = args.limit.unwrap_or(25).clamp(1, 200);
-        match self
-            .state
-            .semantic_search(&args.query, limit, args.media_type.as_deref())
-        {
+        let scope = match self.state.search_scope(&scope_of(&args)) {
+            Ok(scope) => scope,
+            Err(e) => return refused(e),
+        };
+        match self.state.semantic_search(&args.query, limit, &scope) {
             Some(Ok(rows)) => {
-                let json: Vec<_> = rows.iter().map(lodestash_api::summary_json).collect();
+                let json: Vec<_> = rows.iter().map(|r| self.state.summary(r)).collect();
                 Ok(CallToolResult::success(vec![ContentBlock::json(json)?]))
             }
             Some(Err(e)) => Err(internal(e)),
@@ -307,7 +353,7 @@ impl Lodestash {
             .state
             .similar(args.id, args.limit.unwrap_or(10).clamp(1, 200))
             .map_err(internal)?;
-        let json: Vec<_> = rows.iter().map(lodestash_api::summary_json).collect();
+        let json: Vec<_> = rows.iter().map(|r| self.state.summary(r)).collect();
         Ok(CallToolResult::success(vec![ContentBlock::json(json)?]))
     }
 
@@ -571,6 +617,66 @@ impl Lodestash {
         Ok(CallToolResult::success(content))
     }
 
+    /// ENGINE-API §8.1 `list_libraries`.
+    #[tool(
+        name = "list_libraries",
+        description = "The libraries in this catalog (id, name, kind, asset_count), paged by cursor. \
+                       Use an id as source_id for list_assets and the search tools."
+    )]
+    pub async fn list_libraries(
+        &self,
+        Parameters(args): Parameters<ListLibrariesArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.gate("list_libraries")?;
+        answer(self.state.list_libraries(&lodestash_api::LibrariesRequest {
+            limit: args.limit,
+            cursor: args.cursor,
+        }))
+    }
+
+    /// ENGINE-API §8.1 `list_assets`.
+    #[tool(
+        name = "list_assets",
+        description = "Walk one library completely: selection 'ordered' pages in id order — pass \
+                       next_cursor back until it is null; assets added after the walk began wait for \
+                       the next walk. selection 'random' returns a fresh sample without replacement. \
+                       Filter by package, media_type, status and tag_state. Search ranks; this visits."
+    )]
+    pub async fn list_assets(
+        &self,
+        Parameters(args): Parameters<ListAssetsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.gate("list_assets")?;
+        answer(self.state.list_assets(&lodestash_api::ListAssetsRequest {
+            source_id: Some(args.source_id),
+            package_id: args.package_id,
+            media_type: args.media_type,
+            status: args.status,
+            tag_state: args.tag_state,
+            selection: args.selection,
+            limit: args.limit,
+            cursor: args.cursor,
+        }))
+    }
+
+    /// ENGINE-API §8.1 `get_assets`.
+    #[tool(
+        name = "get_assets",
+        description = "Full detail for 1-100 assets in the order given, with the ids that could not \
+                       be returned listed under 'unavailable'. Read each asset's revisions here \
+                       before writing tags."
+    )]
+    pub async fn get_assets(
+        &self,
+        Parameters(args): Parameters<GetAssetsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.gate("get_assets")?;
+        answer(self.state.read_assets(&lodestash_api::ReadAssetsRequest {
+            asset_ids: args.asset_ids,
+            source_id: args.source_id,
+        }))
+    }
+
     /// ENGINE-API §2 `list_tags` — the tag vocabulary with usage counts.
     #[tool(
         name = "list_tags",
@@ -799,7 +905,7 @@ impl Lodestash {
     pub async fn list_staged(&self) -> Result<CallToolResult, ErrorData> {
         self.gate("list_staged")?;
         let rows = self.state.list_staged().map_err(internal)?;
-        let json: Vec<_> = rows.iter().map(lodestash_api::summary_json).collect();
+        let json: Vec<_> = rows.iter().map(|r| self.state.summary(r)).collect();
         Ok(CallToolResult::success(vec![ContentBlock::json(json)?]))
     }
 
@@ -928,6 +1034,33 @@ fn job_path(id: &str, suffix: &str) -> Result<String, ErrorData> {
     Ok(format!("/v1/jobs/{id}{suffix}"))
 }
 
+/// A search's optional scope, as the shared request type.
+fn scope_of(args: &SearchArgs) -> lodestash_api::SearchScope {
+    lodestash_api::SearchScope {
+        source_id: args.source_id,
+        package_id: args.package_id,
+        media_type: args.media_type.clone(),
+        tags: args.tags.clone().unwrap_or_default(),
+    }
+}
+
+/// A refused request as a tool result carrying the same code and status REST would send
+/// (ENGINE-API §8.4) — a domain failure, not a protocol error.
+fn refused(e: lodestash_api::AgentError) -> Result<CallToolResult, ErrorData> {
+    Ok(CallToolResult::error(vec![ContentBlock::json(
+        e.to_json(),
+    )?]))
+}
+
+fn answer(
+    r: Result<serde_json::Value, lodestash_api::AgentError>,
+) -> Result<CallToolResult, ErrorData> {
+    match r {
+        Ok(body) => Ok(CallToolResult::success(vec![ContentBlock::json(body)?])),
+        Err(e) => refused(e),
+    }
+}
+
 fn internal(e: lodestash_core::error::CoreError) -> ErrorData {
     ErrorData::internal_error(e.to_string(), None)
 }
@@ -958,6 +1091,110 @@ mod tests {
         lodestash_core::catalog::Catalog::open(&db).unwrap();
         let state = ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap();
         (dir, Arc::new(state))
+    }
+
+    /// The discovery tools are the shared operations (v1 plan S12): a tool's JSON is what the
+    /// state returns — the value REST sends — and a refusal is an `isError` result with the code
+    /// REST would send, not a protocol error.
+    #[test]
+    fn discovery_tools_are_the_shared_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        let source = {
+            let mut c = lodestash_core::catalog::Catalog::open(&db).unwrap();
+            c.seed_media_types().unwrap();
+            let src = c.upsert_import_source("Lib", "C:/lib", "folder").unwrap();
+            let rec = |n: &str| lodestash_core::catalog::CrawlRecord {
+                workspace_rel: None,
+                content_hash: None,
+                rel_path: n.into(),
+                name: n.into(),
+                media_type: "image".into(),
+                size_bytes: 1,
+                mtime: 1,
+            };
+            c.record_crawl(src, None, &[rec("a.png"), rec("b.png"), rec("c.png")])
+                .unwrap();
+            src
+        };
+        let state =
+            Arc::new(ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap());
+        let mcp = Lodestash::new(state.clone());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let body = |r: &CallToolResult| -> serde_json::Value {
+            let text = serde_json::to_value(r).unwrap()["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            serde_json::from_str(&text).unwrap()
+        };
+
+        let tool = rt
+            .block_on(mcp.list_assets(Parameters(ListAssetsArgs {
+                source_id: source,
+                package_id: None,
+                media_type: None,
+                status: None,
+                tag_state: None,
+                selection: None,
+                limit: Some(2),
+                cursor: None,
+            })))
+            .unwrap();
+        let shared = state
+            .list_assets(&lodestash_api::ListAssetsRequest {
+                source_id: Some(source),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(body(&tool), shared);
+
+        let refused = rt
+            .block_on(mcp.list_assets(Parameters(ListAssetsArgs {
+                source_id: source,
+                package_id: None,
+                media_type: None,
+                status: None,
+                tag_state: None,
+                selection: Some("random".into()),
+                limit: None,
+                cursor: Some("w1.1.2.x.y".into()),
+            })))
+            .expect("a refusal is a tool result");
+        assert_eq!(refused.is_error, Some(true));
+        assert_eq!(body(&refused)["error"]["code"], "invalid_cursor");
+
+        let searched = rt
+            .block_on(mcp.search_assets(Parameters(SearchArgs {
+                query: "png".into(),
+                limit: None,
+                media_type: Some("mesh".into()),
+                source_id: None,
+                package_id: None,
+                tags: None,
+            })))
+            .expect("a refusal is a tool result");
+        assert_eq!(body(&searched)["error"]["code"], "invalid_argument");
+
+        let read = rt
+            .block_on(mcp.get_assets(Parameters(GetAssetsArgs {
+                asset_ids: vec![1, 999],
+                source_id: None,
+            })))
+            .unwrap();
+        assert_eq!(
+            body(&read),
+            state
+                .read_assets(&lodestash_api::ReadAssetsRequest {
+                    asset_ids: vec![1, 999],
+                    source_id: None
+                })
+                .unwrap()
+        );
     }
 
     /// Headless (v1 plan S11): an app-owned tool is the app's REST operation, forwarded whole. The

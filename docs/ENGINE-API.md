@@ -77,8 +77,11 @@ Each row is the **same core operation** as the matching MCP tool in
 
 | MCP tool | REST endpoint | Notes |
 |---|---|---|
-| `search_assets` | `GET /v1/search` | query/filter params; paginated (`cursor`, `limit`) |
-| `semantic_search` | `GET /v1/search?mode=ai` | natural-language `q`; requires embeddings |
+| `search_assets` | `GET /v1/search` | `q`, `limit`, and the §8.1 scope (`media_type`, `source_id`, `package_id`, repeated `tags`) applied before ranking |
+| `semantic_search` | `GET /v1/search?mode=ai` | natural-language `q`; requires embeddings; same scope |
+| `list_libraries` | `GET /v1/libraries` | libraries in id order, cursor-paged (§8.1) |
+| `list_assets` | `GET /v1/assets` | walk one library — ordered keyset pages or a random sample (§8.1) |
+| `get_assets` | `POST /v1/assets/read` | read-only: detail for 1–100 ids, unavailable ones listed (§8.1) |
 | `find_similar` | `GET /v1/assets/{id}/similar` | `limit`; cosine over `vec_asset` ("more like this") |
 | `get_asset` | `GET /v1/assets/{id}` | full **asset detail** (§3) |
 | `get_asset_preview` | `GET /v1/assets/{id}/preview?kind=` | streams PNG/JPEG (thumbnail/turntable/waveform) |
@@ -412,7 +415,8 @@ Unity panel instantly, and vice-versa.
 Drafted 2026-09-10. **§8.3 `write_tags` shipped 2026-09-11 (v1 plan S05)** — REST, MCP and the
 approval gate, with durable receipts (M27). Still open within it: `vocabulary_revision` is accepted
 and recorded but enforced only once §8.5 lands. A headless `--mcp` process forwards the request to
-the app that owns the gate (S11, 2026-09-12). The rest of this section is still proposed. This section owns the wire
+the app that owns the gate (S11, 2026-09-12). **§8.1 discovery shipped 2026-09-12 (v1 plan S12)**,
+with the notes at the end of §8.1. The rest of this section is still proposed. This section owns the wire
 contract for [MCP asset analysis](MCP-ASSET-ANALYSIS.md). It refines the v1 architecture plan's
 S04/S05/S10/S11/S12. Existing §2 operations retain their current containers and required parameters;
 the rows below are additive unless explicitly described as an extension. New fields are not evidence
@@ -461,6 +465,26 @@ by `summary_json` (the old string-tag example in §3 describes the target-era sh
 current JSON). `analysis_revision` is an opaque versioned fingerprint of the source/preview input
 identity, sorted complete tag associations, description and review state; generate it in one read
 snapshot. It must change when the evidence or edited annotations change, even without a new asset ID.
+
+*As shipped (S12, 2026-09-12):*
+
+- The walk cursor is `w1.<last id>.<upper id>.<catalog_id>.<filter digest>` and the library cursor
+  `l1.<last id>.<catalog_id>` — opaque to clients, and refused as `invalid_cursor` when malformed,
+  from another catalog (M31 `catalog_id`), issued for other filters, or passed to a random selection.
+- "Excluded and non-content" is: trashed (`deleted_at`) or without a primary file. A file that is
+  gone from disk stays selectable and says so with `file_availability: missing`.
+- `file_availability` puts policy first: with asset bytes not released (ADR-0020) it is `denied`
+  wherever the file is.
+- An asset outside a `get_assets` `source_id` is reported `asset_not_found`, like one that does not
+  exist, so a scoped read cannot probe another library.
+- `evidence_url` is not emitted yet: it names §8.2's route, which does not exist until that ships.
+  `file_resource_uri` is emitted as the reference §8.2 will resolve.
+- `get_asset`/`get_assets` add `description` and `analysis_revision` (`a1-…`: primary-file identity
+  — size, mtime, content hash, pack entry, extracted path — plus review state and the annotation
+  revision, read in one transaction). `annotation_revision` stays, and is still what `write_tags`
+  checks.
+- On REST a malformed number (`limit=abc`) is `invalid_argument` in the error envelope. The existing
+  search route keeps its historical default of 50 and cap of 500; the new routes use 25 and 200.
 
 ### 8.2 Evidence and file access
 

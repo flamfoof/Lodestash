@@ -194,6 +194,11 @@ Two stages, so the embedding does the semantic lift while constraints stay cheap
    surfaces embedded it in SigLIP's space only, so audio could be found by name and never by
    description.
 
+   The agent planes take a scope with the query — library, pack, media type, tags — and apply it
+   before either retriever ranks (ENGINE-API §8.1, v1 plan S12), so ten models in one pack are found
+   even when a thousand images outrank them library-wide. Search ranks candidates; visiting a whole
+   library is `list_assets`, a keyset walk, not paging through search results.
+
 > Why this is fast at 100k+: the parser converts "under 5k tris" into a cheap indexed filter instead of
 > hoping the vector encodes it; pre-filtering means the ANN only scores a small candidate set
 > (sqlite-vec partition keys + metadata filter in one query, DATA-MODEL §2). The query parse itself is

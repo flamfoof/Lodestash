@@ -83,6 +83,9 @@ against the `claude-api` skill before implementing.
 |---|---|---|
 | `search_assets` | `query`, filters (`type`, `tags[]`, `category`, `format`, `min/max` size…), `limit`, `cursor` | paginated asset summaries (id, name, type, format, tags, thumbnail URI) |
 | `semantic_search` | `query` (natural language), `type?`, `limit` | ranked summaries (embedding index) |
+| `list_libraries` | `limit?`, `cursor?` | libraries (id, name, kind, asset_count), cursor-paged ([ENGINE-API §8.1](ENGINE-API.md#81-discovery-selection-and-detail)) |
+| `list_assets` | `source_id`, `package_id?`, `media_type?`, `status?`, `tag_state?`, `selection?` (ordered/random), `limit?`, `cursor?` | one library walked completely, or sampled — search ranks, this visits (§8.1) |
+| `get_assets` | `asset_ids` (1–100), `source_id?` | full detail in the order asked, plus the ids that could not be returned (§8.1) |
 | `find_similar` | `id`, `limit?` | ranked summaries most similar to the given asset (cosine over `vec_asset`) — "more like this" for agents |
 | `get_asset` | `id` | full metadata (paths, dims/poly-count/duration, formats, tags, collections, category, license) |
 | `get_asset_preview` | `id`, `kind?` (thumbnail/turntable-frame/waveform) | **image content block** (base64+mimeType); audio → waveform image or `resource_link` |

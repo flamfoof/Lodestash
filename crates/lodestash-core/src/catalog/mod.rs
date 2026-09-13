@@ -211,6 +211,8 @@ impl AssetMetrics {
 pub struct AssetSummaryRow {
     pub id: i64,
     pub uuid: String,
+    /// The library (`import_source.id`) the asset belongs to.
+    pub source_id: i64,
     pub name: String,
     /// `media_type.code`.
     pub media_type: String,
@@ -5744,7 +5746,7 @@ impl Catalog {
                         CASE WHEN af.workspace_rel IS NULL
                              THEN s.root_path || '/' || af.rel_path END,
                         af.workspace_rel,
-                        a.tri_count, a.width_px, a.height_px, a.duration_ms
+                        a.tri_count, a.width_px, a.height_px, a.duration_ms, a.source_id
                  FROM asset a
                  JOIN media_type mt    ON mt.id = a.media_type_id
                  JOIN import_source s  ON s.id = a.source_id
@@ -5770,6 +5772,7 @@ impl Catalog {
                         workspace_rel: r.get(10)?,
                         metrics: AssetMetrics::from_row(r, 11)?,
                         tags: Vec::new(),
+                        source_id: r.get(15)?,
                     })
                 })
                 .optional()
@@ -6246,6 +6249,7 @@ pub(crate) fn record_op_in(
 // The two large `impl Catalog` blocks above stay too: the 94 functions in the second do not fall
 // into clean domains without a judgement pass over each one, and a bad split is worse than none.
 
+mod browse;
 mod collections;
 mod excludes;
 mod graph;
@@ -6255,6 +6259,8 @@ mod prefab;
 mod snapshots;
 mod tagbatch;
 mod taxonomy;
+#[cfg(test)]
+mod tests_browse;
 #[cfg(test)]
 mod tests_catalog;
 #[cfg(test)]
@@ -6266,6 +6272,7 @@ mod tests_snapshots;
 #[cfg(test)]
 mod tests_tagbatch;
 
+pub use browse::{AssetScope, LibraryRow, TagState};
 pub use material_inputs::{albedo_rank, MaterialInputSource, MaterialSlot, ModelMaterialInputs};
 pub use prefab::{PrefabBindingRow, PrefabFileScan, LEGACY_PREFAB_SCOPE};
 pub use snapshots::{clear_resident_snapshots, resident_snapshot_count, EmbeddingSnapshot};

@@ -47,6 +47,9 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/stage", get(list_staged).post(stage_asset))
         .route("/v1/stage/import", post(import_staged))
         .route("/v1/assets/{id}/file", get(file))
+        .route("/v1/libraries", get(list_libraries))
+        .route("/v1/assets", get(list_assets))
+        .route("/v1/assets/read", post(read_assets))
         // Innermost: every handler below runs off the runtime thread (v1 plan S11).
         .layer(axum::middleware::from_fn(off_runtime))
         // Order matters: `guard` is added last so it wraps outermost and runs **first** — an
@@ -91,6 +94,9 @@ fn tool_for(method: &Method, path: &str, query: Option<&str>) -> Option<&'static
         ("POST", "/v1/stage") => "stage_asset",
         ("GET", "/v1/stage") => "list_staged",
         ("POST", "/v1/stage/import") => "import_staged",
+        ("GET", "/v1/libraries") => "list_libraries",
+        ("GET", "/v1/assets") => "list_assets",
+        ("POST", "/v1/assets/read") => "get_assets",
         _ => return None,
     })
 }
@@ -216,21 +222,74 @@ async fn server_info(State(state): State<Shared>) -> Response {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct SearchParams {
-    #[serde(default)]
-    q: String,
-    limit: Option<usize>,
-    media_type: Option<String>,
-    mode: Option<String>,
+/// A query string as pairs, so a repeated key (`tags=a&tags=b`) keeps every value — the struct form
+/// keeps one — and a malformed number is an `invalid_argument` in the error envelope rather than
+/// axum's plain-text rejection.
+struct Params(Vec<(String, String)>);
+
+impl Params {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn all(&self, key: &str) -> Vec<String> {
+        self.0
+            .iter()
+            .filter(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+
+    fn parsed<T: std::str::FromStr>(&self, key: &str) -> Result<Option<T>, crate::AgentError> {
+        self.get(key)
+            .map(|v| {
+                v.parse::<T>().map_err(|_| {
+                    crate::AgentError::invalid(format!("{key} must be a number, not {v:?}"))
+                })
+            })
+            .transpose()
+    }
 }
 
-async fn search(State(state): State<Shared>, Query(p): Query<SearchParams>) -> Response {
-    let limit = p.limit.unwrap_or(50).clamp(1, 500);
-    if p.mode.as_deref() == Some("ai") {
-        return match state.semantic_search(&p.q, limit, p.media_type.as_deref()) {
+fn agent_err(e: crate::AgentError) -> Response {
+    err(
+        StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_REQUEST),
+        e.code,
+        &e.message,
+        "",
+    )
+}
+
+/// `search_assets` / `semantic_search` — with the optional scope of ENGINE-API §8.1 applied before
+/// ranking. The historical default (50) and cap (500) stay as they were.
+async fn search(
+    State(state): State<Shared>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Response {
+    let p = Params(pairs);
+    let parsed = (|| {
+        let limit = p.parsed::<usize>("limit")?.unwrap_or(50).clamp(1, 500);
+        let scope = state.search_scope(&crate::SearchScope {
+            source_id: p.parsed("source_id")?,
+            package_id: p.parsed("package_id")?,
+            media_type: p.get("media_type").map(str::to_string),
+            tags: p.all("tags"),
+        })?;
+        Ok::<_, crate::AgentError>((limit, scope))
+    })();
+    let (limit, scope) = match parsed {
+        Ok(v) => v,
+        Err(e) => return agent_err(e),
+    };
+    let q = p.get("q").unwrap_or("");
+    if p.get("mode") == Some("ai") {
+        return match state.semantic_search(q, limit, &scope) {
             Some(Ok(rows)) => {
-                let out: Vec<Value> = rows.iter().map(summary_json).collect();
+                let out: Vec<Value> = rows.iter().map(|r| state.summary(r)).collect();
                 Json(json!({ "results": out })).into_response()
             }
             Some(Err(e)) => db_err(e),
@@ -242,14 +301,72 @@ async fn search(State(state): State<Shared>, Query(p): Query<SearchParams>) -> R
             ),
         };
     }
-    // ponytail: blocking sqlite on the async thread — these are indexed point queries; move to
-    // spawn_blocking if a slow route ever shows up in a trace.
-    let rows = match state.search(&p.q, limit, p.media_type.as_deref()) {
+    let rows = match state.search(q, limit, &scope) {
         Ok(rows) => rows,
         Err(e) => return db_err(e),
     };
-    let out: Vec<Value> = rows.iter().map(summary_json).collect();
+    let out: Vec<Value> = rows.iter().map(|r| state.summary(r)).collect();
     Json(json!({ "results": out })).into_response()
+}
+
+/// ENGINE-API §8.1 `list_libraries` — `GET /v1/libraries`.
+async fn list_libraries(
+    State(state): State<Shared>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Response {
+    let p = Params(pairs);
+    let answer = p.parsed::<usize>("limit").and_then(|limit| {
+        state.list_libraries(&crate::LibrariesRequest {
+            limit,
+            cursor: p.get("cursor").map(str::to_string),
+        })
+    });
+    match answer {
+        Ok(body) => Json(body).into_response(),
+        Err(e) => agent_err(e),
+    }
+}
+
+/// ENGINE-API §8.1 `list_assets` — `GET /v1/assets`.
+async fn list_assets(
+    State(state): State<Shared>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Response {
+    let p = Params(pairs);
+    let answer = (|| {
+        let req = crate::ListAssetsRequest {
+            source_id: p.parsed("source_id")?,
+            package_id: p.parsed("package_id")?,
+            media_type: p.get("media_type").map(str::to_string),
+            status: p.get("status").map(str::to_string),
+            tag_state: p.get("tag_state").map(str::to_string),
+            selection: p.get("selection").map(str::to_string),
+            limit: p.parsed("limit")?,
+            cursor: p.get("cursor").map(str::to_string),
+        };
+        state.list_assets(&req)
+    })();
+    match answer {
+        Ok(body) => Json(body).into_response(),
+        Err(e) => agent_err(e),
+    }
+}
+
+/// ENGINE-API §8.1 `get_assets` — `POST /v1/assets/read`. Read-only despite the method: an id list
+/// belongs in a body, not a URL.
+async fn read_assets(State(state): State<Shared>, body: axum::body::Bytes) -> Response {
+    let req: crate::ReadAssetsRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return agent_err(crate::AgentError::invalid(format!(
+                "the request body is not {{asset_ids, source_id?}}: {e}"
+            )))
+        }
+    };
+    match state.read_assets(&req) {
+        Ok(body) => Json(body).into_response(),
+        Err(e) => agent_err(e),
+    }
 }
 
 async fn asset_detail(State(state): State<Shared>, Path(id): Path<i64>) -> Response {
@@ -316,7 +433,7 @@ async fn similar(
 ) -> Response {
     match state.similar(id, p.limit.unwrap_or(20).clamp(1, 200)) {
         Ok(rows) => {
-            let out: Vec<Value> = rows.iter().map(summary_json).collect();
+            let out: Vec<Value> = rows.iter().map(|r| state.summary(r)).collect();
             Json(json!({ "results": out })).into_response()
         }
         Err(e) => db_err(e),
@@ -508,7 +625,7 @@ async fn unpack_package(
 async fn list_staged(State(state): State<Shared>) -> Response {
     match state.list_staged() {
         Ok(rows) => {
-            let out: Vec<Value> = rows.iter().map(summary_json).collect();
+            let out: Vec<Value> = rows.iter().map(|r| state.summary(r)).collect();
             Json(json!({ "assets": out })).into_response()
         }
         Err(e) => db_err(e),
@@ -947,6 +1064,142 @@ mod tests {
                 .unwrap();
         }
         ids
+    }
+
+    /// The discovery routes are the shared operations (v1 plan S12): each REST body is exactly what
+    /// `ServerState` returns for the same request — the value MCP's tool returns too — refusals
+    /// carry the same code, and the allow-list gates the new routes like any other.
+    #[tokio::test]
+    async fn discovery_routes_are_the_shared_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        let ids = seed_embedded(&db);
+        let st =
+            Arc::new(ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap());
+        let token = st.token.clone();
+        let get = |uri: &str| {
+            let st = st.clone();
+            let req = get_req(uri, Some(&token), None);
+            async move { send(router(st), req).await }
+        };
+
+        let (s, libs) = get("/v1/libraries").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(libs["libraries"][0]["asset_count"], 3);
+        let source = libs["libraries"][0]["id"].as_i64().unwrap();
+
+        let (s, page) = get(&format!("/v1/assets?source_id={source}&limit=2")).await;
+        assert_eq!(s, StatusCode::OK);
+        let shared = st
+            .list_assets(&crate::ListAssetsRequest {
+                source_id: Some(source),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page, shared, "REST and the shared operation disagree");
+        let cursor = page["next_cursor"].as_str().unwrap();
+        let (_, rest) = get(&format!(
+            "/v1/assets?source_id={source}&limit=2&cursor={cursor}"
+        ))
+        .await;
+        let walked: Vec<i64> = page["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(rest["assets"].as_array().unwrap())
+            .map(|a| a["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(walked, ids, "two pages visit the library in id order");
+        assert!(rest["next_cursor"].is_null());
+
+        for (uri, code) in [
+            ("/v1/assets".to_string(), "invalid_argument"),
+            (
+                format!("/v1/assets?source_id={source}&limit=abc"),
+                "invalid_argument",
+            ),
+            (
+                format!("/v1/assets?source_id={source}&cursor=nope"),
+                "invalid_cursor",
+            ),
+            (
+                "/v1/search?q=a&tags=untagged".to_string(),
+                "invalid_argument",
+            ),
+            (
+                "/v1/search?q=a&media_type=mesh".to_string(),
+                "invalid_argument",
+            ),
+        ] {
+            let (s, body) = get(&uri).await;
+            assert_eq!(
+                (s, body["error"]["code"].as_str()),
+                (StatusCode::BAD_REQUEST, Some(code)),
+                "{uri}"
+            );
+        }
+
+        let (s, read) = send(
+            router(st.clone()),
+            post_req(
+                "/v1/assets/read",
+                Some(&token),
+                json!({"asset_ids": [ids[1], 999]}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            read,
+            st.read_assets(&crate::ReadAssetsRequest {
+                asset_ids: vec![ids[1], 999],
+                source_id: None
+            })
+            .unwrap()
+        );
+        let (s, body) = send(
+            router(st.clone()),
+            post_req(
+                "/v1/assets/read",
+                Some(&token),
+                json!({"asset_ids": [1], "extra": true}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            (s, body["error"]["code"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_argument"))
+        );
+
+        // A scoped search ranks within its scope, and a summary carries the §8.1 additions.
+        let (_, found) = get(&format!(
+            "/v1/search?q=png&source_id={source}&media_type=image"
+        ))
+        .await;
+        let first = &found["results"][0];
+        assert_eq!(first["source_id"], source);
+        assert_eq!(
+            first["file_availability"], "denied",
+            "bytes are not released in this fixture"
+        );
+        assert!(first["file_resource_uri"]
+            .as_str()
+            .unwrap()
+            .starts_with("asset://"));
+
+        st.set_allowed(["search_assets".to_string()].into());
+        for uri in [
+            "/v1/libraries".to_string(),
+            format!("/v1/assets?source_id={source}"),
+        ] {
+            let (s, body) = get(&uri).await;
+            assert_eq!(
+                (s, body["error"]["code"].as_str()),
+                (StatusCode::FORBIDDEN, Some("tool_disabled")),
+                "{uri}"
+            );
+        }
     }
 
     /// find_similar ranks by cosine, never returns the query asset, and answers an unembedded
