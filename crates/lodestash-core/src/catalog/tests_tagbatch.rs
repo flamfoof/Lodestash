@@ -117,6 +117,78 @@ fn tags_dirty(c: &Catalog, asset: i64) -> i64 {
 use HistoryOrigin::{Agent, Background, User};
 use TagMode::{Append, RejectAllSources, RemoveScoped, ReplaceSource};
 
+#[test]
+fn a_review_keeps_accepted_ai_tags_and_removes_only_the_named_ai_assignment() {
+    let (mut c, ids) = catalog_with(&[("rock.png", "image")]);
+    let asset_id = ids[0];
+    c.apply_tag_batch(&batch(
+        vec![
+            item(
+                asset_id,
+                "manual",
+                None,
+                Append,
+                vec![TagAssignment::exact("subject", "stone")],
+            ),
+            item(
+                asset_id,
+                "ai:vision",
+                Some("vision-1"),
+                Append,
+                vec![ai("stone", 0.8), ai("moss", 0.7)],
+            ),
+        ],
+        false,
+        None,
+    ))
+    .expect("seed tags");
+    let revision = c.annotation_revision(asset_id).expect("revision");
+
+    let outcome = c
+        .apply_tag_review(&TagReviewBatch {
+            reviewer: "codex@test".into(),
+            decisions: vec![
+                TagReviewDecision {
+                    asset_id,
+                    expected_revision: revision,
+                    namespace: "subject".into(),
+                    value: "stone".into(),
+                    source: "ai:vision".into(),
+                    action: TagReviewAction::Accept,
+                    reason: "The preview supports the stone label.".into(),
+                },
+                TagReviewDecision {
+                    asset_id,
+                    expected_revision: c.annotation_revision(asset_id).expect("same revision"),
+                    namespace: "subject".into(),
+                    value: "moss".into(),
+                    source: "ai:vision".into(),
+                    action: TagReviewAction::Reject,
+                    reason: "No moss is visible in the preview.".into(),
+                },
+            ],
+            receipt: None,
+        })
+        .expect("review");
+
+    assert_eq!(outcome.changed_assets, vec![asset_id]);
+    assert!(outcome.op_id.is_some(), "acceptance is a history event");
+    assert_eq!(
+        rows(&c, asset_id),
+        vec![
+            row("ai:vision", "stone", Some(0.8), Some("vision-1")),
+            row("manual", "stone", None, None),
+        ]
+    );
+    assert!(c
+        .recent_ops(1)
+        .expect("history")
+        .first()
+        .expect("review op")
+        .payload_json
+        .contains("No moss is visible"));
+}
+
 /// A person's tag and two models' results live side by side, and re-running one model replaces
 /// that model's set and nothing else — not the person's, not the other model's.
 #[test]

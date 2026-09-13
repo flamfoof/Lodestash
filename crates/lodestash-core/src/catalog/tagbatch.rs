@@ -113,6 +113,32 @@ pub struct TagBatch {
     pub receipt: Option<TagReceiptKey>,
 }
 
+/// One review outcome for an existing AI association. An acceptance preserves the association and
+/// records why it was checked; a rejection removes only that exact source association.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TagReviewAction {
+    Accept,
+    Reject,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TagReviewDecision {
+    pub asset_id: i64,
+    pub expected_revision: String,
+    pub namespace: String,
+    pub value: String,
+    pub source: String,
+    pub action: TagReviewAction,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TagReviewBatch {
+    pub reviewer: String,
+    pub decisions: Vec<TagReviewDecision>,
+    pub receipt: Option<TagReceiptKey>,
+}
+
 /// A request's identity: the id its caller chose and a digest of the validated body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagReceiptKey {
@@ -324,6 +350,10 @@ struct AssetChange {
 struct BatchPayload {
     v: u32,
     changes: Vec<AssetChange>,
+    #[serde(default)]
+    reviewer: Option<String>,
+    #[serde(default)]
+    reviews: Vec<TagReviewDecision>,
 }
 
 const PAYLOAD_VERSION: u32 = 2;
@@ -697,6 +727,8 @@ impl Catalog {
             let payload = serde_json::to_string(&BatchPayload {
                 v: PAYLOAD_VERSION,
                 changes,
+                reviewer: None,
+                reviews: Vec::new(),
             })?;
             outcome.op_id = Some(record_op_in(
                 &tx,
@@ -728,6 +760,193 @@ impl Catalog {
         }
         tx.commit()
             .map_err(|e| CoreError::Catalog(format!("tag batch commit: {e}")))?;
+        Ok(outcome)
+    }
+
+    /// Review existing AI associations atomically. The target row and every expected revision are
+    /// checked in the writer transaction; acceptance is recorded even when it changes no rows.
+    pub fn apply_tag_review(&mut self, batch: &TagReviewBatch) -> Result<TagBatchOutcome> {
+        if batch.reviewer.trim().is_empty() {
+            return Err(invalid("a review needs a reviewer"));
+        }
+        let mut asset_ids: Vec<i64> = batch.decisions.iter().map(|d| d.asset_id).collect();
+        asset_ids.sort_unstable();
+        asset_ids.dedup();
+        if batch.decisions.is_empty() || asset_ids.len() > MAX_BATCH_ASSETS {
+            return Err(invalid(format!(
+                "{} assets; a review holds 1 to {MAX_BATCH_ASSETS}",
+                asset_ids.len()
+            )));
+        }
+        let mut seen = HashSet::new();
+        let mut expected = std::collections::HashMap::new();
+        let mut norms = Vec::with_capacity(batch.decisions.len());
+        for decision in &batch.decisions {
+            if !is_ai_source(&decision.source) {
+                return Err(invalid(
+                    "protected_assignment: only AI associations are reviewable",
+                ));
+            }
+            if decision.expected_revision.trim().is_empty() {
+                return Err(invalid("expected_revision is required"));
+            }
+            if decision.reason.trim().is_empty()
+                || decision.reason.chars().count() > MAX_DESCRIPTION_CHARS
+            {
+                return Err(invalid(format!(
+                    "a review reason is 1 to {MAX_DESCRIPTION_CHARS} characters"
+                )));
+            }
+            let tag = TagAssignment {
+                namespace: decision.namespace.clone(),
+                value: decision.value.clone(),
+                confidence: None,
+            };
+            if let Some(problem) = assignment_problem("ai:review", &tag) {
+                return Err(invalid(problem));
+            }
+            let namespace = namespace_of(&decision.namespace);
+            let (norm, _) = normalize_tag(&namespace, &decision.value).expect("checked above");
+            if !seen.insert((decision.asset_id, decision.source.as_str(), norm.clone())) {
+                return Err(invalid(format!(
+                    "asset {} reviews {}:{} from {} twice",
+                    decision.asset_id, decision.namespace, decision.value, decision.source
+                )));
+            }
+            match expected.insert(decision.asset_id, decision.expected_revision.as_str()) {
+                Some(previous) if previous != decision.expected_revision => {
+                    return Err(invalid(format!(
+                        "asset {} names two expected revisions",
+                        decision.asset_id
+                    )))
+                }
+                _ => {}
+            }
+            norms.push(norm);
+        }
+
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| CoreError::Catalog(format!("tag review begin: {e}")))?;
+        for asset_id in &asset_ids {
+            let exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM asset WHERE id = ?1)",
+                    params![asset_id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| CoreError::Catalog(format!("review asset lookup: {e}")))?;
+            if !exists {
+                return Err(invalid(format!("asset {asset_id} does not exist")));
+            }
+            let current = annotation_revision_in(&tx, *asset_id)?;
+            if current != expected[asset_id] {
+                return Err(CoreError::Catalog(format!(
+                    "revision_conflict: asset {asset_id} changed since review"
+                )));
+            }
+        }
+        let mut target_ids = Vec::with_capacity(batch.decisions.len());
+        for (decision, norm) in batch.decisions.iter().zip(&norms) {
+            let tag_id: Option<i64> = tx
+                .query_row(
+                    "SELECT at.tag_id FROM asset_tag at JOIN tag t ON t.id = at.tag_id
+                      WHERE at.asset_id = ?1 AND at.source = ?2 AND t.norm_name = ?3",
+                    params![decision.asset_id, decision.source, norm],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| CoreError::Catalog(format!("review target lookup: {e}")))?;
+            target_ids.push(tag_id.ok_or_else(|| {
+                invalid(format!(
+                    "review_target_missing: asset {} has no {}:{} from {}",
+                    decision.asset_id, decision.namespace, decision.value, decision.source
+                ))
+            })?);
+        }
+
+        let mut outcome = TagBatchOutcome::default();
+        let mut changes = Vec::new();
+        for asset_id in &asset_ids {
+            let indices: Vec<usize> = batch
+                .decisions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, decision)| (decision.asset_id == *asset_id).then_some(index))
+                .collect();
+            let mut sources = indices
+                .iter()
+                .map(|&index| batch.decisions[index].source.clone())
+                .collect::<Vec<_>>();
+            sources.sort();
+            sources.dedup();
+            let before = rows_for(&tx, *asset_id, &sources)?;
+            let mut target = before.clone();
+            for index in &indices {
+                if batch.decisions[*index].action == TagReviewAction::Reject {
+                    let source = &batch.decisions[*index].source;
+                    let tag_id = target_ids[*index];
+                    target.retain(|row| !(row.source == *source && row.tag_id == tag_id));
+                }
+            }
+            if same_rows(&before, &target) {
+                outcome.unchanged_assets.push(*asset_id);
+                continue;
+            }
+            write_rows(&tx, *asset_id, &before, &target)?;
+            finish_asset(&tx, *asset_id, None)?;
+            changes.push(AssetChange {
+                asset_id: *asset_id,
+                sources,
+                caption: false,
+                before: Side {
+                    rows: before,
+                    description: None,
+                },
+                after: Side {
+                    rows: target,
+                    description: None,
+                },
+            });
+            outcome.changed_assets.push(*asset_id);
+        }
+        let payload = serde_json::to_string(&BatchPayload {
+            v: PAYLOAD_VERSION,
+            changes,
+            reviewer: Some(batch.reviewer.clone()),
+            reviews: batch.decisions.clone(),
+        })?;
+        outcome.op_id = Some(record_op_in(
+            &tx,
+            "tag_batch",
+            &payload,
+            None,
+            HistoryOrigin::Agent.as_str(),
+        )?);
+        if let Some(key) = &batch.receipt {
+            let result = serde_json::json!({
+                "operation_id": outcome.op_id,
+                "changed_assets": outcome.changed_assets,
+                "unchanged_assets": outcome.unchanged_assets,
+                "asset_ids": asset_ids,
+                "reviewed_decisions": batch.decisions.len(),
+            });
+            tx.execute(
+                "INSERT INTO tag_request (request_id, body_digest, op_id, result_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    key.request_id,
+                    key.digest,
+                    outcome.op_id,
+                    result.to_string(),
+                    unix_now()
+                ],
+            )
+            .map_err(|e| CoreError::Catalog(format!("review receipt: {e}")))?;
+        }
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("tag review commit: {e}")))?;
         Ok(outcome)
     }
 

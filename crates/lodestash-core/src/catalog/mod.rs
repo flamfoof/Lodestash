@@ -6320,6 +6320,7 @@ pub use snapshots::{clear_resident_snapshots, resident_snapshot_count, Embedding
 pub use tagbatch::{
     ai_source, assignment_problem, is_ai_source, source_problem, validate_assignments, AssetTagRow,
     HistoryOrigin, TagBatch, TagBatchItem, TagBatchOutcome, TagMode, TagReceipt, TagReceiptKey,
-    AI_NAMESPACES, HUMAN_NAMESPACES, LEGACY_AI_SOURCE, MAX_AI_ASSIGNMENTS, MAX_AI_PER_NAMESPACE,
-    MAX_BATCH_ASSETS, MAX_DESCRIPTION_CHARS, MAX_LABEL_CHARS,
+    TagReviewAction, TagReviewBatch, TagReviewDecision, AI_NAMESPACES, HUMAN_NAMESPACES,
+    LEGACY_AI_SOURCE, MAX_AI_ASSIGNMENTS, MAX_AI_PER_NAMESPACE, MAX_BATCH_ASSETS,
+    MAX_DESCRIPTION_CHARS, MAX_LABEL_CHARS,
 };
