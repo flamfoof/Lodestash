@@ -535,6 +535,9 @@ pub struct AppConfig {
     /// the model behind it runs.
     #[serde(default)]
     pub mcp_bytes_enabled: bool,
+    /// Which canonical vocabulary terms agent writes may use (ENGINE-API §8.5).
+    #[serde(default = "default_mcp_vocabulary_policy")]
+    pub mcp_vocabulary_policy: String,
     /// Hard per-run cap on cloud-tagged assets (AI-PIPELINE §5.1 budget guard): a run stops after
     /// this many API calls and leaves the rest queued, so a mis-scoped Full Run on a paid endpoint
     /// can't become a surprise bill. Applies only to the API path; the local path is free.
@@ -555,6 +558,10 @@ pub struct AppConfig {
 
 fn default_api_max_per_run() -> u32 {
     500
+}
+
+fn default_mcp_vocabulary_policy() -> String {
+    "extend_with_approval".into()
 }
 
 /// The cloud API key at rest (AI-PIPELINE §5.1). On Windows the key lives in Credential Manager via
@@ -641,6 +648,7 @@ impl Default for AppConfig {
             api_key: String::new(),
             remote_image_bytes: false,
             mcp_bytes_enabled: false,
+            mcp_vocabulary_policy: default_mcp_vocabulary_policy(),
             api_max_per_run: default_api_max_per_run(),
             mcp_disabled_tools: Vec::new(),
             agent_producer_id: None,

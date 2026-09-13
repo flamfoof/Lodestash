@@ -20,6 +20,8 @@ pub const MAX_READ: usize = 100;
 /// Archive pulls and renders allowed at once (ENGINE-API §8.2), and how long a caller waits for one.
 pub const HEAVY_SLOTS: usize = 2;
 pub const HEAVY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+/// At most one 4 MiB PNG is presently delivered; multi-view evidence shares this same aggregate cap.
+pub const MAX_EVIDENCE_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
 
 const STATUSES: &[&str] = &["discovered", "indexed", "identified", "confirmed"];
 
@@ -153,6 +155,24 @@ pub struct ListAssetsRequest {
 pub struct ReadAssetsRequest {
     pub asset_ids: Vec<i64>,
     pub source_id: Option<i64>,
+}
+
+/// `get_asset_evidence`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct EvidenceRequest {
+    pub kind: Option<String>,
+    pub max_dimension: Option<usize>,
+    pub views: Option<usize>,
+}
+
+/// `get_vocabulary`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct VocabularyRequest {
+    pub media_type: Option<String>,
+    pub taxonomy_id: Option<i64>,
+    pub prefix: Option<String>,
+    pub limit: Option<usize>,
+    pub cursor: Option<String>,
 }
 
 /// The optional scope `search_assets` and `semantic_search` accept on top of their query.
@@ -532,6 +552,331 @@ impl ServerState {
         }
         Ok(json!({ "assets": assets, "unavailable": unavailable }))
     }
+
+    /// `get_vocabulary` — a bounded, revisioned view of applicable canonical traits and one
+    /// taxonomy. Raw tags remain on `list_tags`; this is the review vocabulary only.
+    pub fn get_vocabulary(&self, req: &VocabularyRequest) -> Result<Value, AgentError> {
+        let limit = page_limit(req.limit)?;
+        let prefix = req.prefix.as_deref().unwrap_or("").to_lowercase();
+        let cat = self.catalog.lock().unwrap();
+        if let Some(media_type) = req.media_type.as_deref() {
+            if cat.media_type_id(media_type)?.is_none() {
+                return Err(AgentError::invalid(format!(
+                    "unknown media_type {media_type:?} — one of model_3d, texture, audio, image, sprite, material, font"
+                )));
+            }
+        }
+        let taxonomy_id = match positive("taxonomy_id", req.taxonomy_id)? {
+            Some(id) => {
+                if cat.taxonomy_meta(id)?.is_none() {
+                    return Err(AgentError::invalid(format!("no taxonomy has id {id}")));
+                }
+                Some(id)
+            }
+            None => cat.active_taxonomy()?,
+        };
+        let traits = cat
+            .list_vocabulary()?
+            .into_iter()
+            .filter(|trait_row| trait_row.is_trait)
+            .filter(|trait_row| {
+                req.media_type.as_deref().map_or(true, |media_type| {
+                    trait_row
+                        .scope
+                        .as_deref()
+                        .map_or(true, |scope| scope == media_type)
+                })
+            })
+            .filter(|trait_row| {
+                prefix.is_empty()
+                    || trait_row.namespace.to_lowercase().starts_with(&prefix)
+                    || trait_row.value.to_lowercase().starts_with(&prefix)
+            })
+            .map(|trait_row| {
+                json!({
+                    "id": trait_row.id,
+                    "namespace": trait_row.namespace,
+                    "value": trait_row.value,
+                    "scope": trait_row.scope,
+                    "usage_note": trait_row.usage_note,
+                    "teach": trait_row.teach,
+                })
+            })
+            .collect::<Vec<_>>();
+        let (categories, aliases, rules) = match taxonomy_id {
+            None => (Vec::new(), Vec::new(), Vec::new()),
+            Some(taxonomy_id) => {
+                let rows = cat.list_categories(taxonomy_id)?;
+                let ids_by_path = rows
+                    .iter()
+                    .map(|(id, _, path)| (path.as_str(), *id))
+                    .collect::<std::collections::HashMap<_, _>>();
+                let categories = rows
+                    .iter()
+                    .map(|(id, label, path)| {
+                        let parent_id = path
+                            .rsplit_once('/')
+                            .and_then(|(parent, _)| ids_by_path.get(parent).copied());
+                        json!({
+                            "id": id,
+                            "taxonomy_id": taxonomy_id,
+                            "parent_id": parent_id,
+                            "path": path,
+                            "label": label,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let mut aliases = Vec::new();
+                for (category_id, _, _) in &rows {
+                    for alias in cat.list_category_aliases(*category_id)? {
+                        aliases.push(json!({
+                            "id": alias.id,
+                            "taxonomy_id": taxonomy_id,
+                            "category_id": category_id,
+                            "alias": alias.alias,
+                        }));
+                    }
+                }
+                let rules = cat
+                    .list_rules(taxonomy_id)?
+                    .into_iter()
+                    .map(
+                        |(
+                            id,
+                            category_id,
+                            category_path,
+                            match_type,
+                            pattern,
+                            priority,
+                            enabled,
+                        )| {
+                            json!({
+                                "id": id,
+                                "taxonomy_id": taxonomy_id,
+                                "category_id": category_id,
+                                "category_path": category_path,
+                                "match_type": match_type,
+                                "pattern": pattern,
+                                "priority": priority,
+                                "enabled": enabled,
+                            })
+                        },
+                    )
+                    .collect::<Vec<_>>();
+                (categories, aliases, rules)
+            }
+        };
+        drop(cat);
+        let policy = self.vocabulary_policy();
+        let revision_body = json!({
+            "policy": policy,
+            "traits": traits,
+            "categories": categories,
+            "aliases": aliases,
+            "rules": rules,
+        });
+        let revision = format!(
+            "v1-{}",
+            digest16(&serde_json::to_string(&revision_body).unwrap())
+        );
+        let signature = digest16(&format!("{:?}|{:?}|{prefix}", req.media_type, taxonomy_id));
+        let mut entries = Vec::new();
+        entries.extend(
+            traits
+                .into_iter()
+                .map(|row| (0_u8, row["id"].as_i64().unwrap(), "traits", row)),
+        );
+        entries.extend(
+            categories
+                .into_iter()
+                .map(|row| (1_u8, row["id"].as_i64().unwrap(), "categories", row)),
+        );
+        entries.extend(
+            aliases
+                .into_iter()
+                .map(|row| (2_u8, row["id"].as_i64().unwrap(), "aliases", row)),
+        );
+        entries.extend(
+            rules
+                .into_iter()
+                .map(|row| (3_u8, row["id"].as_i64().unwrap(), "rules", row)),
+        );
+        let start = match req.cursor.as_deref() {
+            None => 0,
+            Some(cursor) => {
+                let parts = cursor.split('.').collect::<Vec<_>>();
+                let ["v1", kind, id, cursor_revision, cursor_signature] = parts.as_slice() else {
+                    return Err(AgentError::cursor("the cursor is malformed"));
+                };
+                if *cursor_revision != revision || *cursor_signature != signature {
+                    return Err(AgentError::cursor(
+                        "the vocabulary changed or the cursor has different filters",
+                    ));
+                }
+                let key = (kind.parse::<u8>().ok(), id.parse::<i64>().ok());
+                entries
+                    .iter()
+                    .position(|(entry_kind, entry_id, _, _)| {
+                        Some(*entry_kind) == key.0 && Some(*entry_id) == key.1
+                    })
+                    .map(|index| index + 1)
+                    .ok_or_else(|| {
+                        AgentError::cursor("the cursor no longer names a vocabulary entry")
+                    })?
+            }
+        };
+        let end = (start + limit).min(entries.len());
+        let mut page_traits = Vec::new();
+        let mut page_categories = Vec::new();
+        let mut page_aliases = Vec::new();
+        let mut page_rules = Vec::new();
+        for (_, _, collection, row) in &entries[start..end] {
+            match *collection {
+                "traits" => page_traits.push(row.clone()),
+                "categories" => page_categories.push(row.clone()),
+                "aliases" => page_aliases.push(row.clone()),
+                "rules" => page_rules.push(row.clone()),
+                _ => unreachable!(),
+            }
+        }
+        let next_cursor = (end > 0 && end < entries.len()).then(|| {
+            let (kind, id, _, _) = &entries[end - 1];
+            format!("v1.{kind}.{id}.{revision}.{signature}")
+        });
+        Ok(json!({
+            "revision": revision,
+            "policy": policy,
+            "traits": page_traits,
+            "categories": page_categories,
+            "aliases": page_aliases,
+            "rules": page_rules,
+            "next_cursor": next_cursor,
+        }))
+    }
+    /// `get_asset_evidence` — one manifest shared by REST and MCP. This first path makes the
+    /// byte-consent boundary explicit before asking the preview renderer to do any work.
+    pub fn get_asset_evidence(&self, id: i64, req: &EvidenceRequest) -> Result<Value, AgentError> {
+        let row = self
+            .asset(id)?
+            .ok_or_else(|| AgentError::asset_not_found(id))?;
+        let kind = req.kind.as_deref().unwrap_or("auto");
+        if !matches!(kind, "auto" | "thumbnail" | "model_views" | "text") {
+            return Err(AgentError::invalid(format!(
+                "unknown evidence kind {kind:?} — auto, thumbnail, model_views or text"
+            )));
+        }
+        if kind == "model_views" && row.media_type != "model_3d" {
+            return Err(AgentError::invalid(
+                "model_views evidence is available only for model_3d assets",
+            ));
+        }
+        let max_dimension = req.max_dimension.unwrap_or(512);
+        if !(1..=1024).contains(&max_dimension) {
+            return Err(AgentError::invalid(format!(
+                "max_dimension must be between 1 and 1024, not {max_dimension}"
+            )));
+        }
+        let views = req.views.unwrap_or(1);
+        if !(1..=4).contains(&views) {
+            return Err(AgentError::invalid(format!(
+                "views must be between 1 and 4, not {views}"
+            )));
+        }
+        if views != 1 && row.media_type != "model_3d" {
+            return Err(AgentError::invalid(
+                "views is available only for model_3d assets",
+            ));
+        }
+        let analysis_revision = self.catalog.lock().unwrap().analysis_revision(id)?;
+        let denied = !self.byte_release();
+        let evidence_kind = if row.media_type == "model_3d" {
+            "model_views"
+        } else {
+            "thumbnail"
+        };
+        let preview = (!denied && kind != "text")
+            .then(|| self.preview_path(id))
+            .flatten();
+        let preview_too_large = preview.as_ref().is_some_and(|path| {
+            std::fs::metadata(path)
+                .map(|metadata| metadata.len() > MAX_EVIDENCE_IMAGE_BYTES)
+                .unwrap_or(false)
+        });
+        let representation = preview
+            .filter(|_| !preview_too_large)
+            .and_then(|path| png_dimensions(&path))
+            .filter(|(width, height)| *width <= max_dimension && *height <= max_dimension)
+            .map(|(width, height)| {
+                json!({
+                    "kind": evidence_kind,
+                    "mime_type": "image/png",
+                    "url": format!(
+                        "/v1/assets/{id}/preview?kind={evidence_kind}&view=0&max_dimension={max_dimension}"
+                    ),
+                    "width": width,
+                    "height": height,
+                })
+            });
+        let status = if denied {
+            "denied"
+        } else if representation.is_some() {
+            if views == 1 {
+                "ready"
+            } else {
+                "partial"
+            }
+        } else {
+            "unavailable"
+        };
+        let limitations = if denied {
+            vec![json!({
+                "code": "bytes_not_released",
+                "message": "preview and file bytes need mcp_bytes_enabled in Settings"
+            })]
+        } else if preview_too_large {
+            vec![json!({
+                "code": "evidence_too_large",
+                "message": format!("the preview exceeds the {MAX_EVIDENCE_IMAGE_BYTES}-byte evidence limit")
+            })]
+        } else if representation.is_none() {
+            vec![json!({
+                "code": "evidence_unavailable",
+                "message": "no supported evidence representation is available"
+            })]
+        } else if views > 1 {
+            vec![json!({
+                "code": "additional_views_unavailable",
+                "message": "the current renderer has one cached model view"
+            })]
+        } else {
+            Vec::new()
+        };
+        Ok(json!({
+            "asset_id": id,
+            "analysis_revision": analysis_revision,
+            "status": status,
+            "representations": representation.into_iter().collect::<Vec<_>>(),
+            "file_url": format!("/v1/assets/{id}/file"),
+            "file_resource_uri": format!("asset://{id}/file"),
+            "dependencies_used": [],
+            "limitations": limitations,
+        }))
+    }
+}
+
+fn png_dimensions(path: &std::path::Path) -> Option<(usize, usize)> {
+    let mut bytes = [0; 24];
+    std::io::Read::read_exact(&mut std::fs::File::open(path).ok()?, &mut bytes).ok()?;
+    (bytes[..16]
+        == [
+            0x89, b'P', b'N', b'G', 13, 10, 26, 10, 0, 0, 0, 13, b'I', b'H', b'D', b'R',
+        ])
+    .then(|| {
+        let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?) as usize;
+        let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?) as usize;
+        (width > 0 && height > 0).then_some((width, height))
+    })
+    .flatten()
 }
 
 #[cfg(test)]
@@ -540,6 +885,14 @@ mod tests {
     use lodestash_core::catalog::CrawlRecord;
 
     fn fixture(images: usize, models: usize) -> (tempfile::TempDir, ServerState, i64, i64) {
+        fixture_with_preview(images, models, Box::new(|_| None))
+    }
+
+    fn fixture_with_preview(
+        images: usize,
+        models: usize,
+        preview: crate::PreviewFn,
+    ) -> (tempfile::TempDir, ServerState, i64, i64) {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("catalog.db");
         let (src, other) = {
@@ -567,7 +920,7 @@ mod tests {
                 .unwrap();
             (src, other)
         };
-        let state = ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap();
+        let state = ServerState::new(&db, dir.path().to_path_buf(), preview).unwrap();
         (dir, state, src, other)
     }
 
@@ -578,6 +931,135 @@ mod tests {
             .iter()
             .map(|a| a["id"].as_i64().unwrap())
             .collect()
+    }
+
+    #[test]
+    fn vocabulary_returns_applicable_traits_and_a_revision() {
+        let (dir, state, _, _) = fixture(0, 0);
+        Catalog::open(&dir.path().join("catalog.db"))
+            .unwrap()
+            .upsert_trait(
+                "style",
+                "low poly",
+                Some("model_3d"),
+                Some("Use for stylized meshes"),
+                false,
+            )
+            .unwrap();
+
+        let vocabulary = state
+            .get_vocabulary(&VocabularyRequest {
+                media_type: Some("model_3d".into()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(vocabulary["policy"], "extend_with_approval");
+        assert!(vocabulary["revision"]
+            .as_str()
+            .is_some_and(|revision| revision.starts_with("v1-")));
+        assert_eq!(vocabulary["traits"][0]["namespace"], "style");
+        assert_eq!(vocabulary["traits"][0]["value"], "low poly");
+        assert_eq!(vocabulary["traits"][0]["scope"], "model_3d");
+    }
+
+    #[test]
+    fn evidence_reports_denied_without_byte_release() {
+        let (_dir, state, src, _) = fixture(0, 1);
+        let asset_id = ids(&state
+            .list_assets(&ListAssetsRequest {
+                source_id: Some(src),
+                media_type: Some("model_3d".into()),
+                ..Default::default()
+            })
+            .unwrap())[0];
+
+        let evidence = state
+            .get_asset_evidence(asset_id, &EvidenceRequest::default())
+            .unwrap();
+
+        assert_eq!(evidence["asset_id"], asset_id);
+        assert_eq!(evidence["status"], "denied");
+        assert!(evidence["representations"].as_array().unwrap().is_empty());
+        assert_eq!(
+            evidence["file_resource_uri"],
+            format!("asset://{asset_id}/file")
+        );
+        assert!(evidence["analysis_revision"]
+            .as_str()
+            .is_some_and(|revision| revision.starts_with("a1-")));
+    }
+
+    #[test]
+    fn evidence_advertises_a_cached_model_preview_after_byte_release() {
+        let preview_dir = tempfile::tempdir().unwrap();
+        let preview = preview_dir.path().join("model.png");
+        std::fs::write(
+            &preview,
+            [
+                0x89, b'P', b'N', b'G', 13, 10, 26, 10, 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0,
+                0, 64, 0, 0, 0, 32,
+            ],
+        )
+        .unwrap();
+        let preview_for_renderer = preview.clone();
+        let (_dir, state, src, _) =
+            fixture_with_preview(0, 1, Box::new(move |_| Some(preview_for_renderer.clone())));
+        let asset_id = ids(&state
+            .list_assets(&ListAssetsRequest {
+                source_id: Some(src),
+                media_type: Some("model_3d".into()),
+                ..Default::default()
+            })
+            .unwrap())[0];
+        state.set_byte_release(true);
+
+        let evidence = state
+            .get_asset_evidence(asset_id, &EvidenceRequest::default())
+            .unwrap();
+
+        assert_eq!(evidence["status"], "ready");
+        assert_eq!(
+            evidence["representations"],
+            json!([{
+                "kind": "model_views",
+                "mime_type": "image/png",
+                "url": format!("/v1/assets/{asset_id}/preview?kind=model_views&view=0&max_dimension=512"),
+                "width": 64,
+                "height": 32,
+            }])
+        );
+    }
+
+    #[test]
+    fn evidence_does_not_advertise_a_preview_over_the_inline_image_cap() {
+        let preview_dir = tempfile::tempdir().unwrap();
+        let preview = preview_dir.path().join("large.png");
+        let mut bytes = vec![0; MAX_EVIDENCE_IMAGE_BYTES as usize + 1];
+        bytes[..24].copy_from_slice(&[
+            0x89, b'P', b'N', b'G', 13, 10, 26, 10, 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0,
+            64, 0, 0, 0, 32,
+        ]);
+        std::fs::write(&preview, bytes).unwrap();
+        let preview_for_renderer = preview.clone();
+        let (_dir, state, src, _) =
+            fixture_with_preview(0, 1, Box::new(move |_| Some(preview_for_renderer.clone())));
+        let asset_id = ids(&state
+            .list_assets(&ListAssetsRequest {
+                source_id: Some(src),
+                media_type: Some("model_3d".into()),
+                ..Default::default()
+            })
+            .unwrap())[0];
+        state.set_byte_release(true);
+
+        let evidence = state
+            .get_asset_evidence(asset_id, &EvidenceRequest::default())
+            .unwrap();
+
+        assert_eq!(evidence["status"], "unavailable");
+        assert!(evidence["representations"].as_array().unwrap().is_empty());
+        assert_eq!(evidence["limitations"][0]["code"], "evidence_too_large");
     }
 
     /// A walk through the planes' own request type: pages chain by cursor to every asset once, and

@@ -120,6 +120,15 @@ for audio, use local metadata/transcripts and permitted local audio analysis. A 
 evidence for semantic sound labels. Other media use their existing viewable representations and state
 when no meaningful analysis representation is available.
 
+S12c began on 2026-09-13 with `get_asset_evidence` / `GET /v1/assets/{id}/evidence`: one
+consent-aware manifest, a cached preview view when it exists, and the catalog-scoped file reference.
+It explicitly reports `denied` before rendering or materializing bytes. Multi-view rendering,
+downscaling, extracted text and dependency evidence remain open work.
+
+S12d also provides `get_vocabulary` / `GET /v1/vocabulary`: the configured policy and a revisioned,
+bounded page of applicable promoted traits plus the selected taxonomy. Review decisions, vocabulary
+proposals and enforcement at `write_tags` approval remain open work.
+
 Search/detail responses expose evidence and file references. MCP also exposes catalog-scoped
 `asset://{id}/file` references; resource access uses the same authorization/resolver as REST. Raw large
 model bytes are not embedded in tool text or sent to a vision model expecting images.
@@ -136,7 +145,7 @@ archive access. Reuse warm cache entries only when archive and entry identity st
 
 The user clarified on 2026-09-10 that inspection, identification, acceptance/rejection and vocabulary
 growth are all required. Exact operations and policy are in ENGINE-API §8.5; UI-SPEC §9 owns the
-vocabulary concepts. This remains planning-only.
+vocabulary concepts. Its read operation is available; its review and proposal writes remain planned.
 
 - A **tag** is a namespace/value assigned to an asset with producer provenance.
 - A **trait** is a promoted tag with scope, usage guidance and optional teaching. Reuse applicable

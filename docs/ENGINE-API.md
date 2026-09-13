@@ -417,7 +417,11 @@ approval gate, with durable receipts (M27). Still open within it: `vocabulary_re
 and recorded but enforced only once §8.5 lands. A headless `--mcp` process forwards the request to
 the app that owns the gate (S11, 2026-09-12). **§8.1 discovery shipped 2026-09-12 (v1 plan S12)**,
 with the notes at the end of §8.1; **§8.2's file access shipped with S12b** (notes at its end) —
-the evidence manifest and view parameters have not. The rest of this section is still proposed. This section owns the wire
+the initial consent-aware evidence manifest shipped with S12c on 2026-09-13. It returns one cached
+preview view when available; multiple rendered views, resizing, text extraction and dependency
+evidence remain open. **§8.5's `get_vocabulary` read shipped on 2026-09-13** with a configured
+policy and revisioned, bounded pages; review, proposal and write-policy enforcement remain open.
+The rest of this section is still proposed. This section owns the wire
 contract for [MCP asset analysis](MCP-ASSET-ANALYSIS.md). It refines the v1 architecture plan's
 S04/S05/S10/S11/S12. Existing §2 operations retain their current containers and required parameters;
 the rows below are additive unless explicitly described as an extension. New fields are not evidence
@@ -665,11 +669,12 @@ separately constrains the LLM's proposed annotations. Revalidate host support du
 Clarified 2026-09-10: the complete workflow includes existing tag/preview reporting, identification,
 then vocabulary-based acceptance/rejection, with approved vocabulary growth. Codex is the first host;
 analysis receives 3D preview images and metadata and may write tags plus a short description.
-These additions are planned; `suggest_tags` still means stored suggestions in the shipped server.
+`get_vocabulary` is available; the review/proposal operations and `write_tags` enforcement remain
+planned. `suggest_tags` still means stored suggestions in the shipped server.
 
 | MCP tool | REST endpoint | Contract |
 |---|---|---|
-| `get_vocabulary` (new) | `GET /v1/vocabulary` | Optional `media_type`, `taxonomy_id` (active by default), `prefix`, `limit` (25, maximum 200), `cursor`. Returns `{revision,policy,traits,categories,aliases,rules,next_cursor}`. |
+| `get_vocabulary` | `GET /v1/vocabulary` | Optional `media_type`, `taxonomy_id` (active by default), `prefix`, `limit` (25, maximum 200), `cursor`. Returns `{revision,policy,traits,categories,aliases,rules,next_cursor}`. |
 | `review_tags` (new) | `POST /v1/tags/review` | `{request_id,vocabulary_revision,assets:[{asset_id,expected_revision,decisions:[{namespace,value,source,action,reason}]}]}`. Actions: `accept`, `reject`. App-approved job. |
 | `propose_vocabulary_changes` (new) | `POST /v1/vocabulary/proposals` | `{request_id,expected_revision,changes:[...]}`. App-approved job; approved changes update the existing vocabulary tables. |
 

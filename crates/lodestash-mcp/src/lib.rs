@@ -114,6 +114,34 @@ pub struct AssetArgs {
     pub id: i64,
 }
 
+/// `get_asset_evidence` (ENGINE-API §8.2).
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct EvidenceArgs {
+    /// The asset's catalog id.
+    pub id: i64,
+    /// auto (default), thumbnail, model_views, or text.
+    pub kind: Option<String>,
+    /// Longest representation edge; defaults to 512, maximum 1024.
+    pub max_dimension: Option<usize>,
+    /// Requested 3D views; defaults to 1, maximum 4.
+    pub views: Option<usize>,
+}
+
+/// `get_vocabulary` (ENGINE-API §8.5).
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct VocabularyArgs {
+    /// Restrict traits to this media type.
+    pub media_type: Option<String>,
+    /// Taxonomy id; omitted selects the active taxonomy when there is one.
+    pub taxonomy_id: Option<i64>,
+    /// Trait namespace or value prefix.
+    pub prefix: Option<String>,
+    /// Page size (default 25, maximum 200 across all returned entry types).
+    pub limit: Option<usize>,
+    /// `next_cursor` from the previous page with the same filters.
+    pub cursor: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct RegisterProjectArgs {
     /// Absolute path to the Unity project root.
@@ -617,6 +645,67 @@ impl Lodestash {
             },
         }))?);
         Ok(CallToolResult::success(content))
+    }
+
+    /// A bounded evidence manifest plus the available raster preview for a vision-capable host.
+    #[tool(
+        name = "get_asset_evidence",
+        description = "Return an asset-analysis manifest and available preview image blocks. Byte release must be enabled in Lodestash Settings; a denied or unavailable manifest never claims visual evidence."
+    )]
+    pub async fn get_asset_evidence(
+        &self,
+        Parameters(args): Parameters<EvidenceArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.gate("get_asset_evidence")?;
+        let manifest = match self.state.get_asset_evidence(
+            args.id,
+            &lodestash_api::EvidenceRequest {
+                kind: args.kind,
+                max_dimension: args.max_dimension,
+                views: args.views,
+            },
+        ) {
+            Ok(manifest) => manifest,
+            Err(error) => return refused(error),
+        };
+        let mut content = vec![ContentBlock::json(manifest.clone())?];
+        if manifest["representations"]
+            .as_array()
+            .is_some_and(|representations| !representations.is_empty())
+        {
+            if let Some(path) = self.state.preview_path(args.id) {
+                if let Ok(bytes) = std::fs::read(path) {
+                    content.push(ContentBlock::image(b64(&bytes), "image/png"));
+                }
+            }
+        }
+        content.push(ContentBlock::resource_link(
+            Resource::new(format!("asset://{}/file", args.id), "asset_file")
+                .with_description("The asset source bytes, subject to the same byte policy."),
+        ));
+        Ok(CallToolResult::success(content))
+    }
+
+    /// The canonical traits and selected taxonomy used to review agent assignments.
+    #[tool(
+        name = "get_vocabulary",
+        description = "Return the revisioned, app-configured vocabulary policy, applicable canonical traits, and the selected taxonomy. Keep revision and cursor when proposing or reviewing tags."
+    )]
+    pub async fn get_vocabulary(
+        &self,
+        Parameters(args): Parameters<VocabularyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.gate("get_vocabulary")?;
+        answer(
+            self.state
+                .get_vocabulary(&lodestash_api::VocabularyRequest {
+                    media_type: args.media_type,
+                    taxonomy_id: args.taxonomy_id,
+                    prefix: args.prefix,
+                    limit: args.limit,
+                    cursor: args.cursor,
+                }),
+        )
     }
 
     /// ENGINE-API §8.1 `list_libraries`.
@@ -1303,6 +1392,25 @@ mod tests {
             .unwrap();
         assert_eq!(body(&tool), shared);
 
+        let vocabulary = rt
+            .block_on(mcp.get_vocabulary(Parameters(VocabularyArgs {
+                media_type: None,
+                taxonomy_id: None,
+                prefix: None,
+                limit: Some(2),
+                cursor: None,
+            })))
+            .unwrap();
+        assert_eq!(
+            body(&vocabulary),
+            state
+                .get_vocabulary(&lodestash_api::VocabularyRequest {
+                    limit: Some(2),
+                    ..Default::default()
+                })
+                .unwrap()
+        );
+
         let refused = rt
             .block_on(mcp.list_assets(Parameters(ListAssetsArgs {
                 source_id: source,
@@ -1343,6 +1451,21 @@ mod tests {
                     asset_ids: vec![1, 999],
                     source_id: None
                 })
+                .unwrap()
+        );
+
+        let evidence = rt
+            .block_on(mcp.get_asset_evidence(Parameters(EvidenceArgs {
+                id: 1,
+                kind: None,
+                max_dimension: None,
+                views: None,
+            })))
+            .unwrap();
+        assert_eq!(
+            body(&evidence),
+            state
+                .get_asset_evidence(1, &lodestash_api::EvidenceRequest::default())
                 .unwrap()
         );
     }
@@ -1471,6 +1594,16 @@ mod tests {
         assert_eq!(tools, expected, "MCP tools must mirror the REST operations");
     }
 
+    #[test]
+    fn evidence_tool_is_registered() {
+        let (_dir, state) = fixture();
+        assert!(Lodestash::new(state)
+            .tool_router
+            .list_all()
+            .iter()
+            .any(|tool| tool.name == "get_asset_evidence"));
+    }
+
     /// The per-tool allow-list (UI-SPEC §16, card 178) gates the MCP plane: default allows
     /// everything, a set restricts to its members, and a disabled tool errors.
     #[test]
@@ -1549,6 +1682,72 @@ mod tests {
         assert!(
             !released.contains("withheld"),
             "bytes released and the tool still refuses: {released}"
+        );
+    }
+
+    #[test]
+    fn evidence_tool_delivers_the_manifest_and_preview_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        let id = {
+            let mut c = lodestash_core::catalog::Catalog::open(&db).unwrap();
+            c.seed_media_types().unwrap();
+            let src = c.upsert_import_source("Lib", "C:/lib", "folder").unwrap();
+            c.record_crawl(
+                src,
+                None,
+                &[lodestash_core::catalog::CrawlRecord {
+                    workspace_rel: None,
+                    content_hash: None,
+                    rel_path: "arch.fbx".into(),
+                    name: "arch.fbx".into(),
+                    media_type: "model_3d".into(),
+                    size_bytes: 1,
+                    mtime: 1,
+                }],
+            )
+            .unwrap();
+            c.assets_needing_tags_within(1, None).unwrap()[0].asset_id
+        };
+        let preview = dir.path().join("arch.png");
+        let png = vec![
+            0x89, b'P', b'N', b'G', 13, 10, 26, 10, 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0,
+            64, 0, 0, 0, 32,
+        ];
+        std::fs::write(&preview, &png).unwrap();
+        let preview_for_renderer = preview.clone();
+        let state = Arc::new(
+            ServerState::new(
+                &db,
+                dir.path().to_path_buf(),
+                Box::new(move |_| Some(preview_for_renderer.clone())),
+            )
+            .unwrap(),
+        );
+        state.set_byte_release(true);
+        let mcp = Lodestash::new(state);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let output = rt
+            .block_on(mcp.get_asset_evidence(Parameters(EvidenceArgs {
+                id,
+                kind: None,
+                max_dimension: None,
+                views: None,
+            })))
+            .unwrap();
+        let text = serde_json::to_string(&output).unwrap();
+        assert!(text.contains("model_views"), "MCP said {text}");
+        assert!(
+            text.contains(&b64(&png)),
+            "MCP omitted the preview image: {text}"
+        );
+        assert!(
+            text.contains(&format!("asset://{id}/file")),
+            "MCP said {text}"
         );
     }
 

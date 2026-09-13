@@ -128,7 +128,14 @@ this file stays the live board.
       thumbnail scratch still keys on path/size/offset and keeps a replaced pack's old payload —
       re-keying it froze the shell (pulls run on the protocol thread) and was reverted; it belongs
       to S15.
-- [ ] **R5 · S12c — evidence manifest and model views** (MCP handoff Task 3, second half).
+- [~] **R5 · S12c — evidence manifest and model views** (MCP handoff Task 3, second half).
+      `get_asset_evidence` ↔ `GET /v1/assets/{id}/evidence` now returns a shared, consent-aware
+      manifest, cached preview image block and catalog-scoped file link. *Open:* multiple rendered
+      views, requested downscaling, text extraction and dependency evidence.
+- [~] **R5 · S12d — vocabulary-guided review** (MCP handoff Task 4a). `get_vocabulary` ↔
+      `GET /v1/vocabulary` returns a configured policy and revisioned pages of applicable promoted
+      traits, categories, aliases and rules. *Open:* review decisions, vocabulary proposals and
+      enforcement at `write_tags` approval.
 - [ ] **R5 · S13 — app-owned bulk runs** (MCP handoff Task 5).
 - [ ] **Proxies/packs · S14–S18 — pre-extraction identity, one cache policy, visual tiers, font
       specimens, batched inflate.**

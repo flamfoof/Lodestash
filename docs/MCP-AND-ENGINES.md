@@ -7,7 +7,7 @@ integration target;** Unreal editor integration is planned for a later phase (§
 > Reviewed for the analysis workflow 2026-09-10. The proposed
 > [asset-analysis design](MCP-ASSET-ANALYSIS.md) extends the existing server; its exact tool/REST
 > contracts live in [ENGINE-API §8](ENGINE-API.md#8-proposed-asset-analysis-contract).
-> New analysis operations are planned, not enabled by this documentation change.
+> `get_asset_evidence` and `get_vocabulary` are available; the remaining analysis writes are planned.
 > The clarified scope includes vocabulary reads, identification followed by association review,
 > and approved trait/category proposals; ENGINE-API §8.5 owns those additional tool/REST pairs.
 
@@ -89,6 +89,7 @@ against the `claude-api` skill before implementing.
 | `find_similar` | `id`, `limit?` | ranked summaries most similar to the given asset (cosine over `vec_asset`) — "more like this" for agents |
 | `get_asset` | `id` | full metadata (paths, dims/poly-count/duration, formats, tags, collections, category, license) |
 | `get_asset_preview` | `id`, `kind?` (thumbnail/turntable-frame/waveform) | **image content block** (base64+mimeType); audio → waveform image or `resource_link` |
+| `get_asset_evidence` | `id`, `kind?`, `max_dimension?`, `views?` | shared manifest plus one available preview image block and an `asset://{id}/file` link; byte consent can return `denied` |
 | `list_tags` | `prefix?` | tags with counts |
 | `add_tag` / `retag` | `id`, `tags[]` | updated asset *(mutating — confirm)*; written as `ai:legacy-agent` |
 | `write_tags` | `request_id`, `assets[]` (revision, producer, mode, tags, description) | job `awaiting_approval` → receipt; same contract as `POST /v1/tags/batch` ([ENGINE-API §8.3](ENGINE-API.md#83-attributed-result-writes)) |

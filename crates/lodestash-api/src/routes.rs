@@ -26,6 +26,8 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/search", get(search))
         .route("/v1/assets/{id}", get(asset_detail))
         .route("/v1/assets/{id}/preview", get(preview))
+        .route("/v1/assets/{id}/evidence", get(asset_evidence))
+        .route("/v1/vocabulary", get(vocabulary))
         .route("/v1/assets/{id}/similar", get(similar))
         .route("/v1/packages", get(packages))
         .route("/v1/projects/register", post(register_project))
@@ -75,6 +77,8 @@ fn tool_for(method: &Method, path: &str, query: Option<&str>) -> Option<&'static
         }
         ("GET", "/v1/assets/{id}") => "get_asset",
         ("GET", "/v1/assets/{id}/preview") => "get_asset_preview",
+        ("GET", "/v1/assets/{id}/evidence") => "get_asset_evidence",
+        ("GET", "/v1/vocabulary") => "get_vocabulary",
         ("GET", "/v1/assets/{id}/similar") => "find_similar",
         ("GET", "/v1/packages") => "list_packages",
         ("POST", "/v1/projects/register") => "register_project",
@@ -374,6 +378,47 @@ async fn asset_detail(State(state): State<Shared>, Path(id): Path<i64>) -> Respo
         Ok(Some(body)) => Json(body).into_response(),
         Ok(None) => not_found(),
         Err(e) => db_err(e),
+    }
+}
+
+/// ENGINE-API §8.2 `get_asset_evidence` — the same manifest the MCP tool returns.
+async fn asset_evidence(
+    State(state): State<Shared>,
+    Path(id): Path<i64>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Response {
+    let p = Params(pairs);
+    let request = (|| {
+        Ok::<_, crate::AgentError>(crate::EvidenceRequest {
+            kind: p.get("kind").map(str::to_string),
+            max_dimension: p.parsed("max_dimension")?,
+            views: p.parsed("views")?,
+        })
+    })();
+    match request.and_then(|request| state.get_asset_evidence(id, &request)) {
+        Ok(body) => Json(body).into_response(),
+        Err(e) => agent_err(e),
+    }
+}
+
+/// ENGINE-API §8.5 `get_vocabulary` — filtered and paged exactly like the MCP tool.
+async fn vocabulary(
+    State(state): State<Shared>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Response {
+    let p = Params(pairs);
+    let request = (|| {
+        Ok::<_, crate::AgentError>(crate::VocabularyRequest {
+            media_type: p.get("media_type").map(str::to_string),
+            taxonomy_id: p.parsed("taxonomy_id")?,
+            prefix: p.get("prefix").map(str::to_string),
+            limit: p.parsed("limit")?,
+            cursor: p.get("cursor").map(str::to_string),
+        })
+    })();
+    match request.and_then(|request| state.get_vocabulary(&request)) {
+        Ok(body) => Json(body).into_response(),
+        Err(e) => agent_err(e),
     }
 }
 
@@ -1182,10 +1227,32 @@ mod tests {
             .unwrap()
             .starts_with("asset://"));
 
+        let (s, evidence) = get(&format!("/v1/assets/{}/evidence", ids[0])).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            evidence,
+            st.get_asset_evidence(ids[0], &crate::EvidenceRequest::default())
+                .unwrap(),
+            "REST and the shared evidence operation disagree"
+        );
+        let (s, vocabulary) = get("/v1/vocabulary?limit=2").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            vocabulary,
+            st.get_vocabulary(&crate::VocabularyRequest {
+                limit: Some(2),
+                ..Default::default()
+            })
+            .unwrap(),
+            "REST and the shared vocabulary operation disagree"
+        );
+
         st.set_allowed(["search_assets".to_string()].into());
         for uri in [
             "/v1/libraries".to_string(),
             format!("/v1/assets?source_id={source}"),
+            format!("/v1/assets/{}/evidence", ids[0]),
+            "/v1/vocabulary".to_string(),
         ] {
             let (s, body) = get(&uri).await;
             assert_eq!(

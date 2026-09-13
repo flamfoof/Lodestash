@@ -2251,6 +2251,9 @@ fn build_engine_state() -> Result<
     // Whether an agent may receive bytes at all (v1 plan S10) — metadata and links are always
     // available, the files are not until the user says so.
     state.set_byte_release(cfg.mcp_bytes_enabled);
+    if let Err(error) = state.set_vocabulary_policy(cfg.mcp_vocabulary_policy) {
+        tracing::warn!(%error, "invalid MCP vocabulary policy; using extend_with_approval");
+    }
     // The REST/MCP semantic-search plane (ENGINE-API §2 `mode=ai`) embeds the query exactly as the
     // grid's AI mode does — SigLIP and CLAP, resolved lazily on the first ai search (model load is
     // seconds; a startup resolve would slow every launch). No spaces means no model → the route

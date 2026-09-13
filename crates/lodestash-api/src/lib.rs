@@ -9,7 +9,8 @@ pub mod discovery;
 pub mod export;
 pub mod handshake;
 pub use discovery::{
-    AgentError, LibrariesRequest, ListAssetsRequest, ReadAssetsRequest, SearchScope,
+    AgentError, EvidenceRequest, LibrariesRequest, ListAssetsRequest, ReadAssetsRequest,
+    SearchScope, VocabularyRequest,
 };
 pub mod jobs;
 pub mod routes;
@@ -81,6 +82,8 @@ pub const AGENT_OPERATIONS: &[(&str, &str)] = &[
     ("semantic_search", "GET /v1/search?mode=ai"),
     ("get_asset", "GET /v1/assets/{id}"),
     ("get_asset_preview", "GET /v1/assets/{id}/preview"),
+    ("get_asset_evidence", "GET /v1/assets/{id}/evidence"),
+    ("get_vocabulary", "GET /v1/vocabulary"),
     ("find_similar", "GET /v1/assets/{id}/similar"),
     ("list_packages", "GET /v1/packages"),
     ("register_project", "POST /v1/projects/register"),
@@ -527,6 +530,8 @@ pub struct ServerState {
     /// (v1 plan S10)? Off until the GUI says otherwise: a local transport says nothing about where
     /// the model behind it runs, and reading metadata never implied permission to upload files.
     byte_release: AtomicBool,
+    /// The vocabulary policy selected by the app. The agent only reads it; it never overrides it.
+    vocabulary_policy: Mutex<String>,
     /// Approved-or-not export requests, keyed by job id. Held apart from the job itself so the
     /// job record stays a pure status object.
     pending_exports: Mutex<std::collections::HashMap<String, (export::ExportRequest, PathBuf)>>,
@@ -577,6 +582,7 @@ impl ServerState {
             token: new_token(),
             allowed: Mutex::new(None),
             byte_release: AtomicBool::new(false),
+            vocabulary_policy: Mutex::new("extend_with_approval".into()),
             pending_exports: Mutex::new(std::collections::HashMap::new()),
             pending_imports: Mutex::new(std::collections::HashMap::new()),
             import_queue: Mutex::new(Vec::new()),
@@ -613,6 +619,23 @@ impl ServerState {
     /// May bytes be served to an agent right now?
     pub fn byte_release(&self) -> bool {
         self.byte_release.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The app-configured vocabulary policy (§8.5). Unknown values are rejected by the setter so
+    /// a malformed setting cannot make writes more permissive.
+    pub fn set_vocabulary_policy(&self, policy: String) -> Result<(), String> {
+        if !matches!(
+            policy.as_str(),
+            "open" | "controlled" | "extend_with_approval"
+        ) {
+            return Err(format!("unknown vocabulary policy {policy:?}"));
+        }
+        *self.vocabulary_policy.lock().unwrap() = policy;
+        Ok(())
+    }
+
+    pub fn vocabulary_policy(&self) -> String {
+        self.vocabulary_policy.lock().unwrap().clone()
     }
 
     /// Drop the allow-list — every agent operation is live again (the construction default).
