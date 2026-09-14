@@ -669,13 +669,13 @@ separately constrains the LLM's proposed annotations. Revalidate host support du
 Clarified 2026-09-10: the complete workflow includes existing tag/preview reporting, identification,
 then vocabulary-based acceptance/rejection, with approved vocabulary growth. Codex is the first host;
 analysis receives 3D preview images and metadata and may write tags plus a short description.
-`get_vocabulary` is available; the review/proposal operations and `write_tags` enforcement remain
-planned. `suggest_tags` still means stored suggestions in the shipped server.
+`get_vocabulary`, `review_tags`, and vocabulary-enforced `write_tags` are available; vocabulary
+proposals remain planned. `suggest_tags` still means stored suggestions in the shipped server.
 
 | MCP tool | REST endpoint | Contract |
 |---|---|---|
 | `get_vocabulary` | `GET /v1/vocabulary` | Optional `media_type`, `taxonomy_id` (active by default), `prefix`, `limit` (25, maximum 200), `cursor`. Returns `{revision,policy,traits,categories,aliases,rules,next_cursor}`. |
-| `review_tags` (new) | `POST /v1/tags/review` | `{request_id,vocabulary_revision,assets:[{asset_id,expected_revision,decisions:[{namespace,value,source,action,reason}]}]}`. Actions: `accept`, `reject`. App-approved job. |
+| `review_tags` | `POST /v1/tags/review` | `{request_id,vocabulary_revision,assets:[{asset_id,expected_revision,decisions:[{namespace,value,source,action,reason}]}]}`. Actions: `accept`, `reject`. App-approved job. |
 | `propose_vocabulary_changes` (new) | `POST /v1/vocabulary/proposals` | `{request_id,expected_revision,changes:[...]}`. App-approved job; approved changes update the existing vocabulary tables. |
 
 Vocabulary reads return the canonical tag ID/namespace/value, trait scope/usage note/teach flag;

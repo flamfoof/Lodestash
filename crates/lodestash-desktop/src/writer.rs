@@ -358,6 +358,9 @@ pub enum Op {
     TagBatch {
         batch: lodestash_core::catalog::TagBatch,
     },
+    TagReview {
+        batch: lodestash_core::catalog::TagReviewBatch,
+    },
 }
 
 /// What a write did, in the terms the frontend reports to the user.
@@ -2576,6 +2579,13 @@ fn run(
         }
         Op::TagBatch { batch } => catalog
             .apply_tag_batch(&batch)
+            .map(|out| WriteResult {
+                changed: out.changed_assets.len(),
+                ..Default::default()
+            })
+            .map_err(|e| e.to_string()),
+        Op::TagReview { batch } => catalog
+            .apply_tag_review(&batch)
             .map(|out| WriteResult {
                 changed: out.changed_assets.len(),
                 ..Default::default()

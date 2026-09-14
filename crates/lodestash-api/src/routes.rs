@@ -41,6 +41,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/tags", get(tags))
         .route("/v1/assets/{id}/tags", post(add_tag))
         .route("/v1/tags/batch", post(write_tags))
+        .route("/v1/tags/review", post(review_tags))
         .route("/v1/collections", get(collections))
         .route("/v1/mapping/apply", post(apply_mapping))
         .route("/v1/identify", post(identify_asset))
@@ -90,6 +91,7 @@ fn tool_for(method: &Method, path: &str, query: Option<&str>) -> Option<&'static
         ("GET", "/v1/tags") => "list_tags",
         ("POST", "/v1/assets/{id}/tags") => "add_tag",
         ("POST", "/v1/tags/batch") => "write_tags",
+        ("POST", "/v1/tags/review") => "review_tags",
         ("GET", "/v1/collections") => "list_collections",
         ("POST", "/v1/mapping/apply") => "apply_mapping",
         ("POST", "/v1/identify") => "identify_asset",
@@ -456,6 +458,42 @@ async fn write_tags(State(state): State<Shared>, body: axum::body::Bytes) -> Res
         }
         Err(e) => {
             let (status, code, message) = e.parts();
+            err(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+                code,
+                &message,
+                "",
+            )
+        }
+    }
+}
+
+/// ENGINE-API §8.5 `review_tags` — an approved exact-AI-association review.
+async fn review_tags(State(state): State<Shared>, body: axum::body::Bytes) -> Response {
+    if body.len() > crate::MAX_TAG_BATCH_BYTES {
+        return agent_err(crate::AgentError::resource_too_large(
+            "the review exceeds the 1 MiB request limit",
+        ));
+    }
+    let req: crate::TagReviewRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(error) => {
+            return agent_err(crate::AgentError::invalid(format!(
+                "the review request is malformed: {error}"
+            )))
+        }
+    };
+    match state.request_tag_review(req, body.len()) {
+        Ok(kickoff) => {
+            let (status, response) = kickoff.to_response();
+            (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+                Json(response),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            let (status, code, message) = error.parts();
             err(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
                 code,
@@ -1827,6 +1865,13 @@ mod tests {
                     .map(|o| o.changed_assets.len())
                     .map_err(|e| e.to_string())
             }
+            crate::AgentWrite::TagReview { batch } => {
+                lodestash_core::catalog::Catalog::open(&writer_db)
+                    .map_err(|e| e.to_string())?
+                    .apply_tag_review(&batch)
+                    .map(|o| o.changed_assets.len())
+                    .map_err(|e| e.to_string())
+            }
             other => Err(format!("unexpected write {other:?}")),
         }));
         (dir, s, id)
@@ -1850,6 +1895,14 @@ mod tests {
                 "tags": [{ "namespace": "subject", "value": value, "confidence": 0.8 }],
             }],
         })
+    }
+
+    fn with_vocabulary(st: &Shared, mut body: Value) -> Value {
+        body["vocabulary_revision"] = st
+            .get_vocabulary(&crate::VocabularyRequest::default())
+            .unwrap()["revision"]
+            .clone();
+        body
     }
 
     async fn settle(st: &Shared, job_id: &str) -> Value {
@@ -1880,7 +1933,8 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let post = |body: Value| post_req("/v1/tags/batch", Some(&token), body);
+        let post =
+            |body: Value| post_req("/v1/tags/batch", Some(&token), with_vocabulary(&st, body));
 
         let (s, v) = send(
             app(),
@@ -1892,6 +1946,19 @@ mod tests {
             (StatusCode::CONFLICT, Some("producer_not_configured"))
         );
         st.set_agent_producer(Some("codex@test".into()));
+
+        let (s, v) = send(
+            app(),
+            post(batch_body(RID_B, id, &rev, "codex@test", "stone")),
+        )
+        .await;
+        assert_eq!(
+            (s, v["error"]["code"].as_str()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some("vocabulary_term_unknown")
+            )
+        );
 
         let mut unknown = batch_body(RID_A, id, &rev, "codex@test", "stone");
         unknown["assets"][0]["confirmed"] = json!(true);
@@ -1949,6 +2016,7 @@ mod tests {
     async fn an_approved_batch_writes_once_and_a_retry_gets_the_same_answer() {
         let (_d, st, id) = tag_state();
         st.set_agent_producer(Some("codex@test".into()));
+        st.set_vocabulary_policy("open".into()).unwrap();
         let token = st.token.clone();
         let app = || router(st.clone());
         let rev = |st: &Shared| {
@@ -1958,7 +2026,7 @@ mod tests {
                 .to_string()
         };
         let first = rev(&st);
-        let body = batch_body(RID_A, id, &first, "codex@test", "stone");
+        let body = with_vocabulary(&st, batch_body(RID_A, id, &first, "codex@test", "stone"));
 
         let (s, parked) = send(
             app(),
@@ -2004,7 +2072,7 @@ mod tests {
             post_req(
                 "/v1/tags/batch",
                 Some(&token),
-                batch_body(RID_A, id, &first, "codex@test", "moss"),
+                with_vocabulary(&st, batch_body(RID_A, id, &first, "codex@test", "moss")),
             ),
         )
         .await;
@@ -2018,7 +2086,7 @@ mod tests {
             post_req(
                 "/v1/tags/batch",
                 Some(&token),
-                batch_body(RID_B, id, &first, "codex@test", "moss"),
+                with_vocabulary(&st, batch_body(RID_B, id, &first, "codex@test", "moss")),
             ),
         )
         .await;
@@ -2039,12 +2107,15 @@ mod tests {
             post_req(
                 "/v1/tags/batch",
                 Some(&token),
-                batch_body(
-                    "2d6cf4e9-8e3c-4e70-9c21-3b4d5e6f7a8c",
-                    id,
-                    &rev(&st),
-                    "codex@test",
-                    "ivy",
+                with_vocabulary(
+                    &st,
+                    batch_body(
+                        "2d6cf4e9-8e3c-4e70-9c21-3b4d5e6f7a8c",
+                        id,
+                        &rev(&st),
+                        "codex@test",
+                        "ivy",
+                    ),
                 ),
             ),
         )
@@ -2062,5 +2133,50 @@ mod tests {
             .map(|r| r["value"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(values, vec!["stone"], "only the approved write landed");
+    }
+
+    #[tokio::test]
+    async fn review_tags_records_acceptance_and_removes_only_the_named_ai_tag() {
+        let (_d, st, id) = tag_state();
+        st.set_agent_producer(Some("codex@test".into()));
+        st.set_vocabulary_policy("open".into()).unwrap();
+        let token = st.token.clone();
+        let app = || router(st.clone());
+        let revision = st.asset_detail_json(id).unwrap().unwrap()["annotation_revision"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let first = with_vocabulary(&st, batch_body(RID_A, id, &revision, "codex@test", "stone"));
+        let (_, parked) = send(app(), post_req("/v1/tags/batch", Some(&token), first)).await;
+        let first_job = parked["job_id"].as_str().unwrap().to_string();
+        st.approve_job(&first_job);
+        assert_eq!(settle(&st, &first_job).await["state"], "done");
+
+        let current = st.asset_detail_json(id).unwrap().unwrap()["annotation_revision"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let vocabulary_revision = st
+            .get_vocabulary(&crate::VocabularyRequest::default())
+            .unwrap()["revision"]
+            .clone();
+        let review = json!({
+            "request_id": RID_B,
+            "vocabulary_revision": vocabulary_revision,
+            "assets": [{ "asset_id": id, "expected_revision": current, "decisions": [
+                { "namespace": "subject", "value": "stone", "source": "ai:codex@test", "action": "reject", "reason": "the preview is not a stone asset" }
+            ] }]
+        });
+        let (status, parked) = send(app(), post_req("/v1/tags/review", Some(&token), review)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{parked}");
+        let job_id = parked["job_id"].as_str().unwrap().to_string();
+        st.approve_job(&job_id);
+        let done = settle(&st, &job_id).await;
+        assert_eq!(done["state"], "done", "{done}");
+        assert_eq!(done["result"]["reviewed_decisions"], 1);
+        assert!(st.asset_detail_json(id).unwrap().unwrap()["tag_provenance"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 }

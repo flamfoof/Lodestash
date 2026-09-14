@@ -132,7 +132,7 @@ pub struct TagReviewDecision {
     pub reason: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TagReviewBatch {
     pub reviewer: String,
     pub decisions: Vec<TagReviewDecision>,
@@ -140,7 +140,7 @@ pub struct TagReviewBatch {
 }
 
 /// A request's identity: the id its caller chose and a digest of the validated body.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TagReceiptKey {
     pub request_id: String,
     pub digest: String,

@@ -2123,6 +2123,7 @@ fn engine_write_bridge(writer: Writer) -> lodestash_api::AgentWriteFn {
             batch: request.to_core_batch(&digest),
         })
         .map(|r| r.changed),
+        AgentWrite::TagReview { batch } => run(Op::TagReview { batch }).map(|r| r.changed),
         AgentWrite::ApplyMapping { taxonomy_id } => {
             run(Op::ApplyMapping { taxonomy_id }).map(|r| r.changed)
         }

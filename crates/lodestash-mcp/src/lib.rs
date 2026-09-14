@@ -214,6 +214,27 @@ pub struct WriteTagsArgs {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewDecisionArgs {
+    pub namespace: String,
+    pub value: String,
+    pub source: String,
+    pub action: String,
+    pub reason: String,
+}
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewAssetArgs {
+    pub asset_id: i64,
+    pub expected_revision: String,
+    pub decisions: Vec<ReviewDecisionArgs>,
+}
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewTagsArgs {
+    pub request_id: String,
+    pub vocabulary_revision: String,
+    pub assets: Vec<ReviewAssetArgs>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AddTagArgs {
     /// The asset to tag.
     pub asset_id: i64,
@@ -854,6 +875,37 @@ impl Lodestash {
                     serde_json::json!({
                         "error": { "code": code, "message": message, "status": status }
                     }),
+                )?]))
+            }
+        }
+    }
+
+    #[tool(
+        name = "review_tags",
+        description = "Accept or reject exact existing AI tag associations after local approval. Manual and imported tags are protected."
+    )]
+    pub async fn review_tags(
+        &self,
+        Parameters(args): Parameters<ReviewTagsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.gate("review_tags")?;
+        let value = serde_json::to_value(&args)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        if let Some(result) = self.forward("POST", "/v1/tags/review", Some(value.clone())) {
+            return result;
+        }
+        let bytes = serde_json::to_vec(&value)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let request: lodestash_api::TagReviewRequest = serde_json::from_slice(&bytes)
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        match self.state.request_tag_review(request, bytes.len()) {
+            Ok(kickoff) => Ok(CallToolResult::success(vec![ContentBlock::json(
+                kickoff.to_response().1,
+            )?])),
+            Err(error) => {
+                let (status, code, message) = error.parts();
+                Ok(CallToolResult::error(vec![ContentBlock::json(
+                    serde_json::json!({"error":{"code":code,"message":message,"status":status}}),
                 )?]))
             }
         }
@@ -1888,6 +1940,7 @@ mod tests {
         let state =
             Arc::new(ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap());
         state.set_agent_producer(Some("codex@test".into()));
+        state.set_vocabulary_policy("open".into()).unwrap();
         let mcp = Lodestash::new(state.clone());
         let rev = state.asset_detail_json(id).unwrap().unwrap()["annotation_revision"]
             .as_str()
@@ -1896,6 +1949,7 @@ mod tests {
         let body = |rid: &str, producer: &str, value: &str| {
             serde_json::json!({
                 "request_id": rid,
+                "vocabulary_revision": state.get_vocabulary(&lodestash_api::VocabularyRequest::default()).unwrap()["revision"],
                 "assets": [{ "asset_id": id, "expected_revision": rev, "producer_id": producer,
                              "mode": "append",
                              "tags": [{ "namespace": "subject", "value": value, "confidence": 0.5 }] }]

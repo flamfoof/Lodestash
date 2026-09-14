@@ -126,8 +126,9 @@ It explicitly reports `denied` before rendering or materializing bytes. Multi-vi
 downscaling, extracted text and dependency evidence remain open work.
 
 S12d also provides `get_vocabulary` / `GET /v1/vocabulary`: the configured policy and a revisioned,
-bounded page of applicable promoted traits plus the selected taxonomy. Review decisions, vocabulary
-proposals and enforcement at `write_tags` approval remain open work.
+bounded page of applicable promoted traits plus the selected taxonomy. `review_tags` / `POST
+/v1/tags/review` records approved exact-AI accept/reject decisions, and `write_tags` checks the
+vocabulary revision and controlled terms before approval and commit. Vocabulary proposals remain open work.
 
 Search/detail responses expose evidence and file references. MCP also exposes catalog-scoped
 `asset://{id}/file` references; resource access uses the same authorization/resolver as REST. Raw large
@@ -145,7 +146,7 @@ archive access. Reuse warm cache entries only when archive and entry identity st
 
 The user clarified on 2026-09-10 that inspection, identification, acceptance/rejection and vocabulary
 growth are all required. Exact operations and policy are in ENGINE-API §8.5; UI-SPEC §9 owns the
-vocabulary concepts. Its read operation is available; its review and proposal writes remain planned.
+vocabulary concepts. Its read and review operations are available; proposals remain planned.
 
 - A **tag** is a namespace/value assigned to an asset with producer provenance.
 - A **trait** is a promoted tag with scope, usage guidance and optional teaching. Reuse applicable

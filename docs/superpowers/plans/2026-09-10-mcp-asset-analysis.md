@@ -187,6 +187,11 @@ AI provenance, survives a lost-response retry, and is independently visible thro
 
 ## Task 4a — Vocabulary-guided review and approved extensions
 
+**Progress 2026-09-13:** `get_vocabulary`, controlled/open policy enforcement at `write_tags`,
+and app-approved `review_tags` now ship on REST and MCP with core transaction/history support.
+`propose_vocabulary_changes` is still unchecked; it requires one atomic writer operation for mixed
+trait/category changes and remains the only core authoring operation in this task not implemented.
+
 **Files:** `crates/lodestash-core/src/catalog/mod.rs`,
 `crates/lodestash-core/src/catalog/taxonomy.rs`, `crates/lodestash-core/src/catalog/oplog.rs`,
 `crates/lodestash-desktop/src/writer.rs`, `crates/lodestash-desktop/src/agent_bridge.rs`,
@@ -200,10 +205,10 @@ or vocabulary store; distinguish raw tags, promoted traits and taxonomy categori
 
 - [ ] Create fixtures with applicable and wrong-modality traits, paused teaching, duplicate/synonym
   labels, two taxonomies, pinned category assignments, raw unmatched AI tags and protected manual tags.
-- [ ] Implement bounded revisioned vocabulary reads and app-configured open/controlled/approved-
+- [x] Implement bounded revisioned vocabulary reads and app-configured open/controlled/approved-
   extension policy. Test pagination invalidation, empty taxonomy and source-of-truth guidance.
   Feed vocabulary/revision into Task 4 writes; do not make `teach=false` mean forbidden.
-- [ ] Extend the existing approved operation flow for exact association accept/reject decisions.
+- [x] Extend the existing approved operation flow for exact association accept/reject decisions.
   Preserve producer provenance and human confirmation; record decision/reason and invalidate stale
   review claims. Reject protected associations and whole-batch stale revisions. Do not reuse the
   current all-source `remove_asset_tag` behavior for an AI-only rejection.
