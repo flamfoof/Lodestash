@@ -4,11 +4,11 @@ How AI clients (Claude, Claude Code, IDEs) and the **Unity editor** find and ret
 catalog. This is where "identify and retrieve into the engine" is delivered. **Unity is the primary
 integration target;** Unreal editor integration is planned for a later phase (§4).
 
-> Reviewed for the analysis workflow 2026-09-10. The proposed
+> Reviewed for the analysis workflow 2026-09-15. The
 > [asset-analysis design](MCP-ASSET-ANALYSIS.md) extends the existing server; its exact tool/REST
 > contracts live in [ENGINE-API §8](ENGINE-API.md#8-proposed-asset-analysis-contract).
 > `get_asset_evidence`, `get_vocabulary`, `write_tags`, and `review_tags` are available;
-> approved vocabulary proposals remain planned.
+> `propose_vocabulary_changes` now queues atomic, app-approved trait/category changes.
 > The clarified scope includes vocabulary reads, identification followed by association review,
 > and approved trait/category proposals; ENGINE-API §8.5 owns those additional tool/REST pairs.
 

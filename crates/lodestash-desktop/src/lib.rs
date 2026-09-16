@@ -2119,11 +2119,20 @@ fn engine_write_bridge(writer: Writer) -> lodestash_api::AgentWriteFn {
             batch: legacy_agent_batch(asset_id, namespace, value, TagMode::RemoveScoped),
         })
         .map(|r| r.changed),
-        AgentWrite::TagBatch { request, digest } => run(Op::TagBatch {
-            batch: request.to_core_batch(&digest),
+        AgentWrite::TagBatch { request, digest } => {
+            run(Op::AgentTagBatch { request, digest }).map(|r| r.changed)
+        }
+        AgentWrite::TagReview {
+            batch,
+            vocabulary_revision,
+        } => run(Op::TagReview {
+            batch,
+            vocabulary_revision,
         })
         .map(|r| r.changed),
-        AgentWrite::TagReview { batch } => run(Op::TagReview { batch }).map(|r| r.changed),
+        AgentWrite::VocabularyProposal { proposal, digest } => {
+            run(Op::VocabularyProposal { proposal, digest }).map(|r| r.changed)
+        }
         AgentWrite::ApplyMapping { taxonomy_id } => {
             run(Op::ApplyMapping { taxonomy_id }).map(|r| r.changed)
         }
@@ -2254,6 +2263,27 @@ fn build_engine_state() -> Result<
     state.set_byte_release(cfg.mcp_bytes_enabled);
     if let Err(error) = state.set_vocabulary_policy(cfg.mcp_vocabulary_policy) {
         tracing::warn!(%error, "invalid MCP vocabulary policy; using extend_with_approval");
+    }
+    {
+        state.set_model_evidence(Box::new(move |path, dimension, views| {
+            // Geometry-only proxy: embedded/external textures cannot cause uncontrolled file reads.
+            let meshes = lodestash_ingest::mesh::load_evidence(path)
+                .map_err(lodestash_api::AgentError::not_local)?;
+            lodestash_ingest::render3d::render_views(
+                &meshes,
+                dimension,
+                &lodestash_ingest::render3d::DEFAULT_VIEWS[..views],
+            )
+            .into_iter()
+            .map(|image| {
+                let mut bytes = std::io::Cursor::new(Vec::new());
+                image
+                    .write_to(&mut bytes, image::ImageFormat::Png)
+                    .map_err(|e| lodestash_api::AgentError::not_local(e.to_string()))?;
+                Ok(bytes.into_inner())
+            })
+            .collect()
+        }));
     }
     // The REST/MCP semantic-search plane (ENGINE-API §2 `mode=ai`) embeds the query exactly as the
     // grid's AI mode does — SigLIP and CLAP, resolved lazily on the first ai search (model load is

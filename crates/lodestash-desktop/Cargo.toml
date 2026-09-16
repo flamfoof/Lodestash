@@ -23,6 +23,7 @@ path = "src/lib.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+image = { workspace = true }
 tauri = { version = "2", features = [] }
 # Window geometry persistence: remember size/position/maximized across launches and restore
 # before the window shows (no resize flash). Persists to the app config dir, keyed by window.

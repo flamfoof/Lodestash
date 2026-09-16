@@ -1052,3 +1052,115 @@ fn a_request_receipt_commits_with_its_batch_and_only_then() {
         "one request id, one write"
     );
 }
+
+#[test]
+fn guarded_writes_recheck_scope_and_vocabulary_without_partial_changes() {
+    let (mut c, ids) = catalog_with(&[("arch.fbx", "model_3d"), ("wall.png", "image")]);
+    c.upsert_trait("subject", "arch", Some("model_3d"), None, false)
+        .unwrap();
+    let revision = c.vocabulary_revision("controlled").unwrap();
+    let proposal = batch(
+        vec![
+            item(
+                ids[0],
+                "ai:test",
+                None,
+                TagMode::Append,
+                vec![ai("arch", 0.8)],
+            ),
+            item(
+                ids[1],
+                "ai:test",
+                None,
+                TagMode::Append,
+                vec![ai("arch", 0.8)],
+            ),
+        ],
+        false,
+        Some(HistoryOrigin::Agent),
+    );
+    assert!(c
+        .apply_tag_batch_guarded(&proposal, Some((&revision, "controlled")))
+        .unwrap_err()
+        .to_string()
+        .contains("vocabulary_term_unknown"));
+    assert!(c.asset_tag_rows(ids[0]).unwrap().is_empty());
+    let mut valid = proposal.clone();
+    valid.items.truncate(1);
+    c.apply_tag_batch_guarded(&valid, Some((&revision, "controlled")))
+        .unwrap();
+    assert_eq!(
+        c.asset_tag_rows(ids[0]).unwrap()[0].value,
+        "arch",
+        "teach=false is still admissible"
+    );
+    assert_eq!(
+        c.vocabulary_revision("controlled").unwrap(),
+        revision,
+        "usage counts do not invalidate vocabulary"
+    );
+    c.upsert_trait("subject", "tower", None, None, false)
+        .unwrap();
+    assert!(c
+        .apply_tag_batch_guarded(&valid, Some((&revision, "controlled")))
+        .unwrap_err()
+        .to_string()
+        .contains("vocabulary_conflict"));
+    let revision = c.vocabulary_revision("open").unwrap();
+    assert!(
+        c.apply_tag_batch_guarded(&proposal, Some((&revision, "open")))
+            .unwrap_err()
+            .to_string()
+            .contains("vocabulary_term_unknown"),
+        "open policy still honors scoped traits"
+    );
+}
+
+#[test]
+fn guarded_authoring_refuses_an_asset_trashed_after_approval() {
+    let (mut c, ids) = catalog_with(&[("arch.fbx", "model_3d")]);
+    let revision = c.vocabulary_revision("open").unwrap();
+    let proposed = batch(
+        vec![item(
+            ids[0],
+            "ai:test",
+            None,
+            TagMode::Append,
+            vec![ai("arch", 0.8)],
+        )],
+        false,
+        Some(HistoryOrigin::Agent),
+    );
+    c.conn
+        .execute("UPDATE asset SET deleted_at=1 WHERE id=?1", [ids[0]])
+        .unwrap();
+    assert!(c
+        .apply_tag_batch_guarded(&proposed, Some((&revision, "open")))
+        .is_err());
+    assert!(c.asset_tag_rows(ids[0]).unwrap().is_empty());
+}
+
+#[test]
+fn source_identity_changes_invalidate_pending_annotations() {
+    let (mut c, ids) = catalog_with(&[("arch.fbx", "model_3d")]);
+    let mut proposed = batch(
+        vec![item(
+            ids[0],
+            "ai:test",
+            None,
+            TagMode::Append,
+            vec![ai("arch", 0.8)],
+        )],
+        false,
+        Some(HistoryOrigin::Agent),
+    );
+    proposed.items[0].expected_revision = Some(c.annotation_revision(ids[0]).unwrap());
+    let revision = c.vocabulary_revision("open").unwrap();
+    c.conn.execute("UPDATE asset_file SET mtime=mtime+1 WHERE id=(SELECT primary_file_id FROM asset WHERE id=?1)", [ids[0]]).unwrap();
+    assert!(c
+        .apply_tag_batch_guarded(&proposed, Some((&revision, "open")))
+        .unwrap_err()
+        .to_string()
+        .contains("revision_conflict"));
+    assert!(c.asset_tag_rows(ids[0]).unwrap().is_empty());
+}

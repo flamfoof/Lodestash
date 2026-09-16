@@ -72,6 +72,10 @@ pub struct Target {
 /// What the writer was asked to do. One variant per user-facing action, so the thread — not the
 /// caller — owns the order of operations for anything that touches more than one thing.
 pub enum Op {
+    VocabularyProposal {
+        proposal: lodestash_core::catalog::VocabularyProposal,
+        digest: String,
+    },
     SetFavorite {
         ids: Vec<i64>,
         on: bool,
@@ -360,6 +364,11 @@ pub enum Op {
     },
     TagReview {
         batch: lodestash_core::catalog::TagReviewBatch,
+        vocabulary_revision: String,
+    },
+    AgentTagBatch {
+        request: lodestash_api::TagBatchRequest,
+        digest: String,
     },
 }
 
@@ -2584,13 +2593,76 @@ fn run(
                 ..Default::default()
             })
             .map_err(|e| e.to_string()),
-        Op::TagReview { batch } => catalog
-            .apply_tag_review(&batch)
-            .map(|out| WriteResult {
-                changed: out.changed_assets.len(),
-                ..Default::default()
-            })
-            .map_err(|e| e.to_string()),
+        Op::TagReview {
+            batch,
+            vocabulary_revision,
+        } => {
+            let cfg = AppConfig::load();
+            if cfg.mcp_disabled_tools.iter().any(|t| t == "review_tags") {
+                return Err("tool_disabled".into());
+            }
+            if cfg.agent_producer_id.as_deref() != Some(batch.reviewer.as_str()) {
+                return Err("producer_mismatch".into());
+            }
+            catalog
+                .apply_tag_review_guarded(
+                    &batch,
+                    Some((&vocabulary_revision, &cfg.mcp_vocabulary_policy)),
+                )
+                .map(|out| WriteResult {
+                    changed: out.changed_assets.len(),
+                    ..Default::default()
+                })
+                .map_err(|e| e.to_string())
+        }
+        Op::VocabularyProposal { proposal, digest } => {
+            let cfg = AppConfig::load();
+            if cfg
+                .mcp_disabled_tools
+                .iter()
+                .any(|t| t == "propose_vocabulary_changes")
+            {
+                return Err("tool_disabled".into());
+            }
+            if cfg.agent_producer_id.is_none() {
+                return Err("producer_not_configured".into());
+            }
+            catalog
+                .apply_vocabulary_proposal(&proposal, &cfg.mcp_vocabulary_policy, &digest)
+                .map(|result| WriteResult {
+                    changed: result["changes"].as_array().map_or(0, |rows| {
+                        rows.iter().filter(|row| row["reused"] == false).count()
+                    }),
+                    ..Default::default()
+                })
+                .map_err(|e| e.to_string())
+        }
+        Op::AgentTagBatch { request, digest } => {
+            let cfg = AppConfig::load();
+            if cfg.mcp_disabled_tools.iter().any(|t| t == "write_tags") {
+                return Err("tool_disabled".into());
+            }
+            if request
+                .assets
+                .iter()
+                .any(|a| Some(&a.producer_id) != cfg.agent_producer_id.as_ref())
+            {
+                return Err("producer_mismatch".into());
+            }
+            catalog
+                .apply_tag_batch_guarded(
+                    &request.to_core_batch(&digest),
+                    Some((
+                        request.vocabulary_revision.as_deref().unwrap_or(""),
+                        &cfg.mcp_vocabulary_policy,
+                    )),
+                )
+                .map(|out| WriteResult {
+                    changed: out.changed_assets.len(),
+                    ..Default::default()
+                })
+                .map_err(|e| e.to_string())
+        }
     }
 }
 

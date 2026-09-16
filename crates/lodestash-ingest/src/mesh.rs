@@ -54,7 +54,17 @@ pub fn load_meshes(
     path: &Path,
     tex_files: &BTreeMap<String, PathBuf>,
 ) -> Result<Vec<MeshData>, String> {
-    let scene = ufbx::load_file(path.to_string_lossy().as_ref(), load_opts())
+    load_meshes_with(path, tex_files, true)
+}
+
+fn load_meshes_with(
+    path: &Path,
+    tex_files: &BTreeMap<String, PathBuf>,
+    external: bool,
+) -> Result<Vec<MeshData>, String> {
+    let mut opts = load_opts();
+    opts.load_external_files = external;
+    let scene = ufbx::load_file(path.to_string_lossy().as_ref(), opts)
         .map_err(|e| e.description.to_string())?;
 
     let fbx_dir = path.parent().unwrap_or(Path::new("."));
@@ -80,7 +90,11 @@ pub fn load_meshes(
             uvs,
             indices,
             base_color: material_base_color(first),
-            albedo: material_albedo(first, fbx_dir, tex_files, &mut tex_cache),
+            albedo: if external {
+                material_albedo(first, fbx_dir, tex_files, &mut tex_cache)
+            } else {
+                None
+            },
         });
     }
     if out.is_empty() {
@@ -396,7 +410,13 @@ pub fn load_gltf(path: &Path) -> Result<Vec<MeshData>, String> {
 fn load_gltf_with(path: &Path, textured: bool) -> Result<Vec<(u32, MeshData)>, String> {
     let mut raw = three_d_asset::io::load(&[path]).map_err(|e| e.to_string())?;
     let model: three_d_asset::Model = raw.deserialize(path).map_err(|e| e.to_string())?;
+    flatten_gltf(model, textured)
+}
 
+fn flatten_gltf(
+    model: three_d_asset::Model,
+    textured: bool,
+) -> Result<Vec<(u32, MeshData)>, String> {
     let mut out = Vec::new();
     for prim in &model.geometries {
         let three_d_asset::geometry::Geometry::Triangles(tri) = &prim.geometry else {
@@ -490,6 +510,68 @@ pub fn load_any(
         // ufbx covers FBX and OBJ (and is tolerant of a few other odds and ends).
         load_meshes(path, tex_files)
     }
+}
+
+/// Agent evidence reads only this payload. External glTF buffers are deliberately unavailable;
+/// FBX/OBJ sidecars and texture paths cannot trigger additional disk reads.
+/// Keep this separate from the interactive loader, whose user-requested texture resolution is broader.
+pub fn load_evidence(path: &Path) -> Result<Vec<MeshData>, String> {
+    let meshes = if is_gltf_model(path) {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .map_err(|e| e.to_string())?
+            .take(256 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() > 256 * 1024 * 1024 {
+            return Err("model exceeds 256 MiB".into());
+        }
+        let document = gltf::Gltf::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let uris: Vec<&str> = document
+            .buffers()
+            .filter_map(|b| match b.source() {
+                gltf::buffer::Source::Uri(uri) => Some(uri),
+                _ => None,
+            })
+            .chain(document.images().filter_map(|i| match i.source() {
+                gltf::image::Source::Uri { uri, .. } => Some(uri),
+                _ => None,
+            }))
+            .collect();
+        if uris.len() > 32 || uris.iter().any(|uri| !uri.starts_with("data:")) {
+            return Err(
+                "evidence requires a self-contained glTF/GLB with at most 32 embedded inputs"
+                    .into(),
+            );
+        }
+        let mut raw = three_d_asset::io::RawAssets::new();
+        for uri in uris {
+            let url = data_url::DataUrl::process(uri)
+                .map_err(|e| format!("invalid embedded data: {e:?}"))?;
+            let (data, _) = url
+                .decode_to_vec()
+                .map_err(|e| format!("invalid embedded data: {e:?}"))?;
+            raw.insert(uri, data);
+        }
+        raw.insert(path, bytes);
+        let model = raw.deserialize(path).map_err(|e| {
+            format!("selected payload cannot be decoded without external dependencies: {e}")
+        })?;
+        flatten_gltf(model, false)?
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect()
+    } else {
+        if std::fs::metadata(path).map_err(|e| e.to_string())?.len() > 256 * 1024 * 1024 {
+            return Err("model exceeds 256 MiB".into());
+        }
+        load_meshes_with(path, &BTreeMap::new(), false)?
+    };
+    Ok(crate::decimate::decimate_meshes(
+        &meshes,
+        crate::decimate::PREVIEW_BUDGET,
+    ))
 }
 
 /// Load `path` through a **normalized-geometry cache** (TECH-STACK §7, parse-once): parse it once
@@ -912,6 +994,18 @@ mod gltf_tests {
 
         assert!(is_gltf_model(&path));
         let meshes = load_any(&path, &BTreeMap::new()).expect("load gltf");
+        let evidence = load_evidence(&path).expect("self-contained evidence");
+        assert_eq!(evidence[0].positions.len(), 3);
+        // A declared buffer outside the selected payload must not be fetched, even if present.
+        std::fs::write(dir.join("outside.bin"), &buf).unwrap();
+        let mut external: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        external["buffers"][0]["uri"] = serde_json::json!("outside.bin");
+        std::fs::write(&path, external.to_string()).unwrap();
+        assert!(
+            load_evidence(&path).is_err(),
+            "evidence followed an undeclared disk dependency"
+        );
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(meshes.len(), 1, "one primitive");

@@ -76,11 +76,15 @@ contracts and the implementation handoff. Exact wire shapes belong only in `docs
 do not duplicate them in prompts or this file. The existing v1 architecture plan remains the owner
 of shared FTS, provenance/history, privacy and startup prerequisites.
 
-The design and implementation plan are **proposed, not shipped**. This session authorized planning
-and documentation only; runtime implementation, MCP registration and real asset writes are deferred.
-On a later implementation request, confirm board claims against the current code, implement the
-corresponding MCP/REST operation together, and prove the real host can call it. Equal tool-name sets
-alone do not establish behavioral parity or successful persistence.
+Implementation is authorized and underway in the isolated `mcp-asset-analysis` worktree. The
+[implementation plan](docs/superpowers/plans/2026-09-10-mcp-asset-analysis.md) records verified gates
+and remaining acceptance work. Confirm board claims against code, implement each MCP/REST operation
+together, and distinguish a process smoke test from actual host tool availability.
+
+The user selected Codex with OpenAI Astra. **Stop before live identification of the ten models**;
+do not infer permission to run identification or change real asset tags from a request to continue
+implementation. Disposable fixtures use stub results. Host registration and metadata preflight may
+proceed; evidence release still requires the user's explicit configuration.
 
 Keep three connections distinct: Vite serves the UI, the Engine API serves authenticated `/v1/`
 operations, and `lodestash-desktop --mcp` is the host-spawned stdio service. A computer-use helper

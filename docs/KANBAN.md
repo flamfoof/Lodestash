@@ -77,14 +77,13 @@ source → render-pipeline harvest (cheap now that `.mat` files are parsed).
   ENGINE-API §8.5 and the implementation handoff now include the confirmed Codex host,
   tags/short-description output, existing-tag inspection, identification, vocabulary-guided
   accept/reject review and approved traits/categories. Reviewed as a documentation-only extension;
-  checks pass with existing board warnings. Runtime implementation and live asset changes remain deferred.
+  checks pass with existing board warnings. Later implementation is tracked on [the live board](KANBAN-SVELTE.md); live identification is stopped.
 
 - [x] **MCP asset-analysis design (2026-09-10)** — [design](MCP-ASSET-ANALYSIS.md), proposed
   ENGINE-API §8 contract, CLAUDE.md guidance and
   [implementation handoff](superpowers/plans/2026-09-10-mcp-asset-analysis.md) completed and
   reviewed for documentation conformance. This checkbox covers planning only. Runtime integration,
-  host registration and the ten-model tag-writing pilot remain deferred; task checkboxes in the
-  handoff are open. Documentation checks pass; the board checker retains older absence warnings.
+  host registration and pilot progress are now tracked in the implementation plan and live board. Documentation checks pass; the board checker retains older absence warnings.
 
 - [x] Architecture + language decision ([`ARCHITECTURE.md`](ARCHITECTURE.md))
 - [x] Ingestion / formats / viewers, Asset Store cache, archive memory model ([`INGESTION.md`](INGESTION.md))

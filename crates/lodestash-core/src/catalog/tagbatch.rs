@@ -471,6 +471,15 @@ pub(super) fn annotation_revision_in(conn: &Connection, asset_id: i64) -> Result
         )
         .map_err(|e| CoreError::Catalog(format!("revision prep: {e}")))?;
     let mut hasher = blake3::Hasher::new();
+    // An approved annotation must still describe the same catalogued source payload.
+    let identity: Option<String> = conn.query_row(
+        "SELECT json_array(a.primary_file_id, af.size_bytes, af.mtime, a.content_hash, af.package_entry_id, af.workspace_rel, a.deleted_at)
+         FROM asset a LEFT JOIN asset_file af ON af.id=a.primary_file_id WHERE a.id=?1",
+        params![asset_id], |r| r.get(0),
+    ).optional().map_err(|e| CoreError::Catalog(format!("revision identity: {e}")))?;
+    if let Some(identity) = identity {
+        hasher.update(identity.as_bytes());
+    }
     let rows = stmt
         .query_map(params![asset_id], |r| {
             Ok(format!(
@@ -522,6 +531,14 @@ fn finish_asset(conn: &Connection, asset_id: i64, caption: Option<Option<&str>>)
 impl Catalog {
     /// Apply one tag batch atomically (v1 plan S04). See the module header for the contract.
     pub fn apply_tag_batch(&mut self, batch: &TagBatch) -> Result<TagBatchOutcome> {
+        self.apply_tag_batch_guarded(batch, None)
+    }
+
+    pub fn apply_tag_batch_guarded(
+        &mut self,
+        batch: &TagBatch,
+        vocabulary: Option<(&str, &str)>,
+    ) -> Result<TagBatchOutcome> {
         // ---- the whole batch is validated before anything is written ----
         let mut assets: Vec<i64> = batch.items.iter().map(|i| i.asset_id).collect();
         assets.sort_unstable();
@@ -572,13 +589,25 @@ impl Catalog {
             .conn
             .transaction()
             .map_err(|e| CoreError::Catalog(format!("tag batch begin: {e}")))?;
+        if let Some((revision, policy)) = vocabulary {
+            super::vocabulary::validate_assignments_in(
+                &tx,
+                revision,
+                policy,
+                batch.items.iter().flat_map(|item| {
+                    item.tags
+                        .iter()
+                        .map(move |tag| (item.asset_id, tag.namespace.as_str(), tag.value.as_str()))
+                }),
+            )?;
+        }
         // Existence is checked inside the transaction, so nothing can delete an asset between the
         // check and the write. One missing id refuses the whole batch.
         for id in &assets {
             let exists: bool = tx
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM asset WHERE id = ?1)",
-                    params![id],
+                    "SELECT EXISTS(SELECT 1 FROM asset WHERE id = ?1 AND (?2=0 OR (deleted_at IS NULL AND primary_file_id IS NOT NULL)))",
+                    params![id, vocabulary.is_some()],
                     |r| r.get(0),
                 )
                 .map_err(|e| CoreError::Catalog(format!("asset lookup: {e}")))?;
@@ -766,6 +795,14 @@ impl Catalog {
     /// Review existing AI associations atomically. The target row and every expected revision are
     /// checked in the writer transaction; acceptance is recorded even when it changes no rows.
     pub fn apply_tag_review(&mut self, batch: &TagReviewBatch) -> Result<TagBatchOutcome> {
+        self.apply_tag_review_guarded(batch, None)
+    }
+
+    pub fn apply_tag_review_guarded(
+        &mut self,
+        batch: &TagReviewBatch,
+        vocabulary: Option<(&str, &str)>,
+    ) -> Result<TagBatchOutcome> {
         if batch.reviewer.trim().is_empty() {
             return Err(invalid("a review needs a reviewer"));
         }
@@ -829,11 +866,23 @@ impl Catalog {
             .conn
             .transaction()
             .map_err(|e| CoreError::Catalog(format!("tag review begin: {e}")))?;
+        if let Some((revision, policy)) = vocabulary {
+            super::vocabulary::validate_assignments_in(
+                &tx,
+                revision,
+                policy,
+                batch
+                    .decisions
+                    .iter()
+                    .filter(|d| d.action == TagReviewAction::Accept)
+                    .map(|d| (d.asset_id, d.namespace.as_str(), d.value.as_str())),
+            )?;
+        }
         for asset_id in &asset_ids {
             let exists: bool = tx
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM asset WHERE id = ?1)",
-                    params![asset_id],
+                    "SELECT EXISTS(SELECT 1 FROM asset WHERE id = ?1 AND (?2=0 OR (deleted_at IS NULL AND primary_file_id IS NOT NULL)))",
+                    params![asset_id, vocabulary.is_some()],
                     |r| r.get(0),
                 )
                 .map_err(|e| CoreError::Catalog(format!("review asset lookup: {e}")))?;

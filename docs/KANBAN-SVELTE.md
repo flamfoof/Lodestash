@@ -129,19 +129,24 @@ this file stays the live board.
       re-keying it froze the shell (pulls run on the protocol thread) and was reverted; it belongs
       to S15.
 - [~] **R5 · S12c — evidence manifest and model views** (MCP handoff Task 3, second half).
-      `get_asset_evidence` ↔ `GET /v1/assets/{id}/evidence` now returns a shared, consent-aware
-      manifest, cached preview image block and catalog-scoped file link. *Open:* multiple rendered
-      views, requested downscaling, text extraction and dependency evidence.
-- [~] **R5 · S12d — vocabulary-guided review** (MCP handoff Task 4a). `get_vocabulary` ↔
-      `GET /v1/vocabulary` returns a configured policy and revisioned pages of applicable promoted
-      traits, categories, aliases and rules. *Open:* review decisions, vocabulary proposals and
-      enforcement at `write_tags` approval.
+      Shared bounded model views, requested resize, UTF-8 text, dependency metadata and authenticated
+      view URLs are implemented; REST supports source byte ranges. Restricted selected-payload
+      decoding is documented in ADR-0021. *Open:* destination/modality profiles and the remaining
+      Task 3 acceptance matrix; textured dependencies/external glTF buffers are explicitly unavailable.
+- [x] **R5 · S12d — vocabulary-guided review** (MCP handoff Task 4a; reviewed 2026-09-15).
+      Revisioned vocabulary reads, exact AI accept/reject, atomic approved trait/category proposals,
+      retained decision readback and transaction-time `write_tags` policy enforcement. Core/API/MCP
+      tests cover rollback, stale vocabulary, protected associations, scope, teaching, denial and
+      replay. The disposable MCP workflow reads back ten synthetic models through a separate reader.
+      Wider pilot/contract coverage remains tracked in the implementation plan, not claimed here.
 - [ ] **R5 · S13 — app-owned bulk runs** (MCP handoff Task 5).
 - [ ] **Proxies/packs · S14–S18 — pre-extraction identity, one cache policy, visual tiers, font
       specimens, batched inflate.**
 - [ ] **Records · S19 — one board, one rules source, release evidence.**
 - [ ] **MCP handoff Task 6 — register Codex and run the ten-model pilot.** Needs the user's host,
-      library and consent choices; not something this repo can do on its own.
+      library and consent choices. Codex/Astra is selected; stop before live identification.
+      Read-only registration is saved; stdio preflight lists six real libraries with bytes disabled.
+      A host reconnect must still establish actual conversation tool access.
 
 ---
 

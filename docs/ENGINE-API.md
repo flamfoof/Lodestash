@@ -575,8 +575,23 @@ same OS user. Hosts remain responsible for what they do with bytes after authori
   it ends, and leaves its file for the retry. Measured on the library's deepest in-pack model (3.6 GB
   into the decompressed tar of a 1.3 GB pack): 8.3 s cold, 129 µs warm, release build.
 - MCP resource reads return the bytes inline only up to 4 MiB (`resource_too_large` above it — use
-  the REST route). The REST file route reads the whole file into the response and **has no `Range`
-  support**; that is unchanged from before this slice.
+  the REST route). The REST file route supports a single byte range (206 with `Content-Range`), suffix and open-ended
+  ranges, and 416 for unsatisfiable ranges. Malformed/multipart ranges are ignored; `If-Range` without
+  a matching validator falls back to the full representation. Each response is capped at 256 MiB;
+  larger files require bounded Range requests. Responses are buffered, not streamed.
+
+*Evidence implementation (2026-09-15):* `asset_evidence_bundle` builds the manifest and delivered
+images together. The desktop installs the existing CPU rasterizer with a restricted selected-payload
+loader: FBX/OBJ sidecar reads are disabled; glTF/GLB require self-contained buffers/images (up to 32
+embedded inputs). Requested material/albedo relationships are reported as dependency metadata, not
+claimed as rendered inputs. Missing external glTF data fails explicitly. See
+[ADR-0021](decisions/ADR-0021-bounded-agent-evidence-and-vocabulary-revisions.md).
+The primary payload uses the verified archive cache; model views are rendered on demand, without
+publishing a separate render cache. Each heavy extraction/render stage has the existing two-worker,
+30-second bound; a call requiring both can take two stage deadlines. Cached raster decoding is
+capped, and text extraction reports truncation after the text limit. Agent byte consent still uses
+ADR-0020's explicit `mcp_bytes_enabled` switch; destination/modality profiles described above remain
+a prerequisite for unattended remote-host use, not an implemented per-host permission store.
 
 ### 8.3 Attributed result writes
 
@@ -620,6 +635,8 @@ Return the existing job envelope with `state=awaiting_approval` (HTTP 202); one 
 showing source/IDs, producer, tag diff and description diff. Extend the existing app approval flow,
 not a new agent authority system. Denial changes no catalog annotations. Revalidate permission,
 asset visibility and all revisions at execution time. The entire batch commits or rolls back.
+The annotation revision also fingerprints catalogued primary-file identity; a rescan changing the
+source invalidates a queued result. This detects catalogued changes, not unscanned filesystem edits.
 No agent call can create human confirmation. Preserve existing lifecycle rules; external tags alone
 do not complete embeddings or clear another producer's work queue. Status promotion still requires
 the existing DATA-MODEL §8 prerequisites; never assign `identified` unconditionally after a write.
@@ -669,8 +686,8 @@ separately constrains the LLM's proposed annotations. Revalidate host support du
 Clarified 2026-09-10: the complete workflow includes existing tag/preview reporting, identification,
 then vocabulary-based acceptance/rejection, with approved vocabulary growth. Codex is the first host;
 analysis receives 3D preview images and metadata and may write tags plus a short description.
-`get_vocabulary`, `review_tags`, and vocabulary-enforced `write_tags` are available; vocabulary
-proposals remain planned. `suggest_tags` still means stored suggestions in the shipped server.
+`get_vocabulary`, `review_tags`, vocabulary-enforced `write_tags`, and approved vocabulary
+proposals are available. `suggest_tags` still means stored suggestions in the shipped server.
 
 | MCP tool | REST endpoint | Contract |
 |---|---|---|
@@ -681,8 +698,9 @@ proposals remain planned. `suggest_tags` still means stored suggestions in the s
 Vocabulary reads return the canonical tag ID/namespace/value, trait scope/usage note/teach flag;
 categories return ID/taxonomy/parent/path/label; aliases and rules retain their existing taxonomy
 ownership and priority. Raw non-trait tags remain discoverable via `list_tags`. No taxonomy is
-`categories:[]`, not an implicit request to create one. The revision fingerprints applicable traits,
-taxonomy structure/aliases/rules and the configured policy. Paginate a stable typed-ID order over
+`categories:[]`, not an implicit request to create one. The revision fingerprints all promoted traits,
+taxonomies, structure/aliases/rules and the configured policy, independently of read filters and
+assignment usage counts (ADR-0021). Paginate a stable typed-ID order over
 the combined entries, with at most `limit` entries total across the arrays. Pin revision/filter
 signature in the cursor; changed vocabulary invalidates continuation rather than mixing revisions.
 Returned configuration/usage text is evidence, not authority to execute arbitrary instructions.

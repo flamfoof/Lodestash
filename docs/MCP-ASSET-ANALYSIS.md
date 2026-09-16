@@ -1,9 +1,9 @@
 # MCP asset analysis and tag authoring
 
-Design drafted 2026-09-10. **Proposed implementation contract; not shipped by this document** —
-except the attributed write, `write_tags`, which shipped 2026-09-11 (v1 plan S05; ENGINE-API §8.3).
-The user requested this design and plan, including search, single/list retrieval, evidence and
-file access, surgical Unity-package extraction, and LLM-authored tag updates.
+Design drafted 2026-09-10; implementation reviewed 2026-09-15. Selection/search, attributed writes,
+review, vocabulary proposals and bounded evidence are implemented. The
+[implementation plan](superpowers/plans/2026-09-10-mcp-asset-analysis.md) records the exact validation
+coverage and remaining host/pilot gates. No live ten-model identification has been performed.
 
 ## Outcome and ownership
 
@@ -13,6 +13,11 @@ results. The workflow also reports existing tags/previews, runs identification, 
 tags against the vocabulary, with an approval path for new traits or taxonomy categories.
 The first acceptance scenario is ten randomly selected `model_3d` assets from one library.
 One explicitly selected asset and an explicit list must work through the same contract.
+
+The user selected OpenAI Astra in Codex for the live analysis. That host analyzes the returned
+images/metadata and submits proposed annotations. `identify_asset` invokes the app-configured
+identification pipeline, not the conversation model; it is an optional separate stage and must not
+be substituted for Astra. The live run remains stopped before either form of identification.
 
 This is service-level access to the same catalog the app uses. It does not click the UI or prove
 the UI's interaction flow. MCP transports evidence and tool calls; the connected host runs the
@@ -120,15 +125,19 @@ for audio, use local metadata/transcripts and permitted local audio analysis. A 
 evidence for semantic sound labels. Other media use their existing viewable representations and state
 when no meaningful analysis representation is available.
 
-S12c began on 2026-09-13 with `get_asset_evidence` / `GET /v1/assets/{id}/evidence`: one
-consent-aware manifest, a cached preview view when it exists, and the catalog-scoped file reference.
-It explicitly reports `denied` before rendering or materializing bytes. Multi-view rendering,
-downscaling, extracted text and dependency evidence remain open work.
+S12c provides `get_asset_evidence` / `GET /v1/assets/{id}/evidence`: a consent-aware manifest,
+up to four geometry views, requested downscaling, bounded UTF-8 text and catalog-scoped file
+references. REST view URLs return the same representation bytes as the shared MCP bundle.
+Material/albedo associations and availability are reported as metadata; these dependencies are not
+silently loaded. Geometry-only evidence cannot justify texture/color-specific tags. Self-contained
+glTF/GLB and FBX/OBJ use the restricted loader; an external glTF buffer is reported as unavailable.
+See [ADR-0021](decisions/ADR-0021-bounded-agent-evidence-and-vocabulary-revisions.md).
 
-S12d also provides `get_vocabulary` / `GET /v1/vocabulary`: the configured policy and a revisioned,
-bounded page of applicable promoted traits plus the selected taxonomy. `review_tags` / `POST
-/v1/tags/review` records approved exact-AI accept/reject decisions, and `write_tags` checks the
-vocabulary revision and controlled terms before approval and commit. Vocabulary proposals remain open work.
+S12d provides revisioned vocabulary reads, exact AI-association review, atomic approved trait/category
+proposals and vocabulary-enforced writes. Validation runs inside the writer transaction as well as
+before approval. A filtered vocabulary read returns the same write revision as an unfiltered one;
+assignment usage counts do not invalidate it. Reviewed associations remain AI-authored and retained
+review decisions are available in asset detail.
 
 Search/detail responses expose evidence and file references. MCP also exposes catalog-scoped
 `asset://{id}/file` references; resource access uses the same authorization/resolver as REST. Raw large
@@ -146,7 +155,7 @@ archive access. Reuse warm cache entries only when archive and entry identity st
 
 The user clarified on 2026-09-10 that inspection, identification, acceptance/rejection and vocabulary
 growth are all required. Exact operations and policy are in ENGINE-API §8.5; UI-SPEC §9 owns the
-vocabulary concepts. Its read and review operations are available; proposals remain planned.
+vocabulary concepts. Its read, review and proposal operations are available.
 
 - A **tag** is a namespace/value assigned to an asset with producer provenance.
 - A **trait** is a promoted tag with scope, usage guidance and optional teaching. Reuse applicable

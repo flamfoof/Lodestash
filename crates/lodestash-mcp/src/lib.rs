@@ -197,7 +197,12 @@ pub struct WriteTagsAsset {
     /// `append` (add to this producer's tags) or `replace_producer` (replace them).
     pub mode: String,
     pub tags: Vec<WriteTagsTag>,
-    /// A short description; omit to leave the caption as it is.
+    /// A short description; omit to leave the caption as it is. Null is invalid.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lodestash_api::deserialize_description"
+    )]
     pub description: Option<String>,
 }
 
@@ -207,13 +212,14 @@ pub struct WriteTagsAsset {
 pub struct WriteTagsArgs {
     /// A fresh UUID per request. Reuse it only to retry the same body after a lost response.
     pub request_id: String,
-    /// The vocabulary revision the proposals were checked against (enforced once review lands).
+    /// Required current vocabulary revision, rechecked inside the writer transaction.
     pub vocabulary_revision: Option<String>,
     /// 1 to 100 assets.
     pub assets: Vec<WriteTagsAsset>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewDecisionArgs {
     pub namespace: String,
     pub value: String,
@@ -222,16 +228,45 @@ pub struct ReviewDecisionArgs {
     pub reason: String,
 }
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewAssetArgs {
     pub asset_id: i64,
     pub expected_revision: String,
     pub decisions: Vec<ReviewDecisionArgs>,
 }
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewTagsArgs {
     pub request_id: String,
     pub vocabulary_revision: String,
     pub assets: Vec<ReviewAssetArgs>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VocabularyProposalArgs {
+    pub request_id: String,
+    pub expected_revision: String,
+    pub changes: Vec<VocabularyChangeArgs>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VocabularyChangeArgs {
+    Trait {
+        namespace: String,
+        value: String,
+        scope: Option<String>,
+        usage_note: Option<String>,
+        #[serde(default)]
+        teach: bool,
+    },
+    Category {
+        taxonomy_id: i64,
+        parent_id: Option<i64>,
+        label: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -678,7 +713,7 @@ impl Lodestash {
         Parameters(args): Parameters<EvidenceArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.gate("get_asset_evidence")?;
-        let manifest = match self.state.get_asset_evidence(
+        let bundle = match self.state.asset_evidence_bundle(
             args.id,
             &lodestash_api::EvidenceRequest {
                 kind: args.kind,
@@ -689,16 +724,9 @@ impl Lodestash {
             Ok(manifest) => manifest,
             Err(error) => return refused(error),
         };
-        let mut content = vec![ContentBlock::json(manifest.clone())?];
-        if manifest["representations"]
-            .as_array()
-            .is_some_and(|representations| !representations.is_empty())
-        {
-            if let Some(path) = self.state.preview_path(args.id) {
-                if let Ok(bytes) = std::fs::read(path) {
-                    content.push(ContentBlock::image(b64(&bytes), "image/png"));
-                }
-            }
+        let mut content = vec![ContentBlock::json(bundle.manifest)?];
+        for bytes in bundle.images {
+            content.push(ContentBlock::image(b64(&bytes), "image/png"));
         }
         content.push(ContentBlock::resource_link(
             Resource::new(format!("asset://{}/file", args.id), "asset_file")
@@ -907,6 +935,40 @@ impl Lodestash {
                 Ok(CallToolResult::error(vec![ContentBlock::json(
                     serde_json::json!({"error":{"code":code,"message":message,"status":status}}),
                 )?]))
+            }
+        }
+    }
+
+    /// ENGINE-API §2 `list_collections` — named collections + the active project's staging tray.
+    #[tool(
+        name = "propose_vocabulary_changes",
+        description = "Propose canonical traits or taxonomy categories for local approval. Trait teaching defaults off. Existing guidance cannot be overwritten. Read fresh vocabulary after approval before writing tags."
+    )]
+    pub async fn propose_vocabulary_changes(
+        &self,
+        Parameters(args): Parameters<VocabularyProposalArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.gate("propose_vocabulary_changes")?;
+        let value = serde_json::to_value(&args)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        if let Some(result) = self.forward("POST", "/v1/vocabulary/proposals", Some(value.clone()))
+        {
+            return result;
+        }
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let proposal = serde_json::from_slice(&bytes)
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        match self
+            .state
+            .request_vocabulary_proposal(proposal, bytes.len())
+        {
+            Ok(kickoff) => relay(Ok(kickoff.to_response())),
+            Err(error) => {
+                let (status, code, message) = error.parts();
+                relay(Ok((
+                    status,
+                    serde_json::json!({"error":{"code":code,"message":message}}),
+                )))
             }
         }
     }
@@ -1762,10 +1824,7 @@ mod tests {
             c.assets_needing_tags_within(1, None).unwrap()[0].asset_id
         };
         let preview = dir.path().join("arch.png");
-        let png = vec![
-            0x89, b'P', b'N', b'G', 13, 10, 26, 10, 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0,
-            64, 0, 0, 0, 32,
-        ];
+        let png = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGOQNPL+DwAClAGWmKj4cQAAAABJRU5ErkJggg==").unwrap();
         std::fs::write(&preview, &png).unwrap();
         let preview_for_renderer = preview.clone();
         let state = Arc::new(
@@ -2005,3 +2064,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod workflow_tests;

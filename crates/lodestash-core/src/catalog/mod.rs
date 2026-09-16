@@ -6300,6 +6300,8 @@ mod prefab;
 mod snapshots;
 mod tagbatch;
 mod taxonomy;
+mod vocabulary;
+pub use vocabulary::{VocabularyChange, VocabularyProposal};
 #[cfg(test)]
 mod tests_browse;
 #[cfg(test)]

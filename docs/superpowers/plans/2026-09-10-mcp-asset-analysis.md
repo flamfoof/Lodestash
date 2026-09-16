@@ -1,7 +1,7 @@
 # MCP Asset Analysis Implementation Plan
 
 > **For agentic workers:** Use `superpowers:executing-plans` to implement task by task. This is
-> a handoff for a later model; no implementation is authorized by completion of this planning turn.
+> Implementation was subsequently authorized. The live identification stop below remains in force.
 
 **Goal:** retrieve one or many library assets, search them, deliver usable analysis evidence and
 file references, run identification, review assignments against the vocabulary, persist approved
@@ -12,12 +12,14 @@ and the app's single writer. The LLM host analyzes evidence; Lodestash validates
 output. App-closed writes remain unavailable.
 
 **Tech Stack:** existing Rust/rmcp/axum/rusqlite/Tokio/ureq, Tauri/Svelte and Node test tooling.
-No new runtime dependency planned.
+No new package is added to the runtime dependency graph. Existing transitive `gltf`/`data-url`
+are now direct ingest dependencies for restricted evidence decoding; `image` is reused in API/desktop.
 
 **Spec:** [MCP asset-analysis design](../../MCP-ASSET-ANALYSIS.md), with exact wire contracts in
 [ENGINE-API §8](../../ENGINE-API.md#8-proposed-asset-analysis-contract).
 
-Prepared 2026-09-10. All unchecked items below are future work, not verified behavior.
+Prepared 2026-09-10; scope review updated 2026-09-15. Checked items have implementation evidence;
+unchecked composite gates retain their unverified parts, even when some underlying work is complete.
 
 **User choices confirmed:** Codex; 3D preview images and metadata; tags and a short description.
 The required pilot includes existing-tag reporting, AI identification, acceptance/rejection and an
@@ -187,10 +189,11 @@ AI provenance, survives a lost-response retry, and is independently visible thro
 
 ## Task 4a — Vocabulary-guided review and approved extensions
 
-**Progress 2026-09-13:** `get_vocabulary`, controlled/open policy enforcement at `write_tags`,
-and app-approved `review_tags` now ship on REST and MCP with core transaction/history support.
-`propose_vocabulary_changes` is still unchecked; it requires one atomic writer operation for mixed
-trait/category changes and remains the only core authoring operation in this task not implemented.
+**Progress 2026-09-15:** all three authoring operations are implemented on both planes:
+`write_tags`, `review_tags`, and `propose_vocabulary_changes`. Approved changes commit through the
+single writer with transaction-time vocabulary validation and durable replay receipts. Focused
+route tests cover proposal/write/review, denial, cancellation, revoked tools, protected targets and
+stale vocabulary. The disposable MCP workflow covers ten synthetic models end to end with a stub.
 
 **Files:** `crates/lodestash-core/src/catalog/mod.rs`,
 `crates/lodestash-core/src/catalog/taxonomy.rs`, `crates/lodestash-core/src/catalog/oplog.rs`,
@@ -212,7 +215,7 @@ or vocabulary store; distinguish raw tags, promoted traits and taxonomy categori
   Preserve producer provenance and human confirmation; record decision/reason and invalidate stale
   review claims. Reject protected associations and whole-batch stale revisions. Do not reuse the
   current all-source `remove_asset_tag` behavior for an AI-only rejection.
-- [ ] Add approved vocabulary proposals: promote/create traits and create/reuse a category under
+- [x] Add approved vocabulary proposals: promote/create traits and create/reuse a category under
   an existing taxonomy. Test canonical collisions, invalid parent/taxonomy, unknown namespace,
   denied approval, teaching opt-in, lost-response replay and atomic rollback. No implicit mapping
   rule, cross-taxonomy change, new namespace or assignment follows category creation.
@@ -283,8 +286,48 @@ host-local MCP configuration is changed only during implementation/setup, not th
   in owning docs, run `node scripts/check-docs.mjs` and `node scripts/check-board.mjs`, and inspect
   the final diff against the design. Commit/push only if separately requested.
 
-## Handoff stop condition
+## Current scope review and stop condition (2026-09-15)
 
-This planning turn stops after saving/reconciling these documents and running the documentation
-checks. No app launch, build, migration, MCP registration, package extraction, model call or tag
-mutation is necessary to make the plan reviewable. Implementation remains deferred to another model.
+The earlier documentation-only stop was superseded by the user's implementation requests. The
+current stop is **before any live identification of the ten models**. Codex with OpenAI Astra is
+the chosen host/model. Fixtures may use deterministic stub output; no real-library tag writes or
+live model calls are part of these implementation gates.
+
+| Area | Verified implementation | Remaining acceptance work |
+|---|---|---|
+| Connection and selection (Tasks 1–2) | Fresh executable stdio handshake/EOF/schema refusal tests; library/search/single/list/random selection tests | Actual conversation tool visibility after Codex reconnect |
+| Evidence (Task 3) | Four bounded geometry views, resize, truncated UTF-8 text, dependency metadata, authenticated pixel-equivalent URLs, surgical source resolver and single HTTP Range reads | Per-destination/per-modality agent profiles; textured dependency rendering and external glTF buffers are explicitly unavailable (ADR-0021) |
+| Attributed writes (Task 4) | Producer-scoped atomic tags/description, receipt/replay, protected associations, history/FTS/undo; guarded vocabulary checks in writer transaction | Live approval and readback remain part of the stopped pilot |
+| Vocabulary/review (Task 4a) | Filter-independent revision, scoped policy, exact AI accept/reject, retained review readback, mixed atomic trait/category proposals, approval details and receipts | Broader synonym/taxonomy fixture matrix is not fully covered by the focused tests |
+| Contract workflow (Task 5) | In-process MCP ten-model fixture: stub identification → proposal/approval → review → write → replay → separate-reader verification; independent REST workflow and evidence URL tests | Full workflow through a spawned stdio process and exhaustive normalized REST/MCP error matrix; current spawned test proves startup, not every workflow stage |
+| Real pilot (Task 6) | Read-only host setup/preflight can proceed | Reconnect, select library and explicit evidence consent; stop before identification |
+
+Validation on this branch: core 160 passed / 1 intentionally ignored; API 40 passed; MCP 12 passed;
+desktop spawned stdio 2 passed; frontend production build passed with zero Svelte errors/warnings.
+Loader regression checks: 15 passed / 2 intentionally ignored; the restricted glTF evidence test
+proves embedded data works and disk sidecars are refused.
+
+Test owners: `crates/lodestash-core/src/catalog/tests_tagbatch.rs`, `catalog/vocabulary.rs`,
+`crates/lodestash-api/src/routes.rs`, `src/evidence.rs`,
+`crates/lodestash-mcp/src/workflow_tests.rs`, and
+`crates/lodestash-desktop/tests/mcp_stdio.rs`. Task 4's older unchecked composite list is not a claim
+that atomic authoring is missing; it retains the originally requested broader validation matrix.
+Do not call the complete original plan finished until the remaining acceptance gates above are met.
+
+The live Astra path is host analysis of evidence followed by approved vocabulary/write/review calls.
+`identify_asset` runs the app-configured tagger, not Astra in this conversation. Its stub fixture
+proves orchestration, not the identity or quality of a live model. Do not silently substitute that
+app pipeline for the requested host analysis.
+
+### Read-only host preflight
+
+2026-09-15: registered `lodestash` in the local Codex configuration using the feature worktree's
+fresh `target/debug/lodestash-desktop.exe --mcp`. Its allow-list contains eight metadata tools;
+identification, evidence delivery and mutations are excluded at this checkpoint. A separate stdio
+probe negotiated `2025-06-18`, read schema 31, and listed six libraries. The real catalog reports
+`writer=app_unavailable` and `bytes_released=false`. No GUI was launched, consent changed, asset
+identified or real annotation written. The assistant's active tool inventory still has no Lodestash
+tools: a host reconnect is required, and the shell probe does not satisfy that acceptance gate.
+
+The prospective library choice was requested from the user; do not start live identification to
+resolve it. Start the matching app only for the authorized live phase, using the desktop launch guide.

@@ -487,7 +487,7 @@ impl ServerState {
     /// A job that overruns is not abandoned: it keeps its slot until it finishes, so the bound is
     /// honest about what is really running, and whatever it publishes (a scratch file, a render) is
     /// there for the retry.
-    fn heavy<T: Send + 'static>(
+    pub(crate) fn heavy<T: Send + 'static>(
         &self,
         work: impl FnOnce() -> Result<T, AgentError> + Send + 'static,
     ) -> Result<T, AgentError> {
@@ -666,19 +666,9 @@ impl ServerState {
                 (categories, aliases, rules)
             }
         };
-        drop(cat);
         let policy = self.vocabulary_policy();
-        let revision_body = json!({
-            "policy": policy,
-            "traits": traits,
-            "categories": categories,
-            "aliases": aliases,
-            "rules": rules,
-        });
-        let revision = format!(
-            "v1-{}",
-            digest16(&serde_json::to_string(&revision_body).unwrap())
-        );
+        let revision = cat.vocabulary_revision(&policy)?;
+        drop(cat);
         let signature = digest16(&format!("{:?}|{:?}|{prefix}", req.media_type, taxonomy_id));
         let mut entries = Vec::new();
         entries.extend(
@@ -753,130 +743,6 @@ impl ServerState {
             "next_cursor": next_cursor,
         }))
     }
-    /// `get_asset_evidence` — one manifest shared by REST and MCP. This first path makes the
-    /// byte-consent boundary explicit before asking the preview renderer to do any work.
-    pub fn get_asset_evidence(&self, id: i64, req: &EvidenceRequest) -> Result<Value, AgentError> {
-        let row = self
-            .asset(id)?
-            .ok_or_else(|| AgentError::asset_not_found(id))?;
-        let kind = req.kind.as_deref().unwrap_or("auto");
-        if !matches!(kind, "auto" | "thumbnail" | "model_views" | "text") {
-            return Err(AgentError::invalid(format!(
-                "unknown evidence kind {kind:?} — auto, thumbnail, model_views or text"
-            )));
-        }
-        if kind == "model_views" && row.media_type != "model_3d" {
-            return Err(AgentError::invalid(
-                "model_views evidence is available only for model_3d assets",
-            ));
-        }
-        let max_dimension = req.max_dimension.unwrap_or(512);
-        if !(1..=1024).contains(&max_dimension) {
-            return Err(AgentError::invalid(format!(
-                "max_dimension must be between 1 and 1024, not {max_dimension}"
-            )));
-        }
-        let views = req.views.unwrap_or(1);
-        if !(1..=4).contains(&views) {
-            return Err(AgentError::invalid(format!(
-                "views must be between 1 and 4, not {views}"
-            )));
-        }
-        if views != 1 && row.media_type != "model_3d" {
-            return Err(AgentError::invalid(
-                "views is available only for model_3d assets",
-            ));
-        }
-        let analysis_revision = self.catalog.lock().unwrap().analysis_revision(id)?;
-        let denied = !self.byte_release();
-        let evidence_kind = if row.media_type == "model_3d" {
-            "model_views"
-        } else {
-            "thumbnail"
-        };
-        let preview = (!denied && kind != "text")
-            .then(|| self.preview_path(id))
-            .flatten();
-        let preview_too_large = preview.as_ref().is_some_and(|path| {
-            std::fs::metadata(path)
-                .map(|metadata| metadata.len() > MAX_EVIDENCE_IMAGE_BYTES)
-                .unwrap_or(false)
-        });
-        let representation = preview
-            .filter(|_| !preview_too_large)
-            .and_then(|path| png_dimensions(&path))
-            .filter(|(width, height)| *width <= max_dimension && *height <= max_dimension)
-            .map(|(width, height)| {
-                json!({
-                    "kind": evidence_kind,
-                    "mime_type": "image/png",
-                    "url": format!(
-                        "/v1/assets/{id}/preview?kind={evidence_kind}&view=0&max_dimension={max_dimension}"
-                    ),
-                    "width": width,
-                    "height": height,
-                })
-            });
-        let status = if denied {
-            "denied"
-        } else if representation.is_some() {
-            if views == 1 {
-                "ready"
-            } else {
-                "partial"
-            }
-        } else {
-            "unavailable"
-        };
-        let limitations = if denied {
-            vec![json!({
-                "code": "bytes_not_released",
-                "message": "preview and file bytes need mcp_bytes_enabled in Settings"
-            })]
-        } else if preview_too_large {
-            vec![json!({
-                "code": "evidence_too_large",
-                "message": format!("the preview exceeds the {MAX_EVIDENCE_IMAGE_BYTES}-byte evidence limit")
-            })]
-        } else if representation.is_none() {
-            vec![json!({
-                "code": "evidence_unavailable",
-                "message": "no supported evidence representation is available"
-            })]
-        } else if views > 1 {
-            vec![json!({
-                "code": "additional_views_unavailable",
-                "message": "the current renderer has one cached model view"
-            })]
-        } else {
-            Vec::new()
-        };
-        Ok(json!({
-            "asset_id": id,
-            "analysis_revision": analysis_revision,
-            "status": status,
-            "representations": representation.into_iter().collect::<Vec<_>>(),
-            "file_url": format!("/v1/assets/{id}/file"),
-            "file_resource_uri": format!("asset://{id}/file"),
-            "dependencies_used": [],
-            "limitations": limitations,
-        }))
-    }
-}
-
-fn png_dimensions(path: &std::path::Path) -> Option<(usize, usize)> {
-    let mut bytes = [0; 24];
-    std::io::Read::read_exact(&mut std::fs::File::open(path).ok()?, &mut bytes).ok()?;
-    (bytes[..16]
-        == [
-            0x89, b'P', b'N', b'G', 13, 10, 26, 10, 0, 0, 0, 13, b'I', b'H', b'D', b'R',
-        ])
-    .then(|| {
-        let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?) as usize;
-        let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?) as usize;
-        (width > 0 && height > 0).then_some((width, height))
-    })
-    .flatten()
 }
 
 #[cfg(test)]
@@ -957,7 +823,7 @@ mod tests {
         assert_eq!(vocabulary["policy"], "extend_with_approval");
         assert!(vocabulary["revision"]
             .as_str()
-            .is_some_and(|revision| revision.starts_with("v1-")));
+            .is_some_and(|revision| revision.starts_with("v2-")));
         assert_eq!(vocabulary["traits"][0]["namespace"], "style");
         assert_eq!(vocabulary["traits"][0]["value"], "low poly");
         assert_eq!(vocabulary["traits"][0]["scope"], "model_3d");
@@ -994,14 +860,9 @@ mod tests {
     fn evidence_advertises_a_cached_model_preview_after_byte_release() {
         let preview_dir = tempfile::tempdir().unwrap();
         let preview = preview_dir.path().join("model.png");
-        std::fs::write(
-            &preview,
-            [
-                0x89, b'P', b'N', b'G', 13, 10, 26, 10, 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0,
-                0, 64, 0, 0, 0, 32,
-            ],
-        )
-        .unwrap();
+        image::RgbaImage::from_pixel(64, 32, image::Rgba([30, 60, 90, 255]))
+            .save(&preview)
+            .unwrap();
         let preview_for_renderer = preview.clone();
         let (_dir, state, src, _) =
             fixture_with_preview(0, 1, Box::new(move |_| Some(preview_for_renderer.clone())));
@@ -1024,7 +885,7 @@ mod tests {
             json!([{
                 "kind": "model_views",
                 "mime_type": "image/png",
-                "url": format!("/v1/assets/{asset_id}/preview?kind=model_views&view=0&max_dimension=512"),
+                "url": format!("/v1/assets/{asset_id}/preview?kind=model_views&view=0&max_dimension=512&views=1"),
                 "width": 64,
                 "height": 32,
             }])

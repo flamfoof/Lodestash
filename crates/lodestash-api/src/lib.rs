@@ -12,8 +12,11 @@ pub use discovery::{
     AgentError, EvidenceRequest, LibrariesRequest, ListAssetsRequest, ReadAssetsRequest,
     SearchScope, VocabularyRequest,
 };
+mod evidence;
 pub mod jobs;
 pub mod routes;
+mod vocabulary;
+pub use evidence::{EvidenceBundle, ModelEvidenceFn};
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -104,6 +107,10 @@ pub const AGENT_OPERATIONS: &[(&str, &str)] = &[
     ("import_staged", "POST /v1/stage/import"),
     ("write_tags", "POST /v1/tags/batch"),
     ("review_tags", "POST /v1/tags/review"),
+    (
+        "propose_vocabulary_changes",
+        "POST /v1/vocabulary/proposals",
+    ),
     ("list_libraries", "GET /v1/libraries"),
     ("list_assets", "GET /v1/assets"),
     ("get_assets", "POST /v1/assets/read"),
@@ -142,6 +149,10 @@ pub type QueryEmbedFn = Box<dyn Fn(&str) -> Vec<(String, Vec<f32>)> + Send + Syn
 /// itself (ADR-0002), it only forwards the request and reports how many rows changed.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum AgentWrite {
+    VocabularyProposal {
+        proposal: lodestash_core::catalog::VocabularyProposal,
+        digest: String,
+    },
     AddTag {
         asset_id: i64,
         namespace: String,
@@ -178,6 +189,7 @@ pub enum AgentWrite {
     /// An approved provenance-preserving tag review (ENGINE-API §8.5).
     TagReview {
         batch: lodestash_core::catalog::TagReviewBatch,
+        vocabulary_revision: String,
     },
     /// Register or refresh a Unity editor and make it the active project (ENGINE-API §5.1).
     RegisterProject {
@@ -227,9 +239,17 @@ pub struct TagBatchAsset {
     pub mode: String,
     #[serde(default)]
     pub tags: Vec<TagIn>,
-    /// Omitted preserves the caption.
-    #[serde(default)]
+    /// Omitted preserves the caption; explicit null is not a clearing operation.
+    /// Serialization retains null for the legacy receipt digest; MCP wire output omits it.
+    #[serde(default, deserialize_with = "deserialize_description")]
     pub description: Option<String>,
+}
+
+/// Preserve omission while rejecting explicit null on both agent planes.
+pub fn deserialize_description<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<Option<String>, D::Error> {
+    <String as serde::Deserialize>::deserialize(de).map(Some)
 }
 
 /// `write_tags` ↔ `POST /v1/tags/batch` (ENGINE-API §8.3). One type for both planes: the MCP tool
@@ -238,7 +258,7 @@ pub struct TagBatchAsset {
 #[serde(deny_unknown_fields)]
 pub struct TagBatchRequest {
     pub request_id: String,
-    /// Accepted and recorded; enforced once vocabulary review (§8.5) lands.
+    /// Required current vocabulary revision, checked before approval and inside the writer transaction.
     #[serde(default)]
     pub vocabulary_revision: Option<String>,
     pub assets: Vec<TagBatchAsset>,
@@ -600,6 +620,10 @@ const IMPORT_LEASE: std::time::Duration = std::time::Duration::from_secs(60);
 /// What a handler needs to answer a request. The API owns its **own** catalog connection
 /// (read-only queries) so it never contends with the UI's single writer — DATA-MODEL §1.
 pub struct ServerState {
+    model_evidence: Mutex<Option<Arc<ModelEvidenceFn>>>,
+    pending_vocabulary: Mutex<
+        std::collections::HashMap<String, (lodestash_core::catalog::VocabularyProposal, String)>,
+    >,
     catalog: Mutex<Catalog>,
     pub jobs: jobs::Jobs,
     workspace_dir: PathBuf,
@@ -640,8 +664,12 @@ pub struct ServerState {
     /// rest of the queue: a restart loses an unapproved request visibly, never a committed one —
     /// committed requests have their receipt in the catalog.
     pending_tag_batches: Mutex<std::collections::HashMap<String, (TagBatchRequest, String)>>,
-    pending_tag_reviews:
-        Mutex<std::collections::HashMap<String, (lodestash_core::catalog::TagReviewBatch, String)>>,
+    pending_tag_reviews: Mutex<
+        std::collections::HashMap<
+            String,
+            (lodestash_core::catalog::TagReviewBatch, String, String),
+        >,
+    >,
     /// The producer this host's agent writes tags under (`agent_producer_id`). `None` refuses
     /// `write_tags` rather than attribute an agent's tags to a producer nobody chose.
     agent_producer: Mutex<Option<String>>,
@@ -663,6 +691,8 @@ impl ServerState {
         preview: PreviewFn,
     ) -> lodestash_core::error::Result<Self> {
         Ok(Self {
+            model_evidence: Mutex::new(None),
+            pending_vocabulary: Mutex::new(std::collections::HashMap::new()),
             // Read-only, and refused at any other schema version (v1 plan S11): every write this
             // state makes goes through the bridge to the one writer, and migrating is the writer's
             // job, not a side effect of an agent connecting.
@@ -1062,7 +1092,6 @@ impl ServerState {
             validate_assignments(&source, &tags)
                 .map_err(|e| TagBatchError::Invalid(format!("asset {}: {e}", a.asset_id)))?;
         }
-        self.validate_tag_vocabulary(&req)?;
         for a in &req.assets {
             if self
                 .asset(a.asset_id)
@@ -1097,22 +1126,21 @@ impl ServerState {
             };
         }
         // A parked one answers with its job.
+        let mut pending = self.pending_tag_batches.lock().unwrap();
+        if let Some((job_id, (_, d))) = pending
+            .iter()
+            .find(|(_, (p, _))| p.request_id == req.request_id)
         {
-            let pending = self.pending_tag_batches.lock().unwrap();
-            if let Some((job_id, (_, d))) = pending
-                .iter()
-                .find(|(_, (p, _))| p.request_id == req.request_id)
-            {
-                return if *d == digest {
-                    self.jobs
-                        .get(job_id)
-                        .map(TagBatchKickoff::Awaiting)
-                        .ok_or_else(|| TagBatchError::Catalog("the parked job is gone".into()))
-                } else {
-                    Err(TagBatchError::RequestConflict(req.request_id))
-                };
-            }
+            return if *d == digest {
+                self.jobs
+                    .get(job_id)
+                    .map(TagBatchKickoff::Awaiting)
+                    .ok_or_else(|| TagBatchError::Catalog("the parked job is gone".into()))
+            } else {
+                Err(TagBatchError::RequestConflict(req.request_id))
+            };
         }
+        self.validate_tag_vocabulary(&req)?;
         let detail = self.tag_batch_detail(&req, &source);
         let job = self.jobs.create(
             "write_tags",
@@ -1120,68 +1148,34 @@ impl ServerState {
             jobs::JobState::AwaitingApproval,
         );
         job.set_detail(detail);
-        self.pending_tag_batches
-            .lock()
-            .unwrap()
-            .insert(job.id.clone(), (req, digest));
+        pending.insert(job.id.clone(), (req, digest));
+        drop(pending);
         self.wake();
         Ok(TagBatchKickoff::Awaiting(job))
     }
 
     /// Enforce the app-selected vocabulary against the exact asset modalities in a batch.
     fn validate_tag_vocabulary(&self, req: &TagBatchRequest) -> Result<(), TagBatchError> {
-        let current = self
-            .get_vocabulary(&VocabularyRequest::default())
-            .map_err(|e| TagBatchError::Catalog(e.message))?["revision"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        if req.vocabulary_revision.as_deref() != Some(current.as_str()) {
-            return Err(TagBatchError::VocabularyConflict);
-        }
-        if self.vocabulary_policy() == "open" {
-            return Ok(());
-        }
-        let traits = self
-            .catalog
-            .lock()
-            .unwrap()
-            .list_vocabulary()
-            .map_err(|e| TagBatchError::Catalog(e.to_string()))?;
+        let cat = self.catalog.lock().unwrap();
         for asset in &req.assets {
-            let media_type = self
-                .asset(asset.asset_id)
+            if cat
+                .asset_summaries(&[asset.asset_id])
                 .map_err(|e| TagBatchError::Catalog(e.to_string()))?
-                .ok_or(TagBatchError::AssetNotFound(asset.asset_id))?
-                .media_type;
-            for tag in &asset.tags {
-                let Some((key, _)) =
-                    lodestash_core::catalog::normalize_tag(&tag.namespace, &tag.value)
-                else {
-                    continue;
-                };
-                let known = traits.iter().any(|candidate| {
-                    candidate.is_trait
-                        && candidate
-                            .scope
-                            .as_deref()
-                            .map_or(true, |scope| scope == media_type)
-                        && lodestash_core::catalog::normalize_tag(
-                            &candidate.namespace,
-                            &candidate.value,
-                        )
-                        .map(|(candidate_key, _)| candidate_key == key)
-                        .unwrap_or(false)
-                });
-                if !known {
-                    return Err(TagBatchError::VocabularyTermUnknown(format!(
-                        "asset {}: {}:{}",
-                        asset.asset_id, tag.namespace, tag.value
-                    )));
-                }
+                .is_empty()
+            {
+                return Err(TagBatchError::AssetNotFound(asset.asset_id));
             }
         }
-        Ok(())
+        cat.validate_vocabulary_assignments(
+            req.vocabulary_revision.as_deref().unwrap_or(""),
+            &self.vocabulary_policy(),
+            req.assets.iter().flat_map(|a| {
+                a.tags
+                    .iter()
+                    .map(move |t| (a.asset_id, t.namespace.as_str(), t.value.as_str()))
+            }),
+        )
+        .map_err(vocabulary_error)
     }
 
     /// Queue an exact, provenance-preserving review for local approval.
@@ -1213,15 +1207,6 @@ impl ServerState {
             .unwrap()
             .clone()
             .ok_or(TagBatchError::ProducerNotConfigured)?;
-        let current = self
-            .get_vocabulary(&VocabularyRequest::default())
-            .map_err(|e| TagBatchError::Catalog(e.message))?["revision"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        if req.vocabulary_revision != current {
-            return Err(TagBatchError::VocabularyConflict);
-        }
         let digest = blake3::hash(
             serde_json::to_string(&req)
                 .expect("parsed request serializes")
@@ -1245,6 +1230,34 @@ impl ServerState {
                 Err(TagBatchError::RequestConflict(req.request_id))
             };
         }
+        let mut pending = self.pending_tag_reviews.lock().unwrap();
+        if let Some((job_id, (_, pending_digest, _))) =
+            pending.iter().find(|(_, (pending, _, _))| {
+                pending
+                    .receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.request_id == req.request_id)
+            })
+        {
+            return if *pending_digest == digest {
+                self.jobs
+                    .get(job_id)
+                    .map(TagBatchKickoff::Awaiting)
+                    .ok_or_else(|| TagBatchError::Catalog("the parked job is gone".into()))
+            } else {
+                Err(TagBatchError::RequestConflict(req.request_id))
+            };
+        }
+
+        let current = self
+            .get_vocabulary(&VocabularyRequest::default())
+            .map_err(|e| TagBatchError::Catalog(e.message))?["revision"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if req.vocabulary_revision != current {
+            return Err(TagBatchError::VocabularyConflict);
+        }
         let batch = req
             .to_core_batch(reviewer.clone(), digest.clone())
             .map_err(TagBatchError::Invalid)?;
@@ -1254,24 +1267,19 @@ impl ServerState {
             ));
         }
         self.validate_tag_review(&batch)?;
-        {
-            let pending = self.pending_tag_reviews.lock().unwrap();
-            if let Some((job_id, (_, pending_digest))) = pending.iter().find(|(_, (pending, _))| {
-                pending
-                    .receipt
-                    .as_ref()
-                    .is_some_and(|receipt| receipt.request_id == req.request_id)
-            }) {
-                return if *pending_digest == digest {
-                    self.jobs
-                        .get(job_id)
-                        .map(TagBatchKickoff::Awaiting)
-                        .ok_or_else(|| TagBatchError::Catalog("the parked job is gone".into()))
-                } else {
-                    Err(TagBatchError::RequestConflict(req.request_id))
-                };
-            }
-        }
+        self.catalog
+            .lock()
+            .unwrap()
+            .validate_vocabulary_assignments(
+                &req.vocabulary_revision,
+                &self.vocabulary_policy(),
+                batch
+                    .decisions
+                    .iter()
+                    .filter(|d| d.action == lodestash_core::catalog::TagReviewAction::Accept)
+                    .map(|d| (d.asset_id, d.namespace.as_str(), d.value.as_str())),
+            )
+            .map_err(vocabulary_error)?;
         let job = self.jobs.create(
             "review_tags",
             format!(
@@ -1281,10 +1289,8 @@ impl ServerState {
             jobs::JobState::AwaitingApproval,
         );
         job.set_detail(serde_json::json!({ "reviewer": reviewer, "decisions": batch.decisions }));
-        self.pending_tag_reviews
-            .lock()
-            .unwrap()
-            .insert(job.id.clone(), (batch, digest));
+        pending.insert(job.id.clone(), (batch, digest, req.vocabulary_revision));
+        drop(pending);
         self.wake();
         Ok(TagBatchKickoff::Awaiting(job))
     }
@@ -1296,6 +1302,14 @@ impl ServerState {
         let cat = self.catalog.lock().unwrap();
         let mut seen = HashSet::new();
         for decision in &batch.decisions {
+            if decision.reason.trim().is_empty()
+                || decision.reason.chars().count() > lodestash_core::catalog::MAX_DESCRIPTION_CHARS
+                || decision.expected_revision.trim().is_empty()
+            {
+                return Err(TagBatchError::Invalid(
+                    "review requires a bounded reason and an expected revision".into(),
+                ));
+            }
             if !lodestash_core::catalog::is_ai_source(&decision.source) {
                 return Err(TagBatchError::ProtectedAssignment);
             }
@@ -1326,23 +1340,44 @@ impl ServerState {
         Ok(())
     }
 
-    fn run_tag_review(&self, job: Arc<jobs::Job>, batch: lodestash_core::catalog::TagReviewBatch) {
+    fn run_tag_review(
+        &self,
+        job: Arc<jobs::Job>,
+        batch: lodestash_core::catalog::TagReviewBatch,
+        vocabulary_revision: String,
+    ) {
         job.set_state(jobs::JobState::Running);
         let request_id = batch
             .receipt
             .as_ref()
             .map(|r| r.request_id.clone())
             .unwrap_or_default();
-        if let Err(error) = self.write(AgentWrite::TagReview { batch }) {
+        if job.is_cancelled() {
+            job.set_state(jobs::JobState::Cancelled);
+            return;
+        }
+        if !self.allows("review_tags") {
+            return job.fail("tool_disabled");
+        }
+        if self.agent_producer.lock().unwrap().as_deref() != Some(batch.reviewer.as_str()) {
+            return job.fail("producer_mismatch");
+        }
+        if let Err(error) = self.write(AgentWrite::TagReview {
+            batch,
+            vocabulary_revision,
+        }) {
             return job.fail(error);
         }
-        match self
+        let receipt = self
             .catalog
             .lock()
             .unwrap()
-            .tag_request_receipt(&request_id)
-        {
-            Ok(Some(receipt)) => job.finish(receipt.result),
+            .tag_request_receipt(&request_id);
+        match receipt {
+            Ok(Some(receipt)) => {
+                self.pending_tag_reviews.lock().unwrap().remove(&job.id);
+                job.finish(receipt.result);
+            }
             Ok(None) => job.fail("the review write reported success but left no receipt"),
             Err(error) => job.fail(error.to_string()),
         }
@@ -1383,6 +1418,9 @@ impl ServerState {
     /// Run an approved request through the app's writer, then answer from its receipt — the
     /// catalog's own record of what committed, not this process's memory of it.
     fn run_tag_batch(&self, job: Arc<jobs::Job>, req: TagBatchRequest, digest: String) {
+        if job.is_cancelled() || !self.allows("write_tags") {
+            return job.fail("cancelled or tool_disabled");
+        }
         job.set_state(jobs::JobState::Running);
         let request_id = req.request_id.clone();
         if let Err(error) = self.validate_tag_vocabulary(&req) {
@@ -1394,13 +1432,16 @@ impl ServerState {
         }) {
             return job.fail(e);
         }
-        match self
+        let receipt = self
             .catalog
             .lock()
             .unwrap()
-            .tag_request_receipt(&request_id)
-        {
-            Ok(Some(r)) => job.finish(r.result),
+            .tag_request_receipt(&request_id);
+        match receipt {
+            Ok(Some(r)) => {
+                self.pending_tag_batches.lock().unwrap().remove(&job.id);
+                job.finish(r.result);
+            }
             Ok(None) => job.fail("the write reported success but left no receipt"),
             Err(e) => job.fail(e.to_string()),
         }
@@ -1428,6 +1469,19 @@ impl ServerState {
         body["analysis_revision"] = serde_json::json!(cat.analysis_revision(id)?);
         body["description"] = serde_json::json!(cat.asset_description(id)?);
         body["tag_provenance"] = serde_json::to_value(cat.asset_tag_rows(id)?)?;
+        let mut reviews = Vec::new();
+        for operation in cat.recent_ops(200)? {
+            let payload: serde_json::Value = serde_json::from_str(&operation.payload_json)?;
+            if let Some(decisions) = payload["reviews"].as_array() {
+                for decision in decisions
+                    .iter()
+                    .filter(|d| d["asset_id"].as_i64() == Some(id))
+                {
+                    reviews.push(serde_json::json!({"operation_id":operation.id,"reviewer":payload["reviewer"],"decision":decision,"matches_current_revision":decision["expected_revision"] == body["annotation_revision"]}));
+                }
+            }
+        }
+        body["tag_reviews"] = serde_json::json!(reviews);
         Ok(Some(body))
     }
 
@@ -1843,6 +1897,14 @@ impl ServerState {
         if job.state() != jobs::JobState::AwaitingApproval {
             return;
         }
+        if let Some((proposal, digest)) =
+            self.pending_vocabulary.lock().unwrap().get(job_id).cloned()
+        {
+            job.set_state(jobs::JobState::Queued);
+            let state = self.clone();
+            std::thread::spawn(move || state.run_vocabulary_proposal(job, proposal, digest));
+            return;
+        }
         // The job is either a pending export or a pending import — run whichever it is.
         if let Some((req, dest)) = self.pending_exports.lock().unwrap().remove(job_id) {
             job.set_state(jobs::JobState::Queued);
@@ -1855,19 +1917,34 @@ impl ServerState {
             std::thread::spawn(move || state.enqueue_import(job, req, project_id));
             return;
         }
-        if let Some((req, digest)) = self.pending_tag_batches.lock().unwrap().remove(job_id) {
+        if let Some((req, digest)) = self
+            .pending_tag_batches
+            .lock()
+            .unwrap()
+            .get(job_id)
+            .cloned()
+        {
+            job.set_state(jobs::JobState::Queued);
             let state = self.clone();
             std::thread::spawn(move || state.run_tag_batch(job, req, digest));
             return;
         }
-        if let Some((batch, _)) = self.pending_tag_reviews.lock().unwrap().remove(job_id) {
+        if let Some((batch, _, revision)) = self
+            .pending_tag_reviews
+            .lock()
+            .unwrap()
+            .get(job_id)
+            .cloned()
+        {
+            job.set_state(jobs::JobState::Queued);
             let state = self.clone();
-            std::thread::spawn(move || state.run_tag_review(job, batch));
+            std::thread::spawn(move || state.run_tag_review(job, batch, revision));
         }
     }
 
     /// The desktop app said no.
     pub fn deny_job(&self, job_id: &str) {
+        self.pending_vocabulary.lock().unwrap().remove(job_id);
         self.pending_exports.lock().unwrap().remove(job_id);
         self.pending_imports.lock().unwrap().remove(job_id);
         self.pending_tag_batches.lock().unwrap().remove(job_id);
@@ -2394,5 +2471,16 @@ mod tests {
             )),
             "the albedo is reachable through the graph and pullable through the same scratch"
         );
+    }
+}
+
+fn vocabulary_error(error: lodestash_core::error::CoreError) -> TagBatchError {
+    let message = error.to_string();
+    if message.contains("vocabulary_conflict:") {
+        TagBatchError::VocabularyConflict
+    } else if message.contains("vocabulary_term_unknown:") {
+        TagBatchError::VocabularyTermUnknown(message)
+    } else {
+        TagBatchError::Catalog(message)
     }
 }

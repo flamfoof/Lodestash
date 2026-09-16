@@ -170,6 +170,24 @@
                 {/each}
               </ul>
             {/if}
+              {#if Array.isArray((a.detail as { decisions?: unknown[] } | null)?.decisions)}
+                <ul class="diff" data-testid="review-approval-detail">
+                  {#each (a.detail as { decisions: { asset_id: number; namespace: string; value: string; source: string; action: string; reason: string }[] }).decisions as d}
+                    <li>#{d.asset_id}: {d.action} {d.namespace}:{d.value} ({d.source}) — {d.reason}</li>
+                  {/each}
+                </ul>
+              {/if}
+              {#if Array.isArray((a.detail as { changes?: unknown[] } | null)?.changes)}
+                <ul class="diff" data-testid="vocabulary-approval-detail">
+                  {#each (a.detail as { changes: { kind: string; namespace?: string; value?: string; scope?: string; usage_note?: string; teach?: boolean; label?: string; taxonomy_id?: number; parent_id?: number; reason?: string }[] }).changes as c}
+                    <li>{#if c.kind === "trait"}
+                      Trait {c.namespace}:{c.value} · {c.scope ?? "all media"} · {c.teach ? "Use in future identification" : "Teaching off"}{#if c.usage_note} · {c.usage_note}{/if}
+                    {:else}
+                      Category {c.label} · taxonomy #{c.taxonomy_id} · {c.parent_id ? `under #${c.parent_id}` : "at root"} · {c.reason}
+                    {/if}</li>
+                  {/each}
+                </ul>
+              {/if}
           </div>
         {/each}
       </div>

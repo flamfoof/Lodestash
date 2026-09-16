@@ -42,6 +42,7 @@ pub fn router(state: Shared) -> Router {
         .route("/v1/assets/{id}/tags", post(add_tag))
         .route("/v1/tags/batch", post(write_tags))
         .route("/v1/tags/review", post(review_tags))
+        .route("/v1/vocabulary/proposals", post(propose_vocabulary_changes))
         .route("/v1/collections", get(collections))
         .route("/v1/mapping/apply", post(apply_mapping))
         .route("/v1/identify", post(identify_asset))
@@ -92,6 +93,7 @@ fn tool_for(method: &Method, path: &str, query: Option<&str>) -> Option<&'static
         ("POST", "/v1/assets/{id}/tags") => "add_tag",
         ("POST", "/v1/tags/batch") => "write_tags",
         ("POST", "/v1/tags/review") => "review_tags",
+        ("POST", "/v1/vocabulary/proposals") => "propose_vocabulary_changes",
         ("GET", "/v1/collections") => "list_collections",
         ("POST", "/v1/mapping/apply") => "apply_mapping",
         ("POST", "/v1/identify") => "identify_asset",
@@ -504,6 +506,31 @@ async fn review_tags(State(state): State<Shared>, body: axum::body::Bytes) -> Re
     }
 }
 
+async fn propose_vocabulary_changes(
+    State(state): State<Shared>,
+    body: axum::body::Bytes,
+) -> Response {
+    if body.len() > crate::MAX_TAG_BATCH_BYTES {
+        return agent_err(crate::AgentError::resource_too_large(
+            "proposal exceeds 1 MiB",
+        ));
+    }
+    let proposal = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => return agent_err(crate::AgentError::invalid(error.to_string())),
+    };
+    match state.request_vocabulary_proposal(proposal, body.len()) {
+        Ok(kickoff) => {
+            let (status, body) = kickoff.to_response();
+            (StatusCode::from_u16(status).unwrap(), Json(body)).into_response()
+        }
+        Err(error) => {
+            let (status, code, message) = error.parts();
+            err(StatusCode::from_u16(status).unwrap(), code, &message, "")
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct LimitParam {
     limit: Option<usize>,
@@ -878,9 +905,42 @@ async fn cancel_job(State(state): State<Shared>, Path(id): Path<String>) -> Resp
     }
 }
 
-async fn preview(State(state): State<Shared>, Path(id): Path<i64>) -> Response {
+async fn preview(
+    State(state): State<Shared>,
+    Path(id): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
     if let Some(denied) = bytes_denied(&state) {
         return denied;
+    }
+    if !params.is_empty() {
+        let parse = |name: &str, default: usize| -> Result<usize, crate::AgentError> {
+            params.get(name).map_or(Ok(default), |value| {
+                value
+                    .parse()
+                    .map_err(|_| crate::AgentError::invalid(format!("invalid {name}")))
+            })
+        };
+        let result = (|| {
+            let view = parse("view", 0)?;
+            let bundle = state.asset_evidence_bundle(
+                id,
+                &crate::EvidenceRequest {
+                    kind: params.get("kind").cloned(),
+                    max_dimension: Some(parse("max_dimension", 512)?),
+                    views: Some(parse("views", 1)?),
+                },
+            )?;
+            bundle
+                .images
+                .into_iter()
+                .nth(view)
+                .ok_or_else(|| crate::AgentError::invalid("requested view is unavailable"))
+        })();
+        return match result {
+            Ok(bytes) => ([(header::CONTENT_TYPE, "image/png")], bytes).into_response(),
+            Err(error) => agent_err(error),
+        };
     }
     match state.preview_path(id) {
         Some(path) => serve_file(&path, "image/png").await,
@@ -890,11 +950,91 @@ async fn preview(State(state): State<Shared>, Path(id): Path<i64>) -> Response {
 
 /// `GET /v1/assets/{id}/file` — through the shared resolver (ENGINE-API §8.2), so an in-pack asset
 /// is served from a verified pull of just its payload rather than refused.
-async fn file(State(state): State<Shared>, Path(id): Path<i64>) -> Response {
+async fn file(State(state): State<Shared>, Path(id): Path<i64>, headers: HeaderMap) -> Response {
     match state.resolve_file(id) {
-        Ok(path) => serve_file(&path, "application/octet-stream").await,
+        Ok(path) => serve_asset_file(&path, &headers).await,
         Err(e) => agent_err(e),
     }
+}
+
+/// Single byte ranges allow bounded source retrieval without reading the whole model into memory.
+/// Unsupported/malformed range syntax is ignored; an unsatisfiable single range returns 416.
+async fn serve_asset_file(path: &std::path::Path, headers: &HeaderMap) -> Response {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let Ok(mut file) = tokio::fs::File::open(path).await else {
+        return not_found();
+    };
+    let Ok(meta) = file.metadata().await else {
+        return not_found();
+    };
+    let size = meta.len();
+    let range = if headers.contains_key(header::IF_RANGE) {
+        None
+    } else {
+        headers
+            .get(header::RANGE)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.strip_prefix("bytes="))
+            .filter(|s| !s.contains(','))
+            .and_then(|s| s.split_once('-'))
+            .and_then(|(start, end)| {
+                let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+                if start.is_empty() && digits(end) {
+                    end.parse::<u64>()
+                        .ok()
+                        .map(|suffix| (size.saturating_sub(suffix), size.saturating_sub(1)))
+                } else if digits(start) && (end.is_empty() || digits(end)) {
+                    start.parse::<u64>().ok().zip(if end.is_empty() {
+                        Some(size.saturating_sub(1))
+                    } else {
+                        end.parse::<u64>().ok()
+                    })
+                } else {
+                    None
+                }
+            })
+    };
+    let (start, end, status) = match range {
+        Some((start, end)) if size == 0 || start >= size || end < start => {
+            return (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [(header::CONTENT_RANGE, format!("bytes */{size}"))],
+            )
+                .into_response();
+        }
+        Some((start, end)) => (start, end.min(size - 1), StatusCode::PARTIAL_CONTENT),
+        None => (0, size.saturating_sub(1), StatusCode::OK),
+    };
+    let length = if size == 0 { 0 } else { end - start + 1 };
+    if length > 256 * 1024 * 1024 {
+        return agent_err(crate::AgentError::resource_too_large(
+            "request a byte range of at most 256 MiB",
+        ));
+    }
+    if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+        return not_found();
+    }
+    let mut bytes = Vec::new();
+    if file.take(length).read_to_end(&mut bytes).await.is_err() || bytes.len() as u64 != length {
+        return agent_err(crate::AgentError::not_local(
+            "source changed during the read",
+        ));
+    }
+    let mut response = (status, bytes).into_response();
+    let out = response.headers_mut();
+    out.insert(
+        header::CONTENT_TYPE,
+        "application/octet-stream".parse().unwrap(),
+    );
+    out.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
+    out.insert(header::CONTENT_LENGTH, length.into());
+    if status == StatusCode::PARTIAL_CONTENT {
+        out.insert(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{size}").parse().unwrap(),
+        );
+    }
+    response
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1831,6 +1971,69 @@ mod tests {
 
     /// A catalog file with one image asset, and the state serving it with a write bridge that
     /// applies approved batches through a second connection — the app's writer, in miniature.
+    #[tokio::test]
+    async fn resolved_files_support_bounded_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.bin");
+        std::fs::write(&path, b"0123456789").unwrap();
+        for (range, status, expected, content_range) in [
+            (
+                "bytes=2-4",
+                StatusCode::PARTIAL_CONTENT,
+                "234",
+                Some("bytes 2-4/10"),
+            ),
+            (
+                "bytes=-3",
+                StatusCode::PARTIAL_CONTENT,
+                "789",
+                Some("bytes 7-9/10"),
+            ),
+            (
+                "bytes=8-",
+                StatusCode::PARTIAL_CONTENT,
+                "89",
+                Some("bytes 8-9/10"),
+            ),
+            (
+                "bytes=7-99",
+                StatusCode::PARTIAL_CONTENT,
+                "789",
+                Some("bytes 7-9/10"),
+            ),
+            (
+                "bytes=20-",
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "",
+                Some("bytes */10"),
+            ),
+            (
+                "bytes=-0",
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "",
+                Some("bytes */10"),
+            ),
+            ("bytes=garbage", StatusCode::OK, "0123456789", None),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::RANGE, range.parse().unwrap());
+            let response = serve_asset_file(&path, &headers).await;
+            assert_eq!(response.status(), status, "{range}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_RANGE)
+                    .map(|v| v.to_str().unwrap()),
+                content_range
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 100)
+                .await
+                .unwrap();
+            assert_eq!(&bytes[..], expected.as_bytes(), "{range}");
+        }
+        assert_eq!(std::fs::read(path).unwrap(), b"0123456789");
+    }
+
     fn tag_state() -> (tempfile::TempDir, Shared, i64) {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("catalog.db");
@@ -1857,19 +2060,44 @@ mod tests {
         let s =
             Arc::new(ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap());
         let writer_db = db.clone();
+        let writer_state = Arc::downgrade(&s);
         s.set_write(Box::new(move |w| match w {
             crate::AgentWrite::TagBatch { request, digest } => {
                 lodestash_core::catalog::Catalog::open(&writer_db)
                     .map_err(|e| e.to_string())?
-                    .apply_tag_batch(&request.to_core_batch(&digest))
+                    .apply_tag_batch_guarded(
+                        &request.to_core_batch(&digest),
+                        Some((
+                            request.vocabulary_revision.as_deref().unwrap_or(""),
+                            &writer_state.upgrade().unwrap().vocabulary_policy(),
+                        )),
+                    )
                     .map(|o| o.changed_assets.len())
                     .map_err(|e| e.to_string())
             }
-            crate::AgentWrite::TagReview { batch } => {
+            crate::AgentWrite::TagReview {
+                batch,
+                vocabulary_revision,
+            } => lodestash_core::catalog::Catalog::open(&writer_db)
+                .map_err(|e| e.to_string())?
+                .apply_tag_review_guarded(
+                    &batch,
+                    Some((
+                        &vocabulary_revision,
+                        &writer_state.upgrade().unwrap().vocabulary_policy(),
+                    )),
+                )
+                .map(|o| o.changed_assets.len())
+                .map_err(|e| e.to_string()),
+            crate::AgentWrite::VocabularyProposal { proposal, digest } => {
                 lodestash_core::catalog::Catalog::open(&writer_db)
                     .map_err(|e| e.to_string())?
-                    .apply_tag_review(&batch)
-                    .map(|o| o.changed_assets.len())
+                    .apply_vocabulary_proposal(
+                        &proposal,
+                        &writer_state.upgrade().unwrap().vocabulary_policy(),
+                        &digest,
+                    )
+                    .map(|_| 1)
                     .map_err(|e| e.to_string())
             }
             other => Err(format!("unexpected write {other:?}")),
@@ -1921,6 +2149,184 @@ mod tests {
 
     const RID_A: &str = "0b4ad2c7-6c1a-4c5e-9a0f-1f2b3c4d5e6a";
     const RID_B: &str = "1c5be3d8-7d2b-4d6f-8b10-2a3c4d5e6f7b";
+
+    #[tokio::test]
+    async fn an_approved_running_proposal_keeps_its_request_identity() {
+        let (_dir, st, _) = tag_state();
+        st.set_agent_producer(Some("codex@test".into()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        st.set_write(Box::new(move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            Err("fixture failure after waiting".into())
+        }));
+        let request = json!({"request_id":RID_A,"expected_revision":st.get_vocabulary(&crate::VocabularyRequest::default()).unwrap()["revision"],"changes":[{"kind":"trait","namespace":"subject","value":"tower"}]});
+        let (_, first) = send(
+            router(st.clone()),
+            post_req(
+                "/v1/vocabulary/proposals",
+                Some(st.token()),
+                request.clone(),
+            ),
+        )
+        .await;
+        let job = first["job_id"].as_str().unwrap();
+        st.approve_job(job);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let (_, retry) = send(
+            router(st.clone()),
+            post_req("/v1/vocabulary/proposals", Some(st.token()), request),
+        )
+        .await;
+        assert_eq!(
+            retry["job_id"], first["job_id"],
+            "a running request was parked for approval again"
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(settle(&st, job).await["state"], "error");
+    }
+
+    #[tokio::test]
+    async fn vocabulary_approval_denial_cancellation_and_revocation_leave_no_receipt() {
+        for action in ["deny", "cancel", "disable"] {
+            let (dir, st, _) = tag_state();
+            st.set_agent_producer(Some("codex@test".into()));
+            let revision = st
+                .get_vocabulary(&crate::VocabularyRequest::default())
+                .unwrap()["revision"]
+                .clone();
+            let request = json!({"request_id":RID_A,"expected_revision":revision,"changes":[{"kind":"trait","namespace":"subject","value":"tower"}]});
+            let (status, parked) = send(
+                router(st.clone()),
+                post_req("/v1/vocabulary/proposals", Some(st.token()), request),
+            )
+            .await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{parked}");
+            let job = parked["job_id"].as_str().unwrap();
+            match action {
+                "deny" => st.deny_job(job),
+                "cancel" => {
+                    st.jobs.cancel(job);
+                }
+                _ => st.set_allowed(std::collections::HashSet::new()),
+            }
+            st.approve_job(job);
+            let terminal = settle(&st, job).await;
+            assert!(
+                matches!(terminal["state"].as_str(), Some("cancelled" | "error")),
+                "{terminal}"
+            );
+            let c = lodestash_core::catalog::Catalog::open(&dir.path().join("catalog.db")).unwrap();
+            assert!(c.tag_request_receipt(RID_A).unwrap().is_none());
+            assert!(c.list_vocabulary().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn vocabulary_proposal_write_review_and_replay_share_the_approval_flow() {
+        let (dir, st, id) = tag_state();
+        st.set_agent_producer(Some("codex@test".into()));
+        let token = st.token.clone();
+        let vocabulary = || {
+            st.get_vocabulary(&crate::VocabularyRequest::default())
+                .unwrap()["revision"]
+                .clone()
+        };
+        let annotation = || {
+            st.asset_detail_json(id).unwrap().unwrap()["annotation_revision"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let request = json!({"request_id":RID_A,"expected_revision":vocabulary(),"changes":[{"kind":"trait","namespace":"subject","value":"stone","scope":"image","usage_note":"Stone surface"}]});
+        let (status, parked) = send(
+            router(st.clone()),
+            post_req("/v1/vocabulary/proposals", Some(&token), request.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{parked}");
+        assert_eq!(parked["detail"]["changes"][0]["teach"], false);
+        let (_, duplicate) = send(
+            router(st.clone()),
+            post_req("/v1/vocabulary/proposals", Some(&token), request.clone()),
+        )
+        .await;
+        assert_eq!(duplicate["job_id"], parked["job_id"]);
+        let job = parked["job_id"].as_str().unwrap();
+        st.approve_job(job);
+        let result = settle(&st, job).await;
+        assert_eq!(result["state"], "done", "{result}");
+        assert!(result["result"]["changes"][0]["id"].as_i64().unwrap() > 0);
+        let (status, replay) = send(
+            router(st.clone()),
+            post_req("/v1/vocabulary/proposals", Some(&token), request),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        assert_eq!(replay["result"], result["result"]);
+        let body = with_vocabulary(
+            &st,
+            batch_body(RID_B, id, &annotation(), "codex@test", "stone"),
+        );
+        let (status, parked) = send(
+            router(st.clone()),
+            post_req("/v1/tags/batch", Some(&token), body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{parked}");
+        let job = parked["job_id"].as_str().unwrap();
+        st.approve_job(job);
+        assert_eq!(settle(&st, job).await["state"], "done");
+        let review = json!({"request_id":uuid::Uuid::new_v4().to_string(),"vocabulary_revision":vocabulary(),"assets":[{"asset_id":id,"expected_revision":annotation(),"decisions":[{"namespace":"subject","value":"stone","source":"ai:codex@test","action":"accept","reason":"The preview supports this material"}]}]});
+        let (status, parked) = send(
+            router(st.clone()),
+            post_req("/v1/tags/review", Some(&token), review.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{parked}");
+        let job = parked["job_id"].as_str().unwrap();
+        st.approve_job(job);
+        assert_eq!(settle(&st, job).await["state"], "done");
+        let mut protected = review.clone();
+        protected["request_id"] = json!(uuid::Uuid::new_v4().to_string());
+        protected["assets"][0]["decisions"][0]["source"] = json!("manual");
+        let (status, error) = send(
+            router(st.clone()),
+            post_req("/v1/tags/review", Some(&token), protected),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{error}");
+        // A trait changes while approval is pending: the transaction refuses the stale token.
+        let mut stale = review;
+        stale["request_id"] = json!(uuid::Uuid::new_v4().to_string());
+        let (_, pending) = send(
+            router(st.clone()),
+            post_req("/v1/tags/review", Some(&token), stale),
+        )
+        .await;
+        let c = lodestash_core::catalog::Catalog::open(&dir.path().join("catalog.db")).unwrap();
+        c.upsert_trait("subject", "rock", Some("image"), None, false)
+            .unwrap();
+        let job = pending["job_id"].as_str().unwrap();
+        st.approve_job(job);
+        let failed = settle(&st, job).await;
+        assert_eq!(failed["state"], "error", "{failed}");
+        assert!(failed["error"]
+            .as_str()
+            .unwrap()
+            .contains("vocabulary_conflict"));
+        let rows = c.asset_tag_rows(id).unwrap();
+        assert_eq!(rows[0].source, "ai:codex@test");
+        assert_eq!(rows[0].value, "stone");
+    }
 
     /// Everything that can be refused is refused before a request is parked — so the person at the
     /// machine is never asked to approve something that could not be written.
