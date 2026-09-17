@@ -61,7 +61,7 @@ impl std::fmt::Display for Denied {
             Denied::AgentBytesOff => write!(
                 f,
                 "this agent may read metadata and links; sending it asset bytes needs \
-                 `mcp_bytes_enabled` in Settings"
+                 the agent byte switch, destination and modality consent in Settings"
             ),
         }
     }
@@ -90,8 +90,8 @@ pub fn may_send(cfg: &AppConfig, endpoint: &str, modality: Modality) -> Result<(
 ///
 /// A stdio connection proves the *client process* is local; it says nothing about the model behind
 /// it, which is why this is a configured choice rather than an inference from the transport.
-pub fn agent_may_read_bytes(cfg: &AppConfig) -> Result<(), Denied> {
-    if cfg.mcp_bytes_enabled {
+pub fn agent_may_read_bytes(cfg: &AppConfig, media_type: &str) -> Result<(), Denied> {
+    if cfg.mcp_bytes_enabled && cfg.mcp_byte_profile.allows(Some(media_type)) {
         Ok(())
     } else {
         Err(Denied::AgentBytesOff)
@@ -158,9 +158,18 @@ mod tests {
     #[test]
     fn an_agent_reads_bytes_only_when_that_is_configured() {
         assert!(matches!(
-            agent_may_read_bytes(&cfg(true, false)),
+            agent_may_read_bytes(&cfg(true, false), "model_3d"),
             Err(Denied::AgentBytesOff)
         ));
-        assert_eq!(agent_may_read_bytes(&cfg(false, true)), Ok(()));
+        let mut configured = cfg(false, true);
+        assert!(agent_may_read_bytes(&configured, "model_3d").is_err());
+        configured.mcp_byte_profile = lodestash_api::AgentByteProfile {
+            host: "fixture".into(),
+            destination: "remote".into(),
+            visual_bytes: true,
+            audio_bytes: true,
+        };
+        assert_eq!(agent_may_read_bytes(&configured, "model_3d"), Ok(()));
+        assert!(agent_may_read_bytes(&configured, "audio").is_err());
     }
 }

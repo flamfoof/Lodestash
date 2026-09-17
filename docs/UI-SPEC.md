@@ -734,6 +734,13 @@ tests (the parity test still asserts MCP↔REST 1:1). Not yet built: the per-too
 card, and the optional Streamable-HTTP transport (stable port 4319, rotating token). Until the UI
 lands, the list is driven by editing `config.mcp_disabled_tools` directly.
 
+**Agent evidence consent (shipped 2026-09-16).** The MCP card persists the byte switch, a named
+host/model destination, local/remote/unknown selection and visual/audio consent. Changing the
+host label or locality clears both modality checks. Audio consent is disabled for remote hosts;
+unknown/blank destinations cannot enable either. The shared server checks current settings at
+release time. Full policy and config contract: [ENGINE-API §8.2](ENGINE-API.md#82-evidence-and-file-access).
+This profile applies to every client using the app's MCP/REST access; it is not a per-token store.
+
 ### 11.6 STORAGE
 
 **Two cards, not one** (reworked 2026-08-29). They were a single **STORAGE CAPS** card governing

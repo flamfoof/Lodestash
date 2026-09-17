@@ -667,15 +667,17 @@ impl Lodestash {
         let mut content = Vec::new();
         // Bytes are a separate permission from metadata (v1 plan S10): without it the tool still
         // answers — name, type, links — and simply carries no image.
-        if !self.state.byte_release() {
+        if !self.state.may_release_media(Some(&row.media_type)) {
             content.push(ContentBlock::text(
                 "preview bytes withheld: this agent may read metadata and links; serving asset \
-                 bytes needs `mcp_bytes_enabled` in Settings",
+                 bytes needs destination and modality consent in Settings",
             ));
         } else if let Some(png) = self.state.preview_path(args.id) {
             // An unreadable cache entry costs the image, not the call.
             if let Ok(bytes) = std::fs::read(&png) {
-                content.push(ContentBlock::image(b64(&bytes), "image/png"));
+                if self.state.may_release_media(Some(&row.media_type)) {
+                    content.push(ContentBlock::image(b64(&bytes), "image/png"));
+                }
             }
         }
         // MCP-AND-ENGINES "Returning previews — the rule": always pair a viewable image with a
@@ -1297,6 +1299,7 @@ fn read_asset_file(state: &ServerState, uri: &str) -> Result<ReadResourceResult,
     }
     let bytes = std::fs::read(&path)
         .map_err(|e| ErrorData::internal_error(format!("reading the file failed: {e}"), None))?;
+    state.require_asset_bytes(id).map_err(refuse)?;
     Ok(ReadResourceResult::new(vec![ResourceContents::blob(
         b64(&bytes),
         uri,
@@ -1432,6 +1435,7 @@ mod tests {
             .contains("bytes_not_released"));
 
         state.set_byte_release(true);
+        state.set_byte_profile(serde_json::from_value(serde_json::json!({"host":"fixture", "destination":"local", "visual_bytes":true, "audio_bytes":true})).unwrap());
         let read = read_asset_file(&state, &format!("asset://{rock}/file")).unwrap();
         let body = serde_json::to_value(&read).unwrap();
         assert_eq!(body["contents"][0]["blob"], b64(b"png bytes"));
@@ -1792,6 +1796,7 @@ mod tests {
         );
 
         state.set_byte_release(true);
+        state.set_byte_profile(serde_json::from_value(serde_json::json!({"host":"fixture", "destination":"local", "visual_bytes":true, "audio_bytes":true})).unwrap());
         let released = call();
         assert!(
             !released.contains("withheld"),
@@ -1836,6 +1841,7 @@ mod tests {
             .unwrap(),
         );
         state.set_byte_release(true);
+        state.set_byte_profile(serde_json::from_value(serde_json::json!({"host":"fixture", "destination":"local", "visual_bytes":true, "audio_bytes":true})).unwrap());
         let mcp = Lodestash::new(state);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1859,6 +1865,138 @@ mod tests {
         assert!(
             text.contains(&format!("asset://{id}/file")),
             "MCP said {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn byte_profiles_gate_every_mcp_delivery_path() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        let mut cat = lodestash_core::catalog::Catalog::open(&db).unwrap();
+        cat.seed_media_types().unwrap();
+        let src = cat
+            .upsert_import_source("fixture", dir.path().to_str().unwrap(), "folder")
+            .unwrap();
+        let source = b"source bytes";
+        for (name, media) in [("mesh.obj", "model_3d"), ("clip.wav", "audio")] {
+            std::fs::write(dir.path().join(name), source).unwrap();
+            cat.record_crawl(
+                src,
+                None,
+                &[lodestash_core::catalog::CrawlRecord {
+                    rel_path: name.into(),
+                    name: name.into(),
+                    media_type: media.into(),
+                    size_bytes: source.len() as i64,
+                    mtime: 1,
+                    workspace_rel: None,
+                    content_hash: None,
+                }],
+            )
+            .unwrap();
+        }
+        let ids = cat.recent_asset_ids(10).unwrap();
+        let rows = cat.asset_summaries(&ids).unwrap();
+        let model = rows.iter().find(|a| a.media_type == "model_3d").unwrap().id;
+        let audio = rows.iter().find(|a| a.media_type == "audio").unwrap().id;
+        drop(cat);
+        let png = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGOQNPL+DwAClAGWmKj4cQAAAABJRU5ErkJggg==").unwrap();
+        let preview = dir.path().join("preview.png");
+        std::fs::write(&preview, &png).unwrap();
+        let enabled = Arc::new(AtomicBool::new(true));
+        let revoke = Arc::new(AtomicBool::new(false));
+        let renders = Arc::new(AtomicUsize::new(0));
+        let state = {
+            let (enabled, revoke, renders) = (enabled.clone(), revoke.clone(), renders.clone());
+            Arc::new(
+                ServerState::new(
+                    &db,
+                    dir.path().into(),
+                    Box::new(move |_| {
+                        renders.fetch_add(1, Ordering::SeqCst);
+                        if revoke.load(Ordering::SeqCst) {
+                            enabled.store(false, Ordering::SeqCst);
+                        }
+                        Some(preview.clone())
+                    }),
+                )
+                .unwrap(),
+            )
+        };
+        let profile = Arc::new(std::sync::Mutex::new(
+            lodestash_api::AgentByteProfile::default(),
+        ));
+        state.set_byte_policy_reader(Box::new({
+            let (enabled, profile) = (enabled.clone(), profile.clone());
+            move || {
+                (
+                    enabled.load(Ordering::SeqCst),
+                    profile.lock().unwrap().clone(),
+                )
+            }
+        }));
+        let mcp = Lodestash::new(state.clone());
+        for (destination, visual, audio_consent, id, allowed) in [
+            ("unknown", true, true, model, false),
+            ("remote", true, true, audio, false),
+            ("remote", false, false, model, false),
+            ("remote", true, false, model, true),
+            ("local", false, true, audio, true),
+        ] {
+            *profile.lock().unwrap() = lodestash_api::AgentByteProfile {
+                host: "fixture".into(),
+                destination: destination.into(),
+                visual_bytes: visual,
+                audio_bytes: audio_consent,
+            };
+            let before = renders.load(Ordering::SeqCst);
+            // A caller-supplied locality assertion cannot grant permission.
+            let args = serde_json::from_value(serde_json::json!({"id":id, "local":true})).unwrap();
+            let preview = mcp.get_asset_preview(Parameters(args)).await.unwrap();
+            assert_eq!(
+                serde_json::to_string(&preview)
+                    .unwrap()
+                    .contains(&b64(&png)),
+                allowed
+            );
+            let evidence = mcp
+                .get_asset_evidence(Parameters(EvidenceArgs {
+                    id,
+                    kind: None,
+                    views: None,
+                    max_dimension: None,
+                }))
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_string(&evidence)
+                    .unwrap()
+                    .contains(&b64(&png)),
+                allowed
+            );
+            let resource = read_asset_file(&state, &format!("asset://{id}/file"));
+            if allowed {
+                assert!(serde_json::to_string(&resource.unwrap())
+                    .unwrap()
+                    .contains(&b64(source)));
+            } else {
+                assert!(serde_json::to_string(&resource.unwrap_err())
+                    .unwrap()
+                    .contains("bytes_not_released"));
+                assert_eq!(renders.load(Ordering::SeqCst), before);
+            }
+        }
+        revoke.store(true, Ordering::SeqCst);
+        let output = mcp
+            .get_asset_preview(Parameters(
+                serde_json::from_value(serde_json::json!({"id":audio})).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !serde_json::to_string(&output).unwrap().contains(&b64(&png)),
+            "consent revoked during rendering"
         );
     }
 
@@ -1903,6 +2041,7 @@ mod tests {
             .unwrap(),
         );
         state.set_byte_release(true);
+        state.set_byte_profile(serde_json::from_value(serde_json::json!({"host":"fixture", "destination":"local", "visual_bytes":true, "audio_bytes":true})).unwrap());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

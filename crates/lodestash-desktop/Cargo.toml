@@ -57,3 +57,5 @@ lodestash-ai = { workspace = true }
 # Real files under a real root, for the delete fence — the guard is about paths on disk, so a
 # test that fakes the filesystem would not be testing it.
 tempfile = { workspace = true }
+# Disposable app server for the spawned MCP workflow; already a runtime dependency of the API.
+axum = { workspace = true }

@@ -67,3 +67,16 @@ cargo run -p lodestash-desktop
 B2 scaffold. The app frame, tokens, fonts, icon sprite, the 11 nav destinations and 12 stub routes
 render, and one command (`app_info`) proves the IPC channel. There is **no catalog behind it yet** —
 the status bar says so, and `engine_ready` is `false` until `lodestash-app` exposes `Engine`.
+
+
+## Isolated MCP verification
+
+`cargo test -p lodestash-desktop --test mcp_stdio --test mcp_workflow` launches the real desktop
+binary with `--mcp` against disposable fixtures. The workflow uses a local stub identification
+writer and fixture-owned approvals, never the configured AI provider or real asset library.
+
+For isolated instances, set `LODESTASH_CATALOG`, `LODESTASH_CONFIG` and `LODESTASH_HANDSHAKE` to
+absolute file paths before launching. Unset variables keep the normal OS locations. Both app and
+headless child must use the same paths to communicate. These are launch-time configuration,
+not agent arguments or an authorization override; catalog identity and normal policy still apply.
+Tests set all three so they cannot read user consent or discover the user's running app.

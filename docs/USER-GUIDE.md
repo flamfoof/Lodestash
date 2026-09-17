@@ -49,8 +49,11 @@ Keep the app running for writes using the
 need Vite or the computer-use helper; the running development GUI does need its normal frontend.
 For an approved host-analysis run, enable `get_asset_evidence`, `write_tags`,
 `review_tags`, `propose_vocabulary_changes`, `get_job_status` and `cancel_job`, and configure the
-producer plus explicit evidence consent. The current agent byte switch is global; per-destination
-profiles are still tracked in the plan. Model views are geometry-only; material/texture metadata
+producer plus explicit evidence consent. In Settings → MCP, name the host/model destination,
+choose local or remote, then allow the needed modality and enable the agent byte switch. These
+permissions cover all clients using this app's MCP/REST access. Unknown destinations get metadata
+only; remote audio is always blocked. Changing the destination clears consent, and revocation
+applies without restarting the server. Model views are geometry-only; material/texture metadata
 does not mean those dependencies were rendered. A remote model cannot automatically fetch local
 URLs; its local host must supply authorized image content. Do not paste tokens into URLs or prompts.
 
@@ -72,11 +75,12 @@ model in the current Codex conversation. Use it only when that separate pipeline
 intended. For the requested Astra run, the host analyzes returned images/metadata and submits
 `write_tags` results; the server validates and persists them after app approval.
 
-**Current checkpoint:** Codex with OpenAI Astra is selected. Stop before live identification of
+**Current checkpoint:** Codex with OpenAI Astra is selected; the chosen library is recorded in the
+[implementation plan](superpowers/plans/2026-09-10-mcp-asset-analysis.md#read-only-host-preflight). Stop before live identification of
 the ten models; the read-only registration intentionally excludes identification and mutations.
 Reconnect Codex to load newly registered tools before claiming this conversation can call them.
 
-The first live run must choose a library, host/producer and allowed evidence destination. If fewer
+Before the live run, configure the producer and explicitly consent to the evidence destination. If fewer
 than ten eligible assets exist, report that count. No assets have been analyzed by writing this guide.
 
 ---
@@ -201,7 +205,8 @@ name. Either way you never import a whole pack.
   endpoint, **Allow image bytes to leave this machine** permits pictures to be sent to it. Without
   the second, a remote pass stops before it makes a request. A server running on your own machine
   needs neither. Audio is never uploaded; a remote model only ever sees text about it. Agents (MCP
-  or REST) read metadata and links by default — **Let agents read asset bytes** is what lets them
-  fetch previews and files.
+  or REST) read metadata and links by default. Fetching previews/files requires **Let agents read
+  asset bytes**, a named destination and modality consent in Settings → MCP. Audio files and
+  audio-derived previews can be released only to a configured local destination.
 - **Pick your models:** [`AI-MODELS-BY-GPU.md`](AI-MODELS-BY-GPU.md) tells you exactly what to install
   for your GPU.

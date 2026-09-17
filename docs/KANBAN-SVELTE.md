@@ -131,7 +131,7 @@ this file stays the live board.
 - [~] **R5 · S12c — evidence manifest and model views** (MCP handoff Task 3, second half).
       Shared bounded model views, requested resize, UTF-8 text, dependency metadata and authenticated
       view URLs are implemented; REST supports source byte ranges. Restricted selected-payload
-      decoding is documented in ADR-0021. *Open:* destination/modality profiles and the remaining
+      decoding is documented in ADR-0021. *Implemented (2026-09-16):* active destination/modality consent, Settings persistence and release-time revocation. *Open:* the remaining
       Task 3 acceptance matrix; textured dependencies/external glTF buffers are explicitly unavailable.
 - [x] **R5 · S12d — vocabulary-guided review** (MCP handoff Task 4a; reviewed 2026-09-15).
       Revisioned vocabulary reads, exact AI accept/reject, atomic approved trait/category proposals,
@@ -139,6 +139,12 @@ this file stays the live board.
       tests cover rollback, stale vocabulary, protected associations, scope, teaching, denial and
       replay. The disposable MCP workflow reads back ten synthetic models through a separate reader.
       Wider pilot/contract coverage remains tracked in the implementation plan, not claimed here.
+- [x] **R5 · MCP contract/workflow gate** (MCP handoff Task 5; 2026-09-16).
+      Real desktop stdio process → disposable REST app → serialized stub writer: ten model renders,
+      identification, vocabulary proposal, approved review/write, cross-plane replay, separate-reader
+      verification, undo and stale-review readback after reidentification. Valid read results and
+      invalid/disabled requests are compared for every new operation. Fixture config/handshake
+      overrides isolate the user instance. No real model inference or live approval is claimed.
 - [ ] **R5 · S13 — app-owned bulk runs** (MCP handoff Task 5).
 - [ ] **Proxies/packs · S14–S18 — pre-extraction identity, one cache policy, visual tiers, font
       specimens, batched inflate.**

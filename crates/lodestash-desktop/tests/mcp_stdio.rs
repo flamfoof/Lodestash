@@ -17,6 +17,8 @@ fn spawn(catalog: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_lodestash-desktop"))
         .arg("--mcp")
         .env("LODESTASH_CATALOG", catalog)
+        .env("LODESTASH_CONFIG", catalog.with_file_name("config.json"))
+        .env("LODESTASH_HANDSHAKE", catalog.with_file_name("engine.json"))
         // Every log line the process can emit: one of them on stdout is a malformed message.
         .env("RUST_LOG", "trace")
         .stdin(Stdio::piped())

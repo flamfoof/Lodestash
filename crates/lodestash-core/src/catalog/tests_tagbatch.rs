@@ -187,6 +187,130 @@ fn a_review_keeps_accepted_ai_tags_and_removes_only_the_named_ai_assignment() {
         .expect("review op")
         .payload_json
         .contains("No moss is visible"));
+
+    let reviewed_revision = c.annotation_revision(asset_id).unwrap();
+    c.apply_tag_batch(&batch(
+        vec![item(
+            asset_id,
+            "ai:vision",
+            Some("vision-2"),
+            ReplaceSource,
+            vec![ai("stone", 0.9), ai("moss", 0.6)],
+        )],
+        false,
+        None,
+    ))
+    .unwrap();
+    assert!(
+        rows(&c, asset_id).iter().any(|r| r.1 == "moss"),
+        "rejection is not suppression"
+    );
+    let stale = TagReviewBatch {
+        reviewer: "codex@test".into(),
+        decisions: vec![TagReviewDecision {
+            asset_id,
+            expected_revision: reviewed_revision,
+            namespace: "subject".into(),
+            value: "moss".into(),
+            source: "ai:vision".into(),
+            action: TagReviewAction::Reject,
+            reason: "Outdated review".into(),
+        }],
+        receipt: None,
+    };
+    assert!(
+        c.apply_tag_review(&stale).is_err(),
+        "reidentification invalidates a pending review"
+    );
+}
+
+#[test]
+fn vocabulary_aliases_do_not_merge_traits_or_change_pinned_categories() {
+    let (c, ids) = catalog_with(&[("tower.obj", "model_3d")]);
+    let game = c.create_taxonomy("Game", true).unwrap();
+    let other = c.create_taxonomy("Other", false).unwrap();
+    let root = c
+        .add_category(game, None, "Buildings", "Buildings")
+        .unwrap();
+    let towers = c
+        .add_category(game, Some(root), "Towers", "Buildings/Towers")
+        .unwrap();
+    c.add_category_alias(towers, "spire").unwrap();
+    c.assign_category_manual(ids[0], towers, game).unwrap();
+    let pinned = c.categories_of(ids[0], game).unwrap();
+    let policy = "extend_with_approval";
+    let before = c.vocabulary_revision(policy).unwrap();
+    assert!(
+        c.validate_vocabulary_assignments(
+            &before,
+            policy,
+            [(ids[0], "subject", "spire")].into_iter()
+        )
+        .is_err(),
+        "category aliases are not canonical traits"
+    );
+    let proposal = VocabularyProposal {
+        request_id: "taxonomy-fixture".into(),
+        expected_revision: before,
+        changes: vec![
+            VocabularyChange::Category {
+                taxonomy_id: game,
+                parent_id: Some(root),
+                label: "  TOWERS  ".into(),
+                reason: "Reuse canonical category".into(),
+            },
+            VocabularyChange::Trait {
+                namespace: "subject".into(),
+                value: "spire".into(),
+                scope: Some("model_3d".into()),
+                usage_note: None,
+                teach: false,
+            },
+            VocabularyChange::Trait {
+                namespace: "subject".into(),
+                value: "tower".into(),
+                scope: Some("model_3d".into()),
+                usage_note: None,
+                teach: false,
+            },
+        ],
+    };
+    let result = c
+        .apply_vocabulary_proposal(&proposal, policy, "fixture-digest")
+        .unwrap();
+    assert_eq!(result["changes"][0]["id"], towers);
+    assert_eq!(result["changes"][0]["reused"], true);
+    assert_eq!(
+        c.list_vocabulary().unwrap().len(),
+        2,
+        "synonyms must not be silently merged"
+    );
+    assert_eq!(c.categories_of(ids[0], game).unwrap(), pinned);
+    assert!(c.list_categories(other).unwrap().is_empty());
+    assert!(c.list_rules(game).unwrap().is_empty());
+    assert_eq!(c.list_category_aliases(towers).unwrap()[0].alias, "spire");
+    let revision = c.vocabulary_revision(policy).unwrap();
+    c.validate_vocabulary_assignments(
+        &revision,
+        policy,
+        [(ids[0], "subject", "spire")].into_iter(),
+    )
+    .unwrap();
+    let bad = VocabularyProposal {
+        request_id: "wrong-parent-taxonomy".into(),
+        expected_revision: revision.clone(),
+        changes: vec![VocabularyChange::Category {
+            taxonomy_id: other,
+            parent_id: Some(root),
+            label: "New".into(),
+            reason: "Invalid cross-taxonomy parent".into(),
+        }],
+    };
+    assert!(c
+        .apply_vocabulary_proposal(&bad, policy, "bad-digest")
+        .is_err());
+    assert_eq!(c.vocabulary_revision(policy).unwrap(), revision);
+    assert!(c.tag_request_receipt(&bad.request_id).unwrap().is_none());
 }
 
 /// A person's tag and two models' results live side by side, and re-running one model replaces

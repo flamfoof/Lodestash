@@ -32,6 +32,10 @@ flagged.
 | `lodestash-cli` *(planned)* | headless ops (scan/index/tag) | `clap`, `lodestash-core`. **Not a crate yet** — an empty skeleton was carrying seven unused dependencies, so it was removed until a real command exists. |
 | **shared** | — | `serde`, `serde_json`, `thiserror`, `anyhow`, `tracing`+`tracing-subscriber`, `tokio`, `rayon`, `uuid`, `blake3` |
 
+Desktop integration tests directly reuse the already-installed `axum` as a dev-dependency to run a
+disposable loopback app for the spawned MCP workflow. No new runtime package is introduced.
+
+
 ---
 
 ## 2. Subsystem choices

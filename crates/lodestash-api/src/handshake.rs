@@ -41,6 +41,9 @@ impl Handshake {
 /// `%LOCALAPPDATA%\Lodestash\engine.json` / `~/Library/Application Support/Lodestash/engine.json`
 /// / `~/.local/share/lodestash/engine.json` — `dirs` already resolves all three roots.
 pub fn handshake_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("LODESTASH_HANDSHAKE") {
+        return Some(PathBuf::from(path));
+    }
     let dir = if cfg!(target_os = "macos") {
         dirs::data_dir()?
     } else {

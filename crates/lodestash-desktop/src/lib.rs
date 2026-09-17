@@ -2260,7 +2260,11 @@ fn build_engine_state() -> Result<
     state.set_agent_producer(cfg.agent_producer_id);
     // Whether an agent may receive bytes at all (v1 plan S10) — metadata and links are always
     // available, the files are not until the user says so.
-    state.set_byte_release(cfg.mcp_bytes_enabled);
+    // ponytail: read the small config at each gate; use a watched snapshot if this becomes hot.
+    state.set_byte_policy_reader(Box::new(|| {
+        let cfg = lodestash_app::config::AppConfig::load_display_only();
+        (cfg.mcp_bytes_enabled, cfg.mcp_byte_profile)
+    }));
     if let Err(error) = state.set_vocabulary_policy(cfg.mcp_vocabulary_policy) {
         tracing::warn!(%error, "invalid MCP vocabulary policy; using extend_with_approval");
     }

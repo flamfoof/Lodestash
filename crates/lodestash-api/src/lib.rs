@@ -5,7 +5,9 @@
 //! `assets/{id}`, `preview`, `file`. Mutating routes need the job engine (§4 "Async") and land
 //! with it.
 
+mod byte_policy;
 pub mod discovery;
+pub use byte_policy::{AgentByteProfile, BytePolicyFn};
 pub mod export;
 pub mod handshake;
 pub use discovery::{
@@ -644,6 +646,8 @@ pub struct ServerState {
     /// (v1 plan S10)? Off until the GUI says otherwise: a local transport says nothing about where
     /// the model behind it runs, and reading metadata never implied permission to upload files.
     byte_release: AtomicBool,
+    byte_profile: Mutex<AgentByteProfile>,
+    byte_policy_reader: Mutex<Option<Arc<BytePolicyFn>>>,
     /// The vocabulary policy selected by the app. The agent only reads it; it never overrides it.
     vocabulary_policy: Mutex<String>,
     /// Approved-or-not export requests, keyed by job id. Held apart from the job itself so the
@@ -704,6 +708,8 @@ impl ServerState {
             token: new_token(),
             allowed: Mutex::new(None),
             byte_release: AtomicBool::new(false),
+            byte_profile: Mutex::new(AgentByteProfile::default()),
+            byte_policy_reader: Mutex::new(None),
             vocabulary_policy: Mutex::new("extend_with_approval".into()),
             pending_exports: Mutex::new(std::collections::HashMap::new()),
             pending_imports: Mutex::new(std::collections::HashMap::new()),
@@ -741,7 +747,7 @@ impl ServerState {
 
     /// May bytes be served to an agent right now?
     pub fn byte_release(&self) -> bool {
-        self.byte_release.load(std::sync::atomic::Ordering::Relaxed)
+        self.may_release_media(None)
     }
 
     /// The app-configured vocabulary policy (§8.5). Unknown values are rejected by the setter so
@@ -1477,7 +1483,12 @@ impl ServerState {
                     .iter()
                     .filter(|d| d["asset_id"].as_i64() == Some(id))
                 {
-                    reviews.push(serde_json::json!({"operation_id":operation.id,"reviewer":payload["reviewer"],"decision":decision,"matches_current_revision":decision["expected_revision"] == body["annotation_revision"]}));
+                    let matches = payload["reviewed_revisions"][id.to_string()]
+                        .as_str()
+                        .is_some_and(|revision| {
+                            Some(revision) == body["annotation_revision"].as_str()
+                        });
+                    reviews.push(serde_json::json!({"operation_id":operation.id,"reviewer":payload["reviewer"],"decision":decision,"matches_current_revision":matches}));
                 }
             }
         }
@@ -2382,6 +2393,7 @@ mod tests {
         );
 
         st.set_byte_release(true);
+        st.set_byte_profile(serde_json::from_value(serde_json::json!({"host":"fixture", "destination":"local", "visual_bytes":true, "audio_bytes":true})).unwrap());
         let (status, body) = fetch(st.clone()).await;
         assert_eq!(
             (status, body.as_ref()),

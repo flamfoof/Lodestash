@@ -182,7 +182,8 @@ mean unauthenticated/public access or giving every tool unrestricted permissions
 loopback and origin checks. Client allow-lists narrow visibility; server checks remain authoritative.
 
 Before sending bytes to an external model, configure the host/producer destination and per-modality
-consent. A local stdio client may use a cloud LLM. An unknown destination receives metadata but no
+consent through Settings → MCP (ENGINE-API §8.2, ADR-0022). One active profile governs the shared
+MCP/REST surface; it is not separate authorization for simultaneous hosts. A local stdio client may use a cloud LLM. An unknown destination receives metadata but no
 asset bytes until configured; do not allow a request field to assert `local=true` or human authority.
 Remote audio bytes remain excluded under the v1 plan. Enforce policy for resource/file paths as well
 as image tools, including cross-modality dependencies. No credentials in URLs, reports or identifiers.
@@ -209,5 +210,5 @@ remains null), external evidence consent and vocabulary policy. These choices do
 choices and implementation checks are complete, do not claim that ten assets were analyzed or tagged.
 
 No new protocol, generic plugin framework, public tunnel, always-running daemon, provider SDK or
-whole-library autonomous pipeline is part of this delivery. There is no new accepted ADR here:
-existing invariants hold; the v1 plan's proposed provenance/egress ADRs must land with implementation.
+whole-library autonomous pipeline is part of this delivery. Implementation decisions are recorded
+in ADR-0021 (bounded evidence) and ADR-0022 (agent consent); existing invariants still hold.

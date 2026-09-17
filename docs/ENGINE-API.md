@@ -590,8 +590,31 @@ The primary payload uses the verified archive cache; model views are rendered on
 publishing a separate render cache. Each heavy extraction/render stage has the existing two-worker,
 30-second bound; a call requiring both can take two stage deadlines. Cached raster decoding is
 capped, and text extraction reports truncation after the text limit. Agent byte consent still uses
-ADR-0020's explicit `mcp_bytes_enabled` switch; destination/modality profiles described above remain
-a prerequisite for unattended remote-host use, not an implemented per-host permission store.
+the explicit `mcp_bytes_enabled` switch **and** the app-owned `mcp_byte_profile`:
+
+- `host`: nonblank user-visible destination label, such as the selected host/model; never a credential.
+- `destination`: `local` or `remote`; empty, `unknown` and unrecognized values deny all bytes.
+- `visual_bytes`: consent for model/image/texture/sprite/material/font source files, extracted text
+  and derived previews. These visual dependencies share the same modality permission.
+- `audio_bytes`: consent for audio sources and derived images, honored only for `local`.
+
+Defaults deny all bytes, including old configs with only the global switch enabled. Unknown media
+codes also deny bytes. The desktop and headless child read current configuration before resolving
+or rendering and again before delivering bytes; revocation needs no process restart. Metadata and
+links remain available. `bytes_released` in server info means at least one modality is allowed,
+not that every asset can be fetched. Settings persists these fields and clears modality consent
+when the destination label or locality changes. No request argument can override this policy.
+
+There is one active profile shared by the current producer/stdio child and authenticated REST
+clients. This is configured trust in the host's declared destination, not proof of the host's network
+behavior. Separate simultaneous host permissions require separate client identities/tokens; the
+shared token does not distinguish them. See [ADR-0022](decisions/ADR-0022-agent-destination-consent.md).
+
+For isolated development instances, the app/headless process accepts explicit file paths through
+`LODESTASH_CONFIG` and `LODESTASH_HANDSHAKE`, alongside `LODESTASH_CATALOG`. Without overrides,
+normal OS paths apply. These trusted launch settings do not weaken catalog matching, bearer
+checks or consent. The spawned workflow test uses them solely for disposable configuration and
+handshake files; it never publishes over the user's handshake.
 
 ### 8.3 Attributed result writes
 
@@ -737,7 +760,7 @@ report entry, not a reject call. The approval diff names each producer and assig
 Review is a meaningful history event even if acceptance keeps the tag row unchanged. Persist its
 decisions in the shared versioned operation history; normal retention applies, so permanent review
 history is not promised. Retry receipts follow §8.3 independently of undo retention. Readback exposes
-retained review decisions with their reviewed revision; stale decisions are not claims about current
+retained review decisions with their **post-review** annotation revision; stale decisions are not claims about current
 assignments. Rejection is not a global blacklist or a durable per-model suppression rule. A later
 identify run may propose the tag again and must be reviewed as new output. Undo restores only the
 touched association/review event when conflict checks permit it.
@@ -766,7 +789,7 @@ then read new assignments/revisions and perform this review flow. Internal ident
 not rolled back when a later review batch fails; report the completed and failed stages separately.
 **Bytes are their own permission** (v1 plan S10, [ADR-0020](decisions/ADR-0020-egress-is-a-parsed-endpoint-and-a-per-modality-consent.md)). `GET /v1/assets/{id}/preview`
 and `GET /v1/assets/{id}/file` — and MCP's `get_asset_preview` — serve bytes only when the user has
-switched on `mcp_bytes_enabled`; otherwise they answer `403 bytes_not_released` (the MCP tool returns
+switched on `mcp_bytes_enabled` and configured the destination/modality profile in §8.2; otherwise they answer `403 bytes_not_released` (the MCP tool returns
 its metadata and links with the image withheld). Metadata access never implied permission to upload
 files, and a local stdio transport says where the client program runs, not where its model does.
 

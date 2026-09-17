@@ -910,8 +910,8 @@ async fn preview(
     Path(id): Path<i64>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    if let Some(denied) = bytes_denied(&state) {
-        return denied;
+    if let Err(error) = state.require_asset_bytes(id) {
+        return agent_err(error);
     }
     if !params.is_empty() {
         let parse = |name: &str, default: usize| -> Result<usize, crate::AgentError> {
@@ -942,9 +942,13 @@ async fn preview(
             Err(error) => agent_err(error),
         };
     }
-    match state.preview_path(id) {
+    let response = match state.preview_path(id) {
         Some(path) => serve_file(&path, "image/png").await,
         None => not_found(),
+    };
+    match state.require_asset_bytes(id) {
+        Ok(()) => response,
+        Err(error) => agent_err(error),
     }
 }
 
@@ -952,7 +956,13 @@ async fn preview(
 /// is served from a verified pull of just its payload rather than refused.
 async fn file(State(state): State<Shared>, Path(id): Path<i64>, headers: HeaderMap) -> Response {
     match state.resolve_file(id) {
-        Ok(path) => serve_asset_file(&path, &headers).await,
+        Ok(path) => {
+            let response = serve_asset_file(&path, &headers).await;
+            match state.require_asset_bytes(id) {
+                Ok(()) => response,
+                Err(error) => agent_err(error),
+            }
+        }
         Err(e) => agent_err(e),
     }
 }
@@ -1112,23 +1122,6 @@ async fn serve_file(path: &std::path::Path, content_type: &str) -> Response {
     }
 }
 
-/// The one refusal for every byte-serving route (v1 plan S10): metadata and links stay available,
-/// the bytes do not, and the answer says which switch would change that.
-fn bytes_denied(state: &Shared) -> Option<Response> {
-    if state.byte_release() {
-        return None;
-    }
-    Some(
-        (
-            StatusCode::FORBIDDEN,
-            Json(json!({"error": {"code": "bytes_not_released",
-                "message": "this agent may read metadata and links; serving asset bytes needs \
-                            `mcp_bytes_enabled` in Settings"}})),
-        )
-            .into_response(),
-    )
-}
-
 fn not_found() -> Response {
     err(
         StatusCode::NOT_FOUND,
@@ -1172,6 +1165,183 @@ mod tests {
         }
         let s = ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap();
         (dir, Arc::new(s))
+    }
+
+    #[tokio::test]
+    async fn legacy_byte_switch_does_not_authorize_an_unknown_destination() {
+        let (dir, state) = state();
+        let id = seed_embedded(&dir.path().join("catalog.db"))[0];
+        state.set_byte_release(true);
+        for suffix in ["preview", "preview?kind=thumbnail", "file"] {
+            let (status, body) = send(
+                router(state.clone()),
+                get_req(
+                    &format!("/v1/assets/{id}/{suffix}"),
+                    Some(state.token()),
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{suffix}: {body}");
+            assert_eq!(body["error"]["code"], "bytes_not_released");
+        }
+        assert_eq!(
+            state
+                .get_asset_evidence(id, &crate::EvidenceRequest::default())
+                .unwrap()["status"],
+            "denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn destination_policy_covers_files_previews_evidence_and_revocation() {
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Mutex,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        let mut cat = lodestash_core::catalog::Catalog::open(&db).unwrap();
+        cat.seed_media_types().unwrap();
+        let source = cat
+            .upsert_import_source("fixture", dir.path().to_str().unwrap(), "folder")
+            .unwrap();
+        for (name, media) in [("mesh.obj", "model_3d"), ("clip.wav", "audio")] {
+            std::fs::write(dir.path().join(name), b"original source").unwrap();
+            cat.record_crawl(
+                source,
+                None,
+                &[lodestash_core::catalog::CrawlRecord {
+                    rel_path: name.into(),
+                    name: name.into(),
+                    media_type: media.into(),
+                    size_bytes: 15,
+                    mtime: 1,
+                    workspace_rel: None,
+                    content_hash: None,
+                }],
+            )
+            .unwrap();
+        }
+        let ids = cat.recent_asset_ids(10).unwrap();
+        let rows = cat.asset_summaries(&ids).unwrap();
+        let model = rows.iter().find(|a| a.media_type == "model_3d").unwrap().id;
+        let audio = rows.iter().find(|a| a.media_type == "audio").unwrap().id;
+        drop(cat);
+        let png = dir.path().join("preview.png");
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]))
+            .save(&png)
+            .unwrap();
+        let enabled = Arc::new(AtomicBool::new(true));
+        let revoke_on_preview = Arc::new(AtomicBool::new(false));
+        let renders = Arc::new(AtomicUsize::new(0));
+        let state = {
+            let (enabled, revoke, renders) =
+                (enabled.clone(), revoke_on_preview.clone(), renders.clone());
+            Arc::new(
+                ServerState::new(
+                    &db,
+                    dir.path().into(),
+                    Box::new(move |_| {
+                        renders.fetch_add(1, Ordering::SeqCst);
+                        if revoke.load(Ordering::SeqCst) {
+                            enabled.store(false, Ordering::SeqCst);
+                        }
+                        Some(png.clone())
+                    }),
+                )
+                .unwrap(),
+            )
+        };
+        let profile = Arc::new(Mutex::new(crate::AgentByteProfile {
+            host: "Codex fixture".into(),
+            destination: "remote".into(),
+            visual_bytes: true,
+            audio_bytes: true,
+        }));
+        state.set_byte_policy_reader(Box::new({
+            let (enabled, profile) = (enabled.clone(), profile.clone());
+            move || {
+                (
+                    enabled.load(Ordering::SeqCst),
+                    profile.lock().unwrap().clone(),
+                )
+            }
+        }));
+        for suffix in ["file", "preview", "preview?kind=thumbnail"] {
+            let (status, body) = send(
+                router(state.clone()),
+                get_req(
+                    &format!("/v1/assets/{audio}/{suffix}"),
+                    Some(state.token()),
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{suffix}: {body}");
+            assert_eq!(body["error"]["code"], "bytes_not_released");
+            let (status, _) = send(
+                router(state.clone()),
+                get_req(
+                    &format!("/v1/assets/{model}/{suffix}"),
+                    Some(state.token()),
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{suffix}");
+        }
+        let before = renders.load(Ordering::SeqCst);
+        assert_eq!(
+            state
+                .get_asset_evidence(audio, &crate::EvidenceRequest::default())
+                .unwrap()["status"],
+            "denied"
+        );
+        assert_eq!(
+            state.summary(&state.asset(audio).unwrap().unwrap())["file_availability"],
+            "denied"
+        );
+        assert_eq!(
+            renders.load(Ordering::SeqCst),
+            before,
+            "denied audio was rendered"
+        );
+        profile.lock().unwrap().destination = "local".into();
+        assert_eq!(
+            state
+                .get_asset_evidence(audio, &crate::EvidenceRequest::default())
+                .unwrap()["status"],
+            "ready"
+        );
+        profile.lock().unwrap().destination = "unknown".into();
+        assert_eq!(
+            state.resolve_file(model).unwrap_err().code,
+            "bytes_not_released"
+        );
+        profile.lock().unwrap().destination = "remote".into();
+        revoke_on_preview.store(true, Ordering::SeqCst);
+        for suffix in ["preview", "preview?kind=thumbnail"] {
+            enabled.store(true, Ordering::SeqCst);
+            let (status, body) = send(
+                router(state.clone()),
+                get_req(
+                    &format!("/v1/assets/{model}/{suffix}"),
+                    Some(state.token()),
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "revoked during {suffix}: {body}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("mesh.obj")).unwrap(),
+            b"original source"
+        );
     }
 
     async fn send(app: Router, req: HttpRequest<Body>) -> (StatusCode, Value) {
@@ -1881,6 +2051,7 @@ mod tests {
         assert_eq!(b["error"]["code"], "bytes_not_released");
 
         st.set_byte_release(true);
+        st.set_byte_profile(serde_json::from_value(serde_json::json!({"host":"fixture", "destination":"local", "visual_bytes":true, "audio_bytes":true})).unwrap());
         let (s, _) = send(
             router(st),
             get_req("/v1/assets/999/file", Some(&token), None),
@@ -1914,6 +2085,7 @@ mod tests {
             .unwrap(),
         );
         st.set_byte_release(true);
+        st.set_byte_profile(serde_json::from_value(serde_json::json!({"host":"fixture", "destination":"local", "visual_bytes":true, "audio_bytes":true})).unwrap());
         let token = st.token.clone();
 
         let started = std::time::Instant::now();

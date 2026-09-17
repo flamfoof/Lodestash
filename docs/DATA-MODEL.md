@@ -18,7 +18,11 @@ ENGINE-API §8 defines the wire fields. Human-only confirmation and embedding li
 below remain intact. No catalog migration is performed by this design update.
 
 The clarified review flow (ENGINE-API §8.5) also records agent accept/reject decisions in the shared
-versioned operation history, retaining original assignment provenance and reviewed revisions.
+versioned operation history, retaining original assignment provenance and reviewed revisions. The optional
+`reviewed_revisions` map in the v2 tag-batch history payload records each asset's committed result
+revision. Readback compares against that result, not the pre-rejection input. Older records without
+the map remain visible but cannot claim to match current state. Undo/redo remains compatible with
+both payload shapes; no schema migration is needed.
 Reuse trait columns on `tag` and existing taxonomy/category tables for approved vocabulary changes;
 do not conflate categories with namespaces or build another vocabulary database. History retention
 still applies; an association rejection is not a persistent negative-training/suppression rule.

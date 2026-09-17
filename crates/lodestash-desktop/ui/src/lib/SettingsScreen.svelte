@@ -66,6 +66,7 @@
     api_tagging_enabled: false,
     remote_image_bytes: false,
     mcp_bytes_enabled: false,
+    mcp_byte_profile: { host: "", destination: "unknown", visual_bytes: false, audio_bytes: false },
     api_base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
     api_model: null,
     api_key: "",
@@ -974,10 +975,43 @@
           Let agents read asset bytes, not just metadata and links
         </label>
         <p class="hint">
-          Off, previews and files are refused on both planes and everything else still answers. A
-          local connection says where the client program runs, not where its model does (v1 plan
-          S10).
+          Choose the host and where its model runs before allowing bytes. This profile applies to
+          every client using this app's MCP or REST access. Metadata remains available without it.
         </p>
+        <label>
+          Host / model destination
+          <input type="text" bind:value={s.mcp_byte_profile.host}
+            placeholder="e.g. Codex / OpenAI Astra"
+            onchange={() => {
+              s.mcp_byte_profile.visual_bytes = false;
+              s.mcp_byte_profile.audio_bytes = false;
+              save();
+            }} />
+        </label>
+        <label>
+          Where the model runs
+          <select bind:value={s.mcp_byte_profile.destination} onchange={() => {
+            s.mcp_byte_profile.visual_bytes = false;
+            s.mcp_byte_profile.audio_bytes = false;
+            save();
+          }}>
+            <option value="unknown">Unknown — metadata only</option>
+            <option value="local">On this machine only</option>
+            <option value="remote">Remote / cloud</option>
+          </select>
+        </label>
+        <label class="check">
+          <input type="checkbox" bind:checked={s.mcp_byte_profile.visual_bytes} onchange={save}
+            disabled={!s.mcp_byte_profile.host.trim() || !["local", "remote"].includes(s.mcp_byte_profile.destination)} />
+          Allow visual asset files and previews (3D, images, textures, sprites, materials, fonts)
+        </label>
+        <label class="check">
+          <input type="checkbox" bind:checked={s.mcp_byte_profile.audio_bytes} onchange={save}
+            disabled={!s.mcp_byte_profile.host.trim() || s.mcp_byte_profile.destination !== "local"} />
+          Allow audio files and audio previews to a local model
+        </label>
+        <p class="hint">Remote audio, including waveforms and spectrograms, is always blocked.
+          Changing the destination clears its consent. Your host controls where authorized bytes go.</p>
         <ul class="tools">
           {#each MCP_GROUPS as g (g.id)}
             {@const on = g.tools.every((t) => !s.mcp_disabled_tools.includes(t))}

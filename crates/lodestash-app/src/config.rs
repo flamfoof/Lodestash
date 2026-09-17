@@ -535,6 +535,9 @@ pub struct AppConfig {
     /// the model behind it runs.
     #[serde(default)]
     pub mcp_bytes_enabled: bool,
+    /// App-owned host destination and modality consent, never supplied by an agent request.
+    #[serde(default)]
+    pub mcp_byte_profile: lodestash_api::AgentByteProfile,
     /// Which canonical vocabulary terms agent writes may use (ENGINE-API §8.5).
     #[serde(default = "default_mcp_vocabulary_policy")]
     pub mcp_vocabulary_policy: String,
@@ -648,6 +651,7 @@ impl Default for AppConfig {
             api_key: String::new(),
             remote_image_bytes: false,
             mcp_bytes_enabled: false,
+            mcp_byte_profile: lodestash_api::AgentByteProfile::default(),
             mcp_vocabulary_policy: default_mcp_vocabulary_policy(),
             api_max_per_run: default_api_max_per_run(),
             mcp_disabled_tools: Vec::new(),
@@ -897,6 +901,9 @@ pub fn stem_name(path: &Path) -> String {
 }
 
 fn config_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("LODESTASH_CONFIG") {
+        return Some(PathBuf::from(path));
+    }
     Some(dirs::config_dir()?.join("Lodestash").join("config.json"))
 }
 

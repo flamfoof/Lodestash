@@ -399,6 +399,12 @@ pub struct Settings {
     pub confirm_before_trash: bool,
     /// The MCP allow-list, stored as the disabled half (UI-SPEC §11.5, MCP↔REST 1:1).
     pub mcp_disabled_tools: Vec<String>,
+    #[serde(default)]
+    pub remote_image_bytes: bool,
+    #[serde(default)]
+    pub mcp_bytes_enabled: bool,
+    #[serde(default)]
+    pub mcp_byte_profile: lodestash_api::AgentByteProfile,
     /// Ollama text model for local tagging (AI-PIPELINE §2). `None` = no local LLM.
     #[serde(default)]
     pub tagger_model: Option<String>,
@@ -447,6 +453,9 @@ impl Settings {
             auto_purge_preview_cache: c.auto_purge_preview_cache,
             confirm_before_trash: c.confirm_before_trash,
             mcp_disabled_tools: c.mcp_disabled_tools.clone(),
+            remote_image_bytes: c.remote_image_bytes,
+            mcp_bytes_enabled: c.mcp_bytes_enabled,
+            mcp_byte_profile: c.mcp_byte_profile.clone(),
             tagger_model: c.tagger_model.clone(),
             tagger_vision_model: c.tagger_vision_model.clone(),
             api_tagging_enabled: c.api_tagging_enabled,
@@ -479,6 +488,9 @@ impl Settings {
         c.auto_purge_preview_cache = self.auto_purge_preview_cache;
         c.confirm_before_trash = self.confirm_before_trash;
         c.mcp_disabled_tools = self.mcp_disabled_tools;
+        c.remote_image_bytes = self.remote_image_bytes;
+        c.mcp_bytes_enabled = self.mcp_bytes_enabled;
+        c.mcp_byte_profile = self.mcp_byte_profile;
         c.tagger_model = self.tagger_model;
         c.tagger_vision_model = self.tagger_vision_model;
         c.api_tagging_enabled = self.api_tagging_enabled;
@@ -2534,6 +2546,24 @@ fn distinct_trait_names(tags: Vec<lodestash_core::catalog::TagAssignment>) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_persist_egress_consent() {
+        let mut config = lodestash_app::config::AppConfig::default();
+        let mut value = serde_json::to_value(Settings::from_config(&config)).unwrap();
+        value["remote_image_bytes"] = serde_json::json!(true);
+        value["mcp_bytes_enabled"] = serde_json::json!(true);
+        let profile = serde_json::json!({"host":"Codex test", "destination":"remote", "visual_bytes":true, "audio_bytes":false});
+        value["mcp_byte_profile"] = profile.clone();
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        settings.apply(&mut config);
+        assert!(config.remote_image_bytes);
+        assert!(config.mcp_bytes_enabled);
+        assert_eq!(
+            serde_json::to_value(Settings::from_config(&config)).unwrap()["mcp_byte_profile"],
+            profile
+        );
+    }
 
     fn lib(names: &[(&str, &str)]) -> Library {
         let rows = names

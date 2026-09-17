@@ -298,6 +298,12 @@ export type Settings = {
   remote_image_bytes: boolean;
   /** May an agent plane receive asset bytes, rather than metadata and links only? */
   mcp_bytes_enabled: boolean;
+  mcp_byte_profile: {
+    host: string;
+    destination: string;
+    visual_bytes: boolean;
+    audio_bytes: boolean;
+  };
 };
 
 export const getSettings = () => invoke<Settings>("get_settings");

@@ -64,8 +64,8 @@ impl AgentError {
         Self::with(
             403,
             "bytes_not_released",
-            "this agent may read metadata and links; serving asset bytes needs `mcp_bytes_enabled` \
-             in Settings",
+            "asset bytes require the agent byte switch and a configured destination with consent \
+             for this modality in Settings; remote audio is never released",
         )
     }
 
@@ -315,7 +315,7 @@ impl ServerState {
     /// not released the file is `denied` wherever it is, which is the answer that decides what the
     /// agent can do next.
     fn file_availability(&self, r: &AssetSummaryRow) -> &'static str {
-        if !self.byte_release() {
+        if !self.may_release_media(Some(&r.media_type)) {
             return "denied";
         }
         if r.package_id.is_some() && r.workspace_rel.is_none() {
@@ -453,9 +453,7 @@ impl ServerState {
     /// pulled — verified, capped, into a scratch file — by the resolver the app installs, without
     /// unpacking the package or changing the catalog. Anything else is `not_local`.
     pub fn resolve_file(&self, id: i64) -> Result<std::path::PathBuf, AgentError> {
-        if !self.byte_release() {
-            return Err(AgentError::bytes_not_released());
-        }
+        self.require_asset_bytes(id)?;
         let row = self
             .asset(id)?
             .ok_or_else(|| AgentError::asset_not_found(id))?;
@@ -874,6 +872,7 @@ mod tests {
             })
             .unwrap())[0];
         state.set_byte_release(true);
+        state.set_byte_profile(serde_json::from_value(serde_json::json!({"host":"fixture", "destination":"local", "visual_bytes":true, "audio_bytes":true})).unwrap());
 
         let evidence = state
             .get_asset_evidence(asset_id, &EvidenceRequest::default())
@@ -913,6 +912,7 @@ mod tests {
             })
             .unwrap())[0];
         state.set_byte_release(true);
+        state.set_byte_profile(serde_json::from_value(serde_json::json!({"host":"fixture", "destination":"local", "visual_bytes":true, "audio_bytes":true})).unwrap());
 
         let evidence = state
             .get_asset_evidence(asset_id, &EvidenceRequest::default())

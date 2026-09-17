@@ -354,6 +354,9 @@ struct BatchPayload {
     reviewer: Option<String>,
     #[serde(default)]
     reviews: Vec<TagReviewDecision>,
+    /// Review validity describes the committed result, not the pre-rejection input.
+    #[serde(default)]
+    reviewed_revisions: std::collections::BTreeMap<i64, String>,
 }
 
 const PAYLOAD_VERSION: u32 = 2;
@@ -758,6 +761,7 @@ impl Catalog {
                 changes,
                 reviewer: None,
                 reviews: Vec::new(),
+                reviewed_revisions: Default::default(),
             })?;
             outcome.op_id = Some(record_op_in(
                 &tx,
@@ -965,6 +969,10 @@ impl Catalog {
             changes,
             reviewer: Some(batch.reviewer.clone()),
             reviews: batch.decisions.clone(),
+            reviewed_revisions: asset_ids
+                .iter()
+                .map(|id| annotation_revision_in(&tx, *id).map(|revision| (*id, revision)))
+                .collect::<Result<_>>()?,
         })?;
         outcome.op_id = Some(record_op_in(
             &tx,

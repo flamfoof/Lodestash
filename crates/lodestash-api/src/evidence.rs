@@ -45,8 +45,8 @@ impl ServerState {
         }
         let revision = self.catalog.lock().unwrap().analysis_revision(id)?;
         let mut manifest = json!({"asset_id":id,"analysis_revision":revision,"status":"denied","representations":[],"file_url":format!("/v1/assets/{id}/file"),"file_resource_uri":format!("asset://{id}/file"),"dependencies_used":[],"limitations":[],"metadata":{"media_type":row.media_type,"size_bytes":row.size_bytes,"triangles":row.metrics.tri_count}});
-        if !self.byte_release() {
-            manifest["limitations"] = json!([{"code":"bytes_not_released","message":"preview and file bytes require byte release in Settings"}]);
+        if !self.may_release_media(Some(&row.media_type)) {
+            manifest["limitations"] = json!([{"code":"bytes_not_released","message":AgentError::bytes_not_released().message}]);
             return Ok(EvidenceBundle {
                 manifest,
                 images: vec![],
@@ -172,9 +172,7 @@ impl ServerState {
         manifest["representations"] = json!(representations);
         manifest["dependencies_used"] = json!(used);
         manifest["limitations"] = json!(limitations);
-        if !self.byte_release() {
-            return Err(AgentError::bytes_not_released());
-        }
+        self.require_asset_bytes(id)?;
         Ok(EvidenceBundle { manifest, images })
     }
 }
@@ -278,6 +276,7 @@ mod tests {
             "denied"
         );
         state.set_byte_release(true);
+        state.set_byte_profile(serde_json::from_value(serde_json::json!({"host":"fixture", "destination":"local", "visual_bytes":true, "audio_bytes":true})).unwrap());
         let bundle = state.asset_evidence_bundle(id, &request).unwrap();
         assert_eq!(bundle.images.len(), 4);
         for (index, representation) in bundle.manifest["representations"]

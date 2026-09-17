@@ -122,7 +122,7 @@ Update the existing MCP Settings/approval components identified from UI-SPEC, wi
 and existing rendered previews. **Produces:** `get_asset_evidence`, its REST counterpart, supported
 preview-view parameters, resource reads and file resolution governed by ENGINE-API §8.2.
 
-- [ ] First implement/verify S10's configured producer/destination and modality checks at byte
+- [x] First implement/verify S10's configured producer/destination and modality checks at byte
   release. Test metadata-only unknown destinations and denied bytes through every delivery path;
   a caller's `local=true`/producer argument must not grant access. Do not change global defaults to
   allow cloud access. Record permitted host/model capabilities for the pilot.
@@ -206,7 +206,7 @@ helpers, and `identify_asset`. **Produces:** `get_vocabulary`, `review_tags`,
 `propose_vocabulary_changes` and corresponding REST routes per ENGINE-API §8.5. No new classifier
 or vocabulary store; distinguish raw tags, promoted traits and taxonomy categories.
 
-- [ ] Create fixtures with applicable and wrong-modality traits, paused teaching, duplicate/synonym
+- [x] Create fixtures with applicable and wrong-modality traits, paused teaching, duplicate/synonym
   labels, two taxonomies, pinned category assignments, raw unmatched AI tags and protected manual tags.
 - [x] Implement bounded revisioned vocabulary reads and app-configured open/controlled/approved-
   extension policy. Test pagination invalidation, empty taxonomy and source-of-truth guidance.
@@ -219,7 +219,7 @@ or vocabulary store; distinguish raw tags, promoted traits and taxonomy categori
   an existing taxonomy. Test canonical collisions, invalid parent/taxonomy, unknown namespace,
   denied approval, teaching opt-in, lost-response replay and atomic rollback. No implicit mapping
   rule, cross-taxonomy change, new namespace or assignment follows category creation.
-- [ ] Add tools/routes/allow-list mappings together and compare normalized errors/effects. Test
+- [x] Add tools/routes/allow-list mappings together and compare normalized errors/effects. Test
   a rejected AI tag also present manually, an accepted tag retaining AI source, and a stale receipt
   after reidentification. Test that a later model run can repropose a rejected term: suppression is
   not implemented by deleting one association.
@@ -238,16 +238,17 @@ forge human confirmation, remove protected tags or silently expand vocabulary th
 **Consumes:** Tasks 1–4a. **Produces:** reproducible evidence that the workflow is usable, not just
 equal tool-name sets. The host's workflow instruction uses the template in USER-GUIDE.
 
-- [ ] Add a contract fixture that compares normalized REST/MCP input semantics, output, error
+- [x] Add a contract fixture that compares normalized REST/MCP input semantics, output, error
   codes, disabled-tool behavior, consent and catalog/cache effects for every new operation.
-- [ ] Extend the spawned harness: discover source → search → select one/list/random ten → save
+- [x] Extend the spawned harness: discover source → search → select one/list/random ten → save
   existing tags/evidence → read vocabulary → identify with a stub model → fresh read → review and
   propose new vocabulary → approve using a disposable app fixture → poll → refresh revisions →
   write/review → final independent readback → undo. Never forge a human flag in an agent payload.
-- [ ] Keep approval automation restricted to a test fixture; the real pilot uses the app's normal
+- [x] Keep approval automation restricted to a test fixture; the real pilot uses the app's normal
   approval. Use a stub analysis result for deterministic tests, not a paid/cloud model call.
 
-The harness must assert the following facts using Node's existing standard assertion library:
+The Rust integration harness asserts these facts with Rust's standard assertions (equivalent pseudocode below);
+it builds/spawns the executable under Cargo, so a second Node harness is unnecessary:
 
 ```js
 assert.equal(new Set(selectedIds).size, 10);
@@ -295,14 +296,14 @@ live model calls are part of these implementation gates.
 
 | Area | Verified implementation | Remaining acceptance work |
 |---|---|---|
-| Connection and selection (Tasks 1–2) | Fresh executable stdio handshake/EOF/schema refusal tests; library/search/single/list/random selection tests | Actual conversation tool visibility after Codex reconnect |
-| Evidence (Task 3) | Four bounded geometry views, resize, truncated UTF-8 text, dependency metadata, authenticated pixel-equivalent URLs, surgical source resolver and single HTTP Range reads | Per-destination/per-modality agent profiles; textured dependency rendering and external glTF buffers are explicitly unavailable (ADR-0021) |
+| Connection and selection (Tasks 1–2) | Fresh executable stdio handshake/EOF/schema refusal tests; library/search/single/list/random selection tests | Conversation metadata tools verified 2026-09-16; reconnect to load the newly rebuilt executable |
+| Evidence (Task 3) | Four bounded geometry views, resize, truncated UTF-8 text, dependency metadata, authenticated pixel-equivalent URLs, surgical source resolver and single HTTP Range reads; active destination/modality consent (ADR-0022) | Textured dependency rendering and external glTF buffers are explicitly unavailable (ADR-0021) |
 | Attributed writes (Task 4) | Producer-scoped atomic tags/description, receipt/replay, protected associations, history/FTS/undo; guarded vocabulary checks in writer transaction | Live approval and readback remain part of the stopped pilot |
-| Vocabulary/review (Task 4a) | Filter-independent revision, scoped policy, exact AI accept/reject, retained review readback, mixed atomic trait/category proposals, approval details and receipts | Broader synonym/taxonomy fixture matrix is not fully covered by the focused tests |
-| Contract workflow (Task 5) | In-process MCP ten-model fixture: stub identification → proposal/approval → review → write → replay → separate-reader verification; independent REST workflow and evidence URL tests | Full workflow through a spawned stdio process and exhaustive normalized REST/MCP error matrix; current spawned test proves startup, not every workflow stage |
-| Real pilot (Task 6) | Read-only host setup/preflight can proceed | Reconnect, select library and explicit evidence consent; stop before identification |
+| Vocabulary/review (Task 4a) | Filter-independent revision, scoped policy, exact AI accept/reject, retained review readback, mixed atomic trait/category proposals, approval details and receipts | Two taxonomies, aliases versus traits, canonical category reuse, pinned assignments and later re-proposals covered; exhaustive per-stage fault injection remains open |
+| Contract workflow (Task 5) | Spawned desktop stdio → disposable app → stub writer; ten real geometry renders, approved proposal/review/write, REST/MCP receipt replay, independent readback, undo and reidentification. Valid reads and invalid/disabled errors compared for all new operations | Fixture verification complete; real model quality and user approval remain in the stopped pilot |
+| Real pilot (Task 6) | Read-only host setup/preflight can proceed | Reconnect and explicit evidence consent; library chosen below; stop before identification |
 
-Validation on this branch: core 160 passed / 1 intentionally ignored; API 40 passed; MCP 12 passed;
+Previous validation (2026-09-15): core 160 passed / 1 intentionally ignored; API 40 passed; MCP 12 passed;
 desktop spawned stdio 2 passed; frontend production build passed with zero Svelte errors/warnings.
 Loader regression checks: 15 passed / 2 intentionally ignored; the restricted glTF evidence test
 proves embedded data works and disk sidecars are refused.
@@ -310,7 +311,7 @@ proves embedded data works and disk sidecars are refused.
 Test owners: `crates/lodestash-core/src/catalog/tests_tagbatch.rs`, `catalog/vocabulary.rs`,
 `crates/lodestash-api/src/routes.rs`, `src/evidence.rs`,
 `crates/lodestash-mcp/src/workflow_tests.rs`, and
-`crates/lodestash-desktop/tests/mcp_stdio.rs`. Task 4's older unchecked composite list is not a claim
+`crates/lodestash-desktop/tests/mcp_stdio.rs` / `mcp_workflow.rs`. Task 4's older unchecked composite list is not a claim
 that atomic authoring is missing; it retains the originally requested broader validation matrix.
 Do not call the complete original plan finished until the remaining acceptance gates above are met.
 
@@ -326,8 +327,56 @@ fresh `target/debug/lodestash-desktop.exe --mcp`. Its allow-list contains eight 
 identification, evidence delivery and mutations are excluded at this checkpoint. A separate stdio
 probe negotiated `2025-06-18`, read schema 31, and listed six libraries. The real catalog reports
 `writer=app_unavailable` and `bytes_released=false`. No GUI was launched, consent changed, asset
-identified or real annotation written. The assistant's active tool inventory still has no Lodestash
-tools: a host reconnect is required, and the shell probe does not satisfy that acceptance gate.
+identified or real annotation written. At that checkpoint the assistant had no Lodestash tools. Conversation visibility was subsequently
+verified below; the shell probe alone did not satisfy that acceptance gate.
 
-The prospective library choice was requested from the user; do not start live identification to
-resolve it. Start the matching app only for the authorized live phase, using the desktop launch guide.
+The user selected **Synty (library 2)** for the eventual ten-model pilot. Selection does not
+authorize live identification or evidence release. Start the matching app only for the authorized live phase, using the desktop launch guide.
+
+
+### Destination-consent gate (2026-09-16)
+
+Implemented the active app-owned host destination and visual/audio consent profile (ADR-0022).
+Unknown destinations and unconsented modalities remain metadata-only; remote audio and its previews
+are denied across MCP/REST. Live config is checked before work and delivery. Settings now persists
+both byte switches, which previously appeared in the UI but were dropped by the Rust payload.
+Tests use disposable catalogs and no live configuration changes. The remaining Task 3 rendering
+limitations remain explicit; the Task 5 spawned workflow is now verified below.
+
+Actual conversation preflight now succeeds: `get_server_info` and `list_libraries` returned through
+Codex's eight-tool metadata allow-list, confirming the selected library, schema 31,
+`bytes_released=false`, and `writer=app_unavailable`. This is actual host visibility, not a shell
+probe. That child was launched before the profile changes; reconnect after rebuilding to use the
+new executable. No evidence or source bytes were fetched and no live identification or writes ran.
+
+
+### Spawned workflow and vocabulary fixtures (2026-09-16)
+
+`crates/lodestash-desktop/tests/mcp_workflow.rs` runs the full disposable workflow through a real
+stdio process and authenticated loopback app. It uses the production restricted renderer for ten
+synthetic OBJ models, a serialized stub writer for identification, and app-side fixture approvals.
+The test compares read outputs, invalid-input errors and disabled-tool behavior for all eight new
+operations, verifies cross-plane authoring receipt replay, reads final tags/descriptions through an
+independent catalog connection, undoes the host write, and proves later identification may repropose
+rejected terms without making an old review current. No caller can forge confirmation.
+
+Core fixtures also verify two taxonomies, category aliases versus independent traits, canonical
+category reuse, pinned assignment preservation, no implicit mapping rules and cross-taxonomy
+parent rejection. Original broader per-stage fault injection and some composite Task 4 edge checks
+remain unchecked; this is not a claim that every possible failure permutation has been exercised.
+
+
+The spawned reidentification check caught and fixed review readback comparing against the input
+revision: restoring a rejected term could make the old rejection appear current. Review history
+now retains the committed result revision; legacy records remain visible without a current-state
+claim. The same test proves both current readback immediately after review and stale readback after
+reidentification restores a rejected assignment.
+
+
+Final verification for this follow-up: `cargo test -p lodestash-core -p lodestash-api
+-p lodestash-mcp -p lodestash-app -p lodestash-desktop --offline` passed **337 tests, 2 ignored**
+(including the core doctest). API 43, app 45, core 161, desktop 71, MCP 13, spawned startup 2,
+spawned workflow 1, doctest 1. Frontend production build passed with zero Svelte diagnostics.
+Docs checker: 51 documents, no dead references/warnings. Board checker: no stale citations;
+26 historical absence claims remain outside this feature's gate. Manual docs-vs-diff review was
+performed because the repository-requested `docs-conformance` skill is unavailable in this session.
