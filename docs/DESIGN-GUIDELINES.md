@@ -52,9 +52,14 @@ Keep it tasteful: think **Octopath / Persona menu polish**, not cluttered fantas
 CSS custom properties are the source of truth (prefix `--ls-`). All pairings below meet AA for their
 intended text/background use.
 
-The executable form of this section is [`design/tokens.css`](design/tokens.css) — the single
-checked-in token file, imported directly by the Svelte frontend. The tables below and that file must
-not drift; change both together. The egui `theme.rs` mirror was retired with the B7 cutover (2026-08-07).
+**The values live in one place: [`design/tokens.css`](design/tokens.css)** (2026-11-16,
+[ADR-0023](decisions/ADR-0023-one-visual-authority-and-a-contract-gate.md)). Every token there is a
+value the prototype actually draws, measured by `scripts/design/extract-contract.mjs` and kept honest
+by `scripts/design/check-tokens.mjs` (a drawn value without a token, or a token nothing draws, fails).
+The tables below give the **meaning** of the base colours; their alpha variants
+(`--ls-gold-a15` = gold at 15 %), the type, spacing, radius, shadow, gradient and motion tokens are
+listed only in that file. Values the app needs that the prototype has no instance of sit in its
+marked `app-only` block, each with its reason.
 
 ### Surfaces & text
 | Token | Hex | Use |
@@ -87,7 +92,7 @@ not drift; change both together. The egui `theme.rs` mirror was retired with the
 | `--ls-type-texture` | `#6FB1FF` | **Textures** — shares sapphire with images |
 | `--ls-type-material` | `#A98BFF` | **Materials** — shares amethyst with models |
 | `--ls-type-sprite` | `#5BD897` | **Sprites** — verdant |
-| `--ls-type-font` | `#F2966E` | **Fonts** — coral |
+| `--ls-type-font` | `#F2966E` | **Fonts** — coral (app-only: the prototype's data has no font asset) |
 
 One row per `media_type` value (the 7-value enum, [`DATA-MODEL.md`](DATA-MODEL.md)); shared hues
 keep the palette calm — the type **icon** disambiguates within a hue family (§9: never color alone).
@@ -105,8 +110,8 @@ keep the palette calm — the type **icon** disambiguates within a hue family (�
 | `--ls-success` | `#5BD897` | Success/done |
 | `--ls-warning` | `#F2B84B` | Caution, "Unidentified backlog" nudges |
 | `--ls-danger` | `#F2666E` | Errors, destructive |
-| `--ls-info` | `#5AA9F0` | Neutral info |
-| `--ls-focus` | `#FFD98A` | Focus ring (use as `0 0 0 2px` glow) |
+| `--ls-info` | `#5AA9F0` | Neutral info (app-only) |
+| `--ls-focus` | `#FFD98A` | Focus colour; the ring itself is `--ring-focus` (app-only — the prototype is mouse-only) |
 
 > **Dark-mode elevation rule:** surfaces get *lighter* as they rise (`bg → surface → raised →
 > overlay`). Reserve shadows for modals; use a 1px `--ls-border` + optional accent glow elsewhere.
@@ -121,26 +126,30 @@ keep the palette calm — the type **icon** disambiguates within a hue family (�
 | UI / body | **Inter** (fallback: Segoe UI, system-ui) | Everything functional. Default body **13px**. |
 | Numeric / stats | **JetBrains Mono** (or Inter `tabular-nums`) | Stat blocks, counts, sizes, durations — aligned columns. |
 
-### Scale (`--fs-*`)
-`xs 11` · `sm 12` · **`md 13` (body)** · `lg 15` · `xl 18` · `2xl 24` · `3xl 32`
-Line-height: 1.45 body, 1.2 headings. Weight: 400 body, 500 labels, 600 headings, 700 display.
-
-> Density tip: at 13px body with tabular numerals, a card can show name + type + 4 stats + 3 trait
-> chips and still breathe. Don't go below 11px for any readable text.
+### Sizes (`--fs-<px>`)
+The prototype draws sizes from 8 to 64 px; each has a token named by its size (`--fs-13` is the
+body size). The most used are 11 px (secondary text, chips, meta lines), 12 px (controls, labels),
+13 px (body), and 9–10 px for compact labels such as size tiers, badges and section headings.
+Weights `--fw-400` body, `--fw-500` labels, `--fw-600` headings, `--fw-700` display.
+Consolidating sizes is a design decision taken in the prototype, not in code (ADR-0023 §2).
 
 ---
 
 ## 4. Spacing, radius, density, elevation
 
-- **Spacing scale** (`--sp-*`, 4px base): `1=4 · 2=8 · 3=12 · 4=16 · 5=24 · 6=32 · 7=48`.
-- **Radius** (`--r-*`): `sm=4 · md=6 (default) · lg=10 (cards) · pill=999 (chips)`.
-- **Density:** default **compact** — list row height **32px**, grid card padding `--sp-3`, control
-  height 30–34px. Offer a "Comfortable" toggle (+4px) for accessibility.
+- **Spacing** (`--space-<px>`): the prototype's paddings and gaps, 1–90 px; 5, 8 and 10 px carry
+  most layouts. (The old `--sp-1…7` ladder is legacy and goes with the old UI at plan P5.)
+- **Radius** (`--r-<px>`, `--r-pill`): 4 px small controls, 6 px controls and inputs, 10 px cards,
+  pill for chips and badges; 2, 5, 7, 8, 9 and 12 px also appear.
+- **Density:** default **compact** — list row height **32px**, control height 30–34px. Offer a
+  "Comfortable" toggle (+4px) for accessibility.
 - **JRPG frame (optional, sparing):** header/hero panels may use a **beveled/clipped corner** treatment
   (`clip-path` cut top-left & bottom-right) with a 1px `--ls-gold` edge to evoke a menu frame. Never on
   dense list cards.
 - **Elevation:** `0` flat (`--ls-surface`), `1` raised (`--ls-surface-raised` + 1px border), `2`
-  popover (`--ls-overlay` + soft shadow `0 8px 24px rgba(0,0,0,.45)`), `focus` (2px `--ls-focus` glow).
+  popover (`--ls-overlay` + a drop shadow such as `--shadow-8-24-a45`), `focus` (`--ring-focus`).
+  Accent glows (`--glow-gold-14-a50` on a primary hover, …) are the prototype's hover language.
+  Stacking uses the `--z-*` ladder only.
 
 ### Responsive ladder (ADR-0009)
 
@@ -577,7 +586,9 @@ and engine imports are **not** undoable (jobs / external side effects) — confi
 
 ## 8. Motion
 
-Subtle, fast, purposeful. Durations: micro 120ms, standard 200ms, reveal 360–400ms.
+Subtle, fast, purposeful. Durations are `--dur-<ms>` tokens; the prototype's working set is micro
+120 ms (hover, most transitions), 150–200 ms (menus, panels) and 400 ms (reveals), with longer
+values only for loops such as the shimmer.
 
 `prefers-reduced-motion: reduce` is a **required second column**, not a nice-to-have — it removes
 movement, never information. Anything that was *telling* you something still says it.

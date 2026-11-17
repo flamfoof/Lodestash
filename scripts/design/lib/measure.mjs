@@ -122,7 +122,7 @@ export function vocabularyInPage(rootSelector) {
     const h = (n) => Math.round(n).toString(16).padStart(2, "0");
     return `#${h(p[0])}${h(p[1])}${h(p[2])}${a < 1 ? h(a * 255) : ""}`;
   };
-  for (const el of root.querySelectorAll("*")) {
+  for (const el of [root, ...root.querySelectorAll("*")]) {
     const r = el.getBoundingClientRect();
     if (r.width === 0 && r.height === 0) continue;
     const cs = getComputedStyle(el);

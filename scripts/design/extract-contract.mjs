@@ -17,6 +17,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { openPrototype, DESIGN_DIR, PROTOTYPE, VIEWPORT } from "./lib/prototype.mjs";
 import { measureInPage, vocabularyInPage } from "./lib/measure.mjs";
+import { sourceVocabulary } from "./lib/source-vocab.mjs";
 import { STATES } from "./states.mjs";
 import { ANCHORS } from "./anchors.mjs";
 
@@ -66,9 +67,11 @@ for (const [name, state] of Object.entries(STATES)) {
 }
 
 // Hover styles never appear in a static render: the prototype declares them as `style-hover`
-// attributes. Read them from the source so hover colours and glows get tokens too.
+// attributes. Read them from the source so hover colours and glows get tokens too. Declarations in
+// states the extractor never opens (menus, dialogs) are read from the source the same way.
 {
   const src = fs.readFileSync(protoFile, "utf8");
+  vocabulary.declared = sourceVocabulary(src);
   const hover = {};
   for (const m of src.matchAll(/style-hover="([^"]*)"/g)) {
     for (const decl of m[1].split(";")) {
@@ -80,10 +83,14 @@ for (const [name, state] of Object.entries(STATES)) {
 }
 
 // Stable output: sort vocabulary values by use, most first.
+const sortValues = (values) =>
+  Object.fromEntries(Object.entries(values).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])));
 const sortedVocab = Object.fromEntries(
   Object.entries(vocabulary).map(([cat, values]) => [
     cat,
-    Object.fromEntries(Object.entries(values).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))),
+    cat === "declared"
+      ? Object.fromEntries(Object.entries(values).map(([c, v]) => [c, sortValues(v)]))
+      : sortValues(values),
   ]),
 );
 const outputs = {

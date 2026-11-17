@@ -1,17 +1,27 @@
 /*
  * Lodestash design tokens — the single checked-in source.
  *
- * DESIGN-GUIDELINES.md §2-§4 is the prose spec; this file is its executable form and the
- * two must not drift. The Svelte frontend imports this file directly (no build step, no
- * CSS-in-JS). The egui `theme.rs` mirror (`crates/lodestash-ui`) was retired at the B7
- * cutover (2026-08-07).
+ * Every value here is one the design prototype draws (docs/design/vocabulary.json, measured by
+ * scripts/design/extract-contract.mjs), named — not snapped to a scale (ADR-0023 §2). Two blocks
+ * are the exceptions, and are marked: `app-only` (values the app needs that the prototype has no
+ * instance of) and `legacy` (names the old crates/lodestash-desktop/ui still imports; deleted with
+ * it at plan P5). `node scripts/design/check-tokens.mjs` fails on a drawn value with no token and
+ * on a token nothing draws outside those blocks. DESIGN-GUIDELINES.md §2–§4 and §8 describe this
+ * file; the two must not drift.
  *
- * Dark mode is the only theme. The elevation rule is: surfaces get *lighter* as they rise
- * (bg -> surface -> raised -> overlay); shadows are reserved for modals.
+ * Naming: semantic colour names (`--ls-gold`); alpha variants `--ls-<name>-a<percent>`; numeric
+ * scales where the prototype has no semantic ladder: `--fs-<px>`, `--fw-<weight>`,
+ * `--space-<px>`, `--r-<px>`, `--bw-<px>`, `--track-<px>` (`_` for the decimal point),
+ * `--dur-<ms>`, `--op-<percent>`; shadows `--glow-<colour>-<blur>[-a<pct>]`,
+ * `--ring-[inset-]<colour>-<spread>[-a<pct>]`, `--shadow-<y>-<blur>-a<pct>`; gradients
+ * `--grad-<name>`. New values from a re-import: `node scripts/design/propose-tokens.mjs`.
+ *
+ * Dark mode is the only theme. Surfaces get lighter as they rise (bg → surface → raised →
+ * overlay); drop shadows are reserved for floating layers (menus, dialogs).
  */
 
 :root {
-  /* ---- Surfaces & text (§2) ---- */
+  /* ---- Surfaces & text ---- */
   --ls-bg: #0e1117;
   --ls-surface: #161b26;
   --ls-surface-raised: #1e2533;
@@ -29,14 +39,13 @@
   --ls-arcane-bright: #7bf0e5;
   --ls-violet: #a98bff;
 
-  /* ---- Element-type colors: one per media_type (DATA-MODEL 7-value enum) ---- */
+  /* ---- Element-type colours: one per media_type (DATA-MODEL 7-value enum) ---- */
   --ls-type-model: #a98bff;
   --ls-type-sound: #49c9e0;
   --ls-type-image: #6fb1ff;
   --ls-type-texture: #6fb1ff;
   --ls-type-material: #a98bff;
   --ls-type-sprite: #5bd897;
-  --ls-type-font: #f2966e;
 
   /* ---- Status / rarity ---- */
   --ls-status-unidentified: #8a93a6;
@@ -47,26 +56,282 @@
   --ls-success: #5bd897;
   --ls-warning: #f2b84b;
   --ls-danger: #f2666e;
-  --ls-info: #5aa9f0;
   --ls-focus: #ffd98a;
 
-  /* ---- Typography (§3) ---- */
+  /* ---- Typography families ---- */
   --ff-display: "Cinzel", Georgia, serif;
   --ff-ui: "Inter", "Segoe UI", system-ui, sans-serif;
   --ff-mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
 
+  /* ---- Radius ---- */
+  --r-pill: 999px;
+
+  /* ===== Derived from the prototype's vocabulary (propose-tokens.mjs, reviewed) ===== */
+
+  /* ---- color ---- */
+  --ls-arcane-a14: #49d6c924;
+  --ls-arcane-a15: #49d6c926;
+  --ls-arcane-a16: #49d6c929;
+  --ls-arcane-a22: #49d6c938;
+  --ls-arcane-a30: #49d6c94d;
+  --ls-arcane-a35: #49d6c959;
+  --ls-arcane-a40: #49d6c966;
+  --ls-arcane-a45: #49d6c973;
+  --ls-arcane-a60: #49d6c999;
+  --ls-backdrop-a60: #0a0c1199;
+  --ls-backdrop-a74: #0a0c11bd;
+  --ls-bg-a50: #0e111780;
+  --ls-bg-a70: #0e1117b3;
+  --ls-bg-a75: #0e1117bf;
+  --ls-bg-a78: #0e1117c7;
+  --ls-bg-a80: #0e1117cc;
+  --ls-bg-a85: #0e1117d9;
+  --ls-black-a38: #00000061;
+  --ls-black-a50: #00000080;
+  --ls-black-a7: #00000012;
+  --ls-black: #000000;
+  --ls-border-strong-a55: #3a465c8c;
+  --ls-danger-a18: #f2666e2e;
+  --ls-danger-a35: #f2666e59;
+  --ls-danger-a40: #f2666e66;
+  --ls-danger-a50: #f2666e80;
+  --ls-gold-a10: #e7b7651a;
+  --ls-gold-a15: #e7b76526;
+  --ls-gold-a18: #e7b7652e;
+  --ls-gold-a30: #e7b7654d;
+  --ls-gold-a35: #e7b76559;
+  --ls-gold-a40: #e7b76566;
+  --ls-gold-a45: #e7b76573;
+  --ls-gold-a50: #e7b76580;
+  --ls-gold-a55: #e7b7658c;
+  --ls-gold-a60: #e7b76599;
+  --ls-gold-a6: #e7b7650f;
+  --ls-gold-a8: #e7b76514;
+  --ls-gold-bright-a15: #ffd98a26;
+  --ls-gold-bright-a30: #ffd98a4d;
+  --ls-on-gold: #171207;
+  --ls-on-sound: #062028;
+  --ls-on-success: #08130c;
+  --ls-pane: #12161f;
+  --ls-project-coral: #ff9d6f;
+  --ls-project-lime: #b8e07a;
+  --ls-render-sky-bottom: #222b3e;
+  --ls-render-sky-top: #121722;
+  --ls-stage-center: #1a2130;
+  --ls-success-a18: #5bd8972e;
+  --ls-success-a30: #5bd8974d;
+  --ls-success-a35: #5bd89759;
+  --ls-success-a40: #5bd89766;
+  --ls-success-a45: #5bd89773;
+  --ls-success-a50: #5bd89780;
+  --ls-success-a7: #5bd89712;
+  --ls-sunken: #0b0e14;
+  --ls-text-faint: #5a6273;
+  --ls-text-placeholder: #7e8aa0;
+  --ls-thumb: #20293a;
+  --ls-type-image-a15: #6fb1ff26;
+  --ls-type-image-a30: #6fb1ff4d;
+  --ls-type-sound-a10: #49c9e01a;
+  --ls-type-sound-a15: #49c9e026;
+  --ls-type-sound-a18: #49c9e02e;
+  --ls-type-sound-a30: #49c9e04d;
+  --ls-type-sound-a40: #49c9e066;
+  --ls-unity-idle: #8fe3b8;
+  --ls-viewer: #141926;
+  --ls-violet-a16: #a98bff29;
+  --ls-violet-bright: #c9b6ff;
+  --ls-warning-a15: #f2b84b26;
+  --ls-warning-a18: #f2b84b2e;
+  --ls-warning-a30: #f2b84b4d;
+  --ls-warning-a35: #f2b84b59;
+  --ls-warning-a40: #f2b84b66;
+  --ls-warning-a50: #f2b84b80;
+  --ls-warning-a7: #f2b84b12;
+  --ls-warning-a8: #f2b84b14;
+  --ls-wave-rest: #2f5b66;
+  --ls-wave-unidentified: #4a5468;
+  --ls-well: #0a0d13;
+  --ls-white: #ffffff;
+
+  /* ---- fontSize ---- */
+  --fs-10: 10px;
+  --fs-11: 11px;
+  --fs-12: 12px;
+  --fs-13: 13px;
+  --fs-14: 14px;
+  --fs-15: 15px;
+  --fs-16: 16px;
+  --fs-17: 17px;
+  --fs-18: 18px;
+  --fs-20: 20px;
+  --fs-22: 22px;
+  --fs-24: 24px;
+  --fs-28: 28px;
+  --fs-30: 30px;
+  --fs-32: 32px;
+  --fs-44: 44px;
+  --fs-64: 64px;
+  --fs-8: 8px;
+  --fs-9: 9px;
+
+  /* ---- fontWeight ---- */
+  --fw-400: 400;
+  --fw-500: 500;
+  --fw-600: 600;
+  --fw-700: 700;
+
+  /* ---- letterSpacing ---- */
+  --track-0_4: 0.4px;
+  --track-0_5: 0.5px;
+  --track-1: 1px;
+  --track-1_2: 1.2px;
+
+  /* ---- radius ---- */
+  --r-10: 10px;
+  --r-12: 12px;
+  --r-1: 1px;
+  --r-2: 2px;
+  --r-4: 4px;
+  --r-5: 5px;
+  --r-6: 6px;
+  --r-7: 7px;
+  --r-8: 8px;
+  --r-9: 9px;
+
+  /* ---- space ---- */
+  --space-10: 10px;
+  --space-11: 11px;
+  --space-12: 12px;
+  --space-13: 13px;
+  --space-14: 14px;
+  --space-15: 15px;
+  --space-16: 16px;
+  --space-18: 18px;
+  --space-1: 1px;
+  --space-20: 20px;
+  --space-22: 22px;
+  --space-24: 24px;
+  --space-26: 26px;
+  --space-2: 2px;
+  --space-30: 30px;
+  --space-32: 32px;
+  --space-3: 3px;
+  --space-42: 42px;
+  --space-46: 46px;
+  --space-4: 4px;
+  --space-5: 5px;
+  --space-6: 6px;
+  --space-7: 7px;
+  --space-80: 80px;
+  --space-8: 8px;
+  --space-90: 90px;
+  --space-9: 9px;
+
+  /* ---- borderWidth ---- */
+  --bw-1_5: 1.5px;
+  --bw-2: 2px;
+
+  /* ---- shadow ---- */
+  --glow-arcane-10-a25: 0 0 10px 0 #49d6c940;
+  --glow-arcane-10-a40: 0 0 10px 0 #49d6c966;
+  --glow-arcane-12-a25: 0 0 12px 0 #49d6c940;
+  --glow-arcane-12-a40: 0 0 12px 0 #49d6c966;
+  --glow-arcane-12-a50: 0 0 12px 0 #49d6c980;
+  --glow-arcane-14-a40: 0 0 14px 0 #49d6c966;
+  --glow-arcane-18-a50: 0 0 18px 0 #49d6c980;
+  --glow-arcane-8-a25: 0 0 8px 0 #49d6c940;
+  --glow-arcane-8-a50: 0 0 8px 0 #49d6c980;
+  --glow-danger-10-a20: 0 0 10px 0 #f2666e33;
+  --glow-gold-10-a25: 0 0 10px 0 #e7b76540;
+  --glow-gold-10-a50: 0 0 10px 0 #e7b76580;
+  --glow-gold-12-a35: 0 0 12px 0 #e7b76559;
+  --glow-gold-14-a50: 0 0 14px 0 #e7b76580;
+  --glow-gold-16-a15: 0 0 16px 0 #e7b76526;
+  --glow-gold-18-a60: 0 0 18px 0 #e7b76599;
+  --glow-gold-6-a60: 0 0 6px 0 #e7b76599;
+  --glow-gold-8-a50: 0 0 8px 0 #e7b76580;
+  --glow-gold-8-a60: 0 0 8px 0 #e7b76599;
+  --glow-success-10-a30: 0 0 10px 0 #5bd8974d;
+  --glow-success-14-a40: 0 0 14px 0 #5bd89766;
+  --glow-success-14-a50: 0 0 14px 0 #5bd89780;
+  --glow-success-6: 0 0 6px 0 #5bd897;
+  --glow-success-8: 0 0 8px 0 #5bd897;
+  --ring-gold-1-a18: 0 0 0 1px #e7b7652e;
+  --ring-gold-2-a18: 0 0 0 2px #e7b7652e;
+  --ring-gold-2: 0 0 0 2px #e7b765;
+  --ring-inset-gold-1-a40: inset 0 0 0 1px #e7b76566;
+  --shadow-1-5-a50: 0 1px 5px 0 #00000080;
+  --shadow-12-32-a55: 0 12px 32px 0 #0000008c;
+  --shadow-8-24-a45: 0 8px 24px 0 #00000073;
+  --shadow-8-32-a60: 0 8px 32px 0 #00000099;
+
+  /* ---- gradient ---- */
+  --grad-app: radial-gradient(1200px 600px at 80% -10%, #e7b7650f, transparent 60%), radial-gradient(900px 500px at -10% 110%, #49d6c90d, transparent 60%);
+  --grad-arcane-bar: linear-gradient(90deg, #49d6c9, #7bf0e5);
+  --grad-arcane-wash: linear-gradient(#49d6c90d, transparent);
+  --grad-checker: linear-gradient(45deg, #39455c 25%, transparent 25%), linear-gradient(-45deg, #39455c 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #39455c 75%), linear-gradient(-45deg, transparent 75%, #39455c 75%);
+  --grad-gold-bar: linear-gradient(90deg, #e7b765, #ffd98a);
+  --grad-gold-fade: linear-gradient(90deg, #e7b765, transparent);
+  --grad-gold: linear-gradient(#e7b765, #d9a54e);
+  --grad-grid: linear-gradient(#ffffff08 1px, transparent 1px), linear-gradient(90deg, #ffffff08 1px, transparent 1px);
+  --grad-shimmer: linear-gradient(105deg, transparent, #ffd98a59, transparent);
+  --grad-stage: radial-gradient(120% 120% at 50% 20%, #1a2130, #0c1017);
+  --grad-success: linear-gradient(#5bd897, #3fbf7e);
+
+  /* ---- duration ---- */
+  --dur-1000: 1000ms;
+  --dur-100: 100ms;
+  --dur-120: 120ms;
+  --dur-150: 150ms;
+  --dur-160: 160ms;
+  --dur-180: 180ms;
+  --dur-200: 200ms;
+  --dur-300: 300ms;
+  --dur-4000: 4000ms;
+  --dur-400: 400ms;
+  --dur-450: 450ms;
+  --dur-500: 500ms;
+  --dur-50: 50ms;
+  --dur-550: 550ms;
+  --dur-600: 600ms;
+
+  /* ---- opacity ---- */
+  --op-30: 0.3;
+  --op-35: 0.35;
+  --op-60: 0.6;
+  --op-65: 0.65;
+  --op-85: 0.85;
+  --op-92: 0.92;
+
+  /* app-only: values the app needs that the prototype has no instance of */
+  --ls-type-font: #f2966e; /* media_type `font` exists; the prototype's data has no font asset */
+  --ls-info: #5aa9f0; /* neutral notices; the prototype only draws warn/danger/success notices */
+  --ring-focus: 0 0 0 2px #ffd98a; /* keyboard focus; the prototype is mouse-only */
+  /* Layers: one ladder so nothing invents a z-index. */
+  --z-raised: 1;
+  --z-sticky: 10;
+  --z-popover: 40;
+  --z-dialog: 50;
+  --z-toast: 60;
+  /* Frame metrics the shell grid uses; the contract checks the rendered result. */
+  --topbar-h: 48px;
+  --sidebar-w: 210px;
+  --inspector-w: 300px;
+  /* Density: compact default; [data-density="cozy"] = +4px, [data-density="large"] = +8px. */
+  --row-h: 32px;
+  --control-h: 30px;
+  /* end app-only */
+
+  /* legacy: removed at P5 with crates/lodestash-desktop/ui */
   --fs-xs: 11px;
   --fs-sm: 12px;
-  --fs-md: 13px; /* body */
+  --fs-md: 13px;
   --fs-lg: 15px;
   --fs-xl: 18px;
   --fs-2xl: 24px;
   --fs-3xl: 32px;
-
   --lh-body: 1.45;
   --lh-heading: 1.2;
-
-  /* ---- Spacing, 4px base (§4) ---- */
   --sp-1: 4px;
   --sp-2: 8px;
   --sp-3: 12px;
@@ -74,30 +339,16 @@
   --sp-5: 24px;
   --sp-6: 32px;
   --sp-7: 48px;
-
-  /* ---- Radius ---- */
   --r-sm: 4px;
   --r-md: 6px;
   --r-lg: 10px;
-  --r-pill: 999px;
-
-/* ---- Density: compact default; [data-density="cozy"] = +4px, [data-density="large"] = +8px (§4) ---- */
-  --row-h: 32px;
-  --control-h: 30px;
-
-  /* ---- Elevation ---- */
   --el-popover-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
   --el-focus-ring: 0 0 0 2px var(--ls-focus);
-
-  /* ---- Frame metrics (FEATURES §0.1) ---- */
-  --topbar-h: 48px;
-  --sidebar-w: 210px;
-  --inspector-w: 300px;
+  /* end legacy */
 }
 
-/* The shell sets `data-density` on the `.frame` element (App.svelte), so the selectors key on
-   the frame — `:root[data-density]` would never match and the density stops would be dead.
-   The vars inherit down to the rows/controls that consume `--row-h` / `--control-h`. */
+/* The old shell sets `data-density` on its `.frame` element. Removed with it at P5; the web UI
+   sets density on its own shell root. */
 .frame[data-density="cozy"] {
   --row-h: 36px;
   --control-h: 34px;

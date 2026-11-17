@@ -53,10 +53,10 @@ the prototype has no semantic ladder — `--fs-<px>`, `--sp-<px>`, `--r-<px>`, `
 `--grad-<name>`; families `--ff-display|ui|mono`. One-off values are named, not snapped
 (ADR-0023 §2).
 
-- [ ] Test: `node scripts/design/check-tokens.mjs` passes on the new file, and fails (exit 1, naming
+- [x] Test: `node scripts/design/check-tokens.mjs` passes on the new file, and fails (exit 1, naming
   the value) when one vocabulary colour is removed from `tokens.css` — prove with a temp copy
-- [ ] The old UI still builds: `bun run --cwd crates/lodestash-desktop/ui check` is green
-- [ ] Commit `feat(design): tokens name every value the prototype draws`
+- [x] The old UI still builds: `bun run --cwd crates/lodestash-desktop/ui check` is green
+- [x] Commit `feat(design): tokens name every value the prototype draws`
 
 ### Task 6.2: `web/` scaffold, fonts, icons, style lint
 

@@ -12,6 +12,8 @@
     "check-docs": "node scripts/check-docs.mjs",
     "design:contract": "node scripts/design/extract-contract.mjs",
     "design:check": "node scripts/design/extract-contract.mjs --check",
+    "design:tokens": "node scripts/design/check-tokens.mjs",
+    "design:test": "node --test \"scripts/design/**/*.test.mjs\"",
     "check-board": "node scripts/check-board.mjs"
   }
 }
