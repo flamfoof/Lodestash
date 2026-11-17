@@ -1318,11 +1318,20 @@ impl Catalog {
     }
 
     /// Move/rename detection (DATA-MODEL §6): a file whose **path vanished** from a crawl while
-    /// its **content hash reappeared at another path** is the same file moved — update `rel_path`
-    /// in place, preserving `asset_id`, tags, embeddings, mappings and the hash. Trashed assets
-    /// are exempt (trash is a user decision; a moved file must not resurrect it). Returns the
-    /// new rel_paths that were consumed, so the caller can drop them from `record_crawl` and
-    /// avoid a duplicate insert.
+    /// its **content hash reappeared at a new path** is the same file moved — update `rel_path`
+    /// in place, preserving `asset_id`, tags, embeddings, mappings and the hash. Returns the new
+    /// rel_paths that were consumed, so the caller can drop them from `record_crawl` and avoid a
+    /// duplicate insert; they are on disk, so they still count as present for
+    /// [`Self::reconcile_missing`].
+    ///
+    /// - Matching is **one to one**: each vanished row takes at most one new path and each new path
+    ///   at most one row ([`pair_moves`]). Byte-identical files moved together keep one identity
+    ///   each; when a hash has more vanished rows than new paths, or fewer, the leftovers are left to
+    ///   the normal missing/new handling rather than guessed.
+    /// - A "new path" is one **no row of the source holds** — a present duplicate's path is not a
+    ///   destination, so a move never puts two rows on one path.
+    /// - Trashed assets (`deleted_at`) are exempt: trash is a user decision, and a crawl that finds
+    ///   the bytes elsewhere must not carry the trashed row there.
     ///
     /// Call this **before** `record_crawl` on a full-source crawl. Missing rows (`af.missing=1`)
     /// are included: a file that reappears at a new path is a move back, not a duplicate.
@@ -1331,69 +1340,86 @@ impl Catalog {
         source_id: i64,
         records: &[CrawlRecord],
     ) -> Result<Vec<String>> {
-        let present: std::collections::HashSet<String> =
-            records.iter().map(|r| r.rel_path.clone()).collect();
-        // New-path records with a hash are the move candidates: same bytes, new location.
-        let hash_to_rel: std::collections::HashMap<&str, &CrawlRecord> = records
-            .iter()
-            .filter_map(|r| r.content_hash.as_deref().map(|h| (h, r)))
-            .collect();
-        if hash_to_rel.is_empty() {
+        if records.iter().all(|r| r.content_hash.is_none()) {
             return Ok(Vec::new());
         }
-        // Vanished files: in the catalog, not in this crawl, with a known hash.
-        let vanished: Vec<(i64, String, String, i64)> = {
+        // Every row of the source — package rows too: `record_crawl` looks a path up across all of
+        // them, so none of their paths is free to move onto.
+        let rows: Vec<(i64, String, Option<String>, i64, bool)> = {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT af.id, af.rel_path, a.content_hash, a.id
+                    "SELECT af.id, af.rel_path, a.content_hash, a.id,
+                            a.package_id IS NULL AND a.deleted_at IS NULL
                      FROM asset_file af JOIN asset a ON a.id = af.asset_id
-                     WHERE a.source_id = ?1 AND a.package_id IS NULL
-                       AND a.status != 'trashed'
-                       AND a.content_hash IS NOT NULL",
+                     WHERE a.source_id = ?1",
                 )
                 .map_err(|e| CoreError::Catalog(format!("moves prep: {e}")))?;
             let mapped = stmt
                 .query_map(params![source_id], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                 })
                 .map_err(|e| CoreError::Catalog(format!("moves query: {e}")))?;
             mapped
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(|e| CoreError::Catalog(format!("moves row: {e}")))?
         };
+        let held: HashSet<&str> = rows.iter().map(|r| r.1.as_str()).collect();
+        let present: HashSet<&str> = records.iter().map(|r| r.rel_path.as_str()).collect();
+
+        // Vanished: loose, live, hashed rows whose path this crawl did not see.
+        let mut vanished: HashMap<&str, Vec<MoveSource<'_>>> = HashMap::new();
+        for (file_id, rel_path, hash, asset_id, movable) in &rows {
+            if let (true, Some(hash)) = (*movable, hash.as_deref()) {
+                if !present.contains(rel_path.as_str()) {
+                    vanished.entry(hash).or_default().push(MoveSource {
+                        file_id: *file_id,
+                        asset_id: *asset_id,
+                        rel_path,
+                    });
+                }
+            }
+        }
+        // New: hashed records at a path no row holds.
+        let mut fresh: HashMap<&str, Vec<&CrawlRecord>> = HashMap::new();
+        for r in records {
+            if let Some(hash) = r.content_hash.as_deref() {
+                if !held.contains(r.rel_path.as_str()) {
+                    fresh.entry(hash).or_default().push(r);
+                }
+            }
+        }
 
         let tx = self
             .conn
             .transaction()
             .map_err(|e| CoreError::Catalog(format!("moves begin: {e}")))?;
         let mut moved = Vec::new();
-        for (file_id, rel_path, hash, asset_id) in vanished {
-            if present.contains(&rel_path) {
-                continue; // still on disk at the same path — not a move
-            }
-            let Some(rec) = hash_to_rel.get(hash.as_str()) else {
+        for (hash, sources) in vanished {
+            let Some(targets) = fresh.remove(hash) else {
                 continue; // vanished with no hash match — the caller's reconcile_missing flags it
             };
-            tx.execute(
-                "UPDATE asset_file SET rel_path = ?2, ext = ?3, size_bytes = ?4,
-                                       mtime = ?5, missing = 0
-                 WHERE id = ?1",
-                params![
-                    file_id,
-                    rec.rel_path,
-                    rec.rel_path.rsplit('.').next().map(str::to_lowercase),
-                    rec.size_bytes,
-                    rec.mtime,
-                ],
-            )
-            .map_err(|e| CoreError::Catalog(format!("moves file update: {e}")))?;
-            tx.execute(
-                "UPDATE asset SET name = ?2, updated_at = ?3 WHERE id = ?1",
-                params![asset_id, rec.name, unix_now()],
-            )
-            .map_err(|e| CoreError::Catalog(format!("moves asset update: {e}")))?;
-            moved.push(rec.rel_path.clone());
+            for (from, rec) in pair_moves(sources, targets) {
+                tx.execute(
+                    "UPDATE asset_file SET rel_path = ?2, ext = ?3, size_bytes = ?4,
+                                           mtime = ?5, missing = 0
+                     WHERE id = ?1",
+                    params![
+                        from.file_id,
+                        rec.rel_path,
+                        rec.rel_path.rsplit('.').next().map(str::to_lowercase),
+                        rec.size_bytes,
+                        rec.mtime,
+                    ],
+                )
+                .map_err(|e| CoreError::Catalog(format!("moves file update: {e}")))?;
+                tx.execute(
+                    "UPDATE asset SET name = ?2, updated_at = ?3 WHERE id = ?1",
+                    params![from.asset_id, rec.name, unix_now()],
+                )
+                .map_err(|e| CoreError::Catalog(format!("moves asset update: {e}")))?;
+                moved.push(rec.rel_path.clone());
+            }
         }
         tx.commit()
             .map_err(|e| CoreError::Catalog(format!("moves commit: {e}")))?;
@@ -1694,6 +1720,42 @@ fn refresh_fts(conn: &Connection, asset_id: i64) -> Result<()> {
 /// than inventing a location for it. Uses `strip_prefix` rather than string surgery so a root
 /// stored `C:/cache` still matches a pack stored `C:\cache\x.unitypackage`: the separators differ,
 /// the components do not.
+/// A catalogued file whose path a crawl no longer saw — a candidate to have moved.
+struct MoveSource<'a> {
+    file_id: i64,
+    asset_id: i64,
+    rel_path: &'a str,
+}
+
+/// Pair the vanished rows of one content hash with the new paths of the same hash, one to one.
+///
+/// Rows and paths with the same **file name** pair first (a folder moved, its files kept their
+/// names). What is left pairs in path order only when the two sides are the same size — then
+/// every leftover row has exactly one destination, as a rename does. With unequal leftovers there
+/// is no telling which copy went where, so none is guessed: the rows go missing and the paths
+/// become new assets (DATA-MODEL §6).
+fn pair_moves<'a, 'r>(
+    mut sources: Vec<MoveSource<'a>>,
+    mut targets: Vec<&'r CrawlRecord>,
+) -> Vec<(MoveSource<'a>, &'r CrawlRecord)> {
+    let file_name = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+    sources.sort_by(|a, b| a.rel_path.cmp(b.rel_path));
+    targets.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    let mut pairs = Vec::new();
+    let mut unpaired = Vec::new();
+    for source in sources {
+        let name = file_name(source.rel_path);
+        match targets.iter().position(|t| file_name(&t.rel_path) == name) {
+            Some(i) => pairs.push((source, targets.remove(i))),
+            None => unpaired.push(source),
+        }
+    }
+    if unpaired.len() == targets.len() {
+        pairs.extend(unpaired.into_iter().zip(targets));
+    }
+    pairs
+}
+
 fn reanchor(path: &Path, old_root: &Path, new_root: &Path) -> Option<PathBuf> {
     path.strip_prefix(old_root)
         .ok()
@@ -5665,6 +5727,11 @@ impl Catalog {
     /// The catalog's last-known (size, mtime) per loose-file rel_path for one source root — the
     /// crawl's incremental diff (`crawler::needs_rehash`, DATA-MODEL §6). The writer uses this
     /// for watch-rescans and the desktop for re-adding a folder: unchanged files skip BLAKE3.
+    ///
+    /// Trashed files are included: they are on disk and in the catalog, and the watch rescan
+    /// compares this map with the crawl to decide whether anything changed — leaving them out
+    /// would make every rescan of a source with anything in the Trash look like a change. (A
+    /// `status != 'trashed'` filter here never matched anything: trash is `deleted_at`.)
     pub fn known_sizes_for_source(
         &self,
         root: &str,
@@ -5676,7 +5743,7 @@ impl Catalog {
                  FROM asset_file af
                  JOIN asset a ON a.id = af.asset_id
                  JOIN import_source s ON s.id = a.source_id
-                 WHERE s.root_path = ?1 AND a.package_id IS NULL AND a.status != 'trashed'",
+                 WHERE s.root_path = ?1 AND a.package_id IS NULL",
             )
             .map_err(|e| CoreError::Catalog(format!("known sizes prep: {e}")))?;
         let mapped = stmt

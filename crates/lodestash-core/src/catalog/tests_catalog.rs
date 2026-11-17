@@ -2865,6 +2865,179 @@ fn reconcile_moves_repoints_vanished_path_keeping_asset_id() {
     assert_eq!(gone, 0, "the old path must no longer exist");
 }
 
+// ---- moves keep identity, one row per path (v2 plan Task 1.5, review B2) ---------------------
+
+/// One full-source crawl in the order `persist_to_catalog` runs it: moves, then the rest, then
+/// the missing flags — over every path the crawl saw.
+fn full_crawl(c: &mut Catalog, src: i64, records: &[CrawlRecord]) {
+    let moved = c.reconcile_moves(src, records).expect("moves");
+    let rest: Vec<CrawlRecord> = records
+        .iter()
+        .filter(|r| !moved.contains(&r.rel_path))
+        .cloned()
+        .collect();
+    c.record_crawl(src, None, &rest).expect("crawl");
+    let present: HashSet<String> = records.iter().map(|r| r.rel_path.clone()).collect();
+    c.reconcile_missing(src, &present).expect("missing");
+}
+
+/// `(rel_path, asset_id)` for every row of the source, sorted by path.
+fn rows_by_path(c: &Catalog, src: i64) -> Vec<(String, i64)> {
+    let mut rows: Vec<(String, i64)> = c
+        .assets_for_source(src)
+        .expect("read")
+        .into_iter()
+        .map(|a| (a.rel_path, a.asset_id))
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// The paths the grid shows: rows not flagged missing.
+fn live_paths(c: &Catalog, src: i64) -> Vec<String> {
+    let mut paths: Vec<String> = c
+        .entries_for_source(src)
+        .expect("hydrate")
+        .into_iter()
+        .map(|a| a.rel_path)
+        .collect();
+    paths.sort();
+    paths
+}
+
+fn source_with(records: &[CrawlRecord]) -> (Catalog, i64) {
+    let mut c = Catalog::open_in_memory().expect("open");
+    c.seed_media_types().expect("seed");
+    let src = c
+        .upsert_import_source("Lib", "C:/lib", "folder")
+        .expect("src");
+    full_crawl(&mut c, src, records);
+    (c, src)
+}
+
+fn id_at(c: &Catalog, src: i64, rel: &str) -> i64 {
+    rows_by_path(c, src)
+        .into_iter()
+        .find(|(p, _)| p == rel)
+        .unwrap_or_else(|| panic!("no row at {rel}"))
+        .1
+}
+
+/// Moving a folder that holds two byte-identical files moves each file: two ids on two paths,
+/// each keeping its own tags. It used to point both vanished rows at the same new path and give
+/// the other file a fresh identity without its tags.
+#[test]
+fn moving_a_folder_of_identical_files_keeps_each_identity() {
+    let (mut c, src) = source_with(&[rec_h("old/a.png", 1, 1, "H"), rec_h("old/b.png", 1, 1, "H")]);
+    let (a, b) = (id_at(&c, src, "old/a.png"), id_at(&c, src, "old/b.png"));
+    c.add_asset_tag(a, "manual", "subject", "alpha")
+        .expect("tag a");
+    c.add_asset_tag(b, "manual", "subject", "beta")
+        .expect("tag b");
+
+    full_crawl(
+        &mut c,
+        src,
+        &[rec_h("new/a.png", 1, 1, "H"), rec_h("new/b.png", 1, 1, "H")],
+    );
+    assert_eq!(
+        rows_by_path(&c, src),
+        vec![("new/a.png".to_string(), a), ("new/b.png".to_string(), b)]
+    );
+    assert_eq!(live_paths(&c, src), vec!["new/a.png", "new/b.png"]);
+    let tag = |id| c.tags_for_asset(id).expect("tags")[0].value.clone();
+    assert_eq!((tag(a), tag(b)), ("alpha".to_string(), "beta".to_string()));
+}
+
+/// When a hash has more vanished rows than new paths, or fewer, rows pair with paths of the same
+/// file name and the rest is left alone: an unpaired row goes missing, an unpaired path is new.
+#[test]
+fn unequal_duplicates_pair_by_file_name_and_leave_the_rest() {
+    // Two copies vanish, one reappears under one of their names.
+    let (mut c, src) = source_with(&[rec_h("old/a.png", 1, 1, "H"), rec_h("old/b.png", 1, 1, "H")]);
+    let (a, b) = (id_at(&c, src, "old/a.png"), id_at(&c, src, "old/b.png"));
+    full_crawl(&mut c, src, &[rec_h("new/b.png", 1, 1, "H")]);
+    assert_eq!(id_at(&c, src, "new/b.png"), b, "paired by name");
+    assert_eq!(
+        id_at(&c, src, "old/a.png"),
+        a,
+        "the other stays where it was"
+    );
+    assert_eq!(live_paths(&c, src), vec!["new/b.png"], "and is missing");
+
+    // One copy vanishes, two appear: the same-named one is the move, the other is new.
+    let (mut c, src) = source_with(&[rec_h("old/a.png", 1, 1, "H")]);
+    let a = id_at(&c, src, "old/a.png");
+    full_crawl(
+        &mut c,
+        src,
+        &[rec_h("new/c.png", 1, 1, "H"), rec_h("new/a.png", 1, 1, "H")],
+    );
+    assert_eq!(id_at(&c, src, "new/a.png"), a);
+    assert_ne!(id_at(&c, src, "new/c.png"), a, "a copy is a new asset");
+    assert_eq!(rows_by_path(&c, src).len(), 2);
+
+    // No name to go by: nothing is guessed.
+    let (mut c, src) = source_with(&[rec_h("old/a.png", 1, 1, "H"), rec_h("old/b.png", 1, 1, "H")]);
+    let (a, b) = (id_at(&c, src, "old/a.png"), id_at(&c, src, "old/b.png"));
+    full_crawl(&mut c, src, &[rec_h("new/x.png", 1, 1, "H")]);
+    let x = id_at(&c, src, "new/x.png");
+    assert!(x != a && x != b, "an ambiguous match was guessed");
+    assert_eq!(live_paths(&c, src), vec!["new/x.png"]);
+}
+
+/// A vanished row is only ever repointed at a path no row holds. A present duplicate's path is
+/// held; pointing the vanished row at it put two rows on one path.
+#[test]
+fn a_move_never_puts_two_rows_on_one_path() {
+    let (mut c, src) = source_with(&[
+        rec_h("keep/a.png", 1, 1, "H"),
+        rec_h("gone/a.png", 1, 1, "H"),
+    ]);
+    let (kept, gone) = (id_at(&c, src, "keep/a.png"), id_at(&c, src, "gone/a.png"));
+    full_crawl(&mut c, src, &[rec_h("keep/a.png", 1, 1, "H")]);
+    assert_eq!(
+        rows_by_path(&c, src),
+        vec![
+            ("gone/a.png".to_string(), gone),
+            ("keep/a.png".to_string(), kept)
+        ],
+        "one row per path"
+    );
+    assert_eq!(live_paths(&c, src), vec!["keep/a.png"]);
+}
+
+/// Trash is a decision about an asset; a crawl that finds its bytes elsewhere does not move it
+/// out of the Trash or onto the new path. The new path is a new asset.
+#[test]
+fn a_trashed_row_is_not_repointed() {
+    let (mut c, src) = source_with(&[rec_h("a.png", 1, 1, "H")]);
+    let trashed = id_at(&c, src, "a.png");
+    c.set_trashed(&[trashed], true).expect("trash");
+    full_crawl(&mut c, src, &[rec_h("moved/a.png", 1, 1, "H")]);
+    assert_eq!(
+        id_at(&c, src, "a.png"),
+        trashed,
+        "the trashed row stayed put"
+    );
+    let fresh = id_at(&c, src, "moved/a.png");
+    assert_ne!(fresh, trashed);
+    let rows = c.assets_for_source(src).expect("read");
+    let is_trashed = |id| rows.iter().find(|r| r.asset_id == id).unwrap().trashed;
+    assert!(is_trashed(trashed) && !is_trashed(fresh));
+}
+
+/// The crawl's incremental diff still knows a trashed file's size: the file is on disk and in
+/// the catalog, and forgetting it made every watch rescan look like a change.
+#[test]
+fn known_sizes_include_trashed_files() {
+    let (c, src) = source_with(&[rec_h("a.png", 7, 70, "H")]);
+    c.set_trashed(&[id_at(&c, src, "a.png")], true)
+        .expect("trash");
+    let known = c.known_sizes_for_source("C:/lib").expect("known");
+    assert_eq!(known.get("a.png"), Some(&(7, 70)));
+}
+
 #[test]
 fn assets_for_source_flags_trashed_and_set_trashed_round_trips() {
     let mut c = Catalog::open_in_memory().expect("open");

@@ -382,8 +382,13 @@ CREATE TABLE asset_category (
 - **Watch**: `notify` crate for live updates, **always paired with a periodic full reconcile** (watchers
   drop events under bursts).
 - **Move/rename**: a path that vanished + a new path with the **same `content_hash`** ⇒ same file
-  moved — update `rel_path` in place, preserving `asset_id`, tags, embeddings, and mappings. Missing
-  with no hash match ⇒ `missing=1` (grace period, no hard delete — resilient to unplugged drives).
+  moved — update `rel_path` in place, preserving `asset_id`, tags, embeddings, and mappings
+  (`Catalog::reconcile_moves`). Matching is **one to one**: a "new path" is one no row of the source
+  holds (never two rows on one path); within one hash, rows and paths with the same file name pair
+  first, and the leftovers pair only when both sides are the same size — otherwise nothing is
+  guessed and they fall to the missing/new handling below. Trashed assets (`deleted_at`) never
+  move. The moved paths count as present for the missing pass. Missing with no hash match ⇒
+  `missing=1` (grace period, no hard delete — resilient to unplugged drives).
 - **Perf at 100k**: FTS5 BM25 sub-10 ms; sqlite-vec KNN tens-of-ms (less with partition keys +
   pre-filter). Past ~500k–1M vectors, flip the `VectorIndex` seam to LanceDB (HNSW).
 
