@@ -543,7 +543,8 @@ pub struct AppConfig {
     /// MCP/REST agent tools the user has switched **off** (UI-SPEC §16, card 178). Empty (the
     /// default) = every tool is live, so a fresh install behaves as before. A name here disables
     /// that tool on **both** agent planes at once (the gate is enforced in `lodestash-api`). Names
-    /// are [`lodestash_api::AGENT_OPERATIONS`] tool ids.
+    /// are the names of [`lodestash_protocol::OPERATIONS`] whose audience is `Agent` — the MCP tool
+    /// ids.
     #[serde(default)]
     pub mcp_disabled_tools: Vec<String>,
     /// The producer this host's agent writes tags under — `ai:<producer>` (ENGINE-API §8.3), e.g.
@@ -652,7 +653,7 @@ impl AppConfig {
     const MAX_RECENT: usize = 10;
 
     /// The enabled agent tools as a set, or `None` when nothing is disabled (every tool live —
-    /// the default). Feeds [`lodestash_api::ServerState::set_allowed`]; `None` leaves the state's
+    /// the default). Feeds the API's `ServerState::set_allowed`; `None` leaves the state's
     /// construction default (allow-all) in place. A tool id in `mcp_disabled_tools` that isn't a
     /// real operation is simply ignored — it can only ever narrow the real inventory.
     pub fn mcp_enabled_tools(&self) -> Option<std::collections::HashSet<String>> {
@@ -662,9 +663,7 @@ impl AppConfig {
         let disabled: std::collections::HashSet<&str> =
             self.mcp_disabled_tools.iter().map(String::as_str).collect();
         Some(
-            lodestash_api::AGENT_OPERATIONS
-                .iter()
-                .map(|(tool, _)| *tool)
+            agent_tool_names()
                 .filter(|tool| !disabled.contains(tool))
                 .map(str::to_string)
                 .collect(),
@@ -882,6 +881,15 @@ impl AppConfig {
     }
 }
 
+/// Every agent tool the allow-list can switch off: the operation catalog's `Agent` operations
+/// (v2 spec §5) — one declaration, so the Settings list and the MCP tool list cannot drift.
+pub fn agent_tool_names() -> impl Iterator<Item = &'static str> {
+    lodestash_protocol::OPERATIONS
+        .iter()
+        .filter(|op| op.audience == lodestash_protocol::Audience::Agent)
+        .map(|op| op.name)
+}
+
 pub fn stem_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -966,7 +974,7 @@ mod tests {
         );
         assert_eq!(
             enabled.len(),
-            lodestash_api::AGENT_OPERATIONS.len() - 1,
+            agent_tool_names().count() - 1,
             "exactly one real tool removed"
         );
     }

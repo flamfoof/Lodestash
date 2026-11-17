@@ -1,20 +1,20 @@
 [package]
-name        = "lodestash-app"
+name        = "lodestash-engine"
 version     = { workspace = true }
 edition     = { workspace = true }
 rust-version = { workspace = true }
 license     = { workspace = true }
 
 [dependencies]
-# Headless desktop orchestration: everything the app does that is not drawing. The egui shell it
-# was first written for is gone (B7 cutover, 2026-08-07); the Tauri backend consumes it unchanged,
-# which is the whole point — it must never gain a UI dep.
+# The service (v2 spec §3, ADR-0021): everything the application *does* that is not drawing or
+# serving. It absorbed `lodestash-app`; it must never gain a UI or HTTP-server dependency — the
+# shell and the API are adapters over it, not the other way round.
 lodestash-core   = { workspace = true }
 lodestash-ingest = { workspace = true }
-# config.rs reaches for the cloud provider's default base URL and the agent operation
-# allow-list. Neither crate depends back on this one, so the graph stays acyclic.
+# config.rs reaches for the cloud provider's default base URL.
 lodestash-ai     = { workspace = true }
-lodestash-api    = { workspace = true }
+# The operation catalog: the agent tool inventory the Settings allow-list narrows.
+lodestash-protocol = { workspace = true }
 serde            = { workspace = true }
 serde_json       = { workspace = true }
 tracing          = { workspace = true }

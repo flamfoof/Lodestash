@@ -64,9 +64,9 @@ const citRe = /([A-Za-z0-9_./-]+\.(?:rs|svelte|ts|mjs|js|css|py|toml|md|html)):(
 const bareRe = /(?:`)?((?:crates|docs|scripts|src)\/[A-Za-z0-9_./-]+\.(?:rs|svelte|ts|mjs|json|js|css|py|toml|md|html)\b)/g;
 
 // Resolve a cited path to a real file. The docs use short names a lot:
-//   `writer.rs`        → crates/lodestash-core/src/ | .../lodestash-app/src/ | ui/src/lib/ | ui/src/
+//   `writer.rs`        → crates/lodestash-core/src/ | .../lodestash-engine/src/ | ui/src/lib/ | ui/src/
 //   `TopBar.svelte`    → crates/lodestash-desktop/ui/src/lib/TopBar.svelte
-//   `lodestash-app/...`→ crates/lodestash-app/... (src/ inserted when the direct form misses)
+//   `lodestash-engine/...`→ crates/lodestash-engine/... (src/ inserted when the direct form misses)
 const SEARCH_ROOTS = [
   (rel) => resolve(ROOT, rel),
   (rel) => resolve(ROOT, "crates", rel),
@@ -74,7 +74,7 @@ const SEARCH_ROOTS = [
   (rel) => resolve(ROOT, "docs", "design", rel),
   (rel) => resolve(ROOT, "docs", rel),
   (rel) => resolve(ROOT, "crates", "lodestash-core", "src", rel),
-  (rel) => resolve(ROOT, "crates", "lodestash-app", "src", rel),
+  (rel) => resolve(ROOT, "crates", "lodestash-engine", "src", rel),
   (rel) => resolve(ROOT, "crates", "lodestash-desktop", "ui", "src", "lib", rel),
   (rel) => resolve(ROOT, "crates", "lodestash-desktop", "ui", "src", "styles", rel),
   (rel) => resolve(ROOT, "crates", "lodestash-desktop", "ui", "src", rel),

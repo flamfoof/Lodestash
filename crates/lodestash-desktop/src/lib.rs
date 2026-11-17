@@ -47,7 +47,7 @@ struct AppState {
     pump: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Shared appraise-pass progress (B11d): the tag/embed drains write done/total into this
     /// while a pass runs; `pump_progress` reads it for the Identify screen's bar.
-    appraise: std::sync::Arc<lodestash_app::jobs::JobProgress>,
+    appraise: std::sync::Arc<lodestash_engine::jobs::JobProgress>,
     /// Appraisal queue order (UI-SPEC §3) — what the user is looking at, shared straight with the
     /// writer thread. Deliberately **not** an `Op`: browsing must never queue behind a running
     /// appraise pass, and this is a hint, not a write.
@@ -383,7 +383,7 @@ fn similar_assets(
 fn workspace_usage(
     state: tauri::State<'_, AppState>,
 ) -> Result<crate::storage::ReclaimPlan, String> {
-    let Some(workspace) = lodestash_app::paths::default_cache_dirs().1 else {
+    let Some(workspace) = lodestash_engine::paths::default_cache_dirs().1 else {
         return Ok(crate::storage::ReclaimPlan::default());
     };
     let referenced = state
@@ -410,7 +410,7 @@ struct ReclaimOutcome {
 /// dry run, and a stale plan is how a sweep deletes something that has just been re-materialized.
 #[tauri::command]
 fn reclaim_workspace(state: tauri::State<'_, AppState>) -> Result<ReclaimOutcome, String> {
-    let Some(workspace) = lodestash_app::paths::default_cache_dirs().1 else {
+    let Some(workspace) = lodestash_engine::paths::default_cache_dirs().1 else {
         return Err("no workspace directory configured".into());
     };
     let referenced = state
@@ -542,7 +542,7 @@ fn remove_from_library(
     asset_ids: Vec<i64>,
 ) -> Result<WriteResult, String> {
     let targets = state.targets(&asset_ids)?;
-    let project = lodestash_app::config::AppConfig::load().last_project_name;
+    let project = lodestash_engine::config::AppConfig::load().last_project_name;
     state.write(Op::RemoveFromLibrary { targets, project })
 }
 
@@ -560,7 +560,7 @@ fn delete_from_disk(
         .lock()
         .map(|l| l.roots())
         .map_err(|_| "library lock poisoned".to_string())?;
-    let workspace = lodestash_app::paths::default_cache_dirs().1;
+    let workspace = lodestash_engine::paths::default_cache_dirs().1;
     state.write(Op::DeleteFromDisk {
         targets,
         roots,
@@ -598,7 +598,7 @@ fn import_root(state: &tauri::State<'_, AppState>, path: &str) -> Result<WriteRe
     // ignores it resurrects everything the user removed the moment they re-add the folder.
     // Pack-only sources are honoured for the same reason — the user already said what they want
     // from that folder.
-    let config = lodestash_app::config::AppConfig::load();
+    let config = lodestash_engine::config::AppConfig::load();
     let (excludes, pack_only) = match config.last_project_name.as_deref() {
         Some(project) => (
             config.source_excludes(project, &root),
@@ -618,17 +618,17 @@ fn import_root(state: &tauri::State<'_, AppState>, path: &str) -> Result<WriteRe
         let known = state
             .library
             .lock()
-            .map(|lib| lib.known_sizes(&lodestash_app::config::stem_name(&root)))
+            .map(|lib| lib.known_sizes(&lodestash_engine::config::stem_name(&root)))
             .unwrap_or_default();
-        lodestash_app::scan::crawl_source(0, &root, &excludes, &known)
+        lodestash_engine::scan::crawl_source(0, &root, &excludes, &known)
     };
     if crawled.entries.is_empty() && crawled.pending_packages.is_empty() {
         return Err(format!("nothing indexable in {path}"));
     }
-    let records = lodestash_app::persist::crawl_records(crawled.entries.iter().map(|(_, f)| f));
-    let batch = lodestash_app::types::PersistBatch {
+    let records = lodestash_engine::persist::crawl_records(crawled.entries.iter().map(|(_, f)| f));
+    let batch = lodestash_engine::types::PersistBatch {
         root: root.to_string_lossy().into_owned(),
-        name: lodestash_app::config::stem_name(&root),
+        name: lodestash_engine::config::stem_name(&root),
         excludes_json: None,
         records,
     };
@@ -668,7 +668,7 @@ fn sync_unity_cache(state: tauri::State<'_, AppState>) -> Result<WriteResult, St
         if !root.is_dir() {
             continue;
         }
-        let config = lodestash_app::config::AppConfig::load();
+        let config = lodestash_engine::config::AppConfig::load();
         let pack_only = match config.last_project_name.as_deref() {
             Some(project) => config.is_pack_only(project, &root),
             None => false,
@@ -856,7 +856,7 @@ fn discover_package_folder(
         .map(|l| {
             l.packages()
                 .into_iter()
-                .map(|p| (lodestash_app::scan::normalize_pack_name(&p.name), p.name))
+                .map(|p| (lodestash_engine::scan::normalize_pack_name(&p.name), p.name))
                 .collect()
         })
         .unwrap_or_default();
@@ -889,7 +889,8 @@ fn discover_package_folder(
                 })
             })
             .count();
-        let category = lodestash_app::scan::dominant_content_category(&entries).map(str::to_owned);
+        let category =
+            lodestash_engine::scan::dominant_content_category(&entries).map(str::to_owned);
         // Version needs a second, targeted pass (`read_package_meta`); best-effort — a pack with
         // no UPM package.json simply shows no version.
         let version = if entries.is_empty() {
@@ -909,7 +910,7 @@ fn discover_package_folder(
                 .and_then(|m| m.version)
         };
         let duplicate_of = known
-            .get(&lodestash_app::scan::normalize_pack_name(&p.name))
+            .get(&lodestash_engine::scan::normalize_pack_name(&p.name))
             .cloned();
         cache.insert(abs.clone(), entries);
         out.push(DiscoveredPackage {
@@ -1002,15 +1003,15 @@ fn pack_dir_tree(
 /// The Svelte shell's persisted view prefs (FEATURES §10). Read once at startup; the frontend
 /// keeps its own copy and saves it back through `set_web_prefs` on every change.
 #[tauri::command]
-fn get_web_prefs() -> Result<lodestash_app::config::WebPrefs, String> {
-    lodestash_app::config::edit_config(|c| c.web.clone())
+fn get_web_prefs() -> Result<lodestash_engine::config::WebPrefs, String> {
+    lodestash_engine::config::edit_config(|c| c.web.clone())
 }
 
 /// Persist the Svelte shell's view prefs. All-or-nothing write of the whole group — the
 /// frontend is the only writer, and a partial patch would leave fields silently stale.
 #[tauri::command]
-fn set_web_prefs(prefs: lodestash_app::config::WebPrefs) -> Result<(), String> {
-    lodestash_app::config::edit_config(|c| c.web = prefs)
+fn set_web_prefs(prefs: lodestash_engine::config::WebPrefs) -> Result<(), String> {
+    lodestash_engine::config::edit_config(|c| c.web = prefs)
 }
 
 /// Trait-library authoring (UI-SPEC §9, B8a). Create or promote a trait; an existing tag keeps
@@ -1065,7 +1066,7 @@ fn set_trait_style(
 /// The Settings screen's snapshot (UI-SPEC §11). Read once; the frontend writes it back whole.
 #[tauri::command]
 fn get_settings() -> Result<Settings, String> {
-    lodestash_app::config::edit_config(|c| Settings::from_config(c))
+    lodestash_engine::config::edit_config(|c| Settings::from_config(c))
 }
 
 /// The budget guard's pre-run question (AI-PIPELINE §5.1): would this Identify run spend money,
@@ -1082,7 +1083,7 @@ fn get_settings() -> Result<Settings, String> {
 fn cloud_run_estimate(
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<serde_json::Value>, String> {
-    let cfg = lodestash_app::config::AppConfig::load();
+    let cfg = lodestash_engine::config::AppConfig::load();
     let configured =
         cfg.api_tagging_enabled && !cfg.api_key.trim().is_empty() && cfg.api_model.is_some();
     if !configured || lodestash_ai::openai::is_free_endpoint(&cfg.api_base_url) {
@@ -1139,7 +1140,7 @@ fn api_presets() -> Vec<serde_json::Value> {
 /// and the probe carries its own 30 s timeout.
 #[tauri::command]
 fn test_api_tagger() -> Result<String, String> {
-    let cfg = lodestash_app::config::AppConfig::load();
+    let cfg = lodestash_engine::config::AppConfig::load();
     let Some(model) = cfg.api_model.clone().filter(|m| !m.trim().is_empty()) else {
         return Err("No API model set — fill in the model id first.".into());
     };
@@ -1176,7 +1177,7 @@ fn clear_preview_cache(state: tauri::State<'_, AppState>) -> Result<usize, Strin
 /// grid draws follow immediately (badges, ⚑ size facet, watch toggles).
 #[tauri::command]
 fn set_settings(state: tauri::State<'_, AppState>, settings: Settings) -> Result<(), String> {
-    lodestash_app::config::edit_config(|c| settings.apply(c))?;
+    lodestash_engine::config::edit_config(|c| settings.apply(c))?;
     state
         .library
         .lock()
@@ -1661,26 +1662,26 @@ struct ModelStatus {
 
 /// AI model install status (AI-PIPELINE §2 / AI-MODELS-BY-GPU): SigLIP 2 (visual search),
 /// CLAP (audio search) and the ONNX Runtime dll they load. The downloader is
-/// `lodestash_app::models` — this just reports what's on disk.
+/// `lodestash_engine::models` — this just reports what's on disk.
 #[tauri::command]
 fn models_status() -> Vec<ModelStatus> {
     vec![
         ModelStatus {
             id: "siglip",
             label: "SigLIP 2 — visual search + tagging",
-            installed: lodestash_app::models::siglip_installed(),
+            installed: lodestash_engine::models::siglip_installed(),
             size_mb: 412,
         },
         ModelStatus {
             id: "clap",
             label: "CLAP — audio search + tagging",
-            installed: lodestash_app::models::clap_installed(),
+            installed: lodestash_engine::models::clap_installed(),
             size_mb: 163,
         },
         ModelStatus {
             id: "ort",
             label: "ONNX Runtime (native dll)",
-            installed: lodestash_app::models::ort_installed(),
+            installed: lodestash_engine::models::ort_installed(),
             size_mb: 70,
         },
     ]
@@ -1697,8 +1698,8 @@ fn model_download(state: tauri::State<'_, AppState>, model: String) -> bool {
     let handles = jobs.start(format!("Download {model}"), "download", true);
     // The tray renders the writer's own progress atomics; the downloader writes the app's.
     // A pump copies one into the other while the download runs.
-    let app_progress: std::sync::Arc<lodestash_app::jobs::JobProgress> =
-        std::sync::Arc::new(lodestash_app::jobs::JobProgress::default());
+    let app_progress: std::sync::Arc<lodestash_engine::jobs::JobProgress> =
+        std::sync::Arc::new(lodestash_engine::jobs::JobProgress::default());
     let writer_progress = handles.progress.clone();
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
@@ -1721,9 +1722,9 @@ fn model_download(state: tauri::State<'_, AppState>, model: String) -> bool {
     }
     std::thread::spawn(move || {
         let result = match model.as_str() {
-            "siglip" => lodestash_app::models::download_siglip(app_progress.clone()),
-            "clap" => lodestash_app::models::download_clap(app_progress.clone()),
-            "ort" => lodestash_app::models::download_ort(app_progress.clone()),
+            "siglip" => lodestash_engine::models::download_siglip(app_progress.clone()),
+            "clap" => lodestash_engine::models::download_clap(app_progress.clone()),
+            "ort" => lodestash_engine::models::download_ort(app_progress.clone()),
             other => Err(format!("unknown model {other:?}")),
         };
         done.store(true, Ordering::Relaxed);
@@ -1739,7 +1740,7 @@ fn model_download(state: tauri::State<'_, AppState>, model: String) -> bool {
 /// Remove the SigLIP + CLAP model dirs (Settings MODELS "Remove") so they re-download clean.
 #[tauri::command]
 fn model_remove() -> Result<(), String> {
-    lodestash_app::models::remove_models()
+    lodestash_engine::models::remove_models()
 }
 
 /// Per-pack Extract (B2b slice) — unpack the archive into the workspace and reconcile its
@@ -1812,7 +1813,7 @@ pub struct ImportBatch {
 /// connection never runs migrations and never writes (ARCHITECTURE §5 allows per-task readers).
 #[tauri::command]
 fn recent_exports(limit: usize) -> Result<Vec<ImportBatch>, String> {
-    let Some(db) = lodestash_app::paths::catalog_db_path() else {
+    let Some(db) = lodestash_engine::paths::catalog_db_path() else {
         return Ok(Vec::new());
     };
     if !db.exists() {
@@ -1988,7 +1989,7 @@ fn engine_preview_fn(cache_root: Option<std::path::PathBuf>) -> lodestash_api::P
     Box::new(move |subject| {
         use lodestash_ingest::thumb::{generate, generate_material, meta_key, ThumbParams};
         let cache = cache_root.as_deref()?;
-        let q = lodestash_app::config::AppConfig::load().preview_quality;
+        let q = lodestash_engine::config::AppConfig::load().preview_quality;
         let params = ThumbParams {
             width: q.thumb_px(),
             height: q.thumb_px(),
@@ -2007,7 +2008,7 @@ fn engine_preview_fn(cache_root: Option<std::path::PathBuf>) -> lodestash_api::P
             let albedo = match (&subject.albedo, &subject.albedo_in_pack) {
                 (Some(p), _) => Some(p.clone()),
                 (None, Some((pack, offset, size, ext))) => {
-                    lodestash_app::thumbs::ensure_in_pack_scratch(
+                    lodestash_engine::thumbs::ensure_in_pack_scratch(
                         Some(cache),
                         pack,
                         *offset,
@@ -2043,7 +2044,7 @@ fn engine_preview_fn(cache_root: Option<std::path::PathBuf>) -> lodestash_api::P
         let src = match (&subject.disk_path, &subject.in_pack) {
             (Some(p), _) => p.as_path(),
             (None, Some((pack, offset, size, ext))) => {
-                let (path, _) = lodestash_app::thumbs::ensure_in_pack_scratch(
+                let (path, _) = lodestash_engine::thumbs::ensure_in_pack_scratch(
                     Some(cache),
                     pack,
                     *offset,
@@ -2077,7 +2078,7 @@ fn engine_preview_fn(cache_root: Option<std::path::PathBuf>) -> lodestash_api::P
 /// Apply the Settings MCP allow-list (UI-SPEC §16): config holds the disabled half, the state the
 /// enabled set. Returns how many tools stayed enabled (`None` = every tool is live).
 fn apply_allow_list(state: &lodestash_api::ServerState) -> Option<usize> {
-    let cfg = lodestash_app::config::AppConfig::load();
+    let cfg = lodestash_engine::config::AppConfig::load();
     if cfg.mcp_disabled_tools.is_empty() {
         return None;
     }
@@ -2211,12 +2212,12 @@ fn build_engine_state() -> Result<
     ),
     String,
 > {
-    let db = lodestash_app::paths::catalog_db_path()
+    let db = lodestash_engine::paths::catalog_db_path()
         .ok_or("no data directory for the catalog on this system")?;
     if !db.exists() {
         return Err("no catalog on disk yet — open the app once to create it".into());
     }
-    let (cache_root, workspace) = lodestash_app::paths::default_cache_dirs();
+    let (cache_root, workspace) = lodestash_engine::paths::default_cache_dirs();
     let payload_cache = cache_root.clone();
     let state = lodestash_api::ServerState::new(
         &db,
@@ -2230,7 +2231,7 @@ fn build_engine_state() -> Result<
         state.set_payload_resolver(Box::new(move |entry| {
             use lodestash_api::AgentError;
             use lodestash_ingest::unitypackage::PayloadError;
-            lodestash_app::thumbs::materialize_in_pack_entry(&cache, entry).map_err(|e| {
+            lodestash_engine::thumbs::materialize_in_pack_entry(&cache, entry).map_err(|e| {
                 let why = e.to_string();
                 match e {
                     PayloadError::ArchiveMissing(_) => AgentError::archive_missing(why),
@@ -2245,7 +2246,7 @@ fn build_engine_state() -> Result<
     let allowed = apply_allow_list(&state);
     // ENGINE-API §8.3: `write_tags` writes under the producer the user configured for this host,
     // and refuses without one.
-    let cfg = lodestash_app::config::AppConfig::load_display_only();
+    let cfg = lodestash_engine::config::AppConfig::load_display_only();
     state.set_agent_producer(cfg.agent_producer_id);
     // Whether an agent may receive bytes at all (v1 plan S10) — metadata and links are always
     // available, the files are not until the user says so.
@@ -2254,7 +2255,7 @@ fn build_engine_state() -> Result<
     // grid's AI mode does — SigLIP and CLAP, resolved lazily on the first ai search (model load is
     // seconds; a startup resolve would slow every launch). No spaces means no model → the route
     // answers `ai_unavailable` instead of degrading.
-    state.set_query_embedder(Box::new(lodestash_app::drains::query_spaces));
+    state.set_query_embedder(Box::new(lodestash_engine::drains::query_spaces));
     let token = state.token().to_string();
     Ok((state, token, allowed))
 }
@@ -2282,7 +2283,7 @@ pub fn run() {
     // Here rather than inside the loaders: setting an environment variable is only sound while
     // the process is still single-threaded, and this is before the writer, the REST server and
     // Tauri's own threads exist.
-    lodestash_app::models::apply_ort_dylib_env();
+    lodestash_engine::models::apply_ort_dylib_env();
 
     // The MCP server is its own binary now (ADR-0022). A host still configured with
     // `lodestash-desktop --mcp` is told so, rather than opening a window it cannot see.
@@ -2315,7 +2316,7 @@ pub fn run() {
     // One writer for the process (ARCHITECTURE §5), spawned in `setup` — it needs the
     // AppHandle to push change events (pump events, B2b) to the Svelte shell.
     let pump = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let appraise = std::sync::Arc::new(lodestash_app::jobs::JobProgress::default());
+    let appraise = std::sync::Arc::new(lodestash_engine::jobs::JobProgress::default());
     let focus = std::sync::Arc::new(Mutex::new(lodestash_core::catalog::AppraiseFocus::default()));
     let job_registry = crate::writer::JobRegistry::default();
 
@@ -2352,7 +2353,7 @@ pub fn run() {
             // One writer for the process (ARCHITECTURE §5), spawned before any command can
             // run — setup runs before the event loop. It carries the AppHandle so changes
             // are pushed to the shell (pump events, B2b) instead of the UI polling.
-            let writer = lodestash_app::paths::catalog_db_path()
+            let writer = lodestash_engine::paths::catalog_db_path()
                 .filter(|p| p.exists())
                 .map(|p| {
                     Writer::spawn(

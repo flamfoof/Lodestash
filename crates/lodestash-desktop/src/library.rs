@@ -8,11 +8,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use lodestash_app::config::{SizeTier, SizeTiers, SortBy};
-use lodestash_app::grid;
-use lodestash_app::types::{Category, ContentFilter, StatusFilter, TriBucket};
 use lodestash_core::catalog::{AppraiseFocus, Catalog};
 use lodestash_core::types::{AssetStatus, MediaType};
+use lodestash_engine::config::{SizeTier, SizeTiers, SortBy};
+use lodestash_engine::grid;
+use lodestash_engine::types::{Category, ContentFilter, StatusFilter, TriBucket};
 use serde::{Deserialize, Serialize};
 
 /// One asset as the grid needs it. Carries a `preview_key`, never bytes — the frontend fetches
@@ -426,8 +426,8 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn from_config(c: &lodestash_app::config::AppConfig) -> Self {
-        use lodestash_app::config::PreviewQuality;
+    pub fn from_config(c: &lodestash_engine::config::AppConfig) -> Self {
+        use lodestash_engine::config::PreviewQuality;
         Self {
             m_kb: c.size_tiers.m_kb,
             l_kb: c.size_tiers.l_kb,
@@ -457,9 +457,9 @@ impl Settings {
         }
     }
 
-    pub fn apply(self, c: &mut lodestash_app::config::AppConfig) {
-        use lodestash_app::config::PreviewQuality;
-        c.size_tiers = lodestash_app::config::SizeTiers {
+    pub fn apply(self, c: &mut lodestash_engine::config::AppConfig) {
+        use lodestash_engine::config::PreviewQuality;
+        c.size_tiers = lodestash_engine::config::SizeTiers {
             m_kb: self.m_kb,
             l_kb: self.l_kb,
             xl_kb: self.xl_kb,
@@ -724,7 +724,7 @@ impl Library {
     /// Open the catalog the egui app writes, read-only. Missing catalog is not an error: the
     /// shell shows an empty library and says so.
     pub fn open() -> Self {
-        let Some(path) = lodestash_app::paths::catalog_db_path() else {
+        let Some(path) = lodestash_engine::paths::catalog_db_path() else {
             return Self::empty();
         };
         if !path.exists() {
@@ -734,12 +734,12 @@ impl Library {
             Ok(cat) => {
                 let mut lib = Self {
                     catalog: Some(cat),
-                    thumb_cache: lodestash_app::paths::default_cache_dirs().0,
+                    thumb_cache: lodestash_engine::paths::default_cache_dirs().0,
                     catalog_path: Some(path),
                     sources: Vec::new(),
                     rows: Vec::new(),
                     paths: HashMap::new(),
-                    tiers: lodestash_app::config::AppConfig::load()
+                    tiers: lodestash_engine::config::AppConfig::load()
                         .size_tiers
                         .normalized(),
                 };
@@ -756,7 +756,7 @@ impl Library {
     fn empty() -> Self {
         Self {
             catalog: None,
-            thumb_cache: lodestash_app::paths::default_cache_dirs().0,
+            thumb_cache: lodestash_engine::paths::default_cache_dirs().0,
             catalog_path: None,
             sources: Vec::new(),
             rows: Vec::new(),
@@ -770,7 +770,7 @@ impl Library {
         // Size tiers feed the S/M/L/XL badges and the ⚑ size facet; they come from config, which
         // Settings edits — re-read here so a change lands without a restart (the grid never holds
         // a second copy to go stale).
-        self.tiers = lodestash_app::config::AppConfig::load()
+        self.tiers = lodestash_engine::config::AppConfig::load()
             .size_tiers
             .normalized();
         let Some(cat) = self.catalog.as_ref() else {
@@ -784,7 +784,7 @@ impl Library {
             }
         };
 
-        let (_, workspace_dir) = lodestash_app::paths::default_cache_dirs();
+        let (_, workspace_dir) = lodestash_engine::paths::default_cache_dirs();
         let mut rows = Vec::new();
         let mut paths = HashMap::new();
         let mut sources = Vec::new();
@@ -2087,7 +2087,7 @@ impl Library {
         if needle.is_empty() {
             return None;
         }
-        let spaces = lodestash_app::drains::query_spaces(needle);
+        let spaces = lodestash_engine::drains::query_spaces(needle);
         if spaces.is_empty() {
             return None;
         }
@@ -2355,7 +2355,7 @@ impl Library {
         let Some(cat) = self.catalog.as_ref() else {
             return Default::default();
         };
-        let workspace = lodestash_app::paths::default_cache_dirs().1;
+        let workspace = lodestash_engine::paths::default_cache_dirs().1;
         cat.model_slot_texture_paths(asset_id, workspace.as_deref())
             .unwrap_or_default()
     }
@@ -2577,7 +2577,7 @@ mod tests {
             .collect();
         Library {
             catalog: None,
-            thumb_cache: lodestash_app::paths::default_cache_dirs().0,
+            thumb_cache: lodestash_engine::paths::default_cache_dirs().0,
             catalog_path: None,
             sources: Vec::new(),
             rows,
@@ -2716,7 +2716,7 @@ mod tests {
         assert_eq!(l.page(&q(Some("synty"))).total, 0, "source match is exact");
     }
 
-    /// The bucket rule itself lives in `lodestash_app::types` and is tested there. What this
+    /// The bucket rule itself lives in `lodestash_engine::types` and is tested there. What this
     /// asserts is the *wiring*: that a query's tab reaches that rule, over rows whose
     /// `media_type` came out of the catalog as a string. A parse that silently yields `None`
     /// would empty every tab but All while the grid still looks populated.
@@ -3043,7 +3043,7 @@ mod tests {
         );
     }
 
-    /// Wiring again: the fold itself is tested in `lodestash_app::types`. This asserts the
+    /// Wiring again: the fold itself is tested in `lodestash_engine::types`. This asserts the
     /// catalog's status *string* reaches it — the four states arrive as text and are parsed once
     /// at hydrate, so a parse failure would silently file every asset under Unidentified.
     #[test]

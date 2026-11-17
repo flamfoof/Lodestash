@@ -11,8 +11,7 @@
 //! Pure and synchronous on purpose. Threading, generations and progress rows are the caller's —
 //! they are how a *frontend* stays responsive, not part of what a crawl is.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 
 use lodestash_core::catalog::PackageEntryRecord;
 use lodestash_core::types::Exclude;
@@ -21,16 +20,6 @@ use lodestash_ingest::{detect, unitypackage};
 
 use crate::types::PendingPackage;
 
-/// One source to crawl, with the per-source rules that decide what comes back.
-pub struct Source {
-    pub root: PathBuf,
-    /// The source's blacklist (INGESTION §1) — resolved by the caller, since it lives in config.
-    pub excludes: Vec<Exclude>,
-    /// Pack-only sources (FEATURES §5.2) are tracked but not crawled for loose files: their packs
-    /// surface as in-pack libraries through the hydrate instead (M14).
-    pub pack_only: bool,
-}
-
 /// What a crawl found. `entries` carries the source index so a multi-source scan stays attributable.
 #[derive(Default)]
 pub struct Crawled {
@@ -38,27 +27,15 @@ pub struct Crawled {
     pub pending_packages: Vec<PendingPackage>,
 }
 
-/// Crawl every source in order.
+/// Crawl one source, attributing everything to `source_idx`.
 ///
 /// A `.unitypackage` is never surfaced as an asset: the archive itself is not a thing you browse,
-/// so it becomes a [`PendingPackage`] offering Extract instead (INGESTION §2). Anything the
+/// so it becomes a [`PendingPackage`] the writer records as a pack (INGESTION §2). Anything the
 /// crawler could not classify is dropped — an unrecognised file is not content, and putting it in
 /// the grid means a card with no type, no thumbnail and nothing to do with it.
-pub fn crawl_sources(sources: &[Source]) -> Crawled {
-    let mut out = Crawled::default();
-    // Multi-source wrapper has no DB context, so every browseable file hashes (the desktop's
-    // single-source `crawl_source` passes the incremental diff).
-    let known = std::collections::HashMap::new();
-    for (source_idx, source) in sources.iter().enumerate() {
-        if source.pack_only {
-            continue;
-        }
-        crawl_one(source_idx, &source.root, &source.excludes, &known, &mut out);
-    }
-    out
-}
-
-/// Crawl a single source, attributing everything to `source_idx` — the partial-rescan path.
+///
+/// `known` is the catalog's last-known `(size, mtime)` per `rel_path`: a file it matches is not
+/// re-hashed (the incremental diff, DATA-MODEL §6).
 pub fn crawl_source(
     source_idx: usize,
     root: &Path,
@@ -131,26 +108,15 @@ pub fn package_display_name(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-/// Browse a freshly-crawled `.unitypackage` (cheap manifest read, no extraction) and turn it into
-/// a [`PendingPackage`] ready for the user to act on.
+/// Browse a freshly-crawled `.unitypackage` (cheap manifest read, no extraction) into a
+/// [`PendingPackage`] the writer records as a browsable pack.
 ///
-/// Runs on the caller's background thread, so a large package's manifest read — still O(file size)
-/// to decompress, but O(1) memory — never blocks a frame. Returns `None` if the archive cannot be
-/// read at all: corrupt or unsupported packs are skipped silently rather than surfaced as error
-/// cards, matching INGESTION §8's "don't promise 100%".
+/// Runs on the crawl's thread, so a large package's manifest read — still O(file size) to
+/// decompress, but O(1) memory — never lands on the writer. Returns `None` if the archive cannot
+/// be read at all: corrupt or unsupported packs are skipped rather than surfaced as error cards,
+/// matching INGESTION §8's "don't promise 100%".
 pub fn resolve_pending_package(source_idx: usize, file: &CrawledFile) -> Option<PendingPackage> {
     let manifest = unitypackage::read_manifest(&file.abs_path).ok()?;
-    let nested = unitypackage::nested_package_candidates(&manifest);
-    let chosen_variant = unitypackage::preferred_variant_index(&nested);
-    let nested_candidates = nested
-        .iter()
-        .filter_map(|e| {
-            e.pathname
-                .clone()
-                .map(|p| (package_display_name(Path::new(&p)), p))
-        })
-        .collect();
-
     let entries = manifest
         .iter()
         .map(|e| PackageEntryRecord {
@@ -160,19 +126,11 @@ pub fn resolve_pending_package(source_idx: usize, file: &CrawledFile) -> Option<
             size_bytes: e.asset_size.map(|s| s as i64),
         })
         .collect();
-
     Some(PendingPackage {
         source_idx,
         abs_path: file.abs_path.clone(),
         display_name: package_display_name(&file.rel_path),
-        nested_candidates,
-        chosen_variant,
-        extracting: false,
-        progress: Arc::default(),
         entries,
-        job: None,
-        browsing: false,
-        picked: std::collections::BTreeSet::new(),
     })
 }
 
@@ -270,59 +228,17 @@ mod tests {
         );
     }
 
-    /// A pack-only source is tracked but never walked for loose files: its packs arrive through
-    /// the hydrate instead. Crawling it anyway would surface the archive's neighbours as assets
-    /// of a source the user explicitly said holds only packs.
-    #[test]
-    fn a_pack_only_source_is_not_crawled() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        std::fs::write(dir.path().join("Rock.fbx"), b"not really an fbx").expect("write");
-        let crawled = crawl_sources(&[Source {
-            root: dir.path().to_path_buf(),
-            excludes: Vec::new(),
-            pack_only: true,
-        }]);
-        assert!(
-            crawled.entries.is_empty(),
-            "pack-only sources are not walked"
-        );
-
-        let crawled = crawl_sources(&[Source {
-            root: dir.path().to_path_buf(),
-            excludes: Vec::new(),
-            pack_only: false,
-        }]);
-        assert_eq!(
-            crawled.entries.len(),
-            1,
-            "…but the same source is when it is not"
-        );
-    }
-
     /// Every entry carries the index of the source it came from, or a multi-source scan cannot
     /// say which library an asset belongs to — the question the whole browse design is built to
     /// keep answerable.
     #[test]
     fn entries_are_attributed_to_their_source() {
-        let a = tempfile::tempdir().expect("temp dir");
-        let b = tempfile::tempdir().expect("temp dir");
-        std::fs::write(a.path().join("one.fbx"), b"x").expect("write");
-        std::fs::write(b.path().join("two.fbx"), b"x").expect("write");
-        let crawled = crawl_sources(&[
-            Source {
-                root: a.path().to_path_buf(),
-                excludes: Vec::new(),
-                pack_only: false,
-            },
-            Source {
-                root: b.path().to_path_buf(),
-                excludes: Vec::new(),
-                pack_only: false,
-            },
-        ]);
-        let mut idxs: Vec<usize> = crawled.entries.iter().map(|(i, _)| *i).collect();
-        idxs.sort_unstable();
-        assert_eq!(idxs, [0, 1]);
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("one.fbx"), b"x").expect("write");
+        let known = std::collections::HashMap::new();
+        let crawled = crawl_source(3, dir.path(), &[], &known);
+        let idxs: Vec<usize> = crawled.entries.iter().map(|(i, _)| *i).collect();
+        assert_eq!(idxs, [3]);
     }
 
     /// The blacklist is what **Remove from library** writes (B5), so a crawl that ignored it would
@@ -333,14 +249,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::write(dir.path().join("keep.fbx"), b"x").expect("write");
         std::fs::write(dir.path().join("drop.fbx"), b"x").expect("write");
-        let crawled = crawl_sources(&[Source {
-            root: dir.path().to_path_buf(),
-            excludes: vec![Exclude {
-                kind: ExcludeKind::Asset,
-                value: "drop.fbx".into(),
-            }],
-            pack_only: false,
-        }]);
+        let excludes = [Exclude {
+            kind: ExcludeKind::Asset,
+            value: "drop.fbx".into(),
+        }];
+        let crawled = crawl_source(0, dir.path(), &excludes, &std::collections::HashMap::new());
         let names: Vec<String> = crawled
             .entries
             .iter()

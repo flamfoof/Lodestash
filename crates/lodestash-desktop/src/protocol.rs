@@ -223,7 +223,7 @@ fn thumb(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
                 .in_pack
                 .as_ref()
                 .and_then(|loc| std::fs::metadata(&loc.pack_path).ok())
-                .map(|m| m.len() > lodestash_app::thumbs::IN_PACK_THUMB_MAX_BYTES)
+                .map(|m| m.len() > lodestash_engine::thumbs::IN_PACK_THUMB_MAX_BYTES)
                 .unwrap_or(false);
             if over_cap {
                 return status(
@@ -249,7 +249,7 @@ fn thumb(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
     // at the new settings. The client URL carries `?q=` (see api.ts thumbUrl) purely as a
     // cache-buster — a bare id URL with max-age would keep serving the old-size PNG after a
     // Settings change.
-    let quality = lodestash_app::config::AppConfig::load_display_only().preview_quality;
+    let quality = lodestash_engine::config::AppConfig::load_display_only().preview_quality;
     let side = quality.thumb_px();
     let params = lodestash_ingest::thumb::ThumbParams {
         width: side,
@@ -272,7 +272,7 @@ fn thumb(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
     );
     let made = match job.media_type.as_str() {
         "audio" => lodestash_ingest::thumb::generate_waveform(&cache, &key, params, |bars| {
-            lodestash_app::audio::load_waveform(&path, bars).map(|m| m.peaks)
+            lodestash_engine::audio::load_waveform(&path, bars).map(|m| m.peaks)
         }),
         "material" => {
             // The texture is part of the picture, so it is part of the key: swap a material's
@@ -334,7 +334,7 @@ fn thumb(lib: &Mutex<Library>, rest: &str) -> Response<Vec<u8>> {
 /// `extract_at_offsets` skip-scan is what lifts it.
 fn in_pack_scratch(job: &crate::library::ThumbJob, cache: &Path) -> Option<std::path::PathBuf> {
     let loc = job.in_pack.as_ref()?;
-    lodestash_app::thumbs::ensure_in_pack_scratch(
+    lodestash_engine::thumbs::ensure_in_pack_scratch(
         Some(cache),
         &loc.pack_path,
         loc.offset,

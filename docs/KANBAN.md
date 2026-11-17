@@ -540,9 +540,9 @@ translation. The port removes the translation; the egui build stayed buildable a
         (244 · 1fr · 268) with a persistent left DIRECTORY tree, ← → ↑ history, a **pack-rooted**
         breadcrumb, and a folders-first list with a `Name · Size · Items` header.
         `build_pack_dir_tree`, `DirNode`, `seed_expanded` and `ancestors_expanded`
-        (`lodestash-app/src/types.rs:122–269`) are written and unit-tested but **unreachable from
+        (egui-era `lodestash-app/src/types.rs:122–269`, deleted in v2 Task 2.2) were written and unit-tested but **unreachable from
         the desktop crate** — they need one `pack_dir_tree` command. `content_third_col`
-        (`grid.rs:236`) already computes the list's third column.
+        (`grid.rs:94`) already computes the list's third column.
         ~~Two smaller conformance gaps ride along: the sidebar facet groups and the `counts`
         prop.~~ **Done 2026-08-04 — see B8d.** Still open here: the toolbar is missing the result
         label and the ★ Favorites toggle with its gold count pill.
@@ -753,7 +753,7 @@ tracking; these cards track phases).
 
 - [x] **V2-P0** Review, spec, ADR-0021/0022/0023, plan, one reconciled prototype
 - [x] **V2-P1** Core hardening — typed errors, migration lifecycle, `CatalogReader`, lookup indexes, moves keep identity, atomic project registration, robust unitypackage reads *(2026-11-16; one carry-over: the desktop writer's `Op::SetTrashed` moves to `Catalog::set_trashed_recorded` with the writer in Task 2.3)*
-- [ ] **V2-P2** `lodestash-protocol` operation catalog; `lodestash-engine` absorbs app + writer + read model; config store; one appraisal plan and job registry
+- [ ] **V2-P2** `lodestash-protocol` operation catalog; `lodestash-engine` absorbs app + writer + read model; config store; one appraisal plan and job registry *(in progress: 2.1 protocol and 2.2 `lodestash-app` → `lodestash-engine` done)*
 - [ ] **V2-P3** `lodestash-api` derived from the catalog; UI session, request checks, SSE, bytes, static UI
 - [x] **V2-P4** `lodestash-mcp` standalone thin client with auto-launch (also retired `--mcp` and `agent_bridge.rs`)
 - [ ] **V2-P5** Thin Tauri shell; retire Tauri commands, `lodestash://`, old `ui/`

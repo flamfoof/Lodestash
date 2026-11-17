@@ -39,7 +39,7 @@ rusqlite = { workspace = true }
 # Catalog access. Reads come off this crate's own connection; every write goes through the one
 # writer thread in `writer.rs` (ARCHITECTURE §5, single writer).
 lodestash-core = { workspace = true }
-lodestash-app = { workspace = true }
+lodestash-engine = { workspace = true }
 # Mesh parse + decimation for the Quick Look viewer (lodestash://mesh).
 lodestash-ingest = { workspace = true }
 # The agent plane (B12, ENGINE-API §1–2): the loopback REST server, with its own

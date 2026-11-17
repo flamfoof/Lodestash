@@ -27,18 +27,18 @@ use lodestash_ai::image_tags::ImageZeroShot;
 use lodestash_ai::ollama::OllamaTagger;
 use lodestash_ai::openai::OpenAiTagger;
 use lodestash_ai::tagger::{FilenameTagger, Tagger, TeachTrait};
-use lodestash_app::config::AppConfig;
-use lodestash_app::drains::{
-    drain_audio_tags, drain_previews, drain_promote_resync, drain_tags, resolve_audio_embedder,
-    resolve_embedder,
-};
-use lodestash_app::jobs::JobProgress as AppJobProgress;
-use lodestash_app::paths::default_cache_dirs;
-use lodestash_app::types::PersistBatch;
 use lodestash_core::catalog::{
     AppraiseFocus, Catalog, HistoryOrigin, PackageEntryRecord, TagBatch, TagBatchItem, TagMode,
 };
 use lodestash_core::types::{Exclude, ExcludeKind};
+use lodestash_engine::config::AppConfig;
+use lodestash_engine::drains::{
+    drain_audio_tags, drain_previews, drain_promote_resync, drain_tags, resolve_audio_embedder,
+    resolve_embedder,
+};
+use lodestash_engine::jobs::JobProgress as AppJobProgress;
+use lodestash_engine::paths::default_cache_dirs;
+use lodestash_engine::types::PersistBatch;
 use lodestash_ingest::unitypackage::{
     extract_at_offsets_with_progress, read_manifest_with_progress, EntryLocator, ExtractedAsset,
 };
@@ -405,13 +405,13 @@ enum WriterMsg {
     /// (a `POST /v1/stage` went from 25 ms to ~18 s the moment an embedder actually loaded).
     EmbeddingsDone {
         model_id: String,
-        done: Vec<lodestash_app::drains::ComputedEmbedding>,
+        done: Vec<lodestash_engine::drains::ComputedEmbedding>,
     },
     /// A background tag worker finished a slice — same split, same reason: a caption is a whole
     /// VLM inference (~13 s here) and the writer only persists the result.
     TagsDone {
-        producers: lodestash_app::drains::TagProducers,
-        done: Vec<lodestash_app::drains::ComputedTags>,
+        producers: lodestash_engine::drains::TagProducers,
+        done: Vec<lodestash_engine::drains::ComputedTags>,
     },
 }
 
@@ -1150,7 +1150,7 @@ impl Writer {
                             // Cheap: N `upsert_embedding` calls, no inference. Clearing
                             // `embedding_dirty` here is what lets `promote_statuses` move the
                             // asset on, so the promote runs on the next idle tick.
-                            let n = lodestash_app::drains::store_visual_embeddings(
+                            let n = lodestash_engine::drains::store_visual_embeddings(
                                 &mut catalog,
                                 &model_id,
                                 &done,
@@ -1162,7 +1162,7 @@ impl Writer {
                         }
                         Ok(WriterMsg::TagsDone { producers, done }) => {
                             let before = catalog.total_changes();
-                            let n = lodestash_app::drains::store_tags(&mut catalog, &producers, &done);
+                            let n = lodestash_engine::drains::store_tags(&mut catalog, &producers, &done);
                             tag_inflight.store(false, Ordering::Relaxed);
                             if n > 0 {
                                 tracing::info!(tags = n, producer = %producers.tagger.0, "idle tagging slice stored");
@@ -1278,7 +1278,7 @@ impl Writer {
                                     if !embed_inflight.load(Ordering::Relaxed) {
                                         const SLICE: usize = 8;
                                         let (jobs, albedo) =
-                                            lodestash_app::drains::visual_embed_batch(
+                                            lodestash_engine::drains::visual_embed_batch(
                                                 &catalog, SLICE,
                                             );
                                         if !jobs.is_empty() {
@@ -1289,7 +1289,7 @@ impl Writer {
                                                 (workspace_dir.clone(), cache_dir.clone());
                                             std::thread::spawn(move || {
                                                 let done =
-                                                    lodestash_app::drains::compute_visual_embeddings(
+                                                    lodestash_engine::drains::compute_visual_embeddings(
                                                         jobs,
                                                         &albedo,
                                                         emb.as_ref(),
@@ -1319,7 +1319,7 @@ impl Writer {
                                 // about writes (ADR-0002), which still all land right here.
                                 if !tag_inflight.load(Ordering::Relaxed) {
                                     const TAG_SLICE: usize = 4;
-                                    let jobs = lodestash_app::drains::tag_batch(
+                                    let jobs = lodestash_engine::drains::tag_batch(
                                         &catalog, TAG_SLICE, None,
                                     );
                                     if !jobs.is_empty() {
@@ -1424,7 +1424,7 @@ fn rescan_watched(catalog: &mut Catalog, db_path: &Path) -> bool {
             continue;
         }
         let root = PathBuf::from(&info.root_path);
-        prefab_scopes.push(lodestash_app::drains::PrefabScope {
+        prefab_scopes.push(lodestash_engine::drains::PrefabScope {
             root: root.clone(),
             absent_is_empty: false,
         });
@@ -1434,11 +1434,12 @@ fn rescan_watched(catalog: &mut Catalog, db_path: &Path) -> bool {
         let known = catalog
             .known_sizes_for_source(&info.root_path)
             .unwrap_or_default();
-        let crawled = lodestash_app::scan::crawl_source(0, &root, &excludes, &known);
+        let crawled = lodestash_engine::scan::crawl_source(0, &root, &excludes, &known);
         if crawled.entries.is_empty() && crawled.pending_packages.is_empty() {
             continue;
         }
-        let records = lodestash_app::persist::crawl_records(crawled.entries.iter().map(|(_, f)| f));
+        let records =
+            lodestash_engine::persist::crawl_records(crawled.entries.iter().map(|(_, f)| f));
         // Cheap in-memory diff against the catalog's last-known (size, mtime): nothing moved on
         // disk means nothing to persist (and no spurious `last_scanned_at` write + UI reload).
         let same = records.len() == known.len()
@@ -1450,20 +1451,20 @@ fn rescan_watched(catalog: &mut Catalog, db_path: &Path) -> bool {
         if same {
             continue;
         }
-        let batch = lodestash_app::types::PersistBatch {
+        let batch = lodestash_engine::types::PersistBatch {
             root: info.root_path.clone(),
             name: info.name.clone(),
             excludes_json: None,
             records,
         };
-        match lodestash_app::persist::persist_to_catalog(db_path, &[batch]) {
+        match lodestash_engine::persist::persist_to_catalog(db_path, &[batch]) {
             Ok(_) => changed = true,
             Err(e) => tracing::warn!(%e, root = %info.root_path, "watch rescan failed"),
         }
     }
     // A prefab is not an asset, so the crawl above never sees one change — yet the watch fired.
     // Re-read the watched trees' prefab evidence; only files whose revision moved are parsed.
-    if lodestash_app::drains::refresh_prefab_evidence(catalog, &prefab_scopes, false) > 0 {
+    if lodestash_engine::drains::refresh_prefab_evidence(catalog, &prefab_scopes, false) > 0 {
         changed = true;
     }
     changed
@@ -1525,8 +1526,8 @@ fn tag_worker_slice(
     };
     // Resolved here, on the read connection: the compute phase below runs off the writer and has
     // no catalog to ask what a model wears (v1 plan S08).
-    let slots = lodestash_app::drains::slot_textures_for(&cat, &jobs, workspace_dir.as_deref());
-    let done = lodestash_app::drains::compute_tags(
+    let slots = lodestash_engine::drains::slot_textures_for(&cat, &jobs, workspace_dir.as_deref());
+    let done = lodestash_engine::drains::compute_tags(
         jobs,
         tagger.as_ref(),
         zero_shot.as_ref(),
@@ -1535,7 +1536,7 @@ fn tag_worker_slice(
         &slots,
     );
     tx.send(WriterMsg::TagsDone {
-        producers: lodestash_app::drains::TagProducers {
+        producers: lodestash_engine::drains::TagProducers {
             tagger: (tagger.producer_id(), tagger.model_id().to_string()),
             zero_shot: zero_shot
                 .as_ref()
@@ -1640,7 +1641,7 @@ fn appraise_pass(
             Some(model) => {
                 let api = OpenAiTagger::new(cfg.api_base_url.clone(), cfg.api_key.clone(), model)
                     .with_teaching(teach.clone());
-                lodestash_app::drains::drain_api_tags(
+                lodestash_engine::drains::drain_api_tags(
                     catalog,
                     &cfg,
                     &api,
@@ -1894,7 +1895,7 @@ fn run(
                 .unwrap_or_else(|| "Import".to_string());
             let job = jobs.start(label, "import", false);
             let result = (|| {
-                lodestash_app::persist::persist_to_catalog(db_path, &batches)
+                lodestash_engine::persist::persist_to_catalog(db_path, &batches)
                     .map_err(|e| e.to_string())?;
                 for pack in packs {
                     let Some(source) = catalog
@@ -1922,12 +1923,12 @@ fn run(
                 // queued would re-read it: re-read the scanned trees' prefab evidence here.
                 let scopes: Vec<_> = batches
                     .iter()
-                    .map(|b| lodestash_app::drains::PrefabScope {
+                    .map(|b| lodestash_engine::drains::PrefabScope {
                         root: PathBuf::from(&b.root),
                         absent_is_empty: false,
                     })
                     .collect();
-                lodestash_app::drains::refresh_prefab_evidence(catalog, &scopes, false);
+                lodestash_engine::drains::refresh_prefab_evidence(catalog, &scopes, false);
                 Ok(WriteResult {
                     changed,
                     ..Default::default()
@@ -1946,7 +1947,7 @@ fn run(
             let label = format!("Import {} packs", packs.len());
             let job = jobs.start(label, "import", false);
             let result = (|| {
-                let name = lodestash_app::config::stem_name(std::path::Path::new(&root));
+                let name = lodestash_engine::config::stem_name(std::path::Path::new(&root));
                 let source_id = catalog
                     .upsert_import_source(&name, &root, "folder")
                     .map_err(|e| e.to_string())?;
@@ -2732,7 +2733,7 @@ fn mint_in_pack(
     package_id: i64,
     entries: &[PackageEntryRecord],
 ) -> Result<usize, String> {
-    let classified = lodestash_app::persist::classify_in_pack_entries(entries);
+    let classified = lodestash_engine::persist::classify_in_pack_entries(entries);
     let stats = catalog
         .mint_in_pack_assets(package_id, &classified)
         .map_err(|e| e.to_string())?;
@@ -2863,9 +2864,9 @@ fn materialize_extract(
     }
     // The extraction landed prefabs beside the assets, and they are evidence about those assets.
     if let Some(ws) = workspace {
-        lodestash_app::drains::refresh_prefab_evidence(
+        lodestash_engine::drains::refresh_prefab_evidence(
             catalog,
-            &[lodestash_app::drains::PrefabScope {
+            &[lodestash_engine::drains::PrefabScope {
                 root: ws,
                 absent_is_empty: true,
             }],
@@ -2901,7 +2902,7 @@ fn remove_from_library(
         // rather than reporting a removal that a scan will undo.
         return Err("no project is open, so the asset cannot be excluded from future scans".into());
     };
-    let mut config = lodestash_app::config::AppConfig::load();
+    let mut config = lodestash_engine::config::AppConfig::load();
     let mut excluded = 0;
     for t in &targets {
         let Some(root) = t.source_root.as_deref() else {
@@ -2948,7 +2949,7 @@ fn sync_source_exclude_to_config(
         },
         value: value.to_string(),
     };
-    lodestash_app::config::edit_config(|config| {
+    lodestash_engine::config::edit_config(|config| {
         let Some(project) = config.last_project_name.clone() else {
             return;
         };
@@ -2969,7 +2970,7 @@ fn deletable(t: &Target, roots: &[PathBuf], workspace: Option<&Path>) -> bool {
     let Some(path) = t.abs_path.as_deref() else {
         return false;
     };
-    if !path.is_file() || !lodestash_app::thumbs::under_known_root(path, roots, workspace) {
+    if !path.is_file() || !lodestash_engine::thumbs::under_known_root(path, roots, workspace) {
         tracing::warn!(path = %path.display(), "refused to delete: outside every known root");
         return false;
     }

@@ -272,11 +272,14 @@ surfaces as an error rather than a silently stale answer.
 ```
 lodestash/
 ├─ crates/
-│  ├─ lodestash-core/      # catalog, search, mapping, jobs, asset ops (no UI)
+│  ├─ lodestash-core/      # catalog, search, mapping, asset ops (no UI)
 │  ├─ lodestash-ingest/    # crawl, detect, untar, meta-parse, normalize, thumbnail
 │  ├─ lodestash-ai/        # Tagger/Embedder traits + ONNX/Ollama/cloud impls
-│  ├─ lodestash-mcp/       # rmcp server over lodestash-core
-│  ├─ lodestash-api/       # loopback HTTP/JSON API over lodestash-core
+│  ├─ lodestash-protocol/  # the operation catalog + wire DTOs (no I/O)
+│  ├─ lodestash-engine/    # the service: config, models, scan/persist, identify drains
+│  │                       #   (absorbed lodestash-app, v2 plan Task 2.2)
+│  ├─ lodestash-api/       # loopback HTTP/JSON API
+│  ├─ lodestash-mcp/       # MCP server binary — a thin client of /v1 (ADR-0022)
 │  └─ lodestash-desktop/  # Tauri 2 + Svelte shell — the current app (egui retired at B7)
 │                          #   (lodestash-cli — headless ops for power users & CI — is planned;
 │                          #    the crate lands with the first CLI command, not before)
