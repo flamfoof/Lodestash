@@ -47,6 +47,6 @@ rusqlite = { workspace = true }
 
 # Windows Credential Manager for the cloud API key at rest (AI-PIPELINE §5.1). Windows-only on
 # purpose: the app targets win-x64, and other platforms fall back to the plaintext-config path
-# (config.rs) — no dbus/secret-service pulled into the build.
+# (config_store.rs) — no dbus/secret-service pulled into the build.
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }

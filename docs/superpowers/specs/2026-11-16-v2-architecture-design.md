@@ -146,6 +146,19 @@ HTTP mapping: 404/422/409/403/503/429/413/500, body `{error:{code,message,detail
   reads return `{configured: bool}` (fixes U8). Reading settings never writes the file.
 - Settings changes apply live to the engine (allow-list, byte release, egress consent) — fixes S2
   by making the consent fields part of the typed `Settings` DTO in `lodestash-protocol`.
+- *As built (Task 2.4):* `crates/lodestash-engine/src/config_store.rs`. The store loads the file
+  once and serves reads from memory (an edit made by hand while the app runs is not seen, and the
+  next save replaces it); `update` saves temp → `sync_all` → rename under the store's one mutex and
+  leaves memory unchanged when the save fails. A file that does not parse (or cannot be read) is
+  renamed to `config.json.corrupt-<unix-ts>`; `Engine::report()` carries `config_recovered` (that
+  path) beside the status until `Engine::dismiss_config_recovered`. `Settings` is sectioned in Rust
+  (`appearance`, `library`, `identify`, `cloud`, `agents`, `storage`, each applied on its own) and
+  flat on the wire — the sections are `#[serde(flatten)]`, so the object is the one the old
+  shell's `get_settings`/`set_settings` already exchange. The secret is write-only as two fields:
+  a read carries `api_key_configured: bool` and no `api_key`; a write's `api_key` absent keeps
+  the key, `""` clears it, a value replaces it. Live application: `ConfigStore::on_change`
+  observers; the agent planes subscribe with `ServerState::follow_config` (allow-list, byte
+  release, agent producer), and every appraise pass reads the consent from the store when it starts.
 
 ### 4.6 Identification plan
 

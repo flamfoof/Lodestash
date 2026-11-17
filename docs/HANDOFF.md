@@ -108,7 +108,8 @@ the B7 cutover landed 2026-08-07 (egui `lodestash-ui` deleted; `--mcp` untouched
 server is `lodestash-mcp`, its own crate).
 
 **Traps carried forward:** single-writer rule; `set_tags` replaces per-source (UI uses
-`add_asset_tag` for appends); undo tail capped 200; config writes only via `edit_config`;
+`add_asset_tag` for appends); undo tail capped 200; config reads and writes only through the
+engine's `ConfigStore` (v2 Task 2.4 — atomic, one lock; it replaced `edit_config`);
 preview backfill runs on the persist thread idle in 1s slices, **one tick in four**
 ([ADR-0014](decisions/ADR-0014-the-backlog-lane-is-duty-cycled.md)) — `LODESTASH_NO_PREVIEW_DRAIN=1`
 skips it entirely (e2e sets this); the e2e harness taskkills the app, so geometry persists via the
@@ -214,8 +215,8 @@ LINKS chip, bulk bar, Inspector slices, staging tray, undo button). Verified: Ru
   B9 follow-ups, listed on the B9f/B9b cards.
 
 **Traps carried forward:** single-writer rule (every catalog write via `writer.rs` `Op`; the
-writer now also owns the blacklist→config sync — config writes go through the shared
-`edit_config` lock, never a second `CONFIG_LOCK`); `set_tags` **replaces** the per-source set,
+writer now also owns the blacklist→config sync — config writes go through the engine's one
+`ConfigStore::update`, never a second lock or a direct file write); `set_tags` **replaces** the per-source set,
 so the UI uses `add_asset_tag` for appends — do not "simplify" the bulk path back to
 `set_tags`; undo rows are capped at 200 and bulk ops log only the assets that changed.
 
@@ -441,7 +442,7 @@ in prose, so the VLM captions and a text model writes the facets; the caption be
   fallback per asset (latches `api_dead`); no fallback → leave dirty + stop. Plus an **endpoint-preset
   picker** (`openai::PRESETS` Local/Gemini/Groq/OpenRouter + `is_free_endpoint`), a **Test connection**
   preflight, a **budget guard** (`api_max_per_run` cap + a paid-endpoint confirm), and **key-at-rest**
-  in **Windows Credential Manager** (`config::secret` via the new `keyring` dep; blanked on disk,
+  in **Windows Credential Manager** (`config_store::secret` since v2 Task 2.4, via the `keyring` dep; blanked on disk,
   plaintext fallback off-Windows). AI-PIPELINE §5.1 governs it.
 - **SigLIP zero-shot image/3D tagger (card 171)** — `zeroshot::score_facets` extracted as the shared
   per-facet softmax core (CLAP + SigLIP both use it now); `image_tags::ImageZeroShot` mirrors

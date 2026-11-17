@@ -360,9 +360,9 @@ translation. The port removes the translation; the egui build stayed buildable a
 
       *Remaining:* **Empty Trash** (needs a core purge — nothing hard-deletes a soft-deleted row
       today), multi-select (every action is single-asset), undo, and the toasts the egui build has.
-      **Not covered by an automated test:** the blacklist write itself, because `AppConfig::load`
-      resolves a fixed path and a test would have to write the developer's real config. The trash
-      half of Remove is covered; the exclude half is manual.
+      Both halves of Remove are covered since v2 Task 2.3/2.4: the engine's config is a
+      `ConfigStore` over a path it is handed, so `remove_from_library_mirrors_into_the_open_projects_config`
+      drives the exclude half against a temp config.
 - [~] **B3 remainder — Folders view, facet filters, Ctrl-K palette, drag-in.** Note
       `build_pack_dir_tree`, `folder_children`, `ancestors_expanded` and `seed_expanded` are
       already written and tested in `lodestash-app` — that part is mostly wiring.
@@ -604,8 +604,9 @@ translation. The port removes the translation; the egui build stayed buildable a
         read-only — the rule editor is a later slice over `list_rules`/`apply_mapping`.
   - [x] **B9c — per-source blacklist editor** (UI-SPEC §11.1). *Shipped 2026-08-06.* Source-scoped
         list/add/remove over `import_source.blacklist` **and** mirrored into the app config the
-        crawler actually reads (`edit_config`) — the editor changes real behavior. Writes fail on
-        a missing source instead of silently touching nothing.
+        crawler actually reads (`ConfigStore::update` since v2 Task 2.4) — the
+        editor changes real behavior. Writes fail on a missing source instead of silently touching
+        nothing.
   - [x] **B9d — LINKS filter + bulk-bar tag edits** (E5, D9). *Shipped 2026-08-06.* `GridQuery.links`
         narrows the grid to the one-hop edge neighbourhood (computed once per query from
         `asset_edges`); ⚑ LINKS chip enabled with a selection. Multi-select checkboxes + sticky
@@ -753,7 +754,7 @@ tracking; these cards track phases).
 
 - [x] **V2-P0** Review, spec, ADR-0021/0022/0023, plan, one reconciled prototype
 - [x] **V2-P1** Core hardening — typed errors, migration lifecycle, `CatalogReader`, lookup indexes, moves keep identity, atomic project registration, robust unitypackage reads *(2026-11-16; one carry-over: the desktop writer's `Op::SetTrashed` moves to `Catalog::set_trashed_recorded` with the writer in Task 2.3 — done)*
-- [ ] **V2-P2** `lodestash-protocol` operation catalog; `lodestash-engine` absorbs app + writer + read model; config store; one appraisal plan and job registry *(in progress: 2.1 protocol, 2.2 `lodestash-app` → `lodestash-engine` and 2.3 `Engine` — writer, read model, storage, media; S1/S3/U9 fixed — done; 2.4 config store and 2.5 appraisal plan open)*
+- [ ] **V2-P2** `lodestash-protocol` operation catalog; `lodestash-engine` absorbs app + writer + read model; config store; one appraisal plan and job registry *(in progress: 2.1 protocol, 2.2 `lodestash-app` → `lodestash-engine` and 2.3 `Engine` — writer, read model, storage, media; S1/S3/U9 fixed — done; 2.4 config store, typed `Settings`, S2/U8/B12 fixed — done; 2.5 appraisal plan open)*
 - [ ] **V2-P3** `lodestash-api` derived from the catalog; UI session, request checks, SSE, bytes, static UI
 - [x] **V2-P4** `lodestash-mcp` standalone thin client with auto-launch (also retired `--mcp` and `agent_bridge.rs`)
 - [ ] **V2-P5** Thin Tauri shell; retire Tauri commands, `lodestash://`, old `ui/`

@@ -1648,6 +1648,52 @@ mod tests {
         );
     }
 
+    /// Review S2 / v2 spec §4.5: a Settings write reaches both agent planes at once, with no
+    /// restart — the allow-list closes and re-opens a tool and byte release follows its switch,
+    /// each observed on a fresh request to the router.
+    #[tokio::test]
+    async fn the_agent_planes_follow_settings_changes_live() {
+        let (dir, st) = state();
+        let token = st.token.clone();
+        let store = lodestash_engine::ConfigStore::open(dir.path().join("config.json"), false);
+        ServerState::follow_config(&st, &store);
+        let call = |path: &'static str| {
+            let st = st.clone();
+            let token = token.clone();
+            async move { send(router(st), get_req(path, Some(&token), None)).await }
+        };
+        assert_eq!(call("/v1/server-info").await.0, StatusCode::OK);
+        assert_eq!(
+            call("/v1/assets/999/file").await.1["error"]["code"],
+            "bytes_not_released"
+        );
+
+        let mut s = store.settings();
+        s.agents.mcp_disabled_tools = vec!["get_server_info".into()];
+        s.agents.mcp_bytes_enabled = true;
+        store.set_settings(s).expect("settings");
+        let (code, body) = call("/v1/server-info").await;
+        assert_eq!(
+            (code, body["error"]["code"].as_str()),
+            (StatusCode::FORBIDDEN, Some("tool_disabled"))
+        );
+        assert_eq!(
+            call("/v1/assets/999/file").await.0,
+            StatusCode::NOT_FOUND,
+            "bytes released: the route is ungated"
+        );
+
+        let mut s = store.settings();
+        s.agents.mcp_disabled_tools.clear();
+        s.agents.mcp_bytes_enabled = false;
+        store.set_settings(s).expect("settings");
+        assert_eq!(call("/v1/server-info").await.0, StatusCode::OK, "re-opened");
+        assert_eq!(
+            call("/v1/assets/999/file").await.1["error"]["code"],
+            "bytes_not_released"
+        );
+    }
+
     /// The engine is one current-thread runtime (v1 plan S11). A slow handler — here a preview that
     /// takes a second and a half to render — must not stop a quick question from being answered
     /// meanwhile; before `off_runtime`, the render held the only thread and everything queued

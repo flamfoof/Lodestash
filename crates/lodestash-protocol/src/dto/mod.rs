@@ -14,6 +14,7 @@ mod common;
 mod discovery;
 mod packages;
 mod projects;
+mod settings;
 mod tags;
 
 pub use common::{AssetArgs, JobArgs, NoInput};
@@ -21,6 +22,10 @@ pub use discovery::{GetAssetsArgs, ListAssetsArgs, ListLibrariesArgs, SearchArgs
 pub use packages::{ExportArgs, UnpackArgs};
 pub use projects::{
     AckAsset, AckRequest, ImportQueueArgs, ImportRequest, RegisterProjectArgs, StageArgs,
+};
+pub use settings::{
+    AgentSettings, AppearanceSettings, CloudSettings, IdentifySettings, LibrarySettings,
+    PreviewQuality, Settings, StorageSettings,
 };
 pub use tags::{
     AddTagArgs, IdentifyArgs, MappingArgs, TagBatchAsset, TagBatchRequest, TagIn, TagsArgs,

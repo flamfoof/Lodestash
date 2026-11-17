@@ -17,7 +17,7 @@ use crate::grid;
 use crate::types::{Category, ContentFilter, StatusFilter, TriBucket};
 use lodestash_core::catalog::{AppraiseFocus, CatalogReader};
 
-use crate::config::ConfigFile;
+use crate::config_store::ConfigStore;
 use lodestash_core::types::{AssetStatus, MediaType};
 use serde::{Deserialize, Serialize};
 
@@ -380,121 +380,6 @@ pub struct FolderTileOut {
     pub recursive: usize,
 }
 
-/// The Settings screen's payload (UI-SPEC §11, design README §5). A whole-object snapshot: the
-/// frontend edits it and writes it back through `set_settings`, mirroring how `WebPrefs` works.
-/// Strings are used where the frontend's own ids are the vocabulary ("low"/"medium"/"high").
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Settings {
-    /// Size-tier boundaries in KB (UI-SPEC §11.4): S < m < l < xl < cap, 128 KB minimum gap.
-    pub m_kb: u32,
-    pub l_kb: u32,
-    pub xl_kb: u32,
-    pub cap_kb: u32,
-    /// Grid-only preview render quality (UI-SPEC §11.3). Quick Look is always full detail.
-    pub preview_quality: String,
-    /// Inverted by the UI: "Show first-run onboarding on launch" (§11.7/§1).
-    pub skip_onboarding: bool,
-    pub watch_sources: bool,
-    pub auto_identify: bool,
-    /// Keep extracted packs cached (UI-SPEC §11.6).
-    pub cache_extracted: bool,
-    pub preview_cache_cap_gb: u32,
-    pub auto_purge_preview_cache: bool,
-    /// Ask before trashing (UI-SPEC §11 "confirm before trash"): when on, the trash entry
-    /// points (inspector, bulk bar) require a second confirming click.
-    pub confirm_before_trash: bool,
-    /// The MCP allow-list, stored as the disabled half (UI-SPEC §11.5, MCP↔REST 1:1).
-    pub mcp_disabled_tools: Vec<String>,
-    /// Ollama text model for local tagging (AI-PIPELINE §2). `None` = no local LLM.
-    #[serde(default)]
-    pub tagger_model: Option<String>,
-    /// Optional Ollama vision model that captions the preview before the text model tags
-    /// (AI-PIPELINE §2). `None` = tag from the asset's name alone.
-    #[serde(default)]
-    pub tagger_vision_model: Option<String>,
-    /// Opt-in OpenAI-compatible tagging (AI-PIPELINE §5). On + key + model = the visual tag pass
-    /// uses the API instead of the local Ollama VLM. Off by default — local is free and private.
-    #[serde(default)]
-    pub api_tagging_enabled: bool,
-    /// OpenAI-compatible base URL (default: the provider's endpoint).
-    #[serde(default)]
-    pub api_base_url: String,
-    /// The vision model id at that endpoint. `None` = not configured.
-    #[serde(default)]
-    pub api_model: Option<String>,
-    /// API key for the endpoint — a secret, never logged. Empty = not configured.
-    #[serde(default)]
-    pub api_key: String,
-    /// Hard per-run cap on cloud-tagged assets (AI-PIPELINE §5.1 budget guard). `0` = uncapped,
-    /// which is only sensible on a free or local endpoint.
-    #[serde(default)]
-    pub api_max_per_run: u32,
-}
-
-impl Settings {
-    pub fn from_config(c: &crate::config::AppConfig) -> Self {
-        use crate::config::PreviewQuality;
-        Self {
-            m_kb: c.size_tiers.m_kb,
-            l_kb: c.size_tiers.l_kb,
-            xl_kb: c.size_tiers.xl_kb,
-            cap_kb: c.size_tiers.cap_kb,
-            preview_quality: match c.preview_quality {
-                PreviewQuality::Low => "low",
-                PreviewQuality::Medium => "medium",
-                PreviewQuality::High => "high",
-            }
-            .into(),
-            skip_onboarding: c.skip_onboarding,
-            watch_sources: c.watch_sources,
-            auto_identify: c.auto_identify,
-            cache_extracted: c.cache_extracted,
-            preview_cache_cap_gb: c.preview_cache_cap_gb,
-            auto_purge_preview_cache: c.auto_purge_preview_cache,
-            confirm_before_trash: c.confirm_before_trash,
-            mcp_disabled_tools: c.mcp_disabled_tools.clone(),
-            tagger_model: c.tagger_model.clone(),
-            tagger_vision_model: c.tagger_vision_model.clone(),
-            api_tagging_enabled: c.api_tagging_enabled,
-            api_base_url: c.api_base_url.clone(),
-            api_model: c.api_model.clone(),
-            api_key: c.api_key.clone(),
-            api_max_per_run: c.api_max_per_run,
-        }
-    }
-
-    pub fn apply(self, c: &mut crate::config::AppConfig) {
-        use crate::config::PreviewQuality;
-        c.size_tiers = crate::config::SizeTiers {
-            m_kb: self.m_kb,
-            l_kb: self.l_kb,
-            xl_kb: self.xl_kb,
-            cap_kb: self.cap_kb,
-        }
-        .normalized();
-        c.preview_quality = match self.preview_quality.as_str() {
-            "medium" => PreviewQuality::Medium,
-            "high" => PreviewQuality::High,
-            _ => PreviewQuality::Low,
-        };
-        c.skip_onboarding = self.skip_onboarding;
-        c.watch_sources = self.watch_sources;
-        c.auto_identify = self.auto_identify;
-        c.cache_extracted = self.cache_extracted;
-        c.preview_cache_cap_gb = self.preview_cache_cap_gb;
-        c.auto_purge_preview_cache = self.auto_purge_preview_cache;
-        c.confirm_before_trash = self.confirm_before_trash;
-        c.mcp_disabled_tools = self.mcp_disabled_tools;
-        c.tagger_model = self.tagger_model;
-        c.tagger_vision_model = self.tagger_vision_model;
-        c.api_tagging_enabled = self.api_tagging_enabled;
-        c.api_base_url = self.api_base_url;
-        c.api_model = self.api_model;
-        c.api_key = self.api_key;
-        c.api_max_per_run = self.api_max_per_run;
-    }
-}
-
 /// One folder in the pack browser's left tree (PACK-DIRECTORY-NAV §5).
 #[derive(Debug, Clone, Serialize)]
 pub struct PackDirNode {
@@ -678,7 +563,7 @@ pub struct Library {
     workspace: Option<PathBuf>,
     catalog_path: Option<PathBuf>,
     /// The engine's config — the size tiers the badges and the size facet draw.
-    config: Option<ConfigFile>,
+    config: Option<std::sync::Arc<ConfigStore>>,
     sources: Vec<SourceSummary>,
     /// All live rows, name-sorted once per rebuild. The whole library is ~10k rows of small
     /// structs, so holding it beats a query per page.
@@ -735,7 +620,7 @@ impl Library {
         catalog_path: PathBuf,
         thumb_cache: Option<PathBuf>,
         workspace: Option<PathBuf>,
-        config: ConfigFile,
+        config: std::sync::Arc<ConfigStore>,
     ) -> Self {
         Self {
             catalog: None,
@@ -767,7 +652,7 @@ impl Library {
         // Settings edits — re-read here so a change lands without a restart (the grid never holds
         // a second copy to go stale).
         if let Some(config) = &self.config {
-            self.tiers = config.load_display_only().size_tiers.normalized();
+            self.tiers = config.read(|c| c.size_tiers.normalized());
         }
         let Some(cat) = self.catalog.as_ref() else {
             return;

@@ -622,6 +622,31 @@ impl ServerState {
         *self.allowed.lock().unwrap() = None;
     }
 
+    /// Take what the agent planes need from the app's config: the allow-list (UI-SPEC §11.5),
+    /// whether bytes may be served (v1 plan S10) and the producer `write_tags` writes under
+    /// (ENGINE-API §8.3). An empty disabled list re-opens every tool.
+    pub fn apply_config(&self, config: &lodestash_engine::config::AppConfig) {
+        match config.mcp_enabled_tools() {
+            Some(enabled) => self.set_allowed(enabled),
+            None => self.allow_all(),
+        }
+        self.set_byte_release(config.mcp_bytes_enabled);
+        self.set_agent_producer(config.agent_producer_id.clone());
+    }
+
+    /// Apply `store`'s config now and after every change to it, so a settings edit reaches both
+    /// agent planes without a restart (v2 spec §4.5). The store holds the state weakly: a dropped
+    /// server stops following.
+    pub fn follow_config(state: &Arc<Self>, store: &lodestash_engine::ConfigStore) {
+        let weak = Arc::downgrade(state);
+        store.on_change(move |c| {
+            if let Some(state) = weak.upgrade() {
+                state.apply_config(c);
+            }
+        });
+        state.apply_config(&store.get());
+    }
+
     /// Is `tool` callable? `true` when no allow-list is set (default) or the tool is in it. Both
     /// planes consult this before dispatch, which is what keeps the gate MCP↔REST 1:1.
     pub fn allows(&self, tool: &str) -> bool {

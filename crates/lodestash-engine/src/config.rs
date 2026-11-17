@@ -1,5 +1,6 @@
-//! Persistent app configuration — survives restarts.
-//! Stored at: `{os_config_dir}/Lodestash/config.json`
+//! The app configuration's shape — what `config.json` holds. Stored at
+//! `{os_config_dir}/Lodestash/config.json` for the app ([`config_file_path`]); read and written only
+//! through the engine's [`crate::config_store::ConfigStore`] (v2 spec §4.5).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -178,141 +179,6 @@ impl Default for ViewPrefs {
             mode: ViewMode::Flat,
             page_size: DEFAULT_PAGE_SIZE,
         }
-    }
-}
-
-// ── Svelte shell prefs ─────────────────────────────────────────────────────────
-
-/// Serialize config.json read-modify-write cycles. Several writers (the web-prefs and
-/// settings commands, and now the writer thread's blacklist→config sync) each
-/// load→modify→save the whole file; without this a racing pair can clobber each other's
-/// fields. `AppConfig::save()` is a direct `fs::write` (not atomic), so reads lock too —
-/// a reader must never meet a half-written file. Lock order is always CONFIG_LOCK before
-/// anything else; nothing ever takes a second lock while holding it.
-static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// [`ConfigFile::edit`] on the OS-default config file. Callers that hold an engine use the
-/// engine's own [`ConfigFile`] instead, so a test or a second library never touches this one.
-pub fn edit_config<T>(f: impl FnOnce(&mut AppConfig) -> T) -> Result<T, String> {
-    match ConfigFile::os_default() {
-        Some(file) => file.edit(f),
-        // No config directory on this system: nothing to load or persist, as before.
-        None => Ok(f(&mut AppConfig::default())),
-    }
-}
-
-/// One `config.json`, and where its cloud API key lives (v2 spec §4.5).
-///
-/// The engine is handed one of these with its paths ([`crate::EngineConfig`]) instead of reading
-/// the OS location itself, so a test's engine reads and writes a temp file. The OS credential
-/// store backs only the app's own config ([`Self::os_default`]); a private config ([`Self::at`])
-/// keeps its key in the file and never reads or writes the store — a test must not see, or
-/// clear, the user's real key.
-///
-/// ponytail: Task 2.4 replaces this with the engine's `ConfigStore` (atomic writes, corruption
-/// reported); until then the read/write behaviour is exactly the old `AppConfig::load`/`save`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigFile {
-    path: PathBuf,
-    keychain: bool,
-}
-
-impl ConfigFile {
-    /// The app's own config: the OS config directory, API key in the credential store.
-    pub fn os_default() -> Option<Self> {
-        Some(Self {
-            path: config_path()?,
-            keychain: true,
-        })
-    }
-
-    /// A private config file at `path`. Its API key, if any, stays in the file.
-    pub fn at(path: PathBuf) -> Self {
-        Self {
-            path,
-            keychain: false,
-        }
-    }
-
-    /// Whether the cloud API key lives in the OS credential store.
-    pub fn with_keychain(mut self, on: bool) -> Self {
-        self.keychain = on;
-        self
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// The on-disk config **without** the credential-store round-trip [`Self::load`] makes.
-    ///
-    /// For hot paths that want a display setting and have no interest in the API key. The
-    /// thumbnail route reads `preview_quality` once per card, and going through `load` there
-    /// meant a Windows DPAPI lookup per card on a grid page — the key is blank on disk for
-    /// every user who never set one, which is the branch that reaches the keychain.
-    pub fn load_display_only(&self) -> AppConfig {
-        match std::fs::read(&self.path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            Err(_) => AppConfig::default(),
-        }
-    }
-
-    pub fn load(&self) -> AppConfig {
-        let bytes = match std::fs::read(&self.path) {
-            Ok(b) => b,
-            Err(_) => return AppConfig::default(),
-        };
-        let mut cfg: AppConfig = serde_json::from_slice(&bytes).unwrap_or_default();
-        // The API key lives in the OS credential store (AI-PIPELINE §5.1); the on-disk config keeps
-        // it blank when that succeeded. If it's blank on disk, recover it from the keychain.
-        if self.keychain && cfg.api_key.is_empty() {
-            if let Some(key) = secret::load_api_key() {
-                cfg.api_key = key;
-            }
-        }
-        cfg
-    }
-
-    pub fn save(&self, cfg: &AppConfig) {
-        if let Some(parent) = self.path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        // Key at rest (AI-PIPELINE §5.1): try the OS credential store first. If it took the key we
-        // blank it in the on-disk JSON; if the store is unavailable, fall back to plaintext config so
-        // the app still works. An empty key clears any stored secret.
-        let stored_in_keychain = if !self.keychain {
-            false
-        } else if cfg.api_key.trim().is_empty() {
-            secret::clear_api_key();
-            false
-        } else {
-            secret::store_api_key(&cfg.api_key)
-        };
-        let json = match serde_json::to_value(cfg) {
-            Ok(mut v) => {
-                if stored_in_keychain {
-                    v["api_key"] = serde_json::Value::String(String::new());
-                }
-                v
-            }
-            Err(_) => return,
-        };
-        if let Ok(bytes) = serde_json::to_vec_pretty(&json) {
-            let _ = std::fs::write(&self.path, bytes);
-        }
-    }
-
-    /// Load, apply `f`, and save — the whole cycle under one lock. The one sanctioned way to mutate
-    /// a config file; every caller (desktop commands and the writer thread's blacklist sync) goes
-    /// through it so no two writers interleave.
-    pub fn edit<T>(&self, f: impl FnOnce(&mut AppConfig) -> T) -> Result<T, String> {
-        let _g = CONFIG_LOCK
-            .lock()
-            .map_err(|_| "config lock poisoned".to_string())?;
-        let mut config = self.load();
-        let out = f(&mut config);
-        self.save(&config);
-        Ok(out)
     }
 }
 
@@ -633,7 +499,9 @@ pub struct AppConfig {
     /// The vision model id at that endpoint (e.g. a Gemini flash model). `None` = not configured.
     #[serde(default)]
     pub api_model: Option<String>,
-    /// API key for the endpoint. A secret — never logged. Empty = not configured.
+    /// API key for the endpoint. A secret — never logged, never sent to a client (the Settings
+    /// DTO says only whether one is configured). Empty = not configured. In the app's own config
+    /// it lives in the OS credential store and the file keeps it blank ([`crate::config_store`]).
     #[serde(default)]
     pub api_key: String,
     /// May image bytes — and the pixels derived from models, materials and sprites — go to a
@@ -668,50 +536,6 @@ pub struct AppConfig {
 
 fn default_api_max_per_run() -> u32 {
     500
-}
-
-/// The cloud API key at rest (AI-PIPELINE §5.1). On Windows the key lives in Credential Manager via
-/// `keyring`; everywhere else these are no-ops and the caller keeps the plaintext-config fallback.
-/// Every call is failure-tolerant — a locked or absent keychain never breaks config save/load.
-mod secret {
-    #[cfg(windows)]
-    const SERVICE: &str = "Lodestash";
-    #[cfg(windows)]
-    const USER: &str = "api_key";
-
-    #[cfg(windows)]
-    fn entry() -> Option<keyring::Entry> {
-        keyring::Entry::new(SERVICE, USER).ok()
-    }
-
-    /// Store the key; returns `true` only if it was actually written to the OS store.
-    #[cfg(windows)]
-    pub fn store_api_key(key: &str) -> bool {
-        entry().is_some_and(|e| e.set_password(key).is_ok())
-    }
-
-    #[cfg(windows)]
-    pub fn load_api_key() -> Option<String> {
-        entry().and_then(|e| e.get_password().ok())
-    }
-
-    #[cfg(windows)]
-    pub fn clear_api_key() {
-        if let Some(e) = entry() {
-            let _ = e.delete_credential();
-        }
-    }
-
-    #[cfg(not(windows))]
-    pub fn store_api_key(_key: &str) -> bool {
-        false // no OS store wired for this platform → plaintext-config fallback
-    }
-    #[cfg(not(windows))]
-    pub fn load_api_key() -> Option<String> {
-        None
-    }
-    #[cfg(not(windows))]
-    pub fn clear_api_key() {}
 }
 
 fn default_api_base_url() -> String {
@@ -782,39 +606,21 @@ impl AppConfig {
         )
     }
 
-    /// [`ConfigFile::load_display_only`] on the OS-default config.
-    pub fn load_display_only() -> Self {
-        ConfigFile::os_default()
-            .map(|f| f.load_display_only())
-            .unwrap_or_default()
-    }
-
-    /// [`ConfigFile::load`] on the OS-default config.
-    pub fn load() -> Self {
-        ConfigFile::os_default()
-            .map(|f| f.load())
-            .unwrap_or_default()
-    }
-
-    /// [`ConfigFile::save`] on the OS-default config.
-    pub fn save(&self) {
-        if let Some(f) = ConfigFile::os_default() {
-            f.save(self);
-        }
-    }
-
     /// Return the project with this name, if any.
     pub fn project_by_name(&self, name: &str) -> Option<&LibraryProject> {
         self.projects.iter().find(|p| p.name == name)
     }
 
+    // The mutators below change the value only. Persisting is the caller's: mutate inside
+    // `ConfigStore::update`, which saves what it loaded, atomically (v2 spec §4.5). They used to
+    // save the OS-default config themselves, whichever file the value had come from.
+
     /// Record that a single folder was opened as a new standalone project.
-    /// Returns the project name it was saved under.
+    /// Returns the project name it was recorded under.
     pub fn record_open(&mut self, root: PathBuf) -> String {
         self.touch_recent(root.clone());
         let name = self.upsert_single_path_project(root);
         self.last_project_name = Some(name.clone());
-        self.save();
         name
     }
 
@@ -826,7 +632,6 @@ impl AppConfig {
                 self.touch_recent(path);
             }
         }
-        self.save();
     }
 
     /// Add a source folder to an existing project by name.
@@ -835,7 +640,6 @@ impl AppConfig {
         self.touch_recent(path.clone());
         if let Some(proj) = self.projects.iter_mut().find(|p| p.name == project_name) {
             proj.add_path(path);
-            self.save();
             true
         } else {
             false
@@ -843,13 +647,12 @@ impl AppConfig {
     }
 
     /// Add a **pack-only** source to a project (FEATURES.md §5.2): tracked as a library folder
-    /// but not crawled for loose files — its packs surface as in-pack libraries (M14). Persists.
+    /// but not crawled for loose files — its packs surface as in-pack libraries (M14).
     pub fn add_pack_only_source(&mut self, project_name: &str, path: PathBuf) -> bool {
         self.touch_recent(path.clone());
         if let Some(proj) = self.projects.iter_mut().find(|p| p.name == project_name) {
             proj.add_path(path.clone());
             proj.pack_only.insert(path);
-            self.save();
             true
         } else {
             false
@@ -871,9 +674,6 @@ impl AppConfig {
 
     /// Add a per-source exclusion (deduped). Returns true if added. Non-destructive — only affects
     /// cataloguing (DATA-MODEL.md §1, §6).
-    ///
-    /// Does not save: the caller mutates inside [`ConfigFile::edit`], which persists the file it
-    /// loaded. Saving here wrote the OS-default config whatever file the edit came from.
     pub fn add_source_exclude(
         &mut self,
         project_name: &str,
@@ -886,8 +686,7 @@ impl AppConfig {
             .is_some_and(|proj| proj.add_exclude(source, exclude))
     }
 
-    /// Remove a per-source exclusion. Returns true if it was present. Does not save — see
-    /// [`Self::add_source_exclude`].
+    /// Remove a per-source exclusion. Returns true if it was present.
     pub fn remove_source_exclude(
         &mut self,
         project_name: &str,
@@ -905,11 +704,7 @@ impl AppConfig {
     /// Returns false if the project or the path wasn't found.
     pub fn remove_source_from_project(&mut self, project_name: &str, path: &Path) -> bool {
         if let Some(proj) = self.projects.iter_mut().find(|p| p.name == project_name) {
-            let removed = proj.remove_path(path);
-            if removed {
-                self.save();
-            }
-            removed
+            proj.remove_path(path)
         } else {
             false
         }
@@ -971,10 +766,7 @@ pub fn config_file_path() -> Option<PathBuf> {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
-// Pure project/recent logic only. The public record_*/add_source_* wrappers call
-// save() which writes to the real OS config dir, so tests exercise the private
-// helpers (upsert_single_path_project, touch_recent) and add_path directly — never
-// save() — to avoid clobbering a developer's actual config.
+// Pure project/recent logic only; persistence is `config_store`'s, and its tests.
 // Spec: TECH-STACK.md §5.1 (multi-source projects, this session's feature work).
 
 #[cfg(test)]

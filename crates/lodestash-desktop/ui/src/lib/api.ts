@@ -290,7 +290,11 @@ export type Settings = {
   api_tagging_enabled: boolean;
   api_base_url: string;
   api_model: string | null;
-  api_key: string;
+  /** Write-only (review U8): never present in what `getSettings` returns. Leave it out to keep
+   * the stored key, send `""` to clear it, anything else replaces it. */
+  api_key?: string;
+  /** Read-only: whether a key is stored. */
+  api_key_configured: boolean;
   /** Hard per-run cap on cloud-tagged assets (AI-PIPELINE §5.1). 0 = uncapped. */
   api_max_per_run: number;
   /** May image bytes go to a **remote** endpoint (v1 plan S10)? Off by default; a loopback
