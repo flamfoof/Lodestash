@@ -65,6 +65,20 @@ for (const [name, state] of Object.entries(STATES)) {
   }
 }
 
+// Hover styles never appear in a static render: the prototype declares them as `style-hover`
+// attributes. Read them from the source so hover colours and glows get tokens too.
+{
+  const src = fs.readFileSync(protoFile, "utf8");
+  const hover = {};
+  for (const m of src.matchAll(/style-hover="([^"]*)"/g)) {
+    for (const decl of m[1].split(";")) {
+      const d = decl.trim().replace(/\s+/g, " ");
+      if (d) hover[d] = (hover[d] ?? 0) + 1;
+    }
+  }
+  vocabulary.hover = hover;
+}
+
 // Stable output: sort vocabulary values by use, most first.
 const sortedVocab = Object.fromEntries(
   Object.entries(vocabulary).map(([cat, values]) => [

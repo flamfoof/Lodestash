@@ -106,7 +106,7 @@ export function measureInPage(spec) {
 export function vocabularyInPage(rootSelector) {
   const root = document.querySelector(rootSelector) ?? document.body;
   const out = {
-    color: {}, background: {}, border: {}, fontFamily: {}, fontSize: {}, fontWeight: {},
+    color: {}, background: {}, gradient: {}, border: {}, fontFamily: {}, fontSize: {}, fontWeight: {},
     letterSpacing: {}, radius: {}, padding: {}, gap: {}, shadow: {}, opacity: {}, duration: {},
   };
   const bump = (cat, v) => {
@@ -136,6 +136,7 @@ export function vocabularyInPage(rootSelector) {
       if (cs.letterSpacing !== "normal") bump("letterSpacing", cs.letterSpacing);
     }
     bump("background", hex(cs.backgroundColor));
+    if (cs.backgroundImage.includes("gradient")) bump("gradient", cs.backgroundImage);
     if (parseFloat(cs.borderTopWidth) > 0) bump("border", `${cs.borderTopWidth} ${hex(cs.borderTopColor)}`);
     if (parseFloat(cs.borderTopLeftRadius) > 0) bump("radius", cs.borderTopLeftRadius);
     const pad = [cs.paddingTop, cs.paddingRight, cs.paddingBottom, cs.paddingLeft];
