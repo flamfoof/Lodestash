@@ -8,15 +8,19 @@
     "dev": "vite",
     "build": "node ../scripts/design/gen-icons.mjs --check && svelte-check --tsconfig ./tsconfig.json && vite build",
     "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test": "vitest run",
+    "gate": "node e2e/gate.mjs",
     "lint:styles": "node ../scripts/design/check-styles.mjs",
     "icons": "node ../scripts/design/gen-icons.mjs"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "5.1.1",
+    "jsdom": "30.1.3",
     "playwright-core": "1.62.1",
     "svelte": "5.56.8",
     "svelte-check": "4.7.4",
     "typescript": "5.9.3",
-    "vite": "6.4.3"
+    "vite": "6.4.3",
+    "vitest": "5.0.5"
   }
 }

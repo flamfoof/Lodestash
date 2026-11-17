@@ -1,0 +1,44 @@
+// The primitive library (spec §9.3) — the only place in web/ with visual CSS (spec §9.2 rule 3).
+// Screens and features compose these and carry layout only.
+
+export { default as AppBar } from "./AppBar.svelte";
+export { default as Badge } from "./Badge.svelte";
+export { default as Banner } from "./Banner.svelte";
+export { default as Button, type ButtonSize, type ButtonVariant } from "./Button.svelte";
+export { default as Checkbox } from "./Checkbox.svelte";
+export { default as Chip, type ChipTone } from "./Chip.svelte";
+export { default as ConfirmDialog } from "./ConfirmDialog.svelte";
+export { default as ContextMenu } from "./ContextMenu.svelte";
+export { default as Dialog } from "./Dialog.svelte";
+export { default as Divider } from "./Divider.svelte";
+export { default as EmptyState } from "./EmptyState.svelte";
+export { default as Icon, type IconBox, type IconSize } from "./Icon.svelte";
+export { default as IconButton } from "./IconButton.svelte";
+export { default as Input } from "./Input.svelte";
+export { default as Kbd } from "./Kbd.svelte";
+export { default as ListRow } from "./ListRow.svelte";
+export { default as Menu, type MenuEntry } from "./Menu.svelte";
+export { default as Pill } from "./Pill.svelte";
+export { default as Popover } from "./Popover.svelte";
+export { default as ProgressBar } from "./ProgressBar.svelte";
+export { default as Rail } from "./Rail.svelte";
+export { default as RailHeading } from "./RailHeading.svelte";
+export { default as SearchField } from "./SearchField.svelte";
+export { default as SectionCard } from "./SectionCard.svelte";
+export { default as SegmentedControl, type Segment } from "./SegmentedControl.svelte";
+export { default as Select } from "./Select.svelte";
+export { default as SizeTier, type Tier } from "./SizeTier.svelte";
+export { default as Slider } from "./Slider.svelte";
+export { default as Spinner } from "./Spinner.svelte";
+export { default as Stat } from "./Stat.svelte";
+export { default as StatusGem, STATUS_LABEL, type Status } from "./StatusGem.svelte";
+export { default as Switch } from "./Switch.svelte";
+export { default as Tabs, type Tab } from "./Tabs.svelte";
+export { default as Toast } from "./Toast.svelte";
+export { default as ToggleButton } from "./ToggleButton.svelte";
+export { default as Toolbar } from "./Toolbar.svelte";
+export { tooltip } from "./tooltip";
+export { default as TraitChip } from "./TraitChip.svelte";
+export { default as TreeRow } from "./TreeRow.svelte";
+export { default as Wordmark } from "./Wordmark.svelte";
+export { ICON_NAMES, type IconName } from "./icons.generated";

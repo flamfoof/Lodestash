@@ -45,9 +45,23 @@ function* declarations(file) {
     if (!inStyle) continue;
     if (/style-lint-allow:\s*[^*\s][^*]*\*\//.test(line)) continue;
     if (/^\s*@(media|container|supports|import)\b/.test(line)) continue;
-    const m = line.match(/^\s*([a-z-]+)\s*:\s*(.+?)\s*;?\s*(\/\*.*\*\/)?\s*$/i);
+    // A value continued over several lines (`transition:` then one transition per line) is read
+    // as one declaration, reported at its first line.
+    const start = i;
+    let decl = line;
+    if (/^\s*[a-z-]+\s*:[^;{}]*$/i.test(line)) {
+      while (i + 1 < lines.length && !/[;{}]/.test(decl)) {
+        const next = lines[i + 1];
+        if (/^\s*([a-z-]+\s*:|[}@])/i.test(next) || /<\/style>/.test(next)) break;
+        decl += " " + next.trim();
+        i++;
+      }
+      if (/[{]/.test(decl)) continue; // a selector list, not a declaration
+      if (/style-lint-allow:\s*[^*\s][^*]*\*\//.test(decl)) continue;
+    }
+    const m = decl.match(/^\s*([a-z-]+)\s*:\s*(.+?)\s*;?\s*(\/\*.*\*\/)?\s*$/i);
     if (!m || m[1].startsWith("--")) continue; // custom properties are layout variables or tokens
-    yield { line: i + 1, prop: m[1].toLowerCase(), value: m[2].replace(/;$/, "").trim() };
+    yield { line: start + 1, prop: m[1].toLowerCase(), value: m[2].replace(/;$/, "").trim() };
   }
 }
 

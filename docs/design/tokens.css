@@ -62,6 +62,10 @@
   --ff-display: "Cinzel", Georgia, serif;
   --ff-ui: "Inter", "Segoe UI", system-ui, sans-serif;
   --ff-mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
+  /* The prototype's root sets `line-height: 1.45`; every text box height in contract.json
+     (13px → 18.9, 12px → 17.4, 11px → 16) derives from it. The vocabulary does not collect
+     line heights, so this one is named by hand. */
+  --lh-body: 1.45;
 
   /* ---- Radius ---- */
   --r-pill: 999px;
@@ -307,6 +311,11 @@
   --ls-type-font: #f2966e; /* media_type `font` exists; the prototype's data has no font asset */
   --ls-info: #5aa9f0; /* neutral notices; the prototype only draws warn/danger/success notices */
   --ring-focus: 0 0 0 2px #ffd98a; /* keyboard focus; the prototype is mouse-only */
+  /* Drawn by the prototype only in AI mode, a state the extractor does not render. */
+  --ring-inset-arcane-1-a40: inset 0 0 0 1px #49d6c966;
+  --ring-arcane-2-a22: 0 0 0 2px #49d6c938;
+  /* Left accent borders (cards, toasts) are 3px; the extractor reads only top borders. */
+  --bw-3: 3px;
   /* Layers: one ladder so nothing invents a z-index. */
   --z-raised: 1;
   --z-sticky: 10;
@@ -316,7 +325,16 @@
   /* Frame metrics the shell grid uses; the contract checks the rendered result. */
   --topbar-h: 48px;
   --sidebar-w: 210px;
+  --rail-w: 48px; /* the sidebar as an icon rail, below a 1120 px window (ADR-0009) */
   --inspector-w: 300px;
+  --search-max-w: 400px; /* the top-bar search stops growing here */
+  --meter-w: 180px; /* the top-bar health meter's minimum width */
+  --dialog-w-sm: 460px; /* "Add a source" */
+  --dialog-w-md: 540px; /* "Connect a Unity project" */
+  --toast-max-w: 340px;
+  /* Window floor (ADR-0009): below it the shell scrolls. */
+  --window-min-w: 900px;
+  --window-min-h: 600px;
   /* Density: compact default; [data-density="cozy"] = +4px, [data-density="large"] = +8px. */
   --row-h: 32px;
   --control-h: 30px;
@@ -330,7 +348,6 @@
   --fs-xl: 18px;
   --fs-2xl: 24px;
   --fs-3xl: 32px;
-  --lh-body: 1.45;
   --lh-heading: 1.2;
   --sp-1: 4px;
   --sp-2: 8px;

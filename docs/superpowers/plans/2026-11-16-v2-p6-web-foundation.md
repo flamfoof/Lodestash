@@ -100,10 +100,23 @@ only here; tokens only; props typed; no API calls.
   height); arrow keys move, Enter activates, Escape closes and restores focus.
 - `keymap.svelte.ts` (in `web/src/app/`): a scope stack; `Dialog`/`Menu` push a scope while open, so a
   global shortcut never fires behind them.
-- [ ] Vitest (with `@testing-library/svelte` or plain DOM — choose and add to TECH-STACK): focus trap
+- [x] Vitest (with `@testing-library/svelte` or plain DOM — choose and add to TECH-STACK): focus trap
   cycles; focus restored to opener; Escape closes the top-most overlay only; a global shortcut
   does not fire while a Dialog is open; Menu flips upward when it would overflow the bottom
-- [ ] Commit `feat(web): primitives — buttons, chips, fields, dialog, menu, keymap scopes`
+- [x] Commit `feat(web): primitives — buttons, chips, fields, dialog, menu, keymap scopes`
+
+*As built:* plain DOM — Svelte's `mount`/`flushSync` on `jsdom` (TECH-STACK §5); geometry is
+stubbed in tests, the gate owns real layout. Beyond §9.3 the library has the frame's chrome as
+primitives (`AppBar`, `Rail`, `RailHeading`, `Divider`, `Wordmark`) so features carry layout only,
+and the composites the gallery needs (`StatusGem`, `SizeTier`, `TraitChip`). `Tooltip` is an
+attachment, `{@attach tooltip(text)}`. The overlay host and modal stack are `web/src/app/overlay.ts`.
+Icons take a drawn `size` and a layout `box`, so an icon keeps the measured advance of the Unicode
+glyph it replaces (DEVIATIONS row 1). **Line height is not the fonts' `normal`:** the prototype's
+root sets `line-height: 1.45` and every contract height (13 px → 18.9, 12 px → 17.4) is measured
+with it, so `--lh-body` moved out of the legacy block and `body` sets it. The focus ring is the
+global `:focus-visible` rule, `!important` so a primitive's own shadow cannot hide it. Three sprite
+symbols sat after `</svg>` (invalid XML — no icon could load); they moved inside `<defs>`.
+`check-styles.mjs` now reads multi-line values (a `transition:` list was never linted).
 
 ### Task 6.4: Gallery and the primitive-level gate
 
@@ -128,10 +141,22 @@ only here; tokens only; props typed; no API calls.
   `<select>` the prototype never styled, not a design choice. The app's select uses the UI font;
   record that one property in `DEVIATIONS.md` rather than copying Arial. Line heights are the
   fonts' `normal`; do not set `line-height` globally or every box height drifts.
-- [ ] Test (`scripts/design/lib/compare.test.mjs`, run with `node --test`): ±1 px box tolerance;
+- [x] Test (`scripts/design/lib/compare.test.mjs`, run with `node --test`): ±1 px box tolerance;
   exact colour; a DEVIATIONS row exempts only its property
-- [ ] `bun run web:gate -- --gallery` green
-- [ ] Commit `feat(web): the gallery measures every primitive against the contract`
+- [x] `bun run web:gate -- --gallery` green
+- [x] Commit `feat(web): the gallery measures every primitive against the contract`
+
+*As built:* 29 anchors have specimens (the list above plus `topbar.wordmark`, `topbar.meter(.label)`,
+`sidebar.heading`, `library.banner.action`). The gate first checks coverage: every contract anchor
+must be measured or listed in `DEFERRED` with the task that will measure it (container and card
+anchors → P7), so a new anchor cannot be silently skipped. **The first gate run found the contract
+itself was wrong:** the extractor served the bundled fonts from a second loopback origin without
+CORS, every `FontFace` failed, and the prototype was measured in Segoe UI / Consolas / Georgia —
+`measureInPage` reports the *declared* family, which hid it. `lib/prototype.mjs` now sends CORS
+and `assertFontsLoaded` fails the run when a bundled family is not in use; `contract.json` was
+regenerated (box geometry only; `vocabulary.json` unchanged). The recorded prototype hash is now
+LF-normalised (a CRLF checkout changed it). DEVIATIONS row added: `library.sort` `fontFamily`, `w`
+(the width follows from the font); the select's height is pinned to the drawn 24 px.
 
 ### Task 6.5: Shell layout (static)
 
@@ -141,8 +166,22 @@ gallery entry `shell` rendering the shell with fixture props.
 - The shell is one CSS grid (top bar row; sidebar + main + optional inspector columns). Panes are
   size containers; components adapt with container queries. Window floor 900×600 (ADR-0009).
 - Every `frame` anchor in `scripts/design/anchors.mjs` is present with `data-anchor`.
-- [ ] Gate: the shell specimen at 1440×900 passes every `frame` anchor including `pos`
-- [ ] Commit `feat(web): the shell frame matches the prototype`
+- [x] Gate: the shell specimen at 1440×900 passes every `frame` anchor including `pos`
+- [x] Commit `feat(web): the shell frame matches the prototype`
+
+*As built:* 19/19 frame anchors with positions; `bun run web:gate -- --gallery` measures the
+gallery and `gallery.html#shell` in one run. The shell's data is `ShellData` (`app/shell.ts`).
+The eleven nav rows are FEATURES §0.3's; Unity Assets uses the sprite's existing `ls-unitypackage`
+(the prototype's `unityMark` paths, which FEATURES §0.3 names — no second symbol was added). The
+category tabs follow FEATURES §0.2 and include **Materials**, which the prototype predates — the
+search well is 95 px narrower, a DEVIATIONS row (`topbar.search` `w`). Facet groups show on every
+screen (ADR-0009). The frame takes ADR-0009's two frame rungs — the inspector overlays below
+1280 px, the rail becomes a 48 px icon rail with a flyout below 1120 px — and, because the top bar
+had no rung and overflowed by ~300 px at the floor, a stated fold order for it (`AppBar`: inference
+chip, then tab labels, then wordmark name and mode labels). The gate checks the floor: at 900×600
+nothing overflows and the rail is 48 px; below it the frame keeps its size and the page scrolls.
+Not built here: the Unity-library facet rows (⬢, ✕), the project switcher, the inspector's edge
+tab — their screens' tasks (P7).
 
 ---
 

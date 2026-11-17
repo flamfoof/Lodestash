@@ -54,6 +54,25 @@ test("each kind of literal is reported with its line", () => {
   assert.equal(checkFile(f)[0].line, 4);
 });
 
+test("a value continued over several lines is read whole and reported at its first line", () => {
+  const f = svelte(
+    [
+      "    transition:",
+      "      color var(--dur-120) ease,",
+      "      background 120ms ease;",
+      "    box-shadow:",
+      "      var(--glow-gold-8-a50);",
+    ].join("\n"),
+  );
+  const found = checkFile(f);
+  assert.deepEqual(found.map((x) => [x.prop, x.line]), [["transition", 4]]);
+});
+
+test("a selector list split over lines is not a declaration", () => {
+  const f = svelte(["  }", "  button:hover,", "  a:focus {", "    color: var(--ls-text);"].join("\n"));
+  assert.deepEqual(checkFile(f), []);
+});
+
 test("the escape hatch needs a reason", () => {
   const ok = svelte("    color: #fff; /* style-lint-allow: printing on white */");
   const bare = svelte("    color: #fff; /* style-lint-allow: */");

@@ -61,6 +61,9 @@ const library = {
   "card.status": { proto: { text: "◆", up: 1 }, compare: ["box", "type", "color", "fill", "edge"] },
 };
 
+/** The shell's anchors (top bar and sidebar) — present in every state; the gate's shell specimen. */
+export const FRAME_ANCHORS = Object.keys(frame);
+
 /** Anchors per state. A state not listed here still contributes to the vocabulary. */
 export const ANCHORS = {
   library: { ...frame, ...library },

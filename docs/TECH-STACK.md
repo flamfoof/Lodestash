@@ -98,6 +98,11 @@ payload into — DATA-MODEL §7 / M14). Real-model AI inference is **not** run i
 slow) — gate those behind `--features model-tests` for local/nightly runs; CI uses mock
 `Tagger`/`Embedder` impls.
 
+**Web UI dev-dependencies** (`web/package.json`, v2 plan P6; never bundled, exact versions pinned):
+- `vitest` 5.0.5 (MIT) — unit tests for the primitives and app plumbing (keymap scopes, dialog focus trap, menu placement); runs on the Vite already in the tree.
+- `jsdom` 30.1.3 (MIT) — the DOM those tests run in. It has no layout, so tests stub geometry; real layout is the contract gate's job (`web/e2e/gate.mjs`, `playwright-core`).
+- No Svelte testing library: tests use Svelte's own `mount` / `flushSync`.
+
 ### 5.1 QA matrix — what each layer tests
 
 The rule: **logic lives in pure, testable functions; the render loop and I/O stay thin.** Anything

@@ -54,7 +54,12 @@ export async function serveDir(dir) {
       res.end();
       return;
     }
-    res.writeHead(200, { "content-type": TYPES[path.extname(full)] ?? "application/octet-stream" });
+    // The fonts are served from a second loopback origin: without CORS the browser refuses them and
+    // the page silently renders in fallback fonts (which is how contract.json was first measured).
+    res.writeHead(200, {
+      "content-type": TYPES[path.extname(full)] ?? "application/octet-stream",
+      "access-control-allow-origin": "*",
+    });
     fs.createReadStream(full).pipe(res);
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
@@ -91,7 +96,7 @@ export async function openPrototype({ viewport = VIEWPORT } = {}) {
   );
   await page.route(/fonts\.gstatic\.com/, (route) => route.abort());
   await page.goto(site.base + encodeURIComponent(PROTOTYPE), { waitUntil: "networkidle", timeout: 30000 });
-  await page.evaluate(() => document.fonts.ready);
+  await assertFontsLoaded(page);
   await settle(page);
   const close = async () => {
     await browser.close();
@@ -99,6 +104,23 @@ export async function openPrototype({ viewport = VIEWPORT } = {}) {
     fonts.close();
   };
   return { browser, page, close, errors };
+}
+
+/**
+ * Load the three bundled families and fail unless every one of them is in use. A page whose fonts
+ * did not load still reports the declared family in `getComputedStyle`, so a measurement taken in
+ * fallback fonts looks right everywhere except in its widths — check, never assume.
+ */
+export async function assertFontsLoaded(page) {
+  const problems = await page.evaluate(async () => {
+    const wanted = ['400 12px "Inter"', '700 16px "Cinzel"', '400 11px "JetBrains Mono"'];
+    await Promise.all(wanted.map((f) => document.fonts.load(f).catch(() => [])));
+    await document.fonts.ready;
+    const failed = [...document.fonts].filter((f) => f.status === "error").map((f) => `${f.family} failed to load`);
+    const missing = wanted.filter((f) => !document.fonts.check(f)).map((f) => `${f} is not available`);
+    return [...failed, ...missing];
+  });
+  if (problems.length) throw new Error(`bundled fonts: ${problems.join("; ")}`);
 }
 
 /** Let animations (lsRise is 360 ms) finish before measuring. */
