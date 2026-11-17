@@ -10,6 +10,8 @@
     "check": "bun run --cwd crates/lodestash-desktop/ui check",
     "e2e": "bun run --cwd crates/lodestash-desktop/ui e2e",
     "check-docs": "node scripts/check-docs.mjs",
+    "design:contract": "node scripts/design/extract-contract.mjs",
+    "design:check": "node scripts/design/extract-contract.mjs --check",
     "check-board": "node scripts/check-board.mjs"
   }
 }
