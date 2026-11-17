@@ -243,6 +243,13 @@ surfaces as an error rather than a silently stale answer.
   process owns no writer, jobs or approvals at all: it forwards those tools to the app
   ([ADR-0011](decisions/ADR-0011-headless-mcp-forwards-writes.md)). Its REST and MCP handlers run on
   tokio's blocking pool, because the runtime is one thread and the state they call is synchronous.
+- **The engine owns the catalog** (v2 plan Task 2.3, [ADR-0021](decisions/ADR-0021-engine-owns-the-catalog-ui-is-a-web-client.md)):
+  `lodestash-engine`'s `Engine::start` takes `<catalog>.lock` (`File::try_lock` — a second engine
+  reports `catalog_locked`), and its one writer thread creates, migrates and holds the only writing
+  connection. The writer's inbox is bounded (1024) and replies time out (120 s) as `busy`; every
+  command runs under `catch_unwind`, so a panic answers `internal` and the thread keeps serving. The
+  read model holds a `CatalogReader` and rebuilds when the catalog generation moves. Startup is a
+  status (`starting | migrating | ready | failed{code,message}`), never an empty library.
 - **SQLite access**: `rusqlite::Connection` is `!Sync`, so the catalog is **not** shared by handle.
   When multiple frontends go live (GUI + REST + MCP + ingest workers, P5), all writes funnel through
   **one dedicated writer** (a thread/actor owning the connection, fed by a channel); reads use
@@ -254,7 +261,9 @@ surfaces as an error rather than a silently stale answer.
   registry starts, advances or finishes a job — and one publisher thread sends at most one
   `ls:changed` per 250 ms window, carrying every origin in that window and a generation per domain.
   Fifty writes inside a window are one event; a continuous drain is one event per window, never one
-  per commit. Headless (no window) publishes nothing.
+  per commit. The bus lives in the engine (`Engine::subscribe`); the publisher starts with the first
+  subscriber, so an engine nobody listens to publishes nothing. A turn that committed through a
+  second connection (a crawl's persist) counts too, by SQLite's `data_version`.
 - **Job engine** with bounded queues and progress events; the UI shows placeholders and swaps in
   results as jobs finish (what makes a 10k-grid feel instant).
 - **GPU work** (live viewport + offscreen thumbnail render-to-texture + image texture upload) shares

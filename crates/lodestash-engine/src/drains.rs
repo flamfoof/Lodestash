@@ -151,7 +151,7 @@ impl EmbedderSlot {
     /// lock is held across the load so concurrent first queries wait for one load, not start two.
     fn get(&self, resolve: fn() -> Option<SharedEmbedder>) -> Option<SharedEmbedder> {
         let mut slot = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        if slot.0.is_none() && slot.1.map_or(true, |t| t.elapsed() >= EMBEDDER_RETRY) {
+        if slot.0.is_none() && slot.1.is_none_or(|t| t.elapsed() >= EMBEDDER_RETRY) {
             slot.0 = resolve();
             slot.1 = Some(std::time::Instant::now());
         }
@@ -1613,7 +1613,9 @@ pub fn drain_tags(
         if n == 0 {
             break;
         }
-        let slots = slot_textures_for(cat, &jobs, workspace_dir);
+        let slots = slot_textures_for(&jobs, |id| {
+            cat.model_slot_texture_paths(id, workspace_dir).ok()
+        });
         let done = compute_tags(jobs, tagger, zero_shot, workspace_dir, cache_dir, &slots);
         if progress.is_cancelled() {
             return;
@@ -1840,17 +1842,13 @@ pub type SlotTextures =
 
 /// The textures the models in `jobs` wear, for the compute phase that has no catalog.
 pub fn slot_textures_for(
-    cat: &Catalog,
     jobs: &[lodestash_core::catalog::VisualEmbedJob],
-    workspace_dir: Option<&std::path::Path>,
+    slots_of: impl Fn(i64) -> Option<std::collections::BTreeMap<u32, std::path::PathBuf>>,
 ) -> SlotTextures {
     jobs.iter()
         .filter(|j| j.media_code == "model_3d")
         .filter_map(|j| {
-            let slots = cat
-                .model_slot_texture_paths(j.asset_id, workspace_dir)
-                .ok()
-                .filter(|s| !s.is_empty())?;
+            let slots = slots_of(j.asset_id).filter(|s| !s.is_empty())?;
             Some((j.asset_id, slots))
         })
         .collect()

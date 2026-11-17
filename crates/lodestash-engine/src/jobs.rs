@@ -108,9 +108,8 @@ impl Jobs {
     /// Drop finished rows past their linger and expired toasts. Call once per frame.
     pub fn prune(&mut self) {
         let now = Instant::now();
-        // ponytail: map_or, not is_none_or — the workspace MSRV is 1.80.
         self.jobs
-            .retain(|j| j.finished.map_or(true, |t| now - t < DONE_LINGER));
+            .retain(|j| j.finished.is_none_or(|t| now - t < DONE_LINGER));
         self.toasts.retain(|t| now - t.at < TOAST_LIFE);
     }
 

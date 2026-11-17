@@ -97,6 +97,7 @@ reads! {
     fn eligible_for_search(&self, media_type_id: Option<i64>) -> Result<HashSet<i64>>;
     fn media_type_id(&self, code: &str) -> Result<Option<i64>>;
     fn tag_usage(&self, limit: usize) -> Result<Vec<(String, String, i64)>>;
+    fn teaching_traits(&self) -> Result<Vec<TeachRow>>;
 
     // Libraries and packages
     fn libraries_page(&self, after: i64, limit: usize) -> Result<Vec<LibraryRow>>;
@@ -119,6 +120,47 @@ reads! {
 
     // Receipts of agent writes
     fn tag_request_receipt(&self, request_id: &str) -> Result<Option<TagReceipt>>;
+
+    // The engine's read model (v2 plan Task 2.3): the whole-library snapshot and the screens it
+    // answers.
+    fn source_infos(&self) -> Result<Vec<SourceInfo>>;
+    fn source_info_by_root(&self, root_path: &str) -> Result<Option<SourceInfo>>;
+    fn entries_for_source(&self, source_id: i64) -> Result<Vec<HydratedAsset>>;
+    fn in_pack_entries_for_source(&self, source_id: i64) -> Result<Vec<HydratedInPack>>;
+    fn extracted_entries_for_source(&self, source_id: i64) -> Result<Vec<HydratedExtracted>>;
+    fn perceptual_hashes(&self) -> Result<HashMap<i64, [u8; 8]>>;
+    fn assets_with_preview(&self) -> Result<Vec<i64>>;
+    fn favorite_ids(&self) -> Result<Vec<i64>>;
+    fn all_asset_tags(&self) -> Result<HashMap<i64, Vec<TagAssignment>>>;
+    fn import_states(&self) -> Result<HashMap<i64, ImportState>>;
+    fn count_needing_tags(&self) -> Result<i64>;
+    fn recent_export_batches(&self, limit: usize) -> Result<Vec<ExportBatch>>;
+    fn recent_import_batches(&self, limit: usize) -> Result<Vec<ImportBatch>>;
+    fn relink_preview(&self, source_id: i64, new_root: &Path) -> Result<RelinkPreview>;
+    fn retarget_match(&self, package_id: i64, candidate_guids: &[String]) -> Result<(usize, usize)>;
+    fn list_vocabulary(&self) -> Result<Vec<VocabTrait>>;
+    fn list_rules(&self, taxonomy_id: i64) -> Result<Vec<MappingRuleRow>>;
+    fn list_source_excludes(&self, source_id: i64) -> Result<Vec<SourceExclude>>;
+    fn list_taxonomies(&self) -> Result<Vec<TaxonomyRow>>;
+    fn recent_ops(&self, limit: usize) -> Result<Vec<OpLogRow>>;
+    fn redo_candidates(&self, limit: usize) -> Result<Vec<OpLogRow>>;
+    fn related_assets(&self, asset_id: i64) -> Result<Vec<RelatedAsset>>;
+    fn tag_graph(&self) -> Result<TagGraph>;
+    fn asset_edges(&self) -> Result<Vec<AssetEdge>>;
+    fn effective_license(&self, asset_id: i64) -> Result<Option<(String, Option<String>)>>;
+    fn in_pack_location(&self, asset_id: i64) -> Result<Option<(String, String)>>;
+    fn model_albedo_texture(&self, asset_id: i64) -> Result<Option<i64>>;
+    fn vector_preview(&self, asset_id: i64) -> Result<Option<(String, String)>>;
+    fn referenced_workspace_paths(&self) -> Result<HashSet<String>>;
+    fn workspace_packs(&self) -> Result<Vec<WorkspacePack>>;
+    fn search_assets(&self, query: &str, limit: usize) -> Result<Option<Vec<i64>>>;
+    fn hybrid_search(
+        &self,
+        query: &str,
+        spaces: &[(&str, &[f32])],
+        media_type_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<i64>>;
 }
 
 impl Catalog {

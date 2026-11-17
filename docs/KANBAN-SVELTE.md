@@ -191,7 +191,7 @@ this file stays the live board.
 
 - [x] **Identify: the tagging half (B11 tail, shipped 2026-08-07).** `drain_tags` / `drain_audio_tags`
       had zero call sites — no tagger resolver, rows stalled at `indexed`. Now wired into
-      `appraise_pass` (`writer.rs:602`): local-only, zero new models — the already-resolved SigLIP
+      `appraise_pass` (`writer/mod.rs:1597`): local-only, zero new models — the already-resolved SigLIP
       embedder drives `ImageZeroShot`, CLAP drives `AudioZeroShot`, taught traits (Traits screen,
       AI-PIPELINE §6) become candidate labels, `FilenameTagger` is the captioning stub. Both drains
       gained a `max_assets` budget guard (AI-PIPELINE §5.1, `0` = uncapped) so a writer-thread kick

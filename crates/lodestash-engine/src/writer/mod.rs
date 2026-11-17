@@ -2,25 +2,23 @@
 //!
 //! `ARCHITECTURE.md` §5 is explicit — "all writes funnel through one dedicated writer (a
 //! thread/actor owning the connection, fed by a channel); reads use short-lived per-task
-//! connections". This is that thread. It is not an optimisation: `rusqlite::Connection` is
-//! `!Sync`, Tauri runs every `#[tauri::command]` on a thread pool, and two commands writing at
-//! once is exactly how `database is locked` came back last time (`HANDOFF.md` §6).
+//! connections". This is that thread, owned by the engine (v2 spec §4.1, ADR-0021): it opens —
+//! and migrates — the catalog, and nothing else in the process opens it for writing.
 //!
-//! Commands send a [`Job`] and block on its reply. Blocking is correct here: these are
-//! single-row updates that take microseconds, the caller is a pool thread rather than the UI, and
-//! the frontend needs the outcome before it can honestly redraw. A fire-and-forget write would
-//! report success for something that had not happened yet.
+//! Callers send an [`Op`] through a [`WriterHandle`] and block on its reply. The inbox is bounded
+//! and the wait is too ([`INBOX_CAPACITY`], [`REPLY_TIMEOUT`]): a writer that cannot keep up
+//! answers `busy` instead of hanging its callers. Every command runs under `catch_unwind`, so a
+//! panic fails that command with `internal` and the thread keeps serving (review U9).
 //!
-//! **The reads stay where they are.** `Library` keeps its own read-only connection (WAL makes a
-//! reader and a writer concurrent), so browsing never waits behind a write.
+//! **Reads do not come here.** The read model holds its own read-only connection
+//! ([`crate::read_model`]; WAL makes a reader and a writer concurrent), so browsing never waits
+//! behind a write.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
-
-use rusqlite::Connection;
 
 use lodestash_ai::clap_tags::AudioZeroShot;
 use lodestash_ai::image_tags::ImageZeroShot;
@@ -31,17 +29,18 @@ use lodestash_core::catalog::{
     AppraiseFocus, Catalog, HistoryOrigin, PackageEntryRecord, TagBatch, TagBatchItem, TagMode,
 };
 use lodestash_core::types::{Exclude, ExcludeKind};
-use lodestash_engine::config::AppConfig;
-use lodestash_engine::drains::{
-    drain_audio_tags, drain_previews, drain_promote_resync, drain_tags, resolve_audio_embedder,
-    resolve_embedder,
-};
-use lodestash_engine::jobs::JobProgress as AppJobProgress;
-use lodestash_engine::paths::default_cache_dirs;
-use lodestash_engine::types::PersistBatch;
 use lodestash_ingest::unitypackage::{
     extract_at_offsets_with_progress, read_manifest_with_progress, EntryLocator, ExtractedAsset,
 };
+
+use crate::config::ConfigFile;
+use crate::drains::{
+    drain_audio_tags, drain_previews, drain_promote_resync, drain_tags, resolve_audio_embedder,
+    resolve_embedder,
+};
+use crate::engine::EngineStatus;
+use crate::jobs::JobProgress as AppJobProgress;
+use crate::types::PersistBatch;
 
 /// Bounded tag work per appraise pass (AI-PIPELINE §5.1): a writer-thread kick never blocks
 /// writes on a long backlog; the remainder stays queued for the next kick / idle slice.
@@ -138,7 +137,6 @@ pub enum Op {
     /// asset in its source, so the next scan does not bring it back. No file is touched.
     RemoveFromLibrary {
         targets: Vec<Target>,
-        project: Option<String>,
     },
     /// **Delete from disk** — the one irreversible action in this product.
     DeleteFromDisk {
@@ -358,6 +356,12 @@ pub enum Op {
     TagBatch {
         batch: lodestash_core::catalog::TagBatch,
     },
+    /// A command that panics — how the tests prove the writer survives one (review U9).
+    #[cfg(test)]
+    Panic,
+    /// A command that holds the writer for a while — how the tests reach the reply timeout.
+    #[cfg(test)]
+    Hold(std::time::Duration),
 }
 
 /// What a write did, in the terms the frontend reports to the user.
@@ -376,14 +380,14 @@ pub struct WriteResult {
 
 pub struct Job {
     pub op: Op,
-    pub reply: Sender<Result<WriteResult, String>>,
+    pub reply: Sender<Result<WriteResult, WriteError>>,
     /// Who asked — decides how the shell hears about it (ADR-0016).
     pub origin: Origin,
 }
 
 /// What the writer thread's channel carries: an external op (with its reply), or a worker
 /// reporting back so the catalog half runs on the writer thread (single-writer rule).
-enum WriterMsg {
+pub(crate) enum WriterMsg {
     Op(Job),
     /// A manifest worker finished reading the archive (surgical indexing, M14) — the writer
     /// records the locators + mints in-pack assets, then spawns the extract worker.
@@ -405,13 +409,13 @@ enum WriterMsg {
     /// (a `POST /v1/stage` went from 25 ms to ~18 s the moment an embedder actually loaded).
     EmbeddingsDone {
         model_id: String,
-        done: Vec<lodestash_engine::drains::ComputedEmbedding>,
+        done: Vec<crate::drains::ComputedEmbedding>,
     },
     /// A background tag worker finished a slice — same split, same reason: a caption is a whole
     /// VLM inference (~13 s here) and the writer only persists the result.
     TagsDone {
-        producers: lodestash_engine::drains::TagProducers,
-        done: Vec<lodestash_engine::drains::ComputedTags>,
+        producers: crate::drains::TagProducers,
+        done: Vec<crate::drains::ComputedTags>,
     },
 }
 
@@ -741,155 +745,191 @@ impl JobRegistry {
     }
 }
 
+use crate::changes::{mark_committed, Stamp};
+pub use crate::changes::{ChangedEvent, Changes, Origin};
+
+/// The writer's inbox depth (v2 spec §4.1). A full inbox answers [`WriteError::Busy`] at once
+/// rather than queueing a caller behind work it cannot see.
+pub const INBOX_CAPACITY: usize = 1024;
+
+/// How long a caller waits for its reply before it is told [`WriteError::Busy`]. The command still
+/// runs to completion on the writer; only its answer is dropped.
+pub const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Why a write did not happen (v2 spec §4.4 kinds, where the writer itself knows them).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteError {
+    /// The command ran and refused — the message is the one the caller shows. Its finer kind
+    /// (`not_found`, `invalid`, `conflict`) arrives when the commands carry typed errors (P3).
+    Failed(String),
+    /// The writer did not answer within [`REPLY_TIMEOUT`], or its inbox was full.
+    Busy,
+    /// The command panicked. The writer caught it, rolled nothing forward, and kept serving.
+    Internal(String),
+    /// There is no writer to ask: the engine did not start, or it has stopped.
+    Unavailable(String),
+}
+
+impl WriteError {
+    /// The stable code the API maps (`lodestash_protocol::codes`); `failed` until commands are typed.
+    pub fn code(&self) -> &'static str {
+        match self {
+            WriteError::Failed(_) => "failed",
+            WriteError::Busy => lodestash_protocol::codes::BUSY,
+            WriteError::Internal(_) => lodestash_protocol::codes::INTERNAL,
+            WriteError::Unavailable(_) => lodestash_protocol::codes::UNAVAILABLE,
+        }
+    }
+}
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Verbatim: the old shell showed these strings to the user, and still does.
+            WriteError::Failed(m) | WriteError::Unavailable(m) => f.write_str(m),
+            WriteError::Busy => f.write_str(
+                "busy: the catalog writer did not answer in time — the write may still land; try again",
+            ),
+            WriteError::Internal(m) => write!(
+                f,
+                "internal: the write failed unexpectedly ({m}); the writer is still running"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WriteError {}
+
 /// Handle to the writer thread. Cloneable, `Send`, holds no connection of its own.
 #[derive(Clone)]
-pub struct Writer {
-    tx: Sender<WriterMsg>,
+pub struct WriterHandle {
+    tx: Option<SyncSender<WriterMsg>>,
+    /// What every write answers when there is no writer (`tx` is `None`).
+    absent: Arc<str>,
+    reply_timeout: std::time::Duration,
+    /// Set when the engine is dropped; the loop sees it within one idle tick and exits, closing
+    /// the catalog and releasing its lock.
+    stop: Arc<AtomicBool>,
 }
 
-/// Who caused a catalog change. The shell treats them differently (ADR-0016): the user's own
-/// write refreshes what they are looking at; an agent's or the background lane's only says that
-/// something moved, so a drain can never pull the grid out from under someone browsing it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Origin {
-    User,
-    Agent,
-    Background,
-}
-
-/// What the shell hears on `ls:changed`: which domains changed since the last publication, every
-/// origin that touched the catalog in that window, and the per-domain generations. A refresh that
-/// read the catalog at generation G clears only what was pending through G.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
-pub struct ChangedEvent {
-    pub catalog: bool,
-    pub jobs: bool,
-    pub origins: Vec<&'static str>,
-    pub catalog_gen: u64,
-    pub jobs_gen: u64,
-}
-
-#[derive(Default)]
-struct Pending {
-    catalog: bool,
-    jobs: bool,
-    user: bool,
-    agent: bool,
-    background: bool,
-    catalog_gen: u64,
-    jobs_gen: u64,
-}
-
-impl Pending {
-    fn dirty(&self) -> bool {
-        self.catalog || self.jobs
-    }
-
-    /// Everything pending, as one event. The flags reset; the generations only ever climb.
-    fn take(&mut self) -> ChangedEvent {
-        let origins = [
-            (self.user, "user"),
-            (self.agent, "agent"),
-            (self.background, "background"),
-        ]
-        .into_iter()
-        .filter_map(|(on, name)| on.then_some(name))
-        .collect();
-        let event = ChangedEvent {
-            catalog: self.catalog,
-            jobs: self.jobs,
-            origins,
-            catalog_gen: self.catalog_gen,
-            jobs_gen: self.jobs_gen,
-        };
-        self.catalog = false;
-        self.jobs = false;
-        self.user = false;
-        self.agent = false;
-        self.background = false;
-        event
-    }
-}
-
-/// The longest a committed change waits before the shell hears of it. A fixed window, not a
-/// trailing debounce: the preview drain commits continuously, and a debounce waiting for quiet
-/// would never fire while it ran. Fifty tag writes inside one window publish once; a longer burst
-/// publishes once per window — never once per commit, which is what it used to be.
-const PUBLISH_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
-
-/// The process's change publication (ADR-0016).
-///
-/// Marking is a mutex flip — the writer never waits on the shell, and nothing is emitted from
-/// inside a transaction. A publisher thread, started once there is a window to tell, drains the
-/// marks at most once per [`PUBLISH_WINDOW`]. Until then — and forever, headless — marks only
-/// accumulate: no events and no growth, since a mark is a flag and a counter.
-#[derive(Clone, Default)]
-pub struct Changes {
-    inner: Arc<(Mutex<Pending>, std::sync::Condvar)>,
-}
-
-impl Changes {
-    pub fn catalog(&self, origin: Origin) {
-        let (lock, cv) = &*self.inner;
-        let mut p = lock.lock().expect("changes lock");
-        p.catalog = true;
-        p.catalog_gen += 1;
-        match origin {
-            Origin::User => p.user = true,
-            Origin::Agent => p.agent = true,
-            Origin::Background => p.background = true,
+impl WriterHandle {
+    /// A handle with no writer behind it: every write answers `unavailable` with `why`.
+    pub(crate) fn absent(why: impl Into<String>) -> Self {
+        Self {
+            tx: None,
+            absent: why.into().into(),
+            reply_timeout: REPLY_TIMEOUT,
+            stop: Arc::new(AtomicBool::new(true)),
         }
-        cv.notify_one();
     }
 
-    pub fn jobs(&self) {
-        let (lock, cv) = &*self.inner;
-        let mut p = lock.lock().expect("changes lock");
-        p.jobs = true;
-        p.jobs_gen += 1;
-        cv.notify_one();
+    /// Run one command and wait for it, as the person at the machine.
+    pub fn run(&self, op: Op) -> Result<WriteResult, WriteError> {
+        self.run_as(op, Origin::User)
     }
 
-    /// Tell the shell, as `ls:changed`. Called once, when the window exists.
-    pub fn start_publisher(&self, app: tauri::AppHandle) {
-        self.spawn_publisher(PUBLISH_WINDOW, move |event| {
-            use tauri::Emitter;
-            let _ = app.emit("ls:changed", event);
-        });
+    /// [`WriterHandle::run`] on someone else's behalf. The agent bridge says so, and the shell then
+    /// shows a pending update rather than re-reading under the user (ADR-0016).
+    pub fn run_as(&self, op: Op, origin: Origin) -> Result<WriteResult, WriteError> {
+        let Some(tx) = &self.tx else {
+            return Err(WriteError::Unavailable(self.absent.to_string()));
+        };
+        let (reply, wait) = mpsc::channel();
+        match tx.try_send(WriterMsg::Op(Job { op, reply, origin })) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => return Err(WriteError::Busy),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                return Err(WriteError::Unavailable(
+                    "the catalog writer has stopped".into(),
+                ))
+            }
+        }
+        match wait.recv_timeout(self.reply_timeout) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(WriteError::Busy),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(WriteError::Internal(
+                "the writer dropped the command without answering".into(),
+            )),
+        }
     }
 
-    fn spawn_publisher(
-        &self,
-        window: std::time::Duration,
-        mut sink: impl FnMut(ChangedEvent) + Send + 'static,
-    ) {
-        let inner = self.inner.clone();
-        std::thread::Builder::new()
-            .name("lodestash-changes".into())
-            .spawn(move || {
-                let (lock, cv) = &*inner;
-                loop {
-                    let mut p = lock.lock().expect("changes lock");
-                    while !p.dirty() {
-                        p = cv.wait(p).expect("changes lock");
-                    }
-                    drop(p);
-                    // The window opens at the first mark; everything landing inside it rides along.
-                    std::thread::sleep(window);
-                    let event = lock.lock().expect("changes lock").take();
-                    sink(event);
-                }
-            })
-            .expect("change publisher spawns");
+    /// The same writer, with a shorter wait — how a test reaches the timeout.
+    #[cfg(test)]
+    pub(crate) fn with_reply_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.reply_timeout = timeout;
+        self
+    }
+
+    /// Ask the loop to exit. It finishes the command in hand first.
+    pub(crate) fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 }
 
-/// Publish a catalog change iff this turn committed rows. `total_changes` is SQLite's own count,
-/// so a turn that ran and wrote nothing is not reported as a change.
-fn mark_committed(changes: &Changes, catalog: &Catalog, before: u64, origin: Origin) {
-    if catalog.total_changes() > before {
-        changes.catalog(origin);
+/// Everything the writer thread is started with — the engine's paths and shared state
+/// ([`crate::EngineConfig`]); the thread reads nothing from process-wide locations itself.
+pub(crate) struct WriterSetup {
+    pub db_path: PathBuf,
+    pub cache_dir: Option<PathBuf>,
+    pub workspace_dir: Option<PathBuf>,
+    pub config: ConfigFile,
+    /// The catalog's `.lock` file, held for the thread's life (v2 spec §4.2).
+    pub lock: std::fs::File,
+    pub status: Arc<crate::engine::StatusCell>,
+    pub jobs: JobRegistry,
+    /// Raised while an appraise pass runs (B11d).
+    pub pump: Arc<AtomicBool>,
+    pub appraise: Arc<AppJobProgress>,
+    /// Where the user is looking (UI-SPEC §3). Shared rather than sent as an op: it changes on
+    /// every scroll, and a browse must never queue behind a running appraise pass.
+    pub focus: Arc<Mutex<AppraiseFocus>>,
+}
+
+/// What every command and helper on the writer thread reads besides the catalog.
+pub(crate) struct WriterCtx {
+    db_path: PathBuf,
+    tx: SyncSender<WriterMsg>,
+    jobs: JobRegistry,
+    appraise: Arc<AppJobProgress>,
+    focus: Arc<Mutex<AppraiseFocus>>,
+    cache_dir: Option<PathBuf>,
+    workspace_dir: Option<PathBuf>,
+    config: ConfigFile,
+}
+
+/// Run one command under `catch_unwind` (v2 spec §4.1, review U9): a panic fails that command
+/// with `internal` instead of ending the thread — and with it every write for the session.
+fn supervised(f: impl FnOnce() -> Result<WriteResult, String>) -> Result<WriteResult, WriteError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(e)) => Err(WriteError::Failed(e)),
+        Err(payload) => {
+            let msg = panic_text(payload.as_ref());
+            tracing::error!(%msg, "a writer command panicked; the writer keeps serving");
+            Err(WriteError::Internal(msg))
+        }
     }
+}
+
+/// Background work on the writer thread (a worker's result landing, the idle pass) under the same
+/// supervision. `None` means it panicked; that is logged and the loop carries on.
+fn guarded<T>(what: &str, f: impl FnOnce() -> T) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => Some(v),
+        Err(payload) => {
+            let msg = panic_text(payload.as_ref());
+            tracing::error!(what, %msg, "writer work panicked; the writer keeps serving");
+            None
+        }
+    }
+}
+
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic with no message".into())
 }
 
 /// The writer's channel, plus the one message the idle probe may have taken out of it.
@@ -929,468 +969,471 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-impl Writer {
-    /// Spawn the writer over `db_path`. The connection is opened **on the thread that owns it**,
-    /// never handed across, because that is the whole point of the rule.
-    pub fn spawn(
-        db_path: PathBuf,
-        pump: Arc<AtomicBool>,
-        jobs: JobRegistry,
-        appraise: Arc<AppJobProgress>,
-        // `focus` is where the user is looking (UI-SPEC §3). Shared with the app rather than sent
-        // as an op: it changes on every scroll, and a browse must never queue behind a running
-        // appraise pass.
-        focus: Arc<Mutex<AppraiseFocus>>,
-    ) -> Self {
-        let (tx, rx) = mpsc::channel::<WriterMsg>();
-        let writer_tx = tx.clone();
-        std::thread::Builder::new()
-            .name("lodestash-writer".into())
-            .spawn(move || {
-                // Opened once and held for the process's life: reopening per job would be a new
-                // writer each time, which is the thing the rule forbids.
-                let mut catalog = match Catalog::open(&db_path) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!(%e, "writer: catalog open failed; writes will be refused");
-                        // Drain and refuse rather than hanging every caller forever.
-                        for msg in rx {
-                            if let WriterMsg::Op(job) = msg {
-                                let _ = job.reply.send(Err(format!("catalog unavailable: {e}")));
-                            }
+/// Spawn the writer over `setup.db_path`. The connection is opened **on the thread that owns it**,
+/// never handed across, because that is the whole point of the rule — and so is the migration:
+/// the engine is the only code that opens the catalog for writing (v2 spec §4.2).
+pub(crate) fn spawn(setup: WriterSetup) -> WriterHandle {
+    let (tx, rx) = mpsc::sync_channel::<WriterMsg>(INBOX_CAPACITY);
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = WriterHandle {
+        tx: Some(tx.clone()),
+        absent: "".into(),
+        reply_timeout: REPLY_TIMEOUT,
+        stop: stop.clone(),
+    };
+    std::thread::Builder::new()
+        .name("lodestash-writer".into())
+        .spawn(move || writer_main(setup, tx, rx, stop))
+        .expect("writer thread spawns");
+    handle
+}
+
+/// Open (create, migrate) the catalog, reporting `Migrating` while a migration runs. A failure is
+/// the status the shell shows — never an empty library (v2 spec §1.5).
+fn open_catalog(path: &Path, status: &crate::engine::StatusCell) -> Result<Catalog, EngineStatus> {
+    use lodestash_core::error::CoreError;
+    let too_new = |found: u32, supported: u32| EngineStatus::Failed {
+        code: "schema_too_new".into(),
+        message: format!(
+            "this catalog was written by a newer Lodestash (schema {found}; this build reads up to \
+             {supported}). Update the app — the catalog is left untouched."
+        ),
+    };
+    if path.exists() {
+        // A read-only peek at the version, so the status can say a migration is running.
+        match Catalog::open_reader(path) {
+            Err(CoreError::SchemaTooOld { found, supported }) => {
+                status.set(EngineStatus::Migrating {
+                    from: found,
+                    to: supported,
+                });
+            }
+            Err(CoreError::SchemaTooNew { found, supported }) => {
+                return Err(too_new(found, supported));
+            }
+            // Current, or unreadable — the writing open below says what is wrong.
+            _ => {}
+        }
+    }
+    Catalog::open(path).map_err(|e| match e {
+        CoreError::SchemaTooNew { found, supported } => too_new(found, supported),
+        other => EngineStatus::Failed {
+            code: "catalog_open_failed".into(),
+            message: format!(
+                "the catalog at {} could not be opened: {other}",
+                path.display()
+            ),
+        },
+    })
+}
+
+/// No catalog to write to: answer every command with why, until the engine stops.
+fn refuse_until_stopped(inbox: &mut Inbox, stop: &AtomicBool, why: &str) {
+    while !stop.load(Ordering::Relaxed) {
+        match inbox.next(std::time::Duration::from_millis(250)) {
+            Ok(WriterMsg::Op(job)) => {
+                let _ = job
+                    .reply
+                    .send(Err(WriteError::Unavailable(why.to_string())));
+            }
+            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+fn writer_main(
+    setup: WriterSetup,
+    writer_tx: SyncSender<WriterMsg>,
+    rx: mpsc::Receiver<WriterMsg>,
+    stop: Arc<AtomicBool>,
+) {
+    // Declared first, so it drops last: the lock is released only once the connection is closed.
+    let _lock = setup.lock;
+    let mut inbox = Inbox { rx, held: None };
+    // Opened once and held for the thread's life: reopening per job would be a new writer each
+    // time, which is the thing the rule forbids.
+    let mut catalog = match open_catalog(&setup.db_path, &setup.status) {
+        Ok(c) => c,
+        Err(failed) => {
+            let why = match &failed {
+                EngineStatus::Failed { message, .. } => message.clone(),
+                _ => "the catalog could not be opened".to_string(),
+            };
+            tracing::error!(%why, "writer: catalog open failed; writes will be refused");
+            setup.status.set(failed);
+            refuse_until_stopped(&mut inbox, &stop, &why);
+            return;
+        }
+    };
+    setup.status.set(EngineStatus::Ready);
+
+    let ctx = WriterCtx {
+        db_path: setup.db_path.clone(),
+        tx: writer_tx,
+        jobs: setup.jobs.clone(),
+        appraise: setup.appraise.clone(),
+        focus: setup.focus.clone(),
+        cache_dir: setup.cache_dir.clone(),
+        workspace_dir: setup.workspace_dir.clone(),
+        config: setup.config.clone(),
+    };
+    let pump = setup.pump;
+    let jobs = &ctx.jobs;
+    let changes = jobs.changes().clone();
+
+    // One-shot chores before the loop. Packs indexed before the harvest existed have no pipeline,
+    // and only the writer thread may fix that (single-writer rule)…
+    let before = Stamp::of(&catalog);
+    guarded("startup backfill", || backfill_package_pipelines(&catalog));
+    // …and enforce the preview cap the settings screen has always shown and never applied
+    // (UI-SPEC §11.4). Startup rather than per-write: the cache grows a thumbnail at a time and a
+    // check on that path would stat the whole tree on every preview.
+    let display = ctx.config.load_display_only();
+    if let Some(thumbs) = ctx.cache_dir.as_deref() {
+        guarded("preview cache sweep", || {
+            // Identity before pressure. A stale-budget proxy, an orphan staging mesh and a
+            // crash-leftover `.part` are dead the moment they become so, and the cap never reaches
+            // them: 359 MB against an 8 GB cap means the purge below had never once run while
+            // 145 MB of that was already garbage.
+            crate::storage::sweep_dead_mesh_cache(
+                thumbs,
+                &display.preview_quality.proxy_budget().tag(),
+            );
+            if display.auto_purge_preview_cache {
+                crate::storage::purge_previews_over_cap(
+                    thumbs,
+                    u64::from(display.preview_cache_cap_gb) * 1024 * 1024 * 1024,
+                );
+            }
+        });
+    }
+    mark_committed(&changes, &catalog, before, Origin::Background);
+
+    // Model preview backfill (M15) is time-boxed and durable, and this thread is the one place it
+    // may write (single-writer rule). Ops preempt it within a few seconds; the queue is durable,
+    // so it converges over idle moments.
+    let proxy = display.preview_quality.proxy_budget();
+    // B11c: when auto-identify is on and the local models are present, the idle pass appraises
+    // (metrics → previews → deps → embeddings → promote) instead of only backfilling previews.
+    // The embedders are resolved once here — model files load at startup only when the user
+    // opted in — and borrowed per slice.
+    let auto = display.auto_identify;
+    let (idle_embedder, idle_audio) = if auto {
+        (resolve_embedder(), resolve_audio_embedder())
+    } else {
+        (None, None)
+    };
+    let idle_appraises = auto && (idle_embedder.is_some() || idle_audio.is_some());
+    // Test/CI escape hatch: the preview backfill is CPU-heavy (each model render is a decimate +
+    // 4-view raster), and an e2e run that launches the app dozens of times would otherwise grind
+    // the machine. LODESTASH_NO_PREVIEW_DRAIN=1 skips it; the grid then shows type marks for
+    // models without previews.
+    let drain_enabled = std::env::var("LODESTASH_NO_PREVIEW_DRAIN").is_err();
+    // UI-SPEC §5: ticked packs unpack **one at a time**. An ExtractPackage op that arrives while a
+    // worker is running (or already queued) waits here; each op's reply resolves to the real
+    // outcome when its reconcile runs.
+    let mut extract_queue: VecDeque<Job> = VecDeque::new();
+    // One embed slice in flight at a time. The worker owns the encode; this flag is how the idle
+    // tick knows not to start a second one, and it is cleared when the slice's `EmbeddingsDone`
+    // lands (or when its worker gives up).
+    let embed_inflight = Arc::new(AtomicBool::new(false));
+    let tag_inflight = Arc::new(AtomicBool::new(false));
+    // DATA-MODEL §6 watch: live notify over the watched source roots, debounced by the ingest
+    // helper. A signal means "something changed, rescan when convenient" — the rescan is the
+    // incremental crawl (needs_rehash skips unchanged files), so it is cheap. Skipped under the
+    // e2e escape hatch like every other idle pass.
+    let mut watch = if drain_enabled && display.watch_sources {
+        rebuild_watch(&catalog)
+    } else {
+        None
+    };
+    // The backlog lane works one tick in `IDLE_DUTY_PERIOD`, not every tick.
+    //
+    // Measured on the reference library: an idle app — window open, nothing asked of it — burned
+    // **0.57 cores continuously**, forever, because each 1 s timeout started a 1 s slice. This is
+    // an asset viewer; housekeeping does not get half the machine. Duty-cycling here throttles all
+    // three lanes at once: the embed and tag workers gate on their `*_inflight` flags, and only
+    // this thread clears them.
+    //
+    // Op latency is unaffected — a skipped tick still waits on the channel, so a user write is
+    // picked up the moment it arrives (the point of 147d4b5).
+    let mut idle_tick: u32 = 0;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        match inbox.next(std::time::Duration::from_secs(1)) {
+            Ok(WriterMsg::Op(Job { op, reply, origin })) => {
+                if matches!(op, Op::ExtractPackage { .. }) {
+                    // Extract answers **"accepted"**, not "finished" — the unpack runs for minutes
+                    // on a multi-GB pack, and its progress, outcome and cancel button live in the
+                    // job tray. Both branches reply at the same point on purpose: the reply used
+                    // to be sent at spawn when the queue was empty but only at *start* when it
+                    // wasn't, so one command meant two different things depending on queue depth.
+                    if extract_queue.is_empty() && !jobs.has_active_extract() {
+                        let result = supervised(|| run(&mut catalog, op, &ctx));
+                        let _ = reply.send(result);
+                    } else {
+                        // A pack is unpacking (or queued) — join the queue, and say so now rather
+                        // than blocking the caller until this pack's turn.
+                        let _ = reply.send(Ok(WriteResult::default()));
+                        extract_queue.push_back(Job { op, reply, origin });
+                    }
+                    continue;
+                }
+                // Only the appraise kicks are slow enough to count as "the pump is running" —
+                // everything else is a quick write the frontend already waits on synchronously.
+                let appraising = matches!(op, Op::IdentifyAll | Op::IdentifyOne { .. });
+                if appraising {
+                    pump.store(true, Ordering::Relaxed);
+                }
+                let source_set_changed =
+                    matches!(op, Op::PersistScan { .. } | Op::SetSourceWatch { .. });
+                let before = Stamp::of(&catalog);
+                let result = supervised(|| run(&mut catalog, op, &ctx));
+                if appraising {
+                    pump.store(false, Ordering::Relaxed);
+                }
+                // A failed op publishes nothing: its caller learns from the reply, and an event
+                // must never read as a success.
+                if result.is_ok() {
+                    mark_committed(&changes, &catalog, before, origin);
+                }
+                let _ = reply.send(result);
+                // A source set (or its watch flags) changed — re-arm the watch so new roots are
+                // covered and unwatched ones stop firing.
+                if source_set_changed {
+                    watch = if drain_enabled && ctx.config.load_display_only().watch_sources {
+                        rebuild_watch(&catalog)
+                    } else {
+                        None
+                    };
+                }
+            }
+            Ok(WriterMsg::ExtractDone {
+                job_id,
+                package_id,
+                outcome,
+                cancelled,
+            }) => {
+                // The payloads landed on disk off-thread; materialize them here — the catalog
+                // stays single-writer. Then the next queued pack gets its worker.
+                let before = Stamp::of(&catalog);
+                let result = guarded("extract materialize", || {
+                    materialize_extract(&mut catalog, &ctx, package_id, outcome, cancelled)
+                })
+                .unwrap_or_else(|| Err("materializing the pack's files panicked".into()));
+                let ok = result.is_ok();
+                let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
+                jobs.finish(job_id, ok, cancelled, changed);
+                start_next_extract(&mut catalog, &mut extract_queue, &ctx);
+                // Background: the unpack was asked for minutes ago, and its outcome is in the
+                // tray — not a reason to re-read the page under the user.
+                mark_committed(&changes, &catalog, before, Origin::Background);
+            }
+            Ok(WriterMsg::EmbeddingsDone { model_id, done }) => {
+                // Cheap: N `upsert_embedding` calls, no inference. Clearing `embedding_dirty`
+                // here is what lets `promote_statuses` move the asset on, so the promote runs on
+                // the next idle tick.
+                let n = guarded("embeddings store", || {
+                    crate::drains::store_visual_embeddings(&mut catalog, &model_id, &done)
+                })
+                .unwrap_or(0);
+                embed_inflight.store(false, Ordering::Relaxed);
+                if n > 0 {
+                    changes.catalog(Origin::Background);
+                }
+            }
+            Ok(WriterMsg::TagsDone { producers, done }) => {
+                let before = Stamp::of(&catalog);
+                let n = guarded("tags store", || {
+                    crate::drains::store_tags(&mut catalog, &producers, &done)
+                })
+                .unwrap_or(0);
+                tag_inflight.store(false, Ordering::Relaxed);
+                if n > 0 {
+                    tracing::info!(tags = n, producer = %producers.tagger.0, "idle tagging slice stored");
+                }
+                // An empty result still finishes its assets (the queue flag clears), so the
+                // catalog changed even when no tag row did.
+                mark_committed(&changes, &catalog, before, Origin::Background);
+            }
+            Ok(WriterMsg::ManifestDone {
+                job_id,
+                package_id,
+                entries,
+                cancelled,
+            }) => {
+                // The archive's manifest is read; record the locators + mint the in-pack assets
+                // (surgical indexing, M14), then spawn the extract worker over the locators. The
+                // op's reply was "accepted"; this phase reports through the tray.
+                // `spawned` = an extract worker is now running, so *its* `ExtractDone` drains the
+                // queue. Anything else — an error, or a cancel that stops after the analyze phase
+                // — has to settle here, or the queue behind it never moves again.
+                let before = Stamp::of(&catalog);
+                let mut spawned = false;
+                let result: Result<WriteResult, String> = guarded("manifest record", || {
+                    let entries = entries?;
+                    let minted = mint_in_pack(&mut catalog, package_id, &entries)?;
+                    // Cancelled during analyze: keep the locators that were read (a partial
+                    // manifest is still progress and the next run resumes from it) but do
+                    // **not** roll on into the extract phase — the user asked it to stop.
+                    if cancelled {
+                        return Ok(WriteResult {
+                            changed: minted,
+                            ..Default::default()
+                        });
+                    }
+                    let pkg = catalog
+                        .list_packages()
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .find(|p| p.id == package_id)
+                        .ok_or_else(|| format!("package {package_id} not found"))?;
+                    let workspace_dir = ctx
+                        .workspace_dir
+                        .clone()
+                        .ok_or_else(|| "no workspace directory configured".to_string())?;
+                    spawn_extract_worker(&pkg, &workspace_dir, &entries, &ctx.tx, &ctx.jobs)?;
+                    spawned = true;
+                    Ok(WriteResult {
+                        changed: minted,
+                        ..Default::default()
+                    })
+                })
+                .unwrap_or_else(|| Err("recording the pack's manifest panicked".into()));
+                let ok = result.is_ok();
+                let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
+                jobs.finish(job_id, ok, cancelled, changed);
+                if !spawned {
+                    start_next_extract(&mut catalog, &mut extract_queue, &ctx);
+                }
+                mark_committed(&changes, &catalog, before, Origin::Background);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Quiet for a second. Backfill previews in short slices, and only when nothing is
+                // queued — a long pass would make every write wait for it (measured: a 5s slice
+                // pushed a tag-create past the UI's own timeouts). 1s slices keep op latency under
+                // ~1.2s while still filling most idle time; the queue is durable, so it converges.
+                if !drain_enabled {
+                    continue;
+                }
+                if inbox.waiting() {
+                    continue; // an op is waiting — held, and run on the next turn
+                }
+                guarded("idle pass", || {
+                    // Watch signal (debounced upstream): rescan every watched source with the
+                    // incremental crawl. The writer is idle here by construction.
+                    if let Some(w) = &watch {
+                        if w.rx.recv_timeout(std::time::Duration::ZERO).is_ok()
+                            && rescan_watched(&mut catalog, &ctx)
+                        {
+                            changes.catalog(Origin::Background);
                         }
+                    }
+                    idle_tick = idle_tick.wrapping_add(1);
+                    if !idle_tick.is_multiple_of(IDLE_DUTY_PERIOD) {
                         return;
                     }
-                };
-                // Model preview backfill (M15) is time-boxed and durable, and the persist
-                // thread is the one place it may write (single-writer rule). The egui build
-                // drained it from its pump; without the same call here the desktop leaves
-                // `asset_preview` frozen at its initial coverage (6% of models on a real
-                // library) and every uncovered model card renders icon-only — the "3D cards
-                // look smaller than audio cards" symptom. Ops preempt it within a few
-                // seconds; the queue is durable, so it converges over idle moments.
-                // One-shot, before the loop: packs indexed before the harvest existed have no
-                // pipeline, and only the writer thread may fix that (single-writer rule).
-                backfill_package_pipelines(&catalog);
-                // …and enforce the preview cap the settings screen has always shown and never
-                // applied (UI-SPEC §11.4). Startup rather than per-write: the cache grows a
-                // thumbnail at a time and a check on that path would stat the whole tree on every
-                // preview.
-                {
-                    let cfg = AppConfig::load();
-                    if let Some(thumbs) = default_cache_dirs().0 {
-                        // Identity before pressure. A stale-budget proxy, an orphan staging
-                        // mesh and a crash-leftover `.part` are dead the moment they become
-                        // so, and the cap never reaches them: 359 MB against an 8 GB cap
-                        // means the purge below had never once run while 145 MB of that was
-                        // already garbage.
-                        crate::storage::sweep_dead_mesh_cache(
-                            &thumbs,
-                            &cfg.preview_quality.proxy_budget().tag(),
-                        );
-                        if cfg.auto_purge_preview_cache {
-                            crate::storage::purge_previews_over_cap(
-                                &thumbs,
-                                u64::from(cfg.preview_cache_cap_gb) * 1024 * 1024 * 1024,
-                            );
-                        }
-                    }
-                }
-                let (cache_dir, workspace_dir) = default_cache_dirs();
-                let proxy = AppConfig::load().preview_quality.proxy_budget();
-                // B11c: when auto-identify is on and the local models are present, the idle
-                // pass appraises (metrics → previews → deps → embeddings → promote) instead
-                // of only backfilling previews. The embedders are resolved once here — model
-                // files load at startup only when the user opted in — and borrowed per slice.
-                let auto = AppConfig::load().auto_identify;
-                let (idle_embedder, idle_audio) = if auto {
-                    (resolve_embedder(), resolve_audio_embedder())
-                } else {
-                    (None, None)
-                };
-                let idle_appraises = auto && (idle_embedder.is_some() || idle_audio.is_some());
-                // Test/CI escape hatch: the preview backfill is CPU-heavy (each model render
-                // is a decimate + 4-view raster), and an e2e run that launches the app dozens
-                // of times would otherwise grind the machine. LODESTASH_NO_PREVIEW_DRAIN=1
-                // skips it; the grid then shows type marks for models without previews.
-                let drain_enabled = std::env::var("LODESTASH_NO_PREVIEW_DRAIN").is_err();
-                // UI-SPEC §5: ticked packs unpack **one at a time**. An ExtractPackage op that
-                // arrives while a worker is running (or already queued) waits here; each op's
-                // reply resolves to the real outcome when its reconcile runs.
-                let mut extract_queue: VecDeque<Job> = VecDeque::new();
-                // One embed slice in flight at a time. The worker owns the encode; this flag is
-                // how the idle tick knows not to start a second one, and it is cleared when the
-                // slice's `EmbeddingsDone` lands (or when its worker gives up).
-                let embed_inflight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let tag_inflight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                // DATA-MODEL §6 watch: live notify over the watched source roots, debounced by
-                // the ingest helper. A signal means "something changed, rescan when convenient"
-                // — the rescan is the incremental crawl (needs_rehash skips unchanged files), so
-                // it is cheap. Skipped under the e2e escape hatch like every other idle pass.
-                let mut watch = if drain_enabled && AppConfig::load().watch_sources {
-                    rebuild_watch(&catalog)
-                } else {
-                    None
-                };
-                // The backlog lane works one tick in `IDLE_DUTY_PERIOD`, not every tick.
-                //
-                // Measured on the reference library: an idle app — window open, nothing asked of
-                // it — burned **0.57 cores continuously**, forever, because each 1 s timeout
-                // started a 1 s slice. This is an asset viewer; housekeeping does not get half the
-                // machine. Duty-cycling here throttles all three lanes at once: the embed and tag
-                // workers gate on their `*_inflight` flags, and only this thread clears them.
-                //
-                // Op latency is unaffected — a skipped tick still waits on the channel, so a user
-                // write is picked up the moment it arrives (the point of 147d4b5).
-                let mut idle_tick: u32 = 0;
-                let changes = jobs.changes().clone();
-                let mut inbox = Inbox { rx, held: None };
-                loop {
-                    match inbox.next(std::time::Duration::from_secs(1)) {
-                        Ok(WriterMsg::Op(job)) => {
-                            if matches!(job.op, Op::ExtractPackage { .. }) {
-                                // Extract answers **"accepted"**, not "finished" — the unpack runs
-                                // for minutes on a multi-GB pack, and its progress, outcome and
-                                // cancel button live in the job tray. Both branches reply at the
-                                // same point on purpose: the reply used to be sent at spawn when
-                                // the queue was empty but only at *start* when it wasn't, so one
-                                // command meant two different things depending on queue depth.
-                                if extract_queue.is_empty() && !jobs.has_active_extract() {
-                                    let result = run(
-                                        &mut catalog,
-                                        &db_path,
-                                        job.op,
-                                        &writer_tx,
-                                        &jobs,
-                                        &appraise,
-                                        &focus,
-                                    );
-                                    let _ = job.reply.send(result);
-                                } else {
-                                    // A pack is unpacking (or queued) — join the queue, and say so
-                                    // now rather than blocking the caller until this pack's turn.
-                                    let _ = job.reply.send(Ok(WriteResult {
-                                        changed: 0,
-                                        ..Default::default()
-                                    }));
-                                    extract_queue.push_back(job);
-                                }
-                                continue;
-                            }
-                            // Only the appraise kicks are slow enough to count as "the pump is
-                            // running" — everything else is a quick write the frontend already
-                            // waits on synchronously.
-                            let appraising =
-                                matches!(job.op, Op::IdentifyAll | Op::IdentifyOne { .. });
-                            if appraising {
-                                pump.store(true, Ordering::Relaxed);
-                            }
-                            let source_set_changed = matches!(
-                                job.op,
-                                Op::PersistScan { .. } | Op::SetSourceWatch { .. }
-                            );
-                            let before = catalog.total_changes();
-                            let result = run(
-                                &mut catalog,
-                                &db_path,
-                                job.op,
-                                &writer_tx,
-                                &jobs,
-                                &appraise,
-                                &focus,
-                            );
-                            if appraising {
-                                pump.store(false, Ordering::Relaxed);
-                            }
-                            // A failed op publishes nothing: its caller learns from the reply,
-                            // and an event must never read as a success.
-                            if result.is_ok() {
-                                mark_committed(&changes, &catalog, before, job.origin);
-                            }
-                            let _ = job.reply.send(result);
-                            // A source set (or its watch flags) changed — re-arm the watch so
-                            // new roots are covered and unwatched ones stop firing.
-                            if source_set_changed {
-                                watch = if drain_enabled && AppConfig::load().watch_sources {
-                                    rebuild_watch(&catalog)
-                                } else {
-                                    None
-                                };
-                            }
-                        }
-                        Ok(WriterMsg::ExtractDone {
-                            job_id,
-                            package_id,
-                            outcome,
-                            cancelled,
-                        }) => {
-                            // The payloads landed on disk off-thread; materialize them here —
-                            // the catalog stays single-writer. Then the next queued pack gets
-                            // its worker.
-                            let before = catalog.total_changes();
-                            let result =
-                                materialize_extract(&mut catalog, package_id, outcome, cancelled);
-                            let ok = result.is_ok();
-                            let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
-                            jobs.finish(job_id, ok, cancelled, changed);
-                            start_next_extract(
-                                &mut catalog,
-                                &mut extract_queue,
-                                &db_path,
-                                &writer_tx,
-                                &jobs,
-                                &appraise,
-                                &focus,
-                            );
-                            // Background: the unpack was asked for minutes ago, and its outcome
-                            // is in the tray — not a reason to re-read the page under the user.
-                            mark_committed(&changes, &catalog, before, Origin::Background);
-                        }
-                        Ok(WriterMsg::EmbeddingsDone { model_id, done }) => {
-                            // Cheap: N `upsert_embedding` calls, no inference. Clearing
-                            // `embedding_dirty` here is what lets `promote_statuses` move the
-                            // asset on, so the promote runs on the next idle tick.
-                            let n = lodestash_engine::drains::store_visual_embeddings(
-                                &mut catalog,
-                                &model_id,
-                                &done,
-                            );
-                            embed_inflight.store(false, Ordering::Relaxed);
-                            if n > 0 {
-                                changes.catalog(Origin::Background);
-                            }
-                        }
-                        Ok(WriterMsg::TagsDone { producers, done }) => {
-                            let before = catalog.total_changes();
-                            let n = lodestash_engine::drains::store_tags(&mut catalog, &producers, &done);
-                            tag_inflight.store(false, Ordering::Relaxed);
-                            if n > 0 {
-                                tracing::info!(tags = n, producer = %producers.tagger.0, "idle tagging slice stored");
-                            }
-                            // An empty result still finishes its assets (the queue flag clears), so
-                            // the catalog changed even when no tag row did.
-                            mark_committed(&changes, &catalog, before, Origin::Background);
-                        }
-                        Ok(WriterMsg::ManifestDone {
-                            job_id,
-                            package_id,
-                            entries,
-                            cancelled,
-                        }) => {
-                            // The archive's manifest is read; record the locators + mint the
-                            // in-pack assets (surgical indexing, M14), then spawn the extract
-                            // worker over the locators. The op's reply is answered by that
-                            // phase's ExtractDone — except when the manifest failed, which is
-                            // answered here so the caller never hangs.
-                            // `true` = an extract worker is now running, so *its* `ExtractDone`
-                            // drains the queue. Anything else — an error, or a cancel that stops
-                            // after the analyze phase — has to settle here, or the queue behind it
-                            // never moves again.
-                            let before = catalog.total_changes();
-                            let mut spawned = false;
-                            // Annotated: nothing consumes this as a reply any more (the tray is
-                            // the reporting surface), so the error type has no inference source.
-                            let result: Result<WriteResult, String> = (|| {
-                                let entries = entries?;
-                                let minted = mint_in_pack(&mut catalog, package_id, &entries)?;
-                                // Cancelled during analyze: keep the locators that were read (a
-                                // partial manifest is still progress and the next run resumes from
-                                // it) but do **not** roll on into the extract phase — the user
-                                // asked it to stop.
-                                if cancelled {
-                                    return Ok(WriteResult {
-                                        changed: minted,
-                                        ..Default::default()
+                    if idle_appraises {
+                        // The encode goes to a worker; the writer keeps only the two cheap ends
+                        // (read the queue slice here, persist the result when `EmbeddingsDone`
+                        // arrives). Passing `None` for the embedders below is what keeps the
+                        // pass's own embed drain out of this thread — the kick paths still run it
+                        // inline, because there the user asked for it and is watching a bar.
+                        if let Some(emb) = idle_embedder.clone() {
+                            if !embed_inflight.load(Ordering::Relaxed) {
+                                const SLICE: usize = 8;
+                                let (jobs, albedo) =
+                                    crate::drains::visual_embed_batch(&catalog, SLICE);
+                                if !jobs.is_empty() {
+                                    embed_inflight.store(true, Ordering::Relaxed);
+                                    let tx = ctx.tx.clone();
+                                    let flag = embed_inflight.clone();
+                                    let (ws, cd) =
+                                        (ctx.workspace_dir.clone(), ctx.cache_dir.clone());
+                                    std::thread::spawn(move || {
+                                        let done = crate::drains::compute_visual_embeddings(
+                                            jobs,
+                                            &albedo,
+                                            emb.as_ref(),
+                                            ws.as_deref(),
+                                            cd.as_deref(),
+                                        );
+                                        let model_id = emb.model_id().to_string();
+                                        if tx
+                                            .send(WriterMsg::EmbeddingsDone { model_id, done })
+                                            .is_err()
+                                        {
+                                            // The writer is gone (shutdown) — nothing to persist
+                                            // into, and nothing will clear the flag, so clear it.
+                                            flag.store(false, Ordering::Relaxed);
+                                        }
                                     });
                                 }
-                                let pkg = catalog
-                                    .list_packages()
-                                    .map_err(|e| e.to_string())?
-                                    .into_iter()
-                                    .find(|p| p.id == package_id)
-                                    .ok_or_else(|| format!("package {package_id} not found"))?;
-                                let workspace_dir = default_cache_dirs().1.ok_or_else(|| {
-                                    "no workspace directory configured".to_string()
-                                })?;
-                                spawn_extract_worker(
-                                    &pkg,
-                                    &workspace_dir,
-                                    &entries,
-                                    &writer_tx,
-                                    &jobs,
-                                )?;
-                                spawned = true;
-                                Ok(WriteResult {
-                                    changed: minted,
-                                    ..Default::default()
-                                })
-                            })(
-                            );
-                            let ok = result.is_ok();
-                            let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
-                            jobs.finish(job_id, ok, cancelled, changed);
-                            if !spawned {
-                                start_next_extract(
-                                    &mut catalog,
-                                    &mut extract_queue,
-                                    &db_path,
-                                    &writer_tx,
-                                    &jobs,
-                                    &appraise,
-                                    &focus,
-                                );
-                            }
-                            mark_committed(&changes, &catalog, before, Origin::Background);
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            // Quiet for a second. Backfill previews in short slices, and only
-                            // when nothing is queued — a long pass would make every write wait
-                            // for it (measured: a 5s slice pushed a tag-create past the UI's
-                            // own timeouts). 1s slices keep op latency under ~1.2s while still
-                            // filling most idle time; the queue is durable, so it converges.
-                            if !drain_enabled {
-                                continue;
-                            }
-                            if inbox.waiting() {
-                                continue; // an op is waiting — held, and run on the next turn
-                            }
-                            // Watch signal (debounced upstream): rescan every watched source with
-                            // the incremental crawl. The writer is idle here by construction.
-                            if let Some(w) = &watch {
-                                if w.rx.recv_timeout(std::time::Duration::ZERO).is_ok()
-                                    && rescan_watched(&mut catalog, &db_path)
-                                {
-                                    changes.catalog(Origin::Background);
-                                }
-                            }
-                            idle_tick = idle_tick.wrapping_add(1);
-                            if idle_tick % IDLE_DUTY_PERIOD != 0 {
-                                continue;
-                            }
-                            if idle_appraises {
-                                // The encode goes to a worker; the writer keeps only the two
-                                // cheap ends (read the queue slice here, persist the result when
-                                // `EmbeddingsDone` arrives). Passing `None` for the embedders
-                                // below is what keeps the pass's own embed drain out of this
-                                // thread — the kick paths still run it inline, because there the
-                                // user asked for it and is watching a progress bar.
-                                if let Some(emb) = idle_embedder.clone() {
-                                    if !embed_inflight.load(Ordering::Relaxed) {
-                                        const SLICE: usize = 8;
-                                        let (jobs, albedo) =
-                                            lodestash_engine::drains::visual_embed_batch(
-                                                &catalog, SLICE,
-                                            );
-                                        if !jobs.is_empty() {
-                                            embed_inflight.store(true, Ordering::Relaxed);
-                                            let tx = writer_tx.clone();
-                                            let flag = embed_inflight.clone();
-                                            let (ws, cd) =
-                                                (workspace_dir.clone(), cache_dir.clone());
-                                            std::thread::spawn(move || {
-                                                let done =
-                                                    lodestash_engine::drains::compute_visual_embeddings(
-                                                        jobs,
-                                                        &albedo,
-                                                        emb.as_ref(),
-                                                        ws.as_deref(),
-                                                        cd.as_deref(),
-                                                    );
-                                                let model_id = emb.model_id().to_string();
-                                                if tx
-                                                    .send(WriterMsg::EmbeddingsDone {
-                                                        model_id,
-                                                        done,
-                                                    })
-                                                    .is_err()
-                                                {
-                                                    // The writer is gone (shutdown) — nothing to
-                                                    // persist into, and nothing will clear the
-                                                    // flag, so clear it here.
-                                                    flag.store(false, Ordering::Relaxed);
-                                                }
-                                            });
-                                        }
-                                    }
-                                }
-                                // Tagging takes the same lane. The worker opens its own
-                                // **read-only** catalog connection for the 3D zero-shot lookup —
-                                // WAL admits any number of readers, and the single-writer rule is
-                                // about writes (ADR-0002), which still all land right here.
-                                if !tag_inflight.load(Ordering::Relaxed) {
-                                    const TAG_SLICE: usize = 4;
-                                    let jobs = lodestash_engine::drains::tag_batch(
-                                        &catalog, TAG_SLICE, None,
-                                    );
-                                    if !jobs.is_empty() {
-                                        tag_inflight.store(true, Ordering::Relaxed);
-                                        let tx = writer_tx.clone();
-                                        let flag = tag_inflight.clone();
-                                        let (ws, cd) = (workspace_dir.clone(), cache_dir.clone());
-                                        let db = db_path.clone();
-                                        let emb = idle_embedder.clone();
-                                        std::thread::spawn(move || {
-                                            let sent = tag_worker_slice(&db, jobs, emb, ws, cd, &tx);
-                                            if !sent {
-                                                flag.store(false, Ordering::Relaxed);
-                                            }
-                                        });
-                                    }
-                                }
-                                pump.store(true, Ordering::Relaxed);
-                                let r = appraise_pass(
-                                    &mut catalog,
-                                    None,
-                                    idle_audio.clone(),
-                                    std::time::Duration::from_secs(1),
-                                    &appraise,
-                                    &focus,
-                                    // The idle pass no longer tags inline — the worker above does
-                                    // it. An empty explicit set means "no assets", which is the
-                                    // one thing it cannot be confused with "everything".
-                                    Some(&[]),
-                                );
-                                pump.store(false, Ordering::Relaxed);
-                                if r.map(|w| w.changed > 0).unwrap_or(false) {
-                                    changes.catalog(Origin::Background);
-                                }
-                            } else {
-                                let n = drain_previews(
-                                    &mut catalog,
-                                    workspace_dir.as_deref(),
-                                    cache_dir.as_deref(),
-                                    proxy,
-                                    std::time::Duration::from_secs(1),
-                                );
-                                if n > 0 {
-                                    changes.catalog(Origin::Background);
-                                }
                             }
                         }
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        // Tagging takes the same lane. The worker opens its own **read-only**
+                        // catalog connection for the user's taught vocabulary — WAL admits any
+                        // number of readers, and the single-writer rule is about writes
+                        // (ADR-0002), which still all land right here.
+                        if !tag_inflight.load(Ordering::Relaxed) {
+                            const TAG_SLICE: usize = 4;
+                            let jobs = crate::drains::tag_batch(&catalog, TAG_SLICE, None);
+                            if !jobs.is_empty() {
+                                tag_inflight.store(true, Ordering::Relaxed);
+                                let tx = ctx.tx.clone();
+                                let flag = tag_inflight.clone();
+                                let (ws, cd) = (ctx.workspace_dir.clone(), ctx.cache_dir.clone());
+                                let db = ctx.db_path.clone();
+                                let emb = idle_embedder.clone();
+                                let config = ctx.config.clone();
+                                std::thread::spawn(move || {
+                                    let sent =
+                                        tag_worker_slice(&db, jobs, emb, ws, cd, &tx, &config);
+                                    if !sent {
+                                        flag.store(false, Ordering::Relaxed);
+                                    }
+                                });
+                            }
+                        }
+                        pump.store(true, Ordering::Relaxed);
+                        let r = appraise_pass(
+                            &mut catalog,
+                            &ctx,
+                            None,
+                            idle_audio.clone(),
+                            std::time::Duration::from_secs(1),
+                            // The idle pass no longer tags inline — the worker above does it. An
+                            // empty explicit set means "no assets", which is the one thing it
+                            // cannot be confused with "everything".
+                            Some(&[]),
+                        );
+                        pump.store(false, Ordering::Relaxed);
+                        if r.map(|w| w.changed > 0).unwrap_or(false) {
+                            changes.catalog(Origin::Background);
+                        }
+                    } else {
+                        let n = drain_previews(
+                            &mut catalog,
+                            ctx.workspace_dir.as_deref(),
+                            ctx.cache_dir.as_deref(),
+                            proxy,
+                            std::time::Duration::from_secs(1),
+                        );
+                        if n > 0 {
+                            changes.catalog(Origin::Background);
+                        }
                     }
-                }
-                tracing::debug!("writer: channel closed, thread exiting");
-            })
-            .expect("writer thread spawns");
-        Self { tx }
+                });
+                // A panic inside the pass may have left the flag up; the next pass resets it.
+                pump.store(false, Ordering::Relaxed);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
     }
-
-    /// Run one op and wait for it. `Err` carries a message the frontend can show verbatim.
-    pub fn run(&self, op: Op) -> Result<WriteResult, String> {
-        self.run_as(op, Origin::User)
-    }
-
-    /// [`Writer::run`] on someone else's behalf. The agent bridge says so, and the shell then
-    /// shows a pending update rather than re-reading under the user (ADR-0016).
-    pub fn run_as(&self, op: Op, origin: Origin) -> Result<WriteResult, String> {
-        let (reply, wait) = mpsc::channel();
-        self.tx
-            .send(WriterMsg::Op(Job { op, reply, origin }))
-            .map_err(|_| "writer thread is gone".to_string())?;
-        wait.recv()
-            .map_err(|_| "writer thread dropped the job".to_string())?
-    }
+    tracing::debug!("writer: stopped, thread exiting");
 }
 
 /// (Re)build the notify watch over the catalog's watched source roots (DATA-MODEL §6). `None`
@@ -1414,8 +1457,8 @@ fn rebuild_watch(catalog: &Catalog) -> Option<lodestash_ingest::watch::RootWatch
 /// BLAKE3 via `needs_rehash`), then the standard persist on this thread (single-writer rule —
 /// `persist_to_catalog` opens its own connection here exactly as `Op::PersistScan` does).
 /// Returns whether anything actually changed, so the UI only reloads when it did.
-fn rescan_watched(catalog: &mut Catalog, db_path: &Path) -> bool {
-    let cfg = AppConfig::load();
+fn rescan_watched(catalog: &mut Catalog, ctx: &WriterCtx) -> bool {
+    let cfg = ctx.config.load_display_only();
     let project = cfg.last_project_name.as_deref();
     let mut changed = false;
     let mut prefab_scopes = Vec::new();
@@ -1424,7 +1467,7 @@ fn rescan_watched(catalog: &mut Catalog, db_path: &Path) -> bool {
             continue;
         }
         let root = PathBuf::from(&info.root_path);
-        prefab_scopes.push(lodestash_engine::drains::PrefabScope {
+        prefab_scopes.push(crate::drains::PrefabScope {
             root: root.clone(),
             absent_is_empty: false,
         });
@@ -1434,12 +1477,11 @@ fn rescan_watched(catalog: &mut Catalog, db_path: &Path) -> bool {
         let known = catalog
             .known_sizes_for_source(&info.root_path)
             .unwrap_or_default();
-        let crawled = lodestash_engine::scan::crawl_source(0, &root, &excludes, &known);
+        let crawled = crate::scan::crawl_source(0, &root, &excludes, &known);
         if crawled.entries.is_empty() && crawled.pending_packages.is_empty() {
             continue;
         }
-        let records =
-            lodestash_engine::persist::crawl_records(crawled.entries.iter().map(|(_, f)| f));
+        let records = crate::persist::crawl_records(crawled.entries.iter().map(|(_, f)| f));
         // Cheap in-memory diff against the catalog's last-known (size, mtime): nothing moved on
         // disk means nothing to persist (and no spurious `last_scanned_at` write + UI reload).
         let same = records.len() == known.len()
@@ -1451,20 +1493,20 @@ fn rescan_watched(catalog: &mut Catalog, db_path: &Path) -> bool {
         if same {
             continue;
         }
-        let batch = lodestash_engine::types::PersistBatch {
+        let batch = crate::types::PersistBatch {
             root: info.root_path.clone(),
             name: info.name.clone(),
             excludes_json: None,
             records,
         };
-        match lodestash_engine::persist::persist_to_catalog(db_path, &[batch]) {
+        match crate::persist::persist_to_catalog(&ctx.db_path, &[batch]) {
             Ok(_) => changed = true,
             Err(e) => tracing::warn!(%e, root = %info.root_path, "watch rescan failed"),
         }
     }
     // A prefab is not an asset, so the crawl above never sees one change — yet the watch fired.
     // Re-read the watched trees' prefab evidence; only files whose revision moved are parsed.
-    if lodestash_engine::drains::refresh_prefab_evidence(catalog, &prefab_scopes, false) > 0 {
+    if crate::drains::refresh_prefab_evidence(catalog, &prefab_scopes, false) > 0 {
         changed = true;
     }
     changed
@@ -1485,11 +1527,13 @@ fn tag_worker_slice(
     embedder: Option<std::sync::Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
     workspace_dir: Option<std::path::PathBuf>,
     cache_dir: Option<std::path::PathBuf>,
-    tx: &std::sync::mpsc::Sender<WriterMsg>,
+    tx: &SyncSender<WriterMsg>,
+    config: &ConfigFile,
 ) -> bool {
     // A read connection, only for the user's taught vocabulary — WAL admits any number of
-    // readers, and every write still lands on the writer thread (ADR-0002).
-    let Ok(cat) = Catalog::open(db_path) else {
+    // readers, and every write still lands on the writer thread (ADR-0002). Read-only by type:
+    // this used to be the migrating `Catalog::open` (review R5).
+    let Ok(cat) = Catalog::open_reader(db_path) else {
         tracing::warn!("tag worker could not open a read connection; slice skipped");
         return false;
     };
@@ -1505,7 +1549,7 @@ fn tag_worker_slice(
         })
         .collect::<Vec<_>>();
     let zero_shot = embedder.and_then(|e| ImageZeroShot::new(e, &teach));
-    let cfg = AppConfig::load();
+    let cfg = config.load();
     // **The idle lane never spends money.** Cloud tagging needs `drain_api_tags` (backoff, local
     // fallback, per-run cap) and that drain writes through `&mut Catalog`, so it belongs to the
     // writer's kick path — this slice runs off-writer and can only reach `compute_tags`, which
@@ -1526,8 +1570,11 @@ fn tag_worker_slice(
     };
     // Resolved here, on the read connection: the compute phase below runs off the writer and has
     // no catalog to ask what a model wears (v1 plan S08).
-    let slots = lodestash_engine::drains::slot_textures_for(&cat, &jobs, workspace_dir.as_deref());
-    let done = lodestash_engine::drains::compute_tags(
+    let slots = crate::drains::slot_textures_for(&jobs, |id| {
+        cat.model_slot_texture_paths(id, workspace_dir.as_deref())
+            .ok()
+    });
+    let done = crate::drains::compute_tags(
         jobs,
         tagger.as_ref(),
         zero_shot.as_ref(),
@@ -1536,7 +1583,7 @@ fn tag_worker_slice(
         &slots,
     );
     tx.send(WriterMsg::TagsDone {
-        producers: lodestash_engine::drains::TagProducers {
+        producers: crate::drains::TagProducers {
             tagger: (tagger.producer_id(), tagger.model_id().to_string()),
             zero_shot: zero_shot
                 .as_ref()
@@ -1549,11 +1596,10 @@ fn tag_worker_slice(
 
 fn appraise_pass(
     catalog: &mut Catalog,
+    ctx: &WriterCtx,
     embedder: Option<std::sync::Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
     audio_embedder: Option<std::sync::Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
     budget: std::time::Duration,
-    progress: &AppJobProgress,
-    focus: &Mutex<AppraiseFocus>,
     // The explicit set `identify_asset` was asked about, or `None` for the idle slice over
     // the whole queue. Without it the op flagged the requested assets and then appraised the
     // front of the global queue instead — 8,155 rows deep here, so the assets an agent asked
@@ -1565,15 +1611,20 @@ fn appraise_pass(
     // *current* focus: the one thing that makes the backlog follow the user is that it is re-read
     // after they have moved. A poisoned lock is not worth failing an appraisal over; the queue then
     // keeps whatever order it had, which is the pre-D3b behaviour and still correct.
-    if let Ok(f) = focus.lock() {
+    if let Ok(f) = ctx.focus.lock() {
         catalog.set_appraise_focus(f.clone());
     }
+    let progress = ctx.appraise.as_ref();
     progress.done.store(0, Ordering::Relaxed);
     progress.total.store(0, Ordering::Relaxed);
     progress.failed.store(0, Ordering::Relaxed);
     progress.cancelled.store(false, Ordering::Relaxed);
-    let (cache_dir, workspace_dir) = default_cache_dirs();
-    let proxy = AppConfig::load().preview_quality.proxy_budget();
+    let (cache_dir, workspace_dir) = (ctx.cache_dir.clone(), ctx.workspace_dir.clone());
+    let proxy = ctx
+        .config
+        .load_display_only()
+        .preview_quality
+        .proxy_budget();
     let roots = catalog
         .source_infos()
         .map(|infos| {
@@ -1614,7 +1665,7 @@ fn appraise_pass(
             .collect::<Vec<_>>();
         let zero_shot = embedder.clone().and_then(|e| ImageZeroShot::new(e, &teach));
         let audio_shot = audio_embedder.clone().and_then(AudioZeroShot::new);
-        let cfg = AppConfig::load();
+        let cfg = ctx.config.load();
         let api_model = cfg
             .api_model
             .clone()
@@ -1641,7 +1692,7 @@ fn appraise_pass(
             Some(model) => {
                 let api = OpenAiTagger::new(cfg.api_base_url.clone(), cfg.api_key.clone(), model)
                     .with_teaching(teach.clone());
-                lodestash_engine::drains::drain_api_tags(
+                crate::drains::drain_api_tags(
                     catalog,
                     &cfg,
                     &api,
@@ -1717,29 +1768,22 @@ fn appraise_pass(
 /// to travel back on. It is recorded as a **failed job** instead: the tray is where this feature
 /// reports, and a pack that silently never unpacks is the exact failure this whole path exists to
 /// stop being invisible.
-fn start_next_extract(
-    catalog: &mut Catalog,
-    queue: &mut VecDeque<Job>,
-    db_path: &Path,
-    tx: &Sender<WriterMsg>,
-    jobs: &JobRegistry,
-    progress: &AppJobProgress,
-    focus: &Mutex<AppraiseFocus>,
-) {
-    // Each failure is recorded as a failed job, and the registry publishes that itself.
-    drain_to_first_spawn(queue, jobs, |op| {
-        run(catalog, db_path, op, tx, jobs, progress, focus).map(|_| ())
+fn start_next_extract(catalog: &mut Catalog, queue: &mut VecDeque<Job>, ctx: &WriterCtx) {
+    // Each failure is recorded as a failed job, and the registry publishes that itself. Each start
+    // runs under the same supervision as any command, so a panicking one is a failed job too.
+    drain_to_first_spawn(queue, &ctx.jobs, |op| {
+        supervised(|| run(catalog, op, ctx))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     });
 }
 
 /// The queue invariant itself, with the writer's dependencies handed in.
 ///
-/// Split out to be **testable**. Any test that reaches [`run`] links Tauri's window layer
-/// (`comctl32`/`user32`/`gdi32`/`dwmapi`), and a test binary carries no application manifest — so
-/// it binds to comctl32 v5, misses the v6 exports Tauri imports, and dies at load with
-/// `STATUS_ENTRYPOINT_NOT_FOUND` before a single test runs. That is why this file had no tests at
-/// all, over the only genuinely concurrent code in the repo. Taking `start` as a closure puts the
-/// rule back within reach of one.
+/// Split out to be testable without a writer thread: taking `start` as a closure lets a test drive
+/// the rule directly. (It was first split out because, in the desktop crate, any test that reached
+/// [`run`] linked Tauri's window layer and died at load; in the engine the whole writer is
+/// testable — see `tests_engine.rs`.)
 ///
 /// Returns how many ops failed to spawn — each is recorded as a failed job, because the caller was
 /// already told "accepted" when it queued and has no other way to learn.
@@ -1762,15 +1806,8 @@ fn drain_to_first_spawn(
     failures
 }
 
-fn run(
-    catalog: &mut Catalog,
-    db_path: &Path,
-    op: Op,
-    tx: &Sender<WriterMsg>,
-    jobs: &JobRegistry,
-    progress: &AppJobProgress,
-    focus: &Mutex<AppraiseFocus>,
-) -> Result<WriteResult, String> {
+fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, String> {
+    let jobs = &ctx.jobs;
     match op {
         Op::SetFavorite { ids, on } => catalog
             .set_favorite(&ids, on)
@@ -1853,27 +1890,18 @@ fn run(
             })
             .map_err(|e| e.to_string()),
 
-        // Undo (UI-SPEC §2 / DESIGN-GUIDELINES §7 L5): log the trash toggle so Ctrl/Cmd-Z can
-        // flip it back. Only a toggle that actually changed rows is worth undoing — logging a
-        // no-op would let a revert flip assets that were never touched.
-        Op::SetTrashed { ids, trashed } => {
-            let changed = catalog
-                .set_trashed(&ids, trashed)
-                .map_err(|e| e.to_string())?;
-            if changed > 0 {
-                catalog
-                    .record_trash_op(&ids, trashed)
-                    .map_err(|e| e.to_string())?;
-            }
-            Ok(WriteResult {
+        // Undo (UI-SPEC §2 / DESIGN-GUIDELINES §7 L5): apply the toggle and log it for Ctrl/Cmd-Z
+        // in one transaction, recording only the ids whose state changed (review B13). Logging every
+        // requested id made the undo of "trash {a, b}" restore an `a` that was already in the Trash.
+        Op::SetTrashed { ids, trashed } => catalog
+            .set_trashed_recorded(&ids, trashed)
+            .map(|changed| WriteResult {
                 changed,
                 ..Default::default()
             })
-        }
+            .map_err(|e| e.to_string()),
 
-        Op::RemoveFromLibrary { targets, project } => {
-            remove_from_library(catalog, targets, project)
-        }
+        Op::RemoveFromLibrary { targets } => remove_from_library(catalog, ctx, targets),
 
         Op::DeleteFromDisk {
             targets,
@@ -1895,7 +1923,7 @@ fn run(
                 .unwrap_or_else(|| "Import".to_string());
             let job = jobs.start(label, "import", false);
             let result = (|| {
-                lodestash_engine::persist::persist_to_catalog(db_path, &batches)
+                crate::persist::persist_to_catalog(&ctx.db_path, &batches)
                     .map_err(|e| e.to_string())?;
                 for pack in packs {
                     let Some(source) = catalog
@@ -1923,12 +1951,12 @@ fn run(
                 // queued would re-read it: re-read the scanned trees' prefab evidence here.
                 let scopes: Vec<_> = batches
                     .iter()
-                    .map(|b| lodestash_engine::drains::PrefabScope {
+                    .map(|b| crate::drains::PrefabScope {
                         root: PathBuf::from(&b.root),
                         absent_is_empty: false,
                     })
                     .collect();
-                lodestash_engine::drains::refresh_prefab_evidence(catalog, &scopes, false);
+                crate::drains::refresh_prefab_evidence(catalog, &scopes, false);
                 Ok(WriteResult {
                     changed,
                     ..Default::default()
@@ -1947,7 +1975,7 @@ fn run(
             let label = format!("Import {} packs", packs.len());
             let job = jobs.start(label, "import", false);
             let result = (|| {
-                let name = lodestash_engine::config::stem_name(std::path::Path::new(&root));
+                let name = crate::config::stem_name(std::path::Path::new(&root));
                 let source_id = catalog
                     .upsert_import_source(&name, &root, "folder")
                     .map_err(|e| e.to_string())?;
@@ -2084,7 +2112,7 @@ fn run(
             catalog
                 .add_source_exclude(source_id, &kind, &value)
                 .map_err(|e| e.to_string())?;
-            sync_source_exclude_to_config(catalog, source_id, &kind, &value, true)?;
+            sync_source_exclude_to_config(catalog, ctx, source_id, &kind, &value, true)?;
             Ok(WriteResult {
                 changed: 1,
                 ..Default::default()
@@ -2099,7 +2127,7 @@ fn run(
             let removed = catalog
                 .remove_source_exclude(source_id, &kind, &value)
                 .map_err(|e| e.to_string())?;
-            sync_source_exclude_to_config(catalog, source_id, &kind, &value, false)?;
+            sync_source_exclude_to_config(catalog, ctx, source_id, &kind, &value, false)?;
             Ok(WriteResult {
                 changed: usize::from(removed),
                 ..Default::default()
@@ -2178,11 +2206,10 @@ fn run(
             }
             let result = appraise_pass(
                 catalog,
+                ctx,
                 embedder,
                 audio_embedder,
                 std::time::Duration::from_secs(20),
-                progress,
-                focus,
                 None,
             );
             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
@@ -2206,11 +2233,10 @@ fn run(
             }
             let result = appraise_pass(
                 catalog,
+                ctx,
                 embedder,
                 audio_embedder,
                 std::time::Duration::from_secs(20),
-                progress,
-                focus,
                 None,
             );
             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
@@ -2239,11 +2265,10 @@ fn run(
             }
             let result = appraise_pass(
                 catalog,
+                ctx,
                 embedder,
                 audio_embedder,
                 std::time::Duration::from_secs(20),
-                progress,
-                focus,
                 Some(&asset_ids),
             );
             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
@@ -2315,7 +2340,7 @@ fn run(
             // cache.
             //
             // **This command answers as soon as a worker is spawned, not when the pack is
-            // unpacked.** `Writer::run` does a single `wait.recv()` and drops the receiver, so the
+            // unpacked.** `WriterHandle::run` waits once and drops the receiver, so the
             // `reply.send` the workers make from `ExtractDone`/`ManifestDone` always lands on a
             // dead channel and is discarded. Outcome and progress reach the user through the **job
             // tray**, which is the right home for a multi-GB unpack — but the frontend's per-row
@@ -2328,8 +2353,9 @@ fn run(
                 .into_iter()
                 .find(|p| p.id == package_id)
                 .ok_or_else(|| format!("package {package_id} not found"))?;
-            let workspace_dir = default_cache_dirs()
-                .1
+            let workspace_dir = ctx
+                .workspace_dir
+                .clone()
                 .ok_or_else(|| "no workspace directory configured".to_string())?;
             let entries = catalog
                 .list_package_entries(package_id)
@@ -2339,7 +2365,7 @@ fn run(
                 // inflate its whole tar.gz; never on the writer thread). The kind is
                 // "extract" so the one-at-a-time queue gates the whole flow.
                 let handles = jobs.start(format!("Analyze {}", pkg.name), "extract", true);
-                let wtx = tx.clone();
+                let wtx = ctx.tx.clone();
                 let wcancel = handles.cancel;
                 let wprogress = handles.progress.expect("manifest jobs carry progress");
                 let wpath = PathBuf::from(&pkg.package_path);
@@ -2409,7 +2435,7 @@ fn run(
             } else {
                 // Locators already recorded (browse persistence) — mint + extract right away.
                 mint_in_pack(catalog, package_id, &entries)?;
-                spawn_extract_worker(&pkg, &workspace_dir, &entries, tx, jobs)?;
+                spawn_extract_worker(&pkg, &workspace_dir, &entries, &ctx.tx, jobs)?;
             }
             Ok(WriteResult {
                 changed: 0, // queued — the tray reports the real changed count
@@ -2476,7 +2502,7 @@ fn run(
         // Batch undo opens its own connection on this thread (the same pattern as
         // persist_to_catalog): the single-writer rule is about which *thread* writes, and this
         // is still the writer — no other job can interleave with the delete.
-        Op::UndoImportBatch { batch_id } => undo_import_batch(db_path, &batch_id),
+        Op::UndoImportBatch { batch_id } => undo_import_batch(catalog, &batch_id),
 
         Op::DeleteCategory { id } => catalog
             .delete_category(id)
@@ -2582,6 +2608,14 @@ fn run(
                 ..Default::default()
             })
             .map_err(|e| e.to_string()),
+
+        #[cfg(test)]
+        Op::Panic => panic!("a command panicked on purpose"),
+        #[cfg(test)]
+        Op::Hold(for_) => {
+            std::thread::sleep(for_);
+            Ok(WriteResult::default())
+        }
     }
 }
 
@@ -2633,7 +2667,7 @@ fn undo_export_batch(catalog: &mut Catalog, batch_id: &str) -> Result<WriteResul
         }
         // The sandbox as it stands *now*: a folder that was legal to export into may since have
         // been added as a library source, and deleting inside one is what the invariant forbids.
-        let Ok(dest) = lodestash_api::export::check_dest(dest_path, &roots) else {
+        let Ok(dest) = crate::sandbox::check_dest(dest_path, &roots) else {
             refused += 1;
             continue;
         };
@@ -2669,20 +2703,11 @@ fn undo_export_batch(catalog: &mut Catalog, batch_id: &str) -> Result<WriteResul
     })
 }
 
-fn undo_import_batch(db_path: &Path, batch_id: &str) -> Result<WriteResult, String> {
-    let conn = Connection::open(db_path).map_err(|e| format!("catalog unavailable: {e}"))?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT p.project_path, ir.dest_path
-               FROM import_record ir
-               JOIN project p ON p.id = ir.project_id
-              WHERE ir.batch_id = ?1",
-        )
-        .map_err(|e| e.to_string())?;
-    let files: Vec<(String, String)> = stmt
-        .query_map([batch_id], |r| Ok((r.get(0)?, r.get(1)?)))
-        .map_err(|e| e.to_string())?
-        .collect::<rusqlite::Result<Vec<_>>>()
+fn undo_import_batch(catalog: &Catalog, batch_id: &str) -> Result<WriteResult, String> {
+    // Through the writer's own connection: this used to open a raw one, without the catalog's
+    // pragmas or busy timeout (review R5).
+    let files = catalog
+        .import_batch_files(batch_id)
         .map_err(|e| e.to_string())?;
 
     // Delete the copied files first, while the paths are still known — the records go only
@@ -2713,8 +2738,8 @@ fn undo_import_batch(db_path: &Path, batch_id: &str) -> Result<WriteResult, Stri
         }
     }
 
-    let changed = conn
-        .execute("DELETE FROM import_record WHERE batch_id = ?1", [batch_id])
+    let changed = catalog
+        .forget_import_batch(batch_id)
         .map_err(|e| e.to_string())?;
     Ok(WriteResult {
         changed,
@@ -2733,7 +2758,7 @@ fn mint_in_pack(
     package_id: i64,
     entries: &[PackageEntryRecord],
 ) -> Result<usize, String> {
-    let classified = lodestash_engine::persist::classify_in_pack_entries(entries);
+    let classified = crate::persist::classify_in_pack_entries(entries);
     let stats = catalog
         .mint_in_pack_assets(package_id, &classified)
         .map_err(|e| e.to_string())?;
@@ -2748,7 +2773,7 @@ fn spawn_extract_worker(
     pkg: &lodestash_core::catalog::PackageListing,
     workspace_dir: &Path,
     entries: &[PackageEntryRecord],
-    tx: &Sender<WriterMsg>,
+    tx: &SyncSender<WriterMsg>,
     jobs: &JobRegistry,
 ) -> Result<(), String> {
     let wanted: Vec<EntryLocator> = entries
@@ -2826,6 +2851,7 @@ fn spawn_extract_worker(
 /// workspace from here on (extracted → in-pack → on-disk ladder, DATA-MODEL §7).
 fn materialize_extract(
     catalog: &mut Catalog,
+    ctx: &WriterCtx,
     package_id: i64,
     outcome: Result<Vec<ExtractedAsset>, String>,
     cancelled: bool,
@@ -2837,7 +2863,7 @@ fn materialize_extract(
     // which pass wrote the row. It survived only because `Path::join` with an absolute path
     // *replaces* on Windows, making the wrong form accidentally resolve — until the cache dir
     // moves, at which point every extracted row points at a directory that no longer exists.
-    let workspace = default_cache_dirs().1;
+    let workspace = ctx.workspace_dir.clone();
     let pairs: Vec<(String, String)> = extracted
         .iter()
         .filter_map(|a| {
@@ -2864,9 +2890,9 @@ fn materialize_extract(
     }
     // The extraction landed prefabs beside the assets, and they are evidence about those assets.
     if let Some(ws) = workspace {
-        lodestash_engine::drains::refresh_prefab_evidence(
+        crate::drains::refresh_prefab_evidence(
             catalog,
-            &[lodestash_engine::drains::PrefabScope {
+            &[crate::drains::PrefabScope {
                 root: ws,
                 absent_is_empty: true,
             }],
@@ -2881,42 +2907,42 @@ fn materialize_extract(
 
 /// Soft-delete the rows **and** blacklist each asset in its source.
 ///
-/// The blacklist is what makes this different from Trash: `crawler::crawl` takes the per-source
+/// The blacklist is what makes this different from Trash: the crawl takes the per-source
 /// `Exclude` list, so an excluded asset is never re-offered by a scan. Without it a "removed"
 /// asset reappears the next time the user indexes that folder, which reads as the app ignoring
 /// them.
 ///
-/// The exclude is written to the **app config**, not `import_source.blacklist`: the config is
-/// what `crawl` is actually handed today (`app.rs:812`), and the catalog column is M5 storage
-/// that nothing reads yet. Writing only the column would look right and change nothing.
+/// The exclude goes where the Settings blacklist editor writes one ([`Op::AddSourceExclude`]): the
+/// source's own list in the catalog, mirrored into the open project's config, which is what the
+/// crawl is handed today. It used to require an open project and fail without one — after the
+/// rows were already trashed, so the error path skipped the reload and the asset stayed on screen
+/// (review S3). Without a project the catalog list is written and the mirror has nothing to do.
 fn remove_from_library(
     catalog: &Catalog,
+    ctx: &WriterCtx,
     targets: Vec<Target>,
-    project: Option<String>,
 ) -> Result<WriteResult, String> {
     let ids: Vec<i64> = targets.iter().map(|t| t.asset_id).collect();
     let changed = catalog.set_trashed(&ids, true).map_err(|e| e.to_string())?;
 
-    let Some(project) = project else {
-        // No project open: the row is hidden, but nothing owns a blacklist to write to. Say so
-        // rather than reporting a removal that a scan will undo.
-        return Err("no project is open, so the asset cannot be excluded from future scans".into());
-    };
-    let mut config = lodestash_engine::config::AppConfig::load();
     let mut excluded = 0;
     for t in &targets {
         let Some(root) = t.source_root.as_deref() else {
             continue; // in-pack asset: no source-relative file for the crawler to skip
         };
+        let Some(source) = catalog
+            .source_info_by_root(&root.to_string_lossy())
+            .map_err(|e| e.to_string())?
+        else {
+            continue;
+        };
         // `Asset` matches the full source-relative path or the bare file name
         // (`Exclude::matches`), so this excludes exactly the file the user removed.
-        let exclude = Exclude {
-            kind: ExcludeKind::Asset,
-            value: t.rel_path.clone(),
-        };
-        if config.add_source_exclude(&project, root, exclude) {
-            excluded += 1;
-        }
+        catalog
+            .add_source_exclude(source.id, "asset", &t.rel_path)
+            .map_err(|e| e.to_string())?;
+        sync_source_exclude_to_config(catalog, ctx, source.id, "asset", &t.rel_path, true)?;
+        excluded += 1;
     }
     tracing::info!(rows = changed, excluded, "removed from library");
     Ok(WriteResult {
@@ -2933,6 +2959,7 @@ fn remove_from_library(
 /// settings commands; the writer holds no other lock here, so there is no lock-order cycle.
 fn sync_source_exclude_to_config(
     catalog: &Catalog,
+    ctx: &WriterCtx,
     source_id: i64,
     kind: &str,
     value: &str,
@@ -2949,7 +2976,7 @@ fn sync_source_exclude_to_config(
         },
         value: value.to_string(),
     };
-    lodestash_engine::config::edit_config(|config| {
+    ctx.config.edit(|config| {
         let Some(project) = config.last_project_name.clone() else {
             return;
         };
@@ -2970,7 +2997,7 @@ fn deletable(t: &Target, roots: &[PathBuf], workspace: Option<&Path>) -> bool {
     let Some(path) = t.abs_path.as_deref() else {
         return false;
     };
-    if !path.is_file() || !lodestash_engine::thumbs::under_known_root(path, roots, workspace) {
+    if !path.is_file() || !crate::thumbs::under_known_root(path, roots, workspace) {
         tracing::warn!(path = %path.display(), "refused to delete: outside every known root");
         return false;
     }
@@ -3304,7 +3331,7 @@ mod tests {
         n: i64,
     ) -> (
         VecDeque<Job>,
-        Vec<mpsc::Receiver<Result<WriteResult, String>>>,
+        Vec<mpsc::Receiver<Result<WriteResult, WriteError>>>,
     ) {
         let mut queue = VecDeque::new();
         let waits = (0..n)
@@ -3431,105 +3458,20 @@ mod tests {
         );
     }
 
-    /// Drain whatever is pending right now, as the publisher would at the end of a window.
-    fn take(changes: &Changes) -> ChangedEvent {
-        changes.inner.0.lock().expect("changes lock").take()
-    }
-
-    /// ADR-0016's headline: fifty writes landing inside one window reach the shell as one event.
-    /// Before, every op emitted `catalog` *and* `jobs` — a hundred IPC events and fifty status
-    /// re-reads for fifty tag writes, and a `jobs` event for ops that never touched the tray.
-    #[test]
-    fn fifty_writes_in_one_window_publish_once() {
-        let changes = Changes::default();
-        let (tx, rx) = mpsc::channel();
-        changes.spawn_publisher(std::time::Duration::from_millis(60), move |e| {
-            let _ = tx.send(e);
-        });
-        for _ in 0..50 {
-            changes.catalog(Origin::User);
-        }
-        let event = rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("the window closes and publishes");
-        assert_eq!(
-            event,
-            ChangedEvent {
-                catalog: true,
-                jobs: false,
-                origins: vec!["user"],
-                catalog_gen: 50,
-                jobs_gen: 0,
-            },
-            "one event carrying every write's generation, and no jobs change nobody caused"
-        );
-        assert!(
-            rx.recv_timeout(std::time::Duration::from_millis(200))
-                .is_err(),
-            "nothing after it: the fifty were one publication"
-        );
-    }
-
-    /// A fixed window, not a trailing debounce: a producer that never pauses (the preview drain)
-    /// still publishes every window, where a debounce waiting for quiet would starve forever. And a
-    /// window that mixes origins keeps all of them — the shell must not take an agent's write for
-    /// the user's own because the two happened to share 250 ms.
-    #[test]
-    fn a_continuous_producer_publishes_every_window_and_loses_no_origin() {
-        let changes = Changes::default();
-        let (tx, rx) = mpsc::channel();
-        changes.spawn_publisher(std::time::Duration::from_millis(20), move |e| {
-            let _ = tx.send(e);
-        });
-        let origins = [Origin::User, Origin::Agent, Origin::Background];
-        let started = std::time::Instant::now();
-        let mut marks = 0u64;
-        while started.elapsed() < std::time::Duration::from_millis(300) {
-            changes.catalog(origins[(marks % 3) as usize]);
-            marks += 1;
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        let mut events = Vec::new();
-        while let Ok(e) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
-            events.push(e);
-        }
-        assert!(
-            events.len() >= 5,
-            "300 ms of continuous writes over a 20 ms window published {} time(s) — starved",
-            events.len()
-        );
-        assert!(
-            events
-                .windows(2)
-                .all(|p| p[0].catalog_gen < p[1].catalog_gen),
-            "generations only climb"
-        );
-        assert_eq!(
-            events.last().map(|e| e.catalog_gen),
-            Some(marks),
-            "the last event accounts for every write — none lost, none deferred forever"
-        );
-        let seen: std::collections::HashSet<&str> = events
-            .iter()
-            .flat_map(|e| e.origins.iter().copied())
-            .collect();
-        assert_eq!(seen.len(), 3, "every origin survives coalescing: {seen:?}");
-    }
-
     /// The tray is its own domain: a job starting, moving or finishing publishes `jobs`, never
     /// `catalog` — the grid has no reason to re-read because a download began.
     #[test]
     fn the_job_registry_publishes_its_own_changes_and_only_those() {
         let jobs = JobRegistry::default();
         let h = jobs.start("Extract X".into(), "extract", true);
-        let started = take(jobs.changes());
+        let started = jobs.changes().take_pending();
         assert!(
             started.jobs && !started.catalog,
             "start is a jobs change: {started:?}"
         );
         jobs.progressed();
         jobs.finish(h.id, true, false, 3);
-        let finished = take(jobs.changes());
+        let finished = jobs.changes().take_pending();
         assert!(finished.jobs && !finished.catalog, "{finished:?}");
         assert_eq!(
             finished.jobs_gen, 3,
@@ -3538,30 +3480,6 @@ mod tests {
         assert!(
             finished.origins.is_empty(),
             "a tray change has no catalog origin"
-        );
-    }
-
-    /// Only a turn that committed rows is a catalog change. `total_changes` is SQLite's own count,
-    /// so a turn that only read stays silent and a write says so, under the origin that caused it.
-    #[test]
-    fn only_a_committed_write_marks_the_catalog() {
-        let c = Catalog::open_in_memory().expect("open");
-        let changes = Changes::default();
-
-        let before = c.total_changes();
-        let _ = c.source_infos().expect("read");
-        mark_committed(&changes, &c, before, Origin::User);
-        assert!(!take(&changes).catalog, "a read is not a change");
-
-        let before = c.total_changes();
-        c.upsert_import_source("s", "/s", "folder").expect("write");
-        mark_committed(&changes, &c, before, Origin::Agent);
-        let event = take(&changes);
-        assert!(event.catalog, "a committed write is a change");
-        assert_eq!(
-            event.origins,
-            vec!["agent"],
-            "under the origin that caused it"
         );
     }
 

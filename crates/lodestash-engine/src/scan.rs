@@ -192,7 +192,7 @@ pub fn dominant_content_category(entries: &[PackageEntryRecord]) -> Option<&'sta
     }
     let mut best: Option<(usize, &'static str)> = None;
     for (i, cat) in ORDER.iter().enumerate() {
-        if counts[i] > 0 && best.map_or(true, |(bi, _)| counts[i] > counts[bi]) {
+        if counts[i] > 0 && best.is_none_or(|(bi, _)| counts[i] > counts[bi]) {
             best = Some((i, cat));
         }
     }

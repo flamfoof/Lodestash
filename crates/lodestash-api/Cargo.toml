@@ -10,6 +10,9 @@ description = "Loopback HTTP/JSON API (/v1/) over axum — 1:1 with the MCP surf
 
 [dependencies]
 lodestash-core = { workspace = true }
+# The export sandbox rule (`export::check_dest`), shared with the engine's writer. The adapter
+# depends on the service, never the reverse (v2 spec §3).
+lodestash-engine = { workspace = true }
 serde          = { workspace = true }
 serde_json     = { workspace = true }
 tracing        = { workspace = true }

@@ -752,8 +752,8 @@ Governing docs: [review](reviews/2026-11-16-architecture-review.md) ·
 tracking; these cards track phases).
 
 - [x] **V2-P0** Review, spec, ADR-0021/0022/0023, plan, one reconciled prototype
-- [x] **V2-P1** Core hardening — typed errors, migration lifecycle, `CatalogReader`, lookup indexes, moves keep identity, atomic project registration, robust unitypackage reads *(2026-11-16; one carry-over: the desktop writer's `Op::SetTrashed` moves to `Catalog::set_trashed_recorded` with the writer in Task 2.3)*
-- [ ] **V2-P2** `lodestash-protocol` operation catalog; `lodestash-engine` absorbs app + writer + read model; config store; one appraisal plan and job registry *(in progress: 2.1 protocol and 2.2 `lodestash-app` → `lodestash-engine` done)*
+- [x] **V2-P1** Core hardening — typed errors, migration lifecycle, `CatalogReader`, lookup indexes, moves keep identity, atomic project registration, robust unitypackage reads *(2026-11-16; one carry-over: the desktop writer's `Op::SetTrashed` moves to `Catalog::set_trashed_recorded` with the writer in Task 2.3 — done)*
+- [ ] **V2-P2** `lodestash-protocol` operation catalog; `lodestash-engine` absorbs app + writer + read model; config store; one appraisal plan and job registry *(in progress: 2.1 protocol, 2.2 `lodestash-app` → `lodestash-engine` and 2.3 `Engine` — writer, read model, storage, media; S1/S3/U9 fixed — done; 2.4 config store and 2.5 appraisal plan open)*
 - [ ] **V2-P3** `lodestash-api` derived from the catalog; UI session, request checks, SSE, bytes, static UI
 - [x] **V2-P4** `lodestash-mcp` standalone thin client with auto-launch (also retired `--mcp` and `agent_bridge.rs`)
 - [ ] **V2-P5** Thin Tauri shell; retire Tauri commands, `lodestash://`, old `ui/`
