@@ -137,7 +137,14 @@ export function vocabularyInPage(rootSelector) {
     }
     bump("background", hex(cs.backgroundColor));
     if (cs.backgroundImage.includes("gradient")) bump("gradient", cs.backgroundImage);
-    if (parseFloat(cs.borderTopWidth) > 0) bump("border", `${cs.borderTopWidth} ${hex(cs.borderTopColor)}`);
+    // Every side: accent borders are often one side only (a card's 3px left edge), and a walk
+    // that reads the top border alone never sees them. One count per distinct edge per element.
+    const edges = new Set();
+    for (const side of ["Top", "Right", "Bottom", "Left"]) {
+      const w = cs[`border${side}Width`];
+      if (parseFloat(w) > 0) edges.add(`${w} ${hex(cs[`border${side}Color`])}`);
+    }
+    for (const edge of edges) bump("border", edge);
     if (parseFloat(cs.borderTopLeftRadius) > 0) bump("radius", cs.borderTopLeftRadius);
     const pad = [cs.paddingTop, cs.paddingRight, cs.paddingBottom, cs.paddingLeft];
     if (pad.some((p) => parseFloat(p) > 0)) bump("padding", pad.join(" "));

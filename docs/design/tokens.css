@@ -234,6 +234,7 @@
   /* ---- borderWidth ---- */
   --bw-1_5: 1.5px;
   --bw-2: 2px;
+  --bw-3: 3px; /* one-sided accent edges: a card's status edge, a toast's */
 
   /* ---- shadow ---- */
   --glow-arcane-10-a25: 0 0 10px 0 #49d6c940;
@@ -264,6 +265,9 @@
   --ring-gold-2-a18: 0 0 0 2px #e7b7652e;
   --ring-gold-2: 0 0 0 2px #e7b765;
   --ring-inset-gold-1-a40: inset 0 0 0 1px #e7b76566;
+  /* AI search mode's counterparts of the two gold rings above. */
+  --ring-inset-arcane-1-a40: inset 0 0 0 1px #49d6c966;
+  --ring-arcane-2-a22: 0 0 0 2px #49d6c938;
   --shadow-1-5-a50: 0 1px 5px 0 #00000080;
   --shadow-12-32-a55: 0 12px 32px 0 #0000008c;
   --shadow-8-24-a45: 0 8px 24px 0 #00000073;
@@ -311,11 +315,6 @@
   --ls-type-font: #f2966e; /* media_type `font` exists; the prototype's data has no font asset */
   --ls-info: #5aa9f0; /* neutral notices; the prototype only draws warn/danger/success notices */
   --ring-focus: 0 0 0 2px #ffd98a; /* keyboard focus; the prototype is mouse-only */
-  /* Drawn by the prototype only in AI mode, a state the extractor does not render. */
-  --ring-inset-arcane-1-a40: inset 0 0 0 1px #49d6c966;
-  --ring-arcane-2-a22: 0 0 0 2px #49d6c938;
-  /* Left accent borders (cards, toasts) are 3px; the extractor reads only top borders. */
-  --bw-3: 3px;
   /* Layers: one ladder so nothing invents a z-index. */
   --z-raised: 1;
   --z-sticky: 10;

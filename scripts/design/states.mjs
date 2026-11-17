@@ -15,6 +15,14 @@ const nav = (label) => async (page) => {
 export const STATES = {
   onboarding: { screen: "First-run onboarding", steps: async () => {} },
   library: { screen: "Library", steps: openLibrary },
+  // AI search mode recolours the search well and mode toggle (arcane rings); nothing else draws them.
+  "library+ai": {
+    screen: "Library",
+    steps: async (page) => {
+      await openLibrary(page);
+      await clickText(page, "✦ AI");
+    },
+  },
   "library+inspector": {
     screen: "Inspector",
     steps: async (page) => {

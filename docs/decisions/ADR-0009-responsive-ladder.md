@@ -30,6 +30,22 @@ something behind a gesture.
 
 Supported floor: **900 × 600**. Below that the shell scrolls.
 
+### Amendment 2026-11-17 — the top bar has its own steps
+
+The ladder above never said what the **top bar** gives up, and at the 900 px floor its controls
+overflow by about 300 px. The v2 shell (`web/src/ui/AppBar.svelte`) folds them to their icon in
+this order — decoration first, the same ordering principle — each keeping its label as its
+accessible name and tooltip:
+
+| Window below | What folds to an icon |
+|---|---|
+| 1432px | The local-inference chip (`local · <device>`). |
+| 1232px | The category tabs' labels. |
+| 1032px | The wordmark's name and the search-mode labels (Tags / AI). |
+
+The search well, the health meter and the project chip never fold. These are container queries on
+the bar's own width (1400 / 1200 / 1000 px of bar), so they hold whatever the window chrome is.
+
 The owner call is narrowed to: **facet groups stay expanded on every screen, at every width where
 they fit.** They are never hidden by *screen*; below 1120px they are one click away for everyone,
 on every screen, in the rail's flyout.

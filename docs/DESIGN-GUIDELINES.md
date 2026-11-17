@@ -169,6 +169,11 @@ behind a gesture.
 
 **Floor: 900 × 600.** Below that the shell scrolls; the product does not claim to support it.
 
+**Top bar** (ADR-0009 amendment, 2026-11-17): its controls fold to their icon, label kept as
+accessible name and tooltip — the local-inference chip below a 1432 px window, the category tab
+labels below 1232 px, the wordmark's name and the search-mode labels below 1032 px. The search
+well, health meter and project chip never fold.
+
 **Ordering principle:** decoration first, then chrome that can be recalled on demand, then chrome
 that changes state. **The grid is never what shrinks to make room for a control.**
 

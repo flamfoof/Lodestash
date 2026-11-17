@@ -1395,6 +1395,10 @@
         }
       }
     },
+    "library+ai": {
+      "screen": "Library",
+      "anchors": {}
+    },
     "library+inspector": {
       "screen": "Inspector",
       "anchors": {}
