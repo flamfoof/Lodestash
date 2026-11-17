@@ -68,6 +68,20 @@ truth**. This file is the rule set for working in this repo.
 
 When in doubt, the relevant `docs/` file wins over assumptions.
 
+## v2 rewrite (2026-11-16)
+
+The app is being restructured on branch `rewrite/v2` (not merged to `main`). The governing design is
+[`docs/superpowers/specs/2026-11-16-v2-architecture-design.md`](docs/superpowers/specs/2026-11-16-v2-architecture-design.md);
+the phases and their state are in [`docs/superpowers/plans/2026-11-16-v2-rewrite.md`](docs/superpowers/plans/2026-11-16-v2-rewrite.md);
+why, in [`docs/reviews/2026-11-16-architecture-review.md`](docs/reviews/2026-11-16-architecture-review.md).
+UI work is measured against the design prototype (ADR-0023): run `bun run design:tokens`,
+`bun run design:check` and `bun run web:check` after touching tokens, the prototype or `web/`.
+
+**Trap:** never point two git worktrees of this repo at one `CARGO_TARGET_DIR`. Observed
+2026-11-16: a main-tree build of `lodestash-api` linked another worktree's older `lodestash-core`
+(the workspace crates appear to get the same unit hashes in every checkout), so a build or test
+result can silently reflect the other tree's source. Give each worktree its own target dir.
+
 ## MCP asset-analysis work (2026-09-10)
 
 For agent search, library selection, evidence/file access, Unity-package analysis and LLM-authored
@@ -83,7 +97,8 @@ corresponding MCP/REST operation together, and prove the real host can call it. 
 alone do not establish behavioral parity or successful persistence.
 
 Keep three connections distinct: Vite serves the UI, the Engine API serves authenticated `/v1/`
-operations, and `lodestash-desktop --mcp` is the host-spawned stdio service. A computer-use helper
+operations, and `lodestash-mcp` (a separate binary since v2, ADR-0022; `lodestash-desktop --mcp`
+now only refuses with a pointer to it) is the host-spawned stdio service. A computer-use helper
 pipe failure is not evidence of a Lodestash MCP failure. Use the existing launch guide in
 [`crates/lodestash-desktop/README.md`](crates/lodestash-desktop/README.md) for the GUI.
 
