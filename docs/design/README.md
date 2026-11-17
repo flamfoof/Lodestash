@@ -14,29 +14,21 @@
 >
 > Per `CLAUDE.md` the governing `docs/` files win over this bundle wherever they disagree.
 
-> **Precedence inside this folder (2026-08-13).** The bundle is not one snapshot — it is four
-> generations that disagree with each other. Newest wins:
+> **One visual authority (2026-11-16, [ADR-0023](../decisions/ADR-0023-one-visual-authority-and-a-contract-gate.md)).**
+> The four-generation precedence chain that used to stand here is retired. It called the canvas's
+> top-level prototype "stale"; a three-way merge showed it is a sibling of the handoff prototype,
+> branched from the same 2026-07-14 base — it added Unity Assets, the Unity import dialog and the
+> Add-source chooser while the handoff added Favorites.
 >
-> 0. **`screenshots/library-mockup-2026-08-13.png`** — a full-window Library mockup produced in
->    Claude Design and added to the repo on 2026-08-13. The newest artefact here, and the only one
->    that shows the **asset card at its intended proportions**. **Visual authority only**: it drops
->    the **Unity Assets** nav row (ten rows again) and the **Materials** category tab, so on nav
->    order, taxonomy and counts it loses to `FEATURES.md` exactly as the prototype does. The full
->    shipped-vs-mockup gap list is [`ALIGNMENT-AUDIT.md`](ALIGNMENT-AUDIT.md) §N.
-> 1. **`FEATURES.md`** — reconciled forward, carries dated revision notes (e.g. §5.3's content-derived
->    categories, 2026-07-30). **The arbiter.** Eleven nav rows: Library, Favorites, Identify,
->    Collections, Packages, **Unity Assets**, Traits, Stats, Duplicates, Trash, Settings.
-> 2. **`Lodestash Prototype.dc.html`** — the Jul-23 prototype. Its `navItems` array has **ten** rows
->    and **no Unity Assets** (`grep` finds neither that string nor `Unity Libraries`). Favorites is
->    present. Build against `FEATURES.md`, not this file, wherever the two differ.
-> 3. **`screenshots/`** — older still: every shot has a Unity nav row and **no Favorites**, so all of
->    them predate the prototype. Useful as a pixel-level reference for the Unity landing, Settings and
->    the filter panel — never as a naming or nav authority. Only a partial set is mirrored locally;
->    see `screenshots/README.md` for the numbering scheme and what was left in the remote.
->
-> The Claude Design project also holds a **stale top-level revision** (`Lodestash Prototype.dc.html`
-> and `support.js` at the project root, outside `design_handoff_settings_and_library/`) with a Unity
-> row and no Favorites. It is older than everything above; do not mistake it for newer.
+> - **`Lodestash Prototype.dc.html`** in this folder is now the merge of both, with the eleven nav
+>   rows `FEATURES.md` specifies. It is the only visual authority. Sources and hashes:
+>   [`PROVENANCE.md`](PROVENANCE.md).
+> - **Behaviour** stays owned by `FEATURES.md` and [`UI-SPEC.md`](../UI-SPEC.md).
+> - A deliberate visual difference from the prototype is a row in [`DEVIATIONS.md`](DEVIATIONS.md);
+>   any other difference fails the design-contract gate.
+> - `screenshots/` and `screenshots/library-mockup-2026-08-13.png` are history. Where the mockup's
+>   card proportions differ from the prototype, decide it while rebuilding the Library screen and
+>   record it in `DEVIATIONS.md`.
 
 
 ## Overview

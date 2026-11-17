@@ -145,6 +145,10 @@ manual two-process form, are in
 | [`docs/KANBAN.md`](docs/KANBAN.md) | Kanban board (Backlog → Ready → In Progress → Review → Done) tracking the build |
 | [`docs/KANBAN-SVELTE.md`](docs/KANBAN-SVELTE.md) | The live Svelte re-write board — lanes per status, every card code-verified |
 | [`docs/decisions/`](docs/decisions/) | **ADRs** — numbered records of pivotal cuts (egui→Tauri/Svelte, single-writer, zero-shot tagging, density default, in-pack cap scope, redo) with supersession links |
+| [`docs/reviews/2026-11-16-architecture-review.md`](docs/reviews/2026-11-16-architecture-review.md) | **v2:** the structural review behind the rewrite — root causes, bugs, what to keep |
+| [`docs/superpowers/specs/2026-11-16-v2-architecture-design.md`](docs/superpowers/specs/2026-11-16-v2-architecture-design.md) | **v2 governing design** — engine owns the catalog, one operation catalog, UI as a `/v1` web client, standalone MCP server, design-contract gate; wins over ARCHITECTURE/ENGINE-API §1/MCP-AND-ENGINES §2 until they are rewritten |
+| [`docs/superpowers/plans/2026-11-16-v2-rewrite.md`](docs/superpowers/plans/2026-11-16-v2-rewrite.md) | **v2 implementation plan** — phases P0–P8 on branch `rewrite/v2` |
+| [`docs/design/PROVENANCE.md`](docs/design/PROVENANCE.md) · [`DEVIATIONS.md`](docs/design/DEVIATIONS.md) | Where the one visual authority came from; the only allowed differences from it |
 | [`docs/HANDOFF.md`](docs/HANDOFF.md) | Working handoff — state of play, settled decisions, how to run the AI parts, environment traps (not a design spec) |
 | [`docs/HANDOFF-PROMPT.md`](docs/HANDOFF-PROMPT.md) | Paste-ready session-start prompt for the next agent — orientation, working agreements, invariants, traps |
 

@@ -93,6 +93,14 @@ function resolveCite(rel) {
 
 for (const file of mdFiles) {
   const text = readFileSync(file, "utf8");
+  // A snapshot document (a dated review pinned to one commit) cites code as it was. Once the code
+  // moves, its citations are a record, not drift — report them as warnings, like the board's
+  // `check-board: historical` marker does.
+  const historical = /<!--\s*check-docs:\s*historical\s*-->/.test(text);
+  // Plans and specs name files they will create. A bare path that does not exist yet is a forward
+  // reference there, not a dead one; `file:line` citations are still checked strictly.
+  const forwardLooking = /[\\/]docs[\\/]superpowers[\\/]/.test(file);
+  const severity = historical ? "warn" : "error";
 
   // 4. Last-reviewed marker: a 4-digit year in the first 40 lines.
   const head = text.split("\n").slice(0, 40).join("\n");
@@ -109,12 +117,12 @@ for (const file of mdFiles) {
     if (/egui-era|deleted at B7|retired at B7/.test(ctx)) continue;
     const target = resolveCite(rel);
     if (!target) {
-      flag("error", file, `citation target missing: ${raw}`);
+      flag(severity, file, `citation target missing: ${raw}`);
       continue;
     }
     const n = Number(lineStr);
     if (n > linesOf(target).length) {
-      flag("error", file, `line ${n} out of range in ${rel} (has ${linesOf(target).length})`);
+      flag(severity, file, `line ${n} out of range in ${rel} (has ${linesOf(target).length})`);
     }
   }
 
@@ -123,7 +131,7 @@ for (const file of mdFiles) {
     const rel = m[1].replace(/`/g, "");
     if (rel.startsWith("src/")) continue; // src/ is the caveman repo's layout, not ours
     if (!existsSync(resolve(ROOT, rel))) {
-      flag("error", file, `path mention missing: ${rel}`);
+      flag(forwardLooking ? "warn" : severity, file, `path mention missing: ${rel}`);
     }
   }
 

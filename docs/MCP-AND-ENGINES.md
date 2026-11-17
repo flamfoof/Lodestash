@@ -1,5 +1,10 @@
 # MCP Server & Engine Integration
 
+> **v2 (2026-11-16).** The MCP server becomes a standalone binary, `lodestash-mcp`, that talks to
+> the running app over `/v1` and never opens the catalog
+> ([ADR-0022](decisions/ADR-0022-mcp-is-a-standalone-thin-client.md), superseding ADR-0011).
+> §2's description of an in-process / `--mcp` server is replaced when plan P4 lands.
+
 How AI clients (Claude, Claude Code, IDEs) and the **Unity editor** find and retrieve assets from the
 catalog. This is where "identify and retrieve into the engine" is delivered. **Unity is the primary
 integration target;** Unreal editor integration is planned for a later phase (§4).

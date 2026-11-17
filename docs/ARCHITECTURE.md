@@ -1,5 +1,11 @@
 # Architecture
 
+> **v2 rewrite in progress (2026-11-16).** The process and crate structure is being replaced on
+> branch `rewrite/v2` per the [v2 architecture spec](superpowers/specs/2026-11-16-v2-architecture-design.md)
+> ([ADR-0021](decisions/ADR-0021-engine-owns-the-catalog-ui-is-a-web-client.md)). Where this
+> document's components, threads or crate list disagree with the spec, the spec wins; this file is
+> rewritten when the engine lands (plan P2/P8).
+
 > Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
 
 This document covers the system architecture, the component breakdown, the data flow, and the

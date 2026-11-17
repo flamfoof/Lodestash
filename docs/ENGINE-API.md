@@ -1,5 +1,12 @@
 # Engine API — the loopback HTTP/JSON contract
 
+> **v2 (2026-11-16).** Operations are now declared once in `lodestash-protocol` and the routes and
+> MCP tools are derived from it; the app's own UI becomes a caller of this API with a cookie
+> session; bytes move to `/v1/assets/{id}/…` routes. See the
+> [v2 architecture spec](superpowers/specs/2026-11-16-v2-architecture-design.md) §5–§6. The
+> endpoint paths and shapes in §2–§8 below are preserved; §1 (lifecycle, handshake) gains the
+> spec's additions when P3 lands.
+
 > Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
 
 The **deterministic integration plane**: the loopback HTTP/JSON API that the **Unity editor plugin**

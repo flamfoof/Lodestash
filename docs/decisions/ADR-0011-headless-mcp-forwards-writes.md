@@ -1,6 +1,8 @@
 # ADR-0011 — The headless MCP server forwards its writes to the running app
 
-- **Status:** accepted (2026-08-29); **amended 2026-09-12** by v1 plan S11 — see
+- **Status:** **superseded 2026-11-16** by
+  [ADR-0022](ADR-0022-mcp-is-a-standalone-thin-client.md) (the MCP server becomes a standalone thin
+  client with no catalog access). Was: accepted (2026-08-29); amended 2026-09-12 by v1 plan S11 — see
   [Amendment](#amendment-2026-09-12--forward-the-operation-not-the-write)
 - **Relates to:** [ADR-0002](ADR-0002-single-writer-thread.md) (single writer),
   [`ENGINE-API.md`](../ENGINE-API.md) §1–2, [`MCP-AND-ENGINES.md`](../MCP-AND-ENGINES.md) §2

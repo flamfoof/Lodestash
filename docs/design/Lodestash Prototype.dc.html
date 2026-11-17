@@ -19,6 +19,7 @@ a:hover{color:#FFD98A}
 @keyframes lsRise{0%{opacity:0;transform:translateY(8px)}100%{opacity:1;transform:translateY(0)}}
 @keyframes lsPulse{0%,100%{opacity:.45}50%{opacity:1}}
 @keyframes lsEq{0%,100%{transform:scaleY(.35)}50%{transform:scaleY(1)}}
+@keyframes lsFloat{0%,100%{transform:translateY(-5px)}50%{transform:translateY(5px)}}
 *{scrollbar-width:thin;scrollbar-color:#3A465C transparent}
 input::placeholder{color:#6E7689}
 input[type=range]{accent-color:#49C9E0}
@@ -202,8 +203,10 @@ input[type=range]{accent-color:#49C9E0}
         <div style="padding:0 14px 6px;font-size:10px;letter-spacing:1.2px;color:#6E7689;font-weight:600">LIBRARIES</div>
         <sc-for list="{{ libFacets }}" as="f" hint-placeholder-count="5">
           <div onClick="{{ f.onClick }}" style="cursor:pointer;display:flex;align-items:center;gap:8px;padding:5px 14px;border-left:2px solid {{ f.bl }};color:{{ f.fg }};font-size:12px" style-hover="color:#E6E9F0;background:#1E2533">
+            <sc-if value="{{ f.isUnity }}" hint-placeholder-val="{{ false }}"><span style="color:#5BD897;font-size:10px;flex-shrink:0">⬢</span></sc-if>
             <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ f.label }}</span>
             <span style="font-family:JetBrains Mono,ui-monospace,monospace;font-size:11px;color:#6E7689">{{ f.count }}</span>
+            <sc-if value="{{ f.removable }}" hint-placeholder-val="{{ false }}"><span onClick="{{ f.onRemove }}" title="Remove from Libraries" style="cursor:pointer;color:#6E7689;font-size:11px;flex-shrink:0" style-hover="color:#F2666E">✕</span></sc-if>
           </div>
         </sc-for>
         <div onClick="{{ onAddSource }}" style="cursor:pointer;display:flex;align-items:center;gap:8px;padding:6px 14px;margin:4px 12px 0;border:1px dashed #3A465C;border-radius:6px;color:#6E7689;font-size:12px" style-hover="color:#E7B765;border-color:rgba(231,183,101,.5)">
@@ -232,6 +235,9 @@ input[type=range]{accent-color:#49C9E0}
               </sc-if>
               <sc-if value="{{ hasCollF }}" hint-placeholder-val="{{ false }}">
                 <div style="display:flex;align-items:center;gap:6px;font-size:11px;color:#E7B765;border:1px solid rgba(231,183,101,.45);border-radius:999px;padding:2px 9px">⟡ {{ collFLabel }}<span onClick="{{ clearCollF }}" style="cursor:pointer;color:#A7B0C0">✕</span></div>
+              </sc-if>
+              <sc-if value="{{ showAddAll }}" hint-placeholder-val="{{ false }}">
+                <div onClick="{{ onAddAll }}" title="Copy every asset in this library plus dependencies into the open Unity project" style="cursor:pointer;display:flex;align-items:center;gap:6px;font-size:11px;color:#5BD897;border:1px solid rgba(91,216,151,.45);border-radius:999px;padding:2px 11px;font-weight:600" style-hover="box-shadow:0 0 10px rgba(91,216,151,.3)">⇢ {{ addAllLabel }}</div>
               </sc-if>
               <div style="margin-left:auto;color:#6E7689;font-size:11px">Space quick-looks · ⤢ full size · ⟡ stage</div>
               <select value="{{ sortBy }}" onChange="{{ setSortBy }}" style="background:#232C3D;border:1px solid #3A465C;border-radius:6px;color:#A7B0C0;font-size:11px;padding:4px 8px;outline:none;cursor:pointer">
@@ -547,6 +553,139 @@ input[type=range]{accent-color:#49C9E0}
                 </div>
               </sc-for>
             </div>
+          </div>
+        </sc-if>
+
+        <!-- UNITY LIBRARIES -->
+        <sc-if value="{{ showUnity }}" hint-placeholder-val="{{ false }}">
+          <div data-screen-label="Unity Assets" style="flex:1;min-height:0;display:flex;flex-direction:column">
+
+            <sc-if value="{{ unityLanding }}" hint-placeholder-val="{{ true }}">
+              <div style="padding:18px 20px;border-bottom:1px solid #2C3547;flex-shrink:0;display:flex;align-items:flex-end;gap:16px;flex-wrap:wrap">
+                <div style="flex:1;min-width:260px">
+                  <div style="font-family:Cinzel,Georgia,serif;font-size:20px;font-weight:700;letter-spacing:.5px">Unity Assets</div>
+                  <div style="color:#A7B0C0;font-size:12px;margin-top:2px">.unitypackage archives, indexed in place — nothing is unpacked until you preview or pull a file. Each package is its own library.</div>
+                </div>
+                <div onClick="{{ openUnityImport }}" style="cursor:pointer;display:flex;align-items:center;gap:8px;background:linear-gradient(180deg,#5BD897,#3FBF7E);color:#08130C;font-weight:700;padding:8px 16px;border-radius:7px;white-space:nowrap;font-size:13px" style-hover="box-shadow:0 0 14px rgba(91,216,151,.5)"><span style="font-size:15px">＋</span>Add Unity packages…</div>
+              </div>
+              <div style="flex:1;overflow-y:auto;padding:16px">
+                <sc-if value="{{ unityEmpty }}" hint-placeholder-val="{{ false }}">
+                  <div style="display:flex;flex-direction:column;align-items:center;gap:12px;padding:80px 20px;color:#6E7689;text-align:center">
+                    <div style="opacity:.6">{{ unityBigMark }}</div>
+                    <div style="color:#A7B0C0">No Unity packages imported yet.</div>
+                    <div onClick="{{ openUnityImport }}" style="cursor:pointer;color:#5BD897;border:1px solid rgba(91,216,151,.4);border-radius:6px;padding:6px 14px;font-size:12px" style-hover="border-color:#5BD897">＋ Add from Asset Store-5.x…</div>
+                  </div>
+                </sc-if>
+                <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:14px;align-content:start">
+                  <sc-for list="{{ unityCards }}" as="u" hint-placeholder-count="2">
+                    <div style="background:#161B26;border:1px solid #2C3547;border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:11px" style-hover="border-color:#3A465C">
+                      <div style="display:flex;align-items:flex-start;gap:11px">
+                        <div style="width:40px;height:40px;border-radius:8px;background:#0E1117;border:1px solid #2C3547;display:flex;align-items:center;justify-content:center;flex-shrink:0">{{ u.mark }}</div>
+                        <div style="flex:1;min-width:0">
+                          <div style="font-weight:600;font-size:13px;color:#E6E9F0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ u.name }}</div>
+                          <div style="font-size:11px;color:#8A93A6;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ u.sub }}</div>
+                        </div>
+                        <span style="font-size:10px;color:{{ u.catColor }};border:1px solid {{ u.catColor }};border-radius:999px;padding:1px 9px;white-space:nowrap;flex-shrink:0">{{ u.catGlyph }} {{ u.catLabel }}</span>
+                      </div>
+                      <div style="font-family:JetBrains Mono,ui-monospace,monospace;font-size:10px;color:#6E7689;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ u.path }}</div>
+                      <div style="display:flex;align-items:center;gap:8px">
+                        <span style="font-family:JetBrains Mono,ui-monospace,monospace;font-size:11px;color:#A7B0C0">{{ u.meta }}</span>
+                        <div onClick="{{ u.onSync }}" style="margin-left:auto;cursor:pointer;font-size:11px;color:#49D6C9;border:1px solid rgba(73,214,201,.35);border-radius:5px;padding:4px 10px" style-hover="border-color:#49D6C9">↻ Sync</div>
+                        <div onClick="{{ u.onOpen }}" style="cursor:pointer;font-size:11px;color:#5BD897;border:1px solid rgba(91,216,151,.4);border-radius:5px;padding:4px 12px;font-weight:600" style-hover="border-color:#5BD897">Open →</div>
+                      </div>
+                    </div>
+                  </sc-for>
+                </div>
+              </div>
+            </sc-if>
+
+            <sc-if value="{{ unityBrowsing }}" hint-placeholder-val="{{ false }}">
+              <div style="padding:12px 20px;border-bottom:1px solid #2C3547;flex-shrink:0;display:flex;align-items:center;gap:12px">
+                <div onClick="{{ uCloseLib }}" style="cursor:pointer;color:#A7B0C0;font-size:12px;border:1px solid #3A465C;border-radius:6px;padding:5px 11px;white-space:nowrap" style-hover="color:#E6E9F0;border-color:#6E7689">← Libraries</div>
+                <div style="width:34px;height:34px;border-radius:8px;background:#0E1117;border:1px solid #2C3547;display:flex;align-items:center;justify-content:center;flex-shrink:0">{{ uLibMark }}</div>
+                <div style="min-width:0">
+                  <div style="display:flex;align-items:center;gap:9px">
+                    <span style="font-family:Cinzel,Georgia,serif;font-size:17px;font-weight:700;letter-spacing:.4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ uLibName }}</span>
+                    <span style="font-size:10px;color:{{ uLibCatColor }};border:1px solid {{ uLibCatColor }};border-radius:999px;padding:1px 9px;white-space:nowrap;flex-shrink:0">{{ uLibCat }}</span>
+                  </div>
+                  <div style="font-family:JetBrains Mono,ui-monospace,monospace;font-size:10px;color:#6E7689;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ uLibPath }}</div>
+                </div>
+                <div style="margin-left:auto;display:flex;align-items:center;gap:8px;flex-shrink:0">
+                  <span style="font-size:11px;color:#8A93A6;white-space:nowrap">{{ uLibMeta }}</span>
+                  <div onClick="{{ uSyncLib }}" style="cursor:pointer;font-size:11px;color:#49D6C9;border:1px solid rgba(73,214,201,.35);border-radius:6px;padding:5px 11px" style-hover="border-color:#49D6C9">↻ Sync</div>
+                  <div onClick="{{ uAddToLibrary }}" style="cursor:pointer;font-size:11px;color:{{ uPinFg }};border:1px solid {{ uPinBd }};border-radius:6px;padding:5px 13px;font-weight:600;white-space:nowrap" style-hover="box-shadow:0 0 10px rgba(91,216,151,.3)">{{ uPinLabel }}</div>
+                </div>
+              </div>
+              <div style="flex:1;min-height:0;display:flex">
+                <div style="width:290px;flex-shrink:0;border-right:1px solid #2C3547;overflow-y:auto;background:#12161F;padding:8px 0">
+                  <div style="padding:2px 14px 8px;font-size:10px;letter-spacing:1px;color:#6E7689;font-weight:600">SURGICALLY EXTRACTED · {{ uTreeCount }} files</div>
+                  <sc-for list="{{ uTree }}" as="g" hint-placeholder-count="3">
+                    <div style="padding:8px 14px 4px;font-size:10px;letter-spacing:1px;color:#6E7689;font-weight:600;font-family:JetBrains Mono,ui-monospace,monospace">{{ g.folder }}</div>
+                    <sc-for list="{{ g.items }}" as="a" hint-placeholder-count="2">
+                      <div onClick="{{ a.onClick }}" style="cursor:pointer;display:flex;align-items:center;gap:9px;padding:6px 14px 6px 20px;font-size:12px;color:{{ a.fg }};background:{{ a.bg }};border-left:2px solid {{ a.blc }}" style-hover="background:#1E2533">
+                        <span style="width:14px;text-align:center;color:{{ a.typeColor }};flex-shrink:0;font-size:11px">{{ a.typeGlyph }}</span>
+                        <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ a.name }}</span>
+                      </div>
+                    </sc-for>
+                  </sc-for>
+                </div>
+                <div style="flex:1;min-width:0;overflow-y:auto;display:flex;flex-direction:column">
+                  <sc-if value="{{ uHasSel }}" hint-placeholder-val="{{ false }}">
+                    <div style="flex:1;display:flex;flex-direction:column;padding:18px 22px;gap:16px">
+                      <div style="position:relative;min-height:300px;border-radius:12px;border:1px solid #2C3547;background:radial-gradient(120% 120% at 50% 20%,#1A2130,#0C1017);display:flex;align-items:center;justify-content:center;overflow:hidden;padding:20px">
+                        <div style="position:absolute;inset:0;background-image:linear-gradient(rgba(255,255,255,.03) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.03) 1px,transparent 1px);background-size:26px 26px"></div>
+                        <sc-if value="{{ pvIsModel }}" hint-placeholder-val="{{ true }}">
+                          <div style="position:relative;text-align:center;color:#7E8AA0">
+                            <div style="animation:lsFloat 4s ease-in-out infinite;display:inline-block">{{ pvMark }}</div>
+                            <div style="font-size:11px;margin-top:14px;color:#A98BFF">◈ 3D mesh preview · {{ pvTris }} tris</div>
+                            <div style="font-size:10px;margin-top:3px;color:#6E7689">drag to orbit · scroll to zoom</div>
+                          </div>
+                        </sc-if>
+                        <sc-if value="{{ pvIsTex }}" hint-placeholder-val="{{ false }}">
+                          <div style="position:relative;display:flex;align-items:center;gap:20px">
+                            <div style="width:150px;height:150px;border-radius:8px;border:1px solid #3A465C;background-color:#20293A;background-image:linear-gradient(45deg,#39455c 25%,transparent 25%),linear-gradient(-45deg,#39455c 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#39455c 75%),linear-gradient(-45deg,transparent 75%,#39455c 75%);background-size:22px 22px;background-position:0 0,0 11px,11px -11px,-11px 0"></div>
+                            <div style="text-align:left">
+                              <div style="font-size:11px;color:#6FB1FF">▦ texture / material</div>
+                              <div style="font-family:JetBrains Mono,ui-monospace,monospace;font-size:11px;color:#A7B0C0;margin-top:7px">{{ pvMeta }}</div>
+                            </div>
+                          </div>
+                        </sc-if>
+                        <sc-if value="{{ pvIsAudio }}" hint-placeholder-val="{{ false }}">
+                          <div style="position:relative;text-align:center;width:100%">
+                            <div style="display:flex;align-items:center;gap:3px;height:76px;justify-content:center;margin-bottom:16px">
+                              <sc-for list="{{ pvBars }}" as="b" hint-placeholder-count="40"><div style="width:4px;height:{{ b.h }};background:#49C9E0;border-radius:2px;opacity:.65"></div></sc-for>
+                            </div>
+                            <div onClick="{{ pvTogglePlay }}" style="cursor:pointer;display:inline-flex;align-items:center;gap:9px;background:#49C9E0;color:#062028;font-weight:700;padding:8px 20px;border-radius:999px;font-size:13px">{{ pvPlayGlyph }} {{ pvDur }}</div>
+                          </div>
+                        </sc-if>
+                        <sc-if value="{{ pvIsPrefab }}" hint-placeholder-val="{{ false }}">
+                          <div style="position:relative;text-align:left;font-family:JetBrains Mono,ui-monospace,monospace;font-size:12px;color:#A7B0C0;line-height:1.95">
+                            <div style="font-size:11px;color:#5BD897;margin-bottom:8px">◈ prefab hierarchy · resolved without unpacking</div>
+                            <sc-for list="{{ pvChildren }}" as="c" hint-placeholder-count="5"><div>{{ c.label }}</div></sc-for>
+                          </div>
+                        </sc-if>
+                        <sc-if value="{{ pvIsScript }}" hint-placeholder-val="{{ false }}">
+                          <div style="position:relative;align-self:stretch;width:100%;max-width:520px;background:#0A0D13;border:1px solid #2C3547;border-radius:8px;padding:12px 14px;text-align:left;overflow-x:auto">
+                            <sc-for list="{{ pvCode }}" as="l" hint-placeholder-count="7">
+                              <div style="display:flex;gap:12px;font-family:JetBrains Mono,ui-monospace,monospace;font-size:11px;line-height:1.75"><span style="color:#3A465C;width:16px;text-align:right;flex-shrink:0">{{ l.n }}</span><span style="color:#A7B0C0;white-space:pre">{{ l.code }}</span></div>
+                            </sc-for>
+                          </div>
+                        </sc-if>
+                        <div style="position:absolute;bottom:10px;left:14px;font-size:10px;color:#5A6273;font-family:JetBrains Mono,ui-monospace,monospace">{{ pvExtract }}</div>
+                      </div>
+                      <div style="display:flex;align-items:flex-start;gap:14px">
+                        <div style="flex:1;min-width:0">
+                          <div style="font-size:15px;font-weight:600;color:#E6E9F0">{{ pvName }}</div>
+                          <div style="font-family:JetBrains Mono,ui-monospace,monospace;font-size:11px;color:#6E7689;margin-top:3px">{{ pvFolder }} · {{ pvMeta }} · {{ pvSize }}</div>
+                        </div>
+                        <div onClick="{{ pvAdd }}" style="cursor:pointer;display:flex;align-items:center;gap:8px;background:linear-gradient(180deg,#5BD897,#3FBF7E);color:#08130C;font-weight:700;padding:9px 16px;border-radius:8px;white-space:nowrap;font-size:13px" style-hover="box-shadow:0 0 14px rgba(91,216,151,.5)">⇢ Add to project</div>
+                      </div>
+                      <div style="font-size:11px;color:#8A93A6;background:#12161F;border:1px solid #2C3547;border-radius:8px;padding:10px 13px">Adds this file plus its <b style="color:#E6E9F0">{{ pvDeps }} dependencies</b> (materials, textures, referenced meshes) into the open Unity project — resolved from the package's own dependency graph, so the rest of the archive stays put.</div>
+                    </div>
+                  </sc-if>
+                </div>
+              </div>
+            </sc-if>
           </div>
         </sc-if>
 
@@ -1450,6 +1589,108 @@ input[type=range]{accent-color:#49C9E0}
         </div>
       </div>
     </sc-if>
+    <!-- Unity import -->
+    <sc-if value="{{ uiOpen }}" hint-placeholder-val="{{ false }}">
+      <div data-screen-label="Import Unity packages" onClick="{{ uiClose }}" style="position:fixed;inset:0;background:rgba(10,12,17,.74);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;z-index:85">
+        <div onClick="{{ uiEat }}" style="width:760px;max-width:94vw;max-height:88vh;background:#1E2533;border:1px solid #3A465C;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.6);display:flex;flex-direction:column;overflow:hidden;animation:lsRise .18s ease">
+          <div style="padding:18px 20px 14px;border-bottom:1px solid #2C3547;flex-shrink:0">
+            <div style="display:flex;align-items:center;gap:10px">
+              <div style="width:26px;height:26px;display:flex;align-items:center;justify-content:center">{{ uiHeadMark }}</div>
+              <span style="font-family:Cinzel,Georgia,serif;font-size:18px;font-weight:700;letter-spacing:.5px">Import Unity packages</span>
+              <div onClick="{{ uiClose }}" style="margin-left:auto;cursor:pointer;width:22px;height:22px;border-radius:4px;background:#232C3D;display:flex;align-items:center;justify-content:center;color:#A7B0C0;font-size:12px" style-hover="color:#E6E9F0">✕</div>
+            </div>
+            <div style="display:flex;align-items:center;gap:11px;margin-top:12px;background:#0E1117;border:1px solid #2C3547;border-radius:8px;padding:9px 12px">
+              <span style="color:#E7B765;flex-shrink:0;font-size:15px">🗀</span>
+              <div style="flex:1;min-width:0">
+                <div style="font-size:9px;letter-spacing:1px;color:#6E7689;font-weight:600">ASSET PACKAGE FOLDER</div>
+                <div style="font-family:JetBrains Mono,ui-monospace,monospace;font-size:11px;color:#E6E9F0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ uiFolderPath }}</div>
+              </div>
+              <div onClick="{{ uiPickFolder }}" style="cursor:pointer;font-size:11px;color:#49D6C9;border:1px solid rgba(73,214,201,.4);border-radius:6px;padding:5px 12px;white-space:nowrap" style-hover="border-color:#49D6C9">Choose folder…</div>
+            </div>
+          </div>
+
+          <sc-if value="{{ uiPicked }}" hint-placeholder-val="{{ true }}">
+            <div style="display:flex;gap:6px;padding:12px 20px 4px;flex-wrap:wrap;flex-shrink:0">
+              <sc-for list="{{ uiCatRow }}" as="c" hint-placeholder-count="6">
+                <div onClick="{{ c.onClick }}" style="cursor:pointer;font-size:11px;padding:4px 12px;border-radius:999px;background:{{ c.bg }};color:{{ c.fg }};border:1px solid {{ c.bd }}" style-hover="border-color:#5BD897">{{ c.label }}</div>
+              </sc-for>
+            </div>
+            <div style="flex:1;overflow-y:auto;padding:8px 20px 16px">
+              <sc-for list="{{ uiGroups }}" as="g" hint-placeholder-count="3">
+                <div style="margin-bottom:10px;border:1px solid #2C3547;border-radius:9px;overflow:hidden">
+                  <div onClick="{{ g.onToggle }}" style="cursor:pointer;display:flex;align-items:center;gap:8px;padding:9px 13px;background:#161B26">
+                    <span style="color:#8A93A6;font-size:10px;width:10px">{{ g.chevron }}</span>
+                    <span style="font-weight:600;font-size:12px;color:#E6E9F0">{{ g.pub }}</span>
+                    <span style="font-family:JetBrains Mono,ui-monospace,monospace;font-size:10px;color:#6E7689">{{ g.count }} packages</span>
+                    <div onClick="{{ g.onSelAll }}" style="margin-left:auto;cursor:pointer;font-size:10px;color:#5BD897">{{ g.selAllLabel }}</div>
+                  </div>
+                  <sc-if value="{{ g.open }}" hint-placeholder-val="{{ true }}">
+                    <sc-for list="{{ g.pkgs }}" as="p" hint-placeholder-count="2">
+                      <div style="border-top:1px solid #1E2533;background:#0E1117">
+                        <div style="display:flex;align-items:center;gap:11px;padding:9px 13px">
+                          <div onClick="{{ p.onToggle }}" style="cursor:pointer;width:18px;height:18px;border-radius:5px;border:1px solid {{ p.checkBd }};background:{{ p.checkBg }};color:#08130C;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0">{{ p.check }}</div>
+                          <div style="flex:1;min-width:0">
+                            <div style="font-size:12px;font-weight:600;color:#E6E9F0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ p.name }}</div>
+                            <div style="font-family:JetBrains Mono,ui-monospace,monospace;font-size:10px;color:#6E7689">{{ p.ver }} · {{ p.size }} · {{ p.assets }}</div>
+                            <sc-if value="{{ p.hasDup }}" hint-placeholder-val="{{ false }}"><div style="font-size:10px;color:#F2B84B;margin-top:2px">⧉ possibly already indexed as “{{ p.dupName }}”</div></sc-if>
+                          </div>
+                          <select value="{{ p.curCat }}" onChange="{{ p.onCatChange }}" title="Auto-detected content type — override if wrong" style="background:#232C3D;border:1px solid {{ p.catColor }};border-radius:999px;color:{{ p.catColor }};font-size:10px;padding:3px 9px;outline:none;cursor:pointer;flex-shrink:0">
+                            <sc-for list="{{ p.catOpts }}" as="o" hint-placeholder-count="5"><option value="{{ o.val }}">{{ o.label }}</option></sc-for>
+                          </select>
+                        </div>
+                        <sc-if value="{{ p.hasOlder }}" hint-placeholder-val="{{ false }}">
+                          <div style="padding:0 13px 9px 42px">
+                            <div onClick="{{ p.onOlder }}" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;font-size:10px;color:#6E7689" style-hover="color:#A7B0C0"><span>{{ p.olderChevron }}</span>{{ p.olderLabel }} · newest shown</div>
+                            <sc-if value="{{ p.olderOpen }}" hint-placeholder-val="{{ false }}">
+                              <div style="display:flex;flex-direction:column;gap:3px;margin-top:5px">
+                                <sc-for list="{{ p.olderList }}" as="o" hint-placeholder-count="0">
+                                  <div style="font-family:JetBrains Mono,ui-monospace,monospace;font-size:10px;color:#5A6273">{{ o.label }}</div>
+                                </sc-for>
+                              </div>
+                            </sc-if>
+                          </div>
+                        </sc-if>
+                      </div>
+                    </sc-for>
+                  </sc-if>
+                </div>
+              </sc-for>
+            </div>
+            <div style="border-top:1px solid #2C3547;padding:13px 20px;display:flex;align-items:center;gap:12px;flex-shrink:0">
+              <span style="font-size:11px;color:#8A93A6">Indexed in place — <b style="color:#A7B0C0">no files are copied</b>.</span>
+              <span style="margin-left:auto;font-family:JetBrains Mono,ui-monospace,monospace;font-size:11px;color:#5BD897">{{ uiSelLabel }}</span>
+              <div onClick="{{ uiImport }}" style="cursor:pointer;background:linear-gradient(180deg,#5BD897,#3FBF7E);color:#08130C;font-weight:700;padding:8px 18px;border-radius:7px;font-size:13px" style-hover="box-shadow:0 0 14px rgba(91,216,151,.5)">Import as libraries</div>
+            </div>
+          </sc-if>
+          <sc-if value="{{ uiNotPicked }}" hint-placeholder-val="{{ false }}">
+            <div style="padding:46px 24px;text-align:center;color:#6E7689;font-size:12px;line-height:1.6">Choose your <b style="color:#A7B0C0">Asset Store-5.x</b> folder (or any folder of .unitypackage files) to list every package inside, grouped by publisher.</div>
+          </sc-if>
+        </div>
+      </div>
+    </sc-if>
+
+    <!-- Add source chooser -->
+    <sc-if value="{{ asOpen }}" hint-placeholder-val="{{ false }}">
+      <div data-screen-label="Add a source" onClick="{{ asClose }}" style="position:fixed;inset:0;background:rgba(10,12,17,.74);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;z-index:85">
+        <div onClick="{{ asEat }}" style="width:460px;max-width:92vw;background:#1E2533;border:1px solid #3A465C;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.6);padding:20px;animation:lsRise .18s ease">
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
+            <span style="font-family:Cinzel,Georgia,serif;font-size:17px;font-weight:700;letter-spacing:.5px">Add a source</span>
+            <div onClick="{{ asClose }}" style="margin-left:auto;cursor:pointer;width:22px;height:22px;border-radius:4px;background:#232C3D;display:flex;align-items:center;justify-content:center;color:#A7B0C0;font-size:12px" style-hover="color:#E6E9F0">✕</div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:10px">
+            <div onClick="{{ asWatch }}" style="cursor:pointer;display:flex;align-items:center;gap:13px;background:#0E1117;border:1px solid #2C3547;border-radius:9px;padding:13px 15px" style-hover="border-color:#E7B765">
+              <span style="font-size:20px;color:#E7B765;flex-shrink:0">🗀</span>
+              <div><div style="font-size:13px;font-weight:600;color:#E6E9F0">Watch a folder</div><div style="font-size:11px;color:#8A93A6;margin-top:1px">Loose files & packs — auto-indexed as they drop in.</div></div>
+            </div>
+            <div onClick="{{ asUnity }}" style="cursor:pointer;display:flex;align-items:center;gap:13px;background:#0E1117;border:1px solid #2C3547;border-radius:9px;padding:13px 15px" style-hover="border-color:#5BD897">
+              <div style="width:22px;flex-shrink:0;display:flex;justify-content:center">{{ asUnityMark }}</div>
+              <div><div style="font-size:13px;font-weight:600;color:#E6E9F0">Unity Asset Store packages</div><div style="font-size:11px;color:#8A93A6;margin-top:1px">Pick your Asset Store-5.x folder, then choose packages to index in place.</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </sc-if>
+
     <!-- Connect Unity project wizard -->
     <sc-if value="{{ wizOpen }}" hint-placeholder-val="{{ false }}">
       <div data-screen-label="Connect Unity project" onClick="{{ wizClose }}" style="position:fixed;inset:0;background:rgba(10,12,17,.74);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;z-index:80">
@@ -1547,6 +1788,12 @@ class Component extends DCLogic {
     ],
     newTraitName: '', newTraitUsage: '', newTraitScope: 'any', traitAdvOpen: false, traitEditOpen: null,
     psPack: null, chipsExpanded: [],
+    asOpen: false, uiOpen: false, uiPicked: false, uiCat: 'all', uiSel: {}, uiExpanded: {}, uiOlder: {}, uiOverride: {}, uPlaying: false,
+    unityLibs: [
+      { id: 'ul1', name: 'POLYGON - City Pack', pub: 'Synty Studios', cat: '3d', ver: '1.14', size: 412, assets: 1240, path: 'Asset Store-5.x/Synty Studios/POLYGON City Pack.unitypackage' },
+      { id: 'ul2', name: 'GDC Game Audio Bundle', pub: 'Sonniss', cat: 'audio', ver: '2024', size: 640, assets: 2100, path: 'Asset Store-5.x/Sonniss/GDC Game Audio Bundle.unitypackage' }
+    ],
+    unityLibOpen: null, unitySel: null, unityPinned: [],
     aiThinking: false, aiResults: null,
     selId: null,
     projects: this.defaultProjects(),
@@ -2097,6 +2344,278 @@ class Component extends DCLogic {
     if (!this.state.assets.some(a => a.id === 20)) setTimeout(() => this.watchDrop(), 2200);
   }
 
+  // ── Unity asset-package flow ──
+  uCats() {
+    return {
+      '3d': { label: '3D Models', color: '#A98BFF', glyph: '⬡' },
+      audio: { label: 'Audio', color: '#49C9E0', glyph: '♪' },
+      code: { label: 'Code', color: '#5BD897', glyph: '{}' },
+      ui: { label: 'UI', color: '#F2B84B', glyph: '▢' },
+      materials: { label: 'Materials', color: '#E7B765', glyph: '◍' }
+    };
+  }
+  unityCatalog() {
+    return [
+      { pub: 'Synty Studios', pkgs: [
+        { name: 'POLYGON - City Pack', cat: '3d', size: 412, ver: '1.14', older: ['1.12', '1.08'], assets: 1240 },
+        { name: 'POLYGON - Nature Pack', cat: '3d', size: 388, ver: '1.09', older: ['1.07'], assets: 980 },
+        { name: 'POLYGON - Sci-Fi City', cat: '3d', size: 505, ver: '1.03', older: [], assets: 1520 }
+      ] },
+      { pub: 'Sonniss', pkgs: [
+        { name: 'GDC Game Audio Bundle', cat: 'audio', size: 640, ver: '2024', older: ['2023', '2022'], assets: 2100 }
+      ] },
+      { pub: 'Dogmatic', pkgs: [
+        { name: 'Ultimate Editor Toolkit', cat: 'code', size: 22, ver: '3.2', older: ['3.1', '3.0'], assets: 180 },
+        { name: 'Runtime Console Pro', cat: 'code', size: 8, ver: '2.4', older: [], assets: 64 }
+      ] },
+      { pub: 'Kronnect', pkgs: [
+        { name: 'Beautify 3 — Post FX', cat: 'materials', size: 56, ver: '3.4', older: ['3.3'], assets: 320 }
+      ] },
+      { pub: 'GUI PRO', pkgs: [
+        { name: 'GUI PRO — Casual Game Kit', cat: 'ui', size: 74, ver: '1.2', older: [], assets: 540 },
+        { name: 'GUI PRO — Fantasy RPG', cat: 'ui', size: 96, ver: '1.5', older: ['1.4'], assets: 610 }
+      ] }
+    ];
+  }
+  unityMark(size, color) {
+    var s = size || 16, c = color || '#5BD897';
+    return React.createElement('svg', { width: s, height: s, viewBox: '0 0 24 24', fill: 'none', stroke: c, strokeWidth: 1.7, strokeLinecap: 'round', strokeLinejoin: 'round' },
+      React.createElement('path', { key: 'o', d: 'M12 2.6 20.1 7 20.1 17 12 21.4 3.9 17 3.9 7Z' }),
+      React.createElement('path', { key: 'i', d: 'M12 12 12 2.6M12 12 20.1 17M12 12 3.9 17' })
+    );
+  }
+  curProjName() {
+    const p = (this.state.projects || []).find(x => x.pid === this.state.activePid);
+    return p ? p.name : 'the open Unity project';
+  }
+  openAddSource() { this.setState({ asOpen: true }); }
+  closeAddSource() { this.setState({ asOpen: false }); }
+  openUnityImport() { this.setState({ asOpen: false, uiOpen: true, uiPicked: false, uiSel: {}, uiCat: 'all', uiOverride: {}, uiExpanded: {}, uiOlder: {} }); }
+  closeUnityImport() { this.setState({ uiOpen: false }); }
+  uiPickFolder() { this.setState({ uiPicked: true }); this.toast('⌕ Scanned Asset Store-5.x — 9 packages across 5 publishers', '#5BD897'); }
+  uiToggleGroup(pub) { this.setState(s => ({ uiExpanded: { ...s.uiExpanded, [pub]: s.uiExpanded[pub] === false } })); }
+  uiToggleOlder(key) { this.setState(s => ({ uiOlder: { ...s.uiOlder, [key]: !s.uiOlder[key] } })); }
+  uiToggleSel(key) { this.setState(s => ({ uiSel: { ...s.uiSel, [key]: !s.uiSel[key] } })); }
+  uiSelectGroup(pub, keys, on) { this.setState(s => { const sel = { ...s.uiSel }; keys.forEach(k => { sel[k] = on; }); return { uiSel: sel }; }); }
+  uiSetCat(c) { this.setState({ uiCat: c }); }
+  uiSetOverride(key, cat) { this.setState(s => ({ uiOverride: { ...s.uiOverride, [key]: cat } })); }
+  uiImport() {
+    const sel = this.state.uiSel, ov = this.state.uiOverride, libs = [];
+    this.unityCatalog().forEach(g => g.pkgs.forEach(p => {
+      const key = g.pub + '/' + p.name;
+      if (sel[key]) libs.push({ id: 'ul' + Date.now() + Math.floor(Math.random() * 9999), name: p.name, pub: g.pub, cat: ov[key] || p.cat, ver: p.ver, size: p.size, assets: p.assets, path: 'Asset Store-5.x/' + g.pub + '/' + p.name + '.unitypackage' });
+    }));
+    if (!libs.length) { this.toast('Select at least one package to import', '#F2B84B'); return; }
+    const dups = libs.filter(l => this.unityDup(l.name));
+    this.setState(s => ({ unityLibs: [...libs, ...s.unityLibs.filter(x => !libs.some(l => l.name === x.name))], uiOpen: false, screen: 'unity', unityLibOpen: null, unitySel: null }));
+    this.toast('✓ Indexed ' + libs.length + ' package' + (libs.length === 1 ? '' : 's') + ' in place — no files copied', '#5BD897');
+    if (dups.length) setTimeout(() => this.toast('⧉ ' + dups.length + ' may duplicate assets you already have (' + dups.map(d => this.unityDup(d.name)).join(', ') + ')', '#F2B84B'), 400);
+  }
+  openUnityLib(id) {
+    const assets = this.unityAssetsFor(id);
+    this.setState({ screen: 'unity', unityLibOpen: id, unitySel: assets[0] ? assets[0].key : null, uPlaying: false });
+  }
+  closeUnityLib() { this.setState({ unityLibOpen: null, unitySel: null, uPlaying: false }); }
+  unitySelect(key) { this.setState({ unitySel: key, uPlaying: false }); }
+  unityAddToProject(a) { this.toast('⇢ ' + a.name + ' + ' + a.deps + ' dependencies copied into ' + this.curProjName(), '#5BD897'); }
+  unitySyncLib(name) { this.toast('↻ Synced ' + name + ' — re-scanned archive, index up to date', '#49D6C9'); }
+  uNorm(str) { return (str || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
+  unityDup(name) {
+    const n = this.uNorm(name);
+    if (!n) return null;
+    const packs = [...new Set((this.state.assets || []).map(a => a.pack))];
+    const hit = packs.find(p => { const q = this.uNorm(p); return q && (q.includes(n) || n.includes(q)); });
+    return hit || null;
+  }
+  unityGridAssets(lib) {
+    const base = 6000 + ((parseInt((lib.id.match(/\d{1,4}$/) || ['0'])[0], 10)) % 900);
+    return this.unityAssetsFor(lib.id).map((a, i) => {
+      const t = a.type === 'audio' ? 'sound' : (a.type === 'model' || a.type === 'prefab' ? 'model' : 'image');
+      const sizeStr = a.size || '1 MB';
+      const cm = this.uCats()[lib.cat] || this.uCats()['3d'];
+      const o = {
+        id: base + i + 1, type: t, name: a.name, pack: lib.name, lib: lib.name, status: 'id',
+        statsShort: (a.tris ? a.tris + ' tris · ' : '') + sizeStr,
+        rows: [['Format', (a.name.split('.').pop() || '').toUpperCase()], (a.tris ? ['Tris', a.tris] : ['Detail', a.dim || '—']), ['Size', sizeStr]],
+        tags: [{ t: cm.label.toLowerCase().replace(/\s+/g, '-'), p: 'manual' }, { t: lib.pub.toLowerCase().split(' ')[0], p: 'ai', c: 90 }],
+        desc: a.name + ' ' + a.folder + ' unity ' + lib.cat, deps: [], imported: false, license: lib.pub + ' EULA', unityLib: lib.id
+      };
+      if (t === 'sound') { const d = (a.dur || '0:02').split(':'); o.durS = parseInt(d[0], 10) * 60 + parseInt(d[1] || '0', 10); }
+      else { o.hue = lib.cat === '3d' ? 32 : (lib.cat === 'ui' ? 44 : 210); o.sat = 40; }
+      return o;
+    });
+  }
+  unityPin(id) {
+    const lib = (this.state.unityLibs || []).find(l => l.id === id);
+    if (!lib) return;
+    if ((this.state.unityPinned || []).includes(id)) { this.toast(lib.name + ' is already in your Libraries', '#F2B84B'); return; }
+    const dup = this.unityDup(lib.name);
+    const fresh = this.unityGridAssets(lib).filter(na => !(this.state.assets || []).some(a => a.lib === lib.name && a.name === na.name));
+    this.setState(s => ({ unityPinned: [...(s.unityPinned || []), id], assets: [...s.assets, ...fresh] }));
+    if (this.genThumbs) setTimeout(() => this.genThumbs(), 0);
+    if (dup) this.toast('⧉ ' + lib.name + ' added — heads up: looks like duplicates of “' + dup + '” are already indexed', '#F2B84B');
+    else this.toast('⬢ ' + lib.name + ' added to Libraries — ' + fresh.length + ' assets now browse in the grid', '#5BD897');
+  }
+  unityUnpin(id) {
+    const lib = (this.state.unityLibs || []).find(l => l.id === id);
+    if (!lib) return;
+    this.setState(s => ({
+      unityPinned: (s.unityPinned || []).filter(x => x !== id),
+      assets: s.assets.filter(a => a.unityLib !== id),
+      lib: s.lib === lib.name ? 'all' : s.lib
+    }));
+    this.toast('◻ ' + lib.name + ' removed from Libraries', '#F2B84B');
+  }
+  uTogglePlay() { this.setState(s => ({ uPlaying: !s.uPlaying })); }
+  uTypeGlyph(t) { return { model: '⬡', texture: '▦', material: '◍', audio: '♪', prefab: '◈', script: '{}' }[t] || '▢'; }
+  uTypeColor(t) { return { model: '#A98BFF', texture: '#6FB1FF', material: '#E7B765', audio: '#49C9E0', prefab: '#5BD897', script: '#5BD897' }[t] || '#A7B0C0'; }
+  unityAssetsFor(id) {
+    const lib = (this.state.unityLibs || []).find(l => l.id === id);
+    if (!lib) return [];
+    const mk = (folder, name, type, extra) => Object.assign({ key: folder + '/' + name, folder, name, type, deps: (type === 'prefab' ? 6 : type === 'model' ? 3 : 1) }, extra);
+    if (lib.cat === 'audio') return [
+      mk('Audio/Music', 'battle_theme_loop.wav', 'audio', { dur: '2:14', dim: '48 kHz · stereo', size: '24.1 MB' }),
+      mk('Audio/Music', 'ambient_forest.wav', 'audio', { dur: '3:40', dim: '48 kHz · stereo', size: '38.6 MB' }),
+      mk('Audio/SFX', 'sword_hit_01.wav', 'audio', { dur: '0:01', dim: '44.1 kHz · mono', size: '182 KB' }),
+      mk('Audio/SFX', 'ui_click.wav', 'audio', { dur: '0:00', dim: '44.1 kHz · mono', size: '44 KB' })
+    ];
+    if (lib.cat === 'code') return [
+      mk('Scripts/Editor', 'ToolkitWindow.cs', 'script', { dim: '312 lines · C#', size: '11 KB' }),
+      mk('Scripts/Runtime', 'ObjectPool.cs', 'script', { dim: '88 lines · C#', size: '3 KB' }),
+      mk('Scripts/Runtime', 'DebugConsole.cs', 'script', { dim: '540 lines · C#', size: '18 KB' })
+    ];
+    if (lib.cat === 'ui') return [
+      mk('Prefabs', 'MainMenu.prefab', 'prefab', { dim: '18 objects', size: '96 KB' }),
+      mk('Sprites', 'button_atlas.png', 'texture', { dim: '2048×2048 · RGBA', size: '5.4 MB' }),
+      mk('Fonts', 'Cinzel-Bold.ttf', 'texture', { dim: 'TrueType font', size: '112 KB' })
+    ];
+    if (lib.cat === 'materials') return [
+      mk('Materials', 'Beautify_PostFX.mat', 'material', { dim: 'HDRP · 6 maps', size: '4 KB' }),
+      mk('Textures', 'grunge_albedo.png', 'texture', { dim: '4096×4096 · RGB', size: '18 MB' }),
+      mk('Textures', 'grunge_normal.png', 'texture', { dim: '4096×4096 · normal', size: '21 MB' })
+    ];
+    return [
+      mk('Prefabs', 'SM_Bld_Skyscraper_01.prefab', 'prefab', { dim: '12 objects · LOD3', size: '820 KB' }),
+      mk('Models', 'SM_Bld_Skyscraper_01.fbx', 'model', { tris: '14.2k', dim: '9.8k verts · 4 mats', size: '2.1 MB' }),
+      mk('Models', 'SM_Prop_Streetlight.fbx', 'model', { tris: '1.1k', dim: '780 verts · 1 mat', size: '184 KB' }),
+      mk('Textures', 'PolygonCity_Texture_01.png', 'texture', { dim: '1024×1024 · atlas', size: '1.3 MB' }),
+      mk('Materials', 'PolygonCity_Mat_01.mat', 'material', { dim: 'URP/Lit · 3 maps', size: '3 KB' })
+    ];
+  }
+  uPreview(a) {
+    const isModel = a.type === 'model', isTex = a.type === 'texture' || a.type === 'material',
+      isAudio = a.type === 'audio', isPrefab = a.type === 'prefab', isScript = a.type === 'script';
+    const base = {
+      pvName: a.name, pvFolder: a.folder, pvMeta: a.dim || '', pvSize: a.size || '',
+      pvDeps: a.deps, pvAdd: () => this.unityAddToProject(a),
+      pvIsModel: isModel, pvIsTex: isTex, pvIsAudio: isAudio, pvIsPrefab: isPrefab, pvIsScript: isScript,
+      pvMark: this.unityMark(52, '#5BD897'),
+      pvExtract: 'Surgically extracted from the .unitypackage — the archive stays sealed.'
+    };
+    if (isModel) base.pvTris = a.tris;
+    if (isPrefab) base.pvChildren = ['Root (Transform)', '├ Mesh (MeshRenderer)', '├ Collider (BoxCollider)', '├ LOD Group', '│  ├ LOD0 · LOD1 · LOD2', '└ Children ×8'].map(t => ({ label: t }));
+    if (isAudio) { base.pvPlaying = this.state.uPlaying; base.pvPlayGlyph = this.state.uPlaying ? '⏸' : '▶'; base.pvTogglePlay = () => this.uTogglePlay(); base.pvDur = a.dur; base.pvBars = Array.from({ length: 40 }, (_, i) => ({ h: (20 + Math.round(Math.abs(Math.sin(i * 0.7)) * 60)) + '%' })); }
+    if (isScript) base.pvCode = ['using UnityEngine;', 'using UnityEditor;', '', 'public class ToolkitWindow : EditorWindow {', '    [MenuItem("Tools/Lodestash")]', '    static void Open() =>', '        GetWindow<ToolkitWindow>();', '}'].map((l, i) => ({ n: i + 1, code: l }));
+    return base;
+  }
+  unityVals() {
+    const s = this.state, cats = this.uCats();
+    const catList = [['all', '◆ All']].concat(Object.keys(cats).map(k => [k, cats[k].glyph + ' ' + cats[k].label]));
+    const catRow = catList.map(([k, label]) => ({
+      label, onClick: () => this.uiSetCat(k),
+      fg: s.uiCat === k ? '#08130C' : '#A7B0C0',
+      bg: s.uiCat === k ? '#5BD897' : '#161B26',
+      bd: s.uiCat === k ? '#5BD897' : '#2C3547'
+    }));
+    const groups = this.unityCatalog().map(g => {
+      const pkgs = g.pkgs.filter(p => s.uiCat === 'all' || (s.uiOverride[g.pub + '/' + p.name] || p.cat) === s.uiCat);
+      const keys = pkgs.map(p => g.pub + '/' + p.name);
+      const allSel = keys.length > 0 && keys.every(k => s.uiSel[k]);
+      const open = s.uiExpanded[g.pub] !== false;
+      return {
+        pub: g.pub, count: pkgs.length, open, chevron: open ? '▾' : '▸',
+        onToggle: () => this.uiToggleGroup(g.pub),
+        selAllLabel: allSel ? 'clear' : 'select all',
+        onSelAll: (e) => { e.stopPropagation(); this.uiSelectGroup(g.pub, keys, !allSel); },
+        pkgs: pkgs.map(p => {
+          const key = g.pub + '/' + p.name, c = s.uiOverride[key] || p.cat, cm = cats[c], older = !!s.uiOlder[key];
+          const dupN = this.unityDup(p.name);
+          return {
+            key, name: p.name, onToggle: () => this.uiToggleSel(key),
+            catColor: cm.color, curCat: c,
+            hasDup: !!dupN, dupName: dupN || '',
+            ver: 'v' + p.ver, size: this.fmtMB(p.size), assets: p.assets + ' assets',
+            hasOlder: p.older.length > 0,
+            olderLabel: p.older.length + ' older version' + (p.older.length === 1 ? '' : 's'),
+            olderOpen: older, onOlder: () => this.uiToggleOlder(key), olderChevron: older ? '▾' : '▸',
+            olderList: older ? p.older.map(v => ({ label: 'v' + v + ' · superseded' })) : [],
+            checkBg: s.uiSel[key] ? '#5BD897' : 'transparent', checkBd: s.uiSel[key] ? '#5BD897' : '#3A465C', check: s.uiSel[key] ? '✓' : '',
+            catOpts: Object.keys(cats).map(ck => ({ label: cats[ck].label, val: ck })),
+            onCatChange: e => this.uiSetOverride(key, e.target.value)
+          };
+        })
+      };
+    }).filter(g => g.pkgs.length > 0);
+    const selCount = Object.values(s.uiSel).filter(Boolean).length;
+    const cards = (s.unityLibs || []).map(l => {
+      const cm = cats[l.cat] || cats['3d'];
+      return {
+        id: l.id, name: l.name, sub: l.pub + ' · v' + l.ver, path: l.path,
+        catLabel: cm.label, catColor: cm.color, catGlyph: cm.glyph,
+        meta: l.assets + ' assets · ' + this.fmtMB(l.size), mark: this.unityMark(20, cm.color),
+        onOpen: () => this.openUnityLib(l.id), onSync: () => this.unitySyncLib(l.name)
+      };
+    });
+    const lib = (s.unityLibs || []).find(l => l.id === s.unityLibOpen);
+    const cm = lib ? (cats[lib.cat] || cats['3d']) : null;
+    const assets = lib ? this.unityAssetsFor(lib.id) : [];
+    const folders = [];
+    assets.forEach(a => { let f = folders.find(x => x.folder === a.folder); if (!f) { f = { folder: a.folder, items: [] }; folders.push(f); } f.items.push(a); });
+    const treeGroups = folders.map(f => ({
+      folder: f.folder,
+      items: f.items.map(a => ({
+        key: a.key, name: a.name, typeGlyph: this.uTypeGlyph(a.type), typeColor: this.uTypeColor(a.type),
+        fg: s.unitySel === a.key ? '#E6E9F0' : '#A7B0C0',
+        bg: s.unitySel === a.key ? '#232C3D' : 'transparent',
+        blc: s.unitySel === a.key ? '#5BD897' : 'transparent',
+        onClick: () => this.unitySelect(a.key)
+      }))
+    }));
+    const selAsset = assets.find(a => a.key === s.unitySel) || null;
+    const pv = selAsset ? this.uPreview(selAsset) : null;
+    const activeUnityLib = (s.unityLibs || []).find(l => (s.unityPinned || []).includes(l.id) && l.name === s.lib) || null;
+    const activeCount = activeUnityLib ? s.assets.filter(a => a.lib === activeUnityLib.name).length : 0;
+    return {
+      asOpen: s.asOpen, asClose: () => this.closeAddSource(), asEat: e => e.stopPropagation(),
+      asWatch: () => { this.closeAddSource(); this.addSource(); }, asUnity: () => this.openUnityImport(),
+      asUnityMark: this.unityMark(20, '#5BD897'),
+      showUnity: s.screen === 'unity',
+      unityLanding: !s.unityLibOpen, unityBrowsing: !!s.unityLibOpen,
+      unityEmpty: (s.unityLibs || []).length === 0, unityCards: cards,
+      unityBigMark: this.unityMark(40, '#5BD897'),
+      openUnityImport: () => this.openUnityImport(),
+      uiOpen: s.uiOpen, uiClose: () => this.closeUnityImport(), uiEat: e => e.stopPropagation(),
+      uiPicked: s.uiPicked, uiNotPicked: !s.uiPicked, uiPickFolder: () => this.uiPickFolder(),
+      uiFolderPath: 'G:/AppData/Roaming/Unity/Asset Store-5.x',
+      uiHeadMark: this.unityMark(24, '#5BD897'),
+      uiCatRow: catRow, uiGroups: groups,
+      uiSelLabel: selCount + ' selected', uiImport: () => this.uiImport(),
+      uLibName: lib ? lib.name : '', uLibPath: lib ? lib.path : '', uLibSub: lib ? (lib.pub + ' · v' + lib.ver) : '',
+      uLibCat: cm ? cm.label : '', uLibCatColor: cm ? cm.color : '#5BD897', uLibMark: cm ? this.unityMark(20, cm.color) : null,
+      uLibMeta: lib ? (lib.assets + ' assets · ' + this.fmtMB(lib.size) + ' · indexed in place') : '',
+      uCloseLib: () => this.closeUnityLib(), uSyncLib: () => lib && this.unitySyncLib(lib.name),
+      uAddToLibrary: () => { if (!lib) return; (s.unityPinned || []).includes(lib.id) ? this.unityUnpin(lib.id) : this.unityPin(lib.id); },
+      uPinLabel: (lib && (s.unityPinned || []).includes(lib.id)) ? '✓ In Libraries · remove' : '＋ Add to Library',
+      uPinFg: (lib && (s.unityPinned || []).includes(lib.id)) ? '#8A93A6' : '#5BD897',
+      uPinBd: (lib && (s.unityPinned || []).includes(lib.id)) ? '#3A465C' : 'rgba(91,216,151,.5)',
+      uTree: treeGroups, uTreeCount: assets.length, uHasSel: !!pv,
+      showAddAll: s.screen === 'library' && !!activeUnityLib,
+      addAllLabel: activeUnityLib ? ('Add all ' + activeCount + ' to project') : '',
+      onAddAll: () => { if (activeUnityLib) this.toast('⇢ ' + activeCount + ' assets + dependencies from ' + activeUnityLib.name + ' → ' + this.curProjName(), '#5BD897'); },
+      ...(pv || {})
+    };
+  }
+
   // ── bulk tag editing ──
   bulkApply(add) {
     const tag = this.state.bulkTag.trim().toLowerCase();
@@ -2560,7 +3079,7 @@ class Component extends DCLogic {
           onAddAsset: () => this.addBlacklist(src.id, 'asset')
         };
       }),
-      onAddSource: () => this.addWatchedSource(),
+      onAddSource: () => this.openAddSource(),
       hwTiers: tiers.map(t => {
         const active = st.hwProfile === t.key;
         return { ...t, check: active ? '\u2713' : '', bg: active ? 'rgba(231,183,101,.08)' : '#0E1117',
@@ -2692,10 +3211,18 @@ class Component extends DCLogic {
       fg: s.lib === k ? '#E6E9F0' : '#A7B0C0',
       bl: s.lib === k ? '#E7B765' : 'transparent',
       onClick: () => this.setState({ lib: k, screen: 'library' })
+    })).concat((s.unityLibs || []).filter(l => (s.unityPinned || []).includes(l.id)).map(l => {
+      const on = s.screen === 'library' && s.lib === l.name;
+      return {
+        label: l.name, count: s.assets.filter(a => a.lib === l.name).length,
+        fg: on ? '#E6E9F0' : '#A7B0C0', bl: on ? '#5BD897' : 'transparent',
+        onClick: () => this.setState({ lib: l.name, screen: 'library', packF: 'all', collF: 'all', statusF: 'all', query: '', aiResults: null, fTags: [], fSizes: [], fTris: [] }),
+        isUnity: true, removable: true, onRemove: (e) => { e.stopPropagation(); this.unityUnpin(l.id); }
+      };
     }));
 
     const dupCount = s.dupGroups.length;
-    const navDefs = [['library', 'Library', '⊞'], ['favorites', 'Favorites', '★'], ['identify', 'Identify', '✦'], ['collections', 'Collections', '⟡'], ['packages', 'Packages', '▤'], ['traits', 'Traits', '❖'], ['stats', 'Stats', '◉'], ['dups', 'Duplicates', '⧉'], ['trash', 'Trash', '⊘'], ['settings', 'Settings', '⚙']];
+    const navDefs = [['library', 'Library', '⊞'], ['favorites', 'Favorites', '★'], ['identify', 'Identify', '✦'], ['collections', 'Collections', '⟡'], ['packages', 'Packages', '▤'], ['unity', 'Unity Assets', this.unityMark(15, s.screen === 'unity' ? '#5BD897' : '#8FE3B8')], ['traits', 'Traits', '❖'], ['stats', 'Stats', '◉'], ['dups', 'Duplicates', '⧉'], ['trash', 'Trash', '⊘'], ['settings', 'Settings', '⚙']];
     const badgeVals = { identify: unid.length, dups: dupCount, trash: s.trash.length };
     const navItems = navDefs.map(([k, label, glyph]) => ({
       label, glyph,
@@ -3273,12 +3800,13 @@ class Component extends DCLogic {
           this.toast('✓ Restored ' + a.name, '#5BD897');
         }
       })),
-      onAddSource: () => this.addSource(),
+      onAddSource: () => this.openAddSource(),
       graphRef: (this.graphRefFn = this.graphRefFn || (el => this.setGraphCanvas(el))),
       graphStats: this.gStats ? this.gStats.tags + ' tags · ' + this.gStats.links + ' links · ' + this.gStats.assets + ' assets' : '',
       graphHasUnid: unid.length > 0,
       showSettings: s.screen === 'settings',
       ...this.settingsVals(),
+      ...this.unityVals(),
       showStub: !!stub,
       stubGlyph: stub ? stub[0] : '', stubTitle: stub ? stub[1] : '', stubBody: stub ? stub[2] : '',
       goLibrary: () => this.setState({ screen: 'library' }),

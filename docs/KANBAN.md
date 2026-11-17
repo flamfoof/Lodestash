@@ -743,7 +743,23 @@ translation. The port removes the translation; the egui build stayed buildable a
   should they be reaped?) — not a frontend concern.
 
 ## In Progress
-*(empty — pull from Ready)*
+
+### v2 rewrite (branch `rewrite/v2`, 2026-11-16)
+
+Governing docs: [review](reviews/2026-11-16-architecture-review.md) ·
+[spec](superpowers/specs/2026-11-16-v2-architecture-design.md) ·
+[plan](superpowers/plans/2026-11-16-v2-rewrite.md) (the plan's checkboxes are the task-level
+tracking; these cards track phases).
+
+- [x] **V2-P0** Review, spec, ADR-0021/0022/0023, plan, one reconciled prototype
+- [ ] **V2-P1** Core hardening — typed errors, migration lifecycle, `CatalogReader`, lookup indexes, moves keep identity, atomic project registration, robust unitypackage reads
+- [ ] **V2-P2** `lodestash-protocol` operation catalog; `lodestash-engine` absorbs app + writer + read model; config store; one appraisal plan and job registry
+- [ ] **V2-P3** `lodestash-api` derived from the catalog; UI session, request checks, SSE, bytes, static UI
+- [ ] **V2-P4** `lodestash-mcp` standalone thin client with auto-launch
+- [ ] **V2-P5** Thin Tauri shell; retire Tauri commands, `lodestash://`, `--mcp`, old `ui/`
+- [ ] **V2-P6** Web foundation in `web/` — contract extractor, tokens, primitives, data layer, fixture catalog, gate
+- [ ] **V2-P7** Screens rebuilt against the contract, in spec order
+- [ ] **V2-P8** Per-stage failure state, pinned downloads, delete fence, SQL read model, MCP over HTTP, doc reconciliation
 
 ## In Review
 *(empty)*
