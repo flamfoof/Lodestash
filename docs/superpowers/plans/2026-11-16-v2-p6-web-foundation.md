@@ -124,6 +124,10 @@ only here; tokens only; props typed; no API calls.
   `measureInPage({ anchor })`, compares to `contract.json` state `library`, prints a table, writes
   `test-reports/MM-DD-HH-MM.csv` (owner's convention: one row per check with origin
   `web/e2e/gate.mjs`, status, duration, detail), exits 1 on any diff. A check over 5 s fails.
+- Known prototype artefact: `library.sort` measures `fontFamily: Arial` — the browser default for a
+  `<select>` the prototype never styled, not a design choice. The app's select uses the UI font;
+  record that one property in `DEVIATIONS.md` rather than copying Arial. Line heights are the
+  fonts' `normal`; do not set `line-height` globally or every box height drifts.
 - [ ] Test (`scripts/design/lib/compare.test.mjs`, run with `node --test`): ±1 px box tolerance;
   exact colour; a DEVIATIONS row exempts only its property
 - [ ] `bun run web:gate -- --gallery` green
