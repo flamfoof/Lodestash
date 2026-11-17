@@ -87,7 +87,8 @@ impl CoreError {
     }
 }
 
-fn is_busy(e: &rusqlite::Error) -> bool {
+/// Another connection holds the lock this one needs.
+pub(crate) fn is_busy(e: &rusqlite::Error) -> bool {
     matches!(
         e.sqlite_error_code(),
         Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)

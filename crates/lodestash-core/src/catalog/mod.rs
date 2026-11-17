@@ -371,8 +371,14 @@ fn scope_clause(only: Option<&[i64]>) -> String {
 /// any other ([`Catalog::open_reader`]); a test pins it to the migration list.
 pub const SCHEMA_VERSION: u32 = 31;
 
+/// How many `<catalog>.v<N>.bak` files a migration leaves beside the catalog.
+const KEEP_BACKUPS: usize = 2;
+
 impl Catalog {
-    /// Open (or create) the catalog at `path`. Runs all pending migrations.
+    /// Open the catalog at `path`, creating it when missing, and migrate it to [`SCHEMA_VERSION`]
+    /// (DATA-MODEL §13 "Lifecycle"). An existing catalog is copied to `<file>.v<from>.bak` before
+    /// the first migration step touches it. A catalog a newer build wrote is refused with
+    /// [`CoreError::SchemaTooNew`] and left exactly as it was.
     pub fn open(path: &Path) -> Result<Self> {
         let conn =
             Connection::open(path).map_err(|e| CoreError::Catalog(format!("open failed: {e}")))?;
@@ -383,8 +389,63 @@ impl Catalog {
             db_path: Some(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())),
             appraise_focus: AppraiseFocus::default(),
         };
+        let from = catalog.schema_version()?;
+        refuse_newer(from)?;
+        if from < SCHEMA_VERSION {
+            catalog.backup_before_migration(path, from)?;
+        }
         catalog.apply_migrations()?;
+        // Another build may have moved the file on while this one waited for the lock.
+        refuse_newer(catalog.schema_version()?)?;
         Ok(catalog)
+    }
+
+    /// Copy a catalog at schema `from` to `<file>.v<from>.bak` before a migration changes it, and
+    /// keep only the newest [`KEEP_BACKUPS`]. `None` when there is nothing to keep: a new, empty
+    /// file (`from == 0`) or one already current.
+    ///
+    /// `VACUUM INTO` reads one consistent snapshot even while another connection writes (WAL), and
+    /// it writes a complete database, so a backup is either whole or absent: it goes to a temporary
+    /// name first and is renamed into place.
+    fn backup_before_migration(&self, path: &Path, from: u32) -> Result<Option<PathBuf>> {
+        if from == 0 || from >= SCHEMA_VERSION {
+            return Ok(None);
+        }
+        let name = path
+            .file_name()
+            .ok_or_else(|| CoreError::Catalog(format!("no file name in {}", path.display())))?
+            .to_string_lossy()
+            .into_owned();
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let backup = dir.join(format!("{name}.v{from}.bak"));
+        let partial = dir.join(format!("{name}.v{from}.bak.partial"));
+        if partial.exists() {
+            std::fs::remove_file(&partial)?;
+        }
+        info!(from, backup = %backup.display(), "backing up the catalog before migrating it");
+        self.conn
+            .execute("VACUUM INTO ?1", params![partial.to_string_lossy()])
+            .map_err(|e| CoreError::Catalog(format!("backup before migration: {e}")))?;
+        std::fs::rename(&partial, &backup)?;
+
+        let prefix = format!("{name}.v");
+        let mut kept: Vec<(u32, PathBuf)> = std::fs::read_dir(dir)?
+            .filter_map(|e| {
+                let e = e.ok()?;
+                let file = e.file_name().to_string_lossy().into_owned();
+                let v = file
+                    .strip_prefix(&prefix)?
+                    .strip_suffix(".bak")?
+                    .parse()
+                    .ok()?;
+                Some((v, e.path()))
+            })
+            .collect();
+        kept.sort_unstable_by_key(|(v, _)| std::cmp::Reverse(*v));
+        for (_, old) in kept.into_iter().skip(KEEP_BACKUPS) {
+            std::fs::remove_file(&old)?;
+        }
+        Ok(Some(backup))
     }
 
     /// Open an existing catalog **read-only** — the agent planes' own connection (v1 plan S11).
@@ -417,19 +478,13 @@ impl Catalog {
             db_path: Some(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())),
             appraise_focus: AppraiseFocus::default(),
         };
-        let version = catalog.schema_version()?;
-        if version != SCHEMA_VERSION {
-            return Err(CoreError::Catalog(if version < SCHEMA_VERSION {
-                format!(
-                    "the catalog is at schema v{version} and this build reads v{SCHEMA_VERSION} — \
-                     open the Lodestash app once to upgrade it"
-                )
-            } else {
-                format!(
-                    "the catalog is at schema v{version}, newer than this build (v{SCHEMA_VERSION}) \
-                     — update Lodestash"
-                )
-            }));
+        let found = catalog.schema_version()?;
+        refuse_newer(found)?;
+        if found < SCHEMA_VERSION {
+            return Err(CoreError::SchemaTooOld {
+                found,
+                supported: SCHEMA_VERSION,
+            });
         }
         Ok(catalog)
     }
@@ -480,8 +535,12 @@ impl Catalog {
     /// Run pending migrations up to and including `max_version` (tests use this to
     /// build a fixture at an older schema, then re-run to exercise one migration's
     /// data steps). Each migration runs inside its own transaction (DATA-MODEL §13).
+    ///
+    /// Each step takes the write lock first (`BEGIN IMMEDIATE`) and reads `user_version` again
+    /// under it: another connection — a second process opening the same file — may have applied
+    /// the step while this one waited, and a step applied twice fails (`ALTER TABLE … ADD COLUMN`
+    /// is not idempotent) or worse, applies its data step twice.
     fn apply_migrations_up_to(&mut self, max_version: u32) -> Result<()> {
-        let current = self.schema_version()?;
         let migrations: &[(u32, &str)] = &[
             (1, MIGRATION_01_BASE_SCHEMA),
             (2, MIGRATION_02_PACKAGES),
@@ -516,21 +575,32 @@ impl Catalog {
             (31, MIGRATION_31_CATALOG_IDENTITY),
         ];
 
-        for (version, sql) in migrations {
-            if current < *version && *version <= max_version {
-                info!(version, "applying schema migration");
-                let tx = self
-                    .conn
-                    .transaction()
-                    .map_err(|e| CoreError::Catalog(format!("migration {version} begin: {e}")))?;
-                tx.execute_batch(sql)
-                    .map_err(|e| CoreError::Catalog(format!("migration {version} failed: {e}")))?;
-                // PRAGMA user_version cannot be parameterised — format is safe (u32 literal).
-                tx.execute_batch(&format!("PRAGMA user_version = {version};"))
-                    .map_err(|e| CoreError::Catalog(format!("set user_version: {e}")))?;
-                tx.commit()
-                    .map_err(|e| CoreError::Catalog(format!("migration {version} commit: {e}")))?;
+        for &(version, sql) in migrations {
+            if version > max_version {
+                break;
             }
+            // Unlocked first look: an up-to-date catalog takes no write lock to open.
+            if self.schema_version()? >= version {
+                continue;
+            }
+            let tx = self
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| CoreError::Catalog(format!("migration {version} begin: {e}")))?;
+            let current: u32 = tx
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .map_err(|e| CoreError::Catalog(format!("migration {version} version: {e}")))?;
+            if current >= version {
+                continue; // applied by another connection while this one waited; rolls back
+            }
+            info!(version, "applying schema migration");
+            tx.execute_batch(sql)
+                .map_err(|e| CoreError::Catalog(format!("migration {version} failed: {e}")))?;
+            // PRAGMA user_version cannot be parameterised — format is safe (u32 literal).
+            tx.execute_batch(&format!("PRAGMA user_version = {version};"))
+                .map_err(|e| CoreError::Catalog(format!("set user_version: {e}")))?;
+            tx.commit()
+                .map_err(|e| CoreError::Catalog(format!("migration {version} commit: {e}")))?;
         }
         Ok(())
     }
@@ -1673,16 +1743,43 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// A catalog written by a newer build is not this build's to open: its queries were written for
+/// a shape this one has never seen, and migrating "down" is not a thing.
+fn refuse_newer(found: u32) -> Result<()> {
+    if found > SCHEMA_VERSION {
+        return Err(CoreError::SchemaTooNew {
+            found,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    Ok(())
+}
+
 fn configure_connection(conn: &Connection) -> Result<()> {
+    const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+    let pragma_err = |e: rusqlite::Error| CoreError::Catalog(format!("configure pragmas: {e}"));
+    // Writers queue instead of erroring; chunked pack writes keep the wait short.
+    conn.busy_timeout(BUSY_TIMEOUT).map_err(pragma_err)?;
+    // Switching a new file to WAL needs an exclusive lock, and SQLite answers BUSY at once there
+    // instead of waiting in the busy handler — so two connections opening one new file at the same
+    // moment (two processes starting together) would fail one of them. Wait the same budget here.
+    let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
+    loop {
+        match conn.execute_batch("PRAGMA journal_mode=WAL;") {
+            Ok(()) => break,
+            Err(e) if crate::error::is_busy(&e) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => return Err(pragma_err(e)),
+        }
+    }
     conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         PRAGMA synchronous=NORMAL;
+        "PRAGMA synchronous=NORMAL;
          PRAGMA foreign_keys=ON;
          PRAGMA cache_size=-32768;  -- 32 MiB page cache
-         PRAGMA temp_store=MEMORY;
-         PRAGMA busy_timeout=15000;  -- writers queue instead of erroring; chunked pack writes keep the wait short",
+         PRAGMA temp_store=MEMORY;",
     )
-    .map_err(|e| CoreError::Catalog(format!("configure pragmas: {e}")))?;
+    .map_err(pragma_err)?;
     Ok(())
 }
 
@@ -6302,6 +6399,8 @@ mod taxonomy;
 mod tests_browse;
 #[cfg(test)]
 mod tests_catalog;
+#[cfg(test)]
+mod tests_lifecycle;
 #[cfg(test)]
 mod tests_material_inputs;
 #[cfg(test)]

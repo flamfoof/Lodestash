@@ -929,7 +929,26 @@ ALTER TABLE project ADD COLUMN pipeline TEXT;     -- the registered editor's pip
 ## 13. Migration ledger
 
 `PRAGMA user_version` tracks the schema version; each migration runs exactly once inside a
-transaction, in order, on open. Shipped so far:
+transaction, in order, on open.
+
+**Lifecycle** (v2 spec §4.2; `Catalog::open` / `Catalog::open_reader` in
+`crates/lodestash-core/src/catalog/mod.rs`):
+
+- `open` creates a missing catalog and migrates an existing one to `SCHEMA_VERSION`. A catalog at a
+  **newer** version is refused with `CoreError::SchemaTooNew` and left untouched — an older build
+  never writes a schema it does not know.
+- Before the first step touches an **existing** catalog (version > 0), it is copied with
+  `VACUUM INTO` to `<catalog>.v<from>.bak` beside it — one consistent snapshot even while another
+  connection writes, written under a temporary name and renamed, so a backup is whole or absent. The
+  newest two backups are kept. A new file and a current one are not backed up.
+- Each step takes the write lock first (`BEGIN IMMEDIATE`) and re-reads `user_version` under it, so
+  two processes opening one file apply every step once; the loser of the race skips the steps the
+  winner applied. A failing step rolls back alone and the open fails, leaving the catalog at the
+  last good version with its backup beside it.
+- `open_reader` never migrates: it refuses an older catalog (`SchemaTooOld`, "open the Lodestash
+  app once") and a newer one (`SchemaTooNew`).
+
+Shipped so far:
 
 | ver | Contents |
 |---|---|
