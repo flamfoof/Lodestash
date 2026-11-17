@@ -1,0 +1,22 @@
+{
+  "name": "lodestash-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "The Lodestash UI — a web client of the app's /v1 API, served by the app (spec 9).",
+  "scripts": {
+    "dev": "vite",
+    "build": "node ../scripts/design/gen-icons.mjs --check && svelte-check --tsconfig ./tsconfig.json && vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "lint:styles": "node ../scripts/design/check-styles.mjs",
+    "icons": "node ../scripts/design/gen-icons.mjs"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "5.1.1",
+    "playwright-core": "1.62.1",
+    "svelte": "5.56.8",
+    "svelte-check": "4.7.4",
+    "typescript": "5.9.3",
+    "vite": "6.4.3"
+  }
+}

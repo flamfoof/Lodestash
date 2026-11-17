@@ -13,3 +13,4 @@ prototype is updated to agree.
 
 | Screen / state | Anchor | Properties | Prototype | App | Reason | Decided |
 |---|---|---|---|---|---|---|
+| all | nav and action glyphs (no anchor; glyph shape is not measured) | glyph shape only — box, colour and spacing are still checked | Unicode characters (⊞ ★ ✦ ⟡ ▤ …) rendered by whatever system font has them | the designed SVG icon set, `docs/design/icons/icons.svg`, at the glyph's box size | [ADR-0012](../decisions/ADR-0012-one-icon-ladder.md): one icon ladder from the designer's set; Unicode glyph shapes vary by OS font | 2026-11-16 |

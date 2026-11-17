@@ -1,0 +1,60 @@
+/* The one token source (ADR-0023); never copied. */
+@import "../../../docs/design/tokens.css";
+@import "./fonts.css";
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--ls-bg);
+  color: var(--ls-text);
+  font-family: var(--ff-ui);
+  font-size: var(--fs-13);
+  font-weight: var(--fw-400);
+  -webkit-font-smoothing: antialiased;
+  scrollbar-width: thin;
+  scrollbar-color: var(--ls-border-strong) transparent;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+::placeholder {
+  color: var(--ls-text-dim);
+}
+
+a {
+  color: var(--ls-gold);
+}
+
+a:hover {
+  color: var(--ls-gold-bright);
+}
+
+:focus-visible {
+  outline: none;
+  box-shadow: var(--ring-focus);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0s !important; /* style-lint-allow: reduced motion removes movement */
+    transition-duration: 0s !important; /* style-lint-allow: reduced motion removes movement */
+  }
+}

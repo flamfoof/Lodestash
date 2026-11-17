@@ -82,9 +82,9 @@ root `package.json` scripts (`web:dev`, `web:build`, `web:check`, `web:test`, `w
   literals (`#…`, `rgb(`, `hsl(`), lengths other than `0`, `1px`, `100%`, `fr` units, numeric
   `z-index`, literal `transition`/`animation` durations, literal `box-shadow`, `opacity` other than
   `0`/`1`. Each finding prints `file:line`. Exit 1 on any.
-- [ ] Test: `check-styles.mjs` flags a seeded literal in a temp file and passes on the scaffold
-- [ ] `bun run web:check` (svelte-check) 0 errors; `bun run web:build` succeeds
-- [ ] Commit `feat(web): scaffold — Vite, Svelte 5, bundled fonts, one icon sprite, style lint`
+- [x] Test: `check-styles.mjs` flags a seeded literal in a temp file and passes on the scaffold
+- [x] `bun run web:check` (svelte-check) 0 errors; `bun run web:build` succeeds
+- [x] Commit `feat(web): scaffold — Vite, Svelte 5, bundled fonts, one icon sprite, style lint`
 
 ### Task 6.3: Primitives
 

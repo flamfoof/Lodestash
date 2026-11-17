@@ -5,7 +5,10 @@
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "dev:release": "node scripts/dev.mjs --release",
-    "setup": "bun install --cwd crates/lodestash-desktop/ui",
+    "setup": "bun install --cwd crates/lodestash-desktop/ui && bun install --cwd web",
+    "web:dev": "bun run --cwd web dev",
+    "web:build": "bun run --cwd web build",
+    "web:check": "bun run --cwd web check && node scripts/design/check-styles.mjs && node scripts/design/gen-icons.mjs --check",
     "build": "bun run --cwd crates/lodestash-desktop/ui build",
     "check": "bun run --cwd crates/lodestash-desktop/ui check",
     "e2e": "bun run --cwd crates/lodestash-desktop/ui e2e",
