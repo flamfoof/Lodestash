@@ -1,6 +1,7 @@
 <script lang="ts">
-  // The application shell arrives in P6 Task 6.5; the engine connection in P6b. Until then the
-  // page says what it is rather than pretending to be the app.
+  // The shell (app/Shell.svelte) takes its data as props and is shown with fixture data at
+  // /gallery.html#shell; it mounts here once P6b feeds it from /v1. Until then the page says what
+  // it is rather than pretending to be the app.
 </script>
 
 <main class="placeholder">

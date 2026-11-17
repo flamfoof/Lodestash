@@ -36,6 +36,7 @@
   .search {
     box-sizing: content-box;
     flex: 1;
+    min-width: 0;
     max-width: var(--search-max-w);
     height: var(--space-32);
     display: flex;

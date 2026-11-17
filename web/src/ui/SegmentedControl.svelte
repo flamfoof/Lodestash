@@ -32,6 +32,7 @@
     label,
     size = "md",
     anchors = {},
+    collapse,
     ...rest
   }: Omit<HTMLAttributes<HTMLDivElement>, "onchange"> & {
     options: Segment<V>[];
@@ -41,6 +42,8 @@
     label: string;
     size?: "md" | "sm";
     anchors?: { on?: string; off?: string };
+    /** In the app bar, show only the icons below this rung (AppBar). */
+    collapse?: "xl" | "lg" | "md";
   } = $props();
 
   function pick(v: V) {
@@ -50,7 +53,7 @@
   }
 </script>
 
-<div class="seg {size}" role="group" aria-label={label} {...rest}>
+<div class="seg {size} {collapse ? `collapse-${collapse}` : ''}" role="group" aria-label={label} {...rest}>
   {#each options as option (option.value)}
     {@const on = option.value === value}
     <button
@@ -59,12 +62,12 @@
       class:on
       aria-pressed={on}
       aria-label={option.label ? undefined : option.title}
-      title={option.title}
+      title={option.title ?? (collapse ? option.label : undefined)}
       data-anchor={on ? anchors.on : anchors.off}
       onclick={() => pick(option.value)}
     >
       <span class="label">
-        {#if option.icon}<Icon name={option.icon} size={option.iconSize ?? "12"} box={option.iconBox} />{#if option.label}{" "}{/if}{/if}{option.label ?? ""}
+        {#if option.icon}<Icon name={option.icon} size={option.iconSize ?? "12"} box={option.iconBox} />{/if}{#if option.label}<span class="text">{option.icon ? " " : ""}{option.label}</span>{/if}
       </span>
     </button>
   {/each}
@@ -103,6 +106,17 @@
 
   .sm .item {
     padding: var(--space-3) var(--space-9);
+  }
+
+  @container appbar (width < 1000px) {
+    .collapse-md .text {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+    }
   }
 
   .on.gold {

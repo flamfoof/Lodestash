@@ -3,10 +3,17 @@
    * The brand: the lodestone — a gold-edged diamond with a bright core and a soft glow — and
    * "LODESTASH" in Cinzel. `textAttrs` reaches the name (the contract measures it).
    */
-  let { textAttrs = {} }: { textAttrs?: Record<string, string | undefined> } = $props();
+  let {
+    textAttrs = {},
+    collapse,
+  }: {
+    textAttrs?: Record<string, string | undefined>;
+    /** In the app bar, keep only the stone below this rung (AppBar). */
+    collapse?: "xl" | "lg" | "md";
+  } = $props();
 </script>
 
-<div class="brand">
+<div class="brand {collapse ? `collapse-${collapse}` : ''}">
   <span class="stone" aria-hidden="true"><span class="core"></span></span>
   <span class="name" {...textAttrs}>LODESTASH</span>
 </div>
@@ -37,6 +44,17 @@
     height: var(--space-5);
     border-radius: var(--r-pill);
     background: var(--ls-gold-bright);
+  }
+
+  @container appbar (width < 1000px) {
+    .collapse-md .name {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+    }
   }
 
   .name {

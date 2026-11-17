@@ -31,6 +31,7 @@
     label,
     controls,
     anchors = {},
+    collapse,
     ...rest
   }: Omit<HTMLAttributes<HTMLDivElement>, "onchange"> & {
     tabs: Tab<V>[];
@@ -39,6 +40,8 @@
     label: string;
     controls?: string;
     anchors?: { on?: string; off?: string };
+    /** In the app bar, show only the icons below this rung (AppBar); labels stay the tabs' names. */
+    collapse?: "xl" | "lg" | "md";
   } = $props();
 
   let list: HTMLDivElement;
@@ -65,7 +68,7 @@
   }
 </script>
 
-<div class="tabs" role="tablist" aria-label={label} bind:this={list} {onkeydown} {...rest}>
+<div class="tabs {collapse ? `collapse-${collapse}` : ''}" role="tablist" aria-label={label} bind:this={list} {onkeydown} {...rest}>
   {#each tabs as tab (tab.value)}
     {@const on = tab.value === value}
     <button
@@ -76,11 +79,12 @@
       aria-selected={on}
       aria-controls={controls}
       tabindex={on ? 0 : -1}
+      title={collapse ? tab.label : undefined}
       data-anchor={on ? anchors.on : anchors.off}
       onclick={() => pick(tab.value)}
     >
       <span class="label">
-        {#if tab.icon}<Icon name={tab.icon} size={tab.iconSize ?? "12"} box={tab.iconBox} />{" "}{/if}{tab.label}
+        {#if tab.icon}<Icon name={tab.icon} size={tab.iconSize ?? "12"} box={tab.iconBox} />{/if}<span class="text">{tab.icon ? " " : ""}{tab.label}</span>
       </span>
     </button>
   {/each}
@@ -108,6 +112,17 @@
 
   .tab:hover:not(.on) {
     border-color: var(--ls-text-dim);
+  }
+
+  @container appbar (width < 1200px) {
+    .collapse-lg .text {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+    }
   }
 
   .on.gold {

@@ -325,6 +325,7 @@
   /* Frame metrics the shell grid uses; the contract checks the rendered result. */
   --topbar-h: 48px;
   --sidebar-w: 210px;
+  --rail-w: 48px; /* the sidebar as an icon rail, below a 1120 px window (ADR-0009) */
   --inspector-w: 300px;
   --search-max-w: 400px; /* the top-bar search stops growing here */
   --meter-w: 180px; /* the top-bar health meter's minimum width */

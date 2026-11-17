@@ -166,8 +166,22 @@ gallery entry `shell` rendering the shell with fixture props.
 - The shell is one CSS grid (top bar row; sidebar + main + optional inspector columns). Panes are
   size containers; components adapt with container queries. Window floor 900×600 (ADR-0009).
 - Every `frame` anchor in `scripts/design/anchors.mjs` is present with `data-anchor`.
-- [ ] Gate: the shell specimen at 1440×900 passes every `frame` anchor including `pos`
-- [ ] Commit `feat(web): the shell frame matches the prototype`
+- [x] Gate: the shell specimen at 1440×900 passes every `frame` anchor including `pos`
+- [x] Commit `feat(web): the shell frame matches the prototype`
+
+*As built:* 19/19 frame anchors with positions; `bun run web:gate -- --gallery` measures the
+gallery and `gallery.html#shell` in one run. The shell's data is `ShellData` (`app/shell.ts`).
+The eleven nav rows are FEATURES §0.3's; Unity Assets uses the sprite's existing `ls-unitypackage`
+(the prototype's `unityMark` paths, which FEATURES §0.3 names — no second symbol was added). The
+category tabs follow FEATURES §0.2 and include **Materials**, which the prototype predates — the
+search well is 95 px narrower, a DEVIATIONS row (`topbar.search` `w`). Facet groups show on every
+screen (ADR-0009). The frame takes ADR-0009's two frame rungs — the inspector overlays below
+1280 px, the rail becomes a 48 px icon rail with a flyout below 1120 px — and, because the top bar
+had no rung and overflowed by ~300 px at the floor, a stated fold order for it (`AppBar`: inference
+chip, then tab labels, then wordmark name and mode labels). The gate checks the floor: at 900×600
+nothing overflows and the rail is 48 px; below it the frame keeps its size and the page scrolls.
+Not built here: the Unity-library facet rows (⬢, ✕), the project switcher, the inspector's edge
+tab — their screens' tasks (P7).
 
 ---
 

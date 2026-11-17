@@ -11,6 +11,8 @@
    * - `facet` — a filter value: a diamond dot in its colour, label, a dim mono count; the chosen one
    *   is `aria-pressed` with the gold rail.
    * State is rail + fill + announced state, never colour alone.
+   * In the 48 px icon rail (a `rail` container narrower than 100 px) a nav row shows only its icon;
+   * its label stays its accessible name and its tooltip, its count moves to the rail's flyout.
    */
   let {
     variant = "nav",
@@ -39,6 +41,7 @@
   class:current
   aria-current={variant === "nav" && current ? "page" : undefined}
   aria-pressed={variant === "facet" ? current : undefined}
+  title={variant === "nav" ? label : undefined}
   {...rest}
 >
   {#if variant === "nav"}
@@ -48,7 +51,7 @@
   {/if}
   <span class="label">{label}</span>
   {#if count !== undefined}<span class="count">{count}</span>{/if}
-  {@render trailing?.()}
+  {#if trailing}<span class="trailing">{@render trailing()}</span>{/if}
 </button>
 
 <style>
@@ -113,6 +116,31 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .trailing {
+    display: contents;
+  }
+
+  @container rail (width < 100px) {
+    .nav {
+      justify-content: center;
+      padding-inline: 0;
+    }
+
+    .trailing {
+      display: none;
+    }
+
+    .label,
+    .count {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+    }
   }
 
   .count {

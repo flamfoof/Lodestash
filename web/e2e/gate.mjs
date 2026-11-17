@@ -19,7 +19,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { ANCHORS } from "../../scripts/design/anchors.mjs";
+import { ANCHORS, FRAME_ANCHORS } from "../../scripts/design/anchors.mjs";
 import { compare, describe, exemptionsFor, readDeviations } from "../../scripts/design/lib/compare.mjs";
 import { measureInPage } from "../../scripts/design/lib/measure.mjs";
 import { loadPlaywright, serveDir } from "../../scripts/design/lib/prototype.mjs";
@@ -65,13 +65,10 @@ const GALLERY = [
 ];
 
 /** The shell specimen (gallery.html#shell) at the contract viewport: every frame anchor. */
-const SHELL = [];
+const SHELL = [...FRAME_ANCHORS];
 
 /** Anchors no specimen here can reproduce yet, and the task that will measure them. */
 const DEFERRED = {
-  topbar: "the top bar in place — the shell, plan P6 Task 6.5",
-  "topbar.search": "the search well's width is what the top bar leaves it — the shell, Task 6.5",
-  sidebar: "the rail in place — the shell, plan P6 Task 6.5",
   "library.banner": "spans the library's main column — LibraryScreen, plan P7",
   "library.toolbar": "the library toolbar in place — LibraryScreen, plan P7",
   "library.toolbar.count": "the result label's own text style — LibraryScreen, plan P7",
@@ -148,8 +145,8 @@ if (!setupError) {
   if (!launched.ok) setupError = "the browser did not start";
 }
 
-async function openPage(hash) {
-  const page = await browser.newPage({ viewport: { width: contract.viewport.width, height: contract.viewport.height }, deviceScaleFactor: 1 });
+async function openPage(hash, viewport = contract.viewport) {
+  const page = await browser.newPage({ viewport: { width: viewport.width, height: viewport.height }, deviceScaleFactor: 1 });
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
   page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
@@ -206,11 +203,59 @@ async function measureAll(label, hash, names, skip) {
 const galleryPassed = await measureAll("gallery", "", GALLERY, ["pos"]);
 const shellPassed = SHELL.length ? await measureAll("shell", "#shell", SHELL, []) : 0;
 
+// The window floor (ADR-0009): at 900 × 600 nothing in the frame overflows and the rail is the
+// 48 px icon rail; below the floor the frame stops shrinking and the page scrolls instead.
+const FLOOR = [
+  {
+    name: "shell at 900×600: top bar and rail fit, rail is icons only",
+    viewport: { width: 900, height: 600 },
+    probe: () => {
+      const bar = document.querySelector('[data-anchor="topbar"]');
+      const rail = document.querySelector('[data-anchor="sidebar"]');
+      const problems = [];
+      if (!bar || !rail) return ["the shell did not render"];
+      if (bar.scrollWidth > bar.clientWidth) problems.push(`top bar overflows by ${bar.scrollWidth - bar.clientWidth} px`);
+      if (document.documentElement.scrollWidth > innerWidth) problems.push("the page scrolls sideways");
+      const w = rail.getBoundingClientRect().width;
+      if (Math.abs(w - 48) > 0.5) problems.push(`rail is ${w} px wide, not the 48 px icon rail`);
+      const search = document.querySelector('[data-anchor="topbar.search"]').getBoundingClientRect().width;
+      if (search < 120) problems.push(`search well is only ${search} px`);
+      return problems;
+    },
+  },
+  {
+    name: "shell below the floor (800×500) scrolls instead of shrinking",
+    viewport: { width: 800, height: 500 },
+    probe: () => {
+      const shell = document.querySelector('[data-anchor="topbar"]')?.closest(".shell") ?? document.body.firstElementChild;
+      const r = shell.getBoundingClientRect();
+      const problems = [];
+      if (r.width < 900) problems.push(`frame shrank to ${r.width} px`);
+      if (r.height < 600) problems.push(`frame shrank to ${r.height} px tall`);
+      if (document.documentElement.scrollWidth <= innerWidth) problems.push("the page does not scroll sideways");
+      return problems;
+    },
+  },
+];
+for (const f of FLOOR) {
+  if (setupError) {
+    report.notRun(f.name, setupError);
+    continue;
+  }
+  await report.check(f.name, async () => {
+    const { page, errors } = await openPage("#shell", f.viewport);
+    const problems = [...errors, ...(await page.evaluate(f.probe))];
+    await page.close();
+    if (problems.length) throw new Error(problems.join("; "));
+  });
+}
+
 if (browser) await browser.close();
 site?.close();
 
 const file = report.write();
 const total = GALLERY.length + SHELL.length;
+// (floor checks are counted among report.rows / failures)
 const failures = report.failures;
 console.log(
   `\n${galleryPassed}/${GALLERY.length} gallery anchors, ${shellPassed}/${SHELL.length} shell anchors (with positions) match the contract; ` +

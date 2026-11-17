@@ -18,6 +18,7 @@
     dot,
     caret = false,
     open,
+    collapse,
     onclick,
     ...rest
   }: HTMLAttributes<HTMLElement> & {
@@ -29,6 +30,8 @@
     dot?: string;
     caret?: boolean;
     open?: boolean;
+    /** In the app bar, fold to the icon below this rung (AppBar). */
+    collapse?: "xl" | "lg" | "md";
     onclick?: (event: MouseEvent) => void;
   } = $props();
 </script>
@@ -36,15 +39,16 @@
 <svelte:element
   this={onclick ? "button" : "span"}
   type={onclick ? "button" : undefined}
-  class="pill {tone}"
+  class="pill {tone} {collapse ? `collapse-${collapse}` : ''}"
   class:open
+  title={collapse ? label : undefined}
   aria-expanded={onclick && open !== undefined ? open : undefined}
   aria-haspopup={onclick && open !== undefined ? "menu" : undefined}
   {onclick}
   {...rest}
 >
   {#if dot}<span class="dot" style:--pill-dot={dot}></span>{/if}
-  <span class="label">{#if icon}<Icon name={icon} size={iconSize} box={iconBox} />{" "}{/if}{label}</span>
+  <span class="label">{#if icon}<Icon name={icon} size={iconSize} box={iconBox} />{/if}<span class="text">{icon ? " " : ""}{label}</span></span>
   {#if caret}<span class="caret"><Icon name="action-expand-closed" size="8" box="8" /></span>{/if}
 </svelte:element>
 
@@ -86,6 +90,17 @@
     border-radius: var(--r-pill);
     background: var(--pill-dot);
     box-shadow: var(--pill-glow);
+  }
+
+  @container appbar (width < 1400px) {
+    .collapse-xl .text {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+    }
   }
 
   .caret {
