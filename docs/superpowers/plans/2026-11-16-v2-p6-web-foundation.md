@@ -139,8 +139,9 @@ symbols sat after `</svg>` (invalid XML — no icon could load); they moved insi
   `web/e2e/gate.mjs`, status, duration, detail), exits 1 on any diff. A check over 5 s fails.
 - Known prototype artefact: `library.sort` measures `fontFamily: Arial` — the browser default for a
   `<select>` the prototype never styled, not a design choice. The app's select uses the UI font;
-  record that one property in `DEVIATIONS.md` rather than copying Arial. Line heights are the
-  fonts' `normal`; do not set `line-height` globally or every box height drifts.
+  record that one property in `DEVIATIONS.md` rather than copying Arial. Line height: the
+  prototype's root sets 1.45 (`--lh-body`, set on `body`); every contract box height is measured
+  with it (corrected 2026-11-17 — an earlier note here said the opposite; see 6.3 "As built").
 - [x] Test (`scripts/design/lib/compare.test.mjs`, run with `node --test`): ±1 px box tolerance;
   exact colour; a DEVIATIONS row exempts only its property
 - [x] `bun run web:gate -- --gallery` green
