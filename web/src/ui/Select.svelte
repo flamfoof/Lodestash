@@ -43,6 +43,10 @@
     border-radius: var(--r-6);
     color: var(--ls-text-muted);
     font-size: var(--fs-11);
+    /* The prototype's select is 24 px tall in the browser's default font; in the UI font the
+       control's intrinsic height grows, so the box is pinned to the drawn one. */
+    height: var(--space-24);
+    line-height: normal;
     outline: none;
     cursor: pointer;
   }

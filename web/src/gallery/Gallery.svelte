@@ -1,45 +1,431 @@
 <script lang="ts">
-  import Icon from "../ui/Icon.svelte";
-  import { ICON_NAMES } from "../ui/icons.generated";
+  import {
+    Badge,
+    Banner,
+    Button,
+    Checkbox,
+    Chip,
+    ConfirmDialog,
+    ContextMenu,
+    Dialog,
+    Divider,
+    EmptyState,
+    Icon,
+    IconButton,
+    ICON_NAMES,
+    Input,
+    Kbd,
+    ListRow,
+    Menu,
+    Pill,
+    Popover,
+    ProgressBar,
+    Rail,
+    RailHeading,
+    SearchField,
+    SectionCard,
+    SegmentedControl,
+    Select,
+    SizeTier,
+    Slider,
+    Spinner,
+    Stat,
+    StatusGem,
+    Switch,
+    Tabs,
+    Toast,
+    ToggleButton,
+    Toolbar,
+    tooltip,
+    TraitChip,
+    TreeRow,
+    Wordmark,
+  } from "../ui";
+
+  /*
+   * Every primitive, once. A specimen that reproduces a design-contract anchor carries
+   * `data-anchor="<name>"` and the text the prototype shows there, so the gate
+   * (web/e2e/gate.mjs --gallery) can measure it against docs/design/contract.json. Positions are
+   * not compared here; sizes, type, colour, fill, edges and spacing are.
+   */
+
+  let mode = $state<"tags" | "ai">("tags");
+  let category = $state<"all" | "model" | "sound" | "image">("all");
+  let sort = $state("default");
+  let favorites = $state(false);
+  let density = $state<"compact" | "cozy" | "large">("cozy");
+  let query = $state("");
+
+  let filtersButton = $state<HTMLElement>();
+  let filtersOpen = $state(false);
+  let menuButton = $state<HTMLElement>();
+  let menuOpen = $state(false);
+  let contextEvent = $state<MouseEvent | null>(null);
+  let dialogOpen = $state(false);
+  let confirmOpen = $state(false);
+  let switchOn = $state(true);
+  let checked = $state(false);
+  let cap = $state(8);
+  let expanded = $state(true);
+  let lastAction = $state("—");
 </script>
 
-<!--
-  The gallery renders a specimen of every primitive. Specimens that reproduce a design-contract
-  anchor carry `data-anchor="<name>"` and the same text the prototype shows, so the gate
-  (web/e2e/gate.mjs --gallery) can measure them against docs/design/contract.json (plan P6 Task 6.4).
--->
 <main class="gallery">
   <h1>Gallery</h1>
+
+  <section>
+    <h2>Top bar</h2>
+    <div class="row">
+      <Wordmark textAttrs={{ "data-anchor": "topbar.wordmark" }} />
+      <SegmentedControl
+        label="Search mode"
+        bind:value={mode}
+        data-anchor="topbar.mode"
+        anchors={{ on: "topbar.mode.on", off: "topbar.mode.off" }}
+        options={[
+          { value: "tags", label: "Tags", icon: "search-tags", iconBox: "8" },
+          { value: "ai", label: "AI", icon: "search-ai", iconBox: "10", tone: "arcane" },
+        ]}
+      />
+      <Tabs
+        label="Asset type"
+        bind:value={category}
+        anchors={{ on: "topbar.category.on", off: "topbar.category" }}
+        tabs={[
+          { value: "all", label: "All", icon: "type-all", iconBox: "13" },
+          { value: "model", label: "Models", icon: "type-model", iconBox: "9", tone: "model" },
+          { value: "sound", label: "Sounds", icon: "type-sound", iconSize: "10", iconBox: "6", tone: "sound" },
+          { value: "image", label: "Images", icon: "type-image", iconBox: "10", tone: "image" },
+        ]}
+      />
+      <ProgressBar
+        value={14}
+        max={19}
+        label="Identified"
+        valueText="14 / 19"
+        data-anchor="topbar.meter"
+        labelAttrs={{ "data-anchor": "topbar.meter.label" }}
+      />
+      <Pill label="MyRPG · Unity 6" dot="var(--ls-success)" caret open={false} onclick={() => (lastAction = "project")} data-anchor="topbar.project" />
+      <Pill label="local · RTX 4070" tone="arcane" icon="action-ai-sieve" iconBox="9" data-anchor="topbar.hardware" />
+    </div>
+    <div class="row wide">
+      <SearchField bind:value={query} placeholder="filter by tag, name, or pack…" tone={mode === "ai" ? "arcane" : "gold"} />
+    </div>
+  </section>
+
+  <section>
+    <h2>Rail</h2>
+    <div class="row top">
+      <Rail aria-label="Specimen rail">
+        <ListRow label="Library" icon="nav-library" current data-anchor="sidebar.nav.on" />
+        <ListRow label="Identify" icon="nav-identify">
+          {#snippet trailing()}<Badge label="5 unidentified" data-anchor="sidebar.nav.badge">5</Badge>{/snippet}
+        </ListRow>
+        <ListRow label="Collections" icon="nav-collections" data-anchor="sidebar.nav" />
+        <ListRow label="Unity Assets" icon="unitypackage" />
+        <Divider />
+        <RailHeading text="STATUS" data-anchor="sidebar.heading" />
+        <ListRow variant="facet" label="All" dot="var(--ls-text-dim)" count={19} current />
+        <ListRow variant="facet" label="Unidentified" dot="var(--ls-status-unidentified)" count={5} data-anchor="sidebar.facet" />
+        <div class="rail-foot">
+          <Button variant="dashed" data-anchor="sidebar.addSource">
+            {#snippet leading()}<span>+</span>{/snippet}
+            Add source…
+          </Button>
+        </div>
+      </Rail>
+      <div class="tree">
+        <TreeRow label="Synty" count={3} {expanded} ontoggle={() => (expanded = !expanded)} />
+        {#if expanded}
+          <TreeRow label="POLYGON City Pack" level={1} icon="unitypackage" count={1240} current />
+          <TreeRow label="Forest Pack" level={1} icon="folder" count={2} />
+        {/if}
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Library toolbar</h2>
+    <Banner action={{ label: "Open Identify mode →", onclick: () => (lastAction = "identify") }} actionAttrs={{ "data-anchor": "library.banner.action" }}>
+      <b class="mono">5</b> assets are Unidentified — invisible to AI search until appraised.
+    </Banner>
+    <Toolbar label="Library view">
+      <span class="count">19 assets · all libraries</span>
+      <span class="hint">Space quick-looks · <Kbd>F</Kbd> favourite</span>
+      <Select
+        label="Sort"
+        bind:value={sort}
+        data-anchor="library.sort"
+        options={[
+          { value: "default", label: "sort · default" },
+          { value: "name", label: "sort · name A–Z" },
+          { value: "sizeDesc", label: "sort · largest first" },
+          { value: "sizeAsc", label: "sort · smallest first" },
+          { value: "tris", label: "sort · tri count" },
+        ]}
+      />
+      <ToggleButton bind:pressed={favorites} icon="nav-favorites" iconBox="13" title="Show only favorites" data-anchor="library.favorites">Favorites</ToggleButton>
+      <span bind:this={filtersButton}>
+        <Button
+          icon="action-filters"
+          iconBox="9"
+          aria-expanded={filtersOpen}
+          aria-haspopup="dialog"
+          aria-controls="filters-panel"
+          onclick={() => (filtersOpen = !filtersOpen)}
+          data-anchor="library.filters"
+        >
+          Filters
+        </Button>
+      </span>
+      <SegmentedControl
+        label="Grid size"
+        size="sm"
+        bind:value={density}
+        data-anchor="library.density"
+        anchors={{ on: "library.density.on" }}
+        options={[
+          { value: "compact", title: "Compact", icon: "grid-compact", iconSize: "10", iconBox: "7" },
+          { value: "cozy", title: "Cozy", icon: "grid-cozy", iconSize: "10", iconBox: "10" },
+          { value: "large", title: "Large", icon: "grid-large", iconSize: "10", iconBox: "10" },
+        ]}
+      />
+    </Toolbar>
+    <Popover bind:open={filtersOpen} anchor={filtersButton} id="filters-panel" label="Filter library">
+      <div class="stack">
+        <Input label="TRAIT" placeholder="search traits…" size="sm" />
+        <div class="row">
+          <Chip label="rock" tone="ai" size="md" selected onclick={() => {}} />
+          <Chip label="moss" tone="ai" size="md" onclick={() => {}} />
+        </div>
+      </div>
+    </Popover>
+  </section>
+
+  <section>
+    <h2>Card parts</h2>
+    <div class="row media">
+      <TraitChip name="animal" source="human" onclick={() => (lastAction = "animal")} data-anchor="card.chip.lead" />
+      <TraitChip name="lowpoly" source="ai" confidence={0.94} onclick={() => (lastAction = "lowpoly")} data-anchor="card.chip" />
+      <Chip label="+1" tone="neutral" onclick={() => (lastAction = "more")} data-anchor="card.chip.more" />
+      <Chip label="???" tone="unknown" />
+      <TraitChip name="hero-prop" source="human" color="var(--ls-type-sound)" />
+      <SizeTier tier="L" size="4.1 MB" data-anchor="card.size" />
+      <SizeTier tier="S" size="922 KB" />
+      <Button size="xs" onMedia data-anchor="card.stage">+ stage</Button>
+      <IconButton variant="tile" icon="nav-favorites" iconSize="10" label="Favorite" pressed={false} data-anchor="card.favorite" />
+      <IconButton variant="tile" icon="nav-favorites" iconSize="10" label="Favorite" pressed />
+      <StatusGem status="confirmed" data-anchor="card.status" />
+      <StatusGem status="identified" />
+      <StatusGem status="unidentified" />
+    </div>
+  </section>
+
+  <section>
+    <h2>Buttons</h2>
+    <div class="row">
+      <Button variant="primary" size="lg">+ Create</Button>
+      <Button variant="secondary">Secondary</Button>
+      <Button variant="ghost">Ghost</Button>
+      <Button variant="danger">Move duplicate to Trash</Button>
+      <Button variant="link">Open Identify mode →</Button>
+      <Button size="sm" icon="action-copy" iconSize="10">Copy</Button>
+      <Button disabled>Disabled</Button>
+      <span {@attach tooltip("A tooltip, on hover and on focus")}><Button>With tooltip</Button></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Fields and settings</h2>
+    <div class="row">
+      <Input label="FOLDER" placeholder="folder path or asset name…" />
+      <Checkbox bind:checked label="Select for bulk actions" />
+      <Switch bind:checked={switchOn} label="Enable MCP server" />
+      <span class="slider"><Slider bind:value={cap} min={1} max={16} label="Preview cache limit" valueText="{cap} GB" /></span>
+    </div>
+    <div class="cards">
+      <SectionCard heading="ENGINE BRIDGE" description="Copies picks into the open Unity project.">
+        {#snippet actions()}<Button size="sm">Reset defaults</Button>{/snippet}
+        <ProgressBar value={62} label="Cache used" valueText="5.0 / 8 GB" tone="arcane" />
+      </SectionCard>
+      <Stat value="19" label="Assets" sub="across 4 libraries" tone="gold" />
+      <Stat value="5" label="Unidentified" sub="invisible to AI search" tone="warning" />
+    </div>
+  </section>
+
+  <section>
+    <h2>Overlays</h2>
+    <div class="row">
+      <Button onclick={() => (dialogOpen = true)}>Open dialog</Button>
+      <Button variant="danger" onclick={() => (confirmOpen = true)}>Delete file from disk…</Button>
+      <span bind:this={menuButton}>
+        <Button aria-haspopup="menu" aria-expanded={menuOpen} onclick={() => (menuOpen = true)}>Open menu</Button>
+      </span>
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div class="context-target" oncontextmenu={(e) => (contextEvent = e)}>Right-click here</div>
+      <span class="last">last action: {lastAction}</span>
+    </div>
+    <Dialog bind:open={dialogOpen} title="Add a source" description="Watch a folder, or index Unity Asset Store packages in place.">
+      <Input label="FOLDER" placeholder="G:/GameDev/AssetLibrary" />
+      {#snippet footer()}
+        <Button onclick={() => (dialogOpen = false)}>Cancel</Button>
+        <Button variant="primary" data-autofocus onclick={() => (dialogOpen = false)}>Watch folder</Button>
+      {/snippet}
+    </Dialog>
+    <ConfirmDialog
+      bind:open={confirmOpen}
+      title="Delete file from disk?"
+      message="This removes the original file. Lodestash never does this without asking."
+      confirmLabel="Delete file"
+      destructive
+      onconfirm={() => (lastAction = "deleted")}
+    />
+    <Menu
+      bind:open={menuOpen}
+      anchor={menuButton}
+      label="Asset actions"
+      onselect={(id) => (lastAction = id)}
+      items={[
+        { id: "open", label: "Open", shortcut: "Enter" },
+        { id: "look", label: "Quick Look", icon: "action-fullsize", shortcut: "Space" },
+        { separator: true },
+        { id: "import", label: "Import…", icon: "import", disabled: true, hint: "No project is open" },
+        { id: "trash", label: "Move to Trash", danger: true, shortcut: "Del" },
+      ]}
+    />
+    <ContextMenu
+      bind:event={contextEvent}
+      label="Asset actions"
+      onselect={(id) => (lastAction = id)}
+      items={[
+        { id: "copy-name", label: "Copy name", icon: "action-copy" },
+        { id: "copy-path", label: "Copy path" },
+      ]}
+    />
+  </section>
+
+  <section>
+    <h2>Feedback</h2>
+    <div class="stack narrow">
+      <Toast tone="gold" message="★ Added to Favorites" />
+      <Toast tone="success" message="Removed 3 tags" action={{ label: "Undo", onclick: () => (lastAction = "undo") }} />
+      <Toast tone="danger" message="The engine stopped responding" ondismiss={() => {}} />
+      <Spinner label="Indexing" />
+    </div>
+    <EmptyState icon="search" title="No assets match" line="Clear a filter or search a wider library.">
+      {#snippet action()}<Button>Clear filters</Button>{/snippet}
+    </EmptyState>
+  </section>
 
   <section>
     <h2>Icons</h2>
     <ul class="icons">
       {#each ICON_NAMES as name (name)}
-        <li title={name}><Icon {name} /></li>
+        <li title={name}><Icon {name} size="20" /></li>
       {/each}
     </ul>
   </section>
 </main>
 
 <style>
+  /* Layout of the specimen sheet only; every look comes from the primitives. */
   .gallery {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-30);
     padding: var(--space-20);
   }
 
   h1 {
+    margin: 0;
     font-family: var(--ff-display);
     font-size: var(--fs-20);
     color: var(--ls-gold);
-    margin: 0 0 var(--space-14);
   }
 
   h2 {
+    margin: 0 0 var(--space-10);
     font-size: var(--fs-10);
     font-weight: var(--fw-600);
     letter-spacing: var(--track-1_2);
     color: var(--ls-text-dim);
-    text-transform: uppercase;
-    margin: 0 0 var(--space-10);
+  }
+
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-14);
+  }
+
+  .row.top {
+    align-items: flex-start;
+  }
+
+  .wide {
+    margin-top: var(--space-14);
+  }
+
+  .media {
+    padding: var(--space-14);
+    background: var(--ls-thumb);
+  }
+
+  .rail-foot {
+    padding: var(--space-4) var(--space-12) 0;
+  }
+
+  .tree {
+    width: var(--inspector-w);
+  }
+
+  .stack {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-10);
+  }
+
+  .narrow {
+    align-items: flex-start;
+  }
+
+  .cards {
+    display: grid;
+    grid-template-columns: 2fr 1fr 1fr;
+    gap: var(--space-12);
+    margin-top: var(--space-14);
+  }
+
+  .count {
+    font-size: var(--fs-12);
+    color: var(--ls-text-muted);
+  }
+
+  .hint {
+    margin-left: auto;
+    font-size: var(--fs-11);
+    color: var(--ls-text-dim);
+  }
+
+  .mono {
+    font-family: var(--ff-mono);
+  }
+
+  .slider {
+    width: var(--meter-w);
+  }
+
+  .context-target {
+    padding: var(--space-8) var(--space-14);
+    border: 1px dashed var(--ls-border-strong);
+    border-radius: var(--r-6);
+    color: var(--ls-text-dim);
+  }
+
+  .last {
+    color: var(--ls-text-dim);
+    font-size: var(--fs-11);
   }
 
   .icons {

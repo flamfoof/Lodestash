@@ -141,10 +141,22 @@ symbols sat after `</svg>` (invalid XML — no icon could load); they moved insi
   `<select>` the prototype never styled, not a design choice. The app's select uses the UI font;
   record that one property in `DEVIATIONS.md` rather than copying Arial. Line heights are the
   fonts' `normal`; do not set `line-height` globally or every box height drifts.
-- [ ] Test (`scripts/design/lib/compare.test.mjs`, run with `node --test`): ±1 px box tolerance;
+- [x] Test (`scripts/design/lib/compare.test.mjs`, run with `node --test`): ±1 px box tolerance;
   exact colour; a DEVIATIONS row exempts only its property
-- [ ] `bun run web:gate -- --gallery` green
-- [ ] Commit `feat(web): the gallery measures every primitive against the contract`
+- [x] `bun run web:gate -- --gallery` green
+- [x] Commit `feat(web): the gallery measures every primitive against the contract`
+
+*As built:* 29 anchors have specimens (the list above plus `topbar.wordmark`, `topbar.meter(.label)`,
+`sidebar.heading`, `library.banner.action`). The gate first checks coverage: every contract anchor
+must be measured or listed in `DEFERRED` with the task that will measure it (container and card
+anchors → P7), so a new anchor cannot be silently skipped. **The first gate run found the contract
+itself was wrong:** the extractor served the bundled fonts from a second loopback origin without
+CORS, every `FontFace` failed, and the prototype was measured in Segoe UI / Consolas / Georgia —
+`measureInPage` reports the *declared* family, which hid it. `lib/prototype.mjs` now sends CORS
+and `assertFontsLoaded` fails the run when a bundled family is not in use; `contract.json` was
+regenerated (box geometry only; `vocabulary.json` unchanged). The recorded prototype hash is now
+LF-normalised (a CRLF checkout changed it). DEVIATIONS row added: `library.sort` `fontFamily`, `w`
+(the width follows from the font); the select's height is pinned to the drawn 24 px.
 
 ### Task 6.5: Shell layout (static)
 

@@ -9,6 +9,7 @@
     "build": "node ../scripts/design/gen-icons.mjs --check && svelte-check --tsconfig ./tsconfig.json && vite build",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "test": "vitest run",
+    "gate": "node e2e/gate.mjs",
     "lint:styles": "node ../scripts/design/check-styles.mjs",
     "icons": "node ../scripts/design/gen-icons.mjs"
   },

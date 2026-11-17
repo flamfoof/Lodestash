@@ -156,6 +156,7 @@
 
   .dashed {
     display: flex;
+    width: 100%;
     gap: var(--space-8);
     padding: var(--space-6) var(--space-14);
     border: 1px dashed var(--ls-border-strong);

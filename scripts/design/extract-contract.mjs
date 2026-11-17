@@ -22,7 +22,9 @@ import { STATES } from "./states.mjs";
 import { ANCHORS } from "./anchors.mjs";
 
 const check = process.argv.includes("--check");
-const sha = (file) => crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex").slice(0, 16);
+// LF-normalised, as PROVENANCE.md records it: the hash must not depend on a checkout's line endings.
+const sha = (file) =>
+  crypto.createHash("sha256").update(fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n")).digest("hex").slice(0, 16);
 const protoFile = path.join(DESIGN_DIR, PROTOTYPE);
 
 const contract = {

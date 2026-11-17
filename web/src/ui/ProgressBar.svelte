@@ -68,6 +68,7 @@
   }
 
   .track {
+    box-sizing: content-box;
     height: var(--space-6);
     border-radius: var(--r-pill);
     background: var(--ls-overlay);
