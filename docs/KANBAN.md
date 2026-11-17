@@ -230,7 +230,7 @@ source → render-pipeline harvest (cheap now that `.mat` files are parsed).
 - [ ] **[P2]** Regression corpus — commit small license-clean samples (`.unitypackage`, `.dds`, `.fbx`, `.wav`, `.psd`, material+textures) + `insta` parse snapshots; ingest detect/untar/`.meta` tests
 - [ ] **[P2]** Relationship-harvest tests — GUID-pair resolution → expected edges; **cross-source edge** resolution; inbound/outbound traversal; dup-guard `UNIQUE(asset_id, project_id)`
 - [~] **[P3]** Search/mapping determinism — RRF fusion order (`proptest` invariant under rank perturbation); pre-filter hard-boolean; mapping rule priority + **pinned-override survives re-apply** — *RRF half shipped (2026-07-20)*: `fusion::proptest_tests` asserts bounded / no-duplicates / sound / **deterministic total order** (HashMap iteration must not leak into results) / **rank-perturbation monotonicity** (promoting an id one place earlier never worsens its fused position). Mutation-checked: inverting the rank preference makes the monotonicity property fail while the order-independent ones still pass, so it isn't vacuous. Distributed via Claudenator T2 (isolated worktree), reviewed + trimmed on apply. *Mapping determinism shipped (2026-07-27)*: `apply_mapping` rule-priority resolution (lower wins, insertion-order-independent) and **pinned-override survives re-apply** are unit-tested in `catalog.rs` (card 172 apply engine). *Remaining*: pre-filter hard-boolean
-- [~] **[P5]** **MCP↔REST 1:1 invariant test** — **shipped**: `lodestash-mcp` asserts its tool set equals `lodestash_api::AGENT_OPERATIONS`; handshake-token/off-origin rejection covered in `lodestash-api`. *Open*: request/response schema snapshots
+- [~] **[P5]** **MCP↔REST 1:1 invariant test** — **shipped**, and structural since v2 P4: the MCP tools are `lodestash_protocol::OPERATIONS`' agent operations (`lodestash-mcp/tests/stdio.rs` lists them over real stdio) and every answer is the app's REST answer (`tests/e2e.rs`); handshake-token/off-origin rejection covered in `lodestash-api`. *Open*: request/response schema snapshots
 - [ ] **[P6]** `criterion` perf gate (dev/nightly) — crawl throughput, `rebuild_cache` @100k rows, hybrid-search latency @100k vectors; tracks §3/§6 perf claims
 
 ---
@@ -755,8 +755,8 @@ tracking; these cards track phases).
 - [x] **V2-P1** Core hardening — typed errors, migration lifecycle, `CatalogReader`, lookup indexes, moves keep identity, atomic project registration, robust unitypackage reads *(2026-11-16; one carry-over: the desktop writer's `Op::SetTrashed` moves to `Catalog::set_trashed_recorded` with the writer in Task 2.3)*
 - [ ] **V2-P2** `lodestash-protocol` operation catalog; `lodestash-engine` absorbs app + writer + read model; config store; one appraisal plan and job registry
 - [ ] **V2-P3** `lodestash-api` derived from the catalog; UI session, request checks, SSE, bytes, static UI
-- [ ] **V2-P4** `lodestash-mcp` standalone thin client with auto-launch
-- [ ] **V2-P5** Thin Tauri shell; retire Tauri commands, `lodestash://`, `--mcp`, old `ui/`
+- [x] **V2-P4** `lodestash-mcp` standalone thin client with auto-launch (also retired `--mcp` and `agent_bridge.rs`)
+- [ ] **V2-P5** Thin Tauri shell; retire Tauri commands, `lodestash://`, old `ui/`
 - [ ] **V2-P6** Web foundation in `web/` — contract extractor, tokens, primitives, data layer, fixture catalog, gate
 - [ ] **V2-P7** Screens rebuilt against the contract, in spec order
 - [ ] **V2-P8** Per-stage failure state, pinned downloads, delete fence, SQL read model, MCP over HTTP, doc reconciliation

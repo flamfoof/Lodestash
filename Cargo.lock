@@ -2722,7 +2722,6 @@ dependencies = [
  "lodestash-app",
  "lodestash-core",
  "lodestash-ingest",
- "lodestash-mcp",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2731,10 +2730,8 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-window-state",
  "tempfile",
- "tokio",
  "tracing",
  "tracing-subscriber",
- "ureq",
 ]
 
 [[package]]
@@ -2764,16 +2761,19 @@ dependencies = [
 name = "lodestash-mcp"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "base64 0.22.1",
+ "dirs 5.0.1",
  "lodestash-api",
  "lodestash-core",
  "lodestash-protocol",
  "rmcp",
- "schemars 1.2.1",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
 ]
 
 [[package]]

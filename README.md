@@ -99,7 +99,7 @@ alternatives (Tauri+three.js, pure-Python/PySide6).
 | Audio embeddings/tags | **CLAP** + **YAMNet/PANNs** + Whisper (speech) |
 | Image tags | **WD v3** taggers (ONNX) |
 | Dedup | **BLAKE3** (exact) + pHash/blockhash + Chromaprint (near-dup) |
-| MCP server | **rmcp** (Rust), in-process, stdio default |
+| MCP server | **`lodestash-mcp`** — a standalone **rmcp** (Rust) stdio binary answered by the app's `/v1` API (ADR-0022) |
 | Engine API | loopback **HTTP/JSON** (127.0.0.1 + token); 1:1 with the MCP surface — see [`docs/ENGINE-API.md`](docs/ENGINE-API.md) |
 | Unity round-trip | shared **import queue**: GUI/Claude enqueue → plugin imports on Unity's main thread → acks provenance |
 | Engine plugins | **Unity** (UPM C# `EditorWindow`) — primary; Godot + Unreal — planned (co-equal) |

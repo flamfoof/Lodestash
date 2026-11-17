@@ -41,9 +41,11 @@ client. Startup sequence:
      "catalog_id": "e5406dff133f7c9196a15354e6dbbb71" }
    ```
 
-   `catalog_id` names the catalog the app has open (M31, v1 plan S11). It is how a headless MCP
-   server knows the app it would forward to is serving *its* library; a file without it is treated
-   as a different catalog.
+   `catalog_id` names the catalog the app has open (M31, v1 plan S11). The v1 headless MCP server
+   compared it with its own catalog before forwarding; the v2 `lodestash-mcp` has no catalog of its
+   own and does not. An optional `exe` (v2 spec §6) names the app binary, which `lodestash-mcp`
+   launches again when the app is gone — the protocol's `Handshake` reads it; the app starts writing
+   it in v2 plan P3.
 
    | OS | Handshake file |
    |---|---|
@@ -68,8 +70,9 @@ client. Startup sequence:
      DNS-rebinding-style attacks).
 
 > The GUI can also **display** the token/port for a manual paste flow when a plugin can't read the
-> file (sandboxed editors, remote-ish setups). stdio MCP has no network surface and needs no token;
-> this token applies only to the HTTP plane (and to Streamable-HTTP MCP if ever enabled).
+> file (sandboxed editors, remote-ish setups). The stdio MCP server opens no network surface of its
+> own; it is a client of this API and reads the token from `engine.json` like the plugin (v2 plan
+> P4). The token also applies to Streamable-HTTP MCP if ever enabled.
 
 All endpoints are versioned under **`/v1/`**. Content type is `application/json` unless noted
 (previews/files stream bytes).
@@ -116,14 +119,15 @@ editor needed); **`/v1/import`** routes into the **currently open** Unity projec
 in-editor import (§5). Both reuse the **same dependency-closure resolution** described in
 [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md) §3.
 
-> **A headless MCP server hands app-owned operations to the running app** ([ADR-0011](decisions/ADR-0011-headless-mcp-forwards-writes.md),
-> amended by v1 plan S11). `lodestash-desktop --mcp` reads through its own read-only catalog
-> connection — WAL admits any number of readers — and forwards every tool the app owns (writes,
-> jobs, approvals, `get_job_status`, `cancel_job`) as the one route in this table, relaying the
-> app's body and status as the tool result. Job ids are the app's own; approvals park in the app's
-> tray. `engine.json` is read again for every call, and a call is forwarded only to an app with the
-> same `catalog_id`. Nothing is retried. With no such app the tool answers `app_unavailable` (503)
-> and reads keep working.
+> **The MCP server is a client of this table** ([ADR-0022](decisions/ADR-0022-mcp-is-a-standalone-thin-client.md),
+> v2 plan P4; superseding ADR-0011's headless forwarder). `lodestash-mcp` sends **every** tool —
+> reads included — as the one route in this table and relays the app's answer as the tool result:
+> the body is the tool's structured content (REST's containers and default limits — there is no
+> second MCP shape), an image body is an image block, and a non-2xx status is `isError` with the §4
+> envelope. Job ids are the app's own; approvals park in the app's tray. `engine.json` is read again
+> for every call; with no app answering, the MCP server launches one (`--background`, up to 20 s)
+> and otherwise answers `app_unavailable`. Nothing is retried. Details:
+> [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md) §2.
 
 > **Parity scope.** "1:1" covers the **agent-facing** surface. A few routes are **REST-only by
 > design** — `GET /v1/assets/{id}/file` (the MCP `resource_link` target) and the plugin-transport
@@ -240,13 +244,15 @@ than redefining, so summaries/details never diverge.
   Additive changes are safe; breaking changes get `/v2/`. Plugins check `server-info` on connect and
   degrade gracefully. The handshake file's `api_version` lets a client pick the right prefix.
 - **Capabilities** (v1 plan S11, §8.4): `server-info` also reports `catalog_id`; `writer` —
-  `in_process` inside the app, `app` or `app_unavailable` (with `writer_detail`) for a headless
-  server asking the app it would forward to, `none` when nothing can write; `bytes_released`
-  (ADR-0020); and `enabled_tools`, the agent operations the allow-list leaves on. A client checks
-  these instead of assuming support.
-- **Handlers never block the runtime** (v1 plan S11). Both planes run on one current-thread runtime
-  and call synchronous state, so every REST handler and MCP tool runs on the blocking pool: a slow
-  preview render or model load does not delay `jobs/{id}` or `cancel`.
+  `in_process` inside the app, `none` when nothing can write (the `app`/`app_unavailable` values
+  belonged to the v1 headless server); `bytes_released` (ADR-0020); and `enabled_tools`, the agent
+  operations the allow-list leaves on. A client checks these instead of assuming support. Through
+  `lodestash-mcp`, `get_server_info` adds `mcp: {version, transport, handshake, port}` — the MCP
+  server's version and the handshake file and port it reached (v2 plan P4).
+- **Handlers never block the runtime** (v1 plan S11). The REST plane runs on one current-thread
+  runtime and calls synchronous state, so every handler runs on the blocking pool: a slow preview
+  render or model load does not delay `jobs/{id}` or `cancel`. `lodestash-mcp` likewise sends each
+  tool call from its blocking pool.
 
 ---
 
@@ -421,8 +427,8 @@ Unity panel instantly, and vice-versa.
 
 Drafted 2026-09-10. **§8.3 `write_tags` shipped 2026-09-11 (v1 plan S05)** — REST, MCP and the
 approval gate, with durable receipts (M27). Still open within it: `vocabulary_revision` is accepted
-and recorded but enforced only once §8.5 lands. A headless `--mcp` process forwards the request to
-the app that owns the gate (S11, 2026-09-12). **§8.1 discovery shipped 2026-09-12 (v1 plan S12)**,
+and recorded but enforced only once §8.5 lands. The MCP server sends the request to the app that
+owns the gate (S11, 2026-09-12; every tool since v2 plan P4). **§8.1 discovery shipped 2026-09-12 (v1 plan S12)**,
 with the notes at the end of §8.1; **§8.2's file access shipped with S12b** (notes at its end) —
 the evidence manifest and view parameters have not. The rest of this section is still proposed. This section owns the wire
 contract for [MCP asset analysis](MCP-ASSET-ANALYSIS.md). It refines the v1 architecture plan's
@@ -436,7 +442,7 @@ mapping and behavioral parity check together.
 | MCP tool | REST endpoint | Shared request and response |
 |---|---|---|
 | `list_libraries` (new) | `GET /v1/libraries` | Optional `limit` (25, maximum 200), `cursor`; `{libraries:[{id,name,kind,asset_count}],next_cursor}` ordered by source ID. IDs are `import_source.id`. No root paths needed for discovery. |
-| `search_assets` (extend) | `GET /v1/search` | Existing MCP `query` / REST `q`, `limit`, `media_type`; add optional `source_id`, `package_id`, `tags` (canonical `namespace:value`, AND semantics). Apply all supplied filters before ranking/LIMIT. Keep MCP's array and REST's `{results}` containers. |
+| `search_assets` (extend) | `GET /v1/search` | Existing MCP `query` / REST `q`, `limit`, `media_type`; add optional `source_id`, `package_id`, `tags` (canonical `namespace:value`, AND semantics). Apply all supplied filters before ranking/LIMIT. Both planes answer REST's `{results}` container (the v1 MCP tool's bare array ended with v2 plan P4: the app's answer is the tool's answer). |
 | `semantic_search` (extend) | `GET /v1/search?mode=ai` | Same optional scope filters; apply them before candidate scoring/top-K on both retrieval branches. Missing embedder remains `ai_unavailable`; do not silently substitute keyword search. |
 | `list_assets` (new) | `GET /v1/assets` | `source_id` required, optional `package_id`, `media_type`, `status`, `tag_state` (`any`, `tagged`, `untagged`; default `any`), `selection` (`ordered`, `random`; default `ordered`), `limit` (25, maximum 200), `cursor`. Returns `{assets,next_cursor,selection,upper_id}`. |
 | `get_assets` (new) | `POST /v1/assets/read` | Read-only despite HTTP method: `{asset_ids:[...],source_id?}`, 1–100 unique positive IDs. Returns `{assets,unavailable:[{id,code}]}` in requested order within each array; `source_id` mismatch is unavailable. |
@@ -493,6 +499,8 @@ snapshot. It must change when the evidence or edited annotations change, even wi
   checks.
 - On REST a malformed number (`limit=abc`) is `invalid_argument` in the error envelope. The existing
   search route keeps its historical default of 50 and cap of 500; the new routes use 25 and 200.
+  Since v2 plan P4 the MCP tools have the same defaults — they are these routes (the v1 tools
+  defaulted search to 25 and `find_similar` to 10).
 
 ### 8.2 Evidence and file access
 
@@ -526,6 +534,9 @@ available raster views and a resource link for file access. REST sends the manif
 authenticated representation URLs for the same bytes. Resource reads revalidate source identity,
 visibility and byte policy; link possession does not bypass these checks. An LLM host must actually
 deliver the image blocks to a vision-capable model; raw FBX/GLB bytes or base64 text are not a substitute.
+*Open since v2 plan P4:* `lodestash-mcp` relays one HTTP answer per tool call with no per-tool code,
+so the image blocks need a generic rule when this ships — e.g. the server fetching a manifest's
+`representations` URLs — rather than an evidence-specific handler.
 
 Initial ceilings: at most four images and 4 MiB total decoded image-file bytes per evidence call;
 at most 64 KiB UTF-8 extracted text, with `truncated`/original size disclosed. One asset per evidence
@@ -561,7 +572,8 @@ same OS user. Hosts remain responsible for what they do with bytes after authori
 *As shipped (S12b, 2026-09-12) — file access only:*
 
 - **One resolver** (`ServerState::resolve_file`) behind `GET /v1/assets/{id}/file` and MCP
-  `resources/read` of `asset://{id}/file` (template listed by `resources/templates/list`). Byte
+  `resources/read` of `asset://{id}/file` (template listed by `resources/templates/list`; since v2
+  plan P4 `lodestash-mcp` reads it through that route, MIME type `application/octet-stream`). Byte
   release is checked first (`bytes_not_released`, 403); an on-disk file is served in place; an
   in-pack asset is pulled; anything else is `not_local` (503).
 - **An in-pack pull is verified against the archive itself.** There is no stored archive revision:
@@ -639,12 +651,13 @@ result; same ID/different body is `request_conflict`. At least the mutation rece
 so an ambiguous retry cannot apply twice. Uncommitted approvals lost on restart fail visibly and may
 be resubmitted with the same ID for fresh approval. Never automatically replay an unknown write.
 
-The headless bridge re-reads the handshake for each new operation, checks catalog identity/API
-version and forwards to the app. Status/cancel use the app's job identity, not a nested local job;
-completed receipts remain discoverable after restart. An old missing job is `job_not_found`, never
-assumed successful. An app-closed write is `app_unavailable`; catalog reads continue where safe.
+The MCP server re-reads the handshake for each operation, checks the API version and sends the
+request to the app. Status/cancel use the app's job identity, not a nested local job; completed
+receipts remain discoverable after restart. An old missing job is `job_not_found`, never assumed
+successful. With no app answering, the MCP server launches one, else answers `app_unavailable`.
 *Shipped with S11 (2026-09-12)* except `job_not_found`: the app still answers a missing job with
-`not_found`.
+`not_found`. *v2 plan P4:* the server is the standalone `lodestash-mcp`; it has no catalog, so the
+v1 catalog-identity check and "reads continue with the app closed" are gone (ADR-0022).
 
 ### 8.4 Failures and parity
 

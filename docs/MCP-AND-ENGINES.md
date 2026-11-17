@@ -1,9 +1,10 @@
 # MCP Server & Engine Integration
 
-> **v2 (2026-11-16).** The MCP server becomes a standalone binary, `lodestash-mcp`, that talks to
-> the running app over `/v1` and never opens the catalog
+> **v2 (2026-11-16).** The MCP server is a standalone binary, `lodestash-mcp`, that talks to the
+> running app over `/v1` and never opens the catalog
 > ([ADR-0022](decisions/ADR-0022-mcp-is-a-standalone-thin-client.md), superseding ADR-0011).
-> §2's description of an in-process / `--mcp` server is replaced when plan P4 lands.
+> §2 describes it as built in v2 plan P4; the in-process server and `lodestash-desktop --mcp` are
+> gone.
 
 How AI clients (Claude, Claude Code, IDEs) and the **Unity editor** find and retrieve assets from the
 catalog. This is where "identify and retrieve into the engine" is delivered. **Unity is the primary
@@ -24,14 +25,14 @@ against the `claude-api` skill before implementing.
 ## 1. Two control planes, one backend
 
 ```
-                         ┌──────────── Lodestash core service layer ────────────┐
+                         ┌──────────── Lodestash app: /v1 over the core ────────┐
                          │   catalog · search · preview-render · export      │
                          └───▲───────────────────────────────▲───────────────┘
-              MCP (stdio)    │ in-process            in-process│   HTTP (127.0.0.1 + token)
+        HTTP (127.0.0.1 + token)                               │   HTTP (127.0.0.1 + token)
           ┌──────────────────┴─────┐                  ┌────────┴──────────────────────┐
-          │ AI clients             │                  │ Unity editor plugin (primary)  │
-          │ (Claude Desktop/Code,  │                  │ (Unreal: planned, later phase) │
-          │  Cursor, IDE MCP)      │                  └────────────────────────────────┘
+          │ lodestash-mcp (stdio)  │                  │ Unity editor plugin (primary)  │
+          │  ▲ AI clients: Codex,  │                  │ (Unreal: planned, later phase) │
+          │    Claude Code, IDEs   │                  └────────────────────────────────┘
           └────────────────────────┘
 ```
 
@@ -49,36 +50,60 @@ against the `claude-api` skill before implementing.
 
 ## 2. MCP server
 
-- **SDK**: **`rmcp`** (official Rust SDK) — matches the core language, mature, `#[tool]` macros
-  generate JSON Schema from function signatures, built-in stdio + Streamable HTTP transports.
-- **Shared Rust services.** The desktop embeds the API. An LLM host starts a separate
-  `lodestash-desktop --mcp` child for stdio: catalog reads are local, through a read-only connection
-  that refuses any schema it would have to migrate, and every app-owned tool is forwarded whole to
-  the app with the same catalog open ([ADR-0011](decisions/ADR-0011-headless-mcp-forwards-writes.md),
-  amended by v1 plan S11; the wire rules are in [`ENGINE-API.md`](ENGINE-API.md) §2 and §4). stdout
-  carries only JSON-RPC — logs go to stderr — and the process exits on stdin EOF. `LODESTASH_CATALOG`
-  points it (or the app) at a catalog file other than the default.
-- **Transport**: **stdio by default** (zero network surface, lowest latency, exactly what Claude
-  Desktop/Code expect). Optional **Streamable HTTP** for multiple/remote clients (same loopback +
-  token + origin rules): bound to a **stable configurable port (default 4319)** — unlike the engine
-  API's ephemeral port — since MCP clients configure a URL by hand. The Settings → MCP card
-  ([`UI-SPEC.md`](UI-SPEC.md) §11.5) toggles this transport, shows endpoint + rotating token, and
-  gates tools by **literal per-tool allow-list**; side-effecting
-  import/export tools stay confirm-gated per call regardless. The old HTTP+SSE transport is
-  deprecated — do not build on it.
-- **Registration**: configure the host to spawn the built `lodestash-desktop` executable with
-  `--mcp`; see [USER-GUIDE](USER-GUIDE.md#using-an-llm-through-mcp). The branch runs without a window.
-  Logs **must** go to stderr because stdout carries the protocol; explicit routing and a spawned
-  protocol test are required by the new plan. Do not configure Vite's port as an MCP endpoint.
+*Rewritten 2026-11-16 for v2 plan P4 ([ADR-0022](decisions/ADR-0022-mcp-is-a-standalone-thin-client.md)).*
 
-> **Implementation status (code inspected 2026-09-10).** There are 23 registered tool names in
-> `crates/lodestash-mcp/src/lib.rs`, matching `AGENT_OPERATIONS` in
-> `crates/lodestash-api/src/lib.rs`. They include semantic search, stored-tag reads, previews,
-> single-tag writes and identify jobs. `suggest_tags` currently returns stored tags/confidences;
-> it does not generate new proposals. The table below mixes shipped operations with broader target
-> aliases (such as `retag` and `get_active_project`), which are not separate registered tools.
-> Library-scoped enumeration, batch reads, bounded evidence manifests and attributed batch writes
-> are the explicit additions in ENGINE-API §8. Registration in the actual host is still required.
+- **A standalone thin client.** `lodestash-mcp` is its own binary. It links the protocol catalog
+  (`lodestash-protocol`), **`rmcp`** (the official Rust SDK) and a blocking HTTP client — never the
+  catalog, SQLite, the engine or the server; `crates/lodestash-mcp/tests/deps.rs` fails the build if
+  one enters its tree. Every tool is answered by the running app's `/v1` API.
+- **Tools are the catalog.** The tool list is the catalog's `Agent` operations: name, description
+  (the operation's summary) and input schema come from `lodestash-protocol`, and MCP behaviour hints
+  from the operation's effect (`Read` → read-only; `Gated` → destructive; none open-world). One
+  generic path serves every tool: input → the operation's HTTP request (`OpSpec::request`) → the app
+  with the bearer token from `engine.json` → the answer. There is no per-tool code, so the MCP↔REST
+  1:1 rule holds by construction.
+- **The app's REST answer is the tool's answer** — the shapes in [`ENGINE-API.md`](ENGINE-API.md)
+  §2–§8, unchanged. A JSON body is the tool's structured content and the same JSON as text,
+  including REST's containers (`{results}`, `{tags}`, `{packages}`, `{projects}`, `{collections}`,
+  `{assets}`) and REST's default limits (search 50, `find_similar` 20) — the v1 MCP tools' bare
+  arrays and their own defaults are gone. An `image/*` body (`get_asset_preview`) is an MCP image
+  block. A non-2xx answer is `isError: true` carrying the app's error envelope (§4 of ENGINE-API).
+  Input the operation's type refuses is `isError` with code `invalid`, and nothing is sent; an
+  unknown tool name is a JSON-RPC error. `get_server_info` adds `mcp: {version, transport,
+  handshake, port}` — this server's version and the handshake file and port it used.
+- **Finding the app.** `engine.json` is read on **every** call (`LODESTASH_ENGINE_JSON` overrides
+  the platform path), so an app started or restarted onto a new port is found. A handshake whose
+  `api_version` is not `v1` is refused. When the file is missing or its port refuses, the server
+  launches the app with `--background` — `LODESTASH_APP`, else the handshake's `exe`, else
+  `lodestash-desktop` beside the MCP binary — and waits up to 20 s for a handshake that answers;
+  otherwise the tool answers `app_unavailable` (an `isError` result, not a protocol error). A
+  launched app is detached, gets no stdio, and on Windows inherits none of the host's pipes.
+  **Nothing is retried**: a request that reached the app and got no answer may still have been
+  applied (ADR-0011's rule, kept).
+- **Transport**: **stdio** (zero network surface of its own, exactly what Codex and Claude Code
+  expect). stdout carries only JSON-RPC — logs go to stderr — and the process exits on stdin EOF.
+  Optional **Streamable HTTP** for multiple/remote clients follows (v2 spec §7: the app's "Enable MCP
+  server" toggle runs `lodestash-mcp --http 4319`; same loopback + token + origin rules), on a
+  **stable configurable port (default 4319)** — unlike the engine API's ephemeral port — since MCP
+  clients configure a URL by hand. The Settings → MCP card ([`UI-SPEC.md`](UI-SPEC.md) §11.5) shows
+  endpoint + rotating token and gates tools by **literal per-tool allow-list** — enforced by the app
+  on every call, so a switched-off tool answers `tool_disabled`; side-effecting import/export tools
+  stay confirm-gated per call regardless. The old HTTP+SSE transport is deprecated — do not build
+  on it.
+- **Registration**: build `lodestash-mcp`, install it beside `lodestash-desktop`, and register it
+  with the host — `codex mcp add …` / `claude mcp add …` and a generic stdio config are in
+  [`crates/lodestash-mcp/README.md`](../crates/lodestash-mcp/README.md); see also
+  [USER-GUIDE](USER-GUIDE.md#using-an-llm-through-mcp). Do not configure Vite's port as an MCP
+  endpoint. **Until v2 plan P5** the desktop does not implement `--background`: a launch opens the
+  normal window, which serves `/v1` as usual.
+
+> **Implementation status (v2 plan P4, 2026-11-16).** The 27 tools are the catalog's `Agent`
+> operations, listed over stdio by the built binary and compared with the catalog in
+> `crates/lodestash-mcp/tests/stdio.rs`. `suggest_tags` returns stored tags/confidences; it does
+> not generate new proposals. The table below mixes shipped operations with broader target
+> aliases (such as `retag` and `get_active_project`), which are not separate registered tools, and
+> its *Output* column describes content — the containers are REST's (above). Bounded evidence
+> manifests are still a proposed addition in ENGINE-API §8.2.
 
 ### Proposed MCP surface
 
@@ -117,10 +142,12 @@ against the `claude-api` skill before implementing.
 - `asset://{id}` → metadata (JSON).
 - `asset://{id}/preview` / `thumbnail://{id}` → image blob.
 - `asset://{id}/file` → **`resource_link`** to the on-disk file (never inline large binaries).
-  *As built (v1 plan S12b):* `resources/read` of it answers with the bytes inline up to 4 MiB,
-  through the same resolver and byte policy as the REST file route — an in-pack asset included,
-  pulled and verified without unpacking ([`ENGINE-API.md`](ENGINE-API.md) §8.2). It is the only
-  template served; `asset://{id}` and the preview URIs above are not.
+  *As built (v1 plan S12b; v2 plan P4):* `resources/read` of it answers with the bytes inline up to
+  4 MiB. `lodestash-mcp` reads them from the app's `GET /v1/assets/{id}/file` — the same resolver
+  and byte policy, an in-pack asset included, pulled and verified without unpacking
+  ([`ENGINE-API.md`](ENGINE-API.md) §8.2) — and gives them the route's MIME type
+  (`application/octet-stream`). A refusal is a JSON-RPC error carrying the app's envelope. It is
+  the only template served; `asset://{id}` and the preview URIs above are not.
 
 **Prompts:** a few canned workflows ("find and stage assets matching a brief"; "audit a collection for
 missing tags/licenses").
@@ -134,11 +161,19 @@ embedded `resource`.
 - **Audio**: a generated **waveform image** (directly viewable by Claude) + `resource_link` to the file
   (or an `audio` block where the client supports it).
 - **Always pair a viewable preview with a `resource_link`** — the agent reasons over the preview; the
-  consumer (engine plugin/export) fetches bytes by path/URI.
-- **A missing preview is not an error.** `get_asset_preview` returns what it has — the image when
-  there is one, the `resource_link` when a real file exists, and always a small JSON block naming
-  the asset — so a caller with no image still has something to reason from. It used to answer
-  `Err` before adding anything, which meant *no* content at all.
+  consumer (engine plugin/export) fetches bytes by path/URI. *v2 (P4):* the pair spans two calls —
+  `get_asset_preview` answers the image, and the asset's summary/detail carries the link
+  (`file_resource_uri`, `file_url`); ENGINE-API §8.2's evidence manifest is where both meet in one
+  answer.
+- **A missing preview is a readable answer, never no content.** *v2 (P4):* `get_asset_preview` is
+  the app's preview route — the image block when there is a preview; otherwise an `isError` result
+  carrying the route's code (`not_found` when nothing could be rendered, `bytes_not_released` while
+  asset bytes are withheld). It no longer adds a `resource_link` or a metadata block of its own:
+  `get_asset` carries `file_url` and `file_resource_uri` (`asset://{id}/file`) for the bytes and the
+  metadata to reason from. *(The v1 tool returned what it had — image, link and a JSON block naming
+  the asset; before that it answered `Err` with no content at all.)* The route's `not_found` says
+  "No such asset" for an asset that exists without a preview — a message P3's derived preview
+  route should make precise.
 
 *(Fixed 2026-08-29, and it was total: previews resolved for **0 of 60** sampled assets of every
 type, so the agent plane could not see a single asset in the library. Two causes. The resolver was
@@ -236,10 +271,11 @@ This is exactly how "do it from Claude" in [`USER-GUIDE.md`](USER-GUIDE.md) Step
 
 1. **Claude Desktop / a remote IDE drives a separate editor.** The user has the Unity panel open
    (registered); Claude reasons over previews and calls `import_to_project`; the asset lands in that
-   editor via the queue above. The MCP server is the local Lodestash app (stdio).
+   editor via the queue above. The MCP server is `lodestash-mcp` (stdio), answered by the local
+   Lodestash app.
 2. **Claude Code / Cursor running *in the Unity project folder* (Unity-side MCP client).** A developer
    working alongside the editor registers the Lodestash MCP server in their project
-   (`claude mcp add --transport stdio lodestash -- <lodestash --mcp>`) and asks it to find + import
+   (`claude mcp add lodestash -- <path to lodestash-mcp>`) and asks it to find + import
    assets into the very project they're in. **No new surface** — it's the same `import_to_project`
    flow against the already-open editor; only the client's *placement* differs. Use **stdio** for this
    single-developer case; reserve **Streamable HTTP** for when multiple/remote clients must reach one
@@ -269,7 +305,8 @@ In both, the plugin remains a pure REST client; MCP only ever enters through the
 - Require a **per-session bearer token** the GUI generates and hands to plugins (written to a
   user-readable file the plugin reads, or shown in the UI to paste); validate `Origin`/host headers —
   blocks other local processes and DNS-rebinding-style attacks.
-- **stdio MCP has no network surface** (child process over pipes) — a security argument for stdio as the
+- **stdio MCP opens no network surface of its own** (child process over pipes; `lodestash-mcp` is a
+  loopback client of the token-gated API, like the plugin) — a security argument for stdio as the
   default. If Streamable HTTP MCP is added, apply the same loopback + token + origin rules.
 - Treat all tool inputs as untrusted: validate and **sandbox `export_asset`/`apply_mapping` paths**
   (no traversal), rate-limit, and **confirm mutating/destructive ops server-side** (don't rely solely
@@ -288,8 +325,9 @@ version; plugins check on connect and degrade gracefully.
 
 ## 6. Bottom line
 
-- **MCP server**: `rmcp`, in-process, stdio default — the surface in §2, previews as `image` blocks +
-  `resource_link`s, never inline large binaries.
+- **MCP server**: `lodestash-mcp`, a standalone `rmcp` stdio binary that answers every tool through
+  the app's `/v1` API — the surface in §2, previews as `image` blocks, file bytes behind
+  `asset://{id}/file`, never inline large binaries.
 - **Engine plugins**: **Unity** is primary — a thin client over the loopback HTTP API
   ([`ENGINE-API.md`](ENGINE-API.md)), importing into `Assets/`; Unreal plugin is planned for a later
   phase. Both reuse the same core operations as MCP.

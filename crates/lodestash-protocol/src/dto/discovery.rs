@@ -12,7 +12,7 @@ pub struct SearchArgs {
     // is sent as `q` so a request built from this type reaches a v1 server unchanged.
     #[serde(default, rename(serialize = "q"), alias = "q")]
     pub query: String,
-    /// Maximum results (default 25).
+    /// Maximum results (default 50, maximum 500).
     pub limit: Option<usize>,
     /// Restrict to one media type: model_3d | texture | audio | image | sprite | material | font.
     pub media_type: Option<String>,
@@ -69,6 +69,6 @@ pub struct GetAssetsArgs {
 pub struct SimilarArgs {
     /// The asset to find neighbours for.
     pub id: i64,
-    /// Maximum neighbours (default 10).
+    /// Maximum neighbours (default 20, maximum 200).
     pub limit: Option<usize>,
 }
