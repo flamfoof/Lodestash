@@ -9,6 +9,7 @@
     "web:dev": "bun run --cwd web dev",
     "web:build": "bun run --cwd web build",
     "web:check": "bun run --cwd web check && node scripts/design/check-styles.mjs && node scripts/design/gen-icons.mjs --check",
+    "web:test": "bun run --cwd web test",
     "build": "bun run --cwd crates/lodestash-desktop/ui build",
     "check": "bun run --cwd crates/lodestash-desktop/ui check",
     "e2e": "bun run --cwd crates/lodestash-desktop/ui e2e",

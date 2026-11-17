@@ -131,6 +131,8 @@ The prototype draws sizes from 8 to 64 px; each has a token named by its size (`
 body size). The most used are 11 px (secondary text, chips, meta lines), 12 px (controls, labels),
 13 px (body), and 9–10 px for compact labels such as size tiers, badges and section headings.
 Weights `--fw-400` body, `--fw-500` labels, `--fw-600` headings, `--fw-700` display.
+Line height is the prototype's one root value, `--lh-body` (1.45), set once on the page and
+inherited — every text box height in the design contract is measured with it.
 Consolidating sizes is a design decision taken in the prototype, not in code (ADR-0023 §2).
 
 ---

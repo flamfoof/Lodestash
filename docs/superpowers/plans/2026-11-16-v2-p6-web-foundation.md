@@ -100,10 +100,23 @@ only here; tokens only; props typed; no API calls.
   height); arrow keys move, Enter activates, Escape closes and restores focus.
 - `keymap.svelte.ts` (in `web/src/app/`): a scope stack; `Dialog`/`Menu` push a scope while open, so a
   global shortcut never fires behind them.
-- [ ] Vitest (with `@testing-library/svelte` or plain DOM — choose and add to TECH-STACK): focus trap
+- [x] Vitest (with `@testing-library/svelte` or plain DOM — choose and add to TECH-STACK): focus trap
   cycles; focus restored to opener; Escape closes the top-most overlay only; a global shortcut
   does not fire while a Dialog is open; Menu flips upward when it would overflow the bottom
-- [ ] Commit `feat(web): primitives — buttons, chips, fields, dialog, menu, keymap scopes`
+- [x] Commit `feat(web): primitives — buttons, chips, fields, dialog, menu, keymap scopes`
+
+*As built:* plain DOM — Svelte's `mount`/`flushSync` on `jsdom` (TECH-STACK §5); geometry is
+stubbed in tests, the gate owns real layout. Beyond §9.3 the library has the frame's chrome as
+primitives (`AppBar`, `Rail`, `RailHeading`, `Divider`, `Wordmark`) so features carry layout only,
+and the composites the gallery needs (`StatusGem`, `SizeTier`, `TraitChip`). `Tooltip` is an
+attachment, `{@attach tooltip(text)}`. The overlay host and modal stack are `web/src/app/overlay.ts`.
+Icons take a drawn `size` and a layout `box`, so an icon keeps the measured advance of the Unicode
+glyph it replaces (DEVIATIONS row 1). **Line height is not the fonts' `normal`:** the prototype's
+root sets `line-height: 1.45` and every contract height (13 px → 18.9, 12 px → 17.4) is measured
+with it, so `--lh-body` moved out of the legacy block and `body` sets it. The focus ring is the
+global `:focus-visible` rule, `!important` so a primitive's own shadow cannot hide it. Three sprite
+symbols sat after `</svg>` (invalid XML — no icon could load); they moved inside `<defs>`.
+`check-styles.mjs` now reads multi-line values (a `transition:` list was never linted).
 
 ### Task 6.4: Gallery and the primitive-level gate
 
