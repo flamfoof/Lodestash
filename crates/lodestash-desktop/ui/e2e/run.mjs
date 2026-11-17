@@ -780,7 +780,7 @@ try {
   // successful call writes a permanent source row into the developer's real catalog, and there is
   // no remove-source op to take it back. The refusals are the part worth guarding anyway — both
   // happen before any write, so a green run leaves the catalog exactly as it found it. The
-  // success path is covered where it is safe: `lodestash_app::scan`, over a temp dir it owns.
+  // success path is covered where it is safe: `lodestash_engine::scan`, over a temp dir it owns.
   await check("add_source refuses what it cannot index, without touching the catalog", async () => {
     const before = await invoke("library_status");
 

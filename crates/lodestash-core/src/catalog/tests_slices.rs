@@ -539,6 +539,26 @@ fn undoing_a_trash_restores_only_what_it_changed() {
     assert_eq!(c.recent_ops(10).expect("ops").len(), before);
 }
 
+/// Restoring counts only rows that were in the Trash: the untrash used to match every requested id,
+/// so restoring a live asset reported a change that never happened.
+#[test]
+fn restoring_counts_only_rows_that_were_trashed() {
+    let (c, ids) = tagged_catalog(&[("a.fbx", "model_3d"), ("b.png", "image")]);
+    let (a, b) = (ids[0], ids[1]);
+    c.set_trashed(&[a], true).expect("trash a");
+    assert_eq!(
+        c.set_trashed(&[a, b], false).expect("restore"),
+        1,
+        "b was never trashed, so restoring it changed nothing"
+    );
+    assert!(!is_trashed(&c, a) && !is_trashed(&c, b));
+    assert_eq!(
+        c.set_trashed(&[a, b], false).expect("restore again"),
+        0,
+        "nothing left in the Trash"
+    );
+}
+
 /// Registering a project is one transaction (review B13): a failure after "deactivate all"
 /// leaves the previously active project active and no half-registered row behind.
 #[test]

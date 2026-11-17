@@ -66,4 +66,4 @@ cargo run -p lodestash-desktop
 
 B2 scaffold. The app frame, tokens, fonts, icon sprite, the 11 nav destinations and 12 stub routes
 render, and one command (`app_info`) proves the IPC channel. There is **no catalog behind it yet** —
-the status bar says so, and `engine_ready` is `false` until `lodestash-app` exposes `Engine`.
+the status bar says so, and `engine_ready` is `false` until `lodestash-engine` exposes `Engine`.

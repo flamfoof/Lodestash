@@ -8,6 +8,13 @@
   shell. The duty cycle and the single writer ([ADR-0002](ADR-0002-single-writer-thread.md)) are
   unchanged.
 - **Plan:** [v1 architecture](../superpowers/plans/2026-09-07-v1-architecture.md), S01–S02
+- **Amended 2026-11-17** (v2 plan Task 2.3, [ADR-0021](ADR-0021-engine-owns-the-catalog-ui-is-a-web-client.md)):
+  the bus moved into `lodestash-engine` unchanged in behaviour. Decision 3 now reads "no
+  subscriber, no publisher" (`Engine::subscribe` starts it; the shell subscribes at setup, as it
+  started the publisher before). Decision 1's "committed" also counts a commit through a second
+  connection the writer opened (SQLite's `data_version`), and the read model rebuilds when the
+  catalog generation moves, so the "Library updated · Refresh" path is no longer needed for the
+  backend to be current (v2 spec §4.3).
 
 ## Context
 

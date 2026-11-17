@@ -1,23 +1,29 @@
 [package]
-name        = "lodestash-app"
+name        = "lodestash-engine"
 version     = { workspace = true }
 edition     = { workspace = true }
-rust-version = { workspace = true }
+# Above the workspace floor (1.80): the catalog lock is `std::fs::File::try_lock`, stable since
+# 1.89 (v2 spec §4.2). The toolchain is pinned to stable (1.96 at the time of writing).
+rust-version = "1.89"
 license     = { workspace = true }
 
 [dependencies]
-# Headless desktop orchestration: everything the app does that is not drawing. The egui shell it
-# was first written for is gone (B7 cutover, 2026-08-07); the Tauri backend consumes it unchanged,
-# which is the whole point — it must never gain a UI dep.
+# The service (v2 spec §3, ADR-0021): everything the application *does* that is not drawing or
+# serving. It absorbed `lodestash-app`; it must never gain a UI or HTTP-server dependency — the
+# shell and the API are adapters over it, not the other way round.
 lodestash-core   = { workspace = true }
 lodestash-ingest = { workspace = true }
-# config.rs reaches for the cloud provider's default base URL and the agent operation
-# allow-list. Neither crate depends back on this one, so the graph stays acyclic.
+# config.rs reaches for the cloud provider's default base URL.
 lodestash-ai     = { workspace = true }
-lodestash-api    = { workspace = true }
+# The operation catalog: the agent tool inventory the Settings allow-list narrows.
+lodestash-protocol = { workspace = true }
 serde            = { workspace = true }
 serde_json       = { workspace = true }
 tracing          = { workspace = true }
+# The change feed (`Engine::subscribe`): a broadcast channel any number of listeners — the shell's
+# event bridge now, the SSE route from P3 — can hold. Only `tokio::sync` is used; no runtime runs
+# inside the engine.
+tokio            = { workspace = true }
 # Model artifact downloads (SigLIP / CLAP / ONNX Runtime): HTTP + zip extraction.
 ureq             = { workspace = true }
 zip              = { workspace = true }
@@ -35,6 +41,9 @@ tempfile         = { workspace = true }
 # thing under test, so the fixture is built with the same tar/gzip crates ingest reads it with.
 tar    = { workspace = true }
 flate2 = { workspace = true }
+# One engine test stamps a future `user_version` on a catalog file — the engine must refuse it, and
+# `Catalog`'s connection is private to core.
+rusqlite = { workspace = true }
 
 # Windows Credential Manager for the cloud API key at rest (AI-PIPELINE §5.1). Windows-only on
 # purpose: the app targets win-x64, and other platforms fall back to the plaintext-config path

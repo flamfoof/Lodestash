@@ -2665,6 +2665,7 @@ dependencies = [
  "blake3",
  "dirs 5.0.1",
  "lodestash-core",
+ "lodestash-engine",
  "lodestash-protocol",
  "rusqlite",
  "serde",
@@ -2674,28 +2675,6 @@ dependencies = [
  "tower",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "lodestash-app"
-version = "0.1.0"
-dependencies = [
- "dirs 5.0.1",
- "flate2",
- "image",
- "keyring",
- "lodestash-ai",
- "lodestash-api",
- "lodestash-core",
- "lodestash-ingest",
- "rodio",
- "serde",
- "serde_json",
- "tar",
- "tempfile",
- "tracing",
- "ureq",
- "zip",
 ]
 
 [[package]]
@@ -2719,10 +2698,9 @@ version = "0.1.0"
 dependencies = [
  "lodestash-ai",
  "lodestash-api",
- "lodestash-app",
  "lodestash-core",
+ "lodestash-engine",
  "lodestash-ingest",
- "rusqlite",
  "serde",
  "serde_json",
  "tauri",
@@ -2732,6 +2710,30 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "lodestash-engine"
+version = "0.1.0"
+dependencies = [
+ "dirs 5.0.1",
+ "flate2",
+ "image",
+ "keyring",
+ "lodestash-ai",
+ "lodestash-core",
+ "lodestash-ingest",
+ "lodestash-protocol",
+ "rodio",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "ureq",
+ "zip",
 ]
 
 [[package]]

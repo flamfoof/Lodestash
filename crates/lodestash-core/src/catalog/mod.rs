@@ -112,6 +112,19 @@ pub struct ExportBatch {
     pub exported_at: i64,
 }
 
+/// One import run into a registered project (UI-SPEC §16.1 Recent exports): every
+/// `import_record` sharing a `batch_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportBatch {
+    pub batch_id: String,
+    pub project_id: i64,
+    pub project_name: String,
+    /// The first file's project-relative destination — the row reads its folder.
+    pub sample_dest: Option<String>,
+    pub file_count: i64,
+    pub imported_at: i64,
+}
+
 /// What the `✓ in <project>` badge needs to know about one asset (DESIGN-GUIDELINES §7).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ImportState {
@@ -497,6 +510,16 @@ impl Catalog {
     /// (ADR-0016).
     pub fn total_changes(&self) -> u64 {
         self.conn.total_changes()
+    }
+
+    /// SQLite's `PRAGMA data_version`: it changes when **another** connection commits to this
+    /// file — never for this connection's own writes, which [`Self::total_changes`] counts. The
+    /// writer reads both, so a turn that wrote through a second connection (a crawl's persist)
+    /// is still seen as a change.
+    pub fn data_version(&self) -> Result<i64> {
+        self.conn
+            .query_row("PRAGMA data_version", [], |r| r.get(0))
+            .map_err(|e| CoreError::Catalog(format!("data_version: {e}")))
     }
 
     fn apply_migrations(&mut self) -> Result<()> {
@@ -1496,7 +1519,11 @@ impl Catalog {
                 unix_now()
             )
         } else {
-            format!("UPDATE asset SET deleted_at = NULL WHERE id IN ({id_list})")
+            // Only rows that are in the Trash: the count is what callers report and what undo
+            // logs, and a row that was never trashed did not change.
+            format!(
+                "UPDATE asset SET deleted_at = NULL WHERE id IN ({id_list}) AND deleted_at IS NOT NULL"
+            )
         };
         self.conn
             .execute(&sql, [])
@@ -3956,6 +3983,68 @@ impl Catalog {
                 params![batch_id],
             )
             .map_err(|e| CoreError::Catalog(format!("export forget: {e}")))
+    }
+
+    /// The most recent import runs into a registered project, newest first (UI-SPEC §16.1).
+    pub fn recent_import_batches(&self, limit: usize) -> Result<Vec<ImportBatch>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT ir.batch_id, ir.project_id, p.name, COUNT(*), MAX(ir.imported_at),
+                        (SELECT i2.dest_path FROM import_record i2
+                          WHERE i2.batch_id = ir.batch_id ORDER BY i2.id LIMIT 1)
+                   FROM import_record ir
+                   JOIN project p ON p.id = ir.project_id
+                  WHERE ir.batch_id IS NOT NULL
+                  GROUP BY ir.batch_id
+                  ORDER BY MAX(ir.imported_at) DESC
+                  LIMIT ?1",
+            )
+            .map_err(|e| CoreError::Catalog(format!("import batches prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(ImportBatch {
+                    batch_id: r.get(0)?,
+                    project_id: r.get(1)?,
+                    project_name: r.get(2)?,
+                    file_count: r.get(3)?,
+                    imported_at: r.get(4)?,
+                    sample_dest: r.get(5)?,
+                })
+            })
+            .map_err(|e| CoreError::Catalog(format!("import batches query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("import batches row: {e}")))
+    }
+
+    /// The files one import run copied, as `(project_path, project-relative dest_path)` — what
+    /// undo deletes.
+    pub fn import_batch_files(&self, batch_id: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT p.project_path, ir.dest_path
+                   FROM import_record ir
+                   JOIN project p ON p.id = ir.project_id
+                  WHERE ir.batch_id = ?1",
+            )
+            .map_err(|e| CoreError::Catalog(format!("import files prep: {e}")))?;
+        let rows = stmt
+            .query_map(params![batch_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| CoreError::Catalog(format!("import files query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Catalog(format!("import files row: {e}")))
+    }
+
+    /// Drop an import run's records. Called **after** its files are dealt with, like
+    /// [`Self::forget_export_batch`]; catalog assets are never touched.
+    pub fn forget_import_batch(&self, batch_id: &str) -> Result<usize> {
+        self.conn
+            .execute(
+                "DELETE FROM import_record WHERE batch_id = ?1",
+                params![batch_id],
+            )
+            .map_err(|e| CoreError::Catalog(format!("import forget: {e}")))
     }
 
     /// Point the appraisal queues at what the user is looking at (UI-SPEC §3).

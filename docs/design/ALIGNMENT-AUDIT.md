@@ -178,7 +178,7 @@ Spec citation → app evidence. `ui/` = `crates/lodestash-desktop/ui`.
 | E2 | TRAIT chips + search, arcane selected | A | FEATURES §1.4 | `Filters.svelte:60-78`, `.chip.on` arcane (`:200`) |
 | E3 | TRIANGLES buckets, violet selected | A | FEATURES §1.4 | `Filters.svelte:82-95`, `.chip.tri.on` violet (`:204`) |
 | E4 | FILE SIZE tiers, tier-coloured selected | A | FEATURES §1.4 | `Filters.svelte:98-111`, ranges from backend facets |
-| E5 | LINKS section (uses / used by) | M | FEATURES §1.4, UI-SPEC §2.3 | absent — `ContentFilter` (`api.ts:49-53`) has no `link` group; egui has `LinkFilter` (`lodestash-app/types.rs:587`) but no desktop command |
+| E5 | LINKS section (uses / used by) | M | FEATURES §1.4, UI-SPEC §2.3 | absent — `ContentFilter` (`api.ts:49-53`) has no `link` group; egui has `LinkFilter` (`lodestash-engine/src/types.rs:215`) but no desktop command |
 | E6 | Anchored, never clips edge | A | design README §3 | `Filters.svelte:118-121` anchored right under button, 328px |
 
 ### F. Asset card — FEATURES §1.1, DESIGN-GUIDELINES §7, UI-SPEC §2.5

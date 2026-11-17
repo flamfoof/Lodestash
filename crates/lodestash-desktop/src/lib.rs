@@ -1,35 +1,32 @@
 //! Lodestash desktop shell (Tauri 2).
 //!
-//! Hosts the Svelte frontend and owns the command surface. Today it reads the catalog directly
-//! (see [`library`]); the write path, the pump thread and the rest of the `lodestash://` handlers arrive
-//! with `Engine` once the B1 extraction lands. Nothing here writes to the catalog — the
-//! single-writer rule (ARCHITECTURE §5) puts every write on the persist thread.
+//! Hosts the Svelte frontend and owns the command surface. The catalog belongs to the
+//! [`lodestash_engine::Engine`] this shell starts: every command reads through its read model and
+//! writes through its writer (v2 plan Task 2.3). Nothing here opens the catalog. The commands and
+//! `lodestash://` are the old UI's adapter and go in P5, when the web UI calls `/v1` instead.
 
 #[cfg(debug_assertions)]
 mod devserver;
-pub mod library;
 pub mod protocol;
-pub mod storage;
-pub mod writer;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use rusqlite::Connection;
 use serde::Serialize;
 use tauri::Manager;
 use tauri_plugin_window_state::AppHandleExt;
 
+use lodestash_engine::read_model::{
+    AssetDetail, DupGroup, ExportBatchRow, Facets, FolderPage, FolderQuery, GridPage, GridQuery,
+    LibraryStatus, PackDirNode, PackageRow, RelinkCount, Settings, Stats, VocabRow,
+};
+use lodestash_engine::writer::{Op, WriteResult, WriterHandle};
+use lodestash_engine::{Engine, EngineConfig, EngineStatus};
+
 /// Throttle for the geometry save on Moved/Resized (see the `on_window_event` in [`run`]) —
 /// shared across every event so a drag writes at most every 300ms.
 static LAST_GEOMETRY_SAVE: Mutex<Option<Instant>> = Mutex::new(None);
-
-use crate::library::{
-    AssetDetail, DupGroup, ExportBatchRow, Facets, FolderPage, FolderQuery, GridPage, GridQuery,
-    Library, LibraryStatus, PackDirNode, PackageRow, RelinkCount, Settings, Stats, VocabRow,
-};
-use crate::writer::{Op, WriteResult, Writer};
 
 #[derive(Serialize)]
 pub struct AppInfo {
@@ -41,21 +38,12 @@ pub struct AppInfo {
 }
 
 struct AppState {
-    library: Mutex<Library>,
-    /// Raised while the writer thread runs an appraise pass (B11d) — the ✦ controls and any
-    /// progress surface read it instead of racing the writer on timing guesses.
-    pump: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Shared appraise-pass progress (B11d): the tag/embed drains write done/total into this
-    /// while a pass runs; `pump_progress` reads it for the Identify screen's bar.
-    appraise: std::sync::Arc<lodestash_app::jobs::JobProgress>,
-    /// Appraisal queue order (UI-SPEC §3) — what the user is looking at, shared straight with the
-    /// writer thread. Deliberately **not** an `Op`: browsing must never queue behind a running
-    /// appraise pass, and this is a hint, not a write.
-    focus: std::sync::Arc<Mutex<lodestash_core::catalog::AppraiseFocus>>,
-    /// The agent plane (B12): the embedded REST/MCP `ServerState`, kept alive for the process.
-    /// `None` when there is no catalog on disk yet — the servers then don't exist and the
-    /// Connect screen says so instead of pretending.
-    engine: Option<std::sync::Arc<lodestash_api::ServerState>>,
+    /// The catalog's one owner: read model, writer, jobs, change feed, config (ADR-0021).
+    engine: Engine,
+    /// The agent plane (B12): the embedded REST `ServerState`, kept alive for the process.
+    /// `None` when the engine did not start — the server then doesn't exist and the Connect
+    /// screen says so instead of pretending.
+    agents: Option<std::sync::Arc<lodestash_api::ServerState>>,
     /// The loopback port `engine.json` was written with (ENGINE-API §1).
     engine_port: Option<u16>,
     /// The per-session bearer token (ENGINE-API §1) — surfaced for the Connect screen, never
@@ -63,11 +51,6 @@ struct AppState {
     engine_token: String,
     /// How many agent tools the allow-list left enabled (`None` = every tool is live).
     engine_allowed: Option<usize>,
-    /// The job tray (B2b): active jobs + the session ring, owned by the writer thread.
-    jobs: crate::writer::JobRegistry,
-    /// `None` when there is no catalog on disk yet — every write then reports why instead of
-    /// pretending to succeed.
-    writer: Option<Writer>,
     /// The Import-packages dialog's (FEATURES §5.2) discovery cache: archive absolute path → the
     /// manifest locators `discover_package_folder` read, held so `import_packages` can record +
     /// mint without re-inflating the archive.
@@ -76,41 +59,20 @@ struct AppState {
 }
 
 impl AppState {
-    /// Run a write, then re-read the library so the next `grid_page` reflects it.
-    ///
-    /// The reload is the honest option while this crate has no change notification: the rows are
-    /// an in-memory snapshot, and patching them locally to match what we *think* the write did is
-    /// how a UI ends up disagreeing with its own database. 8k rows re-read in a few milliseconds,
-    /// and only on a mutation. ponytail: patch in place once the pump (B2b) can tell us what
-    /// actually changed.
+    /// Run a write. The next read reflects it: the read model rebuilds when the catalog
+    /// generation moves, which a committed write moves before it answers (v2 spec §4.3).
     fn write(&self, op: Op) -> Result<WriteResult, String> {
-        let writer = self
-            .writer
-            .as_ref()
-            .ok_or_else(|| "no catalog is open — nothing to write to".to_string())?;
-        let result = writer.run(op)?;
-        self.library
-            .lock()
-            .map_err(|_| "library lock poisoned".to_string())?
-            .reload();
-        Ok(result)
+        self.engine.writer().run(op).map_err(|e| e.to_string())
     }
 
-    fn targets(&self, ids: &[i64]) -> Result<Vec<writer::Target>, String> {
-        self.library
-            .lock()
-            .map(|l| l.write_targets(ids))
-            .map_err(|_| "library lock poisoned".to_string())
+    fn targets(&self, ids: &[i64]) -> Vec<lodestash_engine::writer::Target> {
+        self.engine.read().write_targets(ids)
     }
 }
 
 #[tauri::command]
 fn app_info(state: tauri::State<'_, AppState>) -> AppInfo {
-    let open = state
-        .library
-        .lock()
-        .map(|l| l.status().open)
-        .unwrap_or(false);
+    let open = state.engine.status() == EngineStatus::Ready && state.engine.read().status().open;
     AppInfo {
         name: "Lodestash",
         version: env!("CARGO_PKG_VERSION"),
@@ -120,71 +82,43 @@ fn app_info(state: tauri::State<'_, AppState>) -> AppInfo {
 
 #[tauri::command]
 fn library_status(state: tauri::State<'_, AppState>) -> Result<LibraryStatus, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.status())
-        .map_err(|_| "library lock poisoned".to_string())
+    Ok(state.engine.read().status())
 }
 
 #[tauri::command]
 fn grid_page(state: tauri::State<'_, AppState>, query: GridQuery) -> Result<GridPage, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.page(&query))
-        .map_err(|_| "library lock poisoned".to_string())
+    Ok(state.engine.read().page(&query))
 }
 
 /// The trait vocabulary (UI-SPEC §9). Read-only — authoring is a write this shell has no op for.
 #[tauri::command]
 fn vocabulary(state: tauri::State<'_, AppState>) -> Result<Vec<VocabRow>, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.vocabulary())
-        .map_err(|_| "library lock poisoned".to_string())
+    Ok(state.engine.read().vocabulary())
 }
 
 /// Every pack, publisher → pack (UI-SPEC §4). Counts come from the indexed rows, not from
 /// `package.asset_count`, which is populated for 1 of 87 packs on a real cache.
 #[tauri::command]
 fn packages(state: tauri::State<'_, AppState>) -> Result<Vec<PackageRow>, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.packages())
-        .map_err(|_| "library lock poisoned".to_string())
+    Ok(state.engine.read().packages())
 }
 
 /// The Stats overview (UI-SPEC §8.1), derived from rows already in memory — no stats query.
 #[tauri::command]
 fn library_stats(state: tauri::State<'_, AppState>) -> Result<Stats, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.stats())
-        .map_err(|_| "library lock poisoned".to_string())
+    Ok(state.engine.read().stats())
 }
 
 /// Exact-duplicate groups (UI-SPEC §5). A review queue — nothing here resolves itself.
 #[tauri::command]
 fn duplicate_groups(state: tauri::State<'_, AppState>) -> Result<Vec<DupGroup>, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.duplicates())
-        .map_err(|_| "library lock poisoned".to_string())
+    Ok(state.engine.read().duplicates())
 }
 
 /// Near-duplicate review (DATA-MODEL §5): same picture, different bytes — dHash within 6 bits.
 #[tauri::command]
 fn near_duplicate_groups(state: tauri::State<'_, AppState>) -> Result<Vec<DupGroup>, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.near_duplicates())
-        .map_err(|_| "library lock poisoned".to_string())
+    Ok(state.engine.read().near_duplicates())
 }
 
 /// One level of the Folders view (DESIGN-GUIDELINES §7). `source: null` is the top level, where
@@ -194,22 +128,14 @@ fn folder_page(
     state: tauri::State<'_, AppState>,
     query: FolderQuery,
 ) -> Result<FolderPage, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.folder_page(&query))
-        .map_err(|_| "library lock poisoned".to_string())
+    Ok(state.engine.read().folder_page(&query))
 }
 
 /// The chips the ⚑ Filters popover draws (UI-SPEC §2.3). Fetched once per library load, not per
 /// keystroke — it changes only when the catalog does.
 #[tauri::command]
 fn filter_facets(state: tauri::State<'_, AppState>) -> Result<Facets, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.facets())
-        .map_err(|_| "library lock poisoned".to_string())
+    Ok(state.engine.read().facets())
 }
 
 /// Everything the Inspector shows for one asset (UI-SPEC §13).
@@ -218,11 +144,7 @@ fn asset_detail(
     state: tauri::State<'_, AppState>,
     asset_id: i64,
 ) -> Result<Option<AssetDetail>, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.detail(asset_id))
-        .map_err(|_| "library lock poisoned".to_string())
+    Ok(state.engine.read().detail(asset_id))
 }
 
 /// Re-derive source availability from disk (UI-SPEC §11.1, M18).
@@ -250,11 +172,7 @@ async fn relink_preview(
     if !path.is_dir() {
         return Err(format!("{new_root} is not a folder"));
     }
-    state
-        .library
-        .lock()
-        .map_err(|_| "library lock poisoned".to_string())?
-        .relink_preview(source_id, &path)
+    state.engine.read().relink_preview(source_id, &path)
 }
 
 /// Point a source at a new root (UI-SPEC §11.1).
@@ -288,15 +206,8 @@ fn relink_source(
 /// re-sorted mid-flight; it is bounded to seconds, so the new order lands almost immediately.
 #[tauri::command]
 fn set_appraise_focus(state: tauri::State<'_, AppState>, query: GridQuery) -> Result<(), String> {
-    let order = state
-        .library
-        .lock()
-        .map_err(|_| "library lock poisoned".to_string())?
-        .focus_order(&query);
-    *state
-        .focus
-        .lock()
-        .map_err(|_| "focus lock poisoned".to_string())? = order;
+    let order = state.engine.read().focus_order(&query);
+    state.engine.set_appraise_focus(order);
     Ok(())
 }
 
@@ -314,11 +225,7 @@ fn recent_folder_exports(
     state: tauri::State<'_, AppState>,
     limit: usize,
 ) -> Result<Vec<ExportBatchRow>, String> {
-    state
-        .library
-        .lock()
-        .map_err(|_| "library lock poisoned".to_string())?
-        .recent_exports(limit.clamp(1, 50))
+    state.engine.read().recent_exports(limit.clamp(1, 50))
 }
 
 /// Undo one export run — delete the files it copied out, then forget it (FEATURES §7.1).
@@ -367,12 +274,11 @@ fn similar_assets(
     state: tauri::State<'_, AppState>,
     asset_id: i64,
     limit: Option<usize>,
-) -> Result<Vec<crate::library::GridItem>, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.similar_assets(asset_id, limit.unwrap_or(3)))
-        .map_err(|_| "library lock poisoned".to_string())
+) -> Result<Vec<lodestash_engine::read_model::GridItem>, String> {
+    Ok(state
+        .engine
+        .read()
+        .similar_assets(asset_id, limit.unwrap_or(3)))
 }
 
 /// What a workspace reclaim would remove, without removing it (UI-SPEC §11.4).
@@ -382,16 +288,13 @@ fn similar_assets(
 #[tauri::command]
 fn workspace_usage(
     state: tauri::State<'_, AppState>,
-) -> Result<crate::storage::ReclaimPlan, String> {
-    let Some(workspace) = lodestash_app::paths::default_cache_dirs().1 else {
-        return Ok(crate::storage::ReclaimPlan::default());
-    };
-    let referenced = state
-        .library
-        .lock()
-        .map_err(|_| "library lock poisoned".to_string())?
-        .referenced_workspace_paths();
-    Ok(crate::storage::plan_reclaim(&workspace, &referenced))
+) -> Result<lodestash_engine::storage::ReclaimPlan, String> {
+    let workspace = state.engine.config().workspace_dir.clone();
+    let referenced = state.engine.read().referenced_workspace_paths();
+    Ok(lodestash_engine::storage::plan_reclaim(
+        &workspace,
+        &referenced,
+    ))
 }
 
 /// Outcome of a reclaim — recomputed from what actually went, plus where the record was written.
@@ -410,17 +313,11 @@ struct ReclaimOutcome {
 /// dry run, and a stale plan is how a sweep deletes something that has just been re-materialized.
 #[tauri::command]
 fn reclaim_workspace(state: tauri::State<'_, AppState>) -> Result<ReclaimOutcome, String> {
-    let Some(workspace) = lodestash_app::paths::default_cache_dirs().1 else {
-        return Err("no workspace directory configured".into());
-    };
-    let referenced = state
-        .library
-        .lock()
-        .map_err(|_| "library lock poisoned".to_string())?
-        .referenced_workspace_paths();
-    let plan = crate::storage::plan_reclaim(&workspace, &referenced);
-    let log = crate::storage::write_reclaim_log(&workspace, &plan);
-    let (removed, freed) = crate::storage::execute_reclaim(&plan);
+    let workspace = state.engine.config().workspace_dir.clone();
+    let referenced = state.engine.read().referenced_workspace_paths();
+    let plan = lodestash_engine::storage::plan_reclaim(&workspace, &referenced);
+    let log = lodestash_engine::storage::write_reclaim_log(&workspace, &plan);
+    let (removed, freed) = lodestash_engine::storage::execute_reclaim(&plan);
     tracing::info!(removed, freed, "workspace reclaimed");
     Ok(ReclaimOutcome {
         removed,
@@ -433,12 +330,8 @@ fn reclaim_workspace(state: tauri::State<'_, AppState>) -> Result<ReclaimOutcome
 #[tauri::command]
 fn workspace_packs(
     state: tauri::State<'_, AppState>,
-) -> Result<Vec<crate::library::WorkspacePackRow>, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.workspace_packs())
-        .map_err(|_| "library lock poisoned".to_string())
+) -> Result<Vec<lodestash_engine::read_model::WorkspacePackRow>, String> {
+    Ok(state.engine.read().workspace_packs())
 }
 
 /// Keep a pack's extracted bytes (UI-SPEC §15). A pack that is *not* kept stays fully searchable
@@ -478,10 +371,7 @@ fn retarget_preview(
         .into_iter()
         .map(|e| e.guid)
         .collect();
-    let lib = state
-        .library
-        .lock()
-        .map_err(|_| "library lock poisoned".to_string())?;
+    let lib = state.engine.read();
     let (matched, total) = lib
         .retarget_match(package_id, &guids)
         .ok_or_else(|| "no catalog on disk".to_string())?;
@@ -541,9 +431,8 @@ fn remove_from_library(
     state: tauri::State<'_, AppState>,
     asset_ids: Vec<i64>,
 ) -> Result<WriteResult, String> {
-    let targets = state.targets(&asset_ids)?;
-    let project = lodestash_app::config::AppConfig::load().last_project_name;
-    state.write(Op::RemoveFromLibrary { targets, project })
+    let targets = state.targets(&asset_ids);
+    state.write(Op::RemoveFromLibrary { targets })
 }
 
 /// **Delete from disk — irreversible.** The frontend must confirm first; this command does not
@@ -554,13 +443,9 @@ fn delete_from_disk(
     state: tauri::State<'_, AppState>,
     asset_ids: Vec<i64>,
 ) -> Result<WriteResult, String> {
-    let targets = state.targets(&asset_ids)?;
-    let roots = state
-        .library
-        .lock()
-        .map(|l| l.roots())
-        .map_err(|_| "library lock poisoned".to_string())?;
-    let workspace = lodestash_app::paths::default_cache_dirs().1;
+    let targets = state.targets(&asset_ids);
+    let roots = state.engine.read().roots();
+    let workspace = Some(state.engine.config().workspace_dir.clone());
     state.write(Op::DeleteFromDisk {
         targets,
         roots,
@@ -598,7 +483,7 @@ fn import_root(state: &tauri::State<'_, AppState>, path: &str) -> Result<WriteRe
     // ignores it resurrects everything the user removed the moment they re-add the folder.
     // Pack-only sources are honoured for the same reason — the user already said what they want
     // from that folder.
-    let config = lodestash_app::config::AppConfig::load();
+    let config = state.engine.config_file().load_display_only();
     let (excludes, pack_only) = match config.last_project_name.as_deref() {
         Some(project) => (
             config.source_excludes(project, &root),
@@ -616,30 +501,29 @@ fn import_root(state: &tauri::State<'_, AppState>, path: &str) -> Result<WriteRe
         // Incremental diff (DATA-MODEL §6): re-adding an already-indexed folder skips re-hashing
         // files the catalog knows at the same (size, mtime) — one stat per file, not a re-read.
         let known = state
-            .library
-            .lock()
-            .map(|lib| lib.known_sizes(&lodestash_app::config::stem_name(&root)))
-            .unwrap_or_default();
-        lodestash_app::scan::crawl_source(0, &root, &excludes, &known)
+            .engine
+            .read()
+            .known_sizes(&lodestash_engine::config::stem_name(&root));
+        lodestash_engine::scan::crawl_source(0, &root, &excludes, &known)
     };
     if crawled.entries.is_empty() && crawled.pending_packages.is_empty() {
         return Err(format!("nothing indexable in {path}"));
     }
-    let records = lodestash_app::persist::crawl_records(crawled.entries.iter().map(|(_, f)| f));
-    let batch = lodestash_app::types::PersistBatch {
+    let records = lodestash_engine::persist::crawl_records(crawled.entries.iter().map(|(_, f)| f));
+    let batch = lodestash_engine::types::PersistBatch {
         root: root.to_string_lossy().into_owned(),
-        name: lodestash_app::config::stem_name(&root),
+        name: lodestash_engine::config::stem_name(&root),
         excludes_json: None,
         records,
     };
     // Browse persistence (INGESTION §2): the crawl captured each `.unitypackage`'s manifest
     // locators — hand them to the writer so the packs become browsable + surgically
     // extractable rows without ever re-reading the archive.
-    let packs: Vec<crate::writer::DiscoveredPack> = crawled
+    let packs: Vec<lodestash_engine::writer::DiscoveredPack> = crawled
         .pending_packages
         .into_iter()
         .filter(|p| p.source_idx == 0)
-        .map(|p| crate::writer::DiscoveredPack {
+        .map(|p| lodestash_engine::writer::DiscoveredPack {
             root: root.to_string_lossy().into_owned(),
             abs_path: p.abs_path.to_string_lossy().into_owned(),
             display_name: p.display_name,
@@ -668,7 +552,7 @@ fn sync_unity_cache(state: tauri::State<'_, AppState>) -> Result<WriteResult, St
         if !root.is_dir() {
             continue;
         }
-        let config = lodestash_app::config::AppConfig::load();
+        let config = state.engine.config_file().load_display_only();
         let pack_only = match config.last_project_name.as_deref() {
             Some(project) => config.is_pack_only(project, &root),
             None => false,
@@ -707,16 +591,13 @@ fn unity_cache_candidates(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<CacheCandidate>, String> {
     let known: Vec<String> = state
-        .library
-        .lock()
-        .map(|l| {
-            l.status()
-                .sources
-                .iter()
-                .map(|s| s.root_path.to_lowercase())
-                .collect()
-        })
-        .unwrap_or_default();
+        .engine
+        .read()
+        .status()
+        .sources
+        .iter()
+        .map(|s| s.root_path.to_lowercase())
+        .collect();
     Ok(lodestash_ingest::asset_store::candidate_roots()
         .into_iter()
         .filter(|r| r.is_dir())
@@ -851,15 +732,12 @@ fn discover_package_folder(
 
     // §5.6 duplicate check: normalized-name match against what the catalog already holds.
     let known: std::collections::HashMap<String, String> = state
-        .library
-        .lock()
-        .map(|l| {
-            l.packages()
-                .into_iter()
-                .map(|p| (lodestash_app::scan::normalize_pack_name(&p.name), p.name))
-                .collect()
-        })
-        .unwrap_or_default();
+        .engine
+        .read()
+        .packages()
+        .into_iter()
+        .map(|p| (lodestash_engine::scan::normalize_pack_name(&p.name), p.name))
+        .collect();
 
     let mut out = Vec::with_capacity(packs.len());
     let mut cache = state
@@ -889,7 +767,8 @@ fn discover_package_folder(
                 })
             })
             .count();
-        let category = lodestash_app::scan::dominant_content_category(&entries).map(str::to_owned);
+        let category =
+            lodestash_engine::scan::dominant_content_category(&entries).map(str::to_owned);
         // Version needs a second, targeted pass (`read_package_meta`); best-effort — a pack with
         // no UPM package.json simply shows no version.
         let version = if entries.is_empty() {
@@ -909,7 +788,7 @@ fn discover_package_folder(
                 .and_then(|m| m.version)
         };
         let duplicate_of = known
-            .get(&lodestash_app::scan::normalize_pack_name(&p.name))
+            .get(&lodestash_engine::scan::normalize_pack_name(&p.name))
             .cloned();
         cache.insert(abs.clone(), entries);
         out.push(DiscoveredPackage {
@@ -960,7 +839,7 @@ fn import_packages(
                     sel.abs_path
                 )
             })?;
-            full.push(crate::writer::ImportPack {
+            full.push(lodestash_engine::writer::ImportPack {
                 abs_path: sel.abs_path,
                 name: sel.name,
                 publisher: sel.publisher,
@@ -973,16 +852,13 @@ fn import_packages(
     state.write(Op::ImportPacks { root, packs: full })
 }
 
-/// Re-read the catalog. The egui app writes it, so a scan there shows up here on request —
-/// there is no change notification until the pump thread exists.
+/// Re-read the catalog now. Rarely needed: every read rebuilds when the catalog generation moved
+/// (v2 spec §4.3). It stays for the shell's explicit Refresh, and for changes the generation does
+/// not see.
 #[tauri::command]
 fn reload_library(state: tauri::State<'_, AppState>) -> Result<LibraryStatus, String> {
-    let mut lib = state
-        .library
-        .lock()
-        .map_err(|_| "library lock poisoned".to_string())?;
-    lib.reload();
-    Ok(lib.status())
+    state.engine.reload();
+    Ok(state.engine.read().status())
 }
 
 /// The pack browser's left tree (PACK-DIRECTORY-NAV §5). Rooted at one package — derived from
@@ -992,25 +868,26 @@ fn pack_dir_tree(
     state: tauri::State<'_, AppState>,
     package: String,
 ) -> Result<Vec<PackDirNode>, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.pack_tree(&package))
-        .map_err(|_| "library lock poisoned".to_string())
+    Ok(state.engine.read().pack_tree(&package))
 }
 
 /// The Svelte shell's persisted view prefs (FEATURES §10). Read once at startup; the frontend
 /// keeps its own copy and saves it back through `set_web_prefs` on every change.
 #[tauri::command]
-fn get_web_prefs() -> Result<lodestash_app::config::WebPrefs, String> {
-    lodestash_app::config::edit_config(|c| c.web.clone())
+fn get_web_prefs(
+    state: tauri::State<'_, AppState>,
+) -> Result<lodestash_engine::config::WebPrefs, String> {
+    state.engine.config_file().edit(|c| c.web.clone())
 }
 
 /// Persist the Svelte shell's view prefs. All-or-nothing write of the whole group — the
 /// frontend is the only writer, and a partial patch would leave fields silently stale.
 #[tauri::command]
-fn set_web_prefs(prefs: lodestash_app::config::WebPrefs) -> Result<(), String> {
-    lodestash_app::config::edit_config(|c| c.web = prefs)
+fn set_web_prefs(
+    state: tauri::State<'_, AppState>,
+    prefs: lodestash_engine::config::WebPrefs,
+) -> Result<(), String> {
+    state.engine.config_file().edit(|c| c.web = prefs)
 }
 
 /// Trait-library authoring (UI-SPEC §9, B8a). Create or promote a trait; an existing tag keeps
@@ -1064,8 +941,11 @@ fn set_trait_style(
 
 /// The Settings screen's snapshot (UI-SPEC §11). Read once; the frontend writes it back whole.
 #[tauri::command]
-fn get_settings() -> Result<Settings, String> {
-    lodestash_app::config::edit_config(|c| Settings::from_config(c))
+fn get_settings(state: tauri::State<'_, AppState>) -> Result<Settings, String> {
+    state
+        .engine
+        .config_file()
+        .edit(|c| Settings::from_config(c))
 }
 
 /// The budget guard's pre-run question (AI-PIPELINE §5.1): would this Identify run spend money,
@@ -1082,17 +962,13 @@ fn get_settings() -> Result<Settings, String> {
 fn cloud_run_estimate(
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<serde_json::Value>, String> {
-    let cfg = lodestash_app::config::AppConfig::load();
+    let cfg = state.engine.config_file().load();
     let configured =
         cfg.api_tagging_enabled && !cfg.api_key.trim().is_empty() && cfg.api_model.is_some();
     if !configured || lodestash_ai::openai::is_free_endpoint(&cfg.api_base_url) {
         return Ok(None);
     }
-    let queued = state
-        .library
-        .lock()
-        .map_err(|_| "library lock poisoned".to_string())?
-        .count_needing_tags();
+    let queued = state.engine.read().count_needing_tags();
     // One API call per asset (the cloud path is single-call — no caption pre-step), so the cap and
     // the queue depth together are the honest ceiling.
     let calls = if cfg.api_max_per_run == 0 {
@@ -1138,8 +1014,8 @@ fn api_presets() -> Vec<serde_json::Value> {
 /// A blocking call on the command thread is right here — the user pressed a button and is waiting,
 /// and the probe carries its own 30 s timeout.
 #[tauri::command]
-fn test_api_tagger() -> Result<String, String> {
-    let cfg = lodestash_app::config::AppConfig::load();
+fn test_api_tagger(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let cfg = state.engine.config_file().load();
     let Some(model) = cfg.api_model.clone().filter(|m| !m.trim().is_empty()) else {
         return Err("No API model set — fill in the model id first.".into());
     };
@@ -1154,21 +1030,15 @@ fn test_api_tagger() -> Result<String, String> {
 /// Bytes + file count under the preview cache root (Settings' CACHE card).
 #[tauri::command]
 fn preview_cache_usage(state: tauri::State<'_, AppState>) -> Result<(u64, usize), String> {
-    let lib = state
-        .library
-        .lock()
-        .map_err(|_| "library lock poisoned".to_string())?;
+    let lib = state.engine.read();
     Ok(lib.preview_cache_usage())
 }
 
 /// Empty the preview cache (thumbs + mesh/inpack scratch — all regenerable). Runs under the
-/// library lock; the workspace (extracted assets) is never touched.
+/// read-model lock; the workspace (extracted assets) is never touched.
 #[tauri::command]
 fn clear_preview_cache(state: tauri::State<'_, AppState>) -> Result<usize, String> {
-    let lib = state
-        .library
-        .lock()
-        .map_err(|_| "library lock poisoned".to_string())?;
+    let lib = state.engine.read();
     Ok(lib.clear_preview_cache())
 }
 
@@ -1176,12 +1046,9 @@ fn clear_preview_cache(state: tauri::State<'_, AppState>) -> Result<usize, Strin
 /// grid draws follow immediately (badges, ⚑ size facet, watch toggles).
 #[tauri::command]
 fn set_settings(state: tauri::State<'_, AppState>, settings: Settings) -> Result<(), String> {
-    lodestash_app::config::edit_config(|c| settings.apply(c))?;
-    state
-        .library
-        .lock()
-        .map_err(|_| "library lock poisoned".to_string())?
-        .reload();
+    state.engine.config_file().edit(|c| settings.apply(c))?;
+    // Size tiers and watch flags come from config, which the catalog generation does not see.
+    state.engine.reload();
     Ok(())
 }
 
@@ -1201,11 +1068,7 @@ fn set_source_watch(
 fn collections(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<lodestash_core::catalog::CollectionRow>, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.collections())
-        .map_err(|_| "library lock poisoned".to_string())
+    Ok(state.engine.read().collections())
 }
 
 /// The member ids of one collection — what a collection-filtered grid matches on (UI-SPEC §6).
@@ -1214,11 +1077,7 @@ fn collection_members(
     state: tauri::State<'_, AppState>,
     collection_id: i64,
 ) -> Result<Vec<i64>, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.collection_members(collection_id))
-        .map_err(|_| "library lock poisoned".to_string())
+    Ok(state.engine.read().collection_members(collection_id))
 }
 
 #[tauri::command]
@@ -1251,11 +1110,7 @@ fn related_assets(
     state: tauri::State<'_, AppState>,
     asset_id: i64,
 ) -> Result<Vec<lodestash_core::catalog::RelatedAsset>, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.related_assets(asset_id))
-        .map_err(|_| "library lock poisoned".to_string())
+    Ok(state.engine.read().related_assets(asset_id))
 }
 
 /// Stage asset ids into the tray (UI-SPEC §16.2).
@@ -1285,11 +1140,7 @@ fn clear_staged(state: tauri::State<'_, AppState>) -> Result<WriteResult, String
 /// that still exist.
 #[tauri::command]
 fn staged(state: tauri::State<'_, AppState>) -> Result<Vec<i64>, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.staged_ids())
-        .map_err(|_| "library lock poisoned".to_string())
+    Ok(state.engine.read().staged_ids())
 }
 
 /// The Stats Tag Graph (UI-SPEC §8.2): tag nodes, tag↔tag co-occurrence edges and the
@@ -1298,11 +1149,7 @@ fn staged(state: tauri::State<'_, AppState>) -> Result<Vec<i64>, String> {
 fn tag_graph(
     state: tauri::State<'_, AppState>,
 ) -> Result<lodestash_core::catalog::TagGraph, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.tag_graph())
-        .map_err(|_| "library lock poisoned".to_string())
+    Ok(state.engine.read().tag_graph())
 }
 
 /// Every resolved asset→asset edge (DATA-MODEL §10) — the set behind the LINKS filter and the
@@ -1311,11 +1158,7 @@ fn tag_graph(
 fn asset_edges(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<lodestash_core::catalog::AssetEdge>, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.asset_edges())
-        .map_err(|_| "library lock poisoned".to_string())
+    Ok(state.engine.read().asset_edges())
 }
 
 /// One source's blacklist (UI-SPEC §11.1): every `{kind, value}` exclusion the crawler skips.
@@ -1324,11 +1167,7 @@ fn source_excludes(
     state: tauri::State<'_, AppState>,
     source_id: i64,
 ) -> Result<Vec<lodestash_core::catalog::SourceExclude>, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.source_excludes(source_id))
-        .map_err(|_| "library lock poisoned".to_string())
+    Ok(state.engine.read().source_excludes(source_id))
 }
 
 /// Add one `{kind, value}` exclusion to a source's blacklist (UI-SPEC §11.1 ⊘ add buttons).
@@ -1366,11 +1205,7 @@ fn remove_source_exclude(
 fn taxonomies(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<lodestash_core::catalog::TaxonomyRow>, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.taxonomies())
-        .map_err(|_| "library lock poisoned".to_string())
+    Ok(state.engine.read().taxonomies())
 }
 
 /// Make `id` the single active taxonomy (UI-SPEC §9.2 `● active` marker).
@@ -1425,11 +1260,7 @@ fn list_rules(
     state: tauri::State<'_, AppState>,
     taxonomy_id: i64,
 ) -> Result<Vec<lodestash_core::catalog::MappingRuleRow>, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.list_rules(taxonomy_id))
-        .map_err(|_| "library lock poisoned".to_string())
+    Ok(state.engine.read().list_rules(taxonomy_id))
 }
 
 /// Run the deterministic mapping engine over one taxonomy (UI-SPEC §9.2 ⚙ Apply). Returns the
@@ -1473,7 +1304,7 @@ fn identify_asset(state: tauri::State<'_, AppState>, asset_id: i64) -> Result<Wr
 /// Identify screen poll it; nothing races the writer on timing guesses.
 #[tauri::command]
 fn pump_active(state: tauri::State<'_, AppState>) -> bool {
-    state.pump.load(std::sync::atomic::Ordering::Relaxed)
+    state.engine.pump_active()
 }
 
 /// Appraise pass progress (B11d surface): `active` + the drain's done/total counters, so the
@@ -1481,9 +1312,9 @@ fn pump_active(state: tauri::State<'_, AppState>) -> bool {
 /// write arrives only after the tag/embed queues are counted).
 #[tauri::command]
 fn pump_progress(state: tauri::State<'_, AppState>) -> PumpProgress {
-    let progress = &state.appraise;
+    let progress = state.engine.appraise_progress();
     PumpProgress {
-        active: state.pump.load(std::sync::atomic::Ordering::Relaxed),
+        active: state.engine.pump_active(),
         done: progress.done.load(std::sync::atomic::Ordering::Relaxed),
         total: progress.total.load(std::sync::atomic::Ordering::Relaxed),
         failed: progress.failed.load(std::sync::atomic::Ordering::Relaxed),
@@ -1508,7 +1339,7 @@ fn engine_bridge(state: tauri::State<'_, AppState>) -> EngineBridge {
         port: state.engine_port,
         token_set: !state.engine_token.is_empty(),
         allowed: state.engine_allowed,
-        live: state.engine.is_some(),
+        live: state.agents.is_some(),
     }
 }
 
@@ -1548,7 +1379,7 @@ fn engine_import(
     asset_ids: Vec<i64>,
 ) -> Result<EngineImportOutcome, String> {
     let engine = state
-        .engine
+        .agents
         .as_ref()
         .ok_or_else(|| "the engine bridge isn't running yet — no catalog on disk".to_string())?;
     match engine.request_import(lodestash_api::ImportRequest {
@@ -1604,7 +1435,7 @@ fn export_assets(
         return Err("nothing to export".into());
     }
     let engine = state
-        .engine
+        .agents
         .as_ref()
         .ok_or_else(|| "no catalog is open — there is nothing to export".to_string())?;
     engine.export_now(lodestash_api::export::ExportRequest {
@@ -1618,7 +1449,7 @@ fn export_assets(
 /// Unity plugin's queue.
 #[tauri::command]
 fn engine_approve(state: tauri::State<'_, AppState>, job_id: String) -> bool {
-    match state.engine.as_ref() {
+    match state.agents.as_ref() {
         Some(engine) => {
             engine.approve_job(&job_id);
             true
@@ -1630,7 +1461,7 @@ fn engine_approve(state: tauri::State<'_, AppState>, job_id: String) -> bool {
 /// Deny (reject) a job on the approval gate — the pending request is dropped.
 #[tauri::command]
 fn engine_deny(state: tauri::State<'_, AppState>, job_id: String) -> bool {
-    match state.engine.as_ref() {
+    match state.agents.as_ref() {
         Some(engine) => {
             engine.deny_job(&job_id);
             true
@@ -1643,7 +1474,7 @@ fn engine_deny(state: tauri::State<'_, AppState>, job_id: String) -> bool {
 /// "agent imports" section.
 #[tauri::command]
 fn engine_approvals(state: tauri::State<'_, AppState>) -> Vec<serde_json::Value> {
-    let Some(engine) = state.engine.as_ref() else {
+    let Some(engine) = state.agents.as_ref() else {
         return Vec::new();
     };
     let jobs = engine.jobs.awaiting_approval();
@@ -1661,26 +1492,26 @@ struct ModelStatus {
 
 /// AI model install status (AI-PIPELINE §2 / AI-MODELS-BY-GPU): SigLIP 2 (visual search),
 /// CLAP (audio search) and the ONNX Runtime dll they load. The downloader is
-/// `lodestash_app::models` — this just reports what's on disk.
+/// `lodestash_engine::models` — this just reports what's on disk.
 #[tauri::command]
 fn models_status() -> Vec<ModelStatus> {
     vec![
         ModelStatus {
             id: "siglip",
             label: "SigLIP 2 — visual search + tagging",
-            installed: lodestash_app::models::siglip_installed(),
+            installed: lodestash_engine::models::siglip_installed(),
             size_mb: 412,
         },
         ModelStatus {
             id: "clap",
             label: "CLAP — audio search + tagging",
-            installed: lodestash_app::models::clap_installed(),
+            installed: lodestash_engine::models::clap_installed(),
             size_mb: 163,
         },
         ModelStatus {
             id: "ort",
             label: "ONNX Runtime (native dll)",
-            installed: lodestash_app::models::ort_installed(),
+            installed: lodestash_engine::models::ort_installed(),
             size_mb: 70,
         },
     ]
@@ -1693,12 +1524,12 @@ fn models_status() -> Vec<ModelStatus> {
 #[tauri::command]
 fn model_download(state: tauri::State<'_, AppState>, model: String) -> bool {
     use std::sync::atomic::Ordering;
-    let jobs = state.jobs.clone();
+    let jobs = state.engine.jobs().clone();
     let handles = jobs.start(format!("Download {model}"), "download", true);
     // The tray renders the writer's own progress atomics; the downloader writes the app's.
     // A pump copies one into the other while the download runs.
-    let app_progress: std::sync::Arc<lodestash_app::jobs::JobProgress> =
-        std::sync::Arc::new(lodestash_app::jobs::JobProgress::default());
+    let app_progress: std::sync::Arc<lodestash_engine::jobs::JobProgress> =
+        std::sync::Arc::new(lodestash_engine::jobs::JobProgress::default());
     let writer_progress = handles.progress.clone();
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
@@ -1721,9 +1552,9 @@ fn model_download(state: tauri::State<'_, AppState>, model: String) -> bool {
     }
     std::thread::spawn(move || {
         let result = match model.as_str() {
-            "siglip" => lodestash_app::models::download_siglip(app_progress.clone()),
-            "clap" => lodestash_app::models::download_clap(app_progress.clone()),
-            "ort" => lodestash_app::models::download_ort(app_progress.clone()),
+            "siglip" => lodestash_engine::models::download_siglip(app_progress.clone()),
+            "clap" => lodestash_engine::models::download_clap(app_progress.clone()),
+            "ort" => lodestash_engine::models::download_ort(app_progress.clone()),
             other => Err(format!("unknown model {other:?}")),
         };
         done.store(true, Ordering::Relaxed);
@@ -1739,7 +1570,7 @@ fn model_download(state: tauri::State<'_, AppState>, model: String) -> bool {
 /// Remove the SigLIP + CLAP model dirs (Settings MODELS "Remove") so they re-download clean.
 #[tauri::command]
 fn model_remove() -> Result<(), String> {
-    lodestash_app::models::remove_models()
+    lodestash_engine::models::remove_models()
 }
 
 /// Per-pack Extract (B2b slice) — unpack the archive into the workspace and reconcile its
@@ -1756,33 +1587,25 @@ fn extract_package(
     state: tauri::State<'_, AppState>,
     package_id: i64,
 ) -> Result<WriteResult, String> {
-    state
-        .writer
-        .as_ref()
-        .ok_or_else(|| "no catalog is open — nothing to write to".to_string())?
-        .run(Op::ExtractPackage { package_id })
+    state.write(Op::ExtractPackage { package_id })
 }
 
 /// The job tray (B2b): active jobs (progress, cancellable) + the session ring of finished ones.
 #[tauri::command]
-fn jobs(state: tauri::State<'_, AppState>) -> crate::writer::JobsView {
-    state.jobs.snapshot()
+fn jobs(state: tauri::State<'_, AppState>) -> lodestash_engine::writer::JobsView {
+    state.engine.jobs().snapshot()
 }
 
 /// Ask one active job to stop (extract workers cancel between reads; the rest ignore it).
 #[tauri::command]
 fn cancel_job(state: tauri::State<'_, AppState>, job_id: u64) -> bool {
-    state.jobs.cancel(job_id)
+    state.engine.jobs().cancel(job_id)
 }
 
 /// Registered Unity editors, active first (ENGINE-API §5.1) — the Connect wizard's app half.
 #[tauri::command]
 fn projects(state: tauri::State<'_, AppState>) -> Vec<lodestash_core::catalog::ProjectRow> {
-    state
-        .library
-        .lock()
-        .map(|l| l.projects())
-        .unwrap_or_default()
+    state.engine.read().projects()
 }
 
 /// Switch which registered Unity editor is active (ENGINE-API §5.1, UI-SPEC §16.1). A write,
@@ -1808,45 +1631,30 @@ pub struct ImportBatch {
     pub imported_at: i64,
 }
 
-/// The last `limit` import batches, newest first (UI-SPEC §16.1). A read — the short-lived
-/// connection never runs migrations and never writes (ARCHITECTURE §5 allows per-task readers).
+/// The last `limit` import batches, newest first (UI-SPEC §16.1) — read through the engine's
+/// read model, which holds a reader that cannot write.
 #[tauri::command]
-fn recent_exports(limit: usize) -> Result<Vec<ImportBatch>, String> {
-    let Some(db) = lodestash_app::paths::catalog_db_path() else {
-        return Ok(Vec::new());
-    };
-    if !db.exists() {
+fn recent_exports(
+    state: tauri::State<'_, AppState>,
+    limit: usize,
+) -> Result<Vec<ImportBatch>, String> {
+    if state.engine.status() != EngineStatus::Ready {
         return Ok(Vec::new());
     }
-    let limit = limit.clamp(1, 100);
-    let conn = Connection::open(&db).map_err(|e| format!("catalog unavailable: {e}"))?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT ir.batch_id, ir.project_id, p.name, COUNT(*), MAX(ir.imported_at),
-                    (SELECT i2.dest_path FROM import_record i2 WHERE i2.batch_id = ir.batch_id ORDER BY i2.id LIMIT 1)
-               FROM import_record ir
-               JOIN project p ON p.id = ir.project_id
-              WHERE ir.batch_id IS NOT NULL
-              GROUP BY ir.batch_id
-              ORDER BY MAX(ir.imported_at) DESC
-              LIMIT ?1",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([limit as i64], |r| {
-            let sample: Option<String> = r.get(5)?;
-            Ok(ImportBatch {
-                batch_id: r.get(0)?,
-                project_id: r.get(1)?,
-                project_name: r.get(2)?,
-                dest: dest_directory(sample.as_deref()),
-                file_count: r.get(3)?,
-                imported_at: r.get(4)?,
-            })
+    Ok(state
+        .engine
+        .read()
+        .recent_import_batches(limit.clamp(1, 100))?
+        .into_iter()
+        .map(|b| ImportBatch {
+            dest: dest_directory(b.sample_dest.as_deref()),
+            batch_id: b.batch_id,
+            project_id: b.project_id,
+            project_name: b.project_name,
+            file_count: b.file_count,
+            imported_at: b.imported_at,
         })
-        .map_err(|e| e.to_string())?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| e.to_string())
+        .collect())
 }
 
 /// The parent folder of an in-project import path (`Assets/Wildlife/Beaver.fbx` →
@@ -1904,11 +1712,7 @@ fn recent_ops(
     state: tauri::State<'_, AppState>,
     limit: usize,
 ) -> Result<Vec<lodestash_core::catalog::OpLogRow>, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.recent_ops(limit))
-        .map_err(|_| "library lock poisoned".to_string())
+    Ok(state.engine.read().recent_ops(limit))
 }
 
 /// The redo stack (UI-SPEC §2 Shift-Z): the newest undone ops, newest first.
@@ -1917,11 +1721,7 @@ fn redo_ops(
     state: tauri::State<'_, AppState>,
     limit: usize,
 ) -> Result<Vec<lodestash_core::catalog::OpLogRow>, String> {
-    state
-        .library
-        .lock()
-        .map(|l| l.redo_candidates(limit))
-        .map_err(|_| "library lock poisoned".to_string())
+    Ok(state.engine.read().redo_candidates(limit))
 }
 
 /// Undo the logged operation `op_id` (UI-SPEC §2 / DESIGN-GUIDELINES §7 L5). Runs on the writer
@@ -1984,11 +1784,14 @@ fn bulk_tag(
 /// The REST/MCP `PreviewFn` (ENGINE-API preview endpoints): resolve the asset's cached thumbnail,
 /// generating on a miss — the same deterministic key the `lodestash://thumb` route uses, for the
 /// embedded engine (B12).
-fn engine_preview_fn(cache_root: Option<std::path::PathBuf>) -> lodestash_api::PreviewFn {
+fn engine_preview_fn(
+    cache_root: Option<std::path::PathBuf>,
+    config: lodestash_engine::config::ConfigFile,
+) -> lodestash_api::PreviewFn {
     Box::new(move |subject| {
         use lodestash_ingest::thumb::{generate, generate_material, meta_key, ThumbParams};
         let cache = cache_root.as_deref()?;
-        let q = lodestash_app::config::AppConfig::load().preview_quality;
+        let q = config.load_display_only().preview_quality;
         let params = ThumbParams {
             width: q.thumb_px(),
             height: q.thumb_px(),
@@ -2007,7 +1810,7 @@ fn engine_preview_fn(cache_root: Option<std::path::PathBuf>) -> lodestash_api::P
             let albedo = match (&subject.albedo, &subject.albedo_in_pack) {
                 (Some(p), _) => Some(p.clone()),
                 (None, Some((pack, offset, size, ext))) => {
-                    lodestash_app::thumbs::ensure_in_pack_scratch(
+                    lodestash_engine::thumbs::ensure_in_pack_scratch(
                         Some(cache),
                         pack,
                         *offset,
@@ -2043,7 +1846,7 @@ fn engine_preview_fn(cache_root: Option<std::path::PathBuf>) -> lodestash_api::P
         let src = match (&subject.disk_path, &subject.in_pack) {
             (Some(p), _) => p.as_path(),
             (None, Some((pack, offset, size, ext))) => {
-                let (path, _) = lodestash_app::thumbs::ensure_in_pack_scratch(
+                let (path, _) = lodestash_engine::thumbs::ensure_in_pack_scratch(
                     Some(cache),
                     pack,
                     *offset,
@@ -2076,8 +1879,11 @@ fn engine_preview_fn(cache_root: Option<std::path::PathBuf>) -> lodestash_api::P
 
 /// Apply the Settings MCP allow-list (UI-SPEC §16): config holds the disabled half, the state the
 /// enabled set. Returns how many tools stayed enabled (`None` = every tool is live).
-fn apply_allow_list(state: &lodestash_api::ServerState) -> Option<usize> {
-    let cfg = lodestash_app::config::AppConfig::load();
+fn apply_allow_list(
+    state: &lodestash_api::ServerState,
+    config: &lodestash_engine::config::ConfigFile,
+) -> Option<usize> {
+    let cfg = config.load_display_only();
     if cfg.mcp_disabled_tools.is_empty() {
         return None;
     }
@@ -2092,12 +1898,16 @@ fn apply_allow_list(state: &lodestash_api::ServerState) -> Option<usize> {
 
 /// The agent planes' write bridge (ADR-0002): each [`lodestash_api::AgentWrite`] maps to the
 /// single-writer `Op` and blocks on its reply — the API crate never touches the catalog itself.
-fn engine_write_bridge(writer: Writer) -> lodestash_api::AgentWriteFn {
+fn engine_write_bridge(writer: WriterHandle) -> lodestash_api::AgentWriteFn {
     use lodestash_api::AgentWrite;
     use lodestash_core::catalog::TagMode;
     // Everything through here is an agent's write — the shell shows it as a pending update
     // instead of re-reading under the user (ADR-0016).
-    let run = move |op: Op| writer.run_as(op, crate::writer::Origin::Agent);
+    let run = move |op: Op| {
+        writer
+            .run_as(op, lodestash_engine::Origin::Agent)
+            .map_err(|e| e.to_string())
+    };
     Box::new(move |w: AgentWrite| match w {
         // The legacy one-tag operations write as the agent they are — never as the person at the
         // machine (v1 plan S05). They carry no producer of their own, so they land under
@@ -2200,10 +2010,12 @@ fn legacy_agent_batch(
     }
 }
 
-/// Build the shared engine `ServerState` (B12) — one read-only catalog connection, the allow-list
-/// applied, the per-session token minted. `Err` says why there is none: no catalog on disk yet, or
-/// one this build cannot read without the app upgrading it first (v1 plan S11).
-fn build_engine_state() -> Result<
+/// Build the shared engine `ServerState` (B12) over the engine's catalog and paths — one read-only
+/// catalog connection, the allow-list applied, the per-session token minted. `Err` says why there
+/// is none (the engine is not ready, or the API could not read the catalog).
+fn build_engine_state(
+    engine: &Engine,
+) -> Result<
     (
         std::sync::Arc<lodestash_api::ServerState>,
         String,
@@ -2211,41 +2023,39 @@ fn build_engine_state() -> Result<
     ),
     String,
 > {
-    let db = lodestash_app::paths::catalog_db_path()
-        .ok_or("no data directory for the catalog on this system")?;
-    if !db.exists() {
-        return Err("no catalog on disk yet — open the app once to create it".into());
+    if let EngineStatus::Failed { message, .. } = engine.status() {
+        return Err(message);
     }
-    let (cache_root, workspace) = lodestash_app::paths::default_cache_dirs();
-    let payload_cache = cache_root.clone();
+    let paths = engine.config();
+    let cache_root = Some(paths.cache_dir.clone());
+    let config = engine.config_file();
     let state = lodestash_api::ServerState::new(
-        &db,
-        workspace.unwrap_or_else(|| cache_root.clone().unwrap_or_default()),
-        engine_preview_fn(cache_root),
+        &paths.catalog,
+        paths.workspace_dir.clone(),
+        engine_preview_fn(cache_root, config.clone()),
     )
     .map_err(|e| e.to_string())?;
     // In-pack files are served from a verified pull of just their payload (ENGINE-API §8.2, v1 plan
     // S12b) — never an unpack, never a catalog write.
-    if let Some(cache) = payload_cache {
-        state.set_payload_resolver(Box::new(move |entry| {
-            use lodestash_api::AgentError;
-            use lodestash_ingest::unitypackage::PayloadError;
-            lodestash_app::thumbs::materialize_in_pack_entry(&cache, entry).map_err(|e| {
-                let why = e.to_string();
-                match e {
-                    PayloadError::ArchiveMissing(_) => AgentError::archive_missing(why),
-                    PayloadError::SourceChanged(_) => AgentError::source_changed(why),
-                    PayloadError::TooLarge { .. } => AgentError::asset_too_large(why),
-                    PayloadError::Io(_) => AgentError::not_local(why),
-                }
-            })
-        }));
-    }
+    let cache = paths.cache_dir.clone();
+    state.set_payload_resolver(Box::new(move |entry| {
+        use lodestash_api::AgentError;
+        use lodestash_ingest::unitypackage::PayloadError;
+        lodestash_engine::thumbs::materialize_in_pack_entry(&cache, entry).map_err(|e| {
+            let why = e.to_string();
+            match e {
+                PayloadError::ArchiveMissing(_) => AgentError::archive_missing(why),
+                PayloadError::SourceChanged(_) => AgentError::source_changed(why),
+                PayloadError::TooLarge { .. } => AgentError::asset_too_large(why),
+                PayloadError::Io(_) => AgentError::not_local(why),
+            }
+        })
+    }));
     let state = std::sync::Arc::new(state);
-    let allowed = apply_allow_list(&state);
+    let allowed = apply_allow_list(&state, &config);
     // ENGINE-API §8.3: `write_tags` writes under the producer the user configured for this host,
     // and refuses without one.
-    let cfg = lodestash_app::config::AppConfig::load_display_only();
+    let cfg = config.load_display_only();
     state.set_agent_producer(cfg.agent_producer_id);
     // Whether an agent may receive bytes at all (v1 plan S10) — metadata and links are always
     // available, the files are not until the user says so.
@@ -2254,7 +2064,7 @@ fn build_engine_state() -> Result<
     // grid's AI mode does — SigLIP and CLAP, resolved lazily on the first ai search (model load is
     // seconds; a startup resolve would slow every launch). No spaces means no model → the route
     // answers `ai_unavailable` instead of degrading.
-    state.set_query_embedder(Box::new(lodestash_app::drains::query_spaces));
+    state.set_query_embedder(Box::new(lodestash_engine::drains::query_spaces));
     let token = state.token().to_string();
     Ok((state, token, allowed))
 }
@@ -2282,7 +2092,7 @@ pub fn run() {
     // Here rather than inside the loaders: setting an environment variable is only sound while
     // the process is still single-threaded, and this is before the writer, the REST server and
     // Tauri's own threads exist.
-    lodestash_app::models::apply_ort_dylib_env();
+    lodestash_engine::models::apply_ort_dylib_env();
 
     // The MCP server is its own binary now (ADR-0022). A host still configured with
     // `lodestash-desktop --mcp` is told so, rather than opening a window it cannot see.
@@ -2300,24 +2110,32 @@ pub fn run() {
     #[cfg(debug_assertions)]
     devserver::ensure();
 
-    let library = Library::open();
-    let status = library.status();
-    tracing::info!(
-        open = status.open,
-        assets = status.total_assets,
-        in_pack = status.in_pack,
-        favorites = status.favorites,
-        previews = status.with_preview,
-        sources = status.sources.len(),
-        "catalog"
-    );
-
-    // One writer for the process (ARCHITECTURE §5), spawned in `setup` — it needs the
-    // AppHandle to push change events (pump events, B2b) to the Svelte shell.
-    let pump = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let appraise = std::sync::Arc::new(lodestash_app::jobs::JobProgress::default());
-    let focus = std::sync::Arc::new(Mutex::new(lodestash_core::catalog::AppraiseFocus::default()));
-    let job_registry = crate::writer::JobRegistry::default();
+    // The engine owns the catalog (ADR-0021): it takes the catalog's lock, creates the catalog on a
+    // fresh install (review S1) and migrates an old one. Waited for here, as the old read model's
+    // open was, so the window opens on a library rather than a spinner; a failure is a status the
+    // frontend reports, never an empty grid.
+    let engine = match EngineConfig::os_default() {
+        Some(cfg) => Engine::start(cfg),
+        None => Engine::failed(
+            "no_catalog_location",
+            "this system reports no data, config or cache folder, so there is nowhere to keep a \
+             catalog — set LODESTASH_CATALOG to a file path",
+        ),
+    };
+    let status = engine.wait_settled(Duration::from_secs(600));
+    {
+        let lib = engine.read();
+        let summary = lib.status();
+        tracing::info!(
+            ?status,
+            assets = summary.total_assets,
+            in_pack = summary.in_pack,
+            favorites = summary.favorites,
+            previews = summary.with_preview,
+            sources = summary.sources.len(),
+            "catalog"
+        );
+    }
 
     tauri::Builder::default()
         // Window geometry (size/position/maximized) is remembered across launches and restored
@@ -2348,39 +2166,41 @@ pub fn run() {
                 }
             }
         })
-        .setup(|app| {
-            // One writer for the process (ARCHITECTURE §5), spawned before any command can
-            // run — setup runs before the event loop. It carries the AppHandle so changes
-            // are pushed to the shell (pump events, B2b) instead of the UI polling.
-            let writer = lodestash_app::paths::catalog_db_path()
-                .filter(|p| p.exists())
-                .map(|p| {
-                    Writer::spawn(
-                        p,
-                        pump.clone(),
-                        job_registry.clone(),
-                        appraise.clone(),
-                        focus.clone(),
-                    )
-                });
-            // Change publication (ADR-0016): the writer and the job registry only mark what
-            // changed; this thread tells the shell, at most once per window. Started with or
-            // without a catalog — model downloads use the tray too.
-            job_registry.changes().start_publisher(app.handle().clone());
+        .setup(move |app| {
+            // Change publication (ADR-0016): the engine's writer and job registry mark what
+            // changed and publish at most once per window; this thread hands each event to the
+            // shell as `ls:changed`. Subscribed with or without a catalog — model downloads use the
+            // tray too.
+            let mut changes = engine.subscribe();
+            let handle = app.handle().clone();
+            std::thread::Builder::new()
+                .name("lodestash-events".into())
+                .spawn(move || {
+                    use tauri::Emitter;
+                    loop {
+                        match changes.blocking_recv() {
+                            Ok(event) => {
+                                let _ = handle.emit("ls:changed", event);
+                            }
+                            // Fell behind: the next event carries the generations that matter.
+                            Err(lodestash_engine::ChangeRecvError::Lagged(_)) => {}
+                            Err(lodestash_engine::ChangeRecvError::Closed) => break,
+                        }
+                    }
+                })
+                .expect("event bridge spawns");
 
             // B12 — the agent plane (ENGINE-API §1–2) lives in this process: the REST server
             // binds an ephemeral loopback port and writes engine.json for the Unity plugin, the
             // Connect wizard and the `lodestash-mcp` server (ADR-0022). Its ServerState has its
             // own read-only catalog connection — the API never writes the catalog, so the
             // single-writer rule holds.
-            let (engine_state, engine_port, engine_token, engine_allowed) =
-                match build_engine_state() {
+            let (agents, engine_port, engine_token, engine_allowed) =
+                match build_engine_state(&engine) {
                     Ok((state, token, allowed)) => {
                         // Wire the write bridge before serving: mutating agent ops (add_tag,
                         // apply_mapping, identify, unpack, staging) go through the single writer.
-                        if let Some(w) = writer.clone() {
-                            state.set_write(engine_write_bridge(w));
-                        }
+                        state.set_write(engine_write_bridge(engine.writer().clone()));
                         let port = lodestash_api::serve(state.clone())
                             .map(|h| h.port)
                             .map_err(|e| tracing::error!(%e, "engine API failed to bind"))
@@ -2393,13 +2213,8 @@ pub fn run() {
                     }
                 };
             app.manage(AppState {
-                library: Mutex::new(library),
-                writer,
-                pump,
-                appraise,
-                focus,
-                jobs: job_registry,
-                engine: engine_state,
+                engine: engine.clone(),
+                agents,
                 engine_port,
                 engine_token,
                 engine_allowed,
@@ -2409,7 +2224,7 @@ pub fn run() {
         })
         .register_uri_scheme_protocol("lodestash", |ctx, req| {
             let state = ctx.app_handle().state::<AppState>();
-            protocol::handle(&state.library, &req)
+            protocol::handle(&state.engine, &req)
         })
         .invoke_handler(tauri::generate_handler![
             app_info,

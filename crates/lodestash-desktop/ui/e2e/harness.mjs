@@ -81,7 +81,7 @@ function assertBinaryIsCurrent() {
     throw new Error(`no ${BIN} — run: cargo build -p lodestash-desktop --bin lodestash-desktop`);
   }
   const built = fs.statSync(BIN).mtimeMs;
-  const srcDirs = ["lodestash-desktop", "lodestash-app", "lodestash-core"].map((c) =>
+  const srcDirs = ["lodestash-desktop", "lodestash-engine", "lodestash-core"].map((c) =>
     path.join(REPO, "crates", c, "src"),
   );
   let newest = 0;

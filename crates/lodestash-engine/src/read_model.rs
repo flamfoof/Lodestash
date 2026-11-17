@@ -1,17 +1,23 @@
-//! Read-only view of the catalog for the desktop shell.
+//! The engine's read model: an in-memory snapshot of the library (v2 spec §4.3).
 //!
-//! This is deliberately **not** `Engine`. It opens its own connection and never writes:
-//! the single-writer rule (ARCHITECTURE §5) says every catalog write goes through the persist
-//! thread, and nothing here has one. That constraint is what lets the Svelte frontend show a
-//! real library before the B1 extraction finishes — browsing is a read.
+//! It holds a [`CatalogReader`] — a connection that cannot write, by type — and never opens the
+//! catalog itself: the writer does that, migration included, and the engine attaches the reader
+//! once the writer reports the catalog ready. [`crate::Engine::read`] rebuilds the snapshot
+//! whenever the catalog generation has moved since it was built, so an agent's or the background
+//! lane's write is visible on the next read without anyone asking for a refresh.
+//!
+//! A SQL-backed paged listing replaces the snapshot later (v2 spec §13); the tests below are its
+//! contract.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use lodestash_app::config::{SizeTier, SizeTiers, SortBy};
-use lodestash_app::grid;
-use lodestash_app::types::{Category, ContentFilter, StatusFilter, TriBucket};
-use lodestash_core::catalog::{AppraiseFocus, Catalog};
+use crate::config::{SizeTier, SizeTiers, SortBy};
+use crate::grid;
+use crate::types::{Category, ContentFilter, StatusFilter, TriBucket};
+use lodestash_core::catalog::{AppraiseFocus, CatalogReader};
+
+use crate::config::ConfigFile;
 use lodestash_core::types::{AssetStatus, MediaType};
 use serde::{Deserialize, Serialize};
 
@@ -426,8 +432,8 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn from_config(c: &lodestash_app::config::AppConfig) -> Self {
-        use lodestash_app::config::PreviewQuality;
+    pub fn from_config(c: &crate::config::AppConfig) -> Self {
+        use crate::config::PreviewQuality;
         Self {
             m_kb: c.size_tiers.m_kb,
             l_kb: c.size_tiers.l_kb,
@@ -457,9 +463,9 @@ impl Settings {
         }
     }
 
-    pub fn apply(self, c: &mut lodestash_app::config::AppConfig) {
-        use lodestash_app::config::PreviewQuality;
-        c.size_tiers = lodestash_app::config::SizeTiers {
+    pub fn apply(self, c: &mut crate::config::AppConfig) {
+        use crate::config::PreviewQuality;
+        c.size_tiers = crate::config::SizeTiers {
             m_kb: self.m_kb,
             l_kb: self.l_kb,
             xl_kb: self.xl_kb,
@@ -661,23 +667,26 @@ pub struct FacetOption {
     pub label: String,
 }
 
-/// Everything the shell holds about the open catalog.
+/// Everything the read model holds about the open catalog.
 pub struct Library {
-    catalog: Option<Catalog>,
-    /// Where generated thumbnails live — the same cache the egui build writes, so a thumbnail
-    /// rendered by either frontend serves the other.
+    /// `None` until the engine attaches the reader (the writer opens and migrates first), or
+    /// when the engine failed to start.
+    catalog: Option<CatalogReader>,
+    /// Where generated thumbnails live — the engine's preview cache.
     thumb_cache: Option<PathBuf>,
+    /// Where extracted pack payloads live — `workspace_rel` resolves against it.
+    workspace: Option<PathBuf>,
     catalog_path: Option<PathBuf>,
+    /// The engine's config — the size tiers the badges and the size facet draw.
+    config: Option<ConfigFile>,
     sources: Vec<SourceSummary>,
-    /// All live rows, name-sorted once at open. The whole library is ~10k rows of small structs,
-    /// so holding it beats a query per page — and it is what the egui build already does.
-    /// ponytail: re-reads only on `reload`; a catalog written by the egui app while this is open
-    /// will not show until then. Fine while this is a read-only viewer.
+    /// All live rows, name-sorted once per rebuild. The whole library is ~10k rows of small
+    /// structs, so holding it beats a query per page.
     rows: Vec<Row>,
     /// asset_id -> absolute path on disk, for `lodestash://file`.
     paths: HashMap<i64, PathBuf>,
-    /// The user's S/M/L/XL boundaries (§11.4), read from the same config the egui build writes —
-    /// so the size badge on a card and the size facet in the popover agree with each other.
+    /// The user's S/M/L/XL boundaries (§11.4), read from config — so the size badge on a card and
+    /// the size facet in the popover agree with each other.
     tiers: SizeTiers,
 }
 
@@ -721,43 +730,19 @@ struct Row {
 }
 
 impl Library {
-    /// Open the catalog the egui app writes, read-only. Missing catalog is not an error: the
-    /// shell shows an empty library and says so.
-    pub fn open() -> Self {
-        let Some(path) = lodestash_app::paths::catalog_db_path() else {
-            return Self::empty();
-        };
-        if !path.exists() {
-            return Self::empty();
-        }
-        match Catalog::open(&path) {
-            Ok(cat) => {
-                let mut lib = Self {
-                    catalog: Some(cat),
-                    thumb_cache: lodestash_app::paths::default_cache_dirs().0,
-                    catalog_path: Some(path),
-                    sources: Vec::new(),
-                    rows: Vec::new(),
-                    paths: HashMap::new(),
-                    tiers: lodestash_app::config::AppConfig::load()
-                        .size_tiers
-                        .normalized(),
-                };
-                lib.reload();
-                lib
-            }
-            Err(e) => {
-                tracing::warn!(%e, "catalog open failed; shell starts empty");
-                Self::empty()
-            }
-        }
-    }
-
-    fn empty() -> Self {
+    /// An empty model over the engine's paths. Nothing is read until a reader is attached.
+    pub fn new(
+        catalog_path: PathBuf,
+        thumb_cache: Option<PathBuf>,
+        workspace: Option<PathBuf>,
+        config: ConfigFile,
+    ) -> Self {
         Self {
             catalog: None,
-            thumb_cache: lodestash_app::paths::default_cache_dirs().0,
-            catalog_path: None,
+            thumb_cache,
+            workspace,
+            catalog_path: Some(catalog_path),
+            config: Some(config),
             sources: Vec::new(),
             rows: Vec::new(),
             paths: HashMap::new(),
@@ -765,14 +750,25 @@ impl Library {
         }
     }
 
+    /// Hand the model its read-only connection and read the library through it.
+    pub fn attach(&mut self, reader: CatalogReader) {
+        self.catalog = Some(reader);
+        self.reload();
+    }
+
+    /// Whether a catalog is behind the model.
+    pub fn is_attached(&self) -> bool {
+        self.catalog.is_some()
+    }
+
     /// Re-read sources and their assets from the catalog.
     pub fn reload(&mut self) {
         // Size tiers feed the S/M/L/XL badges and the ⚑ size facet; they come from config, which
         // Settings edits — re-read here so a change lands without a restart (the grid never holds
         // a second copy to go stale).
-        self.tiers = lodestash_app::config::AppConfig::load()
-            .size_tiers
-            .normalized();
+        if let Some(config) = &self.config {
+            self.tiers = config.load_display_only().size_tiers.normalized();
+        }
         let Some(cat) = self.catalog.as_ref() else {
             return;
         };
@@ -784,7 +780,7 @@ impl Library {
             }
         };
 
-        let (_, workspace_dir) = lodestash_app::paths::default_cache_dirs();
+        let workspace_dir = self.workspace.clone();
         let mut rows = Vec::new();
         let mut paths = HashMap::new();
         let mut sources = Vec::new();
@@ -902,6 +898,16 @@ impl Library {
                     .collect()
             })
             .map_err(|e| e.to_string())
+    }
+
+    /// The recent import runs into a registered project (UI-SPEC §16.1) — read through the model's
+    /// reader; the shell used to open its own raw connection for this (review R5).
+    pub fn recent_import_batches(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<lodestash_core::catalog::ImportBatch>, String> {
+        let cat = self.catalog.as_ref().ok_or("no catalog open")?;
+        cat.recent_import_batches(limit).map_err(|e| e.to_string())
     }
 
     /// What relinking this source to that folder would reach (UI-SPEC §11.1).
@@ -2087,7 +2093,7 @@ impl Library {
         if needle.is_empty() {
             return None;
         }
-        let spaces = lodestash_app::drains::query_spaces(needle);
+        let spaces = crate::drains::query_spaces(needle);
         if spaces.is_empty() {
             return None;
         }
@@ -2355,7 +2361,7 @@ impl Library {
         let Some(cat) = self.catalog.as_ref() else {
             return Default::default();
         };
-        let workspace = lodestash_app::paths::default_cache_dirs().1;
+        let workspace = self.workspace.clone();
         cat.model_slot_texture_paths(asset_id, workspace.as_deref())
             .unwrap_or_default()
     }
@@ -2577,8 +2583,10 @@ mod tests {
             .collect();
         Library {
             catalog: None,
-            thumb_cache: lodestash_app::paths::default_cache_dirs().0,
+            thumb_cache: None,
+            workspace: None,
             catalog_path: None,
+            config: None,
             sources: Vec::new(),
             rows,
             paths: HashMap::new(),
@@ -2716,7 +2724,7 @@ mod tests {
         assert_eq!(l.page(&q(Some("synty"))).total, 0, "source match is exact");
     }
 
-    /// The bucket rule itself lives in `lodestash_app::types` and is tested there. What this
+    /// The bucket rule itself lives in `crate::types` and is tested there. What this
     /// asserts is the *wiring*: that a query's tab reaches that rule, over rows whose
     /// `media_type` came out of the catalog as a string. A parse that silently yields `None`
     /// would empty every tab but All while the grid still looks populated.
@@ -2897,7 +2905,8 @@ mod tests {
         // pick of something that exists in the catalog. What it need not be is something *this*
         // view has loaded — a second source, not hydrated, is exactly that case.
         let dir = tempfile::tempdir().expect("tmp");
-        let mut cat = Catalog::open(&dir.path().join("catalog.db")).expect("open");
+        let db = dir.path().join("catalog.db");
+        let mut cat = lodestash_core::catalog::Catalog::open(&db).expect("open");
         cat.seed_media_types().expect("seed");
         let src = cat
             .upsert_import_source("Lib", &dir.path().to_string_lossy(), "folder")
@@ -2939,7 +2948,8 @@ mod tests {
         for id in &ids {
             cat.collection_add_asset(tray, *id).expect("stage");
         }
-        l.catalog = Some(cat);
+        drop(cat);
+        l.catalog = Some(lodestash_core::catalog::Catalog::open_reader(&db).expect("reader"));
 
         assert_eq!(
             l.staged_ids(),
@@ -3043,7 +3053,7 @@ mod tests {
         );
     }
 
-    /// Wiring again: the fold itself is tested in `lodestash_app::types`. This asserts the
+    /// Wiring again: the fold itself is tested in `crate::types`. This asserts the
     /// catalog's status *string* reaches it — the four states arrive as text and are parsed once
     /// at hydrate, so a parse failure would silently file every asset under Unidentified.
     #[test]
