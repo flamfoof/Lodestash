@@ -72,7 +72,7 @@ fn a_reader_cannot_write_and_never_migrates() {
     assert_eq!(reader.schema_version().expect("version"), SCHEMA_VERSION);
     assert!(
         reader
-            .conn
+            .conn()
             .execute("UPDATE media_type SET label = 'x'", [])
             .is_err(),
         "the reader connection accepted a write"

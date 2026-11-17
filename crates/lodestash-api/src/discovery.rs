@@ -6,7 +6,7 @@
 //! media type, a negative id or a limit of 5,000 is an `invalid_argument`, never a silently widened
 //! or silently empty result an agent would then report as "the library has none".
 
-use lodestash_core::catalog::{AssetScope, AssetSummaryRow, Catalog, TagState};
+use lodestash_core::catalog::{AssetScope, AssetSummaryRow, CatalogReader, TagState};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -190,7 +190,7 @@ fn digest16(text: &str) -> String {
 
 /// Validate every scope field against the catalog and build the scope.
 fn build_scope(
-    cat: &Catalog,
+    cat: &CatalogReader,
     source_id: Option<i64>,
     package_id: Option<i64>,
     media_type: Option<&str>,
@@ -537,7 +537,7 @@ impl ServerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lodestash_core::catalog::CrawlRecord;
+    use lodestash_core::catalog::{Catalog, CrawlRecord};
 
     fn fixture(images: usize, models: usize) -> (tempfile::TempDir, ServerState, i64, i64) {
         let dir = tempfile::tempdir().unwrap();

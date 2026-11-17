@@ -19,7 +19,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use lodestash_core::catalog::{AssetSummaryRow, Catalog, ImportSpec, PackageListing, ProjectRow};
+use lodestash_core::catalog::{
+    AssetSummaryRow, Catalog, CatalogReader, ImportSpec, PackageListing, ProjectRow,
+};
 
 /// ENGINE-API §2 `list_tags` row — `(namespace, value, asset count)`.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -507,7 +509,7 @@ const IMPORT_LEASE: std::time::Duration = std::time::Duration::from_secs(60);
 /// What a handler needs to answer a request. The API owns its **own** catalog connection
 /// (read-only queries) so it never contends with the UI's single writer — DATA-MODEL §1.
 pub struct ServerState {
-    catalog: Mutex<Catalog>,
+    catalog: Mutex<CatalogReader>,
     pub jobs: jobs::Jobs,
     workspace_dir: PathBuf,
     /// Given everything known about one asset, the cached preview PNG for it (generating on a

@@ -448,47 +448,6 @@ impl Catalog {
         Ok(Some(backup))
     }
 
-    /// Open an existing catalog **read-only** — the agent planes' own connection (v1 plan S11).
-    ///
-    /// Schema setup belongs to the one writer (ADR-0002). [`Self::open`] migrates, so a headless
-    /// MCP server that used it could upgrade the live catalog underneath a running app, from a
-    /// process that owns none of the app's state. This connection cannot write at all — the file is
-    /// opened with `SQLITE_OPEN_READ_ONLY`, and no pragma that changes the file is issued — and a
-    /// catalog at any other schema version is refused with what to do, rather than read with
-    /// queries written for a different shape.
-    pub fn open_reader(path: &Path) -> Result<Self> {
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_URI,
-        )
-        .map_err(|e| CoreError::Catalog(format!("open failed: {e}")))?;
-        // No `journal_mode`: the writer set WAL on the file, and changing it is a write. A reader
-        // needs only its own cache, and to wait on the writer rather than error.
-        conn.execute_batch(
-            "PRAGMA foreign_keys=ON;
-             PRAGMA cache_size=-32768;
-             PRAGMA temp_store=MEMORY;
-             PRAGMA busy_timeout=15000;",
-        )
-        .map_err(|e| CoreError::Catalog(format!("configure pragmas: {e}")))?;
-        let catalog = Self {
-            conn,
-            db_path: Some(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())),
-            appraise_focus: AppraiseFocus::default(),
-        };
-        let found = catalog.schema_version()?;
-        refuse_newer(found)?;
-        if found < SCHEMA_VERSION {
-            return Err(CoreError::SchemaTooOld {
-                found,
-                supported: SCHEMA_VERSION,
-            });
-        }
-        Ok(catalog)
-    }
-
     /// In-memory catalog (tests / CLI dry-run).
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()
@@ -6392,6 +6351,7 @@ mod graph;
 mod material_inputs;
 mod oplog;
 mod prefab;
+mod reader;
 mod snapshots;
 mod tagbatch;
 mod taxonomy;
@@ -6413,6 +6373,7 @@ mod tests_tagbatch;
 pub use browse::{AssetScope, LibraryRow, TagState};
 pub use material_inputs::{albedo_rank, MaterialInputSource, MaterialSlot, ModelMaterialInputs};
 pub use prefab::{PrefabBindingRow, PrefabFileScan, LEGACY_PREFAB_SCOPE};
+pub use reader::{CatalogReader, CatalogWriter};
 pub use snapshots::{clear_resident_snapshots, resident_snapshot_count, EmbeddingSnapshot};
 pub use tagbatch::{
     ai_source, assignment_problem, is_ai_source, source_problem, validate_assignments, AssetTagRow,

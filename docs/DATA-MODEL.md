@@ -40,7 +40,9 @@ vector DB at this scale.
 Run with `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, a generous page cache.
 The agent planes' connection is the exception: `Catalog::open_reader` opens the file
 `SQLITE_OPEN_READ_ONLY`, issues no pragma that writes, and refuses a schema version other than
-`SCHEMA_VERSION` (v1 plan S11) — migrating is the writer's job.
+`SCHEMA_VERSION` (v1 plan S11) — migrating is the writer's job. It returns a `CatalogReader`, which
+exposes only the read methods it lists (`crates/lodestash-core/src/catalog/reader.rs`), so a write
+through it does not compile; `CatalogWriter` is the full `Catalog`.
 
 ---
 
