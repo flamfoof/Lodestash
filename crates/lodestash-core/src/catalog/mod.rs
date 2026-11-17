@@ -3665,6 +3665,9 @@ impl Catalog {
     /// rather than minting a second row. Ensures the project's empty staging tray exists (§9). The
     /// partial UNIQUE index `idx_project_active` allows only one `is_active=1`, so every other row is
     /// cleared first. Returns the project id.
+    ///
+    /// One transaction: a failure part-way (after "deactivate all", say) must not leave the catalog
+    /// with no active project, or with a project that has no tray (review B13).
     pub fn register_project(
         &self,
         project_path: &str,
@@ -3678,12 +3681,14 @@ impl Catalog {
             .filter(|s| !s.is_empty())
             .unwrap_or(project_path)
             .to_string();
-        self.conn
-            .execute("UPDATE project SET is_active = 0", [])
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| CoreError::Catalog(format!("project begin: {e}")))?;
+        tx.execute("UPDATE project SET is_active = 0", [])
             .map_err(|e| CoreError::Catalog(format!("project deactivate: {e}")))?;
-        self.conn
-            .execute(
-                "INSERT INTO project
+        tx.execute(
+            "INSERT INTO project
                      (uuid, name, project_path, unity_version, pipeline, last_seen_at, is_active)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)
                  ON CONFLICT(project_path) DO UPDATE SET
@@ -3692,18 +3697,17 @@ impl Catalog {
                      pipeline = excluded.pipeline,
                      last_seen_at = excluded.last_seen_at,
                      is_active = 1",
-                params![
-                    uuid::Uuid::new_v4().to_string(),
-                    name,
-                    project_path,
-                    unity_version,
-                    pipeline,
-                    unix_now(),
-                ],
-            )
-            .map_err(|e| CoreError::Catalog(format!("project upsert: {e}")))?;
-        let id: i64 = self
-            .conn
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                name,
+                project_path,
+                unity_version,
+                pipeline,
+                unix_now(),
+            ],
+        )
+        .map_err(|e| CoreError::Catalog(format!("project upsert: {e}")))?;
+        let id: i64 = tx
             .query_row(
                 "SELECT id FROM project WHERE project_path = ?1",
                 params![project_path],
@@ -3719,8 +3723,7 @@ impl Catalog {
         // shortlist built by hand is the expensive thing on screen, and connecting an editor is
         // the moment it finally has a destination. Dropping it there would punish the user for
         // doing the two steps in the order the app encourages.
-        let adopted = self
-            .conn
+        let adopted = tx
             .execute(
                 "UPDATE collection SET project_id = ?1
                   WHERE is_staging = 1 AND project_id IS NULL
@@ -3730,16 +3733,17 @@ impl Catalog {
             )
             .map_err(|e| CoreError::Catalog(format!("adopt staging tray: {e}")))?;
         if adopted == 0 {
-            self.conn
-                .execute(
-                    "INSERT INTO collection (uuid, name, is_staging, project_id)
-                         SELECT ?1, 'Staging', 1, ?2
-                         WHERE NOT EXISTS
-                           (SELECT 1 FROM collection WHERE is_staging=1 AND project_id=?2)",
-                    params![uuid::Uuid::new_v4().to_string(), id],
-                )
-                .map_err(|e| CoreError::Catalog(format!("staging tray: {e}")))?;
+            tx.execute(
+                "INSERT INTO collection (uuid, name, is_staging, project_id)
+                     SELECT ?1, 'Staging', 1, ?2
+                     WHERE NOT EXISTS
+                       (SELECT 1 FROM collection WHERE is_staging=1 AND project_id=?2)",
+                params![uuid::Uuid::new_v4().to_string(), id],
+            )
+            .map_err(|e| CoreError::Catalog(format!("staging tray: {e}")))?;
         }
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("project commit: {e}")))?;
         Ok(id)
     }
 

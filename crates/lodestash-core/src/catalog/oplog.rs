@@ -95,7 +95,9 @@ impl Catalog {
     }
 
     /// Record a trash/untrash op (the direction passed to [`Self::set_trashed`]) so the
-    /// toggle can be reverted. Call before mutating.
+    /// toggle can be reverted. Records `asset_ids` **as given** — the undo flips every one of
+    /// them, so pass only ids the toggle changes, or use [`Self::set_trashed_recorded`], which
+    /// works that out and applies the toggle in the same transaction.
     pub fn record_trash_op(&self, asset_ids: &[i64], trashed: bool) -> Result<i64> {
         let payload = serde_json::json!({
             "asset_ids": asset_ids,
@@ -103,6 +105,51 @@ impl Catalog {
         })
         .to_string();
         self.record_op("set_trashed", &payload, None)
+    }
+
+    /// Move assets to or from the Trash **and** log the toggle for undo, in one transaction —
+    /// recording only the ids whose state actually changed (review B13). Returns how many changed;
+    /// a toggle that changes nothing logs nothing.
+    ///
+    /// The undo of a `set_trashed` op flips every id in its payload. [`Self::record_trash_op`]
+    /// records the ids it is handed, so trashing `{a, b}` while `a` was already trashed logged
+    /// both, and the undo restored `a` too — an asset that trash never moved. Prefer this over
+    /// `set_trashed` + `record_trash_op`.
+    pub fn set_trashed_recorded(&self, asset_ids: &[i64], trashed: bool) -> Result<usize> {
+        if asset_ids.is_empty() {
+            return Ok(0);
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| CoreError::Catalog(format!("trash begin: {e}")))?;
+        // Ids are i64s we produced — safe to inline (rusqlite has no array binds).
+        let id_list = asset_ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let state = if trashed { "IS NULL" } else { "IS NOT NULL" };
+        let changing: Vec<i64> = {
+            let mut stmt = tx
+                .prepare(&format!(
+                    "SELECT id FROM asset WHERE id IN ({id_list}) AND deleted_at {state} ORDER BY id"
+                ))
+                .map_err(|e| CoreError::Catalog(format!("trash scope prep: {e}")))?;
+            let rows = stmt
+                .query_map([], |r| r.get(0))
+                .map_err(|e| CoreError::Catalog(format!("trash scope: {e}")))?;
+            rows.collect::<std::result::Result<_, _>>()
+                .map_err(|e| CoreError::Catalog(format!("trash scope row: {e}")))?
+        };
+        if changing.is_empty() {
+            return Ok(0);
+        }
+        self.set_trashed(&changing, trashed)?;
+        self.record_trash_op(&changing, trashed)?;
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("trash commit: {e}")))?;
+        Ok(changing.len())
     }
 
     /// Record a collection-create op (id + name) so the created collection can be deleted

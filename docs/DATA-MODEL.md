@@ -595,7 +595,9 @@ ALTER TABLE asset ADD COLUMN license_url TEXT;
 
 - **`project`** powers "import **into Unity**" targeting and the active-project facet. The Unity plugin
   upserts its row on panel open (`register_project`) and heartbeats `last_seen_at`; the import flow
-  targets `is_active=1` when no `project_id` is given.
+  targets `is_active=1` when no `project_id` is given. Registration (deactivate the others, upsert,
+  adopt or create the tray) is one transaction: a failure part-way leaves the previously active
+  project active.
 - **`import_record`** is the **durable** outcome of an import (the import *queue* itself is transient,
   job-engine backed — only this result persists). The `UNIQUE(asset_id, project_id)` key is the
   **dup-guard**: before enqueuing, the core checks it and, if the `dest_path` still resolves, surfaces
@@ -621,7 +623,9 @@ ALTER TABLE asset ADD COLUMN license_url TEXT;
   list "Recent exports" per project and **undo a batch** — delete the copied files it produced and
   its records; catalog assets are untouched (confirm-gated, [`UI-SPEC.md`](UI-SPEC.md) §16.1).
 **Delete from disk is the one destructive exception.** The catalog is otherwise non-destructive —
-Trash is a soft delete and originals are never touched. The Settings danger flow may permanently
+Trash is a soft delete and originals are never touched. Undo of a trash/untrash flips back only the
+assets that toggle changed: `Catalog::set_trashed_recorded` applies it and logs the changed ids in
+one transaction, so trashing a selection that held an already-trashed asset never restores that one. The Settings danger flow may permanently
 remove a file, and it is fenced: an explicit confirmation modal naming the file count, a guard that
 refuses any path outside the user's source roots and the app's own extraction workspace, and the
 catalog row is marked trashed **only after** the file actually left the disk, so a failed delete

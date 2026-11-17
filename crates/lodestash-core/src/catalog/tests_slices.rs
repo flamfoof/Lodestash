@@ -494,6 +494,77 @@ fn revert_set_trashed_toggles_direction_in_both_ways() {
     assert!(is_trashed(&c, b), "undo of an untrash re-trashes the asset");
 }
 
+/// Undoing a trash puts back only what that trash changed (review B13): an asset that was already
+/// in the Trash stays there. Same for the other direction, and for redo.
+#[test]
+fn undoing_a_trash_restores_only_what_it_changed() {
+    let (mut c, ids) = tagged_catalog(&[("a.fbx", "model_3d"), ("b.png", "image")]);
+    let (a, b) = (ids[0], ids[1]);
+    c.set_trashed(&[a], true).expect("a is already trashed");
+
+    assert_eq!(
+        c.set_trashed_recorded(&[a, b], true).expect("trash both"),
+        1,
+        "only b changed"
+    );
+    let op = c.recent_ops(1).expect("ops")[0].id;
+    c.revert_op(op).expect("undo");
+    assert!(
+        is_trashed(&c, a),
+        "undo restored an asset this trash never moved"
+    );
+    assert!(!is_trashed(&c, b), "undo restored the one it did");
+    c.redo_op(op).expect("redo");
+    assert!(is_trashed(&c, a) && is_trashed(&c, b));
+
+    // Untrash {a, b} while only a is trashed... first put b back so the sides differ.
+    c.set_trashed(&[b], false).expect("b out");
+    assert_eq!(
+        c.set_trashed_recorded(&[a, b], false)
+            .expect("untrash both"),
+        1,
+        "only a changed"
+    );
+    let op = c.recent_ops(1).expect("ops")[0].id;
+    c.revert_op(op).expect("undo untrash");
+    assert!(is_trashed(&c, a), "undo re-trashed the one it restored");
+    assert!(
+        !is_trashed(&c, b),
+        "undo trashed an asset this untrash never moved"
+    );
+
+    // A toggle that changes nothing leaves nothing to undo.
+    let before = c.recent_ops(10).expect("ops").len();
+    assert_eq!(c.set_trashed_recorded(&[a], true).expect("no-op"), 0);
+    assert_eq!(c.recent_ops(10).expect("ops").len(), before);
+}
+
+/// Registering a project is one transaction (review B13): a failure after "deactivate all"
+/// leaves the previously active project active and no half-registered row behind.
+#[test]
+fn a_failed_project_registration_changes_nothing() {
+    let c = Catalog::open_in_memory().expect("open");
+    let first = c
+        .register_project("C:/dev/First", None, None)
+        .expect("register");
+    // The failure lands on the step right after every other project was deactivated.
+    c.conn
+        .execute_batch(
+            "CREATE TEMP TRIGGER inject_failure BEFORE INSERT ON project
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .expect("inject");
+    assert!(c.register_project("C:/dev/Second", None, None).is_err());
+
+    let projects = c.list_projects().expect("list");
+    assert_eq!(
+        projects.len(),
+        1,
+        "a half-registered project was left behind"
+    );
+    assert_eq!(c.active_project_id().expect("active"), Some(first));
+}
+
 #[test]
 fn redo_applies_the_forward_payload_then_consumes_the_op() {
     let (mut c, ids) = tagged_catalog(&[("a.fbx", "model_3d")]);
