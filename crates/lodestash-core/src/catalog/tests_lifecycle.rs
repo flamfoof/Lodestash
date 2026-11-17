@@ -158,3 +158,111 @@ fn two_connections_racing_to_create_one_catalog_both_succeed() {
     assert_eq!(ids[0], ids[1], "the identity was minted twice");
     assert_eq!(user_version(&db), SCHEMA_VERSION);
 }
+
+// ---- M32: the crawl and in-pack lookups are index searches (v2 plan Task 1.4) ----------------
+
+/// How SQLite would run `sql` here, one plan line per step.
+fn query_plan(c: &Catalog, sql: &str, args: impl rusqlite::Params) -> String {
+    let mut stmt = c
+        .conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .expect("explain");
+    let lines = stmt
+        .query_map(args, |r| r.get::<_, String>(3))
+        .expect("plan")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("plan rows");
+    lines.join("\n")
+}
+
+/// `record_crawl` looks every crawled path up in its source. Without an index led by `rel_path`
+/// that is a walk of the source per file — 2,000 lookups over a 20k-asset catalog took 4.5 s.
+#[test]
+fn the_crawl_lookup_searches_by_path() {
+    let c = Catalog::open_in_memory().expect("open");
+    let plan = query_plan(&c, CRAWL_LOOKUP_SQL, params![1, "a.png"]);
+    assert!(
+        plan.contains("idx_file_rel_path (rel_path=?)"),
+        "the crawl lookup walks instead of searching:\n{plan}"
+    );
+}
+
+/// Materializing an extracted pack finds each entry by `(package, pathname)`; without an index
+/// over both, every file walks the whole pack's manifest.
+#[test]
+fn the_materialize_lookup_searches_by_package_and_path() {
+    let c = Catalog::open_in_memory().expect("open");
+    let plan = query_plan(&c, MATERIALIZE_SQL, params![1, "Assets/a.png", "ws/a.png"]);
+    assert!(
+        plan.contains("idx_pkgentry_path (package_id=? AND pathname=?)"),
+        "the materialize lookup walks the pack:\n{plan}"
+    );
+}
+
+/// M32 adds indexes and nothing else: a v31 catalog keeps every row.
+#[test]
+fn migrating_a_v31_catalog_to_v32_keeps_its_rows() {
+    let mut c = Catalog {
+        conn: Connection::open_in_memory().expect("open"),
+        db_path: None,
+        appraise_focus: AppraiseFocus::default(),
+    };
+    configure_connection(&c.conn).expect("pragmas");
+    c.apply_migrations_up_to(31).expect("v31");
+    c.seed_media_types().expect("seed");
+    let src = c
+        .upsert_import_source("Lib", "C:/lib", "folder")
+        .expect("source");
+    let rec = |rel: &str| CrawlRecord {
+        rel_path: rel.into(),
+        name: rel.into(),
+        media_type: "image".into(),
+        size_bytes: 1,
+        mtime: 1,
+        workspace_rel: None,
+        content_hash: Some(format!("h-{rel}")),
+    };
+    c.record_crawl(src, None, &[rec("a.png"), rec("b/c.png")])
+        .expect("crawl");
+    let pkg = c
+        .upsert_package(src, "C:/lib/p.unitypackage", "p", None, None)
+        .expect("package");
+    c.record_package_entries(
+        pkg,
+        &[PackageEntryRecord {
+            guid: "0123456789abcdef0123456789abcdef".into(),
+            pathname: Some("Assets/x.png".into()),
+            tar_offset: Some(512),
+            size_bytes: Some(10),
+        }],
+    )
+    .expect("entries");
+
+    const TABLES: [&str; 4] = ["import_source", "asset", "asset_file", "package_entry"];
+    let counts = |c: &Catalog| -> Vec<i64> {
+        TABLES
+            .iter()
+            .map(|t| {
+                c.conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                    .expect("count")
+            })
+            .collect()
+    };
+    let before = counts(&c);
+    assert_eq!(before, vec![1, 2, 2, 1], "the fixture holds what it should");
+
+    c.apply_migrations_up_to(32).expect("v32");
+    assert_eq!(c.schema_version().expect("version"), 32);
+    assert_eq!(counts(&c), before, "M32 changed rows");
+    let indexes: i64 = c
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index'
+                AND name IN ('idx_file_rel_path', 'idx_pkgentry_path')",
+            [],
+            |r| r.get(0),
+        )
+        .expect("indexes");
+    assert_eq!(indexes, 2);
+}

@@ -18,7 +18,7 @@ fn open_in_memory_applies_migrations() {
         .conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .expect("user_version");
-    assert_eq!(version, 31, "all 31 migrations should have run");
+    assert_eq!(version, 32, "all 32 migrations should have run");
     assert_eq!(
         version, SCHEMA_VERSION,
         "SCHEMA_VERSION must name the last migration, or every reader refuses a current catalog"

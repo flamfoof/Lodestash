@@ -51,6 +51,18 @@ pub struct InPackClass {
 /// scan-persist ("database is locked").
 const PKG_WRITE_CHUNK: usize = 500;
 
+/// `record_crawl`'s per-file lookup: is this path already a row of this source? Runs once per
+/// crawled file, so it must be an index search, not a walk of the source (M32, `idx_file_rel_path`).
+const CRAWL_LOOKUP_SQL: &str = "SELECT af.id, af.size_bytes, af.mtime, af.asset_id
+     FROM asset_file af JOIN asset a ON a.id = af.asset_id
+     WHERE a.source_id = ?1 AND af.rel_path = ?2";
+
+/// `materialize_in_pack_assets`' per-file update, keyed by the manifest path within one pack. Runs
+/// once per extracted file (M32, `idx_pkgentry_path`).
+const MATERIALIZE_SQL: &str = "UPDATE asset_file SET workspace_rel = ?3
+     WHERE package_entry_id = (SELECT id FROM package_entry
+         WHERE package_id = ?1 AND pathname = ?2)";
+
 /// What `record_crawl` did with a batch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CrawlStats {
@@ -369,7 +381,7 @@ fn scope_clause(only: Option<&[i64]>) -> String {
 
 /// The schema version this build writes and reads: the last migration's number. A reader refuses
 /// any other ([`Catalog::open_reader`]); a test pins it to the migration list.
-pub const SCHEMA_VERSION: u32 = 31;
+pub const SCHEMA_VERSION: u32 = 32;
 
 /// How many `<catalog>.v<N>.bak` files a migration leaves beside the catalog.
 const KEEP_BACKUPS: usize = 2;
@@ -532,6 +544,7 @@ impl Catalog {
             (29, MIGRATION_29_TEXTURE_ROLES),
             (30, MIGRATION_30_EMBEDDING_GENERATION),
             (31, MIGRATION_31_CATALOG_IDENTITY),
+            (32, MIGRATION_32_LOOKUP_INDEXES),
         ];
 
         for &(version, sql) in migrations {
@@ -834,11 +847,7 @@ impl Catalog {
             }
 
             let mut lookup = tx
-                .prepare(
-                    "SELECT af.id, af.size_bytes, af.mtime, af.asset_id
-                     FROM asset_file af JOIN asset a ON a.id = af.asset_id
-                     WHERE a.source_id = ?1 AND af.rel_path = ?2",
-                )
+                .prepare(CRAWL_LOOKUP_SQL)
                 .map_err(|e| CoreError::Catalog(format!("lookup prep: {e}")))?;
 
             for rec in records {
@@ -1112,11 +1121,7 @@ impl Catalog {
                 .map_err(|e| CoreError::Catalog(format!("materialize begin: {e}")))?;
             {
                 let mut stmt = tx
-                    .prepare(
-                        "UPDATE asset_file SET workspace_rel = ?3
-                         WHERE package_entry_id = (SELECT id FROM package_entry
-                             WHERE package_id = ?1 AND pathname = ?2)",
-                    )
+                    .prepare(MATERIALIZE_SQL)
                     .map_err(|e| CoreError::Catalog(format!("materialize prep: {e}")))?;
                 for (pathname, workspace_rel) in batch {
                     let changed = stmt
@@ -2355,6 +2360,18 @@ const MIGRATION_14_IN_PACK_ASSETS: &str = "
 ALTER TABLE asset_file ADD COLUMN package_entry_id INTEGER REFERENCES package_entry(id);
 CREATE INDEX IF NOT EXISTS idx_file_pkgentry
   ON asset_file(package_entry_id) WHERE package_entry_id IS NOT NULL;
+";
+
+/// M32 — the two per-file lookups become index searches (v2 plan Task 1.4, review P1).
+///
+/// `record_crawl` looks every crawled path up in its source (`CRAWL_LOOKUP_SQL`). With no index
+/// led by `rel_path`, SQLite walked the source's assets by `idx_asset_source` and probed each one,
+/// so persisting a crawl was quadratic: 2,000 lookups over a 20k-asset replica took 4.5 s.
+/// `materialize_in_pack_assets` finds each extracted file's entry by `(package_id, pathname)`
+/// (`MATERIALIZE_SQL`) and walked the whole pack's manifest per file. Indexes only — no row changes.
+const MIGRATION_32_LOOKUP_INDEXES: &str = "
+CREATE INDEX IF NOT EXISTS idx_file_rel_path ON asset_file(rel_path);
+CREATE INDEX IF NOT EXISTS idx_pkgentry_path ON package_entry(package_id, pathname);
 ";
 
 /// M31 — the catalog's own identity (v1 plan S11, ENGINE-API §8.4).
