@@ -3,6 +3,7 @@ members = [
     "crates/lodestash-core",
     "crates/lodestash-ingest",
     "crates/lodestash-ai",
+    "crates/lodestash-protocol",
     "crates/lodestash-mcp",
     "crates/lodestash-api",
     "crates/lodestash-app",
@@ -94,6 +95,7 @@ proptest = "1"
 lodestash-core   = { path = "crates/lodestash-core" }
 lodestash-ingest = { path = "crates/lodestash-ingest" }
 lodestash-ai     = { path = "crates/lodestash-ai" }
+lodestash-protocol = { path = "crates/lodestash-protocol" }
 lodestash-mcp    = { path = "crates/lodestash-mcp" }
 lodestash-api    = { path = "crates/lodestash-api" }
 lodestash-app    = { path = "crates/lodestash-app" }
