@@ -40,7 +40,9 @@ vector DB at this scale.
 Run with `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, a generous page cache.
 The agent planes' connection is the exception: `Catalog::open_reader` opens the file
 `SQLITE_OPEN_READ_ONLY`, issues no pragma that writes, and refuses a schema version other than
-`SCHEMA_VERSION` (v1 plan S11) — migrating is the writer's job.
+`SCHEMA_VERSION` (v1 plan S11) — migrating is the writer's job. It returns a `CatalogReader`, which
+exposes only the read methods it lists (`crates/lodestash-core/src/catalog/reader.rs`), so a write
+through it does not compile; `CatalogWriter` is the full `Catalog`.
 
 ---
 
@@ -380,8 +382,13 @@ CREATE TABLE asset_category (
 - **Watch**: `notify` crate for live updates, **always paired with a periodic full reconcile** (watchers
   drop events under bursts).
 - **Move/rename**: a path that vanished + a new path with the **same `content_hash`** ⇒ same file
-  moved — update `rel_path` in place, preserving `asset_id`, tags, embeddings, and mappings. Missing
-  with no hash match ⇒ `missing=1` (grace period, no hard delete — resilient to unplugged drives).
+  moved — update `rel_path` in place, preserving `asset_id`, tags, embeddings, and mappings
+  (`Catalog::reconcile_moves`). Matching is **one to one**: a "new path" is one no row of the source
+  holds (never two rows on one path); within one hash, rows and paths with the same file name pair
+  first, and the leftovers pair only when both sides are the same size — otherwise nothing is
+  guessed and they fall to the missing/new handling below. Trashed assets (`deleted_at`) never
+  move. The moved paths count as present for the missing pass. Missing with no hash match ⇒
+  `missing=1` (grace period, no hard delete — resilient to unplugged drives).
 - **Perf at 100k**: FTS5 BM25 sub-10 ms; sqlite-vec KNN tens-of-ms (less with partition keys +
   pre-filter). Past ~500k–1M vectors, flip the `VectorIndex` seam to LanceDB (HNSW).
 
@@ -588,7 +595,9 @@ ALTER TABLE asset ADD COLUMN license_url TEXT;
 
 - **`project`** powers "import **into Unity**" targeting and the active-project facet. The Unity plugin
   upserts its row on panel open (`register_project`) and heartbeats `last_seen_at`; the import flow
-  targets `is_active=1` when no `project_id` is given.
+  targets `is_active=1` when no `project_id` is given. Registration (deactivate the others, upsert,
+  adopt or create the tray) is one transaction: a failure part-way leaves the previously active
+  project active.
 - **`import_record`** is the **durable** outcome of an import (the import *queue* itself is transient,
   job-engine backed — only this result persists). The `UNIQUE(asset_id, project_id)` key is the
   **dup-guard**: before enqueuing, the core checks it and, if the `dest_path` still resolves, surfaces
@@ -614,7 +623,9 @@ ALTER TABLE asset ADD COLUMN license_url TEXT;
   list "Recent exports" per project and **undo a batch** — delete the copied files it produced and
   its records; catalog assets are untouched (confirm-gated, [`UI-SPEC.md`](UI-SPEC.md) §16.1).
 **Delete from disk is the one destructive exception.** The catalog is otherwise non-destructive —
-Trash is a soft delete and originals are never touched. The Settings danger flow may permanently
+Trash is a soft delete and originals are never touched. Undo of a trash/untrash flips back only the
+assets that toggle changed: `Catalog::set_trashed_recorded` applies it and logs the changed ids in
+one transaction, so trashing a selection that held an already-trashed asset never restores that one. The Settings danger flow may permanently
 remove a file, and it is fenced: an explicit confirmation modal naming the file count, a guard that
 refuses any path outside the user's source roots and the app's own extraction workspace, and the
 catalog row is marked trashed **only after** the file actually left the disk, so a failed delete
@@ -929,7 +940,26 @@ ALTER TABLE project ADD COLUMN pipeline TEXT;     -- the registered editor's pip
 ## 13. Migration ledger
 
 `PRAGMA user_version` tracks the schema version; each migration runs exactly once inside a
-transaction, in order, on open. Shipped so far:
+transaction, in order, on open.
+
+**Lifecycle** (v2 spec §4.2; `Catalog::open` / `Catalog::open_reader` in
+`crates/lodestash-core/src/catalog/mod.rs`):
+
+- `open` creates a missing catalog and migrates an existing one to `SCHEMA_VERSION`. A catalog at a
+  **newer** version is refused with `CoreError::SchemaTooNew` and left untouched — an older build
+  never writes a schema it does not know.
+- Before the first step touches an **existing** catalog (version > 0), it is copied with
+  `VACUUM INTO` to `<catalog>.v<from>.bak` beside it — one consistent snapshot even while another
+  connection writes, written under a temporary name and renamed, so a backup is whole or absent. The
+  newest two backups are kept. A new file and a current one are not backed up.
+- Each step takes the write lock first (`BEGIN IMMEDIATE`) and re-reads `user_version` under it, so
+  two processes opening one file apply every step once; the loser of the race skips the steps the
+  winner applied. A failing step rolls back alone and the open fails, leaving the catalog at the
+  last good version with its backup beside it.
+- `open_reader` never migrates: it refuses an older catalog (`SchemaTooOld`, "open the Lodestash
+  app once") and a newer one (`SchemaTooNew`).
+
+Shipped so far:
 
 | ver | Contents |
 |---|---|
@@ -937,6 +967,7 @@ transaction, in order, on open. Shipped so far:
 | **M2** | Mapping library: `taxonomy`, `category`, `category_alias`, `mapping_rule`, `asset_category` (§4) |
 | **M3** | Engine round-trip: `package` + `asset.package_id`, `project`, `import_record`, `asset.license/attribution/license_url` (§7, §9) |
 | **M4** | `asset.rating`, `package.pipeline`, `project.pipeline` (§12) |
+| **M32** | Lookup indexes (v2 plan Task 1.4, review P1): `idx_file_rel_path ON asset_file(rel_path)` and `idx_pkgentry_path ON package_entry(package_id, pathname)`. `record_crawl` looks every crawled path up in its source, and with no index led by `rel_path` SQLite walked the source's assets per file — persisting a crawl was quadratic (2,000 lookups over a 20k-asset replica: 4.5 s). Materializing an extracted pack walked the pack's manifest per file the same way. Indexes only; no row changes. The first catalog version the lifecycle above backs up before migrating |
 | **M31** | Catalog identity (v1 plan S11): `catalog_meta(key, value)` holding a random `catalog_id`, minted by the migration. A path is not an identity — it changes when the file moves — and a headless MCP server must only forward to an app serving the same catalog (ENGINE-API §1). Readers refuse any schema but their own (`Catalog::open_reader`), so an agent host connecting first cannot upgrade a catalog the app has not |
 | **M30** | Embedding generations (v1 plan S09): `embedding_generation(model_id, generation, updated_at)`, bumped inside every `upsert_embedding` transaction. A resident vector snapshot (§3) is only safe if staleness is a fact in the catalog — a GUI process cannot notify an independent headless one. Existing models start at generation 1; no vector is touched and the cache starts empty on every restart |
 | **M29** | Texture roles (v1 plan S07): `asset_relationship.role` holds the material property a `uses_texture` edge fills (`_MainTex`, `_BumpMap`…), so a preview paints with the albedo instead of the lowest-id texture (§10). Every live material is queued for one more dependency scan to fill it; an edge without a role is judged by its texture's file name |

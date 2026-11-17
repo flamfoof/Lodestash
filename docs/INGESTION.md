@@ -151,6 +151,11 @@ to a single entry; reaching any entry means decompressing from the start. Lodest
   records each payload's **`tar_offset`/`size_bytes`**, which is what makes the surgical pull below
   possible, and importing the pack mints an **in-pack `asset` per entry** from it
   ([`DATA-MODEL.md`](DATA-MODEL.md) §7 / M14) — no payload is read.
+- **Hostile or unusual archives** (v2 plan Task 1.7): members named `./<guid>/…` (packed with
+  `tar -C dir .`) read exactly like `<guid>/…`; a `pathname` or `asset.meta` over **64 KiB** is
+  skipped with a warning instead of read into memory (the payload beside it still indexes, under
+  its GUID); and a GUID becomes a file name only when it is 32 hex digits — a folder or catalogued
+  locator named `..` or `../x` is skipped, never joined onto a workspace path.
 - **Surgical pull** = one gzip skip-scan (decompress-and-discard to a payload's offset, copy just that
   payload, ignore the rest — `extract_at_offsets`). This is the workhorse for **preview**, **identify**
   and single-file **Add to project**: the pack is never fully unpacked. **Identify pulls one payload**

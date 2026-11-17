@@ -752,7 +752,7 @@ Governing docs: [review](reviews/2026-11-16-architecture-review.md) ·
 tracking; these cards track phases).
 
 - [x] **V2-P0** Review, spec, ADR-0021/0022/0023, plan, one reconciled prototype
-- [ ] **V2-P1** Core hardening — typed errors, migration lifecycle, `CatalogReader`, lookup indexes, moves keep identity, atomic project registration, robust unitypackage reads
+- [x] **V2-P1** Core hardening — typed errors, migration lifecycle, `CatalogReader`, lookup indexes, moves keep identity, atomic project registration, robust unitypackage reads *(2026-11-16; one carry-over: the desktop writer's `Op::SetTrashed` moves to `Catalog::set_trashed_recorded` with the writer in Task 2.3)*
 - [ ] **V2-P2** `lodestash-protocol` operation catalog; `lodestash-engine` absorbs app + writer + read model; config store; one appraisal plan and job registry
 - [ ] **V2-P3** `lodestash-api` derived from the catalog; UI session, request checks, SSE, bytes, static UI
 - [ ] **V2-P4** `lodestash-mcp` standalone thin client with auto-launch

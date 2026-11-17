@@ -65,7 +65,19 @@ impl Catalog {
             )
             .map_err(|e| CoreError::Catalog(format!("delete_collection: {e}")))?;
         if n == 0 {
-            return Err(CoreError::Catalog("no such collection".into()));
+            let staging: bool = self
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM collection WHERE id = ?1 AND is_staging = 1)",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| CoreError::Catalog(format!("delete_collection lookup: {e}")))?;
+            return Err(if staging {
+                CoreError::Invalid("the staging tray cannot be deleted".into())
+            } else {
+                CoreError::NotFound(format!("no such collection {id}"))
+            });
         }
         Ok(())
     }

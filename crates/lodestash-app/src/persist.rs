@@ -367,9 +367,11 @@ pub fn persist_to_catalog(
             .record_crawl(id, None, &remaining)
             .map_err(|e| e.to_string())?;
         // Files gone from disk are flagged missing (metadata preserved, hidden from
-        // hydrate + grid); files that came back are unflagged.
+        // hydrate + grid); files that came back are unflagged. Present means every path the
+        // crawl saw — a moved file's new path included, or its repointed row is flagged missing
+        // and leaves the grid (review B1).
         let present: std::collections::HashSet<String> =
-            remaining.iter().map(|r| r.rel_path.clone()).collect();
+            batch.records.iter().map(|r| r.rel_path.clone()).collect();
         let (gone, back) = catalog
             .reconcile_missing(id, &present)
             .map_err(|e| e.to_string())?;
@@ -397,4 +399,110 @@ pub fn persist_to_catalog(
     // Hand the open connection back so the caller can drain `embedding_dirty` on this same
     // thread — keeps the single-writer rule (ARCHITECTURE §5) with no extra writer thread.
     Ok((counts, assets, catalog))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn batch(files: &[(&str, &str)]) -> PersistBatch {
+        PersistBatch {
+            root: "C:/lib".into(),
+            name: "Lib".into(),
+            excludes_json: None,
+            records: files
+                .iter()
+                .map(|(rel, hash)| CrawlRecord {
+                    rel_path: rel.to_string(),
+                    name: rel.rsplit('/').next().unwrap().to_string(),
+                    media_type: "image".into(),
+                    size_bytes: 1,
+                    mtime: 1,
+                    workspace_rel: None,
+                    content_hash: Some(hash.to_string()),
+                })
+                .collect(),
+        }
+    }
+
+    /// `(rel_path, asset_id)` the grid would show for the source after a persist: live rows only,
+    /// read back through a separate connection.
+    fn shown(db: &std::path::Path) -> Vec<(String, i64)> {
+        let c = Catalog::open(db).unwrap();
+        let src = c.source_info_by_root("C:/lib").unwrap().unwrap().id;
+        let mut rows: Vec<(String, i64)> = c
+            .entries_for_source(src)
+            .unwrap()
+            .into_iter()
+            .map(|a| (a.rel_path, a.asset_id))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// A renamed file keeps its identity and stays on screen (review B1): the repointed row is on
+    /// disk at its new path, so the missing pass must count it present. It used to be flagged
+    /// missing and vanish from the grid until something else in the source changed.
+    #[test]
+    fn a_renamed_file_keeps_its_identity_and_stays_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        persist_to_catalog(&db, &[batch(&[("rock.png", "H1"), ("tree.png", "H2")])]).unwrap();
+        let before = shown(&db);
+        let rock = before.iter().find(|(p, _)| p == "rock.png").unwrap().1;
+        {
+            let mut c = Catalog::open(&db).unwrap();
+            c.add_asset_tag(rock, "manual", "subject", "boulder")
+                .unwrap();
+        }
+
+        persist_to_catalog(
+            &db,
+            &[batch(&[("stones/big rock.png", "H1"), ("tree.png", "H2")])],
+        )
+        .unwrap();
+        let after = shown(&db);
+        assert!(
+            after.contains(&("stones/big rock.png".to_string(), rock)),
+            "the renamed file is shown under its old id: {after:?}"
+        );
+        assert_eq!(
+            after.len(),
+            2,
+            "nothing went missing, nothing was duplicated"
+        );
+        let tags = Catalog::open(&db).unwrap().tags_for_asset(rock).unwrap();
+        assert_eq!(tags[0].value, "boulder", "its tags came with it");
+    }
+
+    /// A folder of byte-identical files moves file by file: two ids on two paths, both shown,
+    /// each with its own tags (review B2, end to end).
+    #[test]
+    fn a_moved_folder_of_identical_files_keeps_both_identities() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        persist_to_catalog(&db, &[batch(&[("old/a.png", "H"), ("old/b.png", "H")])]).unwrap();
+        let before = shown(&db);
+        let labels = ["alpha", "beta"];
+        {
+            let mut c = Catalog::open(&db).unwrap();
+            for ((_, id), label) in before.iter().zip(labels) {
+                c.add_asset_tag(*id, "manual", "subject", label).unwrap();
+            }
+        }
+
+        persist_to_catalog(&db, &[batch(&[("new/a.png", "H"), ("new/b.png", "H")])]).unwrap();
+        let after = shown(&db);
+        let ids = |rows: &[(String, i64)]| rows.iter().map(|r| r.1).collect::<Vec<_>>();
+        assert_eq!(
+            after.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            vec!["new/a.png", "new/b.png"]
+        );
+        assert_eq!(ids(&after), ids(&before), "each file kept its id");
+        let c = Catalog::open(&db).unwrap();
+        for ((_, id), label) in before.iter().zip(labels) {
+            let tag = c.tags_for_asset(*id).unwrap()[0].value.clone();
+            assert_eq!(tag, label, "asset {id} kept its own tag");
+        }
+    }
 }

@@ -270,7 +270,7 @@ pub fn validate_assignments(
 }
 
 fn invalid(why: impl std::fmt::Display) -> CoreError {
-    CoreError::Catalog(format!("invalid tag batch: {why}"))
+    CoreError::Invalid(format!("invalid tag batch: {why}"))
 }
 
 /// One association as history records it.
@@ -563,10 +563,11 @@ impl Catalog {
             if let Some(expected) = &it.expected_revision {
                 let current = annotation_revision_in(&tx, it.asset_id)?;
                 if &current != expected {
-                    return Err(CoreError::Catalog(format!(
-                        "revision_conflict: asset {} changed since revision {expected}",
-                        it.asset_id
-                    )));
+                    return Err(CoreError::RevisionConflict {
+                        asset_id: it.asset_id,
+                        expected: expected.clone(),
+                        actual: current,
+                    });
                 }
             }
         }
@@ -791,8 +792,8 @@ impl Catalog {
             let now_rows = rows_for(&tx, ch.asset_id, &ch.sources)?;
             let caption_moved = ch.caption && description_of(&tx, ch.asset_id)? != from.description;
             if !same_rows(&now_rows, &from.rows) || caption_moved {
-                return Err(CoreError::Catalog(format!(
-                    "conflict: asset {} has changed since this edit, so it was not {verb} — \
+                return Err(CoreError::Conflict(format!(
+                    "asset {} has changed since this edit, so it was not {verb} — \
                      another writer's newer tags are left as they are",
                     ch.asset_id
                 )));

@@ -52,7 +52,7 @@ impl Catalog {
             )
             .map_err(|e| CoreError::Catalog(format!("taxonomy activate: {e}")))?;
         if n == 0 {
-            return Err(CoreError::Catalog(format!(
+            return Err(CoreError::NotFound(format!(
                 "no such taxonomy {taxonomy_id}"
             )));
         }
@@ -98,7 +98,7 @@ impl Catalog {
             .execute("DELETE FROM taxonomy WHERE id = ?1", params![taxonomy_id])
             .map_err(|e| CoreError::Catalog(format!("delete taxonomy: {e}")))?;
         if n == 0 {
-            return Err(CoreError::Catalog(format!(
+            return Err(CoreError::NotFound(format!(
                 "no such taxonomy {taxonomy_id}"
             )));
         }
@@ -129,7 +129,7 @@ impl Catalog {
             )
             .optional()
             .map_err(|e| CoreError::Catalog(format!("rename lookup: {e}")))?
-            .ok_or_else(|| CoreError::Catalog(format!("no such category {category_id}")))?;
+            .ok_or_else(|| CoreError::NotFound(format!("no such category {category_id}")))?;
         let parent_path: String = match parent_id {
             Some(pid) => tx
                 .query_row(
@@ -183,7 +183,7 @@ impl Catalog {
     pub fn delete_category(&mut self, category_id: i64) -> Result<usize> {
         let ids = self.category_subtree(category_id)?;
         if ids.is_empty() {
-            return Err(CoreError::Catalog(format!(
+            return Err(CoreError::NotFound(format!(
                 "no such category {category_id}"
             )));
         }

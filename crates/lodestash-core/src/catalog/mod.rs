@@ -51,6 +51,18 @@ pub struct InPackClass {
 /// scan-persist ("database is locked").
 const PKG_WRITE_CHUNK: usize = 500;
 
+/// `record_crawl`'s per-file lookup: is this path already a row of this source? Runs once per
+/// crawled file, so it must be an index search, not a walk of the source (M32, `idx_file_rel_path`).
+const CRAWL_LOOKUP_SQL: &str = "SELECT af.id, af.size_bytes, af.mtime, af.asset_id
+     FROM asset_file af JOIN asset a ON a.id = af.asset_id
+     WHERE a.source_id = ?1 AND af.rel_path = ?2";
+
+/// `materialize_in_pack_assets`' per-file update, keyed by the manifest path within one pack. Runs
+/// once per extracted file (M32, `idx_pkgentry_path`).
+const MATERIALIZE_SQL: &str = "UPDATE asset_file SET workspace_rel = ?3
+     WHERE package_entry_id = (SELECT id FROM package_entry
+         WHERE package_id = ?1 AND pathname = ?2)";
+
 /// What `record_crawl` did with a batch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CrawlStats {
@@ -369,10 +381,16 @@ fn scope_clause(only: Option<&[i64]>) -> String {
 
 /// The schema version this build writes and reads: the last migration's number. A reader refuses
 /// any other ([`Catalog::open_reader`]); a test pins it to the migration list.
-pub const SCHEMA_VERSION: u32 = 31;
+pub const SCHEMA_VERSION: u32 = 32;
+
+/// How many `<catalog>.v<N>.bak` files a migration leaves beside the catalog.
+const KEEP_BACKUPS: usize = 2;
 
 impl Catalog {
-    /// Open (or create) the catalog at `path`. Runs all pending migrations.
+    /// Open the catalog at `path`, creating it when missing, and migrate it to [`SCHEMA_VERSION`]
+    /// (DATA-MODEL §13 "Lifecycle"). An existing catalog is copied to `<file>.v<from>.bak` before
+    /// the first migration step touches it. A catalog a newer build wrote is refused with
+    /// [`CoreError::SchemaTooNew`] and left exactly as it was.
     pub fn open(path: &Path) -> Result<Self> {
         let conn =
             Connection::open(path).map_err(|e| CoreError::Catalog(format!("open failed: {e}")))?;
@@ -383,55 +401,63 @@ impl Catalog {
             db_path: Some(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())),
             appraise_focus: AppraiseFocus::default(),
         };
+        let from = catalog.schema_version()?;
+        refuse_newer(from)?;
+        if from < SCHEMA_VERSION {
+            catalog.backup_before_migration(path, from)?;
+        }
         catalog.apply_migrations()?;
+        // Another build may have moved the file on while this one waited for the lock.
+        refuse_newer(catalog.schema_version()?)?;
         Ok(catalog)
     }
 
-    /// Open an existing catalog **read-only** — the agent planes' own connection (v1 plan S11).
+    /// Copy a catalog at schema `from` to `<file>.v<from>.bak` before a migration changes it, and
+    /// keep only the newest [`KEEP_BACKUPS`]. `None` when there is nothing to keep: a new, empty
+    /// file (`from == 0`) or one already current.
     ///
-    /// Schema setup belongs to the one writer (ADR-0002). [`Self::open`] migrates, so a headless
-    /// MCP server that used it could upgrade the live catalog underneath a running app, from a
-    /// process that owns none of the app's state. This connection cannot write at all — the file is
-    /// opened with `SQLITE_OPEN_READ_ONLY`, and no pragma that changes the file is issued — and a
-    /// catalog at any other schema version is refused with what to do, rather than read with
-    /// queries written for a different shape.
-    pub fn open_reader(path: &Path) -> Result<Self> {
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_URI,
-        )
-        .map_err(|e| CoreError::Catalog(format!("open failed: {e}")))?;
-        // No `journal_mode`: the writer set WAL on the file, and changing it is a write. A reader
-        // needs only its own cache, and to wait on the writer rather than error.
-        conn.execute_batch(
-            "PRAGMA foreign_keys=ON;
-             PRAGMA cache_size=-32768;
-             PRAGMA temp_store=MEMORY;
-             PRAGMA busy_timeout=15000;",
-        )
-        .map_err(|e| CoreError::Catalog(format!("configure pragmas: {e}")))?;
-        let catalog = Self {
-            conn,
-            db_path: Some(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())),
-            appraise_focus: AppraiseFocus::default(),
-        };
-        let version = catalog.schema_version()?;
-        if version != SCHEMA_VERSION {
-            return Err(CoreError::Catalog(if version < SCHEMA_VERSION {
-                format!(
-                    "the catalog is at schema v{version} and this build reads v{SCHEMA_VERSION} — \
-                     open the Lodestash app once to upgrade it"
-                )
-            } else {
-                format!(
-                    "the catalog is at schema v{version}, newer than this build (v{SCHEMA_VERSION}) \
-                     — update Lodestash"
-                )
-            }));
+    /// `VACUUM INTO` reads one consistent snapshot even while another connection writes (WAL), and
+    /// it writes a complete database, so a backup is either whole or absent: it goes to a temporary
+    /// name first and is renamed into place.
+    fn backup_before_migration(&self, path: &Path, from: u32) -> Result<Option<PathBuf>> {
+        if from == 0 || from >= SCHEMA_VERSION {
+            return Ok(None);
         }
-        Ok(catalog)
+        let name = path
+            .file_name()
+            .ok_or_else(|| CoreError::Catalog(format!("no file name in {}", path.display())))?
+            .to_string_lossy()
+            .into_owned();
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let backup = dir.join(format!("{name}.v{from}.bak"));
+        let partial = dir.join(format!("{name}.v{from}.bak.partial"));
+        if partial.exists() {
+            std::fs::remove_file(&partial)?;
+        }
+        info!(from, backup = %backup.display(), "backing up the catalog before migrating it");
+        self.conn
+            .execute("VACUUM INTO ?1", params![partial.to_string_lossy()])
+            .map_err(|e| CoreError::Catalog(format!("backup before migration: {e}")))?;
+        std::fs::rename(&partial, &backup)?;
+
+        let prefix = format!("{name}.v");
+        let mut kept: Vec<(u32, PathBuf)> = std::fs::read_dir(dir)?
+            .filter_map(|e| {
+                let e = e.ok()?;
+                let file = e.file_name().to_string_lossy().into_owned();
+                let v = file
+                    .strip_prefix(&prefix)?
+                    .strip_suffix(".bak")?
+                    .parse()
+                    .ok()?;
+                Some((v, e.path()))
+            })
+            .collect();
+        kept.sort_unstable_by_key(|(v, _)| std::cmp::Reverse(*v));
+        for (_, old) in kept.into_iter().skip(KEEP_BACKUPS) {
+            std::fs::remove_file(&old)?;
+        }
+        Ok(Some(backup))
     }
 
     /// In-memory catalog (tests / CLI dry-run).
@@ -480,8 +506,12 @@ impl Catalog {
     /// Run pending migrations up to and including `max_version` (tests use this to
     /// build a fixture at an older schema, then re-run to exercise one migration's
     /// data steps). Each migration runs inside its own transaction (DATA-MODEL §13).
+    ///
+    /// Each step takes the write lock first (`BEGIN IMMEDIATE`) and reads `user_version` again
+    /// under it: another connection — a second process opening the same file — may have applied
+    /// the step while this one waited, and a step applied twice fails (`ALTER TABLE … ADD COLUMN`
+    /// is not idempotent) or worse, applies its data step twice.
     fn apply_migrations_up_to(&mut self, max_version: u32) -> Result<()> {
-        let current = self.schema_version()?;
         let migrations: &[(u32, &str)] = &[
             (1, MIGRATION_01_BASE_SCHEMA),
             (2, MIGRATION_02_PACKAGES),
@@ -514,23 +544,35 @@ impl Catalog {
             (29, MIGRATION_29_TEXTURE_ROLES),
             (30, MIGRATION_30_EMBEDDING_GENERATION),
             (31, MIGRATION_31_CATALOG_IDENTITY),
+            (32, MIGRATION_32_LOOKUP_INDEXES),
         ];
 
-        for (version, sql) in migrations {
-            if current < *version && *version <= max_version {
-                info!(version, "applying schema migration");
-                let tx = self
-                    .conn
-                    .transaction()
-                    .map_err(|e| CoreError::Catalog(format!("migration {version} begin: {e}")))?;
-                tx.execute_batch(sql)
-                    .map_err(|e| CoreError::Catalog(format!("migration {version} failed: {e}")))?;
-                // PRAGMA user_version cannot be parameterised — format is safe (u32 literal).
-                tx.execute_batch(&format!("PRAGMA user_version = {version};"))
-                    .map_err(|e| CoreError::Catalog(format!("set user_version: {e}")))?;
-                tx.commit()
-                    .map_err(|e| CoreError::Catalog(format!("migration {version} commit: {e}")))?;
+        for &(version, sql) in migrations {
+            if version > max_version {
+                break;
             }
+            // Unlocked first look: an up-to-date catalog takes no write lock to open.
+            if self.schema_version()? >= version {
+                continue;
+            }
+            let tx = self
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| CoreError::Catalog(format!("migration {version} begin: {e}")))?;
+            let current: u32 = tx
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .map_err(|e| CoreError::Catalog(format!("migration {version} version: {e}")))?;
+            if current >= version {
+                continue; // applied by another connection while this one waited; rolls back
+            }
+            info!(version, "applying schema migration");
+            tx.execute_batch(sql)
+                .map_err(|e| CoreError::Catalog(format!("migration {version} failed: {e}")))?;
+            // PRAGMA user_version cannot be parameterised — format is safe (u32 literal).
+            tx.execute_batch(&format!("PRAGMA user_version = {version};"))
+                .map_err(|e| CoreError::Catalog(format!("set user_version: {e}")))?;
+            tx.commit()
+                .map_err(|e| CoreError::Catalog(format!("migration {version} commit: {e}")))?;
         }
         Ok(())
     }
@@ -805,11 +847,7 @@ impl Catalog {
             }
 
             let mut lookup = tx
-                .prepare(
-                    "SELECT af.id, af.size_bytes, af.mtime, af.asset_id
-                     FROM asset_file af JOIN asset a ON a.id = af.asset_id
-                     WHERE a.source_id = ?1 AND af.rel_path = ?2",
-                )
+                .prepare(CRAWL_LOOKUP_SQL)
                 .map_err(|e| CoreError::Catalog(format!("lookup prep: {e}")))?;
 
             for rec in records {
@@ -1083,11 +1121,7 @@ impl Catalog {
                 .map_err(|e| CoreError::Catalog(format!("materialize begin: {e}")))?;
             {
                 let mut stmt = tx
-                    .prepare(
-                        "UPDATE asset_file SET workspace_rel = ?3
-                         WHERE package_entry_id = (SELECT id FROM package_entry
-                             WHERE package_id = ?1 AND pathname = ?2)",
-                    )
+                    .prepare(MATERIALIZE_SQL)
                     .map_err(|e| CoreError::Catalog(format!("materialize prep: {e}")))?;
                 for (pathname, workspace_rel) in batch {
                     let changed = stmt
@@ -1284,11 +1318,20 @@ impl Catalog {
     }
 
     /// Move/rename detection (DATA-MODEL §6): a file whose **path vanished** from a crawl while
-    /// its **content hash reappeared at another path** is the same file moved — update `rel_path`
-    /// in place, preserving `asset_id`, tags, embeddings, mappings and the hash. Trashed assets
-    /// are exempt (trash is a user decision; a moved file must not resurrect it). Returns the
-    /// new rel_paths that were consumed, so the caller can drop them from `record_crawl` and
-    /// avoid a duplicate insert.
+    /// its **content hash reappeared at a new path** is the same file moved — update `rel_path`
+    /// in place, preserving `asset_id`, tags, embeddings, mappings and the hash. Returns the new
+    /// rel_paths that were consumed, so the caller can drop them from `record_crawl` and avoid a
+    /// duplicate insert; they are on disk, so they still count as present for
+    /// [`Self::reconcile_missing`].
+    ///
+    /// - Matching is **one to one**: each vanished row takes at most one new path and each new path
+    ///   at most one row ([`pair_moves`]). Byte-identical files moved together keep one identity
+    ///   each; when a hash has more vanished rows than new paths, or fewer, the leftovers are left to
+    ///   the normal missing/new handling rather than guessed.
+    /// - A "new path" is one **no row of the source holds** — a present duplicate's path is not a
+    ///   destination, so a move never puts two rows on one path.
+    /// - Trashed assets (`deleted_at`) are exempt: trash is a user decision, and a crawl that finds
+    ///   the bytes elsewhere must not carry the trashed row there.
     ///
     /// Call this **before** `record_crawl` on a full-source crawl. Missing rows (`af.missing=1`)
     /// are included: a file that reappears at a new path is a move back, not a duplicate.
@@ -1297,69 +1340,86 @@ impl Catalog {
         source_id: i64,
         records: &[CrawlRecord],
     ) -> Result<Vec<String>> {
-        let present: std::collections::HashSet<String> =
-            records.iter().map(|r| r.rel_path.clone()).collect();
-        // New-path records with a hash are the move candidates: same bytes, new location.
-        let hash_to_rel: std::collections::HashMap<&str, &CrawlRecord> = records
-            .iter()
-            .filter_map(|r| r.content_hash.as_deref().map(|h| (h, r)))
-            .collect();
-        if hash_to_rel.is_empty() {
+        if records.iter().all(|r| r.content_hash.is_none()) {
             return Ok(Vec::new());
         }
-        // Vanished files: in the catalog, not in this crawl, with a known hash.
-        let vanished: Vec<(i64, String, String, i64)> = {
+        // Every row of the source — package rows too: `record_crawl` looks a path up across all of
+        // them, so none of their paths is free to move onto.
+        let rows: Vec<(i64, String, Option<String>, i64, bool)> = {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT af.id, af.rel_path, a.content_hash, a.id
+                    "SELECT af.id, af.rel_path, a.content_hash, a.id,
+                            a.package_id IS NULL AND a.deleted_at IS NULL
                      FROM asset_file af JOIN asset a ON a.id = af.asset_id
-                     WHERE a.source_id = ?1 AND a.package_id IS NULL
-                       AND a.status != 'trashed'
-                       AND a.content_hash IS NOT NULL",
+                     WHERE a.source_id = ?1",
                 )
                 .map_err(|e| CoreError::Catalog(format!("moves prep: {e}")))?;
             let mapped = stmt
                 .query_map(params![source_id], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                 })
                 .map_err(|e| CoreError::Catalog(format!("moves query: {e}")))?;
             mapped
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(|e| CoreError::Catalog(format!("moves row: {e}")))?
         };
+        let held: HashSet<&str> = rows.iter().map(|r| r.1.as_str()).collect();
+        let present: HashSet<&str> = records.iter().map(|r| r.rel_path.as_str()).collect();
+
+        // Vanished: loose, live, hashed rows whose path this crawl did not see.
+        let mut vanished: HashMap<&str, Vec<MoveSource<'_>>> = HashMap::new();
+        for (file_id, rel_path, hash, asset_id, movable) in &rows {
+            if let (true, Some(hash)) = (*movable, hash.as_deref()) {
+                if !present.contains(rel_path.as_str()) {
+                    vanished.entry(hash).or_default().push(MoveSource {
+                        file_id: *file_id,
+                        asset_id: *asset_id,
+                        rel_path,
+                    });
+                }
+            }
+        }
+        // New: hashed records at a path no row holds.
+        let mut fresh: HashMap<&str, Vec<&CrawlRecord>> = HashMap::new();
+        for r in records {
+            if let Some(hash) = r.content_hash.as_deref() {
+                if !held.contains(r.rel_path.as_str()) {
+                    fresh.entry(hash).or_default().push(r);
+                }
+            }
+        }
 
         let tx = self
             .conn
             .transaction()
             .map_err(|e| CoreError::Catalog(format!("moves begin: {e}")))?;
         let mut moved = Vec::new();
-        for (file_id, rel_path, hash, asset_id) in vanished {
-            if present.contains(&rel_path) {
-                continue; // still on disk at the same path — not a move
-            }
-            let Some(rec) = hash_to_rel.get(hash.as_str()) else {
+        for (hash, sources) in vanished {
+            let Some(targets) = fresh.remove(hash) else {
                 continue; // vanished with no hash match — the caller's reconcile_missing flags it
             };
-            tx.execute(
-                "UPDATE asset_file SET rel_path = ?2, ext = ?3, size_bytes = ?4,
-                                       mtime = ?5, missing = 0
-                 WHERE id = ?1",
-                params![
-                    file_id,
-                    rec.rel_path,
-                    rec.rel_path.rsplit('.').next().map(str::to_lowercase),
-                    rec.size_bytes,
-                    rec.mtime,
-                ],
-            )
-            .map_err(|e| CoreError::Catalog(format!("moves file update: {e}")))?;
-            tx.execute(
-                "UPDATE asset SET name = ?2, updated_at = ?3 WHERE id = ?1",
-                params![asset_id, rec.name, unix_now()],
-            )
-            .map_err(|e| CoreError::Catalog(format!("moves asset update: {e}")))?;
-            moved.push(rec.rel_path.clone());
+            for (from, rec) in pair_moves(sources, targets) {
+                tx.execute(
+                    "UPDATE asset_file SET rel_path = ?2, ext = ?3, size_bytes = ?4,
+                                           mtime = ?5, missing = 0
+                     WHERE id = ?1",
+                    params![
+                        from.file_id,
+                        rec.rel_path,
+                        rec.rel_path.rsplit('.').next().map(str::to_lowercase),
+                        rec.size_bytes,
+                        rec.mtime,
+                    ],
+                )
+                .map_err(|e| CoreError::Catalog(format!("moves file update: {e}")))?;
+                tx.execute(
+                    "UPDATE asset SET name = ?2, updated_at = ?3 WHERE id = ?1",
+                    params![from.asset_id, rec.name, unix_now()],
+                )
+                .map_err(|e| CoreError::Catalog(format!("moves asset update: {e}")))?;
+                moved.push(rec.rel_path.clone());
+            }
         }
         tx.commit()
             .map_err(|e| CoreError::Catalog(format!("moves commit: {e}")))?;
@@ -1660,6 +1720,42 @@ fn refresh_fts(conn: &Connection, asset_id: i64) -> Result<()> {
 /// than inventing a location for it. Uses `strip_prefix` rather than string surgery so a root
 /// stored `C:/cache` still matches a pack stored `C:\cache\x.unitypackage`: the separators differ,
 /// the components do not.
+/// A catalogued file whose path a crawl no longer saw — a candidate to have moved.
+struct MoveSource<'a> {
+    file_id: i64,
+    asset_id: i64,
+    rel_path: &'a str,
+}
+
+/// Pair the vanished rows of one content hash with the new paths of the same hash, one to one.
+///
+/// Rows and paths with the same **file name** pair first (a folder moved, its files kept their
+/// names). What is left pairs in path order only when the two sides are the same size — then
+/// every leftover row has exactly one destination, as a rename does. With unequal leftovers there
+/// is no telling which copy went where, so none is guessed: the rows go missing and the paths
+/// become new assets (DATA-MODEL §6).
+fn pair_moves<'a, 'r>(
+    mut sources: Vec<MoveSource<'a>>,
+    mut targets: Vec<&'r CrawlRecord>,
+) -> Vec<(MoveSource<'a>, &'r CrawlRecord)> {
+    let file_name = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+    sources.sort_by(|a, b| a.rel_path.cmp(b.rel_path));
+    targets.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    let mut pairs = Vec::new();
+    let mut unpaired = Vec::new();
+    for source in sources {
+        let name = file_name(source.rel_path);
+        match targets.iter().position(|t| file_name(&t.rel_path) == name) {
+            Some(i) => pairs.push((source, targets.remove(i))),
+            None => unpaired.push(source),
+        }
+    }
+    if unpaired.len() == targets.len() {
+        pairs.extend(unpaired.into_iter().zip(targets));
+    }
+    pairs
+}
+
 fn reanchor(path: &Path, old_root: &Path, new_root: &Path) -> Option<PathBuf> {
     path.strip_prefix(old_root)
         .ok()
@@ -1673,16 +1769,43 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// A catalog written by a newer build is not this build's to open: its queries were written for
+/// a shape this one has never seen, and migrating "down" is not a thing.
+fn refuse_newer(found: u32) -> Result<()> {
+    if found > SCHEMA_VERSION {
+        return Err(CoreError::SchemaTooNew {
+            found,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    Ok(())
+}
+
 fn configure_connection(conn: &Connection) -> Result<()> {
+    const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+    let pragma_err = |e: rusqlite::Error| CoreError::Catalog(format!("configure pragmas: {e}"));
+    // Writers queue instead of erroring; chunked pack writes keep the wait short.
+    conn.busy_timeout(BUSY_TIMEOUT).map_err(pragma_err)?;
+    // Switching a new file to WAL needs an exclusive lock, and SQLite answers BUSY at once there
+    // instead of waiting in the busy handler — so two connections opening one new file at the same
+    // moment (two processes starting together) would fail one of them. Wait the same budget here.
+    let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
+    loop {
+        match conn.execute_batch("PRAGMA journal_mode=WAL;") {
+            Ok(()) => break,
+            Err(e) if crate::error::is_busy(&e) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => return Err(pragma_err(e)),
+        }
+    }
     conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         PRAGMA synchronous=NORMAL;
+        "PRAGMA synchronous=NORMAL;
          PRAGMA foreign_keys=ON;
          PRAGMA cache_size=-32768;  -- 32 MiB page cache
-         PRAGMA temp_store=MEMORY;
-         PRAGMA busy_timeout=15000;  -- writers queue instead of erroring; chunked pack writes keep the wait short",
+         PRAGMA temp_store=MEMORY;",
     )
-    .map_err(|e| CoreError::Catalog(format!("configure pragmas: {e}")))?;
+    .map_err(pragma_err)?;
     Ok(())
 }
 
@@ -2299,6 +2422,18 @@ const MIGRATION_14_IN_PACK_ASSETS: &str = "
 ALTER TABLE asset_file ADD COLUMN package_entry_id INTEGER REFERENCES package_entry(id);
 CREATE INDEX IF NOT EXISTS idx_file_pkgentry
   ON asset_file(package_entry_id) WHERE package_entry_id IS NOT NULL;
+";
+
+/// M32 — the two per-file lookups become index searches (v2 plan Task 1.4, review P1).
+///
+/// `record_crawl` looks every crawled path up in its source (`CRAWL_LOOKUP_SQL`). With no index
+/// led by `rel_path`, SQLite walked the source's assets by `idx_asset_source` and probed each one,
+/// so persisting a crawl was quadratic: 2,000 lookups over a 20k-asset replica took 4.5 s.
+/// `materialize_in_pack_assets` finds each extracted file's entry by `(package_id, pathname)`
+/// (`MATERIALIZE_SQL`) and walked the whole pack's manifest per file. Indexes only — no row changes.
+const MIGRATION_32_LOOKUP_INDEXES: &str = "
+CREATE INDEX IF NOT EXISTS idx_file_rel_path ON asset_file(rel_path);
+CREATE INDEX IF NOT EXISTS idx_pkgentry_path ON package_entry(package_id, pathname);
 ";
 
 /// M31 — the catalog's own identity (v1 plan S11, ENGINE-API §8.4).
@@ -3530,6 +3665,9 @@ impl Catalog {
     /// rather than minting a second row. Ensures the project's empty staging tray exists (§9). The
     /// partial UNIQUE index `idx_project_active` allows only one `is_active=1`, so every other row is
     /// cleared first. Returns the project id.
+    ///
+    /// One transaction: a failure part-way (after "deactivate all", say) must not leave the catalog
+    /// with no active project, or with a project that has no tray (review B13).
     pub fn register_project(
         &self,
         project_path: &str,
@@ -3543,12 +3681,14 @@ impl Catalog {
             .filter(|s| !s.is_empty())
             .unwrap_or(project_path)
             .to_string();
-        self.conn
-            .execute("UPDATE project SET is_active = 0", [])
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| CoreError::Catalog(format!("project begin: {e}")))?;
+        tx.execute("UPDATE project SET is_active = 0", [])
             .map_err(|e| CoreError::Catalog(format!("project deactivate: {e}")))?;
-        self.conn
-            .execute(
-                "INSERT INTO project
+        tx.execute(
+            "INSERT INTO project
                      (uuid, name, project_path, unity_version, pipeline, last_seen_at, is_active)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)
                  ON CONFLICT(project_path) DO UPDATE SET
@@ -3557,18 +3697,17 @@ impl Catalog {
                      pipeline = excluded.pipeline,
                      last_seen_at = excluded.last_seen_at,
                      is_active = 1",
-                params![
-                    uuid::Uuid::new_v4().to_string(),
-                    name,
-                    project_path,
-                    unity_version,
-                    pipeline,
-                    unix_now(),
-                ],
-            )
-            .map_err(|e| CoreError::Catalog(format!("project upsert: {e}")))?;
-        let id: i64 = self
-            .conn
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                name,
+                project_path,
+                unity_version,
+                pipeline,
+                unix_now(),
+            ],
+        )
+        .map_err(|e| CoreError::Catalog(format!("project upsert: {e}")))?;
+        let id: i64 = tx
             .query_row(
                 "SELECT id FROM project WHERE project_path = ?1",
                 params![project_path],
@@ -3584,8 +3723,7 @@ impl Catalog {
         // shortlist built by hand is the expensive thing on screen, and connecting an editor is
         // the moment it finally has a destination. Dropping it there would punish the user for
         // doing the two steps in the order the app encourages.
-        let adopted = self
-            .conn
+        let adopted = tx
             .execute(
                 "UPDATE collection SET project_id = ?1
                   WHERE is_staging = 1 AND project_id IS NULL
@@ -3595,16 +3733,17 @@ impl Catalog {
             )
             .map_err(|e| CoreError::Catalog(format!("adopt staging tray: {e}")))?;
         if adopted == 0 {
-            self.conn
-                .execute(
-                    "INSERT INTO collection (uuid, name, is_staging, project_id)
-                         SELECT ?1, 'Staging', 1, ?2
-                         WHERE NOT EXISTS
-                           (SELECT 1 FROM collection WHERE is_staging=1 AND project_id=?2)",
-                    params![uuid::Uuid::new_v4().to_string(), id],
-                )
-                .map_err(|e| CoreError::Catalog(format!("staging tray: {e}")))?;
+            tx.execute(
+                "INSERT INTO collection (uuid, name, is_staging, project_id)
+                     SELECT ?1, 'Staging', 1, ?2
+                     WHERE NOT EXISTS
+                       (SELECT 1 FROM collection WHERE is_staging=1 AND project_id=?2)",
+                params![uuid::Uuid::new_v4().to_string(), id],
+            )
+            .map_err(|e| CoreError::Catalog(format!("staging tray: {e}")))?;
         }
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("project commit: {e}")))?;
         Ok(id)
     }
 
@@ -5592,6 +5731,11 @@ impl Catalog {
     /// The catalog's last-known (size, mtime) per loose-file rel_path for one source root — the
     /// crawl's incremental diff (`crawler::needs_rehash`, DATA-MODEL §6). The writer uses this
     /// for watch-rescans and the desktop for re-adding a folder: unchanged files skip BLAKE3.
+    ///
+    /// Trashed files are included: they are on disk and in the catalog, and the watch rescan
+    /// compares this map with the crawl to decide whether anything changed — leaving them out
+    /// would make every rescan of a source with anything in the Trash look like a change. (A
+    /// `status != 'trashed'` filter here never matched anything: trash is `deleted_at`.)
     pub fn known_sizes_for_source(
         &self,
         root: &str,
@@ -5603,7 +5747,7 @@ impl Catalog {
                  FROM asset_file af
                  JOIN asset a ON a.id = af.asset_id
                  JOIN import_source s ON s.id = a.source_id
-                 WHERE s.root_path = ?1 AND a.package_id IS NULL AND a.status != 'trashed'",
+                 WHERE s.root_path = ?1 AND a.package_id IS NULL",
             )
             .map_err(|e| CoreError::Catalog(format!("known sizes prep: {e}")))?;
         let mapped = stmt
@@ -6201,9 +6345,7 @@ fn write_source_excludes(conn: &Connection, source_id: i64, list: &[SourceExclud
         .optional()
         .map_err(|e| CoreError::Catalog(format!("source check: {e}")))?;
     if exists.is_none() {
-        return Err(CoreError::Catalog(format!(
-            "write_source_excludes: no such source {source_id}"
-        )));
+        return Err(CoreError::NotFound(format!("no such source {source_id}")));
     }
     Ok(())
 }
@@ -6297,6 +6439,7 @@ mod graph;
 mod material_inputs;
 mod oplog;
 mod prefab;
+mod reader;
 mod snapshots;
 mod tagbatch;
 mod taxonomy;
@@ -6304,6 +6447,8 @@ mod taxonomy;
 mod tests_browse;
 #[cfg(test)]
 mod tests_catalog;
+#[cfg(test)]
+mod tests_lifecycle;
 #[cfg(test)]
 mod tests_material_inputs;
 #[cfg(test)]
@@ -6316,6 +6461,7 @@ mod tests_tagbatch;
 pub use browse::{AssetScope, LibraryRow, TagState};
 pub use material_inputs::{albedo_rank, MaterialInputSource, MaterialSlot, ModelMaterialInputs};
 pub use prefab::{PrefabBindingRow, PrefabFileScan, LEGACY_PREFAB_SCOPE};
+pub use reader::{CatalogReader, CatalogWriter};
 pub use snapshots::{clear_resident_snapshots, resident_snapshot_count, EmbeddingSnapshot};
 pub use tagbatch::{
     ai_source, assignment_problem, is_ai_source, source_problem, validate_assignments, AssetTagRow,

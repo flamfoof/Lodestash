@@ -227,7 +227,9 @@ pub fn read_package_meta(path: &Path, entries: &[PackageEntry]) -> io::Result<Pa
     for entry in archive.entries()? {
         let mut entry = entry?;
         let entry_path = entry.path()?.to_path_buf();
-        let name = entry_path.to_string_lossy().replace('\\', "/");
+        let name = member_path(&entry_path)
+            .to_string_lossy()
+            .replace('\\', "/");
         if name == ".icon.png" {
             icon_seen = true;
             if entry.header().size().unwrap_or(0) <= ICON_CAP {
@@ -278,11 +280,51 @@ fn sanitize_basename(name: &str) -> String {
         .collect()
 }
 
+/// A tar member's path with any `.` components dropped. Archives packed with `tar -C dir .` name
+/// every member `./<guid>/…`, and `Path::components` keeps a leading `.` — so without this the
+/// first component of every member was `.` and such a pack read as empty (review B11).
+fn member_path(entry_path: &Path) -> PathBuf {
+    entry_path
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect()
+}
+
 fn guid_and_member(entry_path: &Path) -> Option<(String, String)> {
-    let mut components = entry_path.components();
+    let path = member_path(entry_path);
+    let mut components = path.components();
     let guid = components.next()?.as_os_str().to_string_lossy().to_string();
     let member = components.next()?.as_os_str().to_string_lossy().to_string();
     Some((guid, member))
+}
+
+/// Unity names each GUID folder by the asset's GUID: 32 hex digits. A GUID becomes a file name in
+/// the workspace (the temporary payload, and the basename when a pathname is missing), so anything
+/// else — `..`, `../x`, a device name — is never used as one.
+fn is_guid(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Most bytes a `pathname` or `asset.meta` entry may hold. A path is one line and a `.meta` a few
+/// hundred bytes; anything beyond this is not one, and reading it whole would let an archive make
+/// the reader allocate whatever it declares.
+const SMALL_ENTRY_CAP: u64 = 64 * 1024;
+
+/// Read a `pathname` or `asset.meta` entry, or `None` — with a warning — when it is larger than
+/// [`SMALL_ENTRY_CAP`]. The skipped bytes are never read into memory.
+fn read_small_entry<R: Read>(
+    entry: &mut tar::Entry<'_, R>,
+    guid: &str,
+    member: &str,
+) -> io::Result<Option<String>> {
+    let size = entry.size();
+    if size > SMALL_ENTRY_CAP {
+        tracing::warn!(guid, member, size, "skipping an oversized package entry");
+        return Ok(None);
+    }
+    let mut s = String::new();
+    entry.take(SMALL_ENTRY_CAP).read_to_string(&mut s)?;
+    Ok(Some(s))
 }
 
 /// Browse pass: enumerate every GUID folder's `pathname`/`asset.meta`/`asset` size/`preview.png`
@@ -326,14 +368,14 @@ pub fn read_manifest_with_progress(
 
         match member.as_str() {
             "pathname" => {
-                let mut s = String::new();
-                entry.read_to_string(&mut s)?;
-                rec.pathname = Some(parse_pathname(&s));
+                if let Some(s) = read_small_entry(&mut entry, &guid, &member)? {
+                    rec.pathname = Some(parse_pathname(&s));
+                }
             }
             "asset.meta" => {
-                let mut s = String::new();
-                entry.read_to_string(&mut s)?;
-                rec.meta = parse_meta(&s);
+                if let Some(s) = read_small_entry(&mut entry, &guid, &member)? {
+                    rec.meta = parse_meta(&s);
+                }
             }
             "asset" => {
                 rec.asset_size = Some(entry.header().size()?);
@@ -464,10 +506,17 @@ pub fn extract_to_workspace_with_progress(
             let Some((guid, member)) = guid_and_member(&entry_path) else {
                 continue;
             };
+            if !is_guid(&guid) {
+                if member == "asset" {
+                    tracing::warn!(guid, "skipping a payload whose folder is not a GUID");
+                }
+                continue;
+            }
             match member.as_str() {
                 "pathname" => {
-                    let mut s = String::new();
-                    entry.read_to_string(&mut s)?;
+                    let Some(s) = read_small_entry(&mut entry, &guid, &member)? else {
+                        continue; // placed under its GUID, as if the pathname never came
+                    };
                     let pn = parse_pathname(&s);
                     if let Some((tmp, hash, size)) = pending.remove(&guid) {
                         extracted.push(place_payload(dest, guid, Some(pn), tmp, hash, size)?);
@@ -568,6 +617,14 @@ fn extract_at_offsets_from<R: Read>(
     dest: &Path,
     mut wanted: Vec<EntryLocator>,
 ) -> io::Result<Vec<ExtractedAsset>> {
+    // A locator comes from the catalog, but its GUID still becomes a file name here.
+    wanted.retain(|w| {
+        let ok = is_guid(&w.guid);
+        if !ok {
+            tracing::warn!(guid = %w.guid, "skipping a locator whose GUID is not a GUID");
+        }
+        ok
+    });
     wanted.sort_by_key(|w| w.offset);
     let tmp_dir = dest.join(".tmp");
     std::fs::create_dir_all(&tmp_dir)?;
@@ -980,7 +1037,7 @@ mod tests {
             &pkg,
             &surgical_ws,
             vec![EntryLocator {
-                guid: "stale".into(),
+                guid: "5ca1e0005ca1e0005ca1e0005ca1e000".into(),
                 pathname: None,
                 offset,
                 size: size + 4096,
@@ -1007,7 +1064,10 @@ mod tests {
                 h.set_cksum();
                 b.append_data(&mut h, name, bytes).unwrap();
             };
-            for (guid, file) in [("g1", "One.png"), ("g2", "Two.png")] {
+            for (guid, file) in [
+                ("11111111111111111111111111111111", "One.png"),
+                ("22222222222222222222222222222222", "Two.png"),
+            ] {
                 add(format!("{guid}/asset"), &b"payload".repeat(200));
                 add(
                     format!("{guid}/pathname"),
@@ -1048,9 +1108,9 @@ mod tests {
         let payload = b"surgical".repeat(400);
         let pkg = build_test_package(
             dir.path(),
-            "cafe1234",
+            "cafe1234cafe1234cafe1234cafe1234",
             "Assets/Props/Crate.png",
-            "guid: cafe1234\n",
+            "guid: cafe1234cafe1234cafe1234cafe1234\n",
             &payload,
         );
         let entry = &read_manifest(&pkg).unwrap()[0];
@@ -1091,7 +1151,7 @@ mod tests {
             &pkg,
             &ws,
             vec![EntryLocator {
-                guid: "stale".into(),
+                guid: "5ca1e0005ca1e0005ca1e0005ca1e000".into(),
                 pathname: None,
                 offset: wanted[0].offset,
                 size: wanted[0].size + 4096,
@@ -1347,9 +1407,9 @@ See our website."
         let dir = tempfile::tempdir().unwrap();
         let pkg = build_test_package(
             dir.path(),
-            "abc123",
+            "abc123abc123abc123abc123abc123ab",
             "Assets/Props/Barrel.png",
-            "fileFormatVersion: 2\nguid: abc123\n",
+            "fileFormatVersion: 2\nguid: abc123abc123abc123abc123abc123ab\n",
             b"PNGDATA_PAYLOAD",
         );
         let workspace = dir.path().join("workspace");
@@ -1379,9 +1439,9 @@ See our website."
         let dir = tempfile::tempdir().unwrap();
         let pkg = build_test_package(
             dir.path(),
-            "abc123",
+            "abc123abc123abc123abc123abc123ab",
             "Assets/Toon Fantasy Nature/_ReadFirst.txt\n00",
-            "fileFormatVersion: 2\nguid: abc123\n",
+            "fileFormatVersion: 2\nguid: abc123abc123abc123abc123abc123ab\n",
             b"README_PAYLOAD",
         );
 
@@ -1398,5 +1458,167 @@ See our website."
             "_ReadFirst.txt"
         );
         assert!(extracted[0].workspace_path.exists());
+    }
+
+    // ---- hostile and unusual archives (v2 plan Task 1.7, review B11) --------------------------
+
+    /// A `.unitypackage` whose members are written exactly as named. `tar::Builder::append_data`
+    /// strips a leading `./` and refuses `..` — which are exactly the archives these tests need.
+    fn raw_package(dir: &Path, members: &[(&str, &[u8])]) -> PathBuf {
+        let path = dir.join("raw.unitypackage");
+        let gz = flate2::write::GzEncoder::new(
+            File::create(&path).unwrap(),
+            flate2::Compression::default(),
+        );
+        let mut b = tar::Builder::new(gz);
+        for (name, bytes) in members {
+            let mut h = tar::Header::new_gnu();
+            h.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+            h.set_size(bytes.len() as u64);
+            h.set_mode(0o644);
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_cksum();
+            b.append(&h, *bytes).unwrap();
+        }
+        b.into_inner().unwrap().finish().unwrap();
+        path
+    }
+
+    const GUID: &str = "aaaa1111bbbb2222cccc3333dddd4444";
+
+    /// Archives packed with `tar -C dir .` name every member `./<guid>/…`. They used to read as
+    /// empty packs: the first path component was `.`, so no member was ever an `asset`.
+    #[test]
+    fn dot_slash_members_index_the_same_as_plain_ones() {
+        let payload = b"crate bytes ".repeat(100);
+        let meta = format!("guid: {GUID}\nlabels:\n- Prop\nTextureImporter:\n  x: 1\n");
+        let pack = |dir: &Path, prefix: &str| {
+            let names = [
+                format!("{prefix}.icon.png"),
+                format!("{prefix}{GUID}/asset"),
+                format!("{prefix}{GUID}/asset.meta"),
+                format!("{prefix}{GUID}/pathname"),
+            ];
+            let bodies: [&[u8]; 4] = [
+                b"icon",
+                &payload,
+                meta.as_bytes(),
+                b"Assets/Props/Crate.png",
+            ];
+            let members: Vec<(&str, &[u8])> =
+                names.iter().map(String::as_str).zip(bodies).collect();
+            raw_package(dir, &members)
+        };
+        let (plain_dir, dotted_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let plain = pack(plain_dir.path(), "");
+        let dotted = pack(dotted_dir.path(), "./");
+
+        let manifest = read_manifest(&dotted).unwrap();
+        assert_eq!(
+            manifest,
+            read_manifest(&plain).unwrap(),
+            "indexed differently"
+        );
+        assert_eq!(manifest.len(), 1);
+        let e = &manifest[0];
+        assert_eq!(e.pathname.as_deref(), Some("Assets/Props/Crate.png"));
+        assert_eq!(e.meta.labels, vec!["Prop"]);
+
+        let meta = read_package_meta(&dotted, &manifest).unwrap();
+        assert_eq!(meta.icon_png.as_deref(), Some(b"icon".as_slice()));
+        let (offset, size) = (e.asset_offset.unwrap(), e.asset_size.unwrap());
+        assert_eq!(
+            read_entry_payload(&dotted, GUID, offset, size).unwrap(),
+            payload
+        );
+        let ws = dotted_dir.path().join("ws");
+        let placed = extract_to_workspace(&dotted, &ws).unwrap();
+        assert_eq!(placed.len(), 1);
+        assert_eq!(std::fs::read(&placed[0].workspace_path).unwrap(), payload);
+        assert_eq!(placed[0].workspace_path.file_name().unwrap(), "Crate.png");
+    }
+
+    /// A `pathname` or `asset.meta` over 64 KiB is not one: it is skipped, not read into memory,
+    /// and the payload beside it is still indexed and extracted.
+    #[test]
+    fn an_oversized_pathname_or_meta_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let huge = vec![b'a'; 64 * 1024 + 1];
+        let pkg = raw_package(
+            dir.path(),
+            &[
+                (&format!("{GUID}/asset"), b"payload"),
+                (&format!("{GUID}/asset.meta"), &huge),
+                (&format!("{GUID}/pathname"), &huge),
+            ],
+        );
+        let manifest = read_manifest(&pkg).unwrap();
+        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest[0].pathname, None, "an oversized pathname was read");
+        assert_eq!(
+            manifest[0].meta,
+            UnityMeta::default(),
+            "an oversized meta was read"
+        );
+        assert_eq!(manifest[0].asset_size, Some(7));
+
+        let placed = extract_to_workspace(&pkg, &dir.path().join("ws")).unwrap();
+        assert_eq!(placed.len(), 1);
+        assert_eq!(placed[0].pathname, None);
+        assert_eq!(placed[0].workspace_path.file_name().unwrap(), GUID);
+
+        // At the cap, it is still a pathname.
+        let dir = tempfile::tempdir().unwrap();
+        let at_cap = vec![b'a'; 64 * 1024];
+        let pkg = raw_package(dir.path(), &[(&format!("{GUID}/pathname"), &at_cap)]);
+        assert_eq!(
+            read_manifest(&pkg).unwrap()[0]
+                .pathname
+                .as_deref()
+                .map(str::len),
+            Some(64 * 1024)
+        );
+    }
+
+    /// A GUID becomes a file name in the workspace, so a folder or locator that is not a GUID —
+    /// `..`, `../x` — is skipped rather than joined onto a path. The rest of the pack is unaffected.
+    #[test]
+    fn a_guid_that_is_not_a_guid_never_names_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = raw_package(
+            dir.path(),
+            &[
+                ("../asset", b"hostile"),
+                ("../pathname", b"Assets/Evil.png"),
+                (&format!("{GUID}/asset"), b"honest"),
+                (&format!("{GUID}/pathname"), b"Assets/Good.png"),
+            ],
+        );
+        let ws = dir.path().join("ws");
+        let placed = extract_to_workspace(&pkg, &ws).expect("the honest payload still extracts");
+        assert_eq!(placed.len(), 1);
+        assert_eq!(placed[0].guid, GUID);
+
+        let good = read_manifest(&pkg)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.guid == GUID)
+            .unwrap();
+        let ws = dir.path().join("surgical");
+        for hostile in ["../x", "../../x", ".."] {
+            let placed = extract_at_offsets(
+                &pkg,
+                &ws,
+                vec![EntryLocator {
+                    guid: hostile.into(),
+                    pathname: None,
+                    offset: good.asset_offset.unwrap(),
+                    size: good.asset_size.unwrap(),
+                }],
+            )
+            .expect("a refused locator is skipped, not an error");
+            assert!(placed.is_empty(), "{hostile:?} named a file");
+        }
+        assert!(!ws.join("x").exists() && !dir.path().join("x").exists());
     }
 }

@@ -129,7 +129,9 @@ its contract.
 
 `EngineError { kind, message, detail }` with `kind ∈ {not_found, invalid, conflict, denied,
 unavailable, busy, too_large, internal}`. Core grows typed kinds (`CoreError::Conflict`,
-`::RevisionConflict`, `::InvalidBatch`, `::NotFound`, `::Db`) so mapping never parses strings.
+`::RevisionConflict`, `::Invalid`, `::NotFound`, `::SchemaTooNew`/`::SchemaTooOld`, `::Db`) and
+`CoreError::kind()` (`not_found | invalid | conflict | unavailable | internal`), so mapping never
+parses strings.
 HTTP mapping: 404/422/409/403/503/429/413/500, body `{error:{code,message,detail}}`
 (`ENGINE-API.md` §4).
 
