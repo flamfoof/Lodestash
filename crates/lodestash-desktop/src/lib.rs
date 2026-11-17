@@ -5,7 +5,6 @@
 //! with `Engine` once the B1 extraction lands. Nothing here writes to the catalog — the
 //! single-writer rule (ARCHITECTURE §5) puts every write on the persist thread.
 
-pub mod agent_bridge;
 #[cfg(debug_assertions)]
 mod devserver;
 pub mod library;
@@ -1983,8 +1982,8 @@ fn bulk_tag(
 }
 
 /// The REST/MCP `PreviewFn` (ENGINE-API preview endpoints): resolve the asset's cached thumbnail,
-/// generating on a miss — the same deterministic key the `lodestash://thumb` route uses. Shared by
-/// the embedded engine (B12) and the `--mcp` headless server.
+/// generating on a miss — the same deterministic key the `lodestash://thumb` route uses, for the
+/// embedded engine (B12).
 fn engine_preview_fn(cache_root: Option<std::path::PathBuf>) -> lodestash_api::PreviewFn {
     Box::new(move |subject| {
         use lodestash_ingest::thumb::{generate, generate_material, meta_key, ThumbParams};
@@ -2260,41 +2259,8 @@ fn build_engine_state() -> Result<
     Ok((state, token, allowed))
 }
 
-/// `--mcp` headless: the MCP stdio server without the GUI. Runs until stdin closes; `tracing`
-/// already initialized by `run()`. Exits non-zero if there is no catalog it can serve.
-fn run_mcp_headless() {
-    let (state, _token, _allowed) = match build_engine_state() {
-        Ok(built) => built,
-        Err(why) => {
-            eprintln!("lodestash-desktop --mcp: {why}");
-            std::process::exit(2);
-        }
-    };
-    // Everything the app owns — writes, jobs, approvals — goes to the running app, never to a
-    // second writer or a second job registry in this process (ADR-0002, v1 plan S11). The line
-    // re-reads the app's handshake on every call, so an app started (or restarted) after this
-    // server is found; with no app running, those tools say so and reads keep working.
-    match state.catalog_id() {
-        Ok(id) => state.set_app_proxy(crate::agent_bridge::app_proxy(id)),
-        Err(e) => {
-            eprintln!("lodestash-desktop --mcp: {e}");
-            std::process::exit(2);
-        }
-    }
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("mcp runtime builds");
-    if let Err(e) = rt.block_on(lodestash_mcp::serve_stdio(state)) {
-        tracing::error!(%e, "mcp server exited");
-        std::process::exit(1);
-    }
-}
-
 pub fn run() {
     tracing_subscriber::fmt()
-        // stderr, always. Under `--mcp` stdout *is* the JSON-RPC channel, and the fmt layer's
-        // default writer is stdout: one log line there is a malformed message to the host.
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -2318,17 +2284,14 @@ pub fn run() {
     // Tauri's own threads exist.
     lodestash_app::models::apply_ort_dylib_env();
 
-    // `--mcp` (ENGINE-API §2, MCP↔REST 1:1): serve the MCP stdio plane headless — an agent host
-    // spawns `lodestash-desktop --mcp` and speaks JSON-RPC on stdin/stdout. The process owns
-    // stdin until the host closes it; no window, no REST server, no writer thread.
-    //
-    // After the runtime path, not before (v1 plan S11): this branch used to return first, so a
-    // host-spawned server — which inherits no `ORT_DYLIB_PATH` from anyone — could never load the
-    // query embedder, and `semantic_search` answered "no embedding model" on a machine that had
-    // every model installed.
+    // The MCP server is its own binary now (ADR-0022). A host still configured with
+    // `lodestash-desktop --mcp` is told so, rather than opening a window it cannot see.
     if std::env::args().any(|a| a == "--mcp") {
-        run_mcp_headless();
-        return;
+        eprintln!(
+            "lodestash-desktop --mcp was removed: register the lodestash-mcp binary with your MCP \
+             host instead (crates/lodestash-mcp/README.md)"
+        );
+        std::process::exit(2);
     }
 
     // A debug build's window loads the dev server, so the app starts it rather than expecting the
@@ -2405,12 +2368,11 @@ pub fn run() {
             // without a catalog — model downloads use the tray too.
             job_registry.changes().start_publisher(app.handle().clone());
 
-            // B12 — the agent plane (ENGINE-API §1–2, MCP↔REST 1:1) lives in this process:
-            // the REST server binds an ephemeral loopback port and writes engine.json for the
-            // Unity plugin / Connect wizard; the MCP stdio server answers on stdin when a host
-            // pipes it (a console or no-stdin launch idles or exits on EOF — a background
-            // thread either way). Both share one ServerState with its own read-only catalog
-            // connection — the API never writes the catalog, so the single-writer rule holds.
+            // B12 — the agent plane (ENGINE-API §1–2) lives in this process: the REST server
+            // binds an ephemeral loopback port and writes engine.json for the Unity plugin, the
+            // Connect wizard and the `lodestash-mcp` server (ADR-0022). Its ServerState has its
+            // own read-only catalog connection — the API never writes the catalog, so the
+            // single-writer rule holds.
             let (engine_state, engine_port, engine_token, engine_allowed) =
                 match build_engine_state() {
                     Ok((state, token, allowed)) => {
@@ -2423,19 +2385,7 @@ pub fn run() {
                             .map(|h| h.port)
                             .map_err(|e| tracing::error!(%e, "engine API failed to bind"))
                             .ok();
-                        // MCP stdio plane on its own thread — self-terminates on stdin EOF.
-                        let state_arc = state.clone();
-                        std::thread::Builder::new()
-                            .name("lodestash-mcp".into())
-                            .spawn(move || {
-                                let rt = tokio::runtime::Builder::new_current_thread()
-                                    .enable_all()
-                                    .build()
-                                    .expect("mcp runtime builds");
-                                let _ = rt.block_on(lodestash_mcp::serve_stdio(state));
-                            })
-                            .ok();
-                        (Some(state_arc), port, token, allowed)
+                        (Some(state), port, token, allowed)
                     }
                     Err(why) => {
                         tracing::warn!(%why, "agent planes not started");

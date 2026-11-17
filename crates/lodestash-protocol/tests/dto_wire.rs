@@ -120,7 +120,10 @@ fn the_handshake_file_round_trips() {
                        "api_version": "v1", "catalog_id": "e5406dff133f7c9196a15354e6dbbb71" });
     let old = json!({ "version": 1, "port": 51731, "token": "b3f1", "pid": 8123,
                       "api_version": "v1" });
-    for file in [full, old] {
+    // v2 spec §6: the app also names its own binary, for the MCP server's launcher.
+    let with_exe = json!({ "version": 1, "port": 51731, "token": "b3f1", "pid": 8123,
+                           "api_version": "v1", "exe": "C:\\Lodestash\\lodestash-desktop.exe" });
+    for file in [full, old, with_exe] {
         let h: Handshake = serde_json::from_value(file.clone()).unwrap();
         assert_eq!(
             serde_json::to_value(&h).unwrap(),

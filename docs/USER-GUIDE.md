@@ -21,14 +21,15 @@ attributed batch-tag workflow is **planned**, in [MCP-ASSET-ANALYSIS](MCP-ASSET-
 Reading metadata/tags and structural search do not require an identification pass. Semantic search
 does. The broader Step 3 recommendation applies to getting useful AI-search results.
 
-For a local Codex host, register a built executable with `--mcp`, not port 5173. Example config
-for **existing read tools only**, to merge into the host's configuration during implementation:
+For a local Codex host, register the built **`lodestash-mcp`** executable (since 2026-11-16, v2 plan
+P4 — `lodestash-desktop --mcp` is gone), not port 5173. It answers every tool through the running
+app and starts the app when it is not running; the registration commands for Codex and Claude Code
+are in [`crates/lodestash-mcp/README.md`](../crates/lodestash-mcp/README.md). Example config for
+**existing read tools only**, to merge into the host's configuration:
 
 ```toml
 [mcp_servers.lodestash]
-command = 'G:\GameDev\asset_viewer\target\debug\lodestash-desktop.exe'
-args = ['--mcp']
-cwd = 'G:\GameDev\asset_viewer'
+command = 'G:\GameDev\asset_viewer\target\debug\lodestash-mcp.exe'
 enabled_tools = ['get_server_info', 'search_assets', 'get_asset', 'list_tags']
 ```
 
@@ -44,9 +45,10 @@ allow-lists in its MCP configuration; reconnect the configured server and check 
 list. This example does not edit your host configuration or grant byte-transfer/write permission.
 [Official MCP setup guidance](https://developers.openai.com/codex/mcp/).
 
-Keep the app running for writes using the
-[desktop launch guide](../crates/lodestash-desktop/README.md). A headless stdio connection does not
-need Vite or the computer-use helper; the running development GUI does need its normal frontend.
+Every tool — reads too — is answered by the running app; the MCP server starts it when it is not
+running (today that opens the app's window). To run the app yourself, use the
+[desktop launch guide](../crates/lodestash-desktop/README.md). The stdio connection does not need
+Vite or the computer-use helper; the running development GUI does need its normal frontend.
 After the planned tools ship, enable the specific selection/evidence/write/status tools and configure
 the producer plus permitted evidence destinations. A remote model cannot automatically fetch local
 URLs; its local host must supply authorized image content. Do not paste tokens into URLs or prompts.

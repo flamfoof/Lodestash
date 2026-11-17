@@ -232,6 +232,21 @@ REST paths under the same conventions.
   and stops `lodestash-mcp --http 4319` as a child process.
 - The Unity plugin keeps talking to the app's `/v1` directly (`ENGINE-API.md` §5); it is not an
   MCP client.
+- *As built (P4, 2026-11-16; `crates/lodestash-mcp/README.md`):*
+  - **The app's REST answer is the tool's answer**: REST's containers (`{results}`, `{tags}`, …)
+    and default limits; an `image/*` body is an image block; a non-2xx body is `isError` with the
+    envelope. Input the operation's type refuses is `isError`/`invalid` and is not sent; an unknown
+    tool name is a JSON-RPC error. `get_server_info` adds `mcp: {version, transport, handshake,
+    port}`.
+  - `LODESTASH_ENGINE_JSON` overrides the handshake path, and a launched app is given it (today's
+    desktop ignores it). `LODESTASH_APP`, when set, is the only candidate — it never falls through
+    to another binary. Ready means a `v1` handshake whose port accepts a connection; an app that
+    exits with a failure before publishing is reported at once instead of after 20 s.
+  - The launch is detached: no stdio, its own process group, and outside the host's job object
+    where Windows allows breakaway. On Windows the server clears the inherit flag on its own stdio
+    handles first, or the background app would hold the host's pipes open after the server exits.
+  - The `asset://{id}/file` resource stays, read through the `asset_file` operation's route (the
+    resource summaries advertise; a resource is not a tool, so `Engine` audience is no barrier).
 
 ## 8. Desktop shell (`lodestash-desktop`)
 
@@ -388,7 +403,7 @@ Detailed tasks are in the plan. Each phase ends green and committed.
 | P2 | `lodestash-protocol` (catalog for today's 27 agent ops) and `lodestash-engine` (absorbs app, writer, read model, storage, media, domain half of ServerState); S1/S3/U8/U9, config, AppraisePlan |
 | P3 | `lodestash-api` as an adapter: derived routes, UI session, request checks, SSE, bytes, static UI, system ops |
 | P4 | `lodestash-mcp` standalone (stdio), auto-launch, forbidden-dependency test, end-to-end test with a real app on the fixture catalog |
-| P5 | Thin Tauri shell; delete Tauri commands, `lodestash://`, `--mcp`, `agent_bridge.rs`, old `ui/` |
+| P5 | Thin Tauri shell; delete Tauri commands, `lodestash://`, old `ui/` (`--mcp` and `agent_bridge.rs` went with P4) |
 | P6 | Web foundation: contract extractor, tokens, primitives, data layer, generated client, shell, fixture catalog, gate |
 | P7 | Screens, in order: Library (+Inspector, Quick Look, staging, filters) → Identify → Favorites → Collections → Packages → Unity Assets (+import, add source) → Traits/Mapping → Stats → Duplicates → Trash → Settings → Onboarding → project switcher / Connect wizard |
 | P8 | R8 failure state, B3/B6/B7/B9/B14/B15, SQL-backed read model, MCP streamable HTTP, doc reconciliation |

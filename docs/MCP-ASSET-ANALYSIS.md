@@ -35,11 +35,16 @@ without making unrelated UI, vector-index, renderer or bulk-scheduler work a pre
 
 ## Evidence from the existing implementation
 
-Code inspected 2026-09-10; these are source observations, not a fresh live MCP test:
+Code inspected 2026-09-10; these are source observations, not a fresh live MCP test. *Since
+2026-11-16 (v2 plan P4) the MCP server is the standalone `lodestash-mcp` binary, a thin client of
+the app's `/v1` API with no catalog access
+([ADR-0022](decisions/ADR-0022-mcp-is-a-standalone-thin-client.md),
+[MCP-AND-ENGINES §2](MCP-AND-ENGINES.md#2-mcp-server)); the first two bullets and the diagram below
+describe the v1 server it replaced.*
 
-- `crates/lodestash-mcp/src/lib.rs` exposes 23 tools. Search, detail, previews, `add_tag`,
-  `identify_asset`, status and cancellation already exist. The earlier four-tool status was stale.
-- `lodestash-desktop --mcp` is the actual entry point. `agent_bridge.rs` forwards writes using
+- The v1 in-process server (`lodestash-mcp`'s former `lib.rs`) exposed 23 tools. Search, detail,
+  previews, `add_tag`, `identify_asset`, status and cancellation already exist.
+- `lodestash-desktop --mcp` was the entry point; its `agent_bridge.rs` forwarded writes using
   `engine.json`; the GUI owns the writer (ADR-0011). No new server framework is needed.
 - `ServerState::search` applies media filtering after a limited query; it has no source filter
   or stable full-library pagination. Randomly choosing from its first results is biased.

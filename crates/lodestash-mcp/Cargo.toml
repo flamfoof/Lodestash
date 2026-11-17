@@ -6,20 +6,34 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "MCP server (rmcp, stdio) — 1:1 with the loopback REST surface"
+description = "Lodestash's MCP server (stdio): a thin client of the running app's /v1 API"
 
+[[bin]]
+name = "lodestash-mcp"
+path = "src/main.rs"
+
+# A client of the app, never of the catalog (ADR-0022, v2 spec §7). No catalog, SQLite, engine or
+# server code may enter this crate's normal dependency tree: `tests/deps.rs` fails if one does.
 [dependencies]
-lodestash-core = { workspace = true }
-serde          = { workspace = true }
-serde_json     = { workspace = true }
-lodestash-api  = { workspace = true }
-rmcp           = { workspace = true }
-schemars       = { workspace = true }
-base64         = { workspace = true }
-# Tools run on the blocking pool (v1 plan S11); already in the tree through rmcp.
-tokio          = { workspace = true }
+lodestash-protocol = { workspace = true }
+rmcp               = { workspace = true }
+# Blocking HTTP to the app on loopback; each call runs on tokio's blocking pool.
+ureq               = { workspace = true }
+serde_json         = { workspace = true }
+# rmcp's runtime.
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+# stdout is the JSON-RPC channel: logs go to stderr.
+tracing-subscriber = { workspace = true }
+# Image content blocks and resource blobs.
+base64             = { workspace = true }
+# The platform location of `engine.json`.
+dirs               = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
-# Parity test only (tests/protocol_catalog.rs): today's tools against the v2 operation catalog.
-lodestash-protocol = { workspace = true }
+# The end-to-end tests serve today's `/v1` router on a temp catalog, on a listener they bind
+# themselves (never `lodestash_api::serve`, which writes the user's real `engine.json`).
+lodestash-api  = { workspace = true }
+lodestash-core = { workspace = true }
+axum           = { workspace = true }
+tempfile       = { workspace = true }

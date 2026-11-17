@@ -16,4 +16,8 @@ pub struct Handshake {
     /// v1 plan S11, and then treated as a different catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_id: Option<String>,
+    /// The binary serving this port (v2 spec §6). The MCP server launches it again when the app is
+    /// gone. Absent from a file written by an app that does not record it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
 }

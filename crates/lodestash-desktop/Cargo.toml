@@ -40,16 +40,13 @@ rusqlite = { workspace = true }
 # writer thread in `writer.rs` (ARCHITECTURE §5, single writer).
 lodestash-core = { workspace = true }
 lodestash-app = { workspace = true }
-# Headless MCP forwards its writes to the running app over loopback (agent_bridge.rs).
-ureq          = { workspace = true, features = ["json"] }
 # Mesh parse + decimation for the Quick Look viewer (lodestash://mesh).
 lodestash-ingest = { workspace = true }
-# The agent plane (B12, ENGINE-API §1–2, MCP↔REST 1:1): the loopback REST server + the MCP
-# stdio server share one `lodestash_api::ServerState` in this process. The API never writes the
-# catalog (its own read-only connection; the writer keeps single-writer).
+# The agent plane (B12, ENGINE-API §1–2): the loopback REST server, with its own
+# `lodestash_api::ServerState` in this process. The API never writes the catalog (its own
+# read-only connection; the writer keeps single-writer). The MCP server is a separate binary,
+# `lodestash-mcp`, that talks to it (ADR-0022).
 lodestash-api = { workspace = true }
-lodestash-mcp = { workspace = true }
-tokio = { workspace = true }
 lodestash-ai = { workspace = true }
 
 [dev-dependencies]
