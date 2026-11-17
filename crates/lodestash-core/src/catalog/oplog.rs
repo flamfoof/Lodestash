@@ -272,7 +272,7 @@ impl Catalog {
             )
             .optional()
             .map_err(|e| CoreError::Catalog(format!("op_payload: {e}")))?
-            .ok_or_else(|| CoreError::Catalog(format!("no such op {op_id}")))
+            .ok_or_else(|| CoreError::NotFound(format!("no such op {op_id}")))
     }
 }
 

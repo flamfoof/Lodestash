@@ -561,6 +561,40 @@ fn revert_dispatches_and_rejects_unknown_kinds() {
     assert!(c.revert_op(999).is_err(), "no such op");
 }
 
+/// Naming something that is not there is `NotFound` (v2 plan Task 1.1) — an op to undo or redo, a
+/// collection or taxonomy to delete — so an adapter answers 404, not 500.
+#[test]
+fn naming_a_missing_op_collection_or_taxonomy_is_not_found() {
+    use crate::error::ErrorKind;
+    let mut c = Catalog::open_in_memory().expect("open");
+    let errors = [
+        ("undo", c.revert_op(999).expect_err("undo")),
+        (
+            "delete collection",
+            c.delete_collection(999).expect_err("del"),
+        ),
+        (
+            "activate taxonomy",
+            c.set_active_taxonomy(999).expect_err("activate"),
+        ),
+        (
+            "delete taxonomy",
+            c.delete_taxonomy(999).expect_err("delete"),
+        ),
+    ];
+    for (what, err) in errors {
+        assert!(matches!(err, CoreError::NotFound(_)), "{what}: {err:?}");
+        assert_eq!(err.kind(), ErrorKind::NotFound, "{what}");
+    }
+
+    // The staging tray exists; it is refused for what it is, not reported missing.
+    let tray = c.ensure_active_staging_tray().expect("tray");
+    let err = c
+        .delete_collection(tray)
+        .expect_err("the tray is protected");
+    assert_eq!(err.kind(), ErrorKind::Invalid, "{err:?}");
+}
+
 #[test]
 fn collection_membership_add_remove_is_idempotent() {
     let (c, ids) = tagged_catalog(&[("a.fbx", "model_3d"), ("b.png", "image")]);

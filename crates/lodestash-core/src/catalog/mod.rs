@@ -6201,9 +6201,7 @@ fn write_source_excludes(conn: &Connection, source_id: i64, list: &[SourceExclud
         .optional()
         .map_err(|e| CoreError::Catalog(format!("source check: {e}")))?;
     if exists.is_none() {
-        return Err(CoreError::Catalog(format!(
-            "write_source_excludes: no such source {source_id}"
-        )));
+        return Err(CoreError::NotFound(format!("no such source {source_id}")));
     }
     Ok(())
 }

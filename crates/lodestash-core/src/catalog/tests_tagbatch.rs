@@ -636,7 +636,7 @@ fn undo_refuses_to_overwrite_a_newer_write_by_the_same_producer() {
     ))
     .expect("the same producer again");
     let err = c.revert_op(first).expect_err("undo over a newer write");
-    assert!(err.to_string().contains("conflict"), "{err}");
+    assert!(matches!(err, CoreError::Conflict(_)), "{err:?}");
     assert_eq!(
         rows(&c, a),
         vec![row("ai:host", "granite", Some(0.6), None)],
@@ -903,9 +903,8 @@ fn a_stale_revision_refuses_the_batch_and_a_fresh_one_passes() {
         ))
         .expect_err("a stale revision");
     assert!(
-        err.to_string()
-            .starts_with("catalog error: revision_conflict"),
-        "{err}"
+        matches!(err, CoreError::RevisionConflict { asset_id, .. } if asset_id == a),
+        "{err:?}"
     );
     assert!(
         rows(&c, b).is_empty(),
@@ -979,4 +978,113 @@ fn a_request_receipt_commits_with_its_batch_and_only_then() {
         c.apply_tag_batch(&reused).is_err(),
         "one request id, one write"
     );
+}
+
+// ---- typed error kinds (v2 plan Task 1.1) ----------------------------------------------------
+//
+// Each refusal is its own variant, produced by the operation that means it, so an adapter maps
+// 404/409/422 from `CoreError::kind` instead of reading the message.
+
+/// A write that names a revision the asset has moved past is a `RevisionConflict` carrying both
+/// revisions — what the caller read and what is there now — and nothing in the batch is written.
+#[test]
+fn a_stale_revision_is_a_revision_conflict_naming_both_revisions() {
+    let (mut c, ids) = catalog_with(&[("a.png", "image")]);
+    let a = ids[0];
+    let seen = c.annotation_revision(a).expect("revision");
+    c.apply_tag_batch(&batch(
+        vec![item(a, "ai:m", Some("m"), Append, vec![ai("stone", 0.5)])],
+        true,
+        None,
+    ))
+    .expect("someone else writes");
+    let now = c.annotation_revision(a).expect("moved");
+
+    let mut stale = item(a, "ai:host", None, Append, vec![ai("granite", 0.4)]);
+    stale.expected_revision = Some(seen.clone());
+    let err = c
+        .apply_tag_batch(&batch(vec![stale], false, Some(Agent)))
+        .expect_err("a stale revision");
+    match &err {
+        CoreError::RevisionConflict {
+            asset_id,
+            expected,
+            actual,
+        } => assert_eq!((*asset_id, expected, actual), (a, &seen, &now)),
+        other => panic!("not a revision conflict: {other:?}"),
+    }
+    assert_eq!(err.kind(), crate::error::ErrorKind::Conflict);
+    assert_eq!(
+        rows(&c, a),
+        vec![row("ai:m", "stone", Some(0.5), Some("m"))],
+        "the refused batch wrote nothing"
+    );
+}
+
+/// Undoing an edit whose associations another write has since replaced is a `Conflict`: the newer
+/// write is left alone, and the caller can tell that apart from a failure.
+#[test]
+fn an_undo_over_a_newer_write_is_a_conflict() {
+    let (mut c, ids) = catalog_with(&[("a.png", "image")]);
+    let a = ids[0];
+    let first = c
+        .apply_tag_batch(&batch(
+            vec![item(a, "ai:host", None, Append, vec![ai("stone", 0.5)])],
+            false,
+            Some(Agent),
+        ))
+        .expect("agent")
+        .op_id
+        .expect("op");
+    c.apply_tag_batch(&batch(
+        vec![item(
+            a,
+            "ai:host",
+            None,
+            ReplaceSource,
+            vec![ai("granite", 0.6)],
+        )],
+        false,
+        Some(Agent),
+    ))
+    .expect("the same producer again");
+
+    let err = c.revert_op(first).expect_err("undo over a newer write");
+    assert!(matches!(err, CoreError::Conflict(_)), "{err:?}");
+    assert_eq!(err.kind(), crate::error::ErrorKind::Conflict);
+    assert_eq!(
+        rows(&c, a),
+        vec![row("ai:host", "granite", Some(0.6), None)],
+        "the newer write is left as it is"
+    );
+}
+
+/// A batch that breaks a rule — the same asset twice under one source, or an asset that does not
+/// exist — is `Invalid`, and nothing in it is written.
+#[test]
+fn a_malformed_tag_batch_is_invalid() {
+    let (mut c, ids) = catalog_with(&[("a.png", "image")]);
+    let a = ids[0];
+    let twice = batch(
+        vec![
+            item(a, "ai:host", None, Append, vec![ai("stone", 0.5)]),
+            item(a, "ai:host", None, Append, vec![ai("moss", 0.5)]),
+        ],
+        false,
+        Some(Agent),
+    );
+    let missing = batch(
+        vec![
+            item(a, "ai:host", None, Append, vec![ai("stone", 0.5)]),
+            item(a + 1000, "ai:host", None, Append, vec![ai("moss", 0.5)]),
+        ],
+        false,
+        Some(Agent),
+    );
+    for (why, b) in [("twice", twice), ("missing asset", missing)] {
+        let err = c.apply_tag_batch(&b).expect_err(why);
+        assert!(matches!(err, CoreError::Invalid(_)), "{why}: {err:?}");
+        assert_eq!(err.kind(), crate::error::ErrorKind::Invalid, "{why}");
+    }
+    assert!(rows(&c, a).is_empty(), "a refused batch wrote nothing");
 }
