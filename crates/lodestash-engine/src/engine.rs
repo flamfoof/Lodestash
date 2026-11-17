@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use lodestash_core::catalog::{AppraiseFocus, Catalog};
 
 use crate::changes::{ChangedEvent, PUBLISH_WINDOW};
-use crate::config::ConfigFile;
+use crate::config_store::ConfigStore;
 use crate::jobs::JobProgress;
 use crate::read_model::Library;
 use crate::writer::{JobRegistry, WriterHandle, WriterSetup};
@@ -63,8 +63,15 @@ impl EngineConfig {
     }
 
     /// This engine's `config.json`.
-    pub fn config_file(&self) -> ConfigFile {
-        ConfigFile::at(self.config_dir.join("config.json")).with_keychain(self.os_keychain)
+    pub fn config_path(&self) -> PathBuf {
+        self.config_dir.join("config.json")
+    }
+
+    /// Open this engine's config. The engine opens it once, at start, and every read and write of
+    /// it goes through that store ([`Engine::config_store`]); a test opens one here to seed the file
+    /// before the engine starts.
+    pub fn open_config(&self) -> ConfigStore {
+        ConfigStore::open(self.config_path(), self.os_keychain)
     }
 
     /// The exclusive lock file beside the catalog (v2 spec §4.2).
@@ -99,6 +106,17 @@ impl EngineStatus {
     pub fn is_settled(&self) -> bool {
         matches!(self, EngineStatus::Ready | EngineStatus::Failed { .. })
     }
+}
+
+/// The status and what the user should be told about it — the body `GET /v1/status` will answer
+/// (v2 spec §4.2, §4.5).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EngineReport {
+    #[serde(flatten)]
+    pub status: EngineStatus,
+    /// Set when `config.json` did not parse at start: where the bad file was moved. The engine ran
+    /// on defaults; reported until [`Engine::dismiss_config_recovered`] (review B12).
+    pub config_recovered: Option<PathBuf>,
 }
 
 /// The status, shared with the writer thread that moves it.
@@ -155,6 +173,7 @@ impl std::ops::Deref for ReadModelGuard<'_> {
 
 struct Inner {
     cfg: EngineConfig,
+    config: Arc<ConfigStore>,
     status: Arc<StatusCell>,
     writer: WriterHandle,
     read: Mutex<ReadSlot>,
@@ -188,6 +207,11 @@ impl Engine {
     /// creating or migrating — the catalog and reports `Ready`; [`Self::wait_settled`] waits for it.
     pub fn start(cfg: EngineConfig) -> Engine {
         let status = Arc::new(StatusCell::new(EngineStatus::Starting));
+        // Opened first and once: the writer, the read model and the shell all read this one.
+        let config = Arc::new(cfg.open_config());
+        if let Some(moved) = config.recovered() {
+            tracing::error!(to = %moved.display(), "config.json did not parse; running on defaults");
+        }
         let jobs = JobRegistry::default();
         let pump = Arc::new(AtomicBool::new(false));
         let appraise = Arc::new(JobProgress::default());
@@ -197,7 +221,7 @@ impl Engine {
                 db_path: cfg.catalog.clone(),
                 cache_dir: Some(cfg.cache_dir.clone()),
                 workspace_dir: Some(cfg.workspace_dir.clone()),
-                config: cfg.config_file(),
+                config: config.clone(),
                 lock,
                 status: status.clone(),
                 jobs: jobs.clone(),
@@ -219,12 +243,13 @@ impl Engine {
             cfg.catalog.clone(),
             Some(cfg.cache_dir.clone()),
             Some(cfg.workspace_dir.clone()),
-            cfg.config_file(),
+            config.clone(),
         );
         let (events, _) = tokio::sync::broadcast::channel(64);
         Engine {
             inner: Arc::new(Inner {
                 cfg,
+                config,
                 status,
                 writer,
                 read: Mutex::new(ReadSlot {
@@ -255,11 +280,14 @@ impl Engine {
             workspace_dir: PathBuf::new(),
             os_keychain: false,
         };
-        let model = Library::new(PathBuf::new(), None, None, cfg.config_file());
+        // Nowhere to keep a config either: defaults, held in memory.
+        let config = Arc::new(ConfigStore::in_memory());
+        let model = Library::new(PathBuf::new(), None, None, config.clone());
         let (events, _) = tokio::sync::broadcast::channel(64);
         Engine {
             inner: Arc::new(Inner {
                 cfg,
+                config,
                 status,
                 writer: WriterHandle::absent(message),
                 read: Mutex::new(ReadSlot {
@@ -279,6 +307,24 @@ impl Engine {
     /// What the engine is doing now.
     pub fn status(&self) -> EngineStatus {
         self.inner.status.get()
+    }
+
+    /// The status, with what the user still has to be told (a recovered config).
+    pub fn report(&self) -> EngineReport {
+        EngineReport {
+            status: self.status(),
+            config_recovered: self.config_recovered(),
+        }
+    }
+
+    /// Where a `config.json` that failed to parse at start was moved, until dismissed (B12).
+    pub fn config_recovered(&self) -> Option<PathBuf> {
+        self.inner.config.recovered()
+    }
+
+    /// The user has seen that their config was reset.
+    pub fn dismiss_config_recovered(&self) {
+        self.inner.config.dismiss_recovered();
     }
 
     /// Wait until the engine is `Ready` or `Failed`, at most `timeout`, and say which.
@@ -305,9 +351,9 @@ impl Engine {
         &self.inner.cfg
     }
 
-    /// This engine's `config.json`.
-    pub fn config_file(&self) -> ConfigFile {
-        self.inner.cfg.config_file()
+    /// This engine's configuration — the only way to read or write its `config.json`.
+    pub fn config_store(&self) -> &Arc<ConfigStore> {
+        &self.inner.config
     }
 
     /// Every committed change, coalesced (ADR-0016). The publisher starts with the first

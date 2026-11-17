@@ -304,7 +304,8 @@ throttle hard — Gemini free is on the order of ~15 requests/minute. A naive ti
   the confirm.
 - **Key at rest.** `api_key` is the one secret this local-first app holds; store it in the **OS
   credential store** (Windows Credential Manager) when available, with a plaintext-config fallback so
-  the app still works headless. Never logged, never sent anywhere but the chosen endpoint.
+  the app still works headless. Never logged, never sent anywhere but the chosen endpoint — not to
+  the UI either: a Settings read reports only `api_key_configured` (v2 spec §4.5).
 - **The idle lane never spends money.** A cloud pass is always an explicit, scoped, capped kick —
   the background auto-identify slice does not tag when an API model is configured. Two reasons, and
   either alone is sufficient: a lane that bills an endpoint while the user is not looking is not

@@ -33,7 +33,7 @@ use lodestash_ingest::unitypackage::{
     extract_at_offsets_with_progress, read_manifest_with_progress, EntryLocator, ExtractedAsset,
 };
 
-use crate::config::ConfigFile;
+use crate::config_store::ConfigStore;
 use crate::drains::{
     drain_audio_tags, drain_previews, drain_promote_resync, drain_tags, resolve_audio_embedder,
     resolve_embedder,
@@ -872,7 +872,8 @@ pub(crate) struct WriterSetup {
     pub db_path: PathBuf,
     pub cache_dir: Option<PathBuf>,
     pub workspace_dir: Option<PathBuf>,
-    pub config: ConfigFile,
+    /// The engine's one config store — every read here is of the current, in-memory config.
+    pub config: Arc<ConfigStore>,
     /// The catalog's `.lock` file, held for the thread's life (v2 spec §4.2).
     pub lock: std::fs::File,
     pub status: Arc<crate::engine::StatusCell>,
@@ -894,7 +895,7 @@ pub(crate) struct WriterCtx {
     focus: Arc<Mutex<AppraiseFocus>>,
     cache_dir: Option<PathBuf>,
     workspace_dir: Option<PathBuf>,
-    config: ConfigFile,
+    config: Arc<ConfigStore>,
 }
 
 /// Run one command under `catch_unwind` (v2 spec §4.1, review U9): a panic fails that command
@@ -1089,7 +1090,7 @@ fn writer_main(
     // …and enforce the preview cap the settings screen has always shown and never applied
     // (UI-SPEC §11.4). Startup rather than per-write: the cache grows a thumbnail at a time and a
     // check on that path would stat the whole tree on every preview.
-    let display = ctx.config.load_display_only();
+    let display = ctx.config.get();
     if let Some(thumbs) = ctx.cache_dir.as_deref() {
         guarded("preview cache sweep", || {
             // Identity before pressure. A stale-budget proxy, an orphan staging mesh and a
@@ -1204,7 +1205,7 @@ fn writer_main(
                 // A source set (or its watch flags) changed — re-arm the watch so new roots are
                 // covered and unwatched ones stop firing.
                 if source_set_changed {
-                    watch = if drain_enabled && ctx.config.load_display_only().watch_sources {
+                    watch = if drain_enabled && ctx.config.read(|c| c.watch_sources) {
                         rebuild_watch(&catalog)
                     } else {
                         None
@@ -1458,7 +1459,7 @@ fn rebuild_watch(catalog: &Catalog) -> Option<lodestash_ingest::watch::RootWatch
 /// `persist_to_catalog` opens its own connection here exactly as `Op::PersistScan` does).
 /// Returns whether anything actually changed, so the UI only reloads when it did.
 fn rescan_watched(catalog: &mut Catalog, ctx: &WriterCtx) -> bool {
-    let cfg = ctx.config.load_display_only();
+    let cfg = ctx.config.get();
     let project = cfg.last_project_name.as_deref();
     let mut changed = false;
     let mut prefab_scopes = Vec::new();
@@ -1528,7 +1529,7 @@ fn tag_worker_slice(
     workspace_dir: Option<std::path::PathBuf>,
     cache_dir: Option<std::path::PathBuf>,
     tx: &SyncSender<WriterMsg>,
-    config: &ConfigFile,
+    config: &ConfigStore,
 ) -> bool {
     // A read connection, only for the user's taught vocabulary — WAL admits any number of
     // readers, and every write still lands on the writer thread (ADR-0002). Read-only by type:
@@ -1549,7 +1550,7 @@ fn tag_worker_slice(
         })
         .collect::<Vec<_>>();
     let zero_shot = embedder.and_then(|e| ImageZeroShot::new(e, &teach));
-    let cfg = config.load();
+    let cfg = config.get();
     // **The idle lane never spends money.** Cloud tagging needs `drain_api_tags` (backoff, local
     // fallback, per-run cap) and that drain writes through `&mut Catalog`, so it belongs to the
     // writer's kick path — this slice runs off-writer and can only reach `compute_tags`, which
@@ -1620,11 +1621,7 @@ fn appraise_pass(
     progress.failed.store(0, Ordering::Relaxed);
     progress.cancelled.store(false, Ordering::Relaxed);
     let (cache_dir, workspace_dir) = (ctx.cache_dir.clone(), ctx.workspace_dir.clone());
-    let proxy = ctx
-        .config
-        .load_display_only()
-        .preview_quality
-        .proxy_budget();
+    let proxy = ctx.config.read(|c| c.preview_quality.proxy_budget());
     let roots = catalog
         .source_infos()
         .map(|infos| {
@@ -1665,7 +1662,7 @@ fn appraise_pass(
             .collect::<Vec<_>>();
         let zero_shot = embedder.clone().and_then(|e| ImageZeroShot::new(e, &teach));
         let audio_shot = audio_embedder.clone().and_then(AudioZeroShot::new);
-        let cfg = ctx.config.load();
+        let cfg = ctx.config.get();
         let api_model = cfg
             .api_model
             .clone()
@@ -2954,9 +2951,9 @@ fn remove_from_library(
 /// Mirror a blacklist edit into the app config the crawler actually reads (UI-SPEC §11.1).
 /// `import_source.blacklist` is catalog storage; `crawl` is fed from
 /// `AppConfig.source_excludes(project, root)` — write both, or the Settings editor changes
-/// nothing and the next scan resurrects every "removed" asset. The config write goes through
-/// `edit_config` (the one shared CONFIG_LOCK), so it cannot interleave with the web-prefs /
-/// settings commands; the writer holds no other lock here, so there is no lock-order cycle.
+/// nothing and the next scan resurrects every "removed" asset. The config write is a
+/// [`ConfigStore::update`], so it cannot interleave with the web-prefs or settings writes; the
+/// writer holds no other lock here, so there is no lock-order cycle.
 fn sync_source_exclude_to_config(
     catalog: &Catalog,
     ctx: &WriterCtx,
@@ -2976,16 +2973,18 @@ fn sync_source_exclude_to_config(
         },
         value: value.to_string(),
     };
-    ctx.config.edit(|config| {
-        let Some(project) = config.last_project_name.clone() else {
-            return;
-        };
-        if add {
-            config.add_source_exclude(&project, std::path::Path::new(&root), exclude);
-        } else {
-            config.remove_source_exclude(&project, std::path::Path::new(&root), &exclude);
-        }
-    })
+    ctx.config
+        .update(|config| {
+            let Some(project) = config.last_project_name.clone() else {
+                return;
+            };
+            if add {
+                config.add_source_exclude(&project, std::path::Path::new(&root), exclude);
+            } else {
+                config.remove_source_exclude(&project, std::path::Path::new(&root), &exclude);
+            }
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// May this target's file be deleted?

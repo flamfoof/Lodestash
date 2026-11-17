@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use lodestash_core::catalog::{Catalog, CrawlRecord};
 
-use crate::config::AppConfig;
 use crate::types::PersistBatch;
 use crate::writer::{Op, WriteError};
 use crate::{Engine, EngineConfig, EngineStatus, Origin};
@@ -19,11 +18,12 @@ const SETTLE: Duration = Duration::from_secs(5);
 /// installed) and the source watch.
 fn quiet(root: &Path) -> EngineConfig {
     let cfg = EngineConfig::under(root);
-    cfg.config_file().save(&AppConfig {
-        auto_identify: false,
-        watch_sources: false,
-        ..AppConfig::default()
-    });
+    cfg.open_config()
+        .update(|c| {
+            c.auto_identify = false;
+            c.watch_sources = false;
+        })
+        .expect("seed the config");
     cfg
 }
 
@@ -257,17 +257,17 @@ fn remove_from_library_mirrors_into_the_open_projects_config() {
     let dir = tempfile::tempdir().expect("tmp");
     let cfg = quiet(dir.path());
     let lib = dir.path().join("lib");
-    let file = cfg.config_file();
-    file.edit(|c| {
-        c.projects.push(crate::config::LibraryProject {
-            name: "Game".into(),
-            paths: vec![lib.clone()],
-            blacklist: Default::default(),
-            pack_only: Default::default(),
-        });
-        c.last_project_name = Some("Game".into());
-    })
-    .expect("project");
+    cfg.open_config()
+        .update(|c| {
+            c.projects.push(crate::config::LibraryProject {
+                name: "Game".into(),
+                paths: vec![lib.clone()],
+                blacklist: Default::default(),
+                pack_only: Default::default(),
+            });
+            c.last_project_name = Some("Game".into());
+        })
+        .expect("project");
     let engine = Engine::start(cfg.clone());
     assert_eq!(engine.wait_settled(SETTLE), EngineStatus::Ready);
     let (_, ids) = seed(&engine, dir.path(), &["drop.png"]);
@@ -277,11 +277,46 @@ fn remove_from_library_mirrors_into_the_open_projects_config() {
         .run(Op::RemoveFromLibrary { targets })
         .expect("remove");
 
-    let excludes = file.load_display_only().source_excludes("Game", &lib);
+    // Read back from the file, through a store of its own: the engine's update reached the disk.
+    let excludes = cfg.open_config().get().source_excludes("Game", &lib);
     assert!(
         excludes.iter().any(|e| e.value == "drop.png"),
         "the crawl's list did not get the exclusion: {excludes:?}"
     );
+}
+
+/// Review B12, at the engine: a config that does not parse is quarantined, the engine starts on
+/// defaults, and its report carries `config_recovered` until the user dismisses it. Changing a
+/// setting then writes a valid file.
+#[test]
+fn a_corrupt_config_is_reported_by_the_engine_until_dismissed() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let cfg = EngineConfig::under(dir.path());
+    std::fs::create_dir_all(&cfg.config_dir).unwrap();
+    std::fs::write(cfg.config_path(), b"{\"auto_identify\": fal").unwrap();
+
+    let engine = Engine::start(cfg.clone());
+    assert_eq!(engine.wait_settled(SETTLE), EngineStatus::Ready);
+    let report = serde_json::to_value(engine.report()).unwrap();
+    assert_eq!(report["state"], "ready");
+    let moved = engine.config_recovered().expect("the recovery is reported");
+    assert_eq!(report["config_recovered"], moved.to_string_lossy().as_ref());
+    assert!(moved.is_file(), "the bad file is kept");
+
+    // Quiet the idle lane before it can load models, then prove the write path is whole again.
+    engine
+        .config_store()
+        .update(|c| {
+            c.auto_identify = false;
+            c.watch_sources = false;
+        })
+        .expect("save");
+    let reread = cfg.open_config();
+    assert!(reread.recovered().is_none(), "the saved file parses");
+    assert!(!reread.get().auto_identify);
+
+    engine.dismiss_config_recovered();
+    assert!(engine.report().config_recovered.is_none());
 }
 
 /// Review B13, through the writer: trash {a, b} while a is already in the Trash, then undo — a

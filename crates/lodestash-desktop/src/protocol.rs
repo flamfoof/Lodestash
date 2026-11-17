@@ -117,7 +117,7 @@ fn thumb(engine: &Engine, rest: &str) -> Response<Vec<u8>> {
     // Grid render quality comes from the persisted setting (UI-SPEC §11.3). The client URL carries
     // `?q=` (see api.ts thumbUrl) purely as a cache-buster — a bare id URL with max-age would keep
     // serving the old-size PNG after a Settings change.
-    let quality = engine.config_file().load_display_only().preview_quality;
+    let quality = engine.config_store().read(|c| c.preview_quality);
     match media::render_thumb(&job, &cache, quality) {
         Ok(bytes) => reply(StatusCode::OK)
             .header("Content-Type", "image/png")

@@ -132,3 +132,30 @@ fn the_handshake_file_round_trips() {
         );
     }
 }
+
+/// The old shell's whole-object Settings write (`crates/lodestash-desktop/ui/src/lib/api.ts`
+/// `Settings`, as `SettingsScreen.svelte` sends it with a key typed in) parses into the sectioned
+/// DTO and is the same flat object again — the sections are a Rust shape, not a wire one.
+#[test]
+fn the_old_shells_settings_object_round_trips_flat() {
+    let written = json!({
+        "m_kb": 1024, "l_kb": 4096, "xl_kb": 8192, "cap_kb": 10240,
+        "preview_quality": "medium",
+        "skip_onboarding": false, "watch_sources": true, "auto_identify": true,
+        "cache_extracted": false, "preview_cache_cap_gb": 8, "auto_purge_preview_cache": true,
+        "confirm_before_trash": true, "mcp_disabled_tools": ["export_asset"],
+        "tagger_model": null, "tagger_vision_model": null,
+        "api_tagging_enabled": true,
+        "api_base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "api_model": "gemini-flash", "api_key": "sk-typed", "api_key_configured": false,
+        "api_max_per_run": 500, "remote_image_bytes": true, "mcp_bytes_enabled": true,
+    });
+    round_trips::<lodestash_protocol::dto::Settings>(written.clone());
+
+    // A write from a client that never saw the key (a read carries none) leaves it out.
+    let mut read = written;
+    read.as_object_mut().unwrap().remove("api_key");
+    let s: lodestash_protocol::dto::Settings = serde_json::from_value(read).unwrap();
+    assert_eq!(s.cloud.api_key, None, "absent is 'keep the stored key'");
+    assert!(s.cloud.remote_image_bytes && s.agents.mcp_bytes_enabled);
+}

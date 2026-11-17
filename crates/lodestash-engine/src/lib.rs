@@ -10,6 +10,7 @@
 pub mod audio;
 pub mod changes;
 pub mod config;
+pub mod config_store;
 pub mod drains;
 pub mod egress;
 mod engine;
@@ -28,7 +29,8 @@ pub mod types;
 pub mod writer;
 
 pub use changes::{ChangedEvent, Origin};
-pub use engine::{Engine, EngineConfig, EngineStatus, ReadModelGuard};
+pub use config_store::ConfigStore;
+pub use engine::{Engine, EngineConfig, EngineReport, EngineStatus, ReadModelGuard};
 /// What a [`Engine::subscribe`] receiver answers when it fell behind or the engine is gone.
 pub use tokio::sync::broadcast::error::RecvError as ChangeRecvError;
 pub use writer::{Op, WriteError, WriteResult, WriterHandle};

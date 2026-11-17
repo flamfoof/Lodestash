@@ -68,7 +68,8 @@
     mcp_bytes_enabled: false,
     api_base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
     api_model: null,
-    api_key: "",
+    // No `api_key`: a save before the real settings land must keep the stored key, not clear it.
+    api_key_configured: false,
     // Matches config.rs's `default_api_max_per_run` — the budget guard must not read as uncapped
     // before the real settings land.
     api_max_per_run: 500,
@@ -792,6 +793,7 @@
           <span>API key</span>
           <input
             type="password"
+            placeholder={s.api_key_configured ? "saved — type to replace" : ""}
             bind:value={s.api_key}
             onchange={save}
             autocomplete="off"

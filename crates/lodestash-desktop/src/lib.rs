@@ -17,9 +17,10 @@ use serde::Serialize;
 use tauri::Manager;
 use tauri_plugin_window_state::AppHandleExt;
 
+use lodestash_engine::config_store::Settings;
 use lodestash_engine::read_model::{
     AssetDetail, DupGroup, ExportBatchRow, Facets, FolderPage, FolderQuery, GridPage, GridQuery,
-    LibraryStatus, PackDirNode, PackageRow, RelinkCount, Settings, Stats, VocabRow,
+    LibraryStatus, PackDirNode, PackageRow, RelinkCount, Stats, VocabRow,
 };
 use lodestash_engine::writer::{Op, WriteResult, WriterHandle};
 use lodestash_engine::{Engine, EngineConfig, EngineStatus};
@@ -49,8 +50,6 @@ struct AppState {
     /// The per-session bearer token (ENGINE-API §1) — surfaced for the Connect screen, never
     /// logged.
     engine_token: String,
-    /// How many agent tools the allow-list left enabled (`None` = every tool is live).
-    engine_allowed: Option<usize>,
     /// The Import-packages dialog's (FEATURES §5.2) discovery cache: archive absolute path → the
     /// manifest locators `discover_package_folder` read, held so `import_packages` can record +
     /// mint without re-inflating the archive.
@@ -483,7 +482,7 @@ fn import_root(state: &tauri::State<'_, AppState>, path: &str) -> Result<WriteRe
     // ignores it resurrects everything the user removed the moment they re-add the folder.
     // Pack-only sources are honoured for the same reason — the user already said what they want
     // from that folder.
-    let config = state.engine.config_file().load_display_only();
+    let config = state.engine.config_store().get();
     let (excludes, pack_only) = match config.last_project_name.as_deref() {
         Some(project) => (
             config.source_excludes(project, &root),
@@ -552,11 +551,12 @@ fn sync_unity_cache(state: tauri::State<'_, AppState>) -> Result<WriteResult, St
         if !root.is_dir() {
             continue;
         }
-        let config = state.engine.config_file().load_display_only();
-        let pack_only = match config.last_project_name.as_deref() {
-            Some(project) => config.is_pack_only(project, &root),
-            None => false,
-        };
+        let pack_only = state.engine.config_store().read(|config| {
+            config
+                .last_project_name
+                .as_deref()
+                .is_some_and(|project| config.is_pack_only(project, &root))
+        });
         if pack_only {
             continue;
         }
@@ -877,7 +877,7 @@ fn pack_dir_tree(
 fn get_web_prefs(
     state: tauri::State<'_, AppState>,
 ) -> Result<lodestash_engine::config::WebPrefs, String> {
-    state.engine.config_file().edit(|c| c.web.clone())
+    Ok(state.engine.config_store().read(|c| c.web.clone()))
 }
 
 /// Persist the Svelte shell's view prefs. All-or-nothing write of the whole group — the
@@ -887,7 +887,11 @@ fn set_web_prefs(
     state: tauri::State<'_, AppState>,
     prefs: lodestash_engine::config::WebPrefs,
 ) -> Result<(), String> {
-    state.engine.config_file().edit(|c| c.web = prefs)
+    state
+        .engine
+        .config_store()
+        .update(|c| c.web = prefs)
+        .map_err(|e| e.to_string())
 }
 
 /// Trait-library authoring (UI-SPEC §9, B8a). Create or promote a trait; an existing tag keeps
@@ -940,12 +944,10 @@ fn set_trait_style(
 }
 
 /// The Settings screen's snapshot (UI-SPEC §11). Read once; the frontend writes it back whole.
+/// A read: it never writes the file, and never carries the API key (review U8).
 #[tauri::command]
 fn get_settings(state: tauri::State<'_, AppState>) -> Result<Settings, String> {
-    state
-        .engine
-        .config_file()
-        .edit(|c| Settings::from_config(c))
+    Ok(state.engine.config_store().settings())
 }
 
 /// The budget guard's pre-run question (AI-PIPELINE §5.1): would this Identify run spend money,
@@ -962,7 +964,7 @@ fn get_settings(state: tauri::State<'_, AppState>) -> Result<Settings, String> {
 fn cloud_run_estimate(
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<serde_json::Value>, String> {
-    let cfg = state.engine.config_file().load();
+    let cfg = state.engine.config_store().get();
     let configured =
         cfg.api_tagging_enabled && !cfg.api_key.trim().is_empty() && cfg.api_model.is_some();
     if !configured || lodestash_ai::openai::is_free_endpoint(&cfg.api_base_url) {
@@ -1015,7 +1017,7 @@ fn api_presets() -> Vec<serde_json::Value> {
 /// and the probe carries its own 30 s timeout.
 #[tauri::command]
 fn test_api_tagger(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    let cfg = state.engine.config_file().load();
+    let cfg = state.engine.config_store().get();
     let Some(model) = cfg.api_model.clone().filter(|m| !m.trim().is_empty()) else {
         return Err("No API model set — fill in the model id first.".into());
     };
@@ -1043,10 +1045,15 @@ fn clear_preview_cache(state: tauri::State<'_, AppState>) -> Result<usize, Strin
 }
 
 /// Persist the Settings snapshot and re-read the library so the size tiers and source rows the
-/// grid draws follow immediately (badges, ⚑ size facet, watch toggles).
+/// grid draws follow immediately (badges, ⚑ size facet, watch toggles). The agent planes follow
+/// the allow-list and byte release on their own (`ServerState::follow_config`).
 #[tauri::command]
 fn set_settings(state: tauri::State<'_, AppState>, settings: Settings) -> Result<(), String> {
-    state.engine.config_file().edit(|c| settings.apply(c))?;
+    state
+        .engine
+        .config_store()
+        .set_settings(settings)
+        .map_err(|e| e.to_string())?;
     // Size tiers and watch flags come from config, which the catalog generation does not see.
     state.engine.reload();
     Ok(())
@@ -1338,7 +1345,12 @@ fn engine_bridge(state: tauri::State<'_, AppState>) -> EngineBridge {
     EngineBridge {
         port: state.engine_port,
         token_set: !state.engine_token.is_empty(),
-        allowed: state.engine_allowed,
+        // Read now, not at startup: the allow-list applies live (v2 spec §4.5).
+        allowed: state
+            .engine
+            .config_store()
+            .read(|c| c.mcp_enabled_tools())
+            .map(|set| set.len()),
         live: state.agents.is_some(),
     }
 }
@@ -1786,12 +1798,12 @@ fn bulk_tag(
 /// embedded engine (B12).
 fn engine_preview_fn(
     cache_root: Option<std::path::PathBuf>,
-    config: lodestash_engine::config::ConfigFile,
+    config: std::sync::Arc<lodestash_engine::ConfigStore>,
 ) -> lodestash_api::PreviewFn {
     Box::new(move |subject| {
         use lodestash_ingest::thumb::{generate, generate_material, meta_key, ThumbParams};
         let cache = cache_root.as_deref()?;
-        let q = config.load_display_only().preview_quality;
+        let q = config.read(|c| c.preview_quality);
         let params = ThumbParams {
             width: q.thumb_px(),
             height: q.thumb_px(),
@@ -1875,25 +1887,6 @@ fn engine_preview_fn(
         }
         generate(src, cache, &key, params).ok()
     })
-}
-
-/// Apply the Settings MCP allow-list (UI-SPEC §16): config holds the disabled half, the state the
-/// enabled set. Returns how many tools stayed enabled (`None` = every tool is live).
-fn apply_allow_list(
-    state: &lodestash_api::ServerState,
-    config: &lodestash_engine::config::ConfigFile,
-) -> Option<usize> {
-    let cfg = config.load_display_only();
-    if cfg.mcp_disabled_tools.is_empty() {
-        return None;
-    }
-    let enabled: std::collections::HashSet<String> = lodestash_api::AGENT_OPERATIONS
-        .iter()
-        .map(|(n, _)| n.to_string())
-        .filter(|n| !cfg.mcp_disabled_tools.contains(n))
-        .collect();
-    state.set_allowed(enabled.clone());
-    Some(enabled.len())
 }
 
 /// The agent planes' write bridge (ADR-0002): each [`lodestash_api::AgentWrite`] maps to the
@@ -2015,20 +2008,13 @@ fn legacy_agent_batch(
 /// is none (the engine is not ready, or the API could not read the catalog).
 fn build_engine_state(
     engine: &Engine,
-) -> Result<
-    (
-        std::sync::Arc<lodestash_api::ServerState>,
-        String,
-        Option<usize>,
-    ),
-    String,
-> {
+) -> Result<(std::sync::Arc<lodestash_api::ServerState>, String), String> {
     if let EngineStatus::Failed { message, .. } = engine.status() {
         return Err(message);
     }
     let paths = engine.config();
     let cache_root = Some(paths.cache_dir.clone());
-    let config = engine.config_file();
+    let config = engine.config_store().clone();
     let state = lodestash_api::ServerState::new(
         &paths.catalog,
         paths.workspace_dir.clone(),
@@ -2052,21 +2038,17 @@ fn build_engine_state(
         })
     }));
     let state = std::sync::Arc::new(state);
-    let allowed = apply_allow_list(&state, &config);
-    // ENGINE-API §8.3: `write_tags` writes under the producer the user configured for this host,
-    // and refuses without one.
-    let cfg = config.load_display_only();
-    state.set_agent_producer(cfg.agent_producer_id);
-    // Whether an agent may receive bytes at all (v1 plan S10) — metadata and links are always
-    // available, the files are not until the user says so.
-    state.set_byte_release(cfg.mcp_bytes_enabled);
+    // The allow-list (UI-SPEC §11.5), the producer `write_tags` writes under (ENGINE-API §8.3) and
+    // whether an agent may receive bytes at all (v1 plan S10) — now, and after every settings
+    // change, without a restart (v2 spec §4.5).
+    lodestash_api::ServerState::follow_config(&state, &config);
     // The REST/MCP semantic-search plane (ENGINE-API §2 `mode=ai`) embeds the query exactly as the
     // grid's AI mode does — SigLIP and CLAP, resolved lazily on the first ai search (model load is
     // seconds; a startup resolve would slow every launch). No spaces means no model → the route
     // answers `ai_unavailable` instead of degrading.
     state.set_query_embedder(Box::new(lodestash_engine::drains::query_spaces));
     let token = state.token().to_string();
-    Ok((state, token, allowed))
+    Ok((state, token))
 }
 
 pub fn run() {
@@ -2195,29 +2177,27 @@ pub fn run() {
             // Connect wizard and the `lodestash-mcp` server (ADR-0022). Its ServerState has its
             // own read-only catalog connection — the API never writes the catalog, so the
             // single-writer rule holds.
-            let (agents, engine_port, engine_token, engine_allowed) =
-                match build_engine_state(&engine) {
-                    Ok((state, token, allowed)) => {
-                        // Wire the write bridge before serving: mutating agent ops (add_tag,
-                        // apply_mapping, identify, unpack, staging) go through the single writer.
-                        state.set_write(engine_write_bridge(engine.writer().clone()));
-                        let port = lodestash_api::serve(state.clone())
-                            .map(|h| h.port)
-                            .map_err(|e| tracing::error!(%e, "engine API failed to bind"))
-                            .ok();
-                        (Some(state), port, token, allowed)
-                    }
-                    Err(why) => {
-                        tracing::warn!(%why, "agent planes not started");
-                        (None, None, String::new(), None)
-                    }
-                };
+            let (agents, engine_port, engine_token) = match build_engine_state(&engine) {
+                Ok((state, token)) => {
+                    // Wire the write bridge before serving: mutating agent ops (add_tag,
+                    // apply_mapping, identify, unpack, staging) go through the single writer.
+                    state.set_write(engine_write_bridge(engine.writer().clone()));
+                    let port = lodestash_api::serve(state.clone())
+                        .map(|h| h.port)
+                        .map_err(|e| tracing::error!(%e, "engine API failed to bind"))
+                        .ok();
+                    (Some(state), port, token)
+                }
+                Err(why) => {
+                    tracing::warn!(%why, "agent planes not started");
+                    (None, None, String::new())
+                }
+            };
             app.manage(AppState {
                 engine: engine.clone(),
                 agents,
                 engine_port,
                 engine_token,
-                engine_allowed,
                 discovered: Mutex::new(std::collections::HashMap::new()),
             });
             Ok(())
