@@ -1,0 +1,16 @@
+[package]
+name = "lodestash-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Wire DTOs and the operation catalog — every /v1 operation declared once (no I/O)"
+
+# Wire types only. No catalog, engine, server or runtime code may enter this crate's normal
+# dependency tree: `tests/deps.rs` fails the build if one does (v2 spec §3).
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+schemars   = { workspace = true }

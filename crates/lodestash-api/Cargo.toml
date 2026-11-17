@@ -24,3 +24,5 @@ tower    = { workspace = true }
 tempfile = { workspace = true }
 # Fixtures only: a test seeds a catalog file directly, since `Catalog::conn` is crate-private.
 rusqlite = { workspace = true }
+# Parity tests only (tests/protocol_*.rs): today's router against the v2 operation catalog.
+lodestash-protocol = { workspace = true }
