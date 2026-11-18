@@ -9,18 +9,21 @@
     checked = $bindable(false),
     label,
     hideLabel = false,
+    boxAttrs = {},
     onchange,
     ...rest
   }: Omit<HTMLInputAttributes, "onchange"> & {
     checked?: boolean;
     label: string;
     hideLabel?: boolean;
+    /** Reaches the drawn box (the contract gate marks it). */
+    boxAttrs?: Record<string, string | undefined>;
     onchange?: (checked: boolean) => void;
   } = $props();
 </script>
 
 <label class="check">
-  <span class="box" class:on={checked}>
+  <span class="box" class:on={checked} {...boxAttrs}>
     <input type="checkbox" bind:checked onchange={() => onchange?.(checked)} {...rest} />
     {#if checked}<span class="mark" aria-hidden="true"></span>{/if}
   </span>
