@@ -763,4 +763,16 @@ tracking; these cards track phases).
 - [ ] **V2-P8** Per-stage failure state, pinned downloads, delete fence, SQL read model, MCP over HTTP, doc reconciliation
 
 ## In Review
-*(empty)*
+
+- [ ] **V2-R1** Data-integrity and concurrency review of engine / core / ingest — 13 findings,
+  branch `fix/integrity-review` off `rewrite/v2`, each fix with a test that failed before it
+  *(2026-11-17/18; awaiting merge)*. Destructive paths fail closed (workspace reclaim on the
+  writer as `Op::ReclaimWorkspace`, import undo fenced by `is_plain_relative_path`, export undo,
+  the delete-from-disk root fence); a withdrawn command never runs (`WriteError::StillRunning`
+  for one that is running); undo never restores a retired asset (`Catalog::retire_assets`) and
+  redo re-arms its op; a migration never prunes the backup it just wrote; a read is an error
+  when the engine is not Ready or a rebuild failed (`ReadError`, `engine_status`); nothing a
+  `.unitypackage` declares sizes a read (`for_each_member`, `read_capped`). *Left open, reported:*
+  the workspace folder is shared by every catalog (`LODESTASH_CATALOG`), `lodestash-api`'s export
+  sandbox still runs on `source_roots().unwrap_or_default()`, delete-from-disk trusts the path
+  its caller resolved, and the Trash view can restore a row whose file was deleted from disk.

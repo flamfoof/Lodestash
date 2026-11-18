@@ -314,27 +314,131 @@ fn query_plan(c: &Catalog, sql: &str, args: impl rusqlite::Params) -> String {
     lines.join("\n")
 }
 
+/// How many loose files and how many pack entries [`populated`] holds.
+const PLAN_ROWS: usize = 600;
+
+/// A catalog **file** with real rows in it and fresh statistics: two sources of [`PLAN_ROWS`]
+/// loose files each (the same relative paths in both, so `rel_path` alone is not unique), and one
+/// pack of [`PLAN_ROWS`] minted entries.
+///
+/// The plan tests used to explain their query against an empty in-memory database, where the
+/// planner has nothing to weigh and the answer is the same whatever the data would make it do.
+/// Here it plans as it does for a library: with rows, on a file, after `ANALYZE`.
+fn populated(dir: &Path) -> (Catalog, i64, i64) {
+    let mut c = Catalog::open(&dir.join("catalog.db")).expect("open");
+    c.seed_media_types().expect("seed");
+    let records: Vec<CrawlRecord> = (0..PLAN_ROWS)
+        .map(|i| CrawlRecord {
+            rel_path: format!("dir{}/file{i}.png", i % 20),
+            name: format!("file{i}.png"),
+            media_type: "image".into(),
+            size_bytes: 1,
+            mtime: 1,
+            workspace_rel: None,
+            content_hash: None,
+        })
+        .collect();
+    let mut first = 0;
+    for root in ["C:/lib-a", "C:/lib-b"] {
+        let src = c.upsert_import_source(root, root, "folder").expect("src");
+        c.record_crawl(src, None, &records).expect("crawl");
+        if first == 0 {
+            first = src;
+        }
+    }
+    let pkg = c
+        .upsert_package(first, "C:/lib-a/p.unitypackage", "p", None, None)
+        .expect("package");
+    let entries: Vec<PackageEntryRecord> = (0..PLAN_ROWS)
+        .map(|i| PackageEntryRecord {
+            guid: format!("{i:032x}"),
+            pathname: Some(format!("Assets/dir{}/in{i}.png", i % 20)),
+            tar_offset: Some(512 * (i as i64 + 1)),
+            size_bytes: Some(10),
+        })
+        .collect();
+    c.record_package_entries(pkg, &entries).expect("entries");
+    let classified: HashMap<String, InPackClass> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let class = InPackClass {
+                name: format!("in{i}"),
+                media_type: "image".into(),
+            };
+            (e.guid.clone(), class)
+        })
+        .collect();
+    c.mint_in_pack_assets(pkg, &classified).expect("mint");
+    c.conn.execute_batch("ANALYZE;").expect("analyze");
+    (c, first, pkg)
+}
+
 /// `record_crawl` looks every crawled path up in its source. Without an index led by `rel_path`
 /// that is a walk of the source per file — 2,000 lookups over a 20k-asset catalog took 4.5 s.
+///
+/// Asserted where it matters: on a populated file, where the planner could choose to walk the
+/// source's assets instead — and does, the moment the index is gone, which is what proves the
+/// assertion can fail.
 #[test]
 fn the_crawl_lookup_searches_by_path() {
-    let c = Catalog::open_in_memory().expect("open");
-    let plan = query_plan(&c, CRAWL_LOOKUP_SQL, params![1, "a.png"]);
+    let dir = tempfile::tempdir().expect("tmp");
+    let (c, src, _) = populated(dir.path());
+    let args = || (src, "dir7/file7.png");
+    let found: i64 = c
+        .conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM ({CRAWL_LOOKUP_SQL})"),
+            args(),
+            |r| r.get(0),
+        )
+        .expect("the lookup runs");
+    assert_eq!(
+        found, 1,
+        "one row of this source, though two sources hold the path"
+    );
+
+    let plan = query_plan(&c, CRAWL_LOOKUP_SQL, args());
     assert!(
-        plan.contains("idx_file_rel_path (rel_path=?)"),
+        plan.contains("USING INDEX idx_file_rel_path (rel_path=?)") && !plan.contains("SCAN"),
         "the crawl lookup walks instead of searching:\n{plan}"
+    );
+
+    c.conn
+        .execute_batch("DROP INDEX idx_file_rel_path;")
+        .expect("drop");
+    let without = query_plan(&c, CRAWL_LOOKUP_SQL, args());
+    assert!(
+        !without.contains("rel_path=?"),
+        "without its index the lookup cannot search by path, so the assertion above is real:\n{without}"
     );
 }
 
 /// Materializing an extracted pack finds each entry by `(package, pathname)`; without an index
-/// over both, every file walks the whole pack's manifest.
+/// over both, every file walks the whole pack's manifest. Same shape as the test above.
 #[test]
 fn the_materialize_lookup_searches_by_package_and_path() {
-    let c = Catalog::open_in_memory().expect("open");
-    let plan = query_plan(&c, MATERIALIZE_SQL, params![1, "Assets/a.png", "ws/a.png"]);
+    let dir = tempfile::tempdir().expect("tmp");
+    let (c, _, pkg) = populated(dir.path());
+    let args = || (pkg, "Assets/dir7/in7.png", "ws/in7.png");
+    let plan = query_plan(&c, MATERIALIZE_SQL, args());
     assert!(
-        plan.contains("idx_pkgentry_path (package_id=? AND pathname=?)"),
+        plan.contains("idx_pkgentry_path (package_id=? AND pathname=?)") && !plan.contains("SCAN"),
         "the materialize lookup walks the pack:\n{plan}"
+    );
+    assert_eq!(
+        c.conn.execute(MATERIALIZE_SQL, args()).expect("it runs"),
+        1,
+        "and it updates exactly the one file of that entry"
+    );
+
+    c.conn
+        .execute_batch("DROP INDEX idx_pkgentry_path;")
+        .expect("drop");
+    let without = query_plan(&c, MATERIALIZE_SQL, args());
+    assert!(
+        !without.contains("pathname=?"),
+        "without its index the lookup cannot search by pathname:\n{without}"
     );
 }
 

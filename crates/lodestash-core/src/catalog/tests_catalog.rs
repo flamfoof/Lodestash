@@ -3087,15 +3087,52 @@ fn a_trashed_assets_workspace_file_is_still_referenced() {
     );
 }
 
-/// The crawl's incremental diff still knows a trashed file's size: the file is on disk and in
-/// the catalog, and forgetting it made every watch rescan look like a change.
+/// What the crawl's incremental diff knows of one source: **every loose file it holds — in the
+/// Trash or not — and nothing else.** The watch rescan compares this map with what it finds on
+/// disk, entry for entry, to decide whether anything changed
+/// (`a_watch_rescan_with_a_file_in_the_trash_is_not_a_change` in the engine pins that half).
+///
+/// The whole map is asserted, so each way of getting it wrong fails here: dropping trashed files
+/// (they are still on disk), counting an in-pack asset (its bytes are in an archive, not the
+/// folder) or reading another source's files. The test this replaces looked one key up in a
+/// one-file source, which no filter that was ever in the query could fail.
 #[test]
-fn known_sizes_include_trashed_files() {
-    let (c, src) = source_with(&[rec_h("a.png", 7, 70, "H")]);
+fn known_sizes_are_every_loose_file_of_the_source_trashed_or_not() {
+    let (mut c, src) = source_with(&[rec("a.png", 7, 70), rec("b.png", 8, 80)]);
     c.set_trashed(&[id_at(&c, src, "a.png")], true)
         .expect("trash");
+
+    let pkg = c
+        .upsert_package(src, "C:/lib/p.unitypackage", "p", None, None)
+        .expect("package");
+    let entry = PackageEntryRecord {
+        guid: "0123456789abcdef0123456789abcdef".into(),
+        pathname: Some("Assets/in.png".into()),
+        tar_offset: Some(512),
+        size_bytes: Some(9),
+    };
+    c.record_package_entries(pkg, std::slice::from_ref(&entry))
+        .expect("entries");
+    let class = InPackClass {
+        name: "in".into(),
+        media_type: "image".into(),
+    };
+    let minted = c
+        .mint_in_pack_assets(pkg, &HashMap::from([(entry.guid.clone(), class)]))
+        .expect("mint");
+    assert_eq!(minted.inserted, 1, "the fixture holds an in-pack asset");
+    let other = c
+        .upsert_import_source("Other", "C:/other", "folder")
+        .expect("src");
+    c.record_crawl(other, None, &[rec("c.png", 9, 90)])
+        .expect("crawl");
+
     let known = c.known_sizes_for_source("C:/lib").expect("known");
-    assert_eq!(known.get("a.png"), Some(&(7, 70)));
+    let expected: HashMap<String, (u64, i64)> = HashMap::from([
+        ("a.png".to_string(), (7, 70)),
+        ("b.png".to_string(), (8, 80)),
+    ]);
+    assert_eq!(known, expected);
 }
 
 #[test]

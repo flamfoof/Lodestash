@@ -4187,6 +4187,77 @@ mod tests {
         assert!(!orphaned.snapshot().recent[0].ok);
     }
 
+    /// The watch rescan decides "did anything change?" by comparing what it crawls with what the
+    /// catalog knows of the source (`known_sizes_for_source`), entry for entry. A file in the
+    /// Trash is still on disk, so it is still crawled — and if the catalog side left it out, the
+    /// two would never match and every rescan of a source with anything in the Trash would
+    /// persist again, for ever. This drives the real rescan over a real folder: the consumer the
+    /// core test `known_sizes_are_every_loose_file_of_the_source_trashed_or_not` exists for.
+    #[test]
+    fn a_watch_rescan_with_a_file_in_the_trash_is_not_a_change() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let root = dir.path().join("lib");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(root.join("a.png"), b"aaaa").expect("write a");
+        std::fs::write(root.join("b.png"), b"bbbbbb").expect("write b");
+        let root_str = root.to_string_lossy().into_owned();
+
+        let db = dir.path().join("catalog.db");
+        let mut catalog = Catalog::open(&db).expect("open");
+        catalog
+            .upsert_import_source("lib", &root_str, "folder")
+            .expect("source");
+        let (tx, _inbox) = mpsc::sync_channel(4);
+        let ctx = WriterCtx {
+            db_path: db.clone(),
+            tx,
+            jobs: JobRegistry::default(),
+            appraise: Default::default(),
+            focus: Default::default(),
+            cache_dir: None,
+            workspace_dir: None,
+            config: Arc::new(ConfigStore::in_memory()),
+        };
+
+        assert!(
+            rescan_watched(&mut catalog, &ctx),
+            "the first sight of the folder is a change"
+        );
+        assert!(
+            !rescan_watched(&mut catalog, &ctx),
+            "nothing moved, so nothing is persisted"
+        );
+
+        let source = catalog
+            .source_info_by_root(&root_str)
+            .expect("query")
+            .expect("source");
+        let rows = catalog.entries_for_source(source.id).expect("rows");
+        assert_eq!(rows.len(), 2, "both files were indexed");
+        let a = rows
+            .iter()
+            .find(|r| r.rel_path == "a.png")
+            .expect("a.png")
+            .asset_id;
+        catalog.set_trashed(&[a], true).expect("trash a");
+        for pass in 0..2 {
+            assert!(
+                !rescan_watched(&mut catalog, &ctx),
+                "pass {pass}: a file in the Trash made an unchanged folder look changed"
+            );
+        }
+
+        std::fs::write(root.join("b.png"), b"a different size now").expect("edit b");
+        assert!(
+            rescan_watched(&mut catalog, &ctx),
+            "a real edit is still a change"
+        );
+        assert!(
+            !rescan_watched(&mut catalog, &ctx),
+            "and it is recorded once"
+        );
+    }
+
     /// The embed and tag lanes run one slice at a time behind an in-flight flag that only the
     /// slice's result landing on the writer used to lower. A worker that panicked, had nothing
     /// to send, or found the writer gone must lower it too, or the lane never runs again.
