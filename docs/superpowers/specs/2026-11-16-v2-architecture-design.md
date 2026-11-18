@@ -107,8 +107,9 @@ to top-level `web/`: it is a client of `/v1`, not a Tauri frontend.
   lifetime. A second engine on the same catalog fails fast with `catalog_locked`.
 - **Migration:** `BEGIN IMMEDIATE`, re-read `user_version` inside the transaction, then migrate.
   Before the first migration step on an existing file, copy it to
-  `<catalog>.v<from>.bak` (kept: the last two). A schema newer than this build is refused for
-  writing with `schema_too_new` (the reader already refuses).
+  `<catalog>.v<from>.bak` (kept: the last two written — the new one is never the one pruned, and
+  a failed prune never fails the open; `DATA-MODEL.md` §13). A schema newer than this build is
+  refused for writing with `schema_too_new` (the reader already refuses).
 - **Engine status** is a value the UI and agents can read (`GET /v1/status`):
   `starting | migrating{from,to} | ready | failed{code,message}`. Every failure here renders as a
   blocking screen in the UI with the message and what to do — never an empty library.

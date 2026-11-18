@@ -399,6 +399,67 @@ pub const SCHEMA_VERSION: u32 = 32;
 /// How many `<catalog>.v<N>.bak` files a migration leaves beside the catalog.
 const KEEP_BACKUPS: usize = 2;
 
+/// How old a `<catalog>.v<N>.bak.partial…` file must be before a later open sweeps it. A partial
+/// that young may belong to another connection backing up right now.
+const STALE_PARTIAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// The directory holding `path`. `Path::parent` answers `Some("")` — not `None` — for a bare file
+/// name, and `""` cannot be listed, so a catalog named by a bare relative path failed to open.
+fn folder_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
+}
+
+/// Keep `just_written` and the newest other backups of `name` in `dir`, [`KEEP_BACKUPS`] in all,
+/// and sweep partials an interrupted backup left behind.
+///
+/// "Newest" is by modification time, not by schema number: a catalog restored from an older copy
+/// migrates again and writes a backup with a *lower* number than the ones already there, and
+/// ranking by number deleted the file that had just been written. Housekeeping only — nothing
+/// here can fail the open, so every failure is logged and skipped.
+fn prune_backups(dir: &Path, name: &str, just_written: &Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(dir = %dir.display(), %e, "could not list the catalog's backups; none pruned");
+            return;
+        }
+    };
+    let prefix = format!("{name}.v");
+    let mut others: Vec<(std::time::SystemTime, u32, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = file.strip_prefix(&prefix) else {
+            continue;
+        };
+        let path = entry.path();
+        let modified = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if let Some(version) = rest.strip_suffix(".bak").and_then(|v| v.parse().ok()) {
+            if Some(entry.file_name().as_os_str()) != just_written.file_name() {
+                others.push((modified, version, path));
+            }
+        } else if rest.contains(".bak.partial")
+            && modified.elapsed().is_ok_and(|age| age > STALE_PARTIAL)
+        {
+            if let Err(e) = std::fs::remove_file(&path) {
+                tracing::warn!(path = %path.display(), %e, "a stale partial backup could not be removed");
+            }
+        }
+    }
+    // Newest first; two written in the same instant fall back to the higher schema number.
+    others.sort_unstable_by_key(|(modified, version, _)| std::cmp::Reverse((*modified, *version)));
+    for (_, _, old) in others.into_iter().skip(KEEP_BACKUPS.saturating_sub(1)) {
+        if let Err(e) = std::fs::remove_file(&old) {
+            tracing::warn!(path = %old.display(), %e, "an old catalog backup could not be pruned");
+        }
+    }
+}
+
 impl Catalog {
     /// Open the catalog at `path`, creating it when missing, and migrate it to [`SCHEMA_VERSION`]
     /// (DATA-MODEL §13 "Lifecycle"). An existing catalog is copied to `<file>.v<from>.bak` before
@@ -426,13 +487,21 @@ impl Catalog {
     }
 
     /// Copy a catalog at schema `from` to `<file>.v<from>.bak` before a migration changes it, and
-    /// keep only the newest [`KEEP_BACKUPS`]. `None` when there is nothing to keep: a new, empty
-    /// file (`from == 0`) or one already current.
+    /// keep only the newest [`KEEP_BACKUPS`] ([`prune_backups`]). `None` when there is nothing to
+    /// keep: a new, empty file (`from == 0`), one already current, or one another connection has
+    /// already begun migrating (that connection took the backup).
     ///
     /// `VACUUM INTO` reads one consistent snapshot even while another connection writes (WAL), and
     /// it writes a complete database, so a backup is either whole or absent: it goes to a temporary
-    /// name first and is renamed into place.
+    /// name first and is renamed into place. The temporary name is this connection's own — two
+    /// connections opening one old catalog used to share it, and the second `VACUUM INTO` failed
+    /// on the first's file. A snapshot that is no longer at `from` (the other connection got its
+    /// first step in before this one's read) is discarded rather than filed under the old version.
+    ///
+    /// Failing to **take** the backup fails the open: the migration must not run without it.
+    /// Failing to prune older ones does not.
     fn backup_before_migration(&self, path: &Path, from: u32) -> Result<Option<PathBuf>> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if from == 0 || from >= SCHEMA_VERSION {
             return Ok(None);
         }
@@ -441,35 +510,47 @@ impl Catalog {
             .ok_or_else(|| CoreError::Catalog(format!("no file name in {}", path.display())))?
             .to_string_lossy()
             .into_owned();
-        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let dir = folder_of(path);
         let backup = dir.join(format!("{name}.v{from}.bak"));
-        let partial = dir.join(format!("{name}.v{from}.bak.partial"));
-        if partial.exists() {
-            std::fs::remove_file(&partial)?;
-        }
+        let partial = dir.join(format!(
+            "{name}.v{from}.bak.partial-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         info!(from, backup = %backup.display(), "backing up the catalog before migrating it");
-        self.conn
+        let discard = |partial: &Path| {
+            let _ = std::fs::remove_file(partial);
+        };
+        if let Err(e) = self
+            .conn
             .execute("VACUUM INTO ?1", params![partial.to_string_lossy()])
-            .map_err(|e| CoreError::Catalog(format!("backup before migration: {e}")))?;
-        std::fs::rename(&partial, &backup)?;
-
-        let prefix = format!("{name}.v");
-        let mut kept: Vec<(u32, PathBuf)> = std::fs::read_dir(dir)?
-            .filter_map(|e| {
-                let e = e.ok()?;
-                let file = e.file_name().to_string_lossy().into_owned();
-                let v = file
-                    .strip_prefix(&prefix)?
-                    .strip_suffix(".bak")?
-                    .parse()
-                    .ok()?;
-                Some((v, e.path()))
-            })
-            .collect();
-        kept.sort_unstable_by_key(|(v, _)| std::cmp::Reverse(*v));
-        for (_, old) in kept.into_iter().skip(KEEP_BACKUPS) {
-            std::fs::remove_file(&old)?;
+        {
+            discard(&partial);
+            return Err(CoreError::Catalog(format!("backup before migration: {e}")));
         }
+        let snapshot_version: Result<u32> =
+            Connection::open_with_flags(&partial, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .and_then(|c| c.pragma_query_value(None, "user_version", |r| r.get(0)))
+                .map_err(|e| CoreError::Catalog(format!("backup before migration: verify: {e}")));
+        match snapshot_version {
+            Ok(v) if v == from => {}
+            Ok(_) => {
+                discard(&partial);
+                return Ok(None);
+            }
+            Err(e) => {
+                discard(&partial);
+                return Err(e);
+            }
+        }
+        if let Err(e) = std::fs::rename(&partial, &backup) {
+            discard(&partial);
+            // A connection racing this one filed the same snapshot a moment ago: that one stands.
+            if !backup.is_file() {
+                return Err(e.into());
+            }
+        }
+        prune_backups(dir, &name, &backup);
         Ok(Some(backup))
     }
 

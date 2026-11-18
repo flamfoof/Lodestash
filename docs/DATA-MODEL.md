@@ -950,8 +950,16 @@ transaction, in order, on open.
   never writes a schema it does not know.
 - Before the first step touches an **existing** catalog (version > 0), it is copied with
   `VACUUM INTO` to `<catalog>.v<from>.bak` beside it — one consistent snapshot even while another
-  connection writes, written under a temporary name and renamed, so a backup is whole or absent. The
-  newest two backups are kept. A new file and a current one are not backed up.
+  connection writes, written under a temporary name of that connection's own and renamed, so a
+  backup is whole or absent and two connections opening one old catalog do not collide; a snapshot
+  that is no longer at the old version (the other connection's first step landed first) is
+  discarded, never filed under the old number. **Two backups are kept: the one just written, which
+  is never pruned, and the most recently written other** — by modification time, not schema
+  number, because a catalog restored from an older copy migrates again under a *lower* number.
+  Failing to take the backup fails the open; pruning is housekeeping — a backup that cannot be
+  removed or a folder that cannot be listed is logged and the catalog still opens. A catalog named
+  by a bare relative path backs up into the current directory. A new file and a current one are
+  not backed up.
 - Each step takes the write lock first (`BEGIN IMMEDIATE`) and re-reads `user_version` under it, so
   two processes opening one file apply every step once; the loser of the race skips the steps the
   winner applied. A failing step rolls back alone and the open fails, leaving the catalog at the
