@@ -8,8 +8,8 @@ use std::time::Duration;
 use lodestash_core::catalog::{Catalog, CrawlRecord};
 
 use crate::types::PersistBatch;
-use crate::writer::{Op, WriteError};
-use crate::{Engine, EngineConfig, EngineStatus, Origin};
+use crate::writer::{Op, Probe, ProbeEnd, WriteError};
+use crate::{Engine, EngineConfig, EngineStatus, Origin, ReadError};
 
 const SETTLE: Duration = Duration::from_secs(5);
 
@@ -64,6 +64,7 @@ fn seed(engine: &Engine, root: &Path, names: &[&str]) -> (String, Vec<i64>) {
         .expect("seed");
     let mut items = engine
         .read()
+        .expect("read")
         .page(&crate::read_model::GridQuery {
             page_size: 1000,
             ..Default::default()
@@ -90,6 +91,7 @@ fn a_fresh_install_creates_its_catalog_and_takes_writes() {
         .expect("the first write lands");
     let names: Vec<String> = engine
         .read()
+        .expect("read")
         .collections()
         .into_iter()
         .map(|c| c.name)
@@ -179,7 +181,10 @@ fn a_panicking_command_answers_internal_and_the_writer_keeps_serving() {
     let dir = tempfile::tempdir().expect("tmp");
     let (engine, _) = started(dir.path());
 
-    match engine.writer().run(Op::Panic) {
+    match engine.writer().run(Op::Probe(Probe {
+        end: ProbeEnd::Panic,
+        ..Default::default()
+    })) {
         Err(WriteError::Internal(msg)) => assert!(msg.contains("on purpose"), "{msg}"),
         other => panic!("a panic answered {other:?}"),
     }
@@ -189,28 +194,218 @@ fn a_panicking_command_answers_internal_and_the_writer_keeps_serving() {
             name: "after".into(),
         })
         .expect("the writer survived the panic");
-    assert_eq!(engine.read().collections().len(), 1);
+    assert_eq!(engine.read().expect("read").collections().len(), 1);
 }
 
-/// A reply that does not come within the timeout answers `busy`; the command still finishes, and
-/// the writer goes on serving.
+/// Review findings 7, 11 and 13: a command that fails or panics **after** it has committed, with a
+/// tray job open. The row it wrote is in the catalog, so the generation must move and the next
+/// read must show it — it used to be marked only on success, and the read model went on serving
+/// the snapshot from before. And the job it opened must end (as failed) rather than spin in the
+/// tray for the rest of the session.
 #[test]
-fn a_reply_that_takes_too_long_answers_busy() {
+fn a_command_that_fails_or_panics_after_committing_is_still_seen_and_ends_its_job() {
     let dir = tempfile::tempdir().expect("tmp");
     let (engine, _) = started(dir.path());
+    let (_, ids) = seed(&engine, dir.path(), &["a.png", "b.png"]);
+    assert_eq!(engine.read().expect("read").status().favorites, 0);
+    let jobs_before = engine.jobs().snapshot().recent.len();
+
+    for (end, id) in [(ProbeEnd::Fail, ids[0]), (ProbeEnd::Panic, ids[1])] {
+        let before = engine.catalog_generation();
+        let out = engine.writer().run(Op::Probe(Probe {
+            job: true,
+            favorite: Some(id),
+            end,
+            ..Default::default()
+        }));
+        match (end, out) {
+            (ProbeEnd::Fail, Err(WriteError::Failed(_)))
+            | (ProbeEnd::Panic, Err(WriteError::Internal(_))) => {}
+            (_, other) => panic!("{end:?} answered {other:?}"),
+        }
+        assert!(
+            engine.catalog_generation() > before,
+            "{end:?}: a row was committed and the generation did not move"
+        );
+    }
+    assert_eq!(
+        engine.read().expect("read").status().favorites,
+        2,
+        "the read model is serving the snapshot from before the commands that failed"
+    );
+    let tray = engine.jobs().snapshot();
+    assert!(
+        tray.active.is_empty(),
+        "a job outlived the command that panicked: {:?}",
+        tray.active.iter().map(|j| &j.label).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        tray.recent.len() - jobs_before,
+        2,
+        "both jobs reached the finished ring"
+    );
+    assert!(
+        tray.recent.iter().take(2).all(|j| !j.ok),
+        "a job whose command failed was recorded as a success"
+    );
+}
+
+/// A probe that holds the writer; returns once the writer has started running it.
+fn hold_the_writer(engine: &Engine, hold: Duration) -> std::thread::JoinHandle<()> {
+    let (started, running) = std::sync::mpsc::channel();
+    let writer = engine.writer().clone();
+    let held = std::thread::spawn(move || {
+        writer
+            .run(Op::Probe(Probe {
+                started: Some(started),
+                hold,
+                ..Default::default()
+            }))
+            .expect("the held command finishes");
+    });
+    running.recv_timeout(SETTLE).expect("the hold started");
+    held
+}
+
+/// Review finding 2, first half: a command whose caller gave up **before it started** does not
+/// run. "Busy, try again" used to be said of a command that was still queued — and it then ran
+/// minutes later, after the user had been told it had not. For Delete from disk that is files
+/// deleted behind a "nothing happened" message.
+#[test]
+fn a_command_withdrawn_before_it_started_never_runs() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (engine, cfg) = started(dir.path());
+    let held = hold_the_writer(&engine, Duration::from_millis(500));
 
     let impatient = engine
         .writer()
         .clone()
         .with_reply_timeout(Duration::from_millis(50));
-    assert!(matches!(
-        impatient.run(Op::Hold(Duration::from_millis(400))),
-        Err(WriteError::Busy)
-    ));
+    let out = impatient.run(Op::CreateCollection {
+        name: "abandoned".into(),
+    });
+    assert!(
+        matches!(out, Err(WriteError::Busy)),
+        "a command that never started answered {out:?}"
+    );
+    assert!(
+        out.unwrap_err().to_string().starts_with("busy:"),
+        "the `busy` code leads the text an agent is handed"
+    );
+
+    held.join().expect("hold");
+    // Anything queued behind the hold has been reached by the time this one answers.
+    engine
+        .writer()
+        .run(Op::ClearStaged)
+        .expect("the writer serves again");
+    let reader = Catalog::open_reader(&cfg.catalog).expect("separate read");
+    assert!(
+        reader.list_collections().expect("collections").is_empty(),
+        "a command its caller was told had not run, ran"
+    );
+}
+
+/// Review finding 2, second half: a command that **was** running when its caller stopped waiting
+/// says so — "still running", not "try again" — and it does finish and commit.
+#[test]
+fn a_command_still_running_when_its_caller_stops_waiting_says_so_and_finishes() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (engine, _) = started(dir.path());
+    let (_, ids) = seed(&engine, dir.path(), &["a.png"]);
+
+    let impatient = engine
+        .writer()
+        .clone()
+        .with_reply_timeout(Duration::from_millis(50));
+    let out = impatient.run(Op::Probe(Probe {
+        favorite: Some(ids[0]),
+        hold: Duration::from_millis(400),
+        ..Default::default()
+    }));
+    assert!(
+        matches!(out, Err(WriteError::StillRunning)),
+        "a running command answered {out:?}"
+    );
+    let said = out.unwrap_err().to_string();
+    assert!(
+        said.starts_with("busy:") && said.contains("still running") && !said.contains("try again"),
+        "{said}"
+    );
+
     engine
         .writer()
         .run(Op::ClearStaged)
         .expect("the next command runs once the slow one is done");
+    assert_eq!(
+        engine.read().expect("read").status().favorites,
+        1,
+        "the command its caller stopped waiting for still landed"
+    );
+}
+
+/// Review finding 7, the extract branch: asking to extract a pack mints its in-pack rows on the
+/// spot, before any worker runs. That turn never marked the catalog, so when the extraction then
+/// failed (here: the archive is gone) nothing ever did — and the rows stayed out of the read
+/// model until some unrelated write.
+#[test]
+fn rows_minted_by_an_extract_request_show_even_when_the_extraction_fails() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (engine, _) = started(dir.path());
+    let lib = dir.path().join("lib").to_string_lossy().into_owned();
+    engine
+        .writer()
+        .run(Op::PersistScan {
+            batches: vec![PersistBatch {
+                root: lib.clone(),
+                name: "lib".into(),
+                excludes_json: None,
+                records: Vec::new(),
+            }],
+            packs: vec![crate::writer::DiscoveredPack {
+                root: lib.clone(),
+                abs_path: dir
+                    .path()
+                    .join("lib")
+                    .join("gone.unitypackage")
+                    .to_string_lossy()
+                    .into_owned(),
+                display_name: "Gone".into(),
+                entries: vec![lodestash_core::catalog::PackageEntryRecord {
+                    guid: "aaaa1111bbbb2222cccc3333dddd4444".into(),
+                    pathname: Some("Assets/Gone/Rock.png".into()),
+                    tar_offset: Some(512),
+                    size_bytes: Some(16),
+                }],
+            }],
+        })
+        .expect("the pack is browsable");
+    assert_eq!(
+        engine.read().expect("read").status().in_pack,
+        0,
+        "nothing minted yet"
+    );
+    let package_id = engine.read().expect("read").packages()[0].id;
+
+    engine
+        .writer()
+        .run(Op::ExtractPackage { package_id })
+        .expect("accepted");
+    // The worker fails on the missing archive and reports back; wait for the tray to settle.
+    let deadline = std::time::Instant::now() + SETTLE;
+    while !engine.jobs().snapshot().active.is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the extract never settled"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    engine.writer().run(Op::ClearStaged).expect("drained");
+    assert_eq!(
+        engine.read().expect("read").status().in_pack,
+        1,
+        "the minted in-pack row is in the catalog and not in the read model"
+    );
 }
 
 /// v2 spec §4.3: the read model follows the catalog generation. An agent's write — which the old
@@ -222,8 +417,8 @@ fn an_agent_write_moves_the_read_model_without_a_reload() {
     let (engine, _) = started(dir.path());
     let (_, ids) = seed(&engine, dir.path(), &["a.png", "b.png"]);
     assert_eq!(ids.len(), 2, "the persist's own connection was seen");
-    let before = engine.read().generation();
-    assert_eq!(engine.read().status().favorites, 0);
+    let before = engine.read().expect("read").generation();
+    assert_eq!(engine.read().expect("read").status().favorites, 0);
 
     engine
         .writer()
@@ -235,7 +430,7 @@ fn an_agent_write_moves_the_read_model_without_a_reload() {
             Origin::Agent,
         )
         .expect("agent write");
-    let read = engine.read();
+    let read = engine.read().expect("read");
     assert_eq!(read.status().favorites, 1, "the agent's write is visible");
     assert!(read.generation() > before, "at a newer generation");
 }
@@ -250,7 +445,7 @@ fn remove_from_library_needs_no_open_project() {
     let (engine, cfg) = started(dir.path());
     let (lib, ids) = seed(&engine, dir.path(), &["keep.png", "drop.png"]);
     let drop_id = ids[0]; // "drop.png" sorts first
-    let targets = engine.read().write_targets(&[drop_id]);
+    let targets = engine.read().expect("read").write_targets(&[drop_id]);
     assert_eq!(targets.len(), 1);
 
     let out = engine
@@ -259,7 +454,7 @@ fn remove_from_library_needs_no_open_project() {
         .expect("Remove from Library succeeds without a project");
     assert_eq!(out.changed, 1);
     assert_eq!(
-        engine.read().status().total_assets,
+        engine.read().expect("read").status().total_assets,
         1,
         "the removed asset left the library view"
     );
@@ -281,7 +476,7 @@ fn remove_from_library_needs_no_open_project() {
     assert!(
         excludes
             .iter()
-            .any(|e| e.kind == "asset" && e.value == "drop.png"),
+            .any(|e| e.kind == "asset" && e.value == "/drop.png"),
         "the next scan would bring it back: {excludes:?}"
     );
 }
@@ -308,7 +503,7 @@ fn remove_from_library_mirrors_into_the_open_projects_config() {
     let engine = Engine::start(cfg.clone());
     assert_eq!(engine.wait_settled(SETTLE), EngineStatus::Ready);
     let (_, ids) = seed(&engine, dir.path(), &["drop.png"]);
-    let targets = engine.read().write_targets(&ids);
+    let targets = engine.read().expect("read").write_targets(&ids);
     engine
         .writer()
         .run(Op::RemoveFromLibrary { targets })
@@ -317,7 +512,7 @@ fn remove_from_library_mirrors_into_the_open_projects_config() {
     // Read back from the file, through a store of its own: the engine's update reached the disk.
     let excludes = cfg.open_config().get().source_excludes("Game", &lib);
     assert!(
-        excludes.iter().any(|e| e.value == "drop.png"),
+        excludes.iter().any(|e| e.value == "/drop.png"),
         "the crawl's list did not get the exclusion: {excludes:?}"
     );
 }
@@ -378,7 +573,7 @@ fn undoing_a_trash_restores_only_what_it_changed() {
         })
         .expect("trash both");
     assert_eq!(both.changed, 1, "only b changed");
-    let op = engine.read().recent_ops(1)[0].id;
+    let op = engine.read().expect("read").recent_ops(1)[0].id;
     w.run(Op::RevertOp { op_id: op }).expect("undo");
 
     let reader = Catalog::open_reader(&cfg.catalog).expect("separate read");
@@ -394,6 +589,415 @@ fn undoing_a_trash_restores_only_what_it_changed() {
     };
     assert!(trashed(a), "undo restored an asset this trash never moved");
     assert!(!trashed(b), "undo restored the one it did");
+}
+
+fn touch(path: &Path) {
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(path, b"bytes").expect("write");
+}
+
+/// Index one extracted asset — a row whose bytes live at `<workspace>/<workspace_rel>` — through
+/// the writer, and put the file there. `bbb/Old.png` beside it is what nothing references.
+fn seed_workspace(engine: &Engine, cfg: &EngineConfig, root: &Path) {
+    engine
+        .writer()
+        .run(Op::PersistScan {
+            batches: vec![PersistBatch {
+                root: root.join("lib").to_string_lossy().into_owned(),
+                name: "lib".into(),
+                excludes_json: None,
+                records: vec![CrawlRecord {
+                    rel_path: "Rock.png".into(),
+                    name: "Rock.png".into(),
+                    media_type: "image".into(),
+                    size_bytes: 1,
+                    mtime: 1,
+                    workspace_rel: Some("aaa/Rock.png".into()),
+                    content_hash: None,
+                }],
+            }],
+            packs: Vec::new(),
+        })
+        .expect("seed an extracted asset");
+    touch(&cfg.workspace_dir.join("aaa").join("Rock.png"));
+    touch(&cfg.workspace_dir.join("bbb").join("Old.png"));
+}
+
+/// Review finding 1. "What is referenced" came back **empty** from an engine with no catalog, and
+/// the sweep read empty as "nothing is referenced": a second Lodestash refused the catalog's lock
+/// would delete every extracted file of the one that holds it. Neither the dry run nor the sweep
+/// answers unless the engine is Ready; the engine that owns the catalog still reclaims exactly
+/// what no live asset resolves through.
+#[test]
+fn workspace_reclaim_refuses_unless_the_engine_is_ready() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (first, cfg) = started(dir.path());
+    seed_workspace(&first, &cfg, dir.path());
+    let (kept, loose) = (
+        cfg.workspace_dir.join("aaa").join("Rock.png"),
+        cfg.workspace_dir.join("bbb").join("Old.png"),
+    );
+
+    let second = Engine::start(cfg.clone());
+    assert!(matches!(second.status(), EngineStatus::Failed { .. }));
+    assert!(
+        crate::storage::workspace_reclaim_plan(&second).is_err(),
+        "the dry run answered from an engine that has no catalog"
+    );
+    assert!(
+        crate::storage::reclaim_workspace(&second).is_err(),
+        "the sweep ran from an engine that has no catalog"
+    );
+    assert!(
+        kept.exists() && loose.exists(),
+        "an engine that is not Ready deleted workspace folders"
+    );
+
+    let plan = crate::storage::workspace_reclaim_plan(&first).expect("dry run");
+    assert_eq!(plan.kept_dirs, 1, "the referenced folder is protected");
+    assert_eq!(plan.entries.len(), 1, "{plan:?}");
+    assert!(plan.entries[0].path.ends_with("bbb"));
+    assert!(loose.exists(), "a dry run deletes nothing");
+
+    let out = crate::storage::reclaim_workspace(&first).expect("reclaim");
+    assert_eq!(out.removed, 1);
+    assert!(kept.exists(), "a referenced file was reclaimed");
+    assert!(!loose.exists(), "the unreferenced folder stayed");
+    let log = out.log.expect("the reclaim is logged");
+    assert!(std::fs::read_to_string(log).expect("log").contains("bbb"));
+}
+
+/// The same refusal when the engine is Ready but the question cannot be answered: a failed query
+/// used to read as an empty set (`unwrap_or_default`), and so as permission to delete everything.
+#[test]
+fn workspace_reclaim_refuses_when_what_is_referenced_cannot_be_read() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (engine, cfg) = started(dir.path());
+    seed_workspace(&engine, &cfg, dir.path());
+    rusqlite::Connection::open(&cfg.catalog)
+        .expect("raw")
+        .execute_batch("ALTER TABLE asset_file RENAME TO asset_file_gone;")
+        .expect("break the query");
+
+    assert!(crate::storage::workspace_reclaim_plan(&engine).is_err());
+    assert!(crate::storage::reclaim_workspace(&engine).is_err());
+    assert!(
+        cfg.workspace_dir.join("aaa").join("Rock.png").exists()
+            && cfg.workspace_dir.join("bbb").join("Old.png").exists(),
+        "a failed query was read as nothing referenced"
+    );
+}
+
+/// An extraction places its files first and records them when it finishes; until then they are
+/// in the workspace and referenced by nothing. The sweep waits for it rather than deleting the
+/// half of a pack that has landed (and the `.tmp` folder the rest is being written through).
+#[test]
+fn workspace_reclaim_waits_for_a_running_extraction() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (engine, cfg) = started(dir.path());
+    let (landed, partial) = (
+        cfg.workspace_dir.join("ccc").join("New.png"),
+        cfg.workspace_dir.join(".tmp").join("0123"),
+    );
+    touch(&landed);
+    touch(&partial);
+
+    let job = engine.jobs().start("Extract Pack".into(), "extract", true);
+    assert!(
+        crate::storage::reclaim_workspace(&engine).is_err(),
+        "the sweep ran under an extraction"
+    );
+    assert!(landed.exists() && partial.exists());
+
+    engine.jobs().finish(job.id, true, false, 0);
+    let out = crate::storage::reclaim_workspace(&engine).expect("reclaim after the extraction");
+    assert_eq!(out.removed, 2);
+    assert!(!landed.exists());
+}
+
+/// Review finding 5: removing a file at the source root wrote its bare name as the exclusion, and
+/// a bare name matches every file of that name in every folder of the source — so the next scan
+/// dropped them all. The exclusion names exactly the file removed, and a whole selection is one
+/// config write, not one per file.
+#[test]
+fn removing_a_root_level_file_excludes_only_that_file() {
+    use lodestash_core::types::is_excluded;
+    let dir = tempfile::tempdir().expect("tmp");
+    let cfg = quiet(dir.path());
+    let lib = dir.path().join("lib");
+    cfg.open_config()
+        .update(|c| {
+            c.projects.push(crate::config::LibraryProject {
+                name: "Game".into(),
+                paths: vec![lib.clone()],
+                blacklist: Default::default(),
+                pack_only: Default::default(),
+            });
+            c.last_project_name = Some("Game".into());
+        })
+        .expect("project");
+    let engine = Engine::start(cfg.clone());
+    assert_eq!(engine.wait_settled(SETTLE), EngineStatus::Ready);
+    // In path order: Models/rock.png, other.png, rock.png.
+    let (lib_root, ids) = seed(
+        &engine,
+        dir.path(),
+        &["rock.png", "Models/rock.png", "other.png"],
+    );
+    let (nested, other, root_level) = (ids[0], ids[1], ids[2]);
+
+    let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = writes.clone();
+    engine.config_store().on_change(move |_| {
+        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    let targets = engine
+        .read()
+        .expect("read")
+        .write_targets(&[root_level, other]);
+    engine
+        .writer()
+        .run(Op::RemoveFromLibrary { targets })
+        .expect("remove");
+    assert_eq!(
+        writes.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one config write for the whole selection"
+    );
+
+    // The list the crawl is handed, read back from the file through a store of its own.
+    let excludes = cfg.open_config().get().source_excludes("Game", &lib);
+    assert!(is_excluded(Path::new("rock.png"), &excludes));
+    assert!(is_excluded(Path::new("other.png"), &excludes));
+    assert!(
+        !is_excluded(Path::new("Models/rock.png"), &excludes),
+        "a same-named file in a folder was excluded with it: {excludes:?}"
+    );
+    // The catalog's own list says the same.
+    let reader = Catalog::open_reader(&cfg.catalog).expect("separate read");
+    let source = reader.source_info_by_root(&lib_root).unwrap().unwrap();
+    let stored: Vec<lodestash_core::types::Exclude> = reader
+        .list_source_excludes(source.id)
+        .expect("excludes")
+        .into_iter()
+        .map(|e| lodestash_core::types::Exclude {
+            kind: lodestash_core::types::ExcludeKind::Asset,
+            value: e.value,
+        })
+        .collect();
+    assert_eq!(stored.len(), 2);
+    assert!(is_excluded(Path::new("rock.png"), &stored));
+    assert!(!is_excluded(Path::new("Models/rock.png"), &stored));
+    assert!(
+        !trashed_on_disk(&cfg, &lib_root, nested),
+        "the nested file is untouched"
+    );
+}
+
+/// Is `asset_id` in the Trash, read through a connection of its own?
+fn trashed_on_disk(cfg: &EngineConfig, lib: &str, asset_id: i64) -> bool {
+    let reader = Catalog::open_reader(&cfg.catalog).expect("separate read");
+    let source = reader.source_info_by_root(lib).unwrap().unwrap();
+    reader
+        .entries_for_source(source.id)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.asset_id == asset_id)
+        .expect("the row exists")
+        .trashed
+}
+
+/// Review finding 6: Delete from disk and Remove from library trashed through an unlogged write,
+/// so the undo of an *earlier* "move to Trash" flipped the row back — resurrecting an asset whose
+/// file the app had just deleted, or one the user had removed from the library. Driven through
+/// the writer, read back through a separate connection.
+#[test]
+fn undo_never_restores_a_deleted_or_removed_asset() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (engine, cfg) = started(dir.path());
+    let (lib, ids) = seed(&engine, dir.path(), &["a.png", "b.png", "c.png"]);
+    let (a, b, c) = (ids[0], ids[1], ids[2]);
+    std::fs::create_dir_all(&lib).expect("lib");
+    let file_a = Path::new(&lib).join("a.png");
+    std::fs::write(&file_a, b"bytes").expect("a on disk");
+    let w = engine.writer();
+
+    // Trash a (undoable), then delete its file from disk.
+    w.run(Op::SetTrashed {
+        ids: vec![a],
+        trashed: true,
+    })
+    .expect("trash a");
+    let trash_a = engine.read().expect("read").recent_ops(1)[0].id;
+    let targets = engine.read().expect("read").write_targets(&[a]);
+    let roots = engine.read().expect("read").roots();
+    let out = w
+        .run(Op::DeleteFromDisk {
+            targets,
+            roots,
+            workspace: Some(cfg.workspace_dir.clone()),
+        })
+        .expect("delete from disk");
+    assert_eq!((out.refused, out.failed), (0, 0), "the delete went through");
+    assert!(!file_a.exists(), "the file left the disk");
+    assert!(
+        w.run(Op::RevertOp { op_id: trash_a }).is_err(),
+        "the trash of a deleted file is no longer an undoable op"
+    );
+    assert!(
+        trashed_on_disk(&cfg, &lib, a),
+        "undo un-trashed an asset whose file was deleted"
+    );
+
+    // Trash {b, c} (undoable), then remove b from the library: undo restores c only.
+    w.run(Op::SetTrashed {
+        ids: vec![b, c],
+        trashed: true,
+    })
+    .expect("trash b and c");
+    let trash_bc = engine.read().expect("read").recent_ops(1)[0].id;
+    let targets = engine.read().expect("read").write_targets(&[b]);
+    w.run(Op::RemoveFromLibrary { targets })
+        .expect("remove b from the library");
+    w.run(Op::RevertOp { op_id: trash_bc }).expect("undo");
+    assert!(
+        trashed_on_disk(&cfg, &lib, b),
+        "undo brought back an asset the user removed from the library"
+    );
+    assert!(
+        !trashed_on_disk(&cfg, &lib, c),
+        "the rest of that trash still undoes"
+    );
+}
+
+/// Review finding 8: an engine that is not Ready answered every read with an empty library, so a
+/// failed start looked exactly like a library with nothing in it. A read now says why, and the
+/// report the shell shows carries the same code and message.
+#[test]
+fn a_read_from_an_engine_that_is_not_ready_says_why() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (first, cfg) = started(dir.path());
+    seed(&first, dir.path(), &["a.png"]);
+
+    let second = Engine::start(cfg.clone());
+    match second.read().map(|l| l.status().total_assets) {
+        Err(ReadError::NotReady(EngineStatus::Failed { code, .. })) => {
+            assert_eq!(code, "catalog_locked")
+        }
+        other => panic!("an engine with no catalog answered a read: {other:?}"),
+    }
+    let said = second.read().map(|_| ()).unwrap_err().to_string();
+    assert!(
+        said.contains("catalog_locked") && said.contains("already using"),
+        "the error names the failure: {said}"
+    );
+    let report = serde_json::to_value(second.report()).expect("report");
+    assert_eq!(report["state"], "failed");
+    assert_eq!(report["code"], "catalog_locked");
+    assert!(report["message"].as_str().is_some_and(|m| !m.is_empty()));
+
+    let nowhere = Engine::failed("no_catalog_location", "nowhere to keep a catalog");
+    assert!(matches!(
+        nowhere.read().map(|_| ()),
+        Err(ReadError::NotReady(EngineStatus::Failed { .. }))
+    ));
+    assert_eq!(
+        first.read().expect("the owner reads").status().total_assets,
+        1
+    );
+}
+
+/// Review finding 9: the snapshot is rebuilt from a dozen queries, and one that failed used to be
+/// logged and skipped — then the half-built result was stamped as the current generation and
+/// served. A failed rebuild is an error, is not stamped, and the next read tries again. The same
+/// goes for the tagging-queue count behind the cloud cost estimate, which read 0 on failure.
+#[test]
+fn a_failed_rebuild_is_an_error_and_is_not_stamped_current() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (engine, cfg) = started(dir.path());
+    seed(&engine, dir.path(), &["a.png", "b.png"]);
+    assert_eq!(engine.read().expect("read").status().total_assets, 2);
+    let raw = rusqlite::Connection::open(&cfg.catalog).expect("raw");
+
+    // One of the snapshot's queries now fails, and the catalog moves on.
+    raw.execute_batch("ALTER TABLE asset_preview RENAME TO asset_preview_gone;")
+        .expect("break the previews query");
+    engine
+        .writer()
+        .run(Op::CreateCollection { name: "x".into() })
+        .expect("a write that still works");
+    match engine.read().map(|l| l.status().total_assets) {
+        Err(ReadError::Rebuild(why)) => assert!(why.contains("preview"), "{why}"),
+        other => panic!("a snapshot missing its previews was served: {other:?}"),
+    }
+    assert!(
+        engine.read().is_err(),
+        "the failed build was stamped: the second read served it"
+    );
+
+    // Repaired, the very next read rebuilds — nothing else had to change.
+    raw.execute_batch("ALTER TABLE asset_preview_gone RENAME TO asset_preview;")
+        .expect("repair");
+    let read = engine.read().expect("read after the repair");
+    assert_eq!(read.status().total_assets, 2);
+    assert_eq!(read.generation(), engine.catalog_generation());
+    assert_eq!(read.count_needing_tags().expect("queue"), 2);
+    drop(read);
+
+    // The queue count behind "this run will make N API calls": an error, never a free run.
+    raw.execute_batch("ALTER TABLE asset_file RENAME TO asset_file_gone;")
+        .expect("break the queue count");
+    assert!(
+        engine
+            .read()
+            .expect("the snapshot is still current")
+            .count_needing_tags()
+            .is_err(),
+        "a queue that could not be counted read as empty"
+    );
+}
+
+/// Review finding 10: a panic while the read lock is held poisons it. The snapshot may be
+/// half-built, so it is rebuilt — once. The poison used to stay set, so *every* later read
+/// rebuilt the whole library, and `reload()`, which gave up on a poisoned lock, did nothing.
+#[test]
+fn a_panic_under_the_read_lock_costs_one_rebuild_not_one_per_read() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (engine, _) = started(dir.path());
+    seed(&engine, dir.path(), &["a.png", "b.png"]);
+    let built = engine.read().expect("read").rebuilds();
+    assert_eq!(
+        engine.read().expect("read").rebuilds(),
+        built,
+        "a read at the current generation rebuilds nothing"
+    );
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _held = engine.read().expect("read");
+        panic!("a reader panicked with the snapshot in hand");
+    }));
+    assert!(unwound.is_err());
+
+    assert_eq!(
+        engine.read().expect("read").rebuilds(),
+        built + 1,
+        "the snapshot a panic may have left half-built is rebuilt"
+    );
+    let read = engine.read().expect("read");
+    assert_eq!(
+        read.rebuilds(),
+        built + 1,
+        "every read after one panic rebuilds the whole library"
+    );
+    assert_eq!(read.status().total_assets, 2);
+    drop(read);
+
+    engine.reload();
+    assert_eq!(
+        engine.read().expect("read").rebuilds(),
+        built + 2,
+        "reload() became a no-op after a panic"
+    );
 }
 
 /// A catalog written by a newer build is refused — reported, not opened, not changed.

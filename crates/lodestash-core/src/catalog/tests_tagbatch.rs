@@ -382,10 +382,17 @@ fn a_hundred_asset_edit_undoes_and_redoes_as_one() {
         ids[..100].iter().all(|&id| rows(&c, id).len() == 1),
         "redo re-applied all hundred"
     );
-    assert!(
-        c.recent_ops(10).expect("recent").is_empty(),
-        "redo consumes the row"
+    assert_eq!(
+        c.recent_ops(10).expect("recent").len(),
+        1,
+        "redo puts the edit back on the undo stack"
     );
+    c.revert_op(op).expect("undo the redone edit");
+    assert!(
+        ids[..100].iter().all(|&id| rows(&c, id).is_empty()),
+        "a redone edit undoes again"
+    );
+    c.redo_op(op).expect("redo again");
 
     let all: Vec<_> = ids
         .iter()

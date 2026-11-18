@@ -103,6 +103,114 @@ const META_PAYLOAD_CAP: u64 = 256 * 1024;
 /// The pack icon is a small square PNG; anything larger is not it.
 const ICON_CAP: u64 = 4 * 1024 * 1024;
 
+/// Most GUID folders one package may list. A real pack holds tens of thousands at the outside;
+/// the bound is on what a manifest read keeps in memory for an archive that lists millions.
+pub const MAX_PACKAGE_ENTRIES: usize = 500_000;
+
+/// Largest single payload an extraction writes into the workspace. Unity itself cannot import a
+/// file near this size; the bound is on how much disk one entry of a hostile (or merely broken)
+/// archive can fill — a payload of zeros compresses a thousandfold.
+pub const MAX_EXTRACTED_PAYLOAD_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Most bytes a tar extension record — a PAX header, a GNU long name — may hold. They carry a
+/// path and a few numbers.
+const EXTENSION_RECORD_CAP: u64 = 64 * 1024;
+
+fn invalid(what: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, what.into())
+}
+
+/// Read `reader` whole if it holds at most `cap` bytes; `None` if it holds more.
+///
+/// **Decided by reading, never by a declared size.** The reader is limited to `cap + 1` bytes, so
+/// nothing an archive says about an entry can make this allocate more. The caps used to be checked
+/// against the tar header's size while `read_to_end` followed the PAX size that overrides it: a
+/// header saying "0 bytes" passed every cap and the read then took whatever the PAX record said
+/// (integrity review, finding 12).
+fn read_capped(reader: &mut impl Read, cap: u64) -> io::Result<Option<Vec<u8>>> {
+    let mut buf = Vec::new();
+    reader.by_ref().take(cap + 1).read_to_end(&mut buf)?;
+    Ok((buf.len() as u64 <= cap).then_some(buf))
+}
+
+/// Whether [`for_each_member`] goes on to the next member.
+enum Walk {
+    On,
+    Stop,
+}
+
+/// Walk an archive's members, with every read this module does not make itself bounded too.
+///
+/// The archive is read **raw**: `tar` then hands over its extension records (PAX `x`, GNU `L`)
+/// as ordinary entries instead of reading each into memory whole before the member it describes
+/// — which it does for whatever size the record declares. They are applied here, under
+/// [`EXTENSION_RECORD_CAP`]: a long name or a PAX `path` names the next member, and everything
+/// else in a PAX record (mtime, uid…) is ignored. Two things are refused outright, as
+/// `InvalidData`: a record over the cap, and a PAX `size` that disagrees with the header's own —
+/// honouring it is how a 512-byte header came to "hold" a multi-gigabyte payload, and a raw walk
+/// could not follow it anyway.
+///
+/// `visit` gets each member's path with `./` dropped (archives packed with `tar -C dir .`), and
+/// the entry to read its bytes from; bytes it leaves unread are skipped through a fixed buffer.
+fn for_each_member<R: Read>(
+    archive: &mut tar::Archive<R>,
+    mut visit: impl FnMut(&Path, &mut tar::Entry<'_, R>) -> io::Result<Walk>,
+) -> io::Result<()> {
+    let lossy_path = |bytes: &[u8]| PathBuf::from(String::from_utf8_lossy(bytes).into_owned());
+    let mut named: Option<PathBuf> = None;
+    let mut pax_size: Option<u64> = None;
+    for entry in archive.entries()?.raw(true) {
+        let mut entry = entry?;
+        let kind = entry.header().entry_type();
+        if kind.is_gnu_longname() || kind.is_pax_local_extensions() {
+            let record = read_capped(&mut entry, EXTENSION_RECORD_CAP)?.ok_or_else(|| {
+                invalid(format!(
+                    "a tar extension record is larger than {EXTENSION_RECORD_CAP} bytes"
+                ))
+            })?;
+            if kind.is_gnu_longname() {
+                let end = record.iter().position(|b| *b == 0).unwrap_or(record.len());
+                named = Some(lossy_path(&record[..end]));
+            } else {
+                for field in tar::PaxExtensions::new(&record).flatten() {
+                    match field.key() {
+                        Ok("path") => named = Some(lossy_path(field.value_bytes())),
+                        Ok("size") => {
+                            pax_size = Some(
+                                std::str::from_utf8(field.value_bytes())
+                                    .ok()
+                                    .and_then(|v| v.trim().parse().ok())
+                                    .ok_or_else(|| invalid("an unreadable PAX size record"))?,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            continue;
+        }
+        if kind.is_gnu_longlink() || kind.is_pax_global_extensions() {
+            continue; // nothing in them names or sizes a member
+        }
+        if let Some(declared) = pax_size.take() {
+            if declared != entry.size() {
+                return Err(invalid(format!(
+                    "a PAX record gives a member {declared} bytes where its header says {} — \
+                     not read",
+                    entry.size()
+                )));
+            }
+        }
+        let path = named
+            .take()
+            .unwrap_or_else(|| lossy_path(&entry.path_bytes()));
+        if let Walk::Stop = visit(&member_path(&path), &mut entry)? {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Does this in-pack path look like a licence document?
 fn is_license_path(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path).to_lowercase();
@@ -224,25 +332,21 @@ pub fn read_package_meta(path: &Path, entries: &[PackageEntry]) -> io::Result<Pa
     let mut icon_seen = false;
     let mut found = 0usize;
 
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let entry_path = entry.path()?.to_path_buf();
-        let name = member_path(&entry_path)
-            .to_string_lossy()
-            .replace('\\', "/");
+    for_each_member(&mut archive, |member, entry| {
+        let name = member.to_string_lossy().replace('\\', "/");
         if name == ".icon.png" {
             icon_seen = true;
-            if entry.header().size().unwrap_or(0) <= ICON_CAP {
-                let mut buf = Vec::new();
-                entry.read_to_end(&mut buf)?;
-                meta.icon_png = Some(buf);
-            }
-        } else if let Some((guid, member)) = guid_and_member(&entry_path) {
-            if member == "asset" {
+            // Larger than an icon is not the icon — found out by reading, under the cap.
+            meta.icon_png = read_capped(entry, ICON_CAP)?;
+        } else if let Some((guid, part)) = guid_and_member(member) {
+            if part == "asset" {
                 if let Some(&is_json) = wanted.get(guid.as_str()) {
-                    let mut text = String::new();
-                    // A binary payload that happened to be named LICENSE is simply skipped.
-                    if entry.read_to_string(&mut text).is_ok() {
+                    // The manifest said this one is small; the read holds it to that. A binary
+                    // payload that happened to be named LICENSE is simply skipped, like one
+                    // that turns out larger than it was listed.
+                    let text = read_capped(entry, META_PAYLOAD_CAP)?
+                        .and_then(|bytes| String::from_utf8(bytes).ok());
+                    if let Some(text) = text {
                         if is_json {
                             parse_package_json(&text, &mut meta);
                         } else if meta.license.is_none() {
@@ -254,10 +358,12 @@ pub fn read_package_meta(path: &Path, entries: &[PackageEntry]) -> io::Result<Pa
             }
         }
         // Everything asked for has been read; the rest of a multi-GB archive is not our business.
-        if found >= wanted.len() && (icon_seen || meta.icon_png.is_some()) {
-            break;
-        }
-    }
+        Ok(if found >= wanted.len() && icon_seen {
+            Walk::Stop
+        } else {
+            Walk::On
+        })
+    })?;
     Ok(meta)
 }
 
@@ -274,10 +380,39 @@ fn parse_pathname(raw: &str) -> String {
 /// Strip characters that are invalid in a Windows filename (control chars and `<>:"/\|?*`) from
 /// a workspace-file basename. Belt-and-suspenders on top of [`parse_pathname`] — a well-formed
 /// `pathname` shouldn't hit this, but the workspace write must never panic on hostile input.
+///
+/// Trailing dots and spaces go too: Windows drops them when it creates the file, so the name
+/// recorded would not be the name on disk — and `NUL.` is still the device.
 fn sanitize_basename(name: &str) -> String {
-    name.chars()
+    let cleaned: String = name
+        .chars()
         .filter(|c| !c.is_control() && !r#"<>:"/\|?*"#.contains(*c))
-        .collect()
+        .collect();
+    cleaned.trim_end_matches(['.', ' ']).to_string()
+}
+
+/// Is `name` one Windows reserves for a device — `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`,
+/// `LPT1`–`LPT9` (and the superscript digits it also accepts) — in any case, with or without an
+/// extension?
+///
+/// Such a name in any folder opens the device, not a file: a payload written to
+/// `<workspace>/<hash>/NUL` is gone, the rename onto it fails the whole extraction, and a row
+/// that pointed there would read back empty. Refused on every OS, because the workspace layout
+/// is the same on every OS.
+fn is_reserved_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end();
+    let stem = stem.to_ascii_uppercase();
+    if matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    let mut chars = stem.chars();
+    let port: String = chars.by_ref().take(3).collect();
+    matches!(port.as_str(), "COM" | "LPT")
+        && matches!(chars.next(), Some('1'..='9' | '¹' | '²' | '³'))
+        && chars.next().is_none()
 }
 
 /// A tar member's path with any `.` components dropped. Archives packed with `tar -C dir .` name
@@ -311,20 +446,25 @@ fn is_guid(s: &str) -> bool {
 const SMALL_ENTRY_CAP: u64 = 64 * 1024;
 
 /// Read a `pathname` or `asset.meta` entry, or `None` — with a warning — when it is larger than
-/// [`SMALL_ENTRY_CAP`]. The skipped bytes are never read into memory.
+/// [`SMALL_ENTRY_CAP`] or is not UTF-8. Bytes past the cap are never read into memory, and the
+/// entry beside it is unaffected: one `pathname` that was not UTF-8 used to fail the whole
+/// manifest, and every other asset in the pack with it.
 fn read_small_entry<R: Read>(
     entry: &mut tar::Entry<'_, R>,
     guid: &str,
     member: &str,
 ) -> io::Result<Option<String>> {
-    let size = entry.size();
-    if size > SMALL_ENTRY_CAP {
-        tracing::warn!(guid, member, size, "skipping an oversized package entry");
+    let Some(bytes) = read_capped(entry, SMALL_ENTRY_CAP)? else {
+        tracing::warn!(guid, member, "skipping an oversized package entry");
         return Ok(None);
+    };
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(Some(text)),
+        Err(_) => {
+            tracing::warn!(guid, member, "skipping a package entry that is not UTF-8");
+            Ok(None)
+        }
     }
-    let mut s = String::new();
-    entry.take(SMALL_ENTRY_CAP).read_to_string(&mut s)?;
-    Ok(Some(s))
 }
 
 /// Browse pass: enumerate every GUID folder's `pathname`/`asset.meta`/`asset` size/`preview.png`
@@ -342,6 +482,16 @@ pub fn read_manifest_with_progress(
     path: &Path,
     on_progress: &(dyn Fn(u64, u64) -> bool + Sync),
 ) -> io::Result<Vec<PackageEntry>> {
+    read_manifest_capped(path, on_progress, MAX_PACKAGE_ENTRIES)
+}
+
+/// [`read_manifest_with_progress`] with the entry bound as an argument, so a test can reach it
+/// without building half a million folders. More than `max_entries` GUID folders is `InvalidData`.
+fn read_manifest_capped(
+    path: &Path,
+    on_progress: &(dyn Fn(u64, u64) -> bool + Sync),
+    max_entries: usize,
+) -> io::Result<Vec<PackageEntry>> {
     let file = File::open(path)?;
     let total = file.metadata()?.len();
     let file = ProgressReader {
@@ -355,36 +505,50 @@ pub fn read_manifest_with_progress(
 
     let mut by_guid: BTreeMap<String, PackageEntry> = BTreeMap::new();
 
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let entry_path = entry.path()?.to_path_buf();
-        let Some((guid, member)) = guid_and_member(&entry_path) else {
-            continue;
+    for_each_member(&mut archive, |member, entry| {
+        let Some((guid, part)) = guid_and_member(member) else {
+            return Ok(Walk::On);
         };
+        // The same rule the extract pass applies: a folder that is not a GUID is not an asset,
+        // and its name would otherwise become a catalog row — and later a file name.
+        if !is_guid(&guid) {
+            if part == "asset" {
+                tracing::warn!(guid, "not listing a payload whose folder is not a GUID");
+            }
+            return Ok(Walk::On);
+        }
+        if !by_guid.contains_key(&guid) && by_guid.len() >= max_entries {
+            return Err(invalid(format!(
+                "the package lists more than {max_entries} assets — not read"
+            )));
+        }
         let rec = by_guid.entry(guid.clone()).or_insert_with(|| PackageEntry {
             guid: guid.clone(),
             ..Default::default()
         });
 
-        match member.as_str() {
+        match part.as_str() {
             "pathname" => {
-                if let Some(s) = read_small_entry(&mut entry, &guid, &member)? {
+                if let Some(s) = read_small_entry(entry, &guid, &part)? {
                     rec.pathname = Some(parse_pathname(&s));
                 }
             }
             "asset.meta" => {
-                if let Some(s) = read_small_entry(&mut entry, &guid, &member)? {
+                if let Some(s) = read_small_entry(entry, &guid, &part)? {
                     rec.meta = parse_meta(&s);
                 }
             }
             "asset" => {
-                rec.asset_size = Some(entry.header().size()?);
+                // The entry's own extent, which is what a later pull reads and what
+                // `read_entry_payload` checks against the header (a PAX override is refused).
+                rec.asset_size = Some(entry.size());
                 rec.asset_offset = Some(entry.raw_file_position());
             }
             "preview.png" => rec.has_preview = true,
             _ => {}
         }
-    }
+        Ok(Walk::On)
+    })?;
 
     Ok(by_guid.into_values().collect())
 }
@@ -499,45 +663,58 @@ pub fn extract_to_workspace_with_progress(
     let mut pending: BTreeMap<String, (PathBuf, String, u64)> = BTreeMap::new();
     let mut extracted = Vec::new();
 
-    let walk: io::Result<()> = (|| {
-        for entry in archive.entries()? {
-            let mut entry = entry?;
-            let entry_path = entry.path()?.to_path_buf();
-            let Some((guid, member)) = guid_and_member(&entry_path) else {
-                continue;
-            };
-            if !is_guid(&guid) {
-                if member == "asset" {
-                    tracing::warn!(guid, "skipping a payload whose folder is not a GUID");
-                }
-                continue;
+    let walk = for_each_member(&mut archive, |member, entry| {
+        let Some((guid, part)) = guid_and_member(member) else {
+            return Ok(Walk::On);
+        };
+        if !is_guid(&guid) {
+            if part == "asset" {
+                tracing::warn!(guid, "skipping a payload whose folder is not a GUID");
             }
-            match member.as_str() {
-                "pathname" => {
-                    let Some(s) = read_small_entry(&mut entry, &guid, &member)? else {
-                        continue; // placed under its GUID, as if the pathname never came
-                    };
-                    let pn = parse_pathname(&s);
-                    if let Some((tmp, hash, size)) = pending.remove(&guid) {
-                        extracted.push(place_payload(dest, guid, Some(pn), tmp, hash, size)?);
-                    } else {
-                        pathnames.insert(guid, pn);
-                    }
-                }
-                "asset" => {
-                    let tmp_path = tmp_dir.join(&guid);
-                    let (hash, size) = stream_hash_to_file(&mut entry, &tmp_path)?;
-                    if let Some(pn) = pathnames.remove(&guid) {
-                        extracted.push(place_payload(dest, guid, Some(pn), tmp_path, hash, size)?);
-                    } else {
-                        pending.insert(guid, (tmp_path, hash, size));
-                    }
-                }
-                _ => {}
-            }
+            return Ok(Walk::On);
         }
-        Ok(())
-    })();
+        // What this pass holds in memory is one small record per folder; bound the folders.
+        if extracted.len() + pending.len() >= MAX_PACKAGE_ENTRIES
+            || pathnames.len() >= MAX_PACKAGE_ENTRIES
+        {
+            return Err(invalid(format!(
+                "the package holds more than {MAX_PACKAGE_ENTRIES} assets — not extracted further"
+            )));
+        }
+        match part.as_str() {
+            "pathname" => {
+                let Some(s) = read_small_entry(entry, &guid, &part)? else {
+                    return Ok(Walk::On); // placed under its GUID, as if the pathname never came
+                };
+                let pn = parse_pathname(&s);
+                if let Some((tmp, hash, size)) = pending.remove(&guid) {
+                    extracted.push(place_payload(dest, guid, Some(pn), tmp, hash, size)?);
+                } else {
+                    pathnames.insert(guid, pn);
+                }
+            }
+            "asset" => {
+                let tmp_path = tmp_dir.join(&guid);
+                let Some((hash, size)) =
+                    stream_hash_to_file(entry, &tmp_path, MAX_EXTRACTED_PAYLOAD_BYTES)?
+                else {
+                    tracing::warn!(
+                        guid,
+                        cap = MAX_EXTRACTED_PAYLOAD_BYTES,
+                        "skipping a payload over the extract ceiling"
+                    );
+                    return Ok(Walk::On);
+                };
+                if let Some(pn) = pathnames.remove(&guid) {
+                    extracted.push(place_payload(dest, guid, Some(pn), tmp_path, hash, size)?);
+                } else {
+                    pending.insert(guid, (tmp_path, hash, size));
+                }
+            }
+            _ => {}
+        }
+        Ok(Walk::On)
+    });
 
     // Assets fully read before the walk stopped but still awaiting a pathname are complete — place
     // them (guid basename if the pathname never came) so they count toward a resume.
@@ -617,13 +794,20 @@ fn extract_at_offsets_from<R: Read>(
     dest: &Path,
     mut wanted: Vec<EntryLocator>,
 ) -> io::Result<Vec<ExtractedAsset>> {
-    // A locator comes from the catalog, but its GUID still becomes a file name here.
+    // A locator comes from the catalog, but its GUID still becomes a file name here — and its
+    // size is how much of the stream gets written to disk, so one over the extract ceiling is
+    // skipped like any other entry that is not what it claims (the rest still extract).
     wanted.retain(|w| {
-        let ok = is_guid(&w.guid);
-        if !ok {
+        if !is_guid(&w.guid) {
             tracing::warn!(guid = %w.guid, "skipping a locator whose GUID is not a GUID");
+            return false;
         }
-        ok
+        if w.size > MAX_EXTRACTED_PAYLOAD_BYTES {
+            tracing::warn!(guid = %w.guid, size = w.size, cap = MAX_EXTRACTED_PAYLOAD_BYTES,
+                "skipping a locator over the extract ceiling");
+            return false;
+        }
+        true
     });
     wanted.sort_by_key(|w| w.offset);
     let tmp_dir = dest.join(".tmp");
@@ -646,12 +830,12 @@ fn extract_at_offsets_from<R: Read>(
                 // `Ok`, nothing downstream would ever come back for it: cancel a 400 MB payload
                 // often enough and `.tmp` grows without bound (`remove_dir` is non-recursive and
                 // silently fails on a non-empty dir).
-                match stream_hash_to_file(&mut region, &tmp_path) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = std::fs::remove_file(&tmp_path);
-                        return Err(e);
-                    }
+                match stream_hash_to_file(&mut region, &tmp_path, MAX_EXTRACTED_PAYLOAD_BYTES) {
+                    Ok(Some(v)) => v,
+                    // Unreachable while `w.size` is under the ceiling (checked above) and the
+                    // region is limited to it — but a skip, never a panic, if that ever changes.
+                    Ok(None) => continue,
+                    Err(e) => return Err(e),
                 }
             };
             pos += size;
@@ -806,8 +990,19 @@ const PULL_CAP_HINT: usize = 64 * 1024 * 1024;
 /// (DATA-MODEL §7 / M14). One gzip skip-scan to `offset`, read `size` bytes, return them; no file
 /// is written (unlike [`extract_at_offsets`]), so identifying an in-pack asset leaves nothing on
 /// disk. A short read means a stale locator (the archive changed) and errors rather than handing
-/// back a truncated buffer. The caller decides whether a payload is small enough to pull into RAM.
+/// back a truncated buffer.
+///
+/// `size` comes from a manifest, which is to say from the archive. Over
+/// [`PAYLOAD_PULL_MAX_BYTES`] it is refused here (`InvalidInput`), before the archive is opened —
+/// callers have their own, smaller, limits, but the buffer this fills must not depend on every
+/// caller remembering one.
 pub fn read_payload_at(path: &Path, offset: u64, size: u64) -> io::Result<Vec<u8>> {
+    if size > PAYLOAD_PULL_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("the payload is {size} bytes, over the {PAYLOAD_PULL_MAX_BYTES}-byte ceiling"),
+        ));
+    }
     let mut gz = GzDecoder::new(File::open(path)?);
     io::copy(&mut (&mut gz).take(offset), &mut io::sink())?;
     let mut buf = Vec::with_capacity((size as usize).min(PULL_CAP_HINT));
@@ -831,11 +1026,13 @@ fn place_payload(
     hash: String,
     size: u64,
 ) -> io::Result<ExtractedAsset> {
+    // A name that is empty once cleaned, or that Windows reserves for a device, is not used: the
+    // payload goes under its GUID, which is always a plain file name.
     let basename = pathname
         .as_deref()
         .and_then(|p| Path::new(p).file_name())
         .map(|n| sanitize_basename(&n.to_string_lossy()))
-        .filter(|n| !n.is_empty())
+        .filter(|n| !n.is_empty() && !is_reserved_device_name(n))
         .unwrap_or_else(|| guid.clone());
     let out_dir = dest.join(&hash);
     std::fs::create_dir_all(&out_dir)?;
@@ -854,22 +1051,38 @@ fn place_payload(
     })
 }
 
-/// Stream a tar entry to `dest` while hashing it, without holding the payload in memory.
-fn stream_hash_to_file(entry: &mut impl Read, dest: &Path) -> io::Result<(String, u64)> {
-    let mut out = File::create(dest)?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = [0u8; 64 * 1024];
-    let mut size: u64 = 0;
-    loop {
-        let n = entry.read(&mut buf)?;
-        if n == 0 {
-            break;
+/// Stream a payload to `dest` while hashing it, without holding it in memory — **at most `cap`
+/// bytes**, whatever the entry declares. `Some((hash, size))` when it fit; `None` when the source
+/// held more. Nothing is left at `dest` unless it fit: not after `None`, and not after an error
+/// (a cancel landing mid-payload used to leave its partial write behind in `.tmp`).
+fn stream_hash_to_file(
+    source: &mut impl Read,
+    dest: &Path,
+    cap: u64,
+) -> io::Result<Option<(String, u64)>> {
+    let streamed = (|| {
+        let mut out = File::create(dest)?;
+        let mut limited = source.by_ref().take(cap.saturating_add(1));
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = [0u8; 64 * 1024];
+        let mut size: u64 = 0;
+        loop {
+            let n = limited.read(&mut buf)?;
+            if n == 0 {
+                return Ok(Some((hasher.finalize().to_hex().to_string(), size)));
+            }
+            size += n as u64;
+            if size > cap {
+                return Ok(None);
+            }
+            hasher.update(&buf[..n]);
+            out.write_all(&buf[..n])?;
         }
-        hasher.update(&buf[..n]);
-        out.write_all(&buf[..n])?;
-        size += n as u64;
+    })();
+    if !matches!(streamed, Ok(Some(_))) {
+        let _ = std::fs::remove_file(dest);
     }
-    Ok((hasher.finalize().to_hex().to_string(), size))
+    streamed
 }
 
 #[cfg(test)]
@@ -1166,9 +1379,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pkg = build_test_package(
             dir.path(),
-            "abc123",
+            "abc123abc123abc123abc123abc123ab",
             "Assets/Props/Barrel.png",
-            "guid: abc123\n",
+            "guid: abc123abc123abc123abc123abc123ab\n",
             &b"payload".repeat(500),
         );
         // Progress fires with a non-zero total (the compressed file size).
@@ -1385,16 +1598,16 @@ See our website."
         let dir = tempfile::tempdir().unwrap();
         let pkg = build_test_package(
             dir.path(),
-            "abc123",
+            "abc123abc123abc123abc123abc123ab",
             "Assets/Props/Barrel.png",
-            "fileFormatVersion: 2\nguid: abc123\nlabels:\n- Prop\nTextureImporter:\n  mipmaps: 1\n",
+            "fileFormatVersion: 2\nguid: abc123abc123abc123abc123abc123ab\nlabels:\n- Prop\nTextureImporter:\n  mipmaps: 1\n",
             b"PNGDATA_PAYLOAD",
         );
 
         let manifest = read_manifest(&pkg).unwrap();
         assert_eq!(manifest.len(), 1);
         let entry = &manifest[0];
-        assert_eq!(entry.guid, "abc123");
+        assert_eq!(entry.guid, "abc123abc123abc123abc123abc123ab");
         assert_eq!(entry.pathname.as_deref(), Some("Assets/Props/Barrel.png"));
         assert_eq!(entry.meta.labels, vec!["Prop"]);
         assert_eq!(entry.meta.importer.as_deref(), Some("TextureImporter"));
@@ -1620,5 +1833,360 @@ See our website."
             assert!(placed.is_empty(), "{hostile:?} named a file");
         }
         assert!(!ws.join("x").exists() && !dir.path().join("x").exists());
+    }
+
+    // ---- sizes an archive declares are not sizes it gets (integrity review, finding 12) -------
+
+    /// One part of a hand-built archive.
+    enum Part<'a> {
+        /// An ordinary member, written exactly as named.
+        Member(&'a str, &'a [u8]),
+        /// A PAX extended header applying to the member after it.
+        Pax(&'a [(&'a str, &'a [u8])]),
+        /// A member whose header says `declared` bytes while `body` follows it.
+        Lying {
+            name: &'a str,
+            declared: u64,
+            body: &'a [u8],
+        },
+        /// A GNU long-name record of this many bytes.
+        LongName(usize),
+    }
+
+    fn hand_built(dir: &Path, parts: &[Part<'_>]) -> PathBuf {
+        let path = dir.join("hand.unitypackage");
+        let gz = flate2::write::GzEncoder::new(
+            File::create(&path).unwrap(),
+            flate2::Compression::fast(),
+        );
+        let mut b = tar::Builder::new(gz);
+        let header = |name: &str, size: u64, kind: tar::EntryType| {
+            let mut h = tar::Header::new_gnu();
+            h.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+            h.set_size(size);
+            h.set_mode(0o644);
+            h.set_entry_type(kind);
+            h.set_cksum();
+            h
+        };
+        for part in parts {
+            match part {
+                Part::Member(name, body) => b
+                    .append(
+                        &header(name, body.len() as u64, tar::EntryType::Regular),
+                        *body,
+                    )
+                    .unwrap(),
+                Part::Pax(records) => b.append_pax_extensions(records.iter().copied()).unwrap(),
+                Part::Lying {
+                    name,
+                    declared,
+                    body,
+                } => {
+                    // The header alone, then the bytes written straight behind it, padded to a
+                    // block — the tar the header describes and the one on disk now disagree.
+                    b.append(
+                        &header(name, *declared, tar::EntryType::Regular),
+                        std::io::empty(),
+                    )
+                    .unwrap();
+                    let w = b.get_mut();
+                    w.write_all(body).unwrap();
+                    let pad = (512 - body.len() % 512) % 512;
+                    w.write_all(&vec![0u8; pad]).unwrap();
+                }
+                Part::LongName(len) => b
+                    .append(
+                        &header("././@LongLink", *len as u64, tar::EntryType::GNULongName),
+                        vec![b'a'; *len].as_slice(),
+                    )
+                    .unwrap(),
+            }
+        }
+        b.into_inner().unwrap().finish().unwrap();
+        path
+    }
+
+    /// The caps used to be checked against the tar **header's** size while the read followed the
+    /// **PAX** size, which overrides it: a header saying "0 bytes" over a PAX record saying
+    /// "8 MiB" passed the 4 MiB icon cap and was read whole — on the writer thread, for whatever
+    /// size a hostile pack cared to declare. Such an archive is refused; nothing it declares is
+    /// buffered.
+    #[test]
+    fn a_pax_size_never_carries_a_read_past_its_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = vec![0u8; 8 * 1024 * 1024];
+        let size = big.len().to_string();
+        let records: [(&str, &[u8]); 1] = [("size", size.as_bytes())];
+        let pkg = hand_built(
+            dir.path(),
+            &[
+                Part::Pax(&records),
+                Part::Lying {
+                    name: ".icon.png",
+                    declared: 0,
+                    body: &big,
+                },
+                Part::Member(&format!("{GUID}/asset"), b"honest"),
+                Part::Member(&format!("{GUID}/pathname"), b"Assets/Good.png"),
+            ],
+        );
+        let honest = [PackageEntry {
+            guid: GUID.into(),
+            pathname: Some("Assets/Good.png".into()),
+            asset_size: Some(6),
+            ..Default::default()
+        }];
+        match read_package_meta(&pkg, &honest) {
+            Ok(meta) => panic!(
+                "an icon of {} bytes was buffered past the {ICON_CAP}-byte cap",
+                meta.icon_png.map_or(0, |b| b.len())
+            ),
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}"),
+        }
+        assert!(
+            read_manifest(&pkg).is_err(),
+            "a manifest was built from sizes the archive lies about"
+        );
+
+        // The same lie on a licence: 10 bytes in the header (so the manifest says it is small
+        // enough to read), a megabyte in the PAX record.
+        let dir = tempfile::tempdir().unwrap();
+        let text = vec![b'x'; 1024 * 1024];
+        let size = text.len().to_string();
+        let records: [(&str, &[u8]); 1] = [("size", size.as_bytes())];
+        let pkg = hand_built(
+            dir.path(),
+            &[
+                Part::Pax(&records),
+                Part::Lying {
+                    name: &format!("{GUID}/asset"),
+                    declared: 10,
+                    body: &text,
+                },
+            ],
+        );
+        let licence = [PackageEntry {
+            guid: GUID.into(),
+            pathname: Some("Assets/LICENSE".into()),
+            asset_size: Some(10),
+            ..Default::default()
+        }];
+        assert!(
+            read_package_meta(&pkg, &licence).is_err(),
+            "a megabyte of 'licence' was read behind a 10-byte header"
+        );
+    }
+
+    /// The tar reader itself reads an extension record — a PAX header, a GNU long name — into
+    /// memory whole before handing the next member over. Those are read here instead, under a
+    /// cap: one that declares a megabyte is refused, and an ordinary one still applies.
+    #[test]
+    fn an_oversized_extension_record_is_refused_and_a_normal_one_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = hand_built(
+            dir.path(),
+            &[
+                Part::LongName(1024 * 1024),
+                Part::Member(&format!("{GUID}/asset"), b"payload"),
+            ],
+        );
+        let refused = read_manifest(&pkg).expect_err("a megabyte long-name record was read");
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidData, "{refused}");
+        assert!(extract_to_workspace(&pkg, &dir.path().join("ws")).is_err());
+
+        // What third-party packers really write: a PAX record per member carrying its path (and
+        // an mtime). The path applies; the rest is ignored.
+        let dir = tempfile::tempdir().unwrap();
+        let asset = format!("{GUID}/asset");
+        let pathname = format!("{GUID}/pathname");
+        let for_asset: [(&str, &[u8]); 2] =
+            [("path", asset.as_bytes()), ("mtime", b"1700000000.5")];
+        let for_pathname: [(&str, &[u8]); 1] = [("path", pathname.as_bytes())];
+        let pkg = hand_built(
+            dir.path(),
+            &[
+                Part::Pax(&for_asset),
+                Part::Member("placeholder-a", b"payload"),
+                Part::Pax(&for_pathname),
+                Part::Member("placeholder-b", b"Assets/Rock.png"),
+            ],
+        );
+        let manifest = read_manifest(&pkg).expect("a PAX path record is ordinary");
+        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest[0].guid, GUID);
+        assert_eq!(manifest[0].pathname.as_deref(), Some("Assets/Rock.png"));
+        assert_eq!(manifest[0].asset_size, Some(7));
+        let (offset, size) = (manifest[0].asset_offset.unwrap(), 7);
+        assert_eq!(read_payload_at(&pkg, offset, size).unwrap(), b"payload");
+    }
+
+    /// The browse pass keeps only GUID folders, like the extract pass: `..`, a device name or any
+    /// other folder is not an asset, and its "guid" would become a catalog row and a file name.
+    /// And the number of folders one package may list is bounded.
+    #[test]
+    fn the_manifest_lists_only_guid_folders_and_a_bounded_number_of_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = "bbbb1111bbbb2222cccc3333dddd4444";
+        let pkg = raw_package(
+            dir.path(),
+            &[
+                ("../asset", b"hostile"),
+                ("NUL/asset", b"hostile"),
+                ("abc123/asset", b"not a guid"),
+                ("abc123/pathname", b"Assets/NotAGuid.png"),
+                (&format!("{GUID}/asset"), b"honest"),
+                (&format!("{GUID}/pathname"), b"Assets/Good.png"),
+                (&format!("{other}/asset"), b"second"),
+            ],
+        );
+        let guids: Vec<String> = read_manifest(&pkg)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.guid)
+            .collect();
+        assert_eq!(guids, vec![GUID.to_string(), other.to_string()]);
+
+        assert_eq!(
+            read_manifest_capped(&pkg, &|_, _| true, 2).unwrap().len(),
+            2,
+            "at the bound is fine"
+        );
+        let over = read_manifest_capped(&pkg, &|_, _| true, 1)
+            .expect_err("a package over the entry bound was listed");
+        assert_eq!(over.kind(), io::ErrorKind::InvalidData, "{over}");
+    }
+
+    /// One `pathname` that is not UTF-8 used to fail the whole manifest — every other asset in
+    /// the pack with it. That entry reads as if it had no pathname; the rest are untouched.
+    #[test]
+    fn a_pathname_that_is_not_utf8_costs_one_entry_not_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = "bbbb1111bbbb2222cccc3333dddd4444";
+        let pkg = raw_package(
+            dir.path(),
+            &[
+                (&format!("{GUID}/asset"), b"payload"),
+                (&format!("{GUID}/pathname"), b"Assets/\xff\xfe\xfd.png"),
+                (&format!("{other}/asset"), b"second"),
+                (&format!("{other}/pathname"), b"Assets/Fine.png"),
+            ],
+        );
+        let manifest = read_manifest(&pkg).expect("one bad pathname must not fail the pack");
+        assert_eq!(manifest.len(), 2);
+        assert_eq!(manifest[0].pathname, None, "the unreadable pathname");
+        assert_eq!(
+            manifest[0].asset_size,
+            Some(7),
+            "its payload is still listed"
+        );
+        assert_eq!(manifest[1].pathname.as_deref(), Some("Assets/Fine.png"));
+
+        let placed = extract_to_workspace(&pkg, &dir.path().join("ws")).expect("extracts");
+        assert_eq!(placed.len(), 2);
+    }
+
+    /// `NUL`, `CON`, `COM1`… name devices on Windows, with or without an extension: creating
+    /// `<workspace>/<hash>/NUL` opens the device, the payload is lost, and the catalog is told it
+    /// landed. Such a payload is placed under its GUID, like one with no usable name.
+    #[test]
+    fn a_payload_named_for_a_windows_device_is_placed_under_its_guid() {
+        for (i, hostile) in [
+            "Assets/NUL",
+            "Assets/con.png",
+            "Assets/Com1.fbx",
+            "Assets/lpt9",
+            "Assets/aux.tar.gz",
+            "Assets/PRN ",
+            "Assets/nul.",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let payload = format!("payload {i}").into_bytes();
+            let pkg = build_test_package(dir.path(), GUID, hostile, "guid: x\n", &payload);
+            let placed = extract_to_workspace(&pkg, &dir.path().join("ws")).unwrap();
+            assert_eq!(placed.len(), 1);
+            assert_eq!(
+                placed[0].workspace_path.file_name().unwrap(),
+                GUID,
+                "{hostile:?} named the workspace file"
+            );
+            assert_eq!(
+                std::fs::read(&placed[0].workspace_path).unwrap(),
+                payload,
+                "{hostile:?}: the payload did not land"
+            );
+        }
+        // Names that merely start like one are ordinary files.
+        for fine in ["Assets/Console.png", "Assets/nulls.txt", "Assets/COM10.fbx"] {
+            let dir = tempfile::tempdir().unwrap();
+            let pkg = build_test_package(dir.path(), GUID, fine, "guid: x\n", b"ok");
+            let placed = extract_to_workspace(&pkg, &dir.path().join("ws")).unwrap();
+            assert_eq!(
+                placed[0].workspace_path.file_name().unwrap(),
+                Path::new(fine).file_name().unwrap()
+            );
+        }
+    }
+
+    /// Nothing a locator or a header declares makes an extraction or a pull unbounded: a payload
+    /// over the extract ceiling is skipped (the rest of the pack still extracts), a stream that
+    /// runs past its cap leaves no file behind, and an in-memory pull over the pull ceiling is
+    /// refused before a byte is read.
+    #[test]
+    fn a_payload_over_its_ceiling_is_skipped_not_streamed_or_buffered() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = build_test_package(dir.path(), GUID, "Assets/A.png", "guid: x\n", b"payload");
+        let entry = read_manifest(&pkg).unwrap().remove(0);
+        let offset = entry.asset_offset.unwrap();
+        let ws = dir.path().join("ws");
+
+        let placed = extract_at_offsets(
+            &pkg,
+            &ws,
+            vec![
+                EntryLocator {
+                    guid: "bbbb1111bbbb2222cccc3333dddd4444".into(),
+                    pathname: Some("Assets/Bomb.bin".into()),
+                    offset,
+                    size: MAX_EXTRACTED_PAYLOAD_BYTES + 1,
+                },
+                EntryLocator {
+                    guid: GUID.into(),
+                    pathname: entry.pathname.clone(),
+                    offset,
+                    size: 7,
+                },
+            ],
+        )
+        .expect("an oversized locator is skipped, not an error");
+        assert_eq!(placed.len(), 1, "the honest payload still extracts");
+        assert_eq!(placed[0].guid, GUID);
+
+        // The stream itself is capped, whatever was declared: past the cap, no file.
+        let out = dir.path().join("capped.bin");
+        let mut endless = io::repeat(7).take(10_000);
+        assert!(stream_hash_to_file(&mut endless, &out, 4_096)
+            .unwrap()
+            .is_none());
+        assert!(
+            !out.exists(),
+            "a payload over the cap left its bytes behind"
+        );
+        let mut exact = io::repeat(7).take(4_096);
+        let (_, size) = stream_hash_to_file(&mut exact, &out, 4_096)
+            .unwrap()
+            .expect("at the cap is fine");
+        assert_eq!(size, 4_096);
+
+        let refused = read_payload_at(&pkg, offset, PAYLOAD_PULL_MAX_BYTES + 1)
+            .expect_err("a pull over the ceiling was attempted");
+        assert_eq!(
+            refused.kind(),
+            io::ErrorKind::InvalidInput,
+            "refused for its size, before reading: {refused}"
+        );
     }
 }

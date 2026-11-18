@@ -301,7 +301,8 @@ throttle hard — Gemini free is on the order of ~15 requests/minute. A naive ti
   that a **hard per-run asset cap** and, for any **non-free preset**, a pre-run confirm showing
   *N assets ≈ M API calls* (and an est. cost line when the provider's pricing is known) prevent a
   mis-clicked **Full Run** on a paid endpoint from becoming a surprise bill. Free/local presets skip
-  the confirm.
+  the confirm. *N* is the `tags_dirty` queue the drain walks; when it cannot be counted the
+  estimate is an **error**, never `0` — a zero reads as "this run costs nothing".
 - **Key at rest.** `api_key` is the one secret this local-first app holds; store it in the **OS
   credential store** (Windows Credential Manager) when available, with a plaintext-config fallback so
   the app still works headless. Never logged, never sent anywhere but the chosen endpoint — not to

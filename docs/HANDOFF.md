@@ -141,7 +141,8 @@ all verified: `cargo test --workspace` green, svelte-check 0/0, e2e **52/52**, `
   watch** (notify, debounced, incremental rescan, e2e-escape-hatched); **perceptual near-dup**
   (64-bit dHash, ≤6-bit Hamming union-find → the Duplicates screen's Similar tier).
 - **Undo/redo (`1f86d50`).** Op log carries forward payloads (migration 17: `forward_json`,
-  `undone_at`); redo (Shift-Z / Ctrl-Y) applies + consumes; new work clears the stack. Keyboard map:
+  `undone_at`); redo (Shift-Z / Ctrl-Y) applies and — since 2026-11-17, ADR-0006 amended — puts
+  the op back on the undo stack instead of consuming it; new work clears the stack. Keyboard map:
   Ctrl/Cmd-Z, Shift-Z, Space (Quick Look), F (favourite). Ctrl/Cmd-A multi-select still open.
 - **UI-completeness pass (`17c56cd`, `b84d463`, `519ce4d`, `8dc847d`).** Right-click context menu
   on cards + rows; trash-mode per-row Restore; in-pack Quick Look pulls (file/mesh routes; the

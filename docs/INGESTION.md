@@ -156,6 +156,26 @@ to a single entry; reaching any entry means decompressing from the start. Lodest
   skipped with a warning instead of read into memory (the payload beside it still indexes, under
   its GUID); and a GUID becomes a file name only when it is 32 hex digits — a folder or catalogued
   locator named `..` or `../x` is skipped, never joined onto a workspace path.
+- **Nothing an archive declares sizes a read** (2026-11-17). Every read is limited by the reader
+  itself (`read_capped`: at most *cap + 1* bytes are ever taken), never by a declared size — the
+  caps used to be checked against the tar **header** while the read followed the **PAX** size that
+  overrides it, so a "0 byte" icon behind an 8 MiB PAX record was buffered whole. The archive is
+  walked **raw** (`for_each_member`), because the tar reader itself buffers extension records
+  whole: a PAX header or GNU long name is read here under **64 KiB** and applied (its `path` names
+  the next member; mtime, uid and the rest are ignored), one over the cap fails the read, and a
+  PAX `size` that disagrees with the header's is refused outright — which also means a single
+  member over 8 GiB in a PAX-format archive is not read. The bounds, as named constants in
+  `unitypackage.rs`: icon 4 MiB, licence/manifest text 256 KiB, `pathname`/`asset.meta` 64 KiB,
+  an in-memory pull **256 MiB** (`PAYLOAD_PULL_MAX_BYTES`, enforced inside `read_payload_at`
+  too), one extracted payload **8 GiB** (`MAX_EXTRACTED_PAYLOAD_BYTES` — over it the payload is
+  skipped and the rest of the pack still extracts), and **500,000** GUID folders per package
+  (`MAX_PACKAGE_ENTRIES`).
+- **The browse pass keeps only GUID folders too** — it listed any folder name, which then became
+  a catalog row. A `pathname` (or `.meta`) that is **not UTF-8** costs that one entry its path,
+  not the whole manifest. A payload whose name Windows reserves for a device (`NUL`, `CON`,
+  `PRN`, `AUX`, `COM1`–`9`, `LPT1`–`9`, with or without an extension) is placed under its GUID:
+  written as named it opens the device, loses the bytes and fails the extraction. Trailing dots
+  and spaces are dropped from a workspace file name for the same reason.
 - **Surgical pull** = one gzip skip-scan (decompress-and-discard to a payload's offset, copy just that
   payload, ignore the rest — `extract_at_offsets`). This is the workhorse for **preview**, **identify**
   and single-file **Add to project**: the pack is never fully unpacked. **Identify pulls one payload**
@@ -203,6 +223,15 @@ to a single entry; reaching any entry means decompressing from the start. Lodest
   directory is a segment of both. A pack marked `keep_cached` (M23) keeps its bytes; a pack whose
   `.unitypackage` no longer resolves is never reclaimed at all, because the extracted copy is then
   the only one, and its row offers **Retarget…** (UI-SPEC §15) instead.
+
+  **The sweep fails closed (2026-11-17).** "What is referenced" is a `Result`: with no catalog
+  (the engine is not Ready — a second Lodestash refused the lock shares this workspace) or a
+  failed query there is no plan and no sweep, where an empty set used to mean *delete every
+  folder*. Referenced means **every** asset row with a `workspace_rel`, trashed ones included — a
+  trashed asset is restorable and its extracted bytes may be the only copy. The sweep runs on the
+  writer thread (`Op::ReclaimWorkspace`), reading the set and deleting in one turn, and refuses
+  while a pack is being analysed or extracted: an extraction places its files before it records
+  them, and writes through `<workspace>/.tmp`.
 
 - **Workspace retention (warm reopens)** — extracted payloads **persist across sessions**, so a pack
   opened today is still random-access on disk tomorrow with zero re-extraction. Eviction is

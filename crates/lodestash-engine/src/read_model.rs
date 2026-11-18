@@ -573,6 +573,8 @@ pub struct Library {
     /// The user's S/M/L/XL boundaries (§11.4), read from config — so the size badge on a card and
     /// the size facet in the popover agree with each other.
     tiers: SizeTiers,
+    /// How many times the snapshot has been rebuilt — see [`Library::rebuilds`].
+    rebuilds: u64,
 }
 
 struct Row {
@@ -632,13 +634,20 @@ impl Library {
             rows: Vec::new(),
             paths: HashMap::new(),
             tiers: SizeTiers::default(),
+            rebuilds: 0,
         }
     }
 
-    /// Hand the model its read-only connection and read the library through it.
+    /// Hand the model its read-only connection. Nothing is read until [`Self::reload`].
     pub fn attach(&mut self, reader: CatalogReader) {
         self.catalog = Some(reader);
-        self.reload();
+    }
+
+    /// How many times the snapshot has been rebuilt from the catalog. A rebuild is the whole
+    /// library re-read, so this is what shows one happening when it should not (every read after
+    /// a poisoned lock) or not happening when it should.
+    pub fn rebuilds(&self) -> u64 {
+        self.rebuilds
     }
 
     /// Whether a catalog is behind the model.
@@ -646,24 +655,26 @@ impl Library {
         self.catalog.is_some()
     }
 
-    /// Re-read sources and their assets from the catalog.
-    pub fn reload(&mut self) {
+    /// Re-read sources and their assets from the catalog — **all of it or none of it**.
+    ///
+    /// Every query the snapshot is built from has to succeed. One that failed used to be logged
+    /// and skipped — a source's rows dropped, the previews or favourites of the whole library
+    /// blank — and the caller stamped the result as the current generation, so a partial or
+    /// stale library was served as the truth until the next write (review finding 9). On an
+    /// `Err` the previous snapshot is left exactly as it was, for the caller to **not** serve.
+    pub fn reload(&mut self) -> Result<(), String> {
         // Size tiers feed the S/M/L/XL badges and the ⚑ size facet; they come from config, which
         // Settings edits — re-read here so a change lands without a restart (the grid never holds
         // a second copy to go stale).
         if let Some(config) = &self.config {
             self.tiers = config.read(|c| c.size_tiers.normalized());
         }
-        let Some(cat) = self.catalog.as_ref() else {
-            return;
-        };
-        let infos = match cat.source_infos() {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(%e, "source_infos failed");
-                return;
-            }
-        };
+        let cat = self
+            .catalog
+            .as_ref()
+            .ok_or("no catalog is attached to the read model")?;
+        let failed = |what: &str, e: lodestash_core::error::CoreError| format!("{what}: {e}");
+        let infos = cat.source_infos().map_err(|e| failed("the sources", e))?;
 
         let workspace_dir = self.workspace.clone();
         let mut rows = Vec::new();
@@ -671,13 +682,9 @@ impl Library {
         let mut sources = Vec::new();
         for info in &infos {
             let root = PathBuf::from(&info.root_path);
-            let entries = match cat.entries_for_source(info.id) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(%e, source = %info.name, "entries_for_source failed");
-                    continue;
-                }
-            };
+            let entries = cat
+                .entries_for_source(info.id)
+                .map_err(|e| failed(&format!("the files of {}", info.name), e))?;
             for e in entries {
                 // Trashed rows are **kept**, flagged: the Trash screen is the only way back from
                 // a soft delete, and a row the shell never loaded cannot be restored.
@@ -688,45 +695,37 @@ impl Library {
             // In-pack rows are the bulk of a real library — on this machine 5,963 of 8,237 live
             // assets. Loading only `entries_for_source` showed ~21% of the catalog with nothing
             // saying so, which reads as a small library rather than a missing query.
-            match cat.in_pack_entries_for_source(info.id) {
-                Ok(v) => {
-                    for e in v {
-                        // No local path: `lodestash://file` resolves nothing and answers 503 not_local,
-                        // which is the correct read-only behaviour — extraction is a command.
-                        let ext = Path::new(&e.asset.rel_path)
-                            .extension()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        let mut row = row_from(e.asset, info.id, &info.name, Some(e.package_name));
-                        // Carried per row so a thumbnail pull costs no catalog round-trip.
-                        row.locator = Some(InPackLocator {
-                            pack_path: e.pack_path,
-                            offset: e.tar_offset,
-                            size: e.size,
-                            ext,
-                        });
-                        rows.push(row);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(%e, source = %info.name, "in_pack_entries_for_source failed")
-                }
+            let in_pack = cat
+                .in_pack_entries_for_source(info.id)
+                .map_err(|e| failed(&format!("the in-pack assets of {}", info.name), e))?;
+            for e in in_pack {
+                // No local path: `lodestash://file` resolves nothing and answers 503 not_local,
+                // which is the correct read-only behaviour — extraction is a command.
+                let ext = Path::new(&e.asset.rel_path)
+                    .extension()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let mut row = row_from(e.asset, info.id, &info.name, Some(e.package_name));
+                // Carried per row so a thumbnail pull costs no catalog round-trip.
+                row.locator = Some(InPackLocator {
+                    pack_path: e.pack_path,
+                    offset: e.tar_offset,
+                    size: e.size,
+                    ext,
+                });
+                rows.push(row);
             }
 
             // Extracted-package rows (workspace_rel). Empty on this catalog, but a library that
             // has unpacked anything would otherwise lose those assets the same way.
-            match cat.extracted_entries_for_source(info.id) {
-                Ok(v) => {
-                    for e in v {
-                        if let Some(ws) = workspace_dir.as_ref() {
-                            paths.insert(e.asset.asset_id, ws.join(&e.workspace_rel));
-                        }
-                        rows.push(row_from(e.asset, info.id, &info.name, Some(e.package_name)));
-                    }
+            let extracted = cat
+                .extracted_entries_for_source(info.id)
+                .map_err(|e| failed(&format!("the extracted assets of {}", info.name), e))?;
+            for e in extracted {
+                if let Some(ws) = workspace_dir.as_ref() {
+                    paths.insert(e.asset.asset_id, ws.join(&e.workspace_rel));
                 }
-                Err(e) => {
-                    tracing::warn!(%e, source = %info.name, "extracted_entries_for_source failed")
-                }
+                rows.push(row_from(e.asset, info.id, &info.name, Some(e.package_name)));
             }
             sources.push(SourceSummary {
                 id: info.id,
@@ -743,29 +742,47 @@ impl Library {
 
         rows.sort_by(|a, b| a.search_key.cmp(&b.search_key));
         // Near-duplicate review (DATA-MODEL §5) reads the perceptual hashes once per load.
-        if let Ok(phashes) = cat.perceptual_hashes() {
-            for row in &mut rows {
-                row.perceptual_hash = phashes.get(&row.item.asset_id).copied();
-            }
+        let phashes = cat
+            .perceptual_hashes()
+            .map_err(|e| failed("the perceptual hashes", e))?;
+        for row in &mut rows {
+            row.perceptual_hash = phashes.get(&row.item.asset_id).copied();
         }
-        self.rows = rows;
-        self.paths = paths;
-        self.sources = sources;
-        self.mark_previews();
-        self.mark_favorites();
-        self.mark_traits();
+        // Swapped in for the whole-library passes, and swapped back out if one of them fails: the
+        // snapshot is the old one or the new one, never the new rows half-marked.
+        let previous = (
+            std::mem::replace(&mut self.rows, rows),
+            std::mem::replace(&mut self.paths, paths),
+            std::mem::replace(&mut self.sources, sources),
+        );
+        let marked = self
+            .mark_previews()
+            .and_then(|()| self.mark_favorites())
+            .and_then(|()| self.mark_traits())
+            .and_then(|()| self.mark_imported());
+        if let Err(e) = marked {
+            (self.rows, self.paths, self.sources) = previous;
+            return Err(e);
+        }
         self.mark_tiers();
-        self.mark_imported();
+        self.rebuilds += 1;
+        Ok(())
     }
 
     /// How many assets are queued for tagging — what the budget guard's "N assets ≈ N API calls"
     /// counts (AI-PIPELINE §5.1). The same `tags_dirty` queue the drain walks, so the number the
     /// confirm shows is the number the run would actually bill.
-    pub fn count_needing_tags(&self) -> usize {
-        self.catalog
+    ///
+    /// An `Err` when it cannot be counted, never `0`: a zero here reads as "this run costs
+    /// nothing", and the confirm it feeds exists to ask before spending.
+    pub fn count_needing_tags(&self) -> Result<usize, String> {
+        let cat = self
+            .catalog
             .as_ref()
-            .and_then(|c| c.count_needing_tags().ok())
-            .unwrap_or(0) as usize
+            .ok_or("no catalog is open, so the tagging queue cannot be counted")?;
+        cat.count_needing_tags()
+            .map(|n| n.max(0) as usize)
+            .map_err(|e| format!("the tagging queue could not be counted: {e}"))
     }
 
     /// The recent export runs (FEATURES §7.1). A thin pass-through — the grouping is the catalog's.
@@ -857,17 +874,13 @@ impl Library {
     /// One query for the whole library, like [`Self::mark_traits`]. Switching projects re-runs the
     /// reload, so the badges re-paint — which is correct and visible, and the reason this is not
     /// cached anywhere else.
-    fn mark_imported(&mut self) {
+    fn mark_imported(&mut self) -> Result<(), String> {
         let Some(cat) = self.catalog.as_ref() else {
-            return;
+            return Ok(());
         };
-        let states = match cat.import_states() {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(%e, "import_states failed");
-                return;
-            }
-        };
+        let states = cat
+            .import_states()
+            .map_err(|e| format!("the import states: {e}"))?;
         for r in &mut self.rows {
             // Absent from the map is "never imported" — the common case, and it draws nothing.
             let Some(s) = states.get(&r.item.asset_id) else {
@@ -877,6 +890,7 @@ impl Library {
             r.item.import_stale = s.stale;
             r.item.in_other_projects = s.others;
         }
+        Ok(())
     }
 
     /// Stamp the S/M/L/XL badge onto every card.
@@ -893,17 +907,11 @@ impl Library {
     }
 
     /// Attach tag names to rows, in one query rather than one per row.
-    fn mark_traits(&mut self) {
+    fn mark_traits(&mut self) -> Result<(), String> {
         let Some(cat) = self.catalog.as_ref() else {
-            return;
+            return Ok(());
         };
-        let mut by_asset = match cat.all_asset_tags() {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(%e, "all_asset_tags failed");
-                return;
-            }
-        };
+        let mut by_asset = cat.all_asset_tags().map_err(|e| format!("the tags: {e}"))?;
         for r in &mut self.rows {
             if let Some(t) = by_asset.remove(&r.item.asset_id) {
                 r.traits = distinct_trait_names(t);
@@ -912,6 +920,7 @@ impl Library {
                 r.item.traits = r.traits.clone();
             }
         }
+        Ok(())
     }
 
     /// The chips the ⚑ popover draws, derived from what the library actually holds.
@@ -959,39 +968,33 @@ impl Library {
     }
 
     /// Flag starred rows, in one query rather than one per row.
-    fn mark_favorites(&mut self) {
+    fn mark_favorites(&mut self) -> Result<(), String> {
         let Some(cat) = self.catalog.as_ref() else {
-            return;
+            return Ok(());
         };
-        let ids = match cat.favorite_ids() {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(%e, "favorite_ids failed");
-                return;
-            }
-        };
+        let ids = cat
+            .favorite_ids()
+            .map_err(|e| format!("the favourites: {e}"))?;
         let set: std::collections::HashSet<i64> = ids.into_iter().collect();
         for r in &mut self.rows {
             r.item.favorite = set.contains(&r.item.asset_id);
         }
+        Ok(())
     }
 
     /// Flag which rows have a stored vector preview, in one query instead of one per row.
-    fn mark_previews(&mut self) {
+    fn mark_previews(&mut self) -> Result<(), String> {
         let Some(cat) = self.catalog.as_ref() else {
-            return;
+            return Ok(());
         };
-        let ids = match cat.assets_with_preview() {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(%e, "assets_with_preview failed");
-                return;
-            }
-        };
+        let ids = cat
+            .assets_with_preview()
+            .map_err(|e| format!("the previews: {e}"))?;
         let set: std::collections::HashSet<i64> = ids.into_iter().collect();
         for r in &mut self.rows {
             r.item.has_preview = set.contains(&r.item.asset_id);
         }
+        Ok(())
     }
 
     /// Rows that are actually in the library — everything except the Trash.
@@ -1997,11 +2000,16 @@ impl Library {
 
     /// Every workspace path a live asset still resolves through — what the reclaim sweep must
     /// not touch (`storage::plan_reclaim`).
-    pub fn referenced_workspace_paths(&self) -> std::collections::HashSet<String> {
-        self.catalog
+    ///
+    /// An `Err` when there is no catalog or the query fails, never an empty set: empty means
+    /// "nothing is referenced", which a sweep reads as permission to delete everything.
+    pub fn referenced_workspace_paths(&self) -> Result<std::collections::HashSet<String>, String> {
+        let cat = self
+            .catalog
             .as_ref()
-            .and_then(|c| c.referenced_workspace_paths().ok())
-            .unwrap_or_default()
+            .ok_or("no catalog is open, so what the library still uses is unknown")?;
+        cat.referenced_workspace_paths()
+            .map_err(|e| format!("what the library still uses could not be read: {e}"))
     }
 
     /// Packs holding extracted bytes, each with whether its archive still resolves on disk —
@@ -2476,6 +2484,7 @@ mod tests {
             rows,
             paths: HashMap::new(),
             tiers: SizeTiers::default(),
+            rebuilds: 0,
         }
     }
 

@@ -724,6 +724,36 @@ fn register_project_upserts_activates_and_dup_guards_imports() {
         cross[0],
         ImportOutcome::Recorded { asset_id: 1, .. }
     ));
+
+    // A `dest_path` is joined onto the project root and deleted by batch undo, so one that is not
+    // project-relative is refused whole — the honest spec beside it is not recorded either.
+    for hostile in [
+        "\\Users\\x\\keep.txt",
+        "C:keep.txt",
+        "../keep.txt",
+        "/etc/x",
+    ] {
+        let mut batch = specs(&[2]);
+        batch.push(ImportSpec {
+            asset_id: 1,
+            source_package_id: None,
+            dest_path: hostile.into(),
+            unity_guid: None,
+            with_deps: true,
+        });
+        let err = c
+            .record_imports(p2, &batch, "batch-hostile")
+            .expect_err("a dest_path outside the project was recorded");
+        assert_eq!(
+            err.kind(),
+            crate::error::ErrorKind::Invalid,
+            "{hostile:?}: {err}"
+        );
+    }
+    assert!(
+        c.import_batch_files("batch-hostile").unwrap().is_empty(),
+        "a refused batch left rows behind"
+    );
 }
 
 /// Source availability (UI-SPEC §11.1, M18).
@@ -3027,15 +3057,82 @@ fn a_trashed_row_is_not_repointed() {
     assert!(is_trashed(trashed) && !is_trashed(fresh));
 }
 
-/// The crawl's incremental diff still knows a trashed file's size: the file is on disk and in
-/// the catalog, and forgetting it made every watch rescan look like a change.
+/// The workspace sweep deletes what this set does not name, so the set covers every row that
+/// can still come back — an asset in the Trash is restorable, and its extracted bytes may be the
+/// only copy left (the pack's archive gone). The query used to skip trashed rows while its own
+/// comment said their bytes "are not garbage".
 #[test]
-fn known_sizes_include_trashed_files() {
-    let (c, src) = source_with(&[rec_h("a.png", 7, 70, "H")]);
+fn a_trashed_assets_workspace_file_is_still_referenced() {
+    let with_ws = |rel: &str, ws: &str| CrawlRecord {
+        workspace_rel: Some(ws.to_string()),
+        ..rec(rel, 1, 1)
+    };
+    let (c, src) = source_with(&[
+        with_ws("live.png", "aaa/live.png"),
+        with_ws("binned.png", "bbb/binned.png"),
+        rec("loose.png", 1, 1),
+    ]);
+    c.set_trashed(&[id_at(&c, src, "binned.png")], true)
+        .expect("trash");
+    let referenced = c.referenced_workspace_paths().expect("referenced");
+    assert!(referenced.contains("aaa/live.png"));
+    assert!(
+        referenced.contains("bbb/binned.png"),
+        "the sweep would delete a restorable asset's file: {referenced:?}"
+    );
+    assert_eq!(
+        referenced.len(),
+        2,
+        "a row with no workspace file names none"
+    );
+}
+
+/// What the crawl's incremental diff knows of one source: **every loose file it holds — in the
+/// Trash or not — and nothing else.** The watch rescan compares this map with what it finds on
+/// disk, entry for entry, to decide whether anything changed
+/// (`a_watch_rescan_with_a_file_in_the_trash_is_not_a_change` in the engine pins that half).
+///
+/// The whole map is asserted, so each way of getting it wrong fails here: dropping trashed files
+/// (they are still on disk), counting an in-pack asset (its bytes are in an archive, not the
+/// folder) or reading another source's files. The test this replaces looked one key up in a
+/// one-file source, which no filter that was ever in the query could fail.
+#[test]
+fn known_sizes_are_every_loose_file_of_the_source_trashed_or_not() {
+    let (mut c, src) = source_with(&[rec("a.png", 7, 70), rec("b.png", 8, 80)]);
     c.set_trashed(&[id_at(&c, src, "a.png")], true)
         .expect("trash");
+
+    let pkg = c
+        .upsert_package(src, "C:/lib/p.unitypackage", "p", None, None)
+        .expect("package");
+    let entry = PackageEntryRecord {
+        guid: "0123456789abcdef0123456789abcdef".into(),
+        pathname: Some("Assets/in.png".into()),
+        tar_offset: Some(512),
+        size_bytes: Some(9),
+    };
+    c.record_package_entries(pkg, std::slice::from_ref(&entry))
+        .expect("entries");
+    let class = InPackClass {
+        name: "in".into(),
+        media_type: "image".into(),
+    };
+    let minted = c
+        .mint_in_pack_assets(pkg, &HashMap::from([(entry.guid.clone(), class)]))
+        .expect("mint");
+    assert_eq!(minted.inserted, 1, "the fixture holds an in-pack asset");
+    let other = c
+        .upsert_import_source("Other", "C:/other", "folder")
+        .expect("src");
+    c.record_crawl(other, None, &[rec("c.png", 9, 90)])
+        .expect("crawl");
+
     let known = c.known_sizes_for_source("C:/lib").expect("known");
-    assert_eq!(known.get("a.png"), Some(&(7, 70)));
+    let expected: HashMap<String, (u64, i64)> = HashMap::from([
+        ("a.png".to_string(), (7, 70)),
+        ("b.png".to_string(), (8, 80)),
+    ]);
+    assert_eq!(known, expected);
 }
 
 #[test]

@@ -767,4 +767,16 @@ tracking; these cards track phases).
 - [x] **V2-R1c** API gate and MCP↔REST defaults — the allow-list gate and the search handler ask one function which operation a request is (`operation_for`: the decoded, last `mode`), so an encoded `mode` no longer reaches a tool that is switched off; the gate reads the operation catalog (`agent_tool_names`) instead of a list of its own; a REST import without `with_dependencies` brings the dependency closure, as the MCP tool does; `get_asset_preview`'s description says what it returns; `tests/protocol_catalog.rs` counts a route as reached only when its handler answered *(2026-11-17)*
 
 ## In Review
-*(empty)*
+
+- [ ] **V2-R1** Data-integrity and concurrency review of engine / core / ingest — 13 findings,
+  branch `fix/integrity-review` off `rewrite/v2`, each fix with a test that failed before it
+  *(2026-11-17/18; awaiting merge)*. Destructive paths fail closed (workspace reclaim on the
+  writer as `Op::ReclaimWorkspace`, import undo fenced by `is_plain_relative_path`, export undo,
+  the delete-from-disk root fence); a withdrawn command never runs (`WriteError::StillRunning`
+  for one that is running); undo never restores a retired asset (`Catalog::retire_assets`) and
+  redo re-arms its op; a migration never prunes the backup it just wrote; a read is an error
+  when the engine is not Ready or a rebuild failed (`ReadError`, `engine_status`); nothing a
+  `.unitypackage` declares sizes a read (`for_each_member`, `read_capped`). *Left open, reported:*
+  the workspace folder is shared by every catalog (`LODESTASH_CATALOG`), `lodestash-api`'s export
+  sandbox still runs on `source_roots().unwrap_or_default()`, delete-from-disk trusts the path
+  its caller resolved, and the Trash view can restore a row whose file was deleted from disk.

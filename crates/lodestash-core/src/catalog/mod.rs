@@ -399,6 +399,67 @@ pub const SCHEMA_VERSION: u32 = 32;
 /// How many `<catalog>.v<N>.bak` files a migration leaves beside the catalog.
 const KEEP_BACKUPS: usize = 2;
 
+/// How old a `<catalog>.v<N>.bak.partial…` file must be before a later open sweeps it. A partial
+/// that young may belong to another connection backing up right now.
+const STALE_PARTIAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// The directory holding `path`. `Path::parent` answers `Some("")` — not `None` — for a bare file
+/// name, and `""` cannot be listed, so a catalog named by a bare relative path failed to open.
+fn folder_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
+}
+
+/// Keep `just_written` and the newest other backups of `name` in `dir`, [`KEEP_BACKUPS`] in all,
+/// and sweep partials an interrupted backup left behind.
+///
+/// "Newest" is by modification time, not by schema number: a catalog restored from an older copy
+/// migrates again and writes a backup with a *lower* number than the ones already there, and
+/// ranking by number deleted the file that had just been written. Housekeeping only — nothing
+/// here can fail the open, so every failure is logged and skipped.
+fn prune_backups(dir: &Path, name: &str, just_written: &Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(dir = %dir.display(), %e, "could not list the catalog's backups; none pruned");
+            return;
+        }
+    };
+    let prefix = format!("{name}.v");
+    let mut others: Vec<(std::time::SystemTime, u32, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = file.strip_prefix(&prefix) else {
+            continue;
+        };
+        let path = entry.path();
+        let modified = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if let Some(version) = rest.strip_suffix(".bak").and_then(|v| v.parse().ok()) {
+            if Some(entry.file_name().as_os_str()) != just_written.file_name() {
+                others.push((modified, version, path));
+            }
+        } else if rest.contains(".bak.partial")
+            && modified.elapsed().is_ok_and(|age| age > STALE_PARTIAL)
+        {
+            if let Err(e) = std::fs::remove_file(&path) {
+                tracing::warn!(path = %path.display(), %e, "a stale partial backup could not be removed");
+            }
+        }
+    }
+    // Newest first; two written in the same instant fall back to the higher schema number.
+    others.sort_unstable_by_key(|(modified, version, _)| std::cmp::Reverse((*modified, *version)));
+    for (_, _, old) in others.into_iter().skip(KEEP_BACKUPS.saturating_sub(1)) {
+        if let Err(e) = std::fs::remove_file(&old) {
+            tracing::warn!(path = %old.display(), %e, "an old catalog backup could not be pruned");
+        }
+    }
+}
+
 impl Catalog {
     /// Open the catalog at `path`, creating it when missing, and migrate it to [`SCHEMA_VERSION`]
     /// (DATA-MODEL §13 "Lifecycle"). An existing catalog is copied to `<file>.v<from>.bak` before
@@ -426,13 +487,21 @@ impl Catalog {
     }
 
     /// Copy a catalog at schema `from` to `<file>.v<from>.bak` before a migration changes it, and
-    /// keep only the newest [`KEEP_BACKUPS`]. `None` when there is nothing to keep: a new, empty
-    /// file (`from == 0`) or one already current.
+    /// keep only the newest [`KEEP_BACKUPS`] ([`prune_backups`]). `None` when there is nothing to
+    /// keep: a new, empty file (`from == 0`), one already current, or one another connection has
+    /// already begun migrating (that connection took the backup).
     ///
     /// `VACUUM INTO` reads one consistent snapshot even while another connection writes (WAL), and
     /// it writes a complete database, so a backup is either whole or absent: it goes to a temporary
-    /// name first and is renamed into place.
+    /// name first and is renamed into place. The temporary name is this connection's own — two
+    /// connections opening one old catalog used to share it, and the second `VACUUM INTO` failed
+    /// on the first's file. A snapshot that is no longer at `from` (the other connection got its
+    /// first step in before this one's read) is discarded rather than filed under the old version.
+    ///
+    /// Failing to **take** the backup fails the open: the migration must not run without it.
+    /// Failing to prune older ones does not.
     fn backup_before_migration(&self, path: &Path, from: u32) -> Result<Option<PathBuf>> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if from == 0 || from >= SCHEMA_VERSION {
             return Ok(None);
         }
@@ -441,35 +510,47 @@ impl Catalog {
             .ok_or_else(|| CoreError::Catalog(format!("no file name in {}", path.display())))?
             .to_string_lossy()
             .into_owned();
-        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let dir = folder_of(path);
         let backup = dir.join(format!("{name}.v{from}.bak"));
-        let partial = dir.join(format!("{name}.v{from}.bak.partial"));
-        if partial.exists() {
-            std::fs::remove_file(&partial)?;
-        }
+        let partial = dir.join(format!(
+            "{name}.v{from}.bak.partial-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         info!(from, backup = %backup.display(), "backing up the catalog before migrating it");
-        self.conn
+        let discard = |partial: &Path| {
+            let _ = std::fs::remove_file(partial);
+        };
+        if let Err(e) = self
+            .conn
             .execute("VACUUM INTO ?1", params![partial.to_string_lossy()])
-            .map_err(|e| CoreError::Catalog(format!("backup before migration: {e}")))?;
-        std::fs::rename(&partial, &backup)?;
-
-        let prefix = format!("{name}.v");
-        let mut kept: Vec<(u32, PathBuf)> = std::fs::read_dir(dir)?
-            .filter_map(|e| {
-                let e = e.ok()?;
-                let file = e.file_name().to_string_lossy().into_owned();
-                let v = file
-                    .strip_prefix(&prefix)?
-                    .strip_suffix(".bak")?
-                    .parse()
-                    .ok()?;
-                Some((v, e.path()))
-            })
-            .collect();
-        kept.sort_unstable_by_key(|(v, _)| std::cmp::Reverse(*v));
-        for (_, old) in kept.into_iter().skip(KEEP_BACKUPS) {
-            std::fs::remove_file(&old)?;
+        {
+            discard(&partial);
+            return Err(CoreError::Catalog(format!("backup before migration: {e}")));
         }
+        let snapshot_version: Result<u32> =
+            Connection::open_with_flags(&partial, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .and_then(|c| c.pragma_query_value(None, "user_version", |r| r.get(0)))
+                .map_err(|e| CoreError::Catalog(format!("backup before migration: verify: {e}")));
+        match snapshot_version {
+            Ok(v) if v == from => {}
+            Ok(_) => {
+                discard(&partial);
+                return Ok(None);
+            }
+            Err(e) => {
+                discard(&partial);
+                return Err(e);
+            }
+        }
+        if let Err(e) = std::fs::rename(&partial, &backup) {
+            discard(&partial);
+            // A connection racing this one filed the same snapshot a moment ago: that one stands.
+            if !backup.is_file() {
+                return Err(e.into());
+            }
+        }
+        prune_backups(dir, &name, &backup);
         Ok(Some(backup))
     }
 
@@ -2306,7 +2387,7 @@ CREATE INDEX IF NOT EXISTS idx_oplog_created ON op_log(created_at);
 
 const MIGRATION_17_OP_LOG_REDO: &str = "
 ALTER TABLE op_log ADD COLUMN forward_json TEXT;  -- the redo payload; NULL = payload_json IS the forward too
-ALTER TABLE op_log ADD COLUMN undone_at INTEGER;  -- set on undo; redo applies the forward then deletes the row
+ALTER TABLE op_log ADD COLUMN undone_at INTEGER;  -- set on undo; redo applies the forward and clears it again
 CREATE INDEX IF NOT EXISTS idx_oplog_undone ON op_log(undone_at);
 ";
 
@@ -4333,12 +4414,26 @@ impl Catalog {
     /// NOTHING`: a second import of the same asset into the same project is reported
     /// [`ImportOutcome::AlreadyImported`], never a duplicate row. All rows in one call share
     /// `batch_id` so the run can be listed and undone (§9 batches).
+    ///
+    /// Every `dest_path` must be a plain project-relative path
+    /// ([`crate::types::is_plain_relative_path`]): batch undo joins it onto the project root and
+    /// **deletes** what it finds there, so a rooted, drive-relative or `..` path is refused here —
+    /// the whole call, before anything is written — rather than stored for undo to trip over.
     pub fn record_imports(
         &self,
         project_id: i64,
         specs: &[ImportSpec],
         batch_id: &str,
     ) -> Result<Vec<ImportOutcome>> {
+        if let Some(bad) = specs
+            .iter()
+            .find(|s| !crate::types::is_plain_relative_path(&s.dest_path))
+        {
+            return Err(CoreError::Invalid(format!(
+                "dest_path {:?} for asset {} is not a path inside the project",
+                bad.dest_path, bad.asset_id
+            )));
+        }
         let now = unix_now();
         let mut out = Vec::with_capacity(specs.len());
         for s in specs {
@@ -5519,20 +5614,20 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("set_package_keep_cached: {e}")))
     }
 
-    /// Every `workspace_rel` a **live** asset still resolves through — the set the workspace
-    /// sweep must not touch.
+    /// Every `workspace_rel` an asset row resolves through — the set the workspace sweep must
+    /// not touch.
     ///
-    /// Live means not soft-deleted: a trashed asset is recoverable (DATA-MODEL §8), so its bytes
-    /// are not garbage. Returned as the stored relative paths; the caller resolves them against
-    /// its workspace dir.
+    /// **Trashed rows count.** A trashed asset is recoverable (DATA-MODEL §8), so its bytes are
+    /// not garbage — and when the pack's archive has gone they are the only copy. (The query
+    /// used to carry `deleted_at IS NULL`, which made the sweep delete exactly those.) Returned
+    /// as the stored relative paths; the caller resolves them against its workspace dir.
     pub fn referenced_workspace_paths(&self) -> Result<std::collections::HashSet<String>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT DISTINCT af.workspace_rel
                    FROM asset_file af
-                   JOIN asset a ON a.id = af.asset_id
-                  WHERE af.workspace_rel IS NOT NULL AND a.deleted_at IS NULL",
+                  WHERE af.workspace_rel IS NOT NULL",
             )
             .map_err(|e| CoreError::Catalog(format!("workspace refs prep: {e}")))?;
         let rows = stmt

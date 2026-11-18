@@ -88,6 +88,19 @@ to top-level `web/`: it is a client of `/v1`, not a Tauri frontend.
   `catch_unwind`; a panic fails that command with `internal` and the thread keeps serving.
   Commands are grouped by area (`writer/{assets,tags,vocab,collections,sources,packages,identify,
   projects,history}.rs`), not one match.
+  - *A caller that stops waiting is told the truth, and it stays true.* Each command carries a
+    claim both sides race for: the writer **starts** it before running it, a caller whose wait ran
+    out **withdraws** it. Withdrawn (it was still queued, or the inbox was full) answers `busy` —
+    *not run, nothing written, try again* — and the writer skips it when it reaches it. Already
+    started answers `busy` as *still running* — it will finish and commit on its own, so it must
+    not be resent. Both are the `busy` kind (§4.4) and the message, which the code leads, says
+    which. "Busy, try again" used to be said of a queued Delete from disk that then ran.
+  - *Supervision cleans up after itself.* A tray job is opened through a guard that ends it as
+    failed if the code that opened it unwinds; a pack worker reports back from `Drop` if it dies,
+    so the one-at-a-time extract queue moves; an off-writer slice lowers its lane's in-flight flag
+    however it ends.
+  - *The generation moves whenever rows moved* — also when the command then failed or panicked
+    (ADR-0016, amended): the mark means "the catalog changed", never "the command succeeded".
 - **Readers:** a small pool of `CatalogReader`s (`SQLITE_OPEN_READ_ONLY`). `CatalogReader` exposes
   only read methods; writing through it does not compile.
 - **Work lanes off the writer:** crawl/hash/rescan, extraction, embedding, tagging (local and
@@ -109,11 +122,19 @@ to top-level `web/`: it is a client of `/v1`, not a Tauri frontend.
   cannot write it (§4.5, ADR-0024).
 - **Migration:** `BEGIN IMMEDIATE`, re-read `user_version` inside the transaction, then migrate.
   Before the first migration step on an existing file, copy it to
-  `<catalog>.v<from>.bak` (kept: the last two). A schema newer than this build is refused for
-  writing with `schema_too_new` (the reader already refuses).
+  `<catalog>.v<from>.bak` (kept: the last two written — the new one is never the one pruned, and
+  a failed prune never fails the open; `DATA-MODEL.md` §13). A schema newer than this build is
+  refused for writing with `schema_too_new` (the reader already refuses).
 - **Engine status** is a value the UI and agents can read (`GET /v1/status`):
   `starting | migrating{from,to} | ready | failed{code,message}`. Every failure here renders as a
   blocking screen in the UI with the message and what to do — never an empty library.
+- *As built (2026-11-17):* until `GET /v1/status` exists the old shell reads `Engine::report()`
+  through one Tauri command, `engine_status` (it also records the dismissal of
+  `config_recovered`), and `App.svelte` draws a blocking notice with the code and message while
+  the state is not `ready`, and a dismissible line for a recovered config. **A read from an engine
+  that is not `ready` is an error** (`Engine::read` → `ReadError::NotReady(status)`), not an empty
+  library — so every shell read, and the `lodestash://` byte routes (`503`), say why instead of
+  drawing nothing.
 
 ### 4.3 Read model
 
@@ -123,6 +144,16 @@ generation it was built at with the current one and rebuilds lazily if they diff
 background writes therefore become visible to the UI without a "Refresh" banner (fixes R2's
 backend half). Every read response carries the generation it reflects
 (`X-Lodestash-Gen` header).
+
+**A rebuild is all or nothing, and a failed one is never served.** The snapshot is built from a
+dozen queries; `Library::reload` returns an error if any of them fails and leaves the previous
+snapshot untouched, and `Engine::read` then answers `ReadError::Rebuild` **without stamping** the
+generation — so the next read tries again, where a failed query used to be logged, skipped and the
+half-built result served as current. A panic while the read lock is held costs one rebuild: the
+poison is cleared, where it used to make every later read rebuild the whole library and
+`Engine::reload` a no-op. Counts read through the model's reader for a decision (the tagging queue
+behind the cloud cost estimate, the workspace paths the reclaim must keep) are `Result`s for the
+same reason: a failed count is not zero.
 
 A SQL-backed paged/faceted listing replaces the snapshot later (§13); the snapshot's tests are
 its contract.
