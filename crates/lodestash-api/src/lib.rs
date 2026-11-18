@@ -1486,17 +1486,16 @@ impl ServerState {
     /// Queue an export (ENGINE-API §2 `export_asset`). Validates the destination against the
     /// sandbox *now* — a bad path is an error, not a job that fails later — then parks the job
     /// on the approval gate. Nothing is copied until [`Self::approve_job`].
+    ///
+    /// The sandbox is a fence only while the source roots are known: a roots query that fails
+    /// refuses the export ([`export::SandboxError::RootsUnknown`]). It used to read as no roots,
+    /// which admits every folder — the library's own included.
     pub fn request_export(
         &self,
         req: export::ExportRequest,
     ) -> Result<std::sync::Arc<jobs::Job>, export::SandboxError> {
-        let roots = self
-            .catalog
-            .lock()
-            .unwrap()
-            .source_roots()
-            .unwrap_or_default();
-        let dest = export::check_dest(&req.dest_path, &roots)?;
+        let roots = self.catalog.lock().unwrap().source_roots();
+        let dest = export::check_dest_against(&req.dest_path, roots)?;
         let summary = format!(
             "Export {} asset(s) to {}",
             req.asset_ids.len(),
@@ -1672,20 +1671,16 @@ impl ServerState {
     /// would train them to dismiss the prompt that does matter.
     ///
     /// The **sandbox still applies in full**: absolute, no `..`, and never inside a library source
-    /// root. That rule protects the non-destructive invariant, not the agent boundary, so it holds
-    /// for every caller.
+    /// root — refused, like [`Self::request_export`], when the roots cannot be read. That rule
+    /// protects the non-destructive invariant, not the agent boundary, so it holds for every
+    /// caller.
     ///
     /// Synchronous on purpose. The caller reports what happened, and it cannot do that honestly
     /// from a thread it never waited for.
     pub fn export_now(&self, req: export::ExportRequest) -> Result<export::ExportReport, String> {
-        let roots = self
-            .catalog
-            .lock()
-            .unwrap()
-            .source_roots()
-            .unwrap_or_default();
-        let dest =
-            export::check_dest(&req.dest_path, &roots).map_err(|e| e.message().to_string())?;
+        let roots = self.catalog.lock().unwrap().source_roots();
+        let dest = export::check_dest_against(&req.dest_path, roots)
+            .map_err(|e| e.message().to_string())?;
         let summary = format!(
             "Export {} asset(s) to {}",
             req.asset_ids.len(),

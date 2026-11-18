@@ -870,6 +870,118 @@ fn undo_never_restores_a_deleted_or_removed_asset() {
     );
 }
 
+/// One scan of `<root>/lib` as the crawl would report it: `(rel_path, content hash)` per file.
+fn scan(engine: &Engine, root: &Path, files: &[(&str, &str)]) {
+    let records = files
+        .iter()
+        .map(|(rel, hash)| CrawlRecord {
+            rel_path: (*rel).into(),
+            name: (*rel).into(),
+            media_type: "image".into(),
+            size_bytes: 1,
+            mtime: 1,
+            workspace_rel: None,
+            content_hash: Some((*hash).into()),
+        })
+        .collect();
+    engine
+        .writer()
+        .run(Op::PersistScan {
+            batches: vec![PersistBatch {
+                root: root.join("lib").to_string_lossy().into_owned(),
+                name: "lib".into(),
+                excludes_json: None,
+                records,
+            }],
+            packs: Vec::new(),
+        })
+        .expect("scan");
+}
+
+/// R.4: Delete from disk deleted the path its caller resolved — from a read-model snapshot, some
+/// time before the writer reached the command. A rescan in between can move the asset's row
+/// (DATA-MODEL §6), and then that path names whatever sits there now: the writer deleted a file
+/// the user was never shown and retired an asset whose own file was still on disk. The writer
+/// resolves the asset's path again and refuses the whole command, as a conflict that says what
+/// moved, when it is not the one confirmed.
+#[test]
+fn delete_from_disk_refuses_an_asset_that_moved_since_it_was_confirmed() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (engine, cfg) = started(dir.path());
+    let lib = dir.path().join("lib");
+    let (old, new) = (lib.join("rock.png"), lib.join("stones").join("rock.png"));
+    touch(&old);
+    touch(&lib.join("tree.png"));
+    scan(
+        &engine,
+        dir.path(),
+        &[("rock.png", "H1"), ("tree.png", "H2")],
+    );
+    let read = engine.read().expect("read");
+    let item = |name: &str| {
+        let page = read.page(&crate::read_model::GridQuery {
+            page_size: 1000,
+            ..Default::default()
+        });
+        let found = page.items.into_iter().find(|i| i.rel_path == name);
+        found.expect("indexed").asset_id
+    };
+    let (rock, tree) = (item("rock.png"), item("tree.png"));
+    // What the confirmation named, and so what the command carries.
+    let confirmed = read.write_targets(&[rock, tree]);
+    let roots = read.roots();
+    drop(read);
+    assert_eq!(confirmed[0].abs_path.as_deref(), Some(old.as_path()));
+
+    // Before the writer gets to it: the file is moved, a rescan follows it, and a file the user
+    // has never been shown lands on the old path.
+    std::fs::create_dir_all(new.parent().expect("parent")).expect("mkdir");
+    std::fs::rename(&old, &new).expect("move");
+    scan(
+        &engine,
+        dir.path(),
+        &[("stones/rock.png", "H1"), ("tree.png", "H2")],
+    );
+    std::fs::write(&old, b"someone else's file").expect("write");
+
+    let delete = |targets| {
+        engine.writer().run(Op::DeleteFromDisk {
+            targets,
+            roots: roots.clone(),
+            workspace: Some(cfg.workspace_dir.clone()),
+        })
+    };
+    let refused = match delete(confirmed) {
+        Err(WriteError::Conflict(why)) => why,
+        other => panic!("a delete of a path the asset had left went ahead: {other:?}"),
+    };
+    assert!(
+        refused.contains("rock.png") && refused.contains("stones"),
+        "the refusal does not say what moved: {refused}"
+    );
+    assert_eq!(
+        std::fs::read(&old).expect("still there"),
+        b"someone else's file",
+        "a file that was never confirmed was deleted"
+    );
+    assert!(new.exists(), "the asset's own file was deleted");
+    assert!(
+        lib.join("tree.png").exists(),
+        "a refused delete still deleted part of the selection"
+    );
+    let lib_root = lib.to_string_lossy().into_owned();
+    assert!(
+        !trashed_on_disk(&cfg, &lib_root, rock) && !trashed_on_disk(&cfg, &lib_root, tree),
+        "a refused delete retired its assets"
+    );
+
+    // Asked again against what the catalog says now, it deletes the asset's own file.
+    let again = engine.read().expect("read").write_targets(&[rock]);
+    let out = delete(again).expect("delete");
+    assert_eq!((out.changed, out.refused, out.failed), (1, 0, 0));
+    assert!(!new.exists() && old.exists());
+}
+
 /// Review finding 8: an engine that is not Ready answered every read with an empty library, so a
 /// failed start looked exactly like a library with nothing in it. A read now says why, and the
 /// report the shell shows carries the same code and message.
@@ -1053,4 +1165,161 @@ fn a_subscriber_hears_a_committed_write() {
             Err(e) => panic!("the feed failed: {e}"),
         }
     }
+}
+
+/// R.4: `config_unreadable` was in the engine report and on no screen. While it is set the engine
+/// runs with every agent tool off, nothing identified or rescanned in the background, and no
+/// setting saved (ADR-0024) — a state the user could only infer. The report says it under the
+/// key the old shell reads, and the shell draws it where it draws `config_recovered`.
+///
+/// The second half reads the shell's source, there being no harness that renders it short of the
+/// e2e run; it goes with that shell in P5.
+#[test]
+fn an_unreadable_config_is_in_the_report_and_on_the_old_shells_screen() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let cfg = EngineConfig::under(dir.path());
+    // A `config.json` that is there and cannot be read: a directory, on every platform.
+    std::fs::create_dir_all(cfg.config_path()).expect("mkdir");
+    let engine = Engine::start(cfg);
+    assert_eq!(engine.wait_settled(SETTLE), EngineStatus::Ready);
+
+    let report = serde_json::to_value(engine.report()).expect("report");
+    assert_eq!(report["state"], "ready", "{report}");
+    assert!(
+        report["config_unreadable"]
+            .as_str()
+            .is_some_and(|why| !why.is_empty()),
+        "the report does not say the config could not be loaded: {report}"
+    );
+    assert!(report["config_recovered"].is_null(), "{report}");
+
+    let ui = Path::new(env!("CARGO_MANIFEST_DIR")).join("../lodestash-desktop/ui/src");
+    let shell = std::fs::read_to_string(ui.join("App.svelte")).expect("App.svelte");
+    assert!(
+        shell.contains("engine?.config_unreadable")
+            && shell.contains("{engine.config_unreadable}")
+            && shell.contains(r#"data-testid="config-unreadable""#),
+        "the old shell does not show `config_unreadable`"
+    );
+    let api = std::fs::read_to_string(ui.join("lib/api.ts")).expect("api.ts");
+    assert!(
+        api.contains("config_unreadable: string | null"),
+        "`EngineReport` in api.ts does not carry `config_unreadable`"
+    );
+}
+
+/// The app's directories as the OS would give them, stood up under `root`: one default catalog,
+/// one config dir, one preview cache and the default catalog's workspace. The config is seeded
+/// quiet, as [`quiet`] does.
+fn app_dirs(root: &Path) -> crate::paths::AppDirs {
+    let dirs = crate::paths::AppDirs {
+        default_catalog: root.join("data").join("Lodestash").join("catalog.db"),
+        config_dir: root.join("config").join("Lodestash"),
+        cache_dir: root.join("cache").join("Lodestash").join("thumbs"),
+        workspace_dir: root.join("cache").join("Lodestash").join("workspace"),
+    };
+    crate::ConfigStore::open(dirs.config_dir.join("config.json"), false)
+        .update(|c| {
+            c.auto_identify = false;
+            c.watch_sources = false;
+        })
+        .expect("seed the config");
+    dirs
+}
+
+/// An engine on `catalog`, laid out as the app lays it out — but never near the OS keychain.
+fn started_for(catalog: &Path, dirs: &crate::paths::AppDirs) -> (Engine, EngineConfig) {
+    let mut cfg = EngineConfig::for_catalog(catalog.to_path_buf(), dirs);
+    cfg.os_keychain = false;
+    let engine = Engine::start(cfg.clone());
+    assert_eq!(engine.wait_settled(SETTLE), EngineStatus::Ready);
+    (engine, cfg)
+}
+
+/// R.4: every catalog was given `<cache>/Lodestash/workspace`. A second catalog
+/// (`LODESTASH_CATALOG`) is a Ready engine with its own lock, so nothing stopped it — and its
+/// catalog references none of the first's extracted files, so its Reclaim planned and deleted
+/// every one of them. A catalog that is not the default one now extracts beside itself; the
+/// default keeps the folder it has always used, so nothing already extracted moves.
+#[test]
+fn a_second_catalog_never_reclaims_the_first_catalogs_workspace() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let dirs = app_dirs(dir.path());
+    let (first, first_cfg) = started_for(&dirs.default_catalog, &dirs);
+    assert_eq!(
+        first_cfg.workspace_dir, dirs.workspace_dir,
+        "the default catalog's workspace moved"
+    );
+    seed_workspace(&first, &first_cfg, dir.path());
+    let (kept, loose) = (
+        first_cfg.workspace_dir.join("aaa").join("Rock.png"),
+        first_cfg.workspace_dir.join("bbb").join("Old.png"),
+    );
+
+    // A second catalog that has extracted nothing yet: everything it can see is unreferenced.
+    let second_catalog = dir.path().join("elsewhere").join("second.db");
+    let (second, second_cfg) = started_for(&second_catalog, &dirs);
+    let plan = crate::storage::workspace_reclaim_plan(&second).expect("dry run");
+    assert!(
+        plan.entries.is_empty(),
+        "the second catalog planned to reclaim the first's files: {:?}",
+        plan.entries
+    );
+    crate::storage::reclaim_workspace(&second).expect("reclaim");
+    assert!(
+        kept.exists() && loose.exists(),
+        "a second catalog's reclaim deleted the first catalog's extracted files"
+    );
+    assert_eq!(
+        second_cfg.workspace_dir.parent(),
+        second_catalog.parent(),
+        "a second catalog's workspace sits beside it"
+    );
+
+    // Once it has extracted something of its own, it reclaims that and only that…
+    seed_workspace(&second, &second_cfg, &dir.path().join("elsewhere"));
+    let (second_kept, second_loose) = (
+        second_cfg.workspace_dir.join("aaa").join("Rock.png"),
+        second_cfg.workspace_dir.join("bbb").join("Old.png"),
+    );
+    let out = crate::storage::reclaim_workspace(&second).expect("reclaim");
+    assert_eq!(out.removed, 1, "its own unreferenced folder went");
+    assert!(second_kept.exists() && !second_loose.exists());
+    assert!(kept.exists() && loose.exists());
+
+    // …and the first still reclaims exactly its own.
+    let out = crate::storage::reclaim_workspace(&first).expect("reclaim");
+    assert_eq!(out.removed, 1);
+    assert!(kept.exists() && !loose.exists() && second_kept.exists());
+}
+
+/// Which catalog is "the default one" is a question about the file, not about how its path was
+/// typed: `LODESTASH_CATALOG` set to the default catalog must not strand what it has extracted.
+#[test]
+fn the_default_catalog_keeps_its_workspace_however_its_path_is_spelled() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let dirs = app_dirs(dir.path());
+    let workspace = |catalog: &Path| crate::paths::workspace_for(catalog, &dirs);
+
+    assert_eq!(workspace(&dirs.default_catalog), dirs.workspace_dir);
+    let folder = dirs.default_catalog.parent().expect("parent");
+    let respelled = folder.join(".").join("catalog.db");
+    assert_eq!(workspace(&respelled), dirs.workspace_dir, "not yet created");
+    std::fs::create_dir_all(folder).expect("mkdir");
+    std::fs::write(&dirs.default_catalog, b"").expect("create");
+    assert_eq!(workspace(&respelled), dirs.workspace_dir, "on disk");
+    if cfg!(windows) {
+        let shouted = std::path::PathBuf::from(folder.to_string_lossy().to_uppercase());
+        assert_eq!(
+            workspace(&shouted.join("CATALOG.DB")),
+            dirs.workspace_dir,
+            "another case"
+        );
+    }
+
+    assert_eq!(
+        workspace(&folder.join("other.db")),
+        folder.join("other.db.workspace"),
+        "a different file in the same folder is a different catalog"
+    );
 }

@@ -40,14 +40,21 @@ impl EngineConfig {
     /// The app's own locations: `LODESTASH_CATALOG` or the data dir's catalog, the OS config dir,
     /// the OS cache dir. `None` when the OS has no such directories.
     pub fn os_default() -> Option<Self> {
-        let (cache, workspace) = crate::paths::default_cache_dirs();
-        Some(Self {
-            catalog: crate::paths::catalog_db_path()?,
-            config_dir: crate::config::config_file_path()?.parent()?.to_path_buf(),
-            cache_dir: cache?,
-            workspace_dir: workspace?,
+        let dirs = crate::paths::AppDirs::os()?;
+        Some(Self::for_catalog(crate::paths::catalog_db_path()?, &dirs))
+    }
+
+    /// `catalog` laid out against the app's directories: the shared config and preview cache,
+    /// and a workspace that is **this catalog's alone** ([`crate::paths::workspace_for`]) — the
+    /// default catalog's is where it has always been, any other catalog's sits beside it.
+    pub fn for_catalog(catalog: PathBuf, dirs: &crate::paths::AppDirs) -> Self {
+        Self {
+            workspace_dir: crate::paths::workspace_for(&catalog, dirs),
+            catalog,
+            config_dir: dirs.config_dir.clone(),
+            cache_dir: dirs.cache_dir.clone(),
             os_keychain: true,
-        })
+        }
     }
 
     /// Everything under one directory, the credential store untouched — a test, or a library kept

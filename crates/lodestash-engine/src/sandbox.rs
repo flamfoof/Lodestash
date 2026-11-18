@@ -16,6 +16,9 @@ pub enum SandboxError {
     /// Inside a library source root — exporting there would write into the user's own asset
     /// folders, which the non-destructive invariant forbids.
     InsideLibrary,
+    /// The source roots could not be read, so "inside a library source root" cannot be answered.
+    /// Refused: [`check_dest`] with no roots admits every folder, the library's own included.
+    RootsUnknown,
 }
 
 impl SandboxError {
@@ -23,6 +26,7 @@ impl SandboxError {
         match self {
             SandboxError::Traversal => "path_traversal",
             SandboxError::InsideLibrary => "forbidden_destination",
+            SandboxError::RootsUnknown => lodestash_protocol::codes::UNAVAILABLE,
         }
     }
 
@@ -32,8 +36,25 @@ impl SandboxError {
             SandboxError::InsideLibrary => {
                 "dest_path is inside a library source root; exports must go elsewhere."
             }
+            SandboxError::RootsUnknown => {
+                "the library's source roots could not be read, so the destination cannot be \
+                 checked against them; nothing was exported."
+            }
         }
     }
+}
+
+/// [`check_dest`] against roots that may not have been readable — what a caller holding a
+/// `Result` from the catalog uses, so an unreadable root list can never become an empty one.
+pub fn check_dest_against<E: std::fmt::Display>(
+    dest: &str,
+    source_roots: Result<Vec<String>, E>,
+) -> Result<PathBuf, SandboxError> {
+    let roots = source_roots.map_err(|e| {
+        tracing::warn!(%e, "export sandbox: the source roots could not be read; refusing");
+        SandboxError::RootsUnknown
+    })?;
+    check_dest(dest, &roots)
 }
 
 /// Validate a destination *before* any job exists. Lexical only — the path need not exist yet,

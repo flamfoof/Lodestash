@@ -935,9 +935,14 @@ export const filterFacets = () => invoke<Facets>("filter_facets");
 /**
  * What the engine is doing (v2 spec §4.2). The one read that answers in every state: until it is
  * `ready` every other read rejects, and this says why. `failed` carries the stable code and what
- * to do about it; `config_recovered` is where a `config.json` that did not parse was moved.
+ * to do about it; `config_recovered` is where a `config.json` that did not parse was moved;
+ * `config_unreadable` is why a `config.json` that is there could not be loaded — set for as long
+ * as that lasts, while the engine runs with nothing switched on and saves no settings (ADR-0024).
  */
-export type EngineReport = { config_recovered: string | null } & (
+export type EngineReport = {
+  config_recovered: string | null;
+  config_unreadable: string | null;
+} & (
   | { state: "starting" | "ready" }
   | { state: "migrating"; from: number; to: number }
   | { state: "failed"; code: string; message: string }

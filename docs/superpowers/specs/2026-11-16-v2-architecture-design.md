@@ -131,7 +131,8 @@ to top-level `web/`: it is a client of `/v1`, not a Tauri frontend.
 - *As built (2026-11-17):* until `GET /v1/status` exists the old shell reads `Engine::report()`
   through one Tauri command, `engine_status` (it also records the dismissal of
   `config_recovered`), and `App.svelte` draws a blocking notice with the code and message while
-  the state is not `ready`, and a dismissible line for a recovered config. **A read from an engine
+  the state is not `ready`, a dismissible line for a recovered config, and a standing line for as
+  long as the config is unreadable (`config_unreadable`, §4.5). **A read from an engine
   that is not `ready` is an error** (`Engine::read` → `ReadError::NotReady(status)`), not an empty
   library — so every shell read, and the `lodestash://` byte routes (`503`), say why instead of
   drawing nothing.
@@ -167,6 +168,12 @@ unavailable, busy, too_large, internal}`. Core grows typed kinds (`CoreError::Co
 parses strings.
 HTTP mapping: 404/422/409/403/503/429/413/500, body `{error:{code,message,detail}}`
 (`ENGINE-API.md` §4).
+
+*As built (2026-11-18, plan Task R.4):* the v1 routes map a catalog error by its kind
+(`routes::db_err`: 404/422/409/503 with core's sentence as the message; an internal fault is 500
+with its text logged, not sent). The writer has its first typed refusal: `WriteError::Conflict`
+(code `conflict`), answered by Delete from disk when an asset moved after the delete was
+confirmed (`DATA-MODEL.md` §9). Every other command still refuses as `WriteError::Failed`.
 
 ### 4.5 Config
 

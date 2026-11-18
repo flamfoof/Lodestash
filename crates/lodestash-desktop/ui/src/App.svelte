@@ -838,6 +838,15 @@ import JobTray from "./lib/JobTray.svelte";
         {/if}
       </div>
     </div>
+  {:else if engine?.config_unreadable}
+    <!-- Not dismissible: it is a state, not an event. It goes when the file loads. -->
+    <p class="engine-recovered" role="status" data-testid="config-unreadable">
+      <span>
+        Your settings file could not be loaded (<code>{engine.config_unreadable}</code>). It has
+        been left as it is: until it can be read, agent tools and background work are off and
+        settings are not saved.
+      </span>
+    </p>
   {:else if engine?.config_recovered}
     <p class="engine-recovered" role="status" data-testid="config-recovered">
       <span>

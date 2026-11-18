@@ -63,6 +63,17 @@ const MATERIALIZE_SQL: &str = "UPDATE asset_file SET workspace_rel = ?3
      WHERE package_entry_id = (SELECT id FROM package_entry
          WHERE package_id = ?1 AND pathname = ?2)";
 
+/// Where the catalog records an asset's own file ([`Catalog::file_location`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileLocation {
+    /// A loose file of its source: `<root_path>/<rel_path>`.
+    Source { root_path: String, rel_path: String },
+    /// Extracted from a pack: `<workspace>/<workspace_rel>`.
+    Workspace { workspace_rel: String },
+    /// Inside a `.unitypackage` and nowhere else — the asset has no file of its own.
+    InPack,
+}
+
 /// What `record_crawl` did with a batch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CrawlStats {
@@ -6192,6 +6203,40 @@ impl Catalog {
             )
             .optional()
             .map_err(|e| CoreError::Catalog(format!("embedding_of: {e}")))
+    }
+
+    /// Where an asset's own file is recorded to be **now** — trashed or not, missing or not.
+    /// `None` when there is no such asset.
+    ///
+    /// For the one caller that must not act on an older answer: Delete from disk resolves this on
+    /// the writer, in the turn that deletes, and compares it with the path its caller confirmed
+    /// (DATA-MODEL §9). The three cases are the ones the read model's path map draws
+    /// (`read_model::Library::reload`), so the two agree whenever nothing has moved.
+    pub fn file_location(&self, asset_id: i64) -> Result<Option<FileLocation>> {
+        self.conn
+            .query_row(
+                "SELECT s.root_path, af.rel_path, af.workspace_rel, a.package_id IS NOT NULL
+                   FROM asset a
+                   JOIN import_source s ON s.id = a.source_id
+                   JOIN asset_file af   ON af.id = a.primary_file_id
+                  WHERE a.id = ?1",
+                params![asset_id],
+                |r| {
+                    let (root_path, rel_path): (String, String) = (r.get(0)?, r.get(1)?);
+                    let workspace_rel: Option<String> = r.get(2)?;
+                    let packaged: bool = r.get(3)?;
+                    Ok(match (packaged, workspace_rel) {
+                        (false, _) => FileLocation::Source {
+                            root_path,
+                            rel_path,
+                        },
+                        (true, Some(workspace_rel)) => FileLocation::Workspace { workspace_rel },
+                        (true, None) => FileLocation::InPack,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| CoreError::Catalog(format!("file location: {e}")))
     }
 
     /// Every registered source root. The export sandbox refuses to write inside one — the

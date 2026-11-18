@@ -233,6 +233,17 @@ to a single entry; reaching any entry means decompressing from the start. Lodest
   while a pack is being analysed or extracted: an extraction places its files before it records
   them, and writes through `<workspace>/.tmp`.
 
+  **One workspace per catalog (2026-11-18).** The sweep keeps what *one* catalog references, so a
+  workspace may belong to one catalog only. Every catalog used to be given
+  `<cache>/Lodestash/workspace`: a second catalog (`LODESTASH_CATALOG` — a second library, a test
+  fixture) is a Ready engine holding its own lock, references none of the first's files, and its
+  Reclaim deleted them all. The default catalog (`<data>/Lodestash/catalog.db`) keeps that folder,
+  so nothing already extracted moves; any other catalog extracts into `<catalog file>.workspace`
+  beside itself (`paths::workspace_for`, `EngineConfig::for_catalog`). Nothing is migrated: a
+  non-default catalog that extracted into the shared folder before this resolves those rows from
+  its archive again (or re-extracts), and the bytes it left behind are the default catalog's to
+  reclaim. The preview cache stays shared — everything in it regenerates.
+
 - **Workspace retention (warm reopens)** — extracted payloads **persist across sessions**, so a pack
   opened today is still random-access on disk tomorrow with zero re-extraction. Eviction is
   **size-cap first, then age**: within the cap nothing is evicted; under cap pressure, LRU order —

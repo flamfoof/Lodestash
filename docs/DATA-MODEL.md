@@ -640,6 +640,16 @@ root or workspace admits nothing, and a path with a `..` component is under no r
 catalog row is marked trashed **only after** the file actually left the disk, so a failed delete
 cannot leave the catalog claiming otherwise.
 
+**The delete acts on the file that was confirmed, or on nothing.** The confirmation names paths
+the shell resolved from the read model — a snapshot, taken some time before the writer reaches
+the command — and a rescan in between can move an asset's row (§6). So the writer resolves each
+asset's path again in the turn that deletes (`Catalog::file_location`) and, if any differs from
+the one confirmed, refuses the **whole** command as a `conflict` (`WriteError::Conflict`) that
+says which file is no longer its asset's and where the asset is now. Nothing is deleted, not
+even the targets that still match: the selection the user agreed to is no longer the one on
+disk. It used to delete whatever sat at the confirmed path and retire the asset whose own file
+was still there.
+
 **Delete from disk and Remove from library are not undoable, and undo is never a way around them.**
 Both record through `Catalog::retire_assets`: the rows are trashed and, in the same transaction,
 those asset ids are removed from every `set_trashed` row in `op_log` — live or on the redo stack —
