@@ -88,6 +88,19 @@ to top-level `web/`: it is a client of `/v1`, not a Tauri frontend.
   `catch_unwind`; a panic fails that command with `internal` and the thread keeps serving.
   Commands are grouped by area (`writer/{assets,tags,vocab,collections,sources,packages,identify,
   projects,history}.rs`), not one match.
+  - *A caller that stops waiting is told the truth, and it stays true.* Each command carries a
+    claim both sides race for: the writer **starts** it before running it, a caller whose wait ran
+    out **withdraws** it. Withdrawn (it was still queued, or the inbox was full) answers `busy` —
+    *not run, nothing written, try again* — and the writer skips it when it reaches it. Already
+    started answers `busy` as *still running* — it will finish and commit on its own, so it must
+    not be resent. Both are the `busy` kind (§4.4) and the message, which the code leads, says
+    which. "Busy, try again" used to be said of a queued Delete from disk that then ran.
+  - *Supervision cleans up after itself.* A tray job is opened through a guard that ends it as
+    failed if the code that opened it unwinds; a pack worker reports back from `Drop` if it dies,
+    so the one-at-a-time extract queue moves; an off-writer slice lowers its lane's in-flight flag
+    however it ends.
+  - *The generation moves whenever rows moved* — also when the command then failed or panicked
+    (ADR-0016, amended): the mark means "the catalog changed", never "the command succeeded".
 - **Readers:** a small pool of `CatalogReader`s (`SQLITE_OPEN_READ_ONLY`). `CatalogReader` exposes
   only read methods; writing through it does not compile.
 - **Work lanes off the writer:** crawl/hash/rescan, extraction, embedding, tagging (local and

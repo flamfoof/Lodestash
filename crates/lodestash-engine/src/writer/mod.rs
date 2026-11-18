@@ -364,12 +364,35 @@ pub enum Op {
     TagBatch {
         batch: lodestash_core::catalog::TagBatch,
     },
-    /// A command that panics — how the tests prove the writer survives one (review U9).
+    /// A scripted command — how the tests reach the writer's supervision (review U9, findings 2,
+    /// 7 and 11): it can say it started, open a tray job, commit a real row, hold the writer, and
+    /// then succeed, fail or panic.
     #[cfg(test)]
+    Probe(Probe),
+}
+
+/// What an [`Op::Probe`] does, in this order.
+#[cfg(test)]
+#[derive(Default)]
+pub struct Probe {
+    /// Signalled when the writer starts running the command.
+    pub started: Option<Sender<()>>,
+    /// Open an `import` tray job first, the way a scan does.
+    pub job: bool,
+    /// Star this asset — a committed write the read model's snapshot shows.
+    pub favorite: Option<i64>,
+    /// Then hold the writer this long.
+    pub hold: std::time::Duration,
+    pub end: ProbeEnd,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeEnd {
+    #[default]
+    Ok,
+    Fail,
     Panic,
-    /// A command that holds the writer for a while — how the tests reach the reply timeout.
-    #[cfg(test)]
-    Hold(std::time::Duration),
 }
 
 /// What a write did, in the terms the frontend reports to the user.
@@ -391,6 +414,40 @@ pub struct Job {
     pub reply: Sender<Result<WriteResult, WriteError>>,
     /// Who asked — decides how the shell hears about it (ADR-0016).
     pub origin: Origin,
+    /// Whether the command is still wanted. The writer claims it before running it.
+    pub(crate) claim: Arc<Claim>,
+}
+
+/// Where a queued command stands between its caller and the writer (review finding 2).
+///
+/// A caller that stops waiting has to be able to tell "it never ran" from "it is running", and a
+/// command it was told never ran must then **not run** — "busy, try again" used to be said of a
+/// Delete from disk that was merely queued, and the files went minutes later. Both sides race
+/// for one atomic: the writer *starts* a command (`QUEUED → STARTED`) before running it, a caller
+/// whose wait ran out *withdraws* it (`QUEUED → WITHDRAWN`). Exactly one of them wins.
+#[derive(Default)]
+pub(crate) struct Claim(std::sync::atomic::AtomicU8);
+
+impl Claim {
+    const QUEUED: u8 = 0;
+    const STARTED: u8 = 1;
+    const WITHDRAWN: u8 = 2;
+
+    fn take(&self, to: u8) -> bool {
+        self.0
+            .compare_exchange(Self::QUEUED, to, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// The writer is about to run it. `false`: its caller withdrew it — do not run it.
+    fn start(&self) -> bool {
+        self.take(Self::STARTED)
+    }
+
+    /// The caller has stopped waiting. `false`: the writer already started it — it will finish.
+    fn withdraw(&self) -> bool {
+        self.take(Self::WITHDRAWN)
+    }
 }
 
 /// What the writer thread's channel carries: an external op (with its reply), or a worker
@@ -620,6 +677,174 @@ pub struct JobHandles {
     pub progress: Option<Arc<JobProgress>>,
 }
 
+/// Ends a tray job when dropped — as **failed**, unless [`JobGuard::finish`] reported how it
+/// really ended (review finding 11).
+///
+/// A job used to be opened and closed by two separate calls with the work between them, so a
+/// panic in that work — caught by the writer's supervision, which is the point of supervising —
+/// left the job spinning in the tray for the rest of the session, and one of kind `extract`
+/// blocked every later extraction. Open jobs through [`JobRegistry::open`] and the end is owned.
+pub struct JobGuard {
+    jobs: JobRegistry,
+    id: u64,
+    open: bool,
+}
+
+impl JobGuard {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Report how the job ended.
+    pub fn finish(mut self, ok: bool, cancelled: bool, changed: usize) {
+        self.open = false;
+        self.jobs.finish(self.id, ok, cancelled, changed);
+    }
+
+    /// Someone else ends this job now: the writer, once a worker's report has reached it.
+    fn hand_over(mut self) {
+        self.open = false;
+    }
+}
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        if self.open {
+            self.jobs.finish(self.id, false, false, 0);
+        }
+    }
+}
+
+/// Holds an in-flight flag up for one off-writer slice and lowers it when dropped (review
+/// finding 11). The embed and tag lanes each run one slice at a time behind such a flag, and
+/// only the slice's result landing on the writer used to clear it — so a worker that panicked,
+/// or a thread that never started, left the lane shut for the life of the process.
+struct Inflight {
+    flag: Arc<AtomicBool>,
+    raised: bool,
+}
+
+impl Inflight {
+    fn raise(flag: &Arc<AtomicBool>) -> Self {
+        flag.store(true, Ordering::Relaxed);
+        Self {
+            flag: flag.clone(),
+            raised: true,
+        }
+    }
+
+    /// The slice's result is on its way to the writer, which lowers the flag when it lands.
+    fn hand_over(mut self) {
+        self.raised = false;
+    }
+}
+
+impl Drop for Inflight {
+    fn drop(&mut self) {
+        if self.raised {
+            self.flag.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Run one off-writer slice on a thread of its own: `work` computes the message for the writer
+/// (`None` when there is nothing to send). The flag stays up only if a message was handed over;
+/// a panic in `work`, nothing to send, or a writer that has gone all lower it.
+fn spawn_slice(
+    slice: Inflight,
+    tx: SyncSender<WriterMsg>,
+    work: impl FnOnce() -> Option<WriterMsg> + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        if work().is_some_and(|msg| tx.send(msg).is_ok()) {
+            slice.hand_over();
+        }
+    })
+}
+
+/// A pack worker's promise to report back (review finding 11).
+///
+/// The report is the only thing that ends the worker's job and lets the one-at-a-time extract
+/// queue move, so it is made whatever happens: by [`PackReport::manifest`] /
+/// [`PackReport::extract`] when the work is done, and from `Drop` — as a failure — when the
+/// worker unwinds or its thread never starts. With no writer left to hear it, the job is ended
+/// here instead.
+struct PackReport {
+    tx: SyncSender<WriterMsg>,
+    job: Option<JobGuard>,
+    package_id: i64,
+    analysing: bool,
+}
+
+impl PackReport {
+    fn new(tx: &SyncSender<WriterMsg>, job: JobGuard, package_id: i64, analysing: bool) -> Self {
+        Self {
+            tx: tx.clone(),
+            job: Some(job),
+            package_id,
+            analysing,
+        }
+    }
+
+    fn manifest(mut self, entries: Result<Vec<PackageEntryRecord>, String>, cancelled: bool) {
+        if let Some(job) = self.job.take() {
+            let msg = WriterMsg::ManifestDone {
+                job_id: job.id(),
+                package_id: self.package_id,
+                entries,
+                cancelled,
+            };
+            if self.tx.send(msg).is_ok() {
+                job.hand_over();
+            }
+        }
+    }
+
+    fn extract(mut self, outcome: Result<Vec<ExtractedAsset>, String>, cancelled: bool) {
+        if let Some(job) = self.job.take() {
+            let msg = WriterMsg::ExtractDone {
+                job_id: job.id(),
+                package_id: self.package_id,
+                outcome,
+                cancelled,
+            };
+            if self.tx.send(msg).is_ok() {
+                job.hand_over();
+            }
+        }
+    }
+}
+
+impl Drop for PackReport {
+    fn drop(&mut self) {
+        let Some(job) = self.job.take() else {
+            return;
+        };
+        let why = "the worker stopped without reporting — it panicked or never started".to_string();
+        let (job_id, package_id) = (job.id(), self.package_id);
+        let msg = if self.analysing {
+            WriterMsg::ManifestDone {
+                job_id,
+                package_id,
+                entries: Err(why),
+                cancelled: false,
+            }
+        } else {
+            WriterMsg::ExtractDone {
+                job_id,
+                package_id,
+                outcome: Err(why),
+                cancelled: false,
+            }
+        };
+        // `try_send`: this can run on the writer thread itself (a worker that failed to spawn),
+        // which must not block on its own full inbox. Unsent, `job` drops and ends itself.
+        if self.tx.try_send(msg).is_ok() {
+            job.hand_over();
+        }
+    }
+}
+
 #[derive(Clone, serde::Serialize)]
 pub struct JobSnapshot {
     pub id: u64,
@@ -674,8 +899,21 @@ impl JobRegistry {
         }
     }
 
-    /// Move an active job to the session ring. `changed` is what the tray reports.
-    /// Move an active job to the session ring. Public for the same reason as `start`.
+    /// [`Self::start`], with the job's end owned: the guard finishes it as failed if it is
+    /// dropped without [`JobGuard::finish`] — on a panic, an early return, a thread that never
+    /// ran. Prefer this to `start` + `finish` wherever work happens between the two.
+    pub fn open(&self, label: String, kind: &str, cancellable: bool) -> (JobHandles, JobGuard) {
+        let handles = self.start(label, kind, cancellable);
+        let guard = JobGuard {
+            jobs: self.clone(),
+            id: handles.id,
+            open: true,
+        };
+        (handles, guard)
+    }
+
+    /// Move an active job to the session ring. `changed` is what the tray reports. Public for
+    /// the same reason as `start`.
     pub fn finish(&self, id: u64, ok: bool, cancelled: bool, changed: usize) {
         let mut state = self.inner.lock().expect("job registry lock");
         let Some(pos) = state.active.iter().position(|j| j.id == id) else {
@@ -762,8 +1000,9 @@ pub use crate::changes::{ChangedEvent, Changes, Origin};
 /// rather than queueing a caller behind work it cannot see.
 pub const INBOX_CAPACITY: usize = 1024;
 
-/// How long a caller waits for its reply before it is told [`WriteError::Busy`]. The command still
-/// runs to completion on the writer; only its answer is dropped.
+/// How long a caller waits for its reply. What it is told then depends on where its command is
+/// ([`Claim`]): still queued, it is withdrawn and the caller told [`WriteError::Busy`]; already
+/// running, it finishes on its own and the caller is told [`WriteError::StillRunning`].
 pub const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Why a write did not happen (v2 spec §4.4 kinds, where the writer itself knows them).
@@ -772,20 +1011,27 @@ pub enum WriteError {
     /// The command ran and refused — the message is the one the caller shows. Its finer kind
     /// (`not_found`, `invalid`, `conflict`) arrives when the commands carry typed errors (P3).
     Failed(String),
-    /// The writer did not answer within [`REPLY_TIMEOUT`], or its inbox was full.
+    /// The command **did not run and will not**: the inbox was full, or it was still queued when
+    /// its caller's wait ran out and was withdrawn. Nothing was written; asking again is safe.
     Busy,
-    /// The command panicked. The writer caught it, rolled nothing forward, and kept serving.
+    /// The command **is running** and its caller's wait ran out. It will finish and commit on its
+    /// own, so asking again would do it twice. Its result shows when it lands.
+    StillRunning,
+    /// The command panicked. The writer caught it and kept serving; anything it had already
+    /// committed stays committed, and the catalog generation says so.
     Internal(String),
     /// There is no writer to ask: the engine did not start, or it has stopped.
     Unavailable(String),
 }
 
 impl WriteError {
-    /// The stable code the API maps (`lodestash_protocol::codes`); `failed` until commands are typed.
+    /// The stable code the API maps (`lodestash_protocol::codes`); `failed` until commands are
+    /// typed. Both "not run" and "still running" are `busy` — the kind an agent is told to
+    /// expect — and the message, which the code leads, says which.
     pub fn code(&self) -> &'static str {
         match self {
             WriteError::Failed(_) => "failed",
-            WriteError::Busy => lodestash_protocol::codes::BUSY,
+            WriteError::Busy | WriteError::StillRunning => lodestash_protocol::codes::BUSY,
             WriteError::Internal(_) => lodestash_protocol::codes::INTERNAL,
             WriteError::Unavailable(_) => lodestash_protocol::codes::UNAVAILABLE,
         }
@@ -798,7 +1044,12 @@ impl std::fmt::Display for WriteError {
             // Verbatim: the old shell showed these strings to the user, and still does.
             WriteError::Failed(m) | WriteError::Unavailable(m) => f.write_str(m),
             WriteError::Busy => f.write_str(
-                "busy: the catalog writer did not answer in time — the write may still land; try again",
+                "busy: the catalog writer is occupied and this command was not run — nothing \
+                 was written; try again",
+            ),
+            WriteError::StillRunning => f.write_str(
+                "busy: the command is still running — it will finish on its own, so do not send \
+                 it again; its result shows when it lands",
             ),
             WriteError::Internal(m) => write!(
                 f,
@@ -845,8 +1096,16 @@ impl WriterHandle {
             return Err(WriteError::Unavailable(self.absent.to_string()));
         };
         let (reply, wait) = mpsc::channel();
-        match tx.try_send(WriterMsg::Op(Job { op, reply, origin })) {
+        let claim = Arc::new(Claim::default());
+        let job = Job {
+            op,
+            reply,
+            origin,
+            claim: claim.clone(),
+        };
+        match tx.try_send(WriterMsg::Op(job)) {
             Ok(()) => {}
+            // Never queued, so it will never run.
             Err(mpsc::TrySendError::Full(_)) => return Err(WriteError::Busy),
             Err(mpsc::TrySendError::Disconnected(_)) => {
                 return Err(WriteError::Unavailable(
@@ -856,7 +1115,12 @@ impl WriterHandle {
         }
         match wait.recv_timeout(self.reply_timeout) {
             Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(WriteError::Busy),
+            // Still queued: withdrawn, so "it was not run" stays true.
+            Err(mpsc::RecvTimeoutError::Timeout) if claim.withdraw() => Err(WriteError::Busy),
+            // The writer has it. It may have answered in the instant the wait ran out.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                wait.try_recv().unwrap_or(Err(WriteError::StillRunning))
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(WriteError::Internal(
                 "the writer dropped the command without answering".into(),
             )),
@@ -1175,7 +1439,18 @@ fn writer_main(
             break;
         }
         match inbox.next(std::time::Duration::from_secs(1)) {
-            Ok(WriterMsg::Op(Job { op, reply, origin })) => {
+            Ok(WriterMsg::Op(Job {
+                op,
+                reply,
+                origin,
+                claim,
+            })) => {
+                // Its caller stopped waiting while it was queued and was told it had not run
+                // (`WriteError::Busy`). It must not run now — least of all a delete.
+                if !claim.start() {
+                    tracing::info!("skipped a command its caller withdrew while it was queued");
+                    continue;
+                }
                 if matches!(op, Op::ExtractPackage { .. }) {
                     // Extract answers **"accepted"**, not "finished" — the unpack runs for minutes
                     // on a multi-GB pack, and its progress, outcome and cancel button live in the
@@ -1183,13 +1458,23 @@ fn writer_main(
                     // to be sent at spawn when the queue was empty but only at *start* when it
                     // wasn't, so one command meant two different things depending on queue depth.
                     if extract_queue.is_empty() && !jobs.has_active_extract() {
+                        // This turn mints the pack's in-pack rows before any worker runs, so it
+                        // is marked like any other: it never was, and when the extraction then
+                        // failed nothing told the read model the rows existed.
+                        let before = Stamp::of(&catalog);
                         let result = supervised(|| run(&mut catalog, op, &ctx));
+                        mark_committed(&changes, &catalog, before, origin);
                         let _ = reply.send(result);
                     } else {
                         // A pack is unpacking (or queued) — join the queue, and say so now rather
                         // than blocking the caller until this pack's turn.
                         let _ = reply.send(Ok(WriteResult::default()));
-                        extract_queue.push_back(Job { op, reply, origin });
+                        extract_queue.push_back(Job {
+                            op,
+                            reply,
+                            origin,
+                            claim,
+                        });
                     }
                     continue;
                 }
@@ -1206,11 +1491,13 @@ fn writer_main(
                 if appraising {
                     pump.store(false, Ordering::Relaxed);
                 }
-                // A failed op publishes nothing: its caller learns from the reply, and an event
-                // must never read as a success.
-                if result.is_ok() {
-                    mark_committed(&changes, &catalog, before, origin);
-                }
+                // Marked whenever SQLite's counters moved — also when the command then failed or
+                // panicked. A command can commit and *then* fail (a scan whose packs step errors,
+                // a selection that stops half-way), and marking only on success left the read
+                // model serving the snapshot from before rows that are now in the catalog. The
+                // mark says "the catalog changed", not "the command succeeded": the caller
+                // learns that from the reply.
+                mark_committed(&changes, &catalog, before, origin);
                 let _ = reply.send(result);
                 // A source set (or its watch flags) changed — re-arm the watch so new roots are
                 // covered and unwatched ones stop firing.
@@ -1247,14 +1534,14 @@ fn writer_main(
                 // Cheap: N `upsert_embedding` calls, no inference. Clearing `embedding_dirty`
                 // here is what lets `promote_statuses` move the asset on, so the promote runs on
                 // the next idle tick.
-                let n = guarded("embeddings store", || {
+                let before = Stamp::of(&catalog);
+                guarded("embeddings store", || {
                     crate::drains::store_visual_embeddings(&mut catalog, &model_id, &done)
-                })
-                .unwrap_or(0);
+                });
                 embed_inflight.store(false, Ordering::Relaxed);
-                if n > 0 {
-                    changes.catalog(Origin::Background);
-                }
+                // By what was written, not by the count returned: a store that panicked after
+                // its first rows returns nothing, and those rows are still in the catalog.
+                mark_committed(&changes, &catalog, before, Origin::Background);
             }
             Ok(WriterMsg::TagsDone { producers, done }) => {
                 let before = Stamp::of(&catalog);
@@ -1333,14 +1620,16 @@ fn writer_main(
                 if inbox.waiting() {
                     continue; // an op is waiting — held, and run on the next turn
                 }
+                // The pass is marked once, after it, by what SQLite says it wrote — so a pass
+                // that panics part-way still publishes the rows it had committed (it used to mark
+                // only at the end of each branch, which a panic never reached).
+                let before = Stamp::of(&catalog);
                 guarded("idle pass", || {
                     // Watch signal (debounced upstream): rescan every watched source with the
                     // incremental crawl. The writer is idle here by construction.
                     if let Some(w) = &watch {
-                        if w.rx.recv_timeout(std::time::Duration::ZERO).is_ok()
-                            && rescan_watched(&mut catalog, &ctx)
-                        {
-                            changes.catalog(Origin::Background);
+                        if w.rx.recv_timeout(std::time::Duration::ZERO).is_ok() {
+                            rescan_watched(&mut catalog, &ctx);
                         }
                     }
                     idle_tick = idle_tick.wrapping_add(1);
@@ -1359,12 +1648,13 @@ fn writer_main(
                                 let (jobs, albedo) =
                                     crate::drains::visual_embed_batch(&catalog, SLICE);
                                 if !jobs.is_empty() {
-                                    embed_inflight.store(true, Ordering::Relaxed);
-                                    let tx = ctx.tx.clone();
-                                    let flag = embed_inflight.clone();
+                                    // Raised here and lowered by whoever ends the slice: the
+                                    // writer when `EmbeddingsDone` lands, or the guard itself when
+                                    // the worker panics, cannot send, or never starts.
+                                    let slice = Inflight::raise(&embed_inflight);
                                     let (ws, cd) =
                                         (ctx.workspace_dir.clone(), ctx.cache_dir.clone());
-                                    std::thread::spawn(move || {
+                                    spawn_slice(slice, ctx.tx.clone(), move || {
                                         let done = crate::drains::compute_visual_embeddings(
                                             jobs,
                                             &albedo,
@@ -1373,14 +1663,7 @@ fn writer_main(
                                             cd.as_deref(),
                                         );
                                         let model_id = emb.model_id().to_string();
-                                        if tx
-                                            .send(WriterMsg::EmbeddingsDone { model_id, done })
-                                            .is_err()
-                                        {
-                                            // The writer is gone (shutdown) — nothing to persist
-                                            // into, and nothing will clear the flag, so clear it.
-                                            flag.store(false, Ordering::Relaxed);
-                                        }
+                                        Some(WriterMsg::EmbeddingsDone { model_id, done })
                                     });
                                 }
                             }
@@ -1393,24 +1676,19 @@ fn writer_main(
                             const TAG_SLICE: usize = 4;
                             let jobs = crate::drains::tag_batch(&catalog, TAG_SLICE, None);
                             if !jobs.is_empty() {
-                                tag_inflight.store(true, Ordering::Relaxed);
-                                let tx = ctx.tx.clone();
-                                let flag = tag_inflight.clone();
+                                let slice = Inflight::raise(&tag_inflight);
                                 let (ws, cd) = (ctx.workspace_dir.clone(), ctx.cache_dir.clone());
                                 let db = ctx.db_path.clone();
                                 let emb = idle_embedder.clone();
                                 let config = ctx.config.clone();
-                                std::thread::spawn(move || {
-                                    let sent =
-                                        tag_worker_slice(&db, jobs, emb, ws, cd, &tx, &config);
-                                    if !sent {
-                                        flag.store(false, Ordering::Relaxed);
-                                    }
+                                spawn_slice(slice, ctx.tx.clone(), move || {
+                                    tag_worker_slice(&db, jobs, emb, ws, cd, &config)
                                 });
                             }
                         }
                         pump.store(true, Ordering::Relaxed);
-                        let r = appraise_pass(
+                        // Its outcome is the catalog's: the mark below reads what it wrote.
+                        let _ = appraise_pass(
                             &mut catalog,
                             &ctx,
                             None,
@@ -1422,24 +1700,19 @@ fn writer_main(
                             Some(&[]),
                         );
                         pump.store(false, Ordering::Relaxed);
-                        if r.map(|w| w.changed > 0).unwrap_or(false) {
-                            changes.catalog(Origin::Background);
-                        }
                     } else {
-                        let n = drain_previews(
+                        drain_previews(
                             &mut catalog,
                             ctx.workspace_dir.as_deref(),
                             ctx.cache_dir.as_deref(),
                             proxy,
                             std::time::Duration::from_secs(1),
                         );
-                        if n > 0 {
-                            changes.catalog(Origin::Background);
-                        }
                     }
                 });
                 // A panic inside the pass may have left the flag up; the next pass resets it.
                 pump.store(false, Ordering::Relaxed);
+                mark_committed(&changes, &catalog, before, Origin::Background);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -1528,25 +1801,23 @@ fn rescan_watched(catalog: &mut Catalog, ctx: &WriterCtx) -> bool {
 /// is re-derived here because it can change between passes. `progress` is the shared
 /// B11d surface the Identify screen polls — reset at pass start, filled by the tag/embed
 /// drains as they work.
-/// Compute one idle tagging slice off the writer thread and post the result back.
-///
-/// Returns whether a `TagsDone` was sent — the caller clears the in-flight flag when it was not,
-/// or the lane would wedge shut for the life of the process.
+/// Compute one idle tagging slice off the writer thread: the `TagsDone` for the writer, or
+/// `None` when the slice has nothing to store. [`spawn_slice`] sends it and keeps the in-flight
+/// flag honest whichever it is — or if this panics.
 fn tag_worker_slice(
     db_path: &std::path::Path,
     jobs: Vec<lodestash_core::catalog::VisualEmbedJob>,
     embedder: Option<std::sync::Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
     workspace_dir: Option<std::path::PathBuf>,
     cache_dir: Option<std::path::PathBuf>,
-    tx: &SyncSender<WriterMsg>,
     config: &ConfigStore,
-) -> bool {
+) -> Option<WriterMsg> {
     // A read connection, only for the user's taught vocabulary — WAL admits any number of
     // readers, and every write still lands on the writer thread (ADR-0002). Read-only by type:
     // this used to be the migrating `Catalog::open` (review R5).
     let Ok(cat) = Catalog::open_reader(db_path) else {
         tracing::warn!("tag worker could not open a read connection; slice skipped");
-        return false;
+        return None;
     };
     let teach = cat
         .teaching_traits()
@@ -1568,7 +1839,7 @@ fn tag_worker_slice(
     // AI-PIPELINE §5.1 wants anyway: a background lane must not quietly bill an API, so a cloud
     // pass is always an explicit, scoped, capped kick.
     if cfg.api_tagging_enabled && !cfg.api_key.is_empty() && cfg.api_model.is_some() {
-        return false;
+        return None;
     }
     let tagger: Box<dyn Tagger> = if let Some(model) = cfg.tagger_model.clone() {
         let mut t = OllamaTagger::new(model);
@@ -1593,7 +1864,7 @@ fn tag_worker_slice(
         cache_dir.as_deref(),
         &slots,
     );
-    tx.send(WriterMsg::TagsDone {
+    Some(WriterMsg::TagsDone {
         producers: crate::drains::TagProducers {
             tagger: (tagger.producer_id(), tagger.model_id().to_string()),
             zero_shot: zero_shot
@@ -1602,7 +1873,6 @@ fn tag_worker_slice(
         },
         done,
     })
-    .is_ok()
 }
 
 fn appraise_pass(
@@ -1940,7 +2210,7 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, St
                 .first()
                 .map(|b| format!("Import {}", b.name))
                 .unwrap_or_else(|| "Import".to_string());
-            let job = jobs.start(label, "import", false);
+            let (_, job) = jobs.open(label, "import", false);
             let result = (|| {
                 crate::persist::persist_to_catalog(&ctx.db_path, &batches)
                     .map_err(|e| e.to_string())?;
@@ -1981,8 +2251,7 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, St
                     ..Default::default()
                 })
             })();
-            let ok = result.is_ok();
-            jobs.finish(job.id, ok, false, changed);
+            job.finish(result.is_ok(), false, changed);
             result
         }
 
@@ -1992,7 +2261,7 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, St
         // cards exist immediately; identify runs off the drains in the background.
         Op::ImportPacks { root, packs } => {
             let label = format!("Import {} packs", packs.len());
-            let job = jobs.start(label, "import", false);
+            let (_, job) = jobs.open(label, "import", false);
             let result = (|| {
                 let name = crate::config::stem_name(std::path::Path::new(&root));
                 let source_id = catalog
@@ -2030,9 +2299,8 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, St
                     ..Default::default()
                 })
             })();
-            let ok = result.is_ok();
             let inserted = result.as_ref().map(|r| r.changed).unwrap_or(0);
-            jobs.finish(job.id, ok, false, inserted);
+            job.finish(result.is_ok(), false, inserted);
             result
         }
 
@@ -2217,7 +2485,7 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, St
             // auto-identify is off — the user explicitly asked. No local models (SigLIP/CLAP
             // absent) means nothing can be appraised; the pass still runs metrics/previews/
             // promote and reports honestly. Bounded so a long pass never blocks writes.
-            let job = jobs.start("Identify all".into(), "appraise", false);
+            let (_, job) = jobs.open("Identify all".into(), "appraise", false);
             let embedder = resolve_embedder();
             let audio_embedder = resolve_audio_embedder();
             if embedder.is_none() && audio_embedder.is_none() {
@@ -2232,7 +2500,7 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, St
                 None,
             );
             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
-            jobs.finish(job.id, result.is_ok(), false, changed);
+            job.finish(result.is_ok(), false, changed);
             result
         }
 
@@ -2244,7 +2512,7 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, St
             catalog
                 .mark_for_identify(asset_id)
                 .map_err(|e| e.to_string())?;
-            let job = jobs.start(format!("Identify asset {asset_id}"), "appraise", false);
+            let (_, job) = jobs.open(format!("Identify asset {asset_id}"), "appraise", false);
             let embedder = resolve_embedder();
             let audio_embedder = resolve_audio_embedder();
             if embedder.is_none() && audio_embedder.is_none() {
@@ -2259,7 +2527,7 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, St
                 None,
             );
             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
-            jobs.finish(job.id, result.is_ok(), false, changed);
+            job.finish(result.is_ok(), false, changed);
             result
         }
 
@@ -2269,7 +2537,7 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, St
             for id in &asset_ids {
                 catalog.mark_for_identify(*id).map_err(|e| e.to_string())?;
             }
-            let job = jobs.start(
+            let (_, job) = jobs.open(
                 format!("Identify {} assets", asset_ids.len()),
                 "appraise",
                 false,
@@ -2291,7 +2559,7 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, St
                 Some(&asset_ids),
             );
             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
-            jobs.finish(job.id, result.is_ok(), false, changed);
+            job.finish(result.is_ok(), false, changed);
             result
         }
 
@@ -2383,16 +2651,18 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, St
                 // Phase 1: the manifest is unknown — read it on a worker (a big pack must
                 // inflate its whole tar.gz; never on the writer thread). The kind is
                 // "extract" so the one-at-a-time queue gates the whole flow.
-                let handles = jobs.start(format!("Analyze {}", pkg.name), "extract", true);
-                let wtx = ctx.tx.clone();
+                let (handles, job) = jobs.open(format!("Analyze {}", pkg.name), "extract", true);
+                // Moved into the worker: it reports back when the work is done, and by itself —
+                // as a failure — if the worker unwinds or the thread below never starts.
+                let report_back = PackReport::new(&ctx.tx, job, package_id, true);
                 let wcancel = handles.cancel;
                 let wprogress = handles.progress.expect("manifest jobs carry progress");
                 let wpath = PathBuf::from(&pkg.package_path);
                 let wjobs = jobs.clone();
-                std::thread::Builder::new()
+                let spawned = std::thread::Builder::new()
                     .name("manifest-worker".into())
                     .spawn(move || {
-                        // Same guarantee as the extract worker: this send is the only thing that
+                        // Same guarantee as the extract worker: this report is the only thing that
                         // finishes the job and lets the queue move, so a panic must not eat it.
                         let work =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -2443,14 +2713,11 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, St
                                 false,
                             )
                             });
-                        let _ = wtx.send(WriterMsg::ManifestDone {
-                            job_id: handles.id,
-                            package_id,
-                            entries: outcome,
-                            cancelled,
-                        });
-                    })
-                    .expect("manifest worker spawns");
+                        report_back.manifest(outcome, cancelled);
+                    });
+                // A thread that could not start drops the closure, and with it the report —
+                // which has already told the writer this job failed.
+                spawned.map_err(|e| format!("the manifest worker could not start: {e}"))?;
             } else {
                 // Locators already recorded (browse persistence) — mint + extract right away.
                 mint_in_pack(catalog, package_id, &entries)?;
@@ -2629,11 +2896,30 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, St
             .map_err(|e| e.to_string()),
 
         #[cfg(test)]
-        Op::Panic => panic!("a command panicked on purpose"),
-        #[cfg(test)]
-        Op::Hold(for_) => {
-            std::thread::sleep(for_);
-            Ok(WriteResult::default())
+        Op::Probe(p) => {
+            if let Some(started) = &p.started {
+                let _ = started.send(());
+            }
+            let job = p.job.then(|| jobs.open("Probe".into(), "import", false).1);
+            let mut changed = 0;
+            if let Some(id) = p.favorite {
+                changed = catalog
+                    .set_favorite(&[id], true)
+                    .map_err(|e| e.to_string())?;
+            }
+            std::thread::sleep(p.hold);
+            let result = match p.end {
+                ProbeEnd::Ok => Ok(WriteResult {
+                    changed,
+                    ..Default::default()
+                }),
+                ProbeEnd::Fail => Err("the probe failed on purpose".to_string()),
+                ProbeEnd::Panic => panic!("a command panicked on purpose"),
+            };
+            if let Some(job) = job {
+                job.finish(result.is_ok(), false, changed);
+            }
+            result
         }
     }
 }
@@ -2876,22 +3162,23 @@ fn spawn_extract_worker(
     if wanted.is_empty() {
         return Err("the pack has no extractable payloads".to_string());
     }
-    let handles = jobs.start(format!("Extract {}", pkg.name), "extract", true);
-    let wtx = tx.clone();
+    let (handles, job) = jobs.open(format!("Extract {}", pkg.name), "extract", true);
+    // Moved into the worker: it reports back when the work is done, and by itself — as a
+    // failure — if the worker unwinds or the thread below never starts.
+    let report_back = PackReport::new(tx, job, pkg.id, false);
     let wcancel = handles.cancel;
     let wprogress = handles.progress.expect("extract jobs carry progress");
     let wpath = PathBuf::from(&pkg.package_path);
     let wworkspace = workspace_dir.to_path_buf();
     let wjobs = jobs.clone();
-    let wpkg_id = pkg.id;
     std::thread::Builder::new()
         .name("extract-worker".into())
         .spawn(move || {
-            // The send below is the **only** thing that runs `jobs.finish` and drains the queue.
-            // A panic in the gzip/tar path (corrupt archive) would unwind a detached thread, the
-            // send would never happen, `has_active_extract()` would stay true forever, and every
-            // later extract would join a queue nobody drains — the same session-long jam
-            // `start_next_extract` fixes for the error path, by a different road.
+            // The report below is the **only** thing that runs `jobs.finish` and drains the
+            // queue. A panic in the gzip/tar path (corrupt archive) would unwind a detached
+            // thread, the report would never be made, `has_active_extract()` would stay true
+            // forever, and every later extract would join a queue nobody drains — the same
+            // session-long jam `start_next_extract` fixes for the error path, by a different road.
             let work = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                 let report_cancel = wcancel.clone();
                 let report = move |done: u64, total: u64| {
@@ -2921,14 +3208,11 @@ fn spawn_extract_worker(
                     false,
                 )
             });
-            let _ = wtx.send(WriterMsg::ExtractDone {
-                job_id: handles.id,
-                package_id: wpkg_id,
-                outcome,
-                cancelled,
-            });
+            report_back.extract(outcome, cancelled);
         })
-        .expect("extract worker spawns");
+        // A thread that could not start drops the closure, and with it the report — which has
+        // already told the writer this job failed.
+        .map_err(|e| format!("the extract worker could not start: {e}"))?;
     Ok(())
 }
 
@@ -3676,6 +3960,7 @@ mod tests {
                     },
                     reply,
                     origin: Origin::User,
+                    claim: Default::default(),
                 });
                 wait
             })
@@ -3816,6 +4101,139 @@ mod tests {
         );
     }
 
+    /// A job opened through the registry ends whatever happens to the code that opened it
+    /// (review finding 11): dropped without an outcome — a panic unwinding through it, an early
+    /// `?` — it is finished as failed. It used to stay in the active list for the session, and
+    /// one of kind `extract` made every later extraction queue behind a pack that would never
+    /// finish.
+    #[test]
+    fn a_job_dropped_without_an_outcome_is_finished_as_failed() {
+        let jobs = JobRegistry::default();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (_handles, _job) = jobs.open("Extract X".into(), "extract", true);
+            assert!(jobs.has_active_extract());
+            panic!("between open and finish");
+        }));
+        assert!(unwound.is_err());
+        assert!(
+            !jobs.has_active_extract(),
+            "a panicked extract job still blocks the queue"
+        );
+        let tray = jobs.snapshot();
+        assert!(tray.active.is_empty());
+        assert!(
+            !tray.recent[0].ok,
+            "an unwound job was recorded as a success"
+        );
+
+        // Reported, it ends as reported — and only once.
+        let (_, job) = jobs.open("Import".into(), "import", false);
+        job.finish(true, false, 7);
+        let tray = jobs.snapshot();
+        assert_eq!(tray.recent.len(), 2);
+        assert!(tray.recent[0].ok && tray.recent[0].changed == 7);
+    }
+
+    /// A pack worker that dies still reports back: the report is what ends its job and lets the
+    /// one-at-a-time queue move. Dropped unsent — the worker unwound, or its thread never
+    /// started — it tells the writer the job failed; with no writer left, it ends the job itself.
+    #[test]
+    fn a_pack_worker_that_dies_still_reports_back() {
+        let jobs = JobRegistry::default();
+        let (tx, rx) = mpsc::sync_channel(4);
+
+        let (_, job) = jobs.open("Extract X".into(), "extract", true);
+        let job_id = job.id();
+        let report = PackReport::new(&tx, job, 7, false);
+        let died = std::thread::spawn(move || {
+            let _report = report;
+            panic!("the archive is corrupt in a way nobody caught");
+        })
+        .join();
+        assert!(died.is_err());
+        match rx.try_recv() {
+            Ok(WriterMsg::ExtractDone {
+                job_id: reported,
+                package_id: 7,
+                outcome: Err(_),
+                cancelled: false,
+            }) => assert_eq!(reported, job_id),
+            _ => panic!("a dead extract worker reported nothing"),
+        }
+        assert!(
+            jobs.has_active_extract(),
+            "the writer ends the job when the report lands — not the worker"
+        );
+
+        // The analyse phase reports as a manifest failure.
+        let (_, job) = jobs.open("Analyze Y".into(), "extract", true);
+        drop(PackReport::new(&tx, job, 8, true));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WriterMsg::ManifestDone {
+                package_id: 8,
+                entries: Err(_),
+                ..
+            })
+        ));
+
+        // No writer left to hear it: the job is ended here, so nothing spins.
+        let orphaned = JobRegistry::default();
+        let (_, job) = orphaned.open("Extract Z".into(), "extract", true);
+        let report = PackReport::new(&tx, job, 9, false);
+        drop(rx);
+        drop(report);
+        assert!(!orphaned.has_active_extract());
+        assert!(!orphaned.snapshot().recent[0].ok);
+    }
+
+    /// The embed and tag lanes run one slice at a time behind an in-flight flag that only the
+    /// slice's result landing on the writer used to lower. A worker that panicked, had nothing
+    /// to send, or found the writer gone must lower it too, or the lane never runs again.
+    #[test]
+    fn a_slice_that_never_reaches_the_writer_lowers_its_flag() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(4);
+        let up = || flag.load(Ordering::Relaxed);
+
+        let panicked = spawn_slice(Inflight::raise(&flag), tx.clone(), || {
+            panic!("the encoder blew up")
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(!up(), "a panicked worker left its lane shut");
+
+        spawn_slice(Inflight::raise(&flag), tx.clone(), || None)
+            .join()
+            .expect("join");
+        assert!(!up(), "a slice with nothing to send left its lane shut");
+
+        // Handed to the writer, the flag stays up: the writer lowers it when the result lands.
+        let msg = || {
+            Some(WriterMsg::EmbeddingsDone {
+                model_id: "m".into(),
+                done: Vec::new(),
+            })
+        };
+        spawn_slice(Inflight::raise(&flag), tx.clone(), msg)
+            .join()
+            .expect("join");
+        assert!(up(), "the flag fell before the writer stored the slice");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WriterMsg::EmbeddingsDone { .. })
+        ));
+
+        drop(rx);
+        spawn_slice(Inflight::raise(&flag), tx, msg)
+            .join()
+            .expect("join");
+        assert!(
+            !up(),
+            "a slice sent to a writer that has gone left its lane shut"
+        );
+    }
+
     /// The idle probe used to *receive and discard* whatever it found, so a write arriving at that
     /// instant never ran and never replied. It is held now, delivered next, and delivered once.
     #[test]
@@ -3827,6 +4245,7 @@ mod tests {
             op: Op::ClearStaged,
             reply,
             origin: Origin::User,
+            claim: Default::default(),
         }))
         .expect("send");
         assert!(inbox.waiting(), "the probe sees the queued write");

@@ -1518,8 +1518,12 @@ fn models_status() -> Vec<ModelStatus> {
 #[tauri::command]
 fn model_download(state: tauri::State<'_, AppState>, model: String) -> bool {
     use std::sync::atomic::Ordering;
-    let jobs = state.engine.jobs().clone();
-    let handles = jobs.start(format!("Download {model}"), "download", true);
+    // The job's end is owned by `job`: moved into the download thread, it finishes the job as
+    // failed if that thread panics instead of leaving it spinning in the tray.
+    let (handles, job) = state
+        .engine
+        .jobs()
+        .open(format!("Download {model}"), "download", true);
     // The tray renders the writer's own progress atomics; the downloader writes the app's.
     // A pump copies one into the other while the download runs.
     let app_progress: std::sync::Arc<lodestash_engine::jobs::JobProgress> =
@@ -1545,18 +1549,25 @@ fn model_download(state: tauri::State<'_, AppState>, model: String) -> bool {
         });
     }
     std::thread::spawn(move || {
+        // Stops the progress pump above however this thread ends — it used to be told only on
+        // the way out, so a panicking download left it copying counters for the session.
+        struct Stop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let _stop = Stop(done);
         let result = match model.as_str() {
             "siglip" => lodestash_engine::models::download_siglip(app_progress.clone()),
             "clap" => lodestash_engine::models::download_clap(app_progress.clone()),
             "ort" => lodestash_engine::models::download_ort(app_progress.clone()),
             other => Err(format!("unknown model {other:?}")),
         };
-        done.store(true, Ordering::Relaxed);
-        let ok = result.is_ok();
         if let Err(e) = &result {
             tracing::error!(%e, "model download failed");
         }
-        jobs.finish(handles.id, ok, false, 0);
+        job.finish(result.is_ok(), false, 0);
     });
     true
 }

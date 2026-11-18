@@ -246,8 +246,11 @@ surfaces as an error rather than a silently stale answer.
 - **The engine owns the catalog** (v2 plan Task 2.3, [ADR-0021](decisions/ADR-0021-engine-owns-the-catalog-ui-is-a-web-client.md)):
   `lodestash-engine`'s `Engine::start` takes `<catalog>.lock` (`File::try_lock` — a second engine
   reports `catalog_locked`), and its one writer thread creates, migrates and holds the only writing
-  connection. The writer's inbox is bounded (1024) and replies time out (120 s) as `busy`; every
-  command runs under `catch_unwind`, so a panic answers `internal` and the thread keeps serving. The
+  connection. The writer's inbox is bounded (1024) and a caller waits at most 120 s: a command
+  still queued then is **withdrawn** and answers `busy` (it will not run), one already running
+  answers `busy` as *still running* (it will finish; do not resend). Every command runs under
+  `catch_unwind`, so a panic answers `internal` and the thread keeps serving; a job it had opened
+  ends as failed, and whatever it had committed moves the catalog generation. The
   read model holds a `CatalogReader` and rebuilds when the catalog generation moves. Startup is a
   status (`starting | migrating | ready | failed{code,message}`), never an empty library.
 - **SQLite access**: `rusqlite::Connection` is `!Sync`, so the catalog is **not** shared by handle.

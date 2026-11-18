@@ -8,7 +8,7 @@ use std::time::Duration;
 use lodestash_core::catalog::{Catalog, CrawlRecord};
 
 use crate::types::PersistBatch;
-use crate::writer::{Op, WriteError};
+use crate::writer::{Op, Probe, ProbeEnd, WriteError};
 use crate::{Engine, EngineConfig, EngineStatus, Origin};
 
 const SETTLE: Duration = Duration::from_secs(5);
@@ -142,7 +142,10 @@ fn a_panicking_command_answers_internal_and_the_writer_keeps_serving() {
     let dir = tempfile::tempdir().expect("tmp");
     let (engine, _) = started(dir.path());
 
-    match engine.writer().run(Op::Panic) {
+    match engine.writer().run(Op::Probe(Probe {
+        end: ProbeEnd::Panic,
+        ..Default::default()
+    })) {
         Err(WriteError::Internal(msg)) => assert!(msg.contains("on purpose"), "{msg}"),
         other => panic!("a panic answered {other:?}"),
     }
@@ -155,25 +158,211 @@ fn a_panicking_command_answers_internal_and_the_writer_keeps_serving() {
     assert_eq!(engine.read().collections().len(), 1);
 }
 
-/// A reply that does not come within the timeout answers `busy`; the command still finishes, and
-/// the writer goes on serving.
+/// Review findings 7, 11 and 13: a command that fails or panics **after** it has committed, with a
+/// tray job open. The row it wrote is in the catalog, so the generation must move and the next
+/// read must show it — it used to be marked only on success, and the read model went on serving
+/// the snapshot from before. And the job it opened must end (as failed) rather than spin in the
+/// tray for the rest of the session.
 #[test]
-fn a_reply_that_takes_too_long_answers_busy() {
+fn a_command_that_fails_or_panics_after_committing_is_still_seen_and_ends_its_job() {
     let dir = tempfile::tempdir().expect("tmp");
     let (engine, _) = started(dir.path());
+    let (_, ids) = seed(&engine, dir.path(), &["a.png", "b.png"]);
+    assert_eq!(engine.read().status().favorites, 0);
+    let jobs_before = engine.jobs().snapshot().recent.len();
+
+    for (end, id) in [(ProbeEnd::Fail, ids[0]), (ProbeEnd::Panic, ids[1])] {
+        let before = engine.catalog_generation();
+        let out = engine.writer().run(Op::Probe(Probe {
+            job: true,
+            favorite: Some(id),
+            end,
+            ..Default::default()
+        }));
+        match (end, out) {
+            (ProbeEnd::Fail, Err(WriteError::Failed(_)))
+            | (ProbeEnd::Panic, Err(WriteError::Internal(_))) => {}
+            (_, other) => panic!("{end:?} answered {other:?}"),
+        }
+        assert!(
+            engine.catalog_generation() > before,
+            "{end:?}: a row was committed and the generation did not move"
+        );
+    }
+    assert_eq!(
+        engine.read().status().favorites,
+        2,
+        "the read model is serving the snapshot from before the commands that failed"
+    );
+    let tray = engine.jobs().snapshot();
+    assert!(
+        tray.active.is_empty(),
+        "a job outlived the command that panicked: {:?}",
+        tray.active.iter().map(|j| &j.label).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        tray.recent.len() - jobs_before,
+        2,
+        "both jobs reached the finished ring"
+    );
+    assert!(
+        tray.recent.iter().take(2).all(|j| !j.ok),
+        "a job whose command failed was recorded as a success"
+    );
+}
+
+/// A probe that holds the writer; returns once the writer has started running it.
+fn hold_the_writer(engine: &Engine, hold: Duration) -> std::thread::JoinHandle<()> {
+    let (started, running) = std::sync::mpsc::channel();
+    let writer = engine.writer().clone();
+    let held = std::thread::spawn(move || {
+        writer
+            .run(Op::Probe(Probe {
+                started: Some(started),
+                hold,
+                ..Default::default()
+            }))
+            .expect("the held command finishes");
+    });
+    running.recv_timeout(SETTLE).expect("the hold started");
+    held
+}
+
+/// Review finding 2, first half: a command whose caller gave up **before it started** does not
+/// run. "Busy, try again" used to be said of a command that was still queued — and it then ran
+/// minutes later, after the user had been told it had not. For Delete from disk that is files
+/// deleted behind a "nothing happened" message.
+#[test]
+fn a_command_withdrawn_before_it_started_never_runs() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (engine, cfg) = started(dir.path());
+    let held = hold_the_writer(&engine, Duration::from_millis(500));
 
     let impatient = engine
         .writer()
         .clone()
         .with_reply_timeout(Duration::from_millis(50));
-    assert!(matches!(
-        impatient.run(Op::Hold(Duration::from_millis(400))),
-        Err(WriteError::Busy)
-    ));
+    let out = impatient.run(Op::CreateCollection {
+        name: "abandoned".into(),
+    });
+    assert!(
+        matches!(out, Err(WriteError::Busy)),
+        "a command that never started answered {out:?}"
+    );
+    assert!(
+        out.unwrap_err().to_string().starts_with("busy:"),
+        "the `busy` code leads the text an agent is handed"
+    );
+
+    held.join().expect("hold");
+    // Anything queued behind the hold has been reached by the time this one answers.
+    engine
+        .writer()
+        .run(Op::ClearStaged)
+        .expect("the writer serves again");
+    let reader = Catalog::open_reader(&cfg.catalog).expect("separate read");
+    assert!(
+        reader.list_collections().expect("collections").is_empty(),
+        "a command its caller was told had not run, ran"
+    );
+}
+
+/// Review finding 2, second half: a command that **was** running when its caller stopped waiting
+/// says so — "still running", not "try again" — and it does finish and commit.
+#[test]
+fn a_command_still_running_when_its_caller_stops_waiting_says_so_and_finishes() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (engine, _) = started(dir.path());
+    let (_, ids) = seed(&engine, dir.path(), &["a.png"]);
+
+    let impatient = engine
+        .writer()
+        .clone()
+        .with_reply_timeout(Duration::from_millis(50));
+    let out = impatient.run(Op::Probe(Probe {
+        favorite: Some(ids[0]),
+        hold: Duration::from_millis(400),
+        ..Default::default()
+    }));
+    assert!(
+        matches!(out, Err(WriteError::StillRunning)),
+        "a running command answered {out:?}"
+    );
+    let said = out.unwrap_err().to_string();
+    assert!(
+        said.starts_with("busy:") && said.contains("still running") && !said.contains("try again"),
+        "{said}"
+    );
+
     engine
         .writer()
         .run(Op::ClearStaged)
         .expect("the next command runs once the slow one is done");
+    assert_eq!(
+        engine.read().status().favorites,
+        1,
+        "the command its caller stopped waiting for still landed"
+    );
+}
+
+/// Review finding 7, the extract branch: asking to extract a pack mints its in-pack rows on the
+/// spot, before any worker runs. That turn never marked the catalog, so when the extraction then
+/// failed (here: the archive is gone) nothing ever did — and the rows stayed out of the read
+/// model until some unrelated write.
+#[test]
+fn rows_minted_by_an_extract_request_show_even_when_the_extraction_fails() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (engine, _) = started(dir.path());
+    let lib = dir.path().join("lib").to_string_lossy().into_owned();
+    engine
+        .writer()
+        .run(Op::PersistScan {
+            batches: vec![PersistBatch {
+                root: lib.clone(),
+                name: "lib".into(),
+                excludes_json: None,
+                records: Vec::new(),
+            }],
+            packs: vec![crate::writer::DiscoveredPack {
+                root: lib.clone(),
+                abs_path: dir
+                    .path()
+                    .join("lib")
+                    .join("gone.unitypackage")
+                    .to_string_lossy()
+                    .into_owned(),
+                display_name: "Gone".into(),
+                entries: vec![lodestash_core::catalog::PackageEntryRecord {
+                    guid: "aaaa1111bbbb2222cccc3333dddd4444".into(),
+                    pathname: Some("Assets/Gone/Rock.png".into()),
+                    tar_offset: Some(512),
+                    size_bytes: Some(16),
+                }],
+            }],
+        })
+        .expect("the pack is browsable");
+    assert_eq!(engine.read().status().in_pack, 0, "nothing minted yet");
+    let package_id = engine.read().packages()[0].id;
+
+    engine
+        .writer()
+        .run(Op::ExtractPackage { package_id })
+        .expect("accepted");
+    // The worker fails on the missing archive and reports back; wait for the tray to settle.
+    let deadline = std::time::Instant::now() + SETTLE;
+    while !engine.jobs().snapshot().active.is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the extract never settled"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    engine.writer().run(Op::ClearStaged).expect("drained");
+    assert_eq!(
+        engine.read().status().in_pack,
+        1,
+        "the minted in-pack row is in the catalog and not in the read model"
+    );
 }
 
 /// v2 spec §4.3: the read model follows the catalog generation. An agent's write — which the old

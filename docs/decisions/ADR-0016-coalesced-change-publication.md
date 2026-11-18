@@ -15,6 +15,10 @@
   connection the writer opened (SQLite's `data_version`), and the read model rebuilds when the
   catalog generation moves, so the "Library updated · Refresh" path is no longer needed for the
   backend to be current (v2 spec §4.3).
+- **Amended 2026-11-17, second** (integrity review, finding 7): Decision 1's "during a turn that
+  succeeded" is dropped — a turn is marked whenever SQLite's counters moved, **also when the
+  command then failed or panicked**. See "Amendment" below; the consequence it reverses is struck
+  through in place.
 
 ## Context
 
@@ -67,5 +71,26 @@ logged rejection in `onChanged`.
   Revisit only if a measured workflow needs selective live updates that still meet the frame budget.
 - The event shape changed from `{kind}` to `{catalog, jobs, origins, catalog_gen, jobs_gen}`; both
   consumers moved in the same commit.
-- A multi-transaction op that fails midway after committing some rows publishes nothing, because
-  the op failed. Making such ops atomic is the plan's S04, not the publisher's job.
+- ~~A multi-transaction op that fails midway after committing some rows publishes nothing, because
+  the op failed. Making such ops atomic is the plan's S04, not the publisher's job.~~ Reversed —
+  see the amendment.
+
+## Amendment (2026-11-17) — a mark means "the catalog changed", not "the command succeeded"
+
+When Decision 1 was written a mark only produced an event. Since v2 Task 2.3 the catalog
+generation is also what tells the read model to rebuild (v2 spec §4.3), so not marking a turn that
+committed rows and then failed left the read model serving the snapshot from before rows that are
+now in the catalog — until some unrelated write moved the generation. A scan whose packs step
+errors after the persist, a selection that stops half-way, a command that panics after its first
+statement: each showed stale data behind an error.
+
+The writer now marks every turn by SQLite's counters alone (`changes::mark_committed`): commands
+(succeeded, failed or panicked), the extract request's own turn (it mints the pack's in-pack rows
+before any worker runs, and was never marked), a stored embedding slice, and the idle pass as a
+whole — one mark after it, where each branch used to mark by a returned count a panic never
+reached. The caller still learns the outcome from the reply; the event only ever says that
+something moved.
+
+Tradeoff: `total_changes` also counts rows changed inside a transaction that then rolled back, so
+a failed command can cost one rebuild that finds nothing new. That is the cheap direction to be
+wrong in.
