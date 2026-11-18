@@ -44,8 +44,10 @@ client. Startup sequence:
    `catalog_id` names the catalog the app has open (M31, v1 plan S11). The v1 headless MCP server
    compared it with its own catalog before forwarding; the v2 `lodestash-mcp` has no catalog of its
    own and does not. An optional `exe` (v2 spec §6) names the app binary, which `lodestash-mcp`
-   launches again when the app is gone — the protocol's `Handshake` reads it; the app starts writing
-   it in v2 plan P3.
+   may launch again when the app is gone — its last resort, after `LODESTASH_APP` and the binary
+   installed beside it, and only as an absolute local path to a file named `lodestash-desktop`
+   ([ADR-0024](decisions/ADR-0024-the-boundary-fails-closed.md)). The protocol's `Handshake` reads
+   it; the app starts writing it in v2 plan P3.
 
    | OS | Handshake file |
    |---|---|
@@ -53,8 +55,12 @@ client. Startup sequence:
    | **macOS** | `~/Library/Application Support/Lodestash/engine.json` |
    | **Linux** | `~/.local/share/lodestash/engine.json` |
 
-   The file is **rewritten each session** (token rotates) and removed on clean shutdown. A stale
-   file (dead `pid`) is ignored by clients.
+   The file is **rewritten each session** (token rotates) and removed on clean shutdown — by the
+   process it names only, so an instance started since keeps its own (`remove_handshake`). A crash
+   removes nothing, so a stale file (dead `pid`) **must** be ignored by clients: the port in it may
+   by then belong to another program, and a request sent there hands over the token.
+   `lodestash-mcp` checks that `pid` is a running process before the version and before it
+   connects (ADR-0024).
 
    **Permissions, precisely** (`handshake.rs`): on Unix the file is `chmod 0600` after writing. On
    **Windows there is no explicit mode set** — the protection is the per-user ACL that
@@ -125,9 +131,10 @@ in-editor import (§5). Both reuse the **same dependency-closure resolution** de
 > the body is the tool's structured content (REST's containers and default limits — there is no
 > second MCP shape), an image body is an image block, and a non-2xx status is `isError` with the §4
 > envelope. Job ids are the app's own; approvals park in the app's tray. `engine.json` is read again
-> for every call; with no app answering, the MCP server launches one (`--background`, up to 20 s)
-> and otherwise answers `app_unavailable`. Nothing is retried. Details:
-> [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md) §2.
+> for every call and trusted only while the process it names is alive; with no app answering, the
+> MCP server launches one (`--background`, up to 20 s per call, one app at a time) and otherwise
+> answers `app_unavailable` — or `app_starting` while that app is still coming up. Nothing is
+> retried. Details: [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md) §2.
 
 > **Parity scope.** "1:1" covers the **agent-facing** surface. A few routes are **REST-only by
 > design** — `GET /v1/assets/{id}/file` (the MCP `resource_link` target) and the plugin-transport
@@ -248,7 +255,8 @@ than redefining, so summaries/details never diverge.
   belonged to the v1 headless server); `bytes_released` (ADR-0020); and `enabled_tools`, the agent
   operations the allow-list leaves on. A client checks these instead of assuming support. Through
   `lodestash-mcp`, `get_server_info` adds `mcp: {version, transport, handshake, port}` — the MCP
-  server's version and the handshake file and port it reached (v2 plan P4).
+  server's version and the handshake file (home directory shown as `~`) and port it reached (v2
+  plan P4).
 - **Handlers never block the runtime** (v1 plan S11). The REST plane runs on one current-thread
   runtime and calls synchronous state, so every handler runs on the blocking pool: a slow preview
   render or model load does not delay `jobs/{id}` or `cancel`. `lodestash-mcp` likewise sends each
@@ -651,8 +659,8 @@ result; same ID/different body is `request_conflict`. At least the mutation rece
 so an ambiguous retry cannot apply twice. Uncommitted approvals lost on restart fail visibly and may
 be resubmitted with the same ID for fresh approval. Never automatically replay an unknown write.
 
-The MCP server re-reads the handshake for each operation, checks the API version and sends the
-request to the app. Status/cancel use the app's job identity, not a nested local job; completed
+The MCP server re-reads the handshake for each operation, checks that the process it names is
+alive, then the API version, and sends the request to the app. Status/cancel use the app's job identity, not a nested local job; completed
 receipts remain discoverable after restart. An old missing job is `job_not_found`, never assumed
 successful. With no app answering, the MCP server launches one, else answers `app_unavailable`.
 *Shipped with S11 (2026-09-12)* except `job_not_found`: the app still answers a missing job with
@@ -668,6 +676,9 @@ Use §4's error envelope. New errors have stable codes: `invalid_argument`/`inva
 `deadline_exceeded` (504), `app_unavailable`/`archive_missing`/`not_local` (503), and
 `evidence_denied` (403). Existing auth and `tool_disabled` behavior stays intact. MCP exposes domain
 failures as `isError=true` with the same code/details; malformed protocol calls remain protocol errors.
+Two codes are `lodestash-mcp`'s own and never an HTTP status: `app_unavailable` (no app answered
+and none could be started; `detail.sent` says whether the request went out) and `app_starting`
+(the app it launched is still coming up — nothing was sent, ask again in a few seconds).
 
 New structured MCP outputs include a JSON-text fallback. Name-set parity is necessary but insufficient:
 compare normalized responses, eligibility, provenance, authorization, cache effects, persistence,

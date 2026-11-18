@@ -15,29 +15,53 @@ opens the catalog, and every tool is answered by the app's `/v1` API.
   (`get_asset_preview`) becomes an image block; a non-2xx answer becomes `isError: true` carrying
   the app's error envelope `{error: {code, message, detail}}`.
 - **`get_server_info`** adds `mcp: {version, transport, handshake, port}` to the app's answer, so a
-  host can see which server and which `engine.json` it is talking through.
+  host can see which server and which `engine.json` it is talking through. Paths a model reads —
+  here and in errors — show the home directory as `~`; the full path is in the log on stderr.
 - **One resource:** `asset://{id}/file` (the `file_resource_uri` asset summaries carry) reads the
   app's `GET /v1/assets/{id}/file`, inline up to 4 MiB.
 - **Errors.** Input the operation refuses → `isError`, code `invalid`, nothing sent. No app
   answering and none could be started → `isError`, code `app_unavailable`, with `detail` naming the
-  handshake file and whether the request was sent. An unknown tool name → a JSON-RPC error.
-  **Nothing is retried:** a request that reached the app and got no answer may have been applied.
+  handshake file and whether the request was sent (`sent`). The app this server started is still
+  coming up → `isError`, code `app_starting`, `sent: false`: ask again. An unknown tool name → a
+  JSON-RPC error. **Nothing is retried:** a request that reached the app and got no answer may have
+  been applied.
+- **Leaving.** The server exits within about a second of the host closing stdin, even with a call
+  still waiting on the app.
 
 ## Finding and starting the app
 
 On **every** call the server reads the app's handshake file (`engine.json`, ENGINE-API §1):
 `LODESTASH_ENGINE_JSON` if set, else `%LOCALAPPDATA%\Lodestash\engine.json` (Windows),
 `~/Library/Application Support/Lodestash/engine.json` (macOS), `~/.local/share/lodestash/engine.json`
-(Linux). A handshake whose `api_version` is not `v1` is refused.
+(Linux).
 
-If the file is missing or its port refuses the connection, the server launches the app with
-`--background` — detached, no stdio, outside the host's job where Windows allows it — and waits up
-to **20 s** for a `v1` handshake whose port answers. The binary is, in order:
+**The file is trusted only while the process it names is running**
+([ADR-0024](../../docs/decisions/ADR-0024-the-boundary-fails-closed.md)). Every request carries the
+session token, and a crashed app leaves its file behind while its port goes to whoever binds it
+next. So the handshake's `pid` is checked first — before the version, before a connection — and a
+file whose process is gone is treated as no file. (Windows: `OpenProcess` + `GetExitCodeProcess`;
+Linux and macOS: `kill(pid, 0)`. A pid this user cannot query is not the app. The OS reuses pids,
+so a dead app's pid can come to name some other live process; that leaves a narrow window, which
+the app closes on a clean exit by removing its file.) A *running* app whose `api_version` is not
+`v1` is refused.
+
+If the file is missing, stale, or its port refuses the connection, the server launches the app with
+`--background` — detached, in the app's own directory, no stdio, outside the host's job where
+Windows allows it — and the call waits up to **20 s** for a `v1` handshake, written by a live
+process, whose port answers. The binary is, in order:
 
 1. `LODESTASH_APP` — when set, the only candidate (if it names nothing, the answer is
    `app_unavailable`; it never falls through to another binary);
-2. the `exe` the last handshake recorded;
-3. `lodestash-desktop` (`.exe` on Windows) beside this binary.
+2. `lodestash-desktop` (`.exe` on Windows) beside this binary;
+3. the `exe` the last handshake recorded — the least trusted, since it is a string in a file. It
+   is used only when it is an absolute path on a local disk (no UNC or network-drive path on
+   Windows; on Linux and macOS a network mount is not told apart) to a file named
+   `lodestash-desktop` or `lodestash-desktop.exe`.
+
+**One launch at a time.** The process the server started is remembered while it runs. If it takes
+longer than one call's 20 s to come up, that call and the ones after it answer `app_starting` and
+wait for the same process — none starts a second app. A start that exits with a failure before
+publishing is reported at once as `app_unavailable`.
 
 The launched app is given `LODESTASH_ENGINE_JSON` naming the file the server waits on.
 
@@ -98,7 +122,9 @@ a tool switched off there answers `tool_disabled`, and gated tools wait for appr
 
 `cargo test -p lodestash-mcp` — the built binary over real stdio JSON-RPC against today's `/v1`
 router on a temp catalog (`tests/e2e.rs`), launching fake app executables (`tests/launch.rs`,
-unit tests in `src/launch.rs`), `tools/list` against the catalog (`tests/stdio.rs`), and the
-dependency rule (`tests/deps.rs`: no catalog, SQLite, engine or server crate in the normal tree).
-Every test points the server at a temp `engine.json` and an app binary of its own; none touches the
-real handshake file.
+unit tests in `src/launch.rs` and `src/forward.rs`), `tools/list` against the catalog
+(`tests/stdio.rs`), and the dependency rule (`tests/deps.rs`: no catalog, SQLite, engine or server
+crate in the normal tree). The trust rules are tested against a raw listener that is *not* the app
+(`tests/common/raw.rs`): a dead process's handshake gets no connection, a dropped request is sent
+exactly once, another API version is sent nothing. Every test points the server at a temp
+`engine.json` and an app binary of its own; none touches the real handshake file.

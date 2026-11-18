@@ -206,7 +206,9 @@ REST paths under the same conventions.
 ## 6. HTTP server (`lodestash-api`)
 
 - **Bind:** `127.0.0.1`, ephemeral port; write `engine.json` (existing fields plus `exe`, the
-  path to the running binary, used by the MCP launcher). Remove it on clean exit.
+  path to the running binary, used by the MCP launcher). Remove it on clean exit — *as built
+  (2026-11-17):* the desktop calls `lodestash_api::remove_handshake` on `RunEvent::Exit`, and it
+  removes the file only while it still names this process's pid (a newer instance's file stays).
 - **Caller identity:**
   - *Agent*: `Authorization: Bearer <engine.json token>`. Agent calls go through the per-tool
     allow-list and the approval gates exactly as today (`ENGINE-API.md` §8.4).
@@ -236,10 +238,15 @@ REST paths under the same conventions.
   relays the app's body and status as the tool result (`isError` on non-2xx). One generic
   implementation serves every tool.
 - **Finding the app:** read `engine.json` on every call (an app restarted onto a new port is
-  picked up). If it is missing, or the port refuses, launch the app with `--background` — binary
-  from `LODESTASH_APP`, else `engine.json`'s last `exe`, else a sibling `lodestash-desktop` next to
-  the MCP binary — and wait up to 20 s for a handshake whose `api_version` is `v1`. Otherwise
-  answer `app_unavailable`.
+  picked up). A handshake is an address only while the process it names (`pid`) is running —
+  checked before the version and before anything is sent, because the request carries the token
+  ([ADR-0024](../../decisions/ADR-0024-the-boundary-fails-closed.md)). If the file is missing,
+  names a dead process, or its port refuses, launch the app with `--background` — binary from
+  `LODESTASH_APP`, else a sibling `lodestash-desktop` next to the MCP binary, else `engine.json`'s
+  last `exe` (only as an absolute local path to a file named `lodestash-desktop`) — and wait up to
+  20 s for a handshake whose `api_version` is `v1`. Otherwise answer `app_unavailable`, or the
+  retryable `app_starting` while an app this server started is still coming up: one launched app at
+  a time.
 - **Never retried.** A request that timed out after it was sent may still land (ADR-0011's rule
   stands).
 - **Transport:** stdio first. Streamable HTTP on `127.0.0.1:4319` (the design's Settings → MCP card:
@@ -262,6 +269,20 @@ REST paths under the same conventions.
     handles first, or the background app would hold the host's pipes open after the server exits.
   - The `asset://{id}/file` resource stays, read through the `asset_file` operation's route (the
     resource summaries advertise; a resource is not a tool, so `Engine` audience is no barrier).
+- *As built (boundary review, 2026-11-17; ADR-0024):*
+  - **Liveness** is `OpenProcess` + `GetExitCodeProcess` on Windows and `kill(pid, 0)` on Linux and
+    macOS — no new dependency. A pid this user cannot query is not the app and reads as dead. The
+    same test applies to the handshake a launched app publishes, so a dead app's file is never
+    mistaken for the new app's. A **live** app of another API version that answers is refused at
+    once (launching would not help); a dead one's file is just stale.
+  - **One launch.** The started process is remembered while it runs. A call that arrives meanwhile
+    waits for that process's handshake for its own 20 s and then answers `app_starting`
+    (`detail.sent: false`); a start that exits with a failure is reported to every call waiting on
+    it. The app starts in its own directory, not the host's.
+  - **Leaving.** The server exits within about a second of the host closing stdin, even with a
+    call still waiting on the app (it used to wait out the call — up to 120 s).
+  - **What a model reads** names files with the home directory shown as `~`: the handshake path in
+    error `detail` and in `get_server_info`'s `mcp.handshake`, and binary paths in messages.
 
 ## 8. Desktop shell (`lodestash-desktop`)
 

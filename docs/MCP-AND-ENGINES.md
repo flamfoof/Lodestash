@@ -72,16 +72,25 @@ against the `claude-api` skill before implementing.
   unknown tool name is a JSON-RPC error. `get_server_info` adds `mcp: {version, transport,
   handshake, port}` — this server's version and the handshake file and port it used.
 - **Finding the app.** `engine.json` is read on **every** call (`LODESTASH_ENGINE_JSON` overrides
-  the platform path), so an app started or restarted onto a new port is found. A handshake whose
-  `api_version` is not `v1` is refused. When the file is missing or its port refuses, the server
-  launches the app with `--background` — `LODESTASH_APP`, else the handshake's `exe`, else
-  `lodestash-desktop` beside the MCP binary — and waits up to 20 s for a handshake that answers;
-  otherwise the tool answers `app_unavailable` (an `isError` result, not a protocol error). A
-  launched app is detached, gets no stdio, and on Windows inherits none of the host's pipes.
+  the platform path), so an app started or restarted onto a new port is found. **The file is an
+  address only while the process it names is running**
+  ([ADR-0024](decisions/ADR-0024-the-boundary-fails-closed.md)): the request carries the session
+  token, so `pid` is checked before the version and before anything is sent, and a file left by a
+  dead app is never a place to send to — whoever holds its port now. A *running* app whose
+  `api_version` is not `v1` is refused. When the file is missing, stale, or its port refuses, the
+  server launches the app with `--background` — `LODESTASH_APP`, else `lodestash-desktop` beside
+  the MCP binary, else the handshake's `exe` (only as an absolute local path to a file named
+  `lodestash-desktop`) — and each call waits up to 20 s for a handshake that answers. **One app is
+  launched at a time**: while the one this server started is still coming up, later calls wait for
+  it and answer `app_starting` (ask again) instead of starting another; otherwise the tool answers
+  `app_unavailable`. Both are `isError` results, not protocol errors, and their `detail` names the
+  handshake file with the home directory as `~`. A launched app is detached, starts in its own
+  directory, gets no stdio, and on Windows inherits none of the host's pipes.
   **Nothing is retried**: a request that reached the app and got no answer may still have been
   applied (ADR-0011's rule, kept).
 - **Transport**: **stdio** (zero network surface of its own, exactly what Codex and Claude Code
-  expect). stdout carries only JSON-RPC — logs go to stderr — and the process exits on stdin EOF.
+  expect). stdout carries only JSON-RPC — logs go to stderr — and the process exits within about a
+  second of stdin EOF, even with a call still waiting on the app.
   Optional **Streamable HTTP** for multiple/remote clients follows (v2 spec §7: the app's "Enable MCP
   server" toggle runs `lodestash-mcp --http 4319`; same loopback + token + origin rules), on a
   **stable configurable port (default 4319)** — unlike the engine API's ephemeral port — since MCP

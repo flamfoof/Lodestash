@@ -761,6 +761,8 @@ tracking; these cards track phases).
 - [ ] **V2-P6** Web foundation in `web/` — contract extractor, tokens, primitives, data layer, fixture catalog, gate
 - [ ] **V2-P7** Screens rebuilt against the contract, in spec order
 - [ ] **V2-P8** Per-stage failure state, pinned downloads, delete fence, SQL read model, MCP over HTTP, doc reconciliation
+- [ ] **V2-R1** Boundary review fixes (2026-11-17, [ADR-0024](decisions/ADR-0024-the-boundary-fails-closed.md)) — the protocol, MCP server, HTTP API and config store resolve absent, stale and ambiguous input in the closed direction. Three slices: MCP trust and launch (done, below); settings and config store; API gate and MCP↔REST defaults
+- [x] **V2-R1a** MCP trust and launch — a handshake is an address only while its process is alive (`pid_alive`, checked before the version and before the token is sent; the desktop's `remove_handshake` on a clean exit), the handshake's `exe` is the last and a constrained candidate (`trusted_exe`), one launched app at a time (`Launcher`, the retryable `app_starting`), the server leaves within a second of stdin closing, and paths a model reads show the home directory as `~` *(2026-11-17)*
 
 ## In Review
 *(empty)*

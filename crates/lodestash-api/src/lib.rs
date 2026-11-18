@@ -70,7 +70,7 @@ pub struct TagProposal {
     pub confidence: Option<f64>,
 }
 
-pub use handshake::{handshake_path, write_handshake, Handshake};
+pub use handshake::{handshake_path, remove_handshake, write_handshake, Handshake};
 pub use routes::{package_json, project_json, router, summary_json};
 
 /// Every agent-facing operation in ENGINE-API §2, by MCP tool name. The MCP crate asserts its
