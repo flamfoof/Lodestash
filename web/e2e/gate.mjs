@@ -73,15 +73,12 @@ const PAGES = [
   { label: "gallery", hash: "", state: "library", anchors: GALLERY, skip: ["pos"] },
   // The shell alone: every frame anchor, with positions.
   { label: "shell", hash: "#shell", state: "library", anchors: [...FRAME_ANCHORS], skip: [] },
+  // The Library screen in the shell, on the prototype's data: the whole state, with positions.
+  { label: "library", hash: "#library", state: "library", anchors: Object.keys(ANCHORS.library), skip: [] },
 ];
 
 /** Anchors no page reproduces yet, per state, and the plan task that will measure them. */
 const DEFERRED = {
-  library: Object.fromEntries(
-    Object.keys(ANCHORS.library)
-      .filter((name) => !GALLERY.includes(name) && !FRAME_ANCHORS.includes(name))
-      .map((name) => [name, "the Library screen — plan P7 Task 7.6"]),
-  ),
   "library+inspector": Object.fromEntries(
     Object.keys(ANCHORS["library+inspector"]).map((name) => [name, "the Inspector — plan P7 Task 7.7"]),
   ),
