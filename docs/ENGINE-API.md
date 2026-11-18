@@ -371,6 +371,13 @@ Unity's real `dest_path`/`guid` and flips the job `done` — the `UNIQUE(asset_i
 dup-guard applies at that write. This is exercised end-to-end headless by a simulated plugin
 (register → approve → poll → ack → re-import is dup-guarded).
 
+**An acked `dest_path` must be a plain project-relative path** (`Assets/Wildlife/Beaver.fbx`):
+no root (`/x`, `\x`, `\\server\x`), no drive or stream (`C:x`), no `.`/`..` or empty component.
+Batch undo joins that path onto the project root and deletes what it finds
+([`DATA-MODEL.md`](DATA-MODEL.md) §9), so an ack carrying any other shape is refused whole —
+before the queue entry is taken, so the plugin can ack again — and `Catalog::record_imports`
+refuses it a second time at the write.
+
 Still interim until the real **UPM plugin** lands:
 
 - **The queue poll returns immediately**, not the spec's ~25 s long-poll — a busy-poll cost, not a

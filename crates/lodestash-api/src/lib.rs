@@ -1449,6 +1449,20 @@ impl ServerState {
                 );
                 return Err(AckError::UnknownRequest);
             }
+            // `dest_path` is joined onto the project root and deleted by batch undo, so only a
+            // plain project-relative path is recorded — refused here, before the entry is taken,
+            // so the plugin can ack again with the real paths.
+            if let Some(bad) = imported
+                .iter()
+                .find(|a| !lodestash_core::types::is_plain_relative_path(&a.dest_path))
+            {
+                return Err(AckError::Db(lodestash_core::error::CoreError::Invalid(
+                    format!(
+                        "dest_path {:?} for asset {} is not a path inside the project",
+                        bad.dest_path, bad.asset_id
+                    ),
+                )));
+            }
             q.remove(pos)
         };
         let ids: Vec<i64> = imported.iter().map(|a| a.asset_id).collect();

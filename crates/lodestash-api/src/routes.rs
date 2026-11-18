@@ -1323,6 +1323,29 @@ mod tests {
             Err(crate::AckError::UnknownRequest)
         ));
 
+        // So is an ack whose `dest_path` is not a path inside the project: batch undo joins that
+        // path onto the project root and deletes what it finds, so `\Users\x`, `C:x` and `..`
+        // are refused at the door — before the queue entry is taken, like the check above.
+        for hostile in ["\\Users\\x\\keep.txt", "C:keep.txt", "../keep.txt"] {
+            let bad: Vec<crate::AckAsset> = reqs[0]
+                .assets
+                .iter()
+                .map(|a| crate::AckAsset {
+                    asset_id: a.id,
+                    dest_path: hostile.into(),
+                    unity_guid: None,
+                })
+                .collect();
+            match st.ack_import(&reqs[0].request_id, bad) {
+                Err(crate::AckError::Db(e)) => assert_eq!(
+                    e.kind(),
+                    lodestash_core::error::ErrorKind::Invalid,
+                    "{hostile:?}: {e}"
+                ),
+                other => panic!("{hostile:?} was acked: {other:?}"),
+            }
+        }
+
         // Simulate the Unity plugin acking with a real in-project path + GUID.
         let req0 = &reqs[0];
         let imported: Vec<crate::AckAsset> = req0

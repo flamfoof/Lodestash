@@ -144,6 +144,14 @@ pub enum Op {
         roots: Vec<PathBuf>,
         workspace: Option<PathBuf>,
     },
+    /// Reclaim the workspace folders no live asset resolves through (UI-SPEC §11.4) — what it
+    /// removed goes back on `outcome` ([`crate::storage::reclaim_workspace`]).
+    ///
+    /// On this thread because it deletes: "what is referenced" is read and acted on in one turn
+    /// no extraction can interleave with, and an engine with no catalog has no writer to run it.
+    ReclaimWorkspace {
+        outcome: Sender<crate::storage::ReclaimOutcome>,
+    },
     /// Record a finished crawl: upsert the source and reconcile its assets (INGESTION §1).
     ///
     /// The **crawl** does not happen here. It is a disk walk that can take minutes, and the writer
@@ -688,7 +696,9 @@ impl JobRegistry {
         self.changes.jobs();
     }
 
-    fn has_active_extract(&self) -> bool {
+    /// Is a pack being analysed or extracted right now? The one-at-a-time queue gates on it, and
+    /// the workspace reclaim refuses under it.
+    pub(crate) fn has_active_extract(&self) -> bool {
         self.inner
             .lock()
             .expect("job registry lock")
@@ -1906,6 +1916,18 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, St
             workspace,
         } => delete_from_disk(catalog, targets, &roots, workspace.as_deref()),
 
+        Op::ReclaimWorkspace { outcome } => {
+            let done =
+                crate::storage::reclaim_on_writer(catalog, ctx.workspace_dir.as_deref(), jobs)?;
+            let changed = done.removed;
+            // The caller is waiting on this op's reply; a receiver that has gone changes nothing.
+            let _ = outcome.send(done);
+            Ok(WriteResult {
+                changed,
+                ..Default::default()
+            })
+        }
+
         // `persist_to_catalog` opens its **own** connection, which would be a second writer
         // anywhere else. Running it on this thread is what keeps the rule true: this thread's own
         // connection sits idle for the duration, and no other job can interleave with it.
@@ -2644,7 +2666,11 @@ fn undo_export_batch(catalog: &mut Catalog, batch_id: &str) -> Result<WriteResul
     if files.is_empty() {
         return Err("that export is no longer in the history".into());
     }
-    let roots = catalog.source_roots().unwrap_or_default();
+    // The sandbox is only a fence while the roots are known. With none it admits every folder,
+    // so a roots query that fails refuses the undo instead of running it unfenced.
+    let roots = catalog.source_roots().map_err(|e| {
+        format!("the library's source roots could not be read ({e}) — nothing was undone")
+    })?;
 
     let mut removed = 0usize;
     let mut refused = 0usize;
@@ -2700,6 +2726,51 @@ fn undo_export_batch(catalog: &mut Catalog, batch_id: &str) -> Result<WriteResul
     })
 }
 
+/// What batch undo may do about one recorded import file.
+enum ProjectFile {
+    /// Delete this — it resolves inside the project.
+    Delete(PathBuf),
+    /// Already gone: nothing to delete, and not a failure.
+    Gone,
+    /// Not a path inside the project. Never touched.
+    Refused,
+}
+
+/// Fence one import record to its project (review finding 3): `dest_path` must be a plain relative
+/// path, and the folder it names must **resolve** inside `project_root`.
+///
+/// The old fence asked `Path::is_absolute`, which on Windows is false for a root-relative
+/// (`\Users\x`) or drive-relative (`C:f`) path — and `Path::join` then discards the base, so the
+/// delete landed wherever the record pointed. Resolving the parent also stops a link inside the
+/// project from carrying the delete out of it.
+fn project_file(project_root: &Path, dest_path: &str) -> ProjectFile {
+    if !lodestash_core::types::is_plain_relative_path(dest_path) {
+        return ProjectFile::Refused;
+    }
+    // Component by component: `project_root` is canonical, and on Windows a canonical (`\\?\`)
+    // path does not treat `/` as a separator, so a plain `join("Assets/x.png")` would name a
+    // file that cannot exist.
+    let mut abs = project_root.to_path_buf();
+    for part in dest_path.split(['/', '\\']) {
+        abs.push(part);
+    }
+    let (Some(parent), Some(name)) = (abs.parent(), abs.file_name()) else {
+        return ProjectFile::Refused;
+    };
+    if !abs.starts_with(project_root) {
+        return ProjectFile::Refused;
+    }
+    match parent.canonicalize() {
+        Ok(real_parent) if real_parent.starts_with(project_root) => {
+            ProjectFile::Delete(real_parent.join(name))
+        }
+        Ok(_) => ProjectFile::Refused,
+        // The folder it was copied into is gone, so the file is.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ProjectFile::Gone,
+        Err(_) => ProjectFile::Refused,
+    }
+}
+
 fn undo_import_batch(catalog: &Catalog, batch_id: &str) -> Result<WriteResult, String> {
     // Through the writer's own connection: this used to open a raw one, without the catalog's
     // pragmas or busy timeout (review R5).
@@ -2708,36 +2779,54 @@ fn undo_import_batch(catalog: &Catalog, batch_id: &str) -> Result<WriteResult, S
         .map_err(|e| e.to_string())?;
 
     // Delete the copied files first, while the paths are still known — the records go only
-    // after the files, so a failed delete never strands a record pointing at nothing. A missing
-    // file counts as refused (already gone), an error as failed.
+    // after the files, and only when none is left behind. A missing file counts as refused
+    // (already gone), an error as failed.
     let mut failed = 0usize;
     let mut refused = 0usize;
-    for (project_path, dest_path) in &files {
-        let dest = Path::new(dest_path);
-        // Fence the one destructive path (HANDOFF §6): `dest_path` is project-relative, so a
-        // non-relative path or a `..` component must never resolve outside the project root.
-        if dest.is_absolute()
-            || dest
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            refused += 1;
-            continue;
+    // Each project root resolved once. A root that does not resolve — the project moved, its
+    // drive is unplugged — gives nothing to judge a path against: the undo is refused whole and
+    // its records kept, rather than every file counted "already gone" and the batch forgotten.
+    let mut roots: std::collections::HashMap<&str, PathBuf> = std::collections::HashMap::new();
+    for (project_path, _) in &files {
+        if !roots.contains_key(project_path.as_str()) {
+            let real = Path::new(project_path).canonicalize().map_err(|e| {
+                format!(
+                    "the project folder {project_path} is not available ({e}) — nothing was undone"
+                )
+            })?;
+            roots.insert(project_path, real);
         }
-        let abs = Path::new(project_path).join(dest);
-        match std::fs::remove_file(&abs) {
-            Ok(()) => {
-                // Unity's import sidecar, if it exists — leaving it would half-undo the import.
-                let _ = std::fs::remove_file(PathBuf::from(format!("{}.meta", abs.display())));
+    }
+    for (project_path, dest_path) in &files {
+        match project_file(&roots[project_path.as_str()], dest_path) {
+            ProjectFile::Refused => {
+                tracing::warn!(%project_path, %dest_path, "import undo refused a path outside the project");
+                refused += 1;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => refused += 1,
-            Err(_) => failed += 1,
+            ProjectFile::Gone => refused += 1,
+            ProjectFile::Delete(abs) => match std::fs::remove_file(&abs) {
+                Ok(()) => {
+                    // Unity's import sidecar, if it exists — leaving it would half-undo the import.
+                    let _ = std::fs::remove_file(PathBuf::from(format!("{}.meta", abs.display())));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => refused += 1,
+                Err(e) => {
+                    tracing::warn!(path = %abs.display(), %e, "import undo could not delete a file");
+                    failed += 1;
+                }
+            },
         }
     }
 
-    let changed = catalog
-        .forget_import_batch(batch_id)
-        .map_err(|e| e.to_string())?;
+    // Forgotten only once the files are dealt with, like an export's: a batch left half-deleted
+    // keeps its records, so it stays listed and can be undone again.
+    let changed = if failed == 0 {
+        catalog
+            .forget_import_batch(batch_id)
+            .map_err(|e| e.to_string())?
+    } else {
+        0
+    };
     Ok(WriteResult {
         changed,
         failed,
@@ -2924,7 +3013,8 @@ fn remove_from_library(
     // must not bring the asset back either (DATA-MODEL §9).
     let changed = catalog.retire_assets(&ids).map_err(|e| e.to_string())?;
 
-    let mut excluded = 0;
+    // What the open project's config is handed: `(source root, exclusion)` per removed file.
+    let mut mirror: Vec<(String, Exclude)> = Vec::new();
     for t in &targets {
         let Some(root) = t.source_root.as_deref() else {
             continue; // in-pack asset: no source-relative file for the crawler to skip
@@ -2935,15 +3025,40 @@ fn remove_from_library(
         else {
             continue;
         };
-        // `Asset` matches the full source-relative path or the bare file name
-        // (`Exclude::matches`), so this excludes exactly the file the user removed.
+        // Anchored, so it names this one path. A bare `rock.png` — what a file at the source
+        // root used to be written as — also matches every `rock.png` in every folder
+        // (`Exclude::matches`), and the next scan dropped them all (review finding 5).
+        let value = Exclude::anchored(&t.rel_path);
         catalog
-            .add_source_exclude(source.id, "asset", &t.rel_path)
+            .add_source_exclude(source.id, "asset", &value)
             .map_err(|e| e.to_string())?;
-        sync_source_exclude_to_config(catalog, ctx, source.id, "asset", &t.rel_path, true)?;
-        excluded += 1;
+        mirror.push((
+            source.root_path,
+            Exclude {
+                kind: ExcludeKind::Asset,
+                value,
+            },
+        ));
     }
-    tracing::info!(rows = changed, excluded, "removed from library");
+    // One config write for the whole selection (it is a whole-file save and a round of change
+    // observers each time), and none when no project is open to mirror into.
+    if !mirror.is_empty() && ctx.config.read(|c| c.last_project_name.is_some()) {
+        ctx.config
+            .update(|config| {
+                let Some(project) = config.last_project_name.clone() else {
+                    return;
+                };
+                for (root, exclude) in &mirror {
+                    config.add_source_exclude(&project, Path::new(root), exclude.clone());
+                }
+            })
+            .map_err(|e| e.to_string())?;
+    }
+    tracing::info!(
+        rows = changed,
+        excluded = mirror.len(),
+        "removed from library"
+    );
     Ok(WriteResult {
         changed,
         ..Default::default()
@@ -3324,6 +3439,223 @@ mod tests {
 
         // An unknown batch is an error, not a silent no-op that reads as success.
         assert!(undo_export_batch(&mut c, "no-such-batch").is_err());
+    }
+
+    /// The export undo's "never inside a library root" fence needs the roots. When they cannot
+    /// be read, the undo refuses — it used to carry on with none, which is every folder allowed
+    /// (review finding 1's audit).
+    #[test]
+    fn undoing_an_export_refuses_when_the_library_roots_cannot_be_read() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(&lib).expect("mkdir lib");
+        std::fs::write(lib.join("inside.fbx"), b"library file").expect("w");
+        let db = dir.path().join("catalog.db");
+        let mut c = Catalog::open(&db).expect("open");
+        c.upsert_import_source("Lib", &lib.to_string_lossy(), "folder")
+            .expect("src");
+        c.record_exports(
+            "batch",
+            &lib.to_string_lossy(),
+            &[(None, "inside.fbx".to_string())],
+        )
+        .expect("record");
+        // The roots query now fails; the export history still reads.
+        rusqlite::Connection::open(&db)
+            .expect("raw")
+            .execute_batch("ALTER TABLE import_source RENAME TO import_source_gone;")
+            .expect("break the roots query");
+        assert!(
+            c.source_roots().is_err(),
+            "the fixture must break the query"
+        );
+
+        assert!(
+            undo_export_batch(&mut c, "batch").is_err(),
+            "the undo ran without knowing the library roots"
+        );
+        assert!(
+            lib.join("inside.fbx").exists(),
+            "a file inside a library root was deleted"
+        );
+        assert_eq!(
+            c.export_batch_files("batch").expect("history").len(),
+            1,
+            "a refused undo keeps its record"
+        );
+    }
+
+    /// A file catalog with one project registered at `project` and `dest_paths` recorded as the
+    /// import batch `batch` — inserted raw, the way a build without the ack fence stored them.
+    fn import_batch(dir: &Path, project: &Path, dest_paths: &[&str]) -> Catalog {
+        let db = dir.join("catalog.db");
+        let mut c = Catalog::open(&db).expect("open");
+        c.seed_media_types().expect("seed");
+        let src = c
+            .upsert_import_source("Lib", &dir.join("lib").to_string_lossy(), "folder")
+            .expect("source");
+        let records: Vec<lodestash_core::catalog::CrawlRecord> = (0..dest_paths.len())
+            .map(|i| lodestash_core::catalog::CrawlRecord {
+                rel_path: format!("a{i}.png"),
+                name: format!("a{i}.png"),
+                media_type: "image".into(),
+                size_bytes: 1,
+                mtime: 1,
+                workspace_rel: None,
+                content_hash: None,
+            })
+            .collect();
+        c.record_crawl(src, None, &records).expect("crawl");
+        let project_id = c
+            .register_project(&project.to_string_lossy(), None, None)
+            .expect("project");
+        let raw = rusqlite::Connection::open(&db).expect("raw");
+        let assets: Vec<i64> = raw
+            .prepare("SELECT id FROM asset ORDER BY id")
+            .expect("prep")
+            .query_map([], |r| r.get(0))
+            .expect("ids")
+            .collect::<Result<_, _>>()
+            .expect("id rows");
+        for (asset_id, dest) in assets.iter().zip(dest_paths) {
+            raw.execute(
+                "INSERT INTO import_record
+                     (asset_id, project_id, dest_path, with_deps, imported_at, batch_id)
+                     VALUES (?1, ?2, ?3, 1, 0, 'batch')",
+                rusqlite::params![asset_id, project_id, dest],
+            )
+            .expect("import record");
+        }
+        c
+    }
+
+    /// `path` without its drive — `\Users\x\f` on Windows. `Path::is_absolute` is false for that
+    /// there, yet `Path::join` lets it replace everything but the drive of what it is joined onto.
+    fn root_relative(path: &Path) -> String {
+        let s = path.to_string_lossy().into_owned();
+        match s.split_once(':') {
+            Some((_drive, rest)) if cfg!(windows) => rest.to_string(),
+            _ => s,
+        }
+    }
+
+    /// Batch undo deletes files, so every recorded path is fenced to the project (review finding
+    /// 3). The old fence asked `Path::is_absolute`, which on Windows is false for a root-relative
+    /// path — and the join then threw the project root away and deleted wherever it pointed.
+    #[test]
+    fn undoing_an_import_never_deletes_outside_the_project() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(project.join("Assets")).expect("mkdir");
+        std::fs::write(project.join("Assets").join("Good.png"), b"copy").expect("w");
+        std::fs::write(project.join("Assets").join("Good.png.meta"), b"meta").expect("w");
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, b"do not touch").expect("w");
+
+        let rooted = root_relative(&outside);
+        let c = import_batch(
+            dir.path(),
+            &project,
+            &[
+                "Assets/Good.png",
+                &rooted,
+                "../outside.txt",
+                "Assets/../../outside.txt",
+            ],
+        );
+        let r = undo_import_batch(&c, "batch").expect("undo");
+        assert!(
+            outside.exists(),
+            "undo deleted a file outside the project ({rooted:?})"
+        );
+        assert_eq!(r.refused, 3, "every path leaving the project is refused");
+        assert_eq!(r.failed, 0);
+        assert!(
+            !project.join("Assets").join("Good.png").exists(),
+            "the import's own copy was not deleted"
+        );
+        assert!(
+            !project.join("Assets").join("Good.png.meta").exists(),
+            "its Unity sidecar was left behind"
+        );
+        assert!(
+            c.import_batch_files("batch").expect("records").is_empty(),
+            "a finished undo left its records behind"
+        );
+        assert_eq!(r.changed, 4, "every record of the batch was forgotten");
+    }
+
+    /// A link inside the project must not carry the delete out of it: the folder a recorded file
+    /// sits in has to *resolve* inside the project root, not merely be spelled under it.
+    #[test]
+    fn undoing_an_import_does_not_follow_a_link_out_of_the_project() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let project = dir.path().join("proj");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(project.join("Assets")).expect("mkdir");
+        std::fs::create_dir_all(&elsewhere).expect("mkdir");
+        std::fs::write(elsewhere.join("keep.txt"), b"not the project's").expect("w");
+        let link = project.join("Assets").join("Linked");
+        #[cfg(windows)]
+        {
+            // A junction: a directory link that needs no privilege to create.
+            let made = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&link)
+                .arg(&elsewhere)
+                .output()
+                .expect("mklink runs");
+            assert!(made.status.success(), "junction: {made:?}");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&elsewhere, &link).expect("symlink");
+        assert!(link.join("keep.txt").exists(), "the link resolves");
+
+        let c = import_batch(dir.path(), &project, &["Assets/Linked/keep.txt"]);
+        let r = undo_import_batch(&c, "batch").expect("undo");
+        assert!(
+            elsewhere.join("keep.txt").exists(),
+            "undo followed a link out of the project and deleted there"
+        );
+        assert_eq!((r.refused, r.failed), (1, 0));
+    }
+
+    /// The records go only once the files are dealt with. A batch with a file that could not be
+    /// deleted keeps its records, so it stays listed and can be undone again — they used to be
+    /// forgotten whatever happened, which the comment above the loop said could not happen.
+    #[test]
+    fn an_import_undo_that_could_not_finish_keeps_its_records() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let project = dir.path().join("proj");
+        // A directory where a file was recorded: `remove_file` fails on it, and not as "missing".
+        std::fs::create_dir_all(project.join("Assets").join("Stuck.png")).expect("mkdir");
+        std::fs::write(project.join("Assets").join("Good.png"), b"copy").expect("w");
+        let c = import_batch(
+            dir.path(),
+            &project,
+            &["Assets/Good.png", "Assets/Stuck.png"],
+        );
+
+        let r = undo_import_batch(&c, "batch").expect("undo");
+        assert_eq!(r.failed, 1, "the stuck entry is reported as failed");
+        assert!(!project.join("Assets").join("Good.png").exists());
+        assert_eq!(r.changed, 0, "nothing is forgotten while a file is left");
+        assert_eq!(
+            c.import_batch_files("batch").expect("records").len(),
+            2,
+            "a half-finished undo lost track of what it left on disk"
+        );
+
+        // And with the project folder gone entirely there is nothing to judge the paths against:
+        // refused as a whole, records kept — not "already gone, forget it".
+        std::fs::create_dir_all(dir.path().join("second")).expect("mkdir");
+        let gone = import_batch(
+            &dir.path().join("second"),
+            &dir.path().join("no-such-project"),
+            &["Assets/Good.png"],
+        );
+        assert!(undo_import_batch(&gone, "batch").is_err());
+        assert_eq!(gone.import_batch_files("batch").expect("records").len(), 1);
     }
 
     /// `n` queued `ExtractPackage` jobs. The reply receivers come back with them: dropping one

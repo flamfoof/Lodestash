@@ -204,6 +204,15 @@ to a single entry; reaching any entry means decompressing from the start. Lodest
   `.unitypackage` no longer resolves is never reclaimed at all, because the extracted copy is then
   the only one, and its row offers **Retarget…** (UI-SPEC §15) instead.
 
+  **The sweep fails closed (2026-11-17).** "What is referenced" is a `Result`: with no catalog
+  (the engine is not Ready — a second Lodestash refused the lock shares this workspace) or a
+  failed query there is no plan and no sweep, where an empty set used to mean *delete every
+  folder*. Referenced means **every** asset row with a `workspace_rel`, trashed ones included — a
+  trashed asset is restorable and its extracted bytes may be the only copy. The sweep runs on the
+  writer thread (`Op::ReclaimWorkspace`), reading the set and deleting in one turn, and refuses
+  while a pack is being analysed or extracted: an extraction places its files before it records
+  them, and writes through `<workspace>/.tmp`.
+
 - **Workspace retention (warm reopens)** — extracted payloads **persist across sessions**, so a pack
   opened today is still random-access on disk tomorrow with zero re-extraction. Eviction is
   **size-cap first, then age**: within the cap nothing is evicted; under cap pressure, LRU order —

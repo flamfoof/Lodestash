@@ -762,6 +762,13 @@ record is not something to do quietly. Below it, cached packs largest-first with
 pack whose archive has gone reads **archive missing**, is never reclaimed, and offers
 **Retarget…** (§15).
 
+**Reclaim refuses rather than guesses.** Both the size line and the sweep answer only when the
+engine is Ready and the catalog can say what is still referenced; otherwise nothing is measured
+(the size line stays at zero and the button disabled) and a sweep answers with the reason instead
+of removing anything — "could not find out" is never read as "nothing is referenced". The sweep
+also refuses while a pack is being analysed or extracted, and a file
+belonging to an asset in the Trash counts as referenced ([`INGESTION.md`](INGESTION.md) §2).
+
 *(The old text promised a workspace **cap** and a **Clear workspace** action. Neither shipped, and
 neither is planned: a size cap needs last-used times the workspace does not record, and "clear
 everything" is the wrong verb for a store where one folder may be a pack's only surviving copy.

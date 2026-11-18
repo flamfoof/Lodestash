@@ -724,6 +724,36 @@ fn register_project_upserts_activates_and_dup_guards_imports() {
         cross[0],
         ImportOutcome::Recorded { asset_id: 1, .. }
     ));
+
+    // A `dest_path` is joined onto the project root and deleted by batch undo, so one that is not
+    // project-relative is refused whole — the honest spec beside it is not recorded either.
+    for hostile in [
+        "\\Users\\x\\keep.txt",
+        "C:keep.txt",
+        "../keep.txt",
+        "/etc/x",
+    ] {
+        let mut batch = specs(&[2]);
+        batch.push(ImportSpec {
+            asset_id: 1,
+            source_package_id: None,
+            dest_path: hostile.into(),
+            unity_guid: None,
+            with_deps: true,
+        });
+        let err = c
+            .record_imports(p2, &batch, "batch-hostile")
+            .expect_err("a dest_path outside the project was recorded");
+        assert_eq!(
+            err.kind(),
+            crate::error::ErrorKind::Invalid,
+            "{hostile:?}: {err}"
+        );
+    }
+    assert!(
+        c.import_batch_files("batch-hostile").unwrap().is_empty(),
+        "a refused batch left rows behind"
+    );
 }
 
 /// Source availability (UI-SPEC §11.1, M18).
@@ -3025,6 +3055,36 @@ fn a_trashed_row_is_not_repointed() {
     let rows = c.assets_for_source(src).expect("read");
     let is_trashed = |id| rows.iter().find(|r| r.asset_id == id).unwrap().trashed;
     assert!(is_trashed(trashed) && !is_trashed(fresh));
+}
+
+/// The workspace sweep deletes what this set does not name, so the set covers every row that
+/// can still come back — an asset in the Trash is restorable, and its extracted bytes may be the
+/// only copy left (the pack's archive gone). The query used to skip trashed rows while its own
+/// comment said their bytes "are not garbage".
+#[test]
+fn a_trashed_assets_workspace_file_is_still_referenced() {
+    let with_ws = |rel: &str, ws: &str| CrawlRecord {
+        workspace_rel: Some(ws.to_string()),
+        ..rec(rel, 1, 1)
+    };
+    let (c, src) = source_with(&[
+        with_ws("live.png", "aaa/live.png"),
+        with_ws("binned.png", "bbb/binned.png"),
+        rec("loose.png", 1, 1),
+    ]);
+    c.set_trashed(&[id_at(&c, src, "binned.png")], true)
+        .expect("trash");
+    let referenced = c.referenced_workspace_paths().expect("referenced");
+    assert!(referenced.contains("aaa/live.png"));
+    assert!(
+        referenced.contains("bbb/binned.png"),
+        "the sweep would delete a restorable asset's file: {referenced:?}"
+    );
+    assert_eq!(
+        referenced.len(),
+        2,
+        "a row with no workspace file names none"
+    );
 }
 
 /// The crawl's incremental diff still knows a trashed file's size: the file is on disk and in

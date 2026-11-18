@@ -162,6 +162,92 @@ pub fn execute_reclaim(plan: &ReclaimPlan) -> (usize, u64) {
     (removed, freed)
 }
 
+/// Outcome of a reclaim — recomputed from what actually went, plus where the record was written.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReclaimOutcome {
+    pub removed: usize,
+    pub freed: u64,
+    /// The append-only log listing every folder removed. `None` means it could not be written,
+    /// which the caller says out loud: deleting gigabytes and keeping no record is worth knowing.
+    pub log: Option<String>,
+}
+
+/// What a workspace reclaim would remove, without removing it (UI-SPEC §11.4) — the dry run.
+///
+/// Answered only by an engine that is **Ready** and whose catalog can say what is still
+/// referenced. "Nothing is referenced" and "I could not find out" used to be the same empty set
+/// (review finding 1): an engine with no catalog — a second Lodestash refused the lock — planned
+/// to delete every folder in a workspace it shares with the one that holds it.
+pub fn workspace_reclaim_plan(engine: &crate::Engine) -> Result<ReclaimPlan, String> {
+    let status = engine.status();
+    if let crate::EngineStatus::Failed { code, message } = &status {
+        return Err(format!(
+            "the library is not open ({code}): {message} — nothing in the workspace was measured"
+        ));
+    }
+    if status != crate::EngineStatus::Ready {
+        return Err(
+            "the library is still opening — the workspace is measured once it is ready".into(),
+        );
+    }
+    let workspace = engine.config().workspace_dir.clone();
+    if workspace.as_os_str().is_empty() {
+        return Err("no workspace folder is configured".into());
+    }
+    let referenced = engine.read().referenced_workspace_paths()?;
+    Ok(plan_reclaim(&workspace, &referenced))
+}
+
+/// Reclaim the workspace folders no live asset resolves through (UI-SPEC §11.4).
+///
+/// Runs **on the writer thread** ([`crate::writer::Op::ReclaimWorkspace`]), like every other
+/// delete, for three reasons: an engine with no catalog has no writer, so it cannot run at all;
+/// "what is referenced" is read through the writer's own connection in the same turn that
+/// deletes, so no extraction can record a folder between the plan and the sweep; and a caller
+/// that gave up waiting before the sweep started does not have its files deleted later.
+pub fn reclaim_workspace(engine: &crate::Engine) -> Result<ReclaimOutcome, String> {
+    let (outcome, done) = std::sync::mpsc::channel();
+    engine
+        .writer()
+        .run(crate::writer::Op::ReclaimWorkspace { outcome })
+        .map_err(|e| e.to_string())?;
+    done.try_recv()
+        .map_err(|_| "the reclaim finished without saying what it removed".to_string())
+}
+
+/// The sweep itself — [`reclaim_workspace`]'s half on the writer thread.
+///
+/// Refuses, deleting nothing, when the workspace is unset, when the referenced set cannot be
+/// read, and while a pack is being analysed or extracted: an extraction places its files first
+/// and records them when it finishes, so until then they are referenced by nothing — as is the
+/// `.tmp` folder the rest is being written through.
+pub(crate) fn reclaim_on_writer(
+    catalog: &lodestash_core::catalog::Catalog,
+    workspace: Option<&Path>,
+    jobs: &crate::writer::JobRegistry,
+) -> Result<ReclaimOutcome, String> {
+    let workspace = workspace
+        .filter(|w| !w.as_os_str().is_empty())
+        .ok_or("no workspace folder is configured")?;
+    if jobs.has_active_extract() {
+        return Err(
+            "a pack is being extracted — reclaim the workspace once it has finished".into(),
+        );
+    }
+    let referenced = catalog.referenced_workspace_paths().map_err(|e| {
+        format!("what the library still uses could not be read ({e}) — nothing was reclaimed")
+    })?;
+    let plan = plan_reclaim(workspace, &referenced);
+    let log = write_reclaim_log(workspace, &plan);
+    let (removed, freed) = execute_reclaim(&plan);
+    tracing::info!(removed, freed, "workspace reclaimed");
+    Ok(ReclaimOutcome {
+        removed,
+        freed,
+        log: log.map(|p| p.to_string_lossy().into_owned()),
+    })
+}
+
 /// Delete the mesh-cache files that are dead by **identity**, before any cap is consulted.
 ///
 /// The cap cannot do this job. Three classes of file stop being useful the moment they do, and

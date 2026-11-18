@@ -283,46 +283,28 @@ fn similar_assets(
 /// What a workspace reclaim would remove, without removing it (UI-SPEC §11.4).
 ///
 /// Always a dry run. The button that calls it reports the size first, because the sweep deletes
-/// files from the user's disk and the first honest thing to do with 3.6 GB is show it.
+/// files from the user's disk and the first honest thing to do with 3.6 GB is show it. An error —
+/// never an empty plan — when the engine is not Ready or cannot say what is still referenced
+/// (`lodestash_engine::storage::workspace_reclaim_plan`).
 #[tauri::command]
 fn workspace_usage(
     state: tauri::State<'_, AppState>,
 ) -> Result<lodestash_engine::storage::ReclaimPlan, String> {
-    let workspace = state.engine.config().workspace_dir.clone();
-    let referenced = state.engine.read().referenced_workspace_paths();
-    Ok(lodestash_engine::storage::plan_reclaim(
-        &workspace,
-        &referenced,
-    ))
-}
-
-/// Outcome of a reclaim — recomputed from what actually went, plus where the record was written.
-#[derive(serde::Serialize)]
-struct ReclaimOutcome {
-    removed: usize,
-    freed: u64,
-    /// The append-only log listing every folder removed. `None` means it could not be written,
-    /// which the caller says out loud: deleting gigabytes and keeping no record is worth knowing.
-    log: Option<String>,
+    lodestash_engine::storage::workspace_reclaim_plan(&state.engine)
 }
 
 /// Reclaim the workspace folders no live asset resolves through (UI-SPEC §11.4).
 ///
-/// Re-plans rather than trusting a plan the frontend held: the catalog may have changed since the
-/// dry run, and a stale plan is how a sweep deletes something that has just been re-materialized.
+/// Re-plans rather than trusting a plan the frontend held, and does it on the writer thread, in
+/// the same turn that deletes: the catalog may have changed since the dry run, and a stale plan is
+/// how a sweep deletes something that has just been re-materialized. Refused — nothing deleted —
+/// when the engine is not Ready, when what is referenced cannot be read, and while a pack is
+/// extracting (`lodestash_engine::storage::reclaim_workspace`).
 #[tauri::command]
-fn reclaim_workspace(state: tauri::State<'_, AppState>) -> Result<ReclaimOutcome, String> {
-    let workspace = state.engine.config().workspace_dir.clone();
-    let referenced = state.engine.read().referenced_workspace_paths();
-    let plan = lodestash_engine::storage::plan_reclaim(&workspace, &referenced);
-    let log = lodestash_engine::storage::write_reclaim_log(&workspace, &plan);
-    let (removed, freed) = lodestash_engine::storage::execute_reclaim(&plan);
-    tracing::info!(removed, freed, "workspace reclaimed");
-    Ok(ReclaimOutcome {
-        removed,
-        freed,
-        log: log.map(|p| p.to_string_lossy().into_owned()),
-    })
+fn reclaim_workspace(
+    state: tauri::State<'_, AppState>,
+) -> Result<lodestash_engine::storage::ReclaimOutcome, String> {
+    lodestash_engine::storage::reclaim_workspace(&state.engine)
 }
 
 /// Packs holding extracted bytes, largest first (UI-SPEC §11.4 storage list).

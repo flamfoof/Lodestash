@@ -4414,12 +4414,26 @@ impl Catalog {
     /// NOTHING`: a second import of the same asset into the same project is reported
     /// [`ImportOutcome::AlreadyImported`], never a duplicate row. All rows in one call share
     /// `batch_id` so the run can be listed and undone (§9 batches).
+    ///
+    /// Every `dest_path` must be a plain project-relative path
+    /// ([`crate::types::is_plain_relative_path`]): batch undo joins it onto the project root and
+    /// **deletes** what it finds there, so a rooted, drive-relative or `..` path is refused here —
+    /// the whole call, before anything is written — rather than stored for undo to trip over.
     pub fn record_imports(
         &self,
         project_id: i64,
         specs: &[ImportSpec],
         batch_id: &str,
     ) -> Result<Vec<ImportOutcome>> {
+        if let Some(bad) = specs
+            .iter()
+            .find(|s| !crate::types::is_plain_relative_path(&s.dest_path))
+        {
+            return Err(CoreError::Invalid(format!(
+                "dest_path {:?} for asset {} is not a path inside the project",
+                bad.dest_path, bad.asset_id
+            )));
+        }
         let now = unix_now();
         let mut out = Vec::with_capacity(specs.len());
         for s in specs {
@@ -5600,20 +5614,20 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("set_package_keep_cached: {e}")))
     }
 
-    /// Every `workspace_rel` a **live** asset still resolves through — the set the workspace
-    /// sweep must not touch.
+    /// Every `workspace_rel` an asset row resolves through — the set the workspace sweep must
+    /// not touch.
     ///
-    /// Live means not soft-deleted: a trashed asset is recoverable (DATA-MODEL §8), so its bytes
-    /// are not garbage. Returned as the stored relative paths; the caller resolves them against
-    /// its workspace dir.
+    /// **Trashed rows count.** A trashed asset is recoverable (DATA-MODEL §8), so its bytes are
+    /// not garbage — and when the pack's archive has gone they are the only copy. (The query
+    /// used to carry `deleted_at IS NULL`, which made the sweep delete exactly those.) Returned
+    /// as the stored relative paths; the caller resolves them against its workspace dir.
     pub fn referenced_workspace_paths(&self) -> Result<std::collections::HashSet<String>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT DISTINCT af.workspace_rel
                    FROM asset_file af
-                   JOIN asset a ON a.id = af.asset_id
-                  WHERE af.workspace_rel IS NOT NULL AND a.deleted_at IS NULL",
+                  WHERE af.workspace_rel IS NOT NULL",
             )
             .map_err(|e| CoreError::Catalog(format!("workspace refs prep: {e}")))?;
         let rows = stmt

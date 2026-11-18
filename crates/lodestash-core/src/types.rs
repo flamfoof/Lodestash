@@ -95,7 +95,8 @@ pub type AssetId = uuid::Uuid;
 pub enum ExcludeKind {
     /// A folder (and everything under it), relative to the source root.
     Folder,
-    /// A single asset — matched by exact relative path or by file name.
+    /// A single asset — matched by exact relative path or by file name. A value that starts with
+    /// `/` is **anchored** at the source root and matches that one path only.
     Asset,
 }
 
@@ -110,9 +111,17 @@ pub struct Exclude {
 }
 
 impl Exclude {
+    /// The `Asset` value that names exactly one file: its source-relative path behind a leading
+    /// `/` (the `.gitignore` convention). What **Remove from library** writes — a bare `rock.png`
+    /// would also match every `rock.png` in every folder of the source.
+    pub fn anchored(rel_path: &str) -> String {
+        format!("/{}", rel_path.replace('\\', "/").trim_matches('/'))
+    }
+
     /// Does this exclusion match a source-relative path?
     /// - `Folder`: `rel` equals the value or lies under it (any path prefix of components).
-    /// - `Asset`: `rel` equals the value, or its file name equals the value.
+    /// - `Asset`: `rel` equals the value, or — unless the value is anchored with a leading `/` —
+    ///   its file name equals the value.
     pub fn matches(&self, rel: &std::path::Path) -> bool {
         let norm = |s: &str| s.replace('\\', "/").trim_matches('/').to_lowercase();
         let target = norm(&self.value);
@@ -123,14 +132,31 @@ impl Exclude {
         match self.kind {
             ExcludeKind::Folder => rel_s == target || rel_s.starts_with(&format!("{target}/")),
             ExcludeKind::Asset => {
+                let anchored = self.value.trim_start().starts_with(['/', '\\']);
                 rel_s == target
-                    || rel
-                        .file_name()
-                        .map(|n| norm(&n.to_string_lossy()) == target)
-                        .unwrap_or(false)
+                    || (!anchored
+                        && rel
+                            .file_name()
+                            .map(|n| norm(&n.to_string_lossy()) == target)
+                            .unwrap_or(false))
             }
         }
     }
+}
+
+/// Is `path` a plain relative path — one or more ordinary components and nothing else?
+///
+/// The fence for any stored path that is later joined onto a folder and **deleted** (an import
+/// record's `dest_path`, DATA-MODEL §9). Refused: an empty path, a root (`/x`, `\x`, `\\srv\x`), a
+/// drive or stream (`C:x`, `a:b`), and any `.`/`..`/empty component. Judged on the text with both
+/// separators, because `Path::is_absolute` is false on Windows for `\x` and `C:x` while
+/// `Path::join` still lets either one replace the base it is joined onto.
+pub fn is_plain_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains([':', '\0'])
+        && path
+            .split(['/', '\\'])
+            .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 /// Is a source-relative path excluded by any entry in the blacklist?
@@ -183,6 +209,68 @@ mod tests {
             "bare file name anywhere"
         );
         assert!(!asset("chair.fbx").matches(Path::new("Models/table.fbx")));
+    }
+
+    /// What **Remove from library** writes for a file at the source root. A bare `drop.png`
+    /// matches by file name, so removing one root-level file used to exclude every `drop.png` in
+    /// the source; the anchored form names that one path.
+    #[test]
+    fn an_anchored_asset_exclude_matches_only_that_path() {
+        let e = asset(&Exclude::anchored("drop.png"));
+        assert!(e.matches(Path::new("drop.png")), "the file itself");
+        assert!(e.matches(Path::new("DROP.PNG")), "still case-insensitive");
+        assert!(
+            !e.matches(Path::new("Models/drop.png")),
+            "a same-named file in a folder is a different file"
+        );
+        assert!(!e.matches(Path::new("a/b/drop.png")));
+
+        let nested = asset(&Exclude::anchored("Models\\chair.fbx"));
+        assert!(nested.matches(Path::new("Models/chair.fbx")));
+        assert!(!nested.matches(Path::new("Other/Models/chair.fbx")));
+        assert!(!nested.matches(Path::new("chair.fbx")));
+        // Anchoring is idempotent, so a value read back and re-anchored is the same entry.
+        assert_eq!(
+            Exclude::anchored(&Exclude::anchored("drop.png")),
+            "/drop.png"
+        );
+    }
+
+    /// The fence `undo_import_batch` and the import ack share (review finding 3): a path that
+    /// can leave — or replace — the folder it is joined onto is not project-relative. On Windows
+    /// `Path::is_absolute` is false for `\Users\x` and `C:f`, and `Path::join` then discards the
+    /// base, so the judgement is made on the text, the same on every OS.
+    #[test]
+    fn a_plain_relative_path_has_no_root_prefix_or_parent() {
+        for ok in [
+            "Assets/Wildlife/Beaver.fbx",
+            "Assets\\Wildlife\\Beaver.fbx",
+            "a",
+        ] {
+            assert!(is_plain_relative_path(ok), "{ok:?} is project-relative");
+        }
+        for bad in [
+            "",
+            "/etc/passwd",
+            "\\Users\\x\\file.txt",
+            "C:file.txt",
+            "C:\\Users\\x",
+            "c:/users/x",
+            "\\\\server\\share\\x",
+            "//server/share/x",
+            "..",
+            "../x",
+            "Assets/../../x",
+            "Assets\\..\\..\\x",
+            "./Assets/x",
+            "Assets/./x",
+            "Assets//x",
+            "Assets/x/",
+            "Assets/x:stream",
+            "Assets/x\0y",
+        ] {
+            assert!(!is_plain_relative_path(bad), "{bad:?} must be refused");
+        }
     }
 
     #[test]

@@ -28,12 +28,23 @@ pub enum ThumbKind {
 
 /// Is `path` inside a source root the user opened, or the extraction workspace this app owns?
 /// Pure so the one destructive path in the app has a testable guard (TECH-STACK §5.1).
+///
+/// Fails closed: an **empty** root or workspace is no root at all (every path `starts_with` the
+/// empty path, so an unset one used to admit any file on the machine), and a path with a `..`
+/// component is under nothing (`starts_with` compares components, so `<root>/../x` passed).
 pub fn under_known_root(
     path: &std::path::Path,
     roots: &[PathBuf],
     workspace: Option<&std::path::Path>,
 ) -> bool {
-    roots.iter().any(|r| path.starts_with(r)) || workspace.is_some_and(|w| path.starts_with(w))
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    let under = |root: &std::path::Path| !root.as_os_str().is_empty() && path.starts_with(root);
+    roots.iter().any(|r| under(r)) || workspace.is_some_and(under)
 }
 
 /// Archive-size ceiling above which in-pack assets keep their typed placeholder instead of pulling a
@@ -429,5 +440,36 @@ mod tests {
             !under_known_root(std::path::Path::new("C:/anything"), &roots, None),
             "no workspace configured means no workspace deletions"
         );
+    }
+
+    /// The fence must not fail open (review finding 1's audit). Every path `starts_with` an
+    /// empty path, so an unset workspace or a source row with no root used to admit any file on
+    /// the machine; and `starts_with` compares components, so `<root>/../../x` passed as "under
+    /// the root" while naming a file outside it.
+    #[test]
+    fn an_empty_root_or_a_climbing_path_is_never_under_a_known_root() {
+        let victim = std::path::Path::new("C:/Windows/System32/kernel32.dll");
+        assert!(
+            !under_known_root(victim, &[PathBuf::new()], None),
+            "an empty source root admitted everything"
+        );
+        assert!(
+            !under_known_root(victim, &[], Some(std::path::Path::new(""))),
+            "an empty workspace admitted everything"
+        );
+        let roots = vec![PathBuf::from("C:/lib")];
+        assert!(
+            !under_known_root(
+                std::path::Path::new("C:/lib/../Windows/x.dll"),
+                &roots,
+                None
+            ),
+            "a path that climbs out of its root is not under it"
+        );
+        assert!(under_known_root(
+            std::path::Path::new("C:/lib/a/b.png"),
+            &roots,
+            None
+        ));
     }
 }

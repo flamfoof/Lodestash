@@ -1997,11 +1997,16 @@ impl Library {
 
     /// Every workspace path a live asset still resolves through — what the reclaim sweep must
     /// not touch (`storage::plan_reclaim`).
-    pub fn referenced_workspace_paths(&self) -> std::collections::HashSet<String> {
-        self.catalog
+    ///
+    /// An `Err` when there is no catalog or the query fails, never an empty set: empty means
+    /// "nothing is referenced", which a sweep reads as permission to delete everything.
+    pub fn referenced_workspace_paths(&self) -> Result<std::collections::HashSet<String>, String> {
+        let cat = self
+            .catalog
             .as_ref()
-            .and_then(|c| c.referenced_workspace_paths().ok())
-            .unwrap_or_default()
+            .ok_or("no catalog is open, so what the library still uses is unknown")?;
+        cat.referenced_workspace_paths()
+            .map_err(|e| format!("what the library still uses could not be read: {e}"))
     }
 
     /// Packs holding extracted bytes, each with whether its archive still resolves on disk —

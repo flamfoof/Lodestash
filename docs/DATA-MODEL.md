@@ -622,12 +622,21 @@ ALTER TABLE asset ADD COLUMN license_url TEXT;
 - **Import batches**: `import_record` rows from one tray/queue run share a `batch_id`, so the UI can
   list "Recent exports" per project and **undo a batch** — delete the copied files it produced and
   its records; catalog assets are untouched (confirm-gated, [`UI-SPEC.md`](UI-SPEC.md) §16.1).
+  Undo deletes, so it is fenced: `dest_path` must be a **plain project-relative path** — refused
+  at the ack and at `record_imports` ([`ENGINE-API.md`](ENGINE-API.md) §5.6), and again at undo for
+  rows an older build stored — and the folder it names must *resolve* inside the project root, so
+  a link inside the project cannot carry the delete out of it. (The first fence asked
+  `Path::is_absolute`, which on Windows is false for `\Users\x` and `C:x`, while `Path::join`
+  still discards the base for both.) A project root that does not resolve refuses the undo whole.
+  The records are forgotten only when no file was left behind; a batch that could not finish
+  stays listed.
 **Delete from disk is the one destructive exception.** The catalog is otherwise non-destructive —
 Trash is a soft delete and originals are never touched. Undo of a trash/untrash flips back only the
 assets that toggle changed: `Catalog::set_trashed_recorded` applies it and logs the changed ids in
 one transaction, so trashing a selection that held an already-trashed asset never restores that one. The Settings danger flow may permanently
 remove a file, and it is fenced: an explicit confirmation modal naming the file count, a guard that
-refuses any path outside the user's source roots and the app's own extraction workspace, and the
+refuses any path outside the user's source roots and the app's own extraction workspace (an unset
+root or workspace admits nothing, and a path with a `..` component is under no root), and the
 catalog row is marked trashed **only after** the file actually left the disk, so a failed delete
 cannot leave the catalog claiming otherwise.
 
@@ -681,9 +690,10 @@ put files on the user's disk.
 Undo is the one delete in the app that touches a location the *user* chose, so it is fenced rather
 than trusted: `file_name` must be a bare name, the file must sit directly inside the recorded
 `dest_path`, and that destination is re-checked against the export sandbox **at undo time** (a
-folder that was legal to export into may since have become a library source root). A missing file
-counts as already-undone; a run that could not finish keeps its record, so copies still on disk stay
-findable.
+folder that was legal to export into may since have become a library source root). When the source
+roots cannot be read the undo is refused — with no roots the sandbox admits every folder. A missing
+file counts as already-undone; a run that could not finish keeps its record, so copies still on disk
+stay findable.
 
 ---
 
@@ -719,7 +729,10 @@ Each `import_source` carries an independent **blacklist** — a list of `{kind, 
 (`folder` or `asset`) that the crawler **skips when indexing** ([`INGESTION.md`](INGESTION.md) §1),
 editable in Settings → Library (design §5.1). Semantics: a `folder` entry prunes that subtree
 (source-relative path); an `asset` entry drops a single file (exact source-relative path or bare
-file name). Matching is `/`↔`\` and case-insensitive. **Non-destructive** — a blacklist entry only
+file name). An `asset` value with a **leading `/`** is anchored at the source root and matches that
+one path only (`Exclude::anchored`, the `.gitignore` convention) — what **Remove from library**
+writes, because a bare `rock.png` also matches every `rock.png` in every folder of the source.
+Matching is `/`↔`\` and case-insensitive. **Non-destructive** — a blacklist entry only
 affects cataloguing, never files on disk (§6). Removing a source drops its blacklist. Interim: while
 the SQLite catalog is pre-`import_source`, the pre-catalog UI persists this per source in the app
 config (`LibraryProject.blacklist`, keyed by source path); it maps 1:1 onto this column when the
