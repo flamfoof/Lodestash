@@ -9,17 +9,25 @@
    * A file's size tier and size ("L · 4.1 MB"), coloured by tier — S success, M sound-aqua,
    * L warning, XL danger (DESIGN-GUIDELINES §7 Filters). `badge` is the outlined tag on a thumbnail
    * corner; `text` the bare mono label of a list row. The tier letter is the shape that keeps it
-   * from being colour alone.
+   * from being colour alone. `compact` shows the letter only — on a card the badge sits on the
+   * artwork and has nowhere to grow, and the size is already in the stat line (UI-SPEC §2.5); the
+   * exact size is then the tooltip.
    */
   let {
     tier,
     size,
     variant = "badge",
+    compact = false,
     ...rest
-  }: HTMLAttributes<HTMLSpanElement> & { tier: Tier; size: string; variant?: "badge" | "text" } = $props();
+  }: HTMLAttributes<HTMLSpanElement> & { tier: Tier; size: string; variant?: "badge" | "text"; compact?: boolean } = $props();
 </script>
 
-<span class="tier {variant} t{tier}" title="File size on disk" {...rest}>{tier} · {size}</span>
+<span
+  class="tier {variant} t{tier}"
+  title={compact ? `${size} on disk` : "File size on disk"}
+  aria-label={compact ? `Size tier ${tier}, ${size}` : undefined}
+  {...rest}>{tier}{#if !compact}{" "}· {size}{/if}</span
+>
 
 <style>
   .tier {

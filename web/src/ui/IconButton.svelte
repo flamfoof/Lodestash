@@ -7,7 +7,9 @@
    * A square button that is only an icon. `label` is required: it is the accessible name, and the
    * tooltip (`title`) unless one is given.
    * - `tile` — the 20 px tile on a thumbnail (☆ favourite), on the translucent backdrop;
-   * - `plain` — the 22 px dialog close / row action, on the overlay surface.
+   * - `plain` — the 22 px dialog close / row action, on the overlay surface;
+   * - `media` — the 22 px close on a preview, on the translucent backdrop;
+   * - `round` — the 30 px arcane play button of a sound.
    * `pressed` makes it a toggle (`aria-pressed`) drawn gold when on.
    */
   let {
@@ -21,7 +23,7 @@
   }: HTMLButtonAttributes & {
     icon: IconName;
     label: string;
-    variant?: "tile" | "plain";
+    variant?: "tile" | "plain" | "media" | "round";
     iconSize?: IconSize;
     pressed?: boolean;
   } = $props();
@@ -65,8 +67,32 @@
     font-size: var(--fs-12);
   }
 
+  .media {
+    width: var(--space-22);
+    height: var(--space-22);
+    background: var(--ls-bg-a75);
+    color: var(--ls-text-muted);
+    font-size: var(--fs-12);
+  }
+
+  .round {
+    width: var(--space-30);
+    height: var(--space-30);
+    border-radius: var(--r-pill);
+    background: var(--ls-arcane-a16);
+    border: 1px solid var(--ls-arcane);
+    color: var(--ls-arcane-bright);
+    font-size: var(--fs-11);
+    transition: box-shadow var(--dur-120) ease;
+  }
+
   .icon-btn:hover:not(:disabled) {
     color: var(--ls-text);
+  }
+
+  .round:hover:not(:disabled) {
+    color: var(--ls-arcane-bright);
+    box-shadow: var(--glow-arcane-12-a50);
   }
 
   .tile:hover:not(:disabled) {

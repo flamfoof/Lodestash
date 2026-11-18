@@ -42,6 +42,7 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
+    box-sizing: content-box;
     width: var(--space-18);
     height: var(--space-18);
     flex: none;

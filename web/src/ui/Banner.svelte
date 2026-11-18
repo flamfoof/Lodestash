@@ -5,11 +5,13 @@
   /**
    * A full-width strip across the top of a screen: the library's "N assets are Unidentified" nudge.
    * A tinted band with a hairline under it, a leading mark, the message, and at most one action
-   * (a text button in the band's colour). `actionAttrs` reaches the action button.
+   * (a text button in the band's colour). `actionAttrs` reaches the action button. `figure` is a
+   * count that opens the message, in mono bold ("**5** assets are Unidentified…").
    */
   let {
     tone = "warning",
     mark = "?",
+    figure,
     action,
     actionAttrs = {},
     children,
@@ -18,6 +20,7 @@
     tone?: "warning" | "info" | "danger";
     /** A one-character mark before the message. */
     mark?: string;
+    figure?: string | number;
     action?: { label: string; onclick: () => void };
     actionAttrs?: Record<string, string | undefined>;
     children: Snippet;
@@ -26,7 +29,7 @@
 
 <div class="banner {tone}" role="status" {...rest}>
   <span class="mark" aria-hidden="true">{mark}</span>
-  <span class="msg">{@render children()}</span>
+  <span class="msg">{#if figure !== undefined}<b class="figure">{figure}</b>{" "}{/if}{@render children()}</span>
   {#if action}
     <button type="button" class="action" onclick={action.onclick} {...actionAttrs}>{action.label}</button>
   {/if}
@@ -67,6 +70,10 @@
   .msg {
     flex: 1;
     color: var(--ls-text);
+  }
+
+  .figure {
+    font-family: var(--ff-mono);
   }
 
   .action {

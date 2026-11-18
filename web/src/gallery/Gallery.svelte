@@ -13,32 +13,45 @@
     Icon,
     IconButton,
     ICON_NAMES,
+    ImportedBadge,
     Input,
+    ItemCard,
     Kbd,
+    LinkRow,
     ListRow,
     Menu,
+    MiniWave,
     Pill,
     Popover,
     ProgressBar,
+    Provenance,
     Rail,
     RailHeading,
     SearchField,
     SectionCard,
+    SectionHeading,
     SegmentedControl,
     Select,
+    SidePanel,
     SizeTier,
     Slider,
     Spinner,
     Stat,
+    StatList,
     StatusGem,
+    StatusLine,
     Switch,
     Tabs,
+    Text,
+    TextLink,
+    Thumb,
     Toast,
     ToggleButton,
     Toolbar,
     tooltip,
     TraitChip,
     TreeRow,
+    TypeMark,
     Wordmark,
   } from "../ui";
 
@@ -68,6 +81,10 @@
   let cap = $state(8);
   let expanded = $state(true);
   let lastAction = $state("—");
+  let view = $state<"grid" | "list">("grid");
+  let cardPicked = $state(false);
+  let cardStaged = $state(false);
+  let inCollection = $state(false);
 </script>
 
 <main class="gallery">
@@ -147,12 +164,13 @@
 
   <section>
     <h2>Library toolbar</h2>
-    <Banner action={{ label: "Open Identify mode →", onclick: () => (lastAction = "identify") }} actionAttrs={{ "data-anchor": "library.banner.action" }}>
-      <b class="mono">5</b> assets are Unidentified — invisible to AI search until appraised.
+    <Banner figure={5} action={{ label: "Open Identify mode →", onclick: () => (lastAction = "identify") }} actionAttrs={{ "data-anchor": "library.banner.action" }}>
+      assets are Unidentified — invisible to AI search until appraised.
     </Banner>
     <Toolbar label="Library view">
-      <span class="count">19 assets · all libraries</span>
-      <span class="hint">Space quick-looks · <Kbd>F</Kbd> favourite</span>
+      <Text>19 assets · all libraries</Text>
+      <span class="grow"></span>
+      <Text variant="hint">Space quick-looks · <Kbd>F</Kbd> favourite</Text>
       <Select
         label="Sort"
         bind:value={sort}
@@ -191,6 +209,15 @@
           { value: "large", title: "Large", icon: "grid-large", iconSize: "10", iconBox: "10" },
         ]}
       />
+      <SegmentedControl
+        label="View"
+        size="sm-wide"
+        bind:value={view}
+        options={[
+          { value: "grid", title: "Grid view", icon: "view-grid", iconBox: "12" },
+          { value: "list", title: "List view", icon: "view-list", iconBox: "11" },
+        ]}
+      />
     </Toolbar>
     <Popover bind:open={filtersOpen} anchor={filtersButton} id="filters-panel" label="Filter library">
       <div class="stack">
@@ -211,14 +238,127 @@
       <Chip label="+1" tone="neutral" onclick={() => (lastAction = "more")} data-anchor="card.chip.more" />
       <Chip label="???" tone="unknown" />
       <TraitChip name="hero-prop" source="human" color="var(--ls-type-sound)" />
-      <SizeTier tier="L" size="4.1 MB" data-anchor="card.size" />
-      <SizeTier tier="S" size="922 KB" />
+      <SizeTier tier="L" size="4.1 MB" compact data-anchor="card.size" />
+      <SizeTier tier="L" size="4.1 MB" />
+      <SizeTier tier="S" size="922 KB" variant="text" />
+      <ImportedBadge label="in MyRPG" />
+      <ImportedBadge label="in 2 others" tone="others" />
+      <ImportedBadge label="older copy" tone="stale" />
+      <Button size="xs" onMedia accent="arcane" icon="action-fullsize" iconSize="10" iconBox="10" aria-label="Quick Look" title="Full-size preview" />
+      <Button size="xs" onMedia active>✓ staged</Button>
+      <IconButton variant="round" icon="play" iconSize="11" label="Play" />
+      <MiniWave />
+      <MiniWave unknown />
       <Button size="xs" onMedia data-anchor="card.stage">+ stage</Button>
       <IconButton variant="tile" icon="nav-favorites" iconSize="10" label="Favorite" pressed={false} data-anchor="card.favorite" />
       <IconButton variant="tile" icon="nav-favorites" iconSize="10" label="Favorite" pressed />
       <StatusGem status="confirmed" data-anchor="card.status" />
       <StatusGem status="identified" />
       <StatusGem status="unidentified" />
+    </div>
+  </section>
+
+  <section>
+    <h2>Item card</h2>
+    <div class="row top">
+      <div class="card-slot" role="grid" aria-label="Specimen cards">
+        <div role="row" class="card-row">
+          <ItemCard status="confirmed" title="Beaver_LowPoly" tabStop pin={{ topStart: cardPicked, bottomEnd: cardStaged }} onopen={() => (lastAction = "open")}>
+            {#snippet media()}<Thumb />{/snippet}
+            {#snippet topStart()}<Checkbox bind:checked={cardPicked} label="Select for bulk actions" hideLabel tabindex={-1} />{/snippet}
+            {#snippet topEnd()}
+              <IconButton variant="tile" icon="nav-favorites" iconSize="10" label="Favorite" pressed={false} tabindex={-1} />
+              <StatusGem status="confirmed" />
+            {/snippet}
+            {#snippet bottomStart()}<SizeTier tier="L" size="4.1 MB" compact /><ImportedBadge label="in MyRPG" />{/snippet}
+            {#snippet bottomEnd()}
+              <Button size="xs" onMedia accent="arcane" icon="action-fullsize" iconSize="10" iconBox="10" aria-label="Quick Look" tabindex={-1} />
+              <Button size="xs" onMedia active={cardStaged} tabindex={-1} onclick={() => (cardStaged = !cardStaged)}>{cardStaged ? "✓ staged" : "+ stage"}</Button>
+            {/snippet}
+            {#snippet mark()}<TypeMark tone="model" label="Model" />{/snippet}
+            {#snippet meta()}<TextLink tabindex={-1} onclick={() => (lastAction = "pack")}>Forest Pack</TextLink> · 1.2k tris · 4.1 MB{/snippet}
+            {#snippet chips()}
+              <TraitChip name="animal" source="human" />
+              <TraitChip name="lowpoly" source="ai" confidence={0.94} />
+            {/snippet}
+          </ItemCard>
+          <ItemCard status="unidentified" title="audio_23_final" selected>
+            {#snippet media()}
+              <Thumb><IconButton variant="round" icon="play" iconSize="11" label="Play" tabindex={-1} /><MiniWave unknown /></Thumb>
+            {/snippet}
+            {#snippet topEnd()}<StatusGem status="unidentified" />{/snippet}
+            {#snippet mark()}<TypeMark tone="sound" label="Sound" />{/snippet}
+            {#snippet meta()}Ambience Bundle · 0:00.6 · 44.1 kHz{/snippet}
+            {#snippet chips()}<Chip label="???" tone="unknown" />{/snippet}
+          </ItemCard>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Inspector parts</h2>
+    <div class="row top">
+      <div class="panel-slot">
+        <SidePanel label="Specimen inspector">
+          <Thumb size="preview" />
+          <div class="panel-body">
+            <div>
+              <div class="row tight"><TypeMark tone="model" size="md" label="Model" /><b>Beaver_LowPoly</b></div>
+              <StatusLine status="confirmed" suffix="Model" rule />
+            </div>
+            <StatList
+              rows={[
+                ["Format", "FBX"],
+                ["Tris", "1,248"],
+                ["Size", "4.1 MB"],
+              ]}
+            />
+            <div>
+              <SectionHeading text="TRAITS" />
+              <div class="row tight">
+                <TraitChip name="animal" source="human" size="md" />
+                <TraitChip name="lowpoly" source="ai" confidence={0.94} size="md" />
+                <TraitChip name="Props" source="imported" size="md" />
+                <Chip tone="add" size="md" label="+hero-prop" onclick={() => (lastAction = "add trait")} />
+              </div>
+              <Text variant="note">quick-tag from your trait library</Text>
+              <Text variant="empty">No traits yet — run Identify.</Text>
+            </div>
+            <div>
+              <SectionHeading text="LINKED FILES" caption="parsed from FBX bindings" />
+              <div class="stack tight">
+                <LinkRow name="M_Beaver_Body" kind="material" state="in_pack" />
+                <LinkRow name="T_Beaver_Albedo.png" kind="texture" state="in_library" indent onclick={() => (lastAction = "open link")} />
+                <LinkRow name="T_Sword_Metallic.png" kind="texture" state="missing" indent />
+                <LinkRow name="T_Rope_Albedo.png" kind="texture" state="ignored" indent />
+              </div>
+              <Text variant="warning">missing links are skipped on export</Text>
+            </div>
+            <div>
+              <SectionHeading text="COLLECTIONS" />
+              <Chip tone="toggle" size="md" label="{inCollection ? '✓' : '+'}Forest ambience" selected={inCollection} onclick={() => (inCollection = !inCollection)} />
+            </div>
+            <Provenance
+              lines={[
+                { label: "Source", value: "Synty · Forest Pack", onclick: () => (lastAction = "pack") },
+                { label: "License", value: "Synty EULA" },
+                { value: "imported in MyRPG → Assets/Imported/", tone: "success" },
+              ]}
+            />
+            <div class="stack">
+              <div class="pair">
+                <Button variant="outline-gold" size="block" icon="action-stage" iconSize="13" iconBox="13">Stage</Button>
+                <Button variant="primary" size="block" icon="import" iconSize="13" iconBox="11">Import</Button>
+              </div>
+              <Button variant="outline-arcane" size="block-sm" icon="action-ai-sieve" iconBox="10">Re-identify</Button>
+              <Button variant="arcane" size="block" icon="action-ai-sieve" iconSize="13" iconBox="11">Identify now</Button>
+            </div>
+          </div>
+        </SidePanel>
+      </div>
+      <Button size="pill" onMedia accent="arcane" icon="action-fullsize" iconSize="11" iconBox="11">full size</Button>
+      <IconButton variant="media" icon="action-clear" label="Close" />
     </div>
   </section>
 
@@ -397,19 +537,40 @@
     margin-top: var(--space-14);
   }
 
-  .count {
-    font-size: var(--fs-12);
-    color: var(--ls-text-muted);
+  .grow {
+    flex: 1;
   }
 
-  .hint {
-    margin-left: auto;
-    font-size: var(--fs-11);
-    color: var(--ls-text-dim);
+  .tight {
+    gap: var(--space-5);
   }
 
-  .mono {
-    font-family: var(--ff-mono);
+  .card-slot {
+    width: calc(var(--card-min-cozy) * 2 + var(--space-12) + var(--space-24));
+  }
+
+  .card-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--space-12);
+  }
+
+  .panel-slot {
+    width: var(--inspector-w);
+    height: calc(var(--inspector-w) * 2);
+  }
+
+  .panel-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-12);
+    padding: var(--space-14) var(--space-16);
+  }
+
+  .pair {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--space-8);
   }
 
   .slider {

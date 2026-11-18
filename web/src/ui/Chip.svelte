@@ -3,9 +3,12 @@
    * - `trait` — a human tag (gold-bright, or the trait's own colour when it has one);
    * - `ai` — a machine tag: arcane outline, with its confidence as a small bar;
    * - `neutral` — the "+N" expander and other counters;
-   * - `unknown` — the `???` placeholder of an unidentified asset.
+   * - `unknown` — the `???` placeholder of an unidentified asset;
+   * - `imported` — a tag an importer wrote (a Unity label): neutral slate;
+   * - `add` — a dashed "+ trait" offer, not yet applied;
+   * - `toggle` — a membership chip ("+ name" / "✓ name"): gold when `selected`.
    */
-  export type ChipTone = "trait" | "ai" | "neutral" | "unknown";
+  export type ChipTone = "trait" | "ai" | "neutral" | "unknown" | "imported" | "add" | "toggle";
 </script>
 
 <script lang="ts">
@@ -99,9 +102,31 @@
     border-color: var(--ls-border-strong);
   }
 
-  .unknown {
+  .unknown,
+  .imported {
     color: var(--ls-status-unidentified);
     border-color: var(--ls-border-strong);
+  }
+
+  /* The prototype draws these two without a gap: the "+" sits against the name. */
+  .add,
+  .toggle {
+    gap: normal;
+  }
+
+  .add {
+    color: var(--ls-text-dim);
+    border: 1px dashed var(--ls-border-strong);
+  }
+
+  .toggle {
+    color: var(--ls-text-muted);
+    border-color: var(--ls-border-strong);
+  }
+
+  .toggle.selected {
+    color: var(--ls-gold-bright);
+    border-color: var(--ls-gold-a50);
   }
 
   button.chip:hover {
@@ -110,6 +135,15 @@
 
   button.neutral:hover {
     border-color: var(--ls-text-dim);
+  }
+
+  button.add:hover {
+    color: var(--ls-gold-bright);
+    border-color: var(--ls-gold-a50);
+  }
+
+  button.toggle:hover {
+    border-color: var(--ls-gold);
   }
 
   .ai.selected {
