@@ -75,14 +75,16 @@ const PAGES = [
   { label: "shell", hash: "#shell", state: "library", anchors: [...FRAME_ANCHORS], skip: [] },
   // The Library screen in the shell, on the prototype's data: the whole state, with positions.
   { label: "library", hash: "#library", state: "library", anchors: Object.keys(ANCHORS.library), skip: [] },
+  // The same with the first asset selected: the Inspector, and what its column moves.
+  { label: "inspector", hash: "#library-inspector", state: "library+inspector", anchors: Object.keys(ANCHORS["library+inspector"]), skip: [] },
 ];
 
-/** Anchors no page reproduces yet, per state, and the plan task that will measure them. */
-const DEFERRED = {
-  "library+inspector": Object.fromEntries(
-    Object.keys(ANCHORS["library+inspector"]).map((name) => [name, "the Inspector — plan P7 Task 7.7"]),
-  ),
-};
+/**
+ * Anchors no page reproduces yet, per state, and the plan task that will measure them:
+ * `{ "<state>": { "<anchor>": "<what will measure it — plan task>" } }`. Empty since plan P7
+ * Task 7.7; a new screen's anchors start here and leave when its specimen page exists.
+ */
+const DEFERRED = {};
 const deferredCount = Object.values(DEFERRED).reduce((n, d) => n + Object.keys(d).length, 0);
 
 // ---- run ----
@@ -245,6 +247,54 @@ const FLOOR = [
       return problems;
     },
   },
+  {
+    name: "library at 900×600: the toolbar fits, the hint is folded, the inspector overlays the grid",
+    hash: "#library-inspector",
+    viewport: { width: 900, height: 600 },
+    probe: () => {
+      const q = (name) => document.querySelector(`[data-anchor="${name}"]`);
+      const toolbar = q("library.toolbar");
+      const grid = q("library.grid");
+      const panel = q("inspector");
+      const problems = [];
+      if (!toolbar || !grid || !panel) return ["the library did not render"];
+      if (toolbar.scrollWidth > toolbar.clientWidth) problems.push(`toolbar overflows by ${toolbar.scrollWidth - toolbar.clientWidth} px`);
+      if (document.documentElement.scrollWidth > innerWidth) problems.push("the page scrolls sideways");
+      if (q("library.hint")?.getBoundingClientRect().width) problems.push("the keyboard hint is still shown below 1400 px");
+      const g = grid.getBoundingClientRect();
+      const p = panel.getBoundingClientRect();
+      // ADR-0009: below 1280 px the inspector overlays the grid instead of pushing it.
+      if (Math.abs(p.right - innerWidth) > 0.5) problems.push(`the inspector ends at ${p.right}, not the window's edge`);
+      if (g.right <= p.left) problems.push("the inspector pushes the grid instead of overlaying it");
+      const cards = [...grid.querySelectorAll('[role="gridcell"]')].map((c) => c.getBoundingClientRect());
+      if (cards.some((c) => c.width < 150)) problems.push("a card is narrower than its minimum");
+      return problems;
+    },
+  },
+  {
+    name: "library at 1280×720: the inspector pushes the grid, and each card states the row and column it is drawn in",
+    hash: "#library-inspector",
+    viewport: { width: 1280, height: 720 },
+    probe: () => {
+      const grid = document.querySelector('[data-anchor="library.grid"]');
+      const panel = document.querySelector('[data-anchor="inspector"]');
+      if (!grid || !panel) return ["the library did not render"];
+      const problems = [];
+      if (grid.getBoundingClientRect().right > panel.getBoundingClientRect().left) problems.push("the inspector overlaps the grid at 1280 px");
+      // The row and column a card states for itself must be the row and column it is drawn in:
+      // the count the grid measured is the count the browser laid out.
+      const cells = [...grid.querySelectorAll('[role="gridcell"]')].map((c) => {
+        const r = c.getBoundingClientRect();
+        return { row: c.getAttribute("aria-rowindex"), col: c.getAttribute("aria-colindex"), top: Math.round(r.top), left: Math.round(r.left) };
+      });
+      const tops = [...new Set(cells.map((c) => c.top))].sort((x, y) => x - y);
+      const lefts = [...new Set(cells.map((c) => c.left))].sort((x, y) => x - y);
+      const wrong = cells.filter((c) => Number(c.row) !== tops.indexOf(c.top) + 1 || Number(c.col) !== lefts.indexOf(c.left) + 1);
+      if (wrong.length) problems.push(`${wrong.length} card(s) state a row or column they are not drawn in`);
+      if (Number(grid.getAttribute("aria-colcount")) !== lefts.length) problems.push(`aria-colcount is ${grid.getAttribute("aria-colcount")}, drawn columns ${lefts.length}`);
+      return problems;
+    },
+  },
 ];
 for (const f of FLOOR) {
   if (setupError) {
@@ -252,7 +302,7 @@ for (const f of FLOOR) {
     continue;
   }
   await report.check(f.name, async () => {
-    const { page, errors } = await openPage("#shell", f.viewport);
+    const { page, errors } = await openPage(f.hash ?? "#shell", f.viewport);
     const problems = [...errors, ...(await page.evaluate(f.probe))];
     await page.close();
     if (problems.length) throw new Error(problems.join("; "));

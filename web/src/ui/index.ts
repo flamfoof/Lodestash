@@ -22,6 +22,7 @@ export { default as LinkRow, type LinkRowState } from "./LinkRow.svelte";
 export { default as ListRow } from "./ListRow.svelte";
 export { default as Menu, type MenuEntry } from "./Menu.svelte";
 export { default as MiniWave } from "./MiniWave.svelte";
+export { default as PanelTitle } from "./PanelTitle.svelte";
 export { default as Pill } from "./Pill.svelte";
 export { default as Popover } from "./Popover.svelte";
 export { default as ProgressBar } from "./ProgressBar.svelte";

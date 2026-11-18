@@ -49,13 +49,19 @@ function click(el: Element, init: MouseEventInit = {}) {
 }
 
 describe("AssetGrid — structure", () => {
-  it("is an ARIA grid of rows of cells, five to a row", () => {
+  it("is an ARIA grid whose cells state their own row and column, five to a row", () => {
     render();
-    const rows = [...grid().querySelectorAll('[role="row"]')];
-    expect(rows.map((r) => r.querySelectorAll('[role="gridcell"]').length)).toEqual([5, 5, 5, 4]);
     expect(grid().getAttribute("aria-multiselectable")).toBe("true");
     expect(grid().getAttribute("aria-rowcount")).toBe("4");
     expect(grid().getAttribute("aria-colcount")).toBe("5");
+    expect(grid().querySelectorAll(':scope > [role="row"] > [role="gridcell"]').length).toBe(19);
+    const place = (id: number) => [cell(id).getAttribute("aria-rowindex"), cell(id).getAttribute("aria-colindex")];
+    expect([place(1), place(5), place(6), place(19)]).toEqual([
+      ["1", "1"],
+      ["1", "5"],
+      ["2", "1"],
+      ["4", "4"],
+    ]);
   });
 
   it("a card is a container, never a button, and no button contains another control", () => {

@@ -1,13 +1,21 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import type { Selection } from "../../state/selection.svelte";
   import { intentFor, type AssetActionId, type AssetIntent } from "./actions";
   import AssetCard from "./AssetCard.svelte";
-  import { columnsFor, moveIndex, rowsOf } from "./grid";
+  import { columnsFor, moveIndex } from "./grid";
   import type { AssetSummary, PackageRef, ProjectRef, SizeThresholds, TraitDef } from "./model";
 
   /**
    * The asset grid (UI-SPEC §2.5, DESIGN-GUIDELINES §9): one page of cards in an ARIA grid —
-   * `grid` → `row` (`display: contents`) → `gridcell` (the card).
+   * `grid` → `row` → `gridcell` (the card).
+   *
+   * **The cards never change parent.** There is one `row` element in the DOM (`display: contents`)
+   * and every card states its own place with `aria-rowindex` / `aria-colindex`, as a virtualised
+   * grid does. A DOM row per drawn row would re-parent cards whenever the column count changes —
+   * and it changes when the inspector opens, which a single arrow key does: the focused card would
+   * be destroyed under the keyboard, and every card's state with it. The cost: assistive technology
+   * that ignores a cell's own indices hears one long row.
    *
    * **One tab stop.** Exactly one card has `tabindex="0"` — the lead, else the card focus was last
    * on, else the first — and every control inside every card has `tabindex="-1"`. Tab enters the
@@ -73,7 +81,8 @@
 
   const order = $derived(assets.map((a) => a.id));
   const cols = $derived(columns ?? measured ?? undefined);
-  const rows = $derived(rowsOf(assets, cols ?? Math.max(1, assets.length)));
+  /** Until the width is measured the grid is one row as far as it can tell. */
+  const perRow = $derived(cols ?? Math.max(1, assets.length));
   const tabStop = $derived.by(() => {
     if (selection.lead !== null && order.includes(selection.lead)) return selection.lead;
     if (cursor !== null && order.includes(cursor)) return cursor;
@@ -92,6 +101,27 @@
     });
     observer.observe(el);
     return () => observer.disconnect();
+  });
+
+  // A card that had focus can leave the page (trashed, filtered out, another page). Focus must not
+  // fall to the document: it goes to the card now in that place, so the keyboard carries on there.
+  let hadFocus = false;
+  let lastOrder: readonly number[] = [];
+  let lostAt = -1;
+  $effect.pre(() => {
+    void order;
+    hadFocus = !!grid && grid.contains(document.activeElement);
+    lostAt = hadFocus && cursor !== null ? lastOrder.indexOf(cursor) : -1;
+  });
+  $effect(() => {
+    const shown = order;
+    if (hadFocus && grid && !grid.contains(document.activeElement) && shown.length > 0) {
+      // Only the page changing is a reason to move focus: nothing else is read reactively here.
+      const next = lostAt >= 0 ? shown[Math.min(lostAt, shown.length - 1)] : untrack(() => tabStop);
+      if (next !== null) cellOf(next)?.focus();
+    }
+    hadFocus = false;
+    lastOrder = shown;
   });
 
   const cellOf = (id: number) => grid?.querySelector<HTMLElement>(`[role="gridcell"][data-id="${id}"]`) ?? null;
@@ -204,7 +234,7 @@
   tabindex={-1}
   aria-label={label}
   aria-multiselectable="true"
-  aria-rowcount={rows.length}
+  aria-rowcount={Math.ceil(assets.length / perRow)}
   aria-colcount={cols}
   data-size={size}
   data-anchor={anchored ? "library.grid" : undefined}
@@ -214,29 +244,29 @@
   {onfocusin}
   {onfocusout}
 >
-  {#each rows as row, r (row[0].id)}
-    <div class="row" role="row" aria-rowindex={r + 1}>
-      {#each row as asset (asset.id)}
-        <AssetCard
-          {asset}
-          selected={selection.lead === asset.id}
-          picked={selection.picks.has(asset.id)}
-          picking={selection.picking}
-          tabStop={tabStop === asset.id}
-          {project}
-          {traits}
-          {thresholds}
-          anchored={anchored && asset.id === order[0]}
-          onopen={(event) => open(asset, event)}
-          onpick={() => selection.toggle(asset.id)}
-          onaction={(id) => emit(id, asset)}
-          onmenu={(event) => onmenu?.(asset, { event })}
-          {onpack}
-          {ontag}
-        />
-      {/each}
-    </div>
-  {/each}
+  <div class="row" role="row">
+    {#each assets as asset, i (asset.id)}
+      <AssetCard
+        {asset}
+        row={Math.floor(i / perRow) + 1}
+        col={(i % perRow) + 1}
+        selected={selection.lead === asset.id}
+        picked={selection.picks.has(asset.id)}
+        picking={selection.picking}
+        tabStop={tabStop === asset.id}
+        {project}
+        {traits}
+        {thresholds}
+        anchored={anchored && i === 0}
+        onopen={(event) => open(asset, event)}
+        onpick={() => selection.toggle(asset.id)}
+        onaction={(id) => emit(id, asset)}
+        onmenu={(event) => onmenu?.(asset, { event })}
+        {onpack}
+        {ontag}
+      />
+    {/each}
+  </div>
 </div>
 
 <style>
@@ -259,7 +289,7 @@
     --grid-min: var(--card-min-large);
   }
 
-  /* A row is a grouping for assistive technology; its cards are the grid's items. */
+  /* The row exists for assistive technology; its cards are the grid's items. */
   .row {
     display: contents;
   }

@@ -4,8 +4,9 @@
   import type { ShellData } from "../app/shell";
   import type { AssetIntent } from "../features/asset/actions";
   import type { AssetDetail } from "../features/asset/model";
+  import Inspector from "../features/inspector/Inspector.svelte";
   import { DEFAULT_VIEW, type LibraryView } from "../features/library/view";
-  import { ASSETS, PROJECT, SIZE_THRESHOLDS, TRAITS, shellData } from "../fixtures/library";
+  import { ASSETS, COLLECTIONS, PROJECT, SIZE_THRESHOLDS, TRAITS, shellData } from "../fixtures/library";
   import LibraryScreen from "../screens/LibraryScreen.svelte";
   import { Selection } from "../state/selection.svelte";
   import { Toast } from "../ui";
@@ -32,6 +33,28 @@
 
   const say = (message: string) => (said = message);
 
+  // The inspector describes the lead — looked up in the data every time, never kept.
+  const inspected = $derived(assets.find((a) => a.id === selection.lead) ?? null);
+
+  function setCollection(id: number, on: boolean) {
+    const lead = selection.lead;
+    assets = assets.map((a) =>
+      a.id === lead ? { ...a, collection_ids: on ? [...a.collection_ids, id] : a.collection_ids.filter((c) => c !== id) } : a,
+    );
+  }
+
+  function addTag(name: string) {
+    const lead = selection.lead;
+    assets = assets.map((a) =>
+      a.id === lead ? { ...a, tags: [...a.tags, { namespace: null, value: name, confidence: null, source: "manual" }] } : a,
+    );
+  }
+
+  function openAsset(id: number) {
+    if (page.some((a) => a.id === id)) selection.moveTo(id);
+    else say("That asset is hidden by the current filter");
+  }
+
   const tris = (a: AssetDetail) => a.stats.tris ?? 0;
   const page = $derived.by(() => {
     const list = assets.filter((a) => !view.favoritesOnly || a.favorite);
@@ -56,8 +79,28 @@
   }
 </script>
 
+{#snippet panel()}
+  {#if inspected}
+    <Inspector
+      asset={inspected}
+      collections={COLLECTIONS}
+      traits={TRAITS}
+      project={PROJECT}
+      anchored
+      onintent={carryOut}
+      onclose={() => (selection.lead = null)}
+      oncollection={setCollection}
+      onaddtag={addTag}
+      onopenasset={openAsset}
+      onsearchtag={(tag) => (shell.query = tag)}
+      onpack={(pack) => say(`Pack stats · ${pack.name}`)}
+    />
+  {/if}
+{/snippet}
+
 <Shell
   data={shell}
+  inspector={inspected ? panel : undefined}
   onnavigate={(id) => (shell.route = id)}
   onmode={(m) => (shell.mode = m)}
   onquery={(q) => (shell.query = q)}

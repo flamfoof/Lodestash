@@ -9,14 +9,6 @@ export function columnsFor(width: number, minCard: number, gap: number): number 
   return Math.max(1, Math.floor((width + gap) / (minCard + gap)));
 }
 
-/** `items` cut into rows of `columns`. */
-export function rowsOf<T>(items: readonly T[], columns: number): T[][] {
-  const size = Math.max(1, Math.floor(columns));
-  const rows: T[][] = [];
-  for (let i = 0; i < items.length; i += size) rows.push(items.slice(i, i + size));
-  return rows;
-}
-
 /**
  * Where a navigation key takes focus from `index` in a grid of `count` items, `columns` wide.
  * ← → step by one; ↑ ↓ by a row (↓ from the last full row lands on the last item when the row

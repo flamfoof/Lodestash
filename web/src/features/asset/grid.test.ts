@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { columnsFor, moveIndex, rowsOf } from "./grid";
+import { columnsFor, moveIndex } from "./grid";
 
 describe("columnsFor", () => {
   it("matches auto-fill at the prototype's library width for the three grid sizes", () => {
@@ -19,14 +19,6 @@ describe("columnsFor", () => {
     expect(columnsFor(0, 205, 12)).toBe(1);
     expect(columnsFor(Number.NaN, 205, 12)).toBe(1);
     expect(columnsFor(1197, 0, 12)).toBe(1);
-  });
-});
-
-describe("rowsOf", () => {
-  it("cuts items into rows, the last one short", () => {
-    expect(rowsOf([1, 2, 3, 4, 5, 6, 7], 3)).toEqual([[1, 2, 3], [4, 5, 6], [7]]);
-    expect(rowsOf([], 3)).toEqual([]);
-    expect(rowsOf([1, 2], 0)).toEqual([[1], [2]]);
   });
 });
 

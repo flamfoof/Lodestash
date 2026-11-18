@@ -26,6 +26,8 @@
     traits = [],
     thresholds,
     anchored = false,
+    row,
+    col,
     onopen,
     onpick,
     onaction,
@@ -46,6 +48,9 @@
     thresholds: SizeThresholds;
     /** Mark this card's parts for the contract gate (the grid marks its first card). */
     anchored?: boolean;
+    /** The card's place in the grid, 1-based: it says so itself (AssetGrid explains why). */
+    row?: number;
+    col?: number;
     onopen?: (event: MouseEvent) => void;
     onpick?: () => void;
     onaction?: (id: AssetActionId) => void;
@@ -75,6 +80,8 @@
   {onopen}
   oncontextmenu={onmenu}
   aria-selected={selected || picked}
+  aria-rowindex={row}
+  aria-colindex={col}
   data-id={asset.id}
   data-anchor={anchor("card")}
   titleAttrs={{ "data-anchor": anchor("card.name") }}
