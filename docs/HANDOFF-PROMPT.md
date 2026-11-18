@@ -24,8 +24,10 @@ catalogues Unity game assets (3D/audio/image) — Rust core + a Tauri 2 / Svelte
 - **Single writer.** Every catalog write goes through the desktop's `Writer` thread (`Op`). Agent
   plane mutations arrive as `AgentWrite` and cross the ADR-0002 write bridge — never write on a
   command thread, never add a second catalog writer.
-- **Agent planes are 1:1.** A new agent operation = `ServerState` method + REST route + MCP tool +
-  a row in `AGENT_OPERATIONS`. Skipping the last one fails the parity test, which is the point.
+- **Agent planes are 1:1.** A new agent operation = one declaration in `lodestash-protocol`'s
+  `operations!` list + a `ServerState` method + a REST route. The MCP tool and the allow-list gate
+  come from the declaration; a route without one — or a declaration without a route — fails
+  `lodestash-api/tests/protocol_catalog.rs`, which is the point.
 - **Non-destructive.** Original assets + the Unity cache are never modified or moved; `file`/`mesh`
   pulls materialize to our own cache/scratch only. The 256 MB in-pack cap guards the **thumb route
   only** (ADR-0005).

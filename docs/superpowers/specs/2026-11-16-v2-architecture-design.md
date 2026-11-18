@@ -239,7 +239,11 @@ REST paths under the same conventions.
   removes the file only while it still names this process's pid (a newer instance's file stays).
 - **Caller identity:**
   - *Agent*: `Authorization: Bearer <engine.json token>`. Agent calls go through the per-tool
-    allow-list and the approval gates exactly as today (`ENGINE-API.md` §8.4).
+    allow-list and the approval gates exactly as today (`ENGINE-API.md` §8.4). *As built
+    (2026-11-17, ADR-0024):* the gate finds a request's tool in the catalog
+    (`routes::operation_for`) rather than in a list of its own, and where two operations share a
+    route (`GET /v1/search`) the handler asks the same function which one a request is — the
+    decoded, last `mode` — so the gate and the handler cannot read one request two ways.
   - *UI*: the shell opens the window at `/session?code=<one-time, 60 s>`; the server exchanges it
     for an `HttpOnly; SameSite=Strict; Path=/` cookie and redirects to `/`. A UI caller is the
     human; agent approval gates do not apply to it, the destructive-action confirmations in the UI

@@ -357,3 +357,102 @@ fn an_error_names_the_handshake_file_without_the_home_directory() {
     }
     assert!(!handshake.parent().unwrap().exists(), "nothing was created");
 }
+
+/// `POST /v1/import` on the app, as a plain REST client sends it: the JSON `body` and the token.
+fn rest_import(app: &App, body: Value) -> Value {
+    let response = ureq::post(&format!("http://127.0.0.1:{}/v1/import", app.port))
+        .set("Authorization", &format!("Bearer {}", app.token))
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+        .expect("the import is accepted");
+    assert_eq!(response.status(), 202);
+    serde_json::from_str(&response.into_string().unwrap()).unwrap()
+}
+
+/// `with_dependencies` left out means the same thing on both planes: bring the dependency
+/// closure (ENGINE-API §5.2). REST alone used to read an absent field as `false`, so the same
+/// import brought a model's textures through the MCP tool and left them behind over REST.
+///
+/// Four imports of the wall — the field absent and `false`, through the MCP tool and as a raw
+/// REST body — are approved, and the queue says what each would import.
+#[test]
+fn an_import_brings_its_dependencies_by_default_on_both_planes() {
+    let (app, mut mcp) = connected();
+    let (project, _) = app
+        .state
+        .register_project("C:/dev/Game", None, None)
+        .expect("an editor is registered");
+    let wall = json!([app.asset]);
+
+    let job = |parked: &Value| parked["job_id"].as_str().expect("a parked job").to_string();
+    let mcp_default = job(body(
+        &mcp.call("import_to_project", json!({ "asset_ids": wall })),
+    ));
+    let rest_default = job(&rest_import(&app, json!({ "asset_ids": wall })));
+    let mcp_alone = job(body(&mcp.call(
+        "import_to_project",
+        json!({ "asset_ids": wall, "with_dependencies": false }),
+    )));
+    let rest_alone = job(&rest_import(
+        &app,
+        json!({ "asset_ids": wall, "with_dependencies": false }),
+    ));
+    for id in [&mcp_default, &rest_default, &mcp_alone, &rest_alone] {
+        app.state.approve_job(id);
+    }
+
+    // The approved imports are queued for the plugin on worker threads; a poll hands each out once.
+    let mut queued = std::collections::HashMap::new();
+    let until = Instant::now() + STEP;
+    while queued.len() < 4 {
+        for request in app.state.poll_import_queue(project).expect("the queue") {
+            let mut ids: Vec<i64> = request.assets.iter().map(|a| a.id).collect();
+            ids.sort_unstable();
+            queued.insert(request.job_id, ids);
+        }
+        assert!(Instant::now() < until, "only {queued:?} was queued");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut with_texture = vec![app.asset, app.dependency];
+    with_texture.sort_unstable();
+    assert_eq!(queued[&mcp_default], with_texture, "MCP, field absent");
+    assert_eq!(queued[&rest_default], with_texture, "REST, field absent");
+    assert_eq!(queued[&mcp_alone], [app.asset], "MCP, false");
+    assert_eq!(queued[&rest_alone], [app.asset], "REST, false");
+}
+
+/// A tool's description is a promise to the model. `get_asset_preview` answers the image and
+/// nothing else (v2 spec §7: the app's REST answer is the tool's answer), so its description
+/// must not promise a resource link beside it — and does say where the link is.
+#[test]
+fn the_preview_tool_describes_what_it_returns() {
+    let (app, mut mcp) = connected();
+    let listed = mcp.request("tools/list", json!({}));
+    let description = listed["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|t| t["name"] == "get_asset_preview")
+        .expect("the preview tool")["description"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let result = mcp.call("get_asset_preview", json!({"id": app.asset}));
+    let blocks = result["content"].as_array().expect("content");
+    assert_eq!(blocks.len(), 1, "{result}");
+    assert_eq!(blocks[0]["type"], "image");
+    assert!(
+        !description.contains("plus a resource link"),
+        "the description promises a link the answer does not carry: {description}"
+    );
+
+    // The link it points to instead is really there.
+    assert!(description.contains("file_resource_uri"), "{description}");
+    let detail = mcp.call("get_asset", json!({"id": app.asset}));
+    assert_eq!(
+        body(&detail)["file_resource_uri"],
+        format!("asset://{}/file", app.asset),
+        "{detail}"
+    );
+}

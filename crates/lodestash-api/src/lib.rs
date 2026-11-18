@@ -73,39 +73,11 @@ pub struct TagProposal {
 pub use handshake::{handshake_path, remove_handshake, write_handshake, Handshake};
 pub use routes::{package_json, project_json, router, summary_json};
 
-/// Every agent-facing operation in ENGINE-API §2, by MCP tool name. The MCP crate asserts its
-/// own tool list against this, which is how the 1:1 invariant stays enforced rather than hoped
-/// for. The list grows as routes land — parity is about *presence in both planes*, so a row is
-/// added only when the route exists.
-pub const AGENT_OPERATIONS: &[(&str, &str)] = &[
-    ("get_server_info", "GET /v1/server-info"),
-    ("search_assets", "GET /v1/search"),
-    ("semantic_search", "GET /v1/search?mode=ai"),
-    ("get_asset", "GET /v1/assets/{id}"),
-    ("get_asset_preview", "GET /v1/assets/{id}/preview"),
-    ("find_similar", "GET /v1/assets/{id}/similar"),
-    ("list_packages", "GET /v1/packages"),
-    ("register_project", "POST /v1/projects/register"),
-    ("list_projects", "GET /v1/projects"),
-    ("import_to_project", "POST /v1/import"),
-    ("export_asset", "POST /v1/export"),
-    ("get_job_status", "GET /v1/jobs/{id}"),
-    ("cancel_job", "POST /v1/jobs/{id}/cancel"),
-    ("list_tags", "GET /v1/tags"),
-    ("add_tag", "POST /v1/assets/{id}/tags"),
-    ("list_collections", "GET /v1/collections"),
-    ("apply_mapping", "POST /v1/mapping/apply"),
-    ("identify_asset", "POST /v1/identify"),
-    ("suggest_tags", "GET /v1/assets/{id}/suggest-tags"),
-    ("unpack_package", "POST /v1/packages/unpack"),
-    ("stage_asset", "POST /v1/stage"),
-    ("list_staged", "GET /v1/stage"),
-    ("import_staged", "POST /v1/stage/import"),
-    ("write_tags", "POST /v1/tags/batch"),
-    ("list_libraries", "GET /v1/libraries"),
-    ("list_assets", "GET /v1/assets"),
-    ("get_assets", "POST /v1/assets/read"),
-];
+/// Every agent-facing operation in ENGINE-API §2, by MCP tool name: the operation catalog's
+/// `Agent` operations (`lodestash_protocol::OPERATIONS`). This crate used to keep its own list of
+/// them, and the gate a second one; both now read the catalog, so an operation declared there is
+/// reported and gated here with nothing to keep in step.
+pub use lodestash_engine::config::agent_tool_names;
 
 /// Everything a preview renderer needs for one asset, resolved from the catalog by
 /// [`ServerState::preview_subject`] so the renderer needs no database access of its own.
@@ -389,8 +361,16 @@ pub struct ImportRequest {
     pub project_id: Option<i64>,
     #[serde(default)]
     pub dest_subfolder: Option<String>,
-    #[serde(default)]
+    /// Omitted ⇒ **true**: an import brings the dependency closure, as the MCP tool, the staged
+    /// import and the desktop all mean it (`lodestash_protocol::dto::ImportRequest`). This body
+    /// alone used to read an absent field as `false`, so the same import brought a model's
+    /// textures over MCP and left them behind over REST.
+    #[serde(default = "with_dependencies_by_default")]
     pub with_dependencies: bool,
+}
+
+fn with_dependencies_by_default() -> bool {
+    true
 }
 
 /// What [`ServerState::request_import`] decided (ENGINE-API §5.2/§5.4).
@@ -598,7 +578,7 @@ impl ServerState {
     }
 
     /// Restrict the agent surface to `enabled` tool names (UI-SPEC §16). The GUI computes this
-    /// from config — every [`AGENT_OPERATIONS`] name the user hasn't switched off — and calls it
+    /// from config — every [`agent_tool_names`] name the user hasn't switched off — and calls it
     /// once at wiring time and again whenever the toggles change. An empty set disables every
     /// tool; to re-open everything, call [`Self::allow_all`].
     pub fn set_allowed(&self, enabled: HashSet<String>) {
@@ -742,9 +722,7 @@ impl ServerState {
         } else {
             ("none", None)
         };
-        let enabled: Vec<&str> = AGENT_OPERATIONS
-            .iter()
-            .map(|(name, _)| *name)
+        let enabled: Vec<&str> = agent_tool_names()
             .filter(|name| self.allows(name))
             .collect();
         Ok(serde_json::json!({

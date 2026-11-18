@@ -16,7 +16,9 @@ and the config store — found the same shape of defect in several places: where
 absent, stale or ambiguous, the code resolved it in the permissive direction. A handshake file
 left by a dead app was still an address the session token was sent to. A string in that file was
 run as a program. A launch that outlasted one call was forgotten, so the next call started
-another app.
+another app. A Settings write that left out the spend cap removed it, and one that carried an
+empty key field deleted the key. A config that could not be read was replaced with defaults. A
+percent-encoded `mode` reached a tool the user had switched off.
 
 None of these is a design change. Each is a default that pointed the wrong way, and the rule that
 replaces them is one rule, so it is recorded once.
@@ -79,6 +81,21 @@ second app. `app_unavailable` keeps its meaning: nothing answers and nothing cou
 - Config observers are told of commits in commit order, and a save that fails restores the
   credential store.
 
+### A request is read one way, and a default means one thing on both planes
+
+- **One reading of a request.** The allow-list gate and the search handler decided separately
+  which operation `GET /v1/search` was — the gate from the raw text `mode=ai`, the handler from
+  the decoded, last `mode` — so `?mode=%61i` ran semantic search under `search_assets`'s
+  permission. One function (`routes::operation_for`) now answers both, from the operation catalog:
+  the gate's hand-kept list of routes and `lodestash_api::AGENT_OPERATIONS` are gone, and an
+  operation added to the catalog is gated without being listed anywhere.
+- **`with_dependencies` on an import defaults to `true` on both planes.** The REST body read an
+  absent field as `false` while the protocol type — and so the MCP tool — reads it as `true`.
+  REST now agrees with the declaration. (`export`'s default stays `false`, on both planes.)
+- **A tool's description says what the tool returns.** `get_asset_preview` promised a resource
+  link beside the image; the answer is the image, and the description now says where the link is
+  (`file_resource_uri` in `get_asset`).
+
 ## Consequences
 
 - A crashed app's `engine.json` costs a launch, not a leaked token. The remaining window is pid
@@ -97,6 +114,10 @@ second app. `app_unavailable` keeps its meaning: nothing answers and nothing cou
   `tool_disabled` and nothing identifies or rescans in the background, until the file loads.
   That state is reported (`config_unreadable` in the engine report) rather than silent.
 - A second Lodestash instance shows the settings it read at start and cannot change them.
+- A REST client that posts `/v1/import` without `with_dependencies` now imports the dependency
+  closure too. One that wants the named assets alone must send `false`.
+- A request that reached semantic search with the tool switched off, by encoding `mode`, is now
+  `403 tool_disabled`.
 
 ## Alternatives rejected
 

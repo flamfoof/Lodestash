@@ -68,12 +68,41 @@ fn an_import_body_reads_as_todays_type_reads_it() {
         // ENGINE-API §5.2.
         json!({ "asset_ids": [4821], "project_id": 2, "dest_subfolder": "Wildlife",
                 "with_dependencies": false }),
+        // Only what is required: every default is then the type's own. This is the body that
+        // told the two types apart — the fixtures above all spell `with_dependencies` out.
+        json!({ "asset_ids": [4821] }),
     ] {
         let today: lodestash_api::ImportRequest = serde_json::from_value(body.clone()).unwrap();
         let protocol: dto::ImportRequest = serde_json::from_value(body.clone()).unwrap();
         assert_eq!(protocol.asset_ids, today.asset_ids);
         assert_eq!(protocol.project_id, today.project_id);
         assert_eq!(protocol.dest_subfolder, today.dest_subfolder);
+        assert_eq!(
+            protocol.with_dependencies, today.with_dependencies,
+            "{body}"
+        );
+    }
+    let bare: lodestash_api::ImportRequest =
+        serde_json::from_value(json!({ "asset_ids": [4821] })).unwrap();
+    assert!(
+        bare.with_dependencies,
+        "an import brings dependencies unless told not to"
+    );
+}
+
+/// The other operation with a `with_dependencies`: an export leaves them out unless asked
+/// (ENGINE-API §2). Both types read an absent field as `false`.
+#[test]
+fn an_export_body_reads_as_todays_type_reads_it() {
+    for body in [
+        json!({ "asset_ids": [4821], "dest_path": "D:/out" }),
+        json!({ "asset_ids": [4821], "dest_path": "D:/out", "with_dependencies": true }),
+    ] {
+        let today: lodestash_api::export::ExportRequest =
+            serde_json::from_value(body.clone()).unwrap();
+        let protocol: dto::ExportArgs = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(protocol.asset_ids, today.asset_ids);
+        assert_eq!(protocol.dest_path, today.dest_path);
         assert_eq!(
             protocol.with_dependencies, today.with_dependencies,
             "{body}"

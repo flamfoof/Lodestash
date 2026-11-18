@@ -136,6 +136,12 @@ in-editor import (§5). Both reuse the **same dependency-closure resolution** de
 > answers `app_unavailable` — or `app_starting` while that app is still coming up. Nothing is
 > retried. Details: [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md) §2.
 
+> **Two operations, one route.** `GET /v1/search` is `semantic_search` when the request's `mode`
+> is `ai` and `search_assets` otherwise. The query is percent-decoded first and the **last** `mode`
+> decides — for the handler *and* for the per-tool allow-list (§8.4), which ask one function
+> (`routes::operation_for`, reading the operation catalog). They used to decide separately, and
+> `?mode=%61i` ran semantic search under `search_assets`'s permission (fixed 2026-11-17, ADR-0024).
+
 > **Parity scope.** "1:1" covers the **agent-facing** surface. A few routes are **REST-only by
 > design** — `GET /v1/assets/{id}/file` (the MCP `resource_link` target) and the plugin-transport
 > endpoints `GET /v1/import-queue` + `POST /v1/import-queue/{req}/ack` (§5.3) — because they are
@@ -296,7 +302,13 @@ POST /v1/import
 
 The core resolves the **dependency closure** (mesh + materials + textures — same resolver as
 `export`), stages the bytes into a temp area, and appends an **import request** to that project's
-queue. If `project_id` is omitted it targets the **active** project; if **none is registered** it
+queue. **`with_dependencies` defaults to `true` when omitted, on both planes** — an import brings
+what the asset needs unless told not to; send `false` to import the named assets alone. (The REST
+body alone used to read an absent field as `false`, so the same import differed between REST and
+the MCP tool — fixed 2026-11-17,
+[ADR-0024](decisions/ADR-0024-the-boundary-fails-closed.md).) `export`'s `with_dependencies` is the
+opposite default, `false`, also on both planes: a copy out of the library takes only what was
+named unless asked. If `project_id` is omitted it targets the **active** project; if **none is registered** it
 returns `409 project_not_registered` (the AI/GUI then falls back to `export` to a path).
 
 ### 5.3 The plugin drains the queue on Unity's main thread

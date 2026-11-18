@@ -251,8 +251,8 @@ pub fn refused_port() -> u16 {
     l.local_addr().unwrap().port()
 }
 
-/// Today's app, minus the window: the `/v1` router over a temp catalog seeded with one asset, on a
-/// listener this test bound — `lodestash_api::serve` is not used because it writes the platform
+/// Today's app, minus the window: the `/v1` router over a temp catalog seeded with one asset and
+/// the texture it depends on, on a listener this test bound — `lodestash_api::serve` is not used because it writes the platform
 /// handshake file.
 pub struct App {
     pub dir: tempfile::TempDir,
@@ -260,6 +260,8 @@ pub struct App {
     pub token: String,
     /// `mossy_wall.png`'s id.
     pub asset: i64,
+    /// `lichen_albedo.png`'s id — the texture `mossy_wall.png` depends on.
+    pub dependency: i64,
     /// Where this app's handshake goes. Not written until a test asks (`publish`).
     pub handshake: PathBuf,
     /// The app's side of things a test plays the person for: approving a parked job, registering
@@ -273,24 +275,41 @@ impl App {
 
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("catalog.db");
+        let dependency;
         {
             let mut c = Catalog::open(&db).unwrap();
             c.seed_media_types().unwrap();
             let src = c
                 .upsert_import_source("Lib", dir.path().to_str().unwrap(), "folder")
                 .unwrap();
+            let file = |name: &str| CrawlRecord {
+                workspace_rel: None,
+                content_hash: None,
+                rel_path: name.into(),
+                name: name.into(),
+                media_type: "image".into(),
+                size_bytes: FILE.len() as i64,
+                mtime: 1,
+            };
             c.record_crawl(
                 src,
                 None,
-                &[CrawlRecord {
-                    workspace_rel: None,
-                    content_hash: None,
-                    rel_path: "mossy_wall.png".into(),
-                    name: "mossy_wall.png".into(),
-                    media_type: "image".into(),
-                    size_bytes: FILE.len() as i64,
-                    mtime: 1,
-                }],
+                &[file("mossy_wall.png"), file("lichen_albedo.png")],
+            )
+            .unwrap();
+            // The wall depends on the lichen texture: an import or export "with dependencies"
+            // brings both.
+            let recent = c.recent_asset_ids(10).unwrap();
+            let rows = c.asset_summaries(&recent).unwrap();
+            let id = |name: &str| rows.iter().find(|r| r.name == name).unwrap().id;
+            dependency = id("lichen_albedo.png");
+            c.record_dependencies(dependency, Some("11aa"), "uses_texture", &[])
+                .unwrap();
+            c.record_dependencies(
+                id("mossy_wall.png"),
+                Some("22bb"),
+                "uses_texture",
+                &["11aa".to_string()],
             )
             .unwrap();
         }
@@ -332,6 +351,7 @@ impl App {
             port,
             token,
             asset,
+            dependency,
             handshake,
             state,
         }

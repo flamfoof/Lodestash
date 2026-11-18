@@ -13,6 +13,10 @@ lodestash-core = { workspace = true }
 # The export sandbox rule (`export::check_dest`), shared with the engine's writer. The adapter
 # depends on the service, never the reverse (v2 spec §3).
 lodestash-engine = { workspace = true }
+# The operation catalog. The allow-list gate finds a request's tool in it (`routes::operation_for`)
+# instead of keeping a list of its own; the router itself is derived from it in v2 plan P3. No new
+# crate in the tree: the engine already links it.
+lodestash-protocol = { workspace = true }
 serde          = { workspace = true }
 serde_json     = { workspace = true }
 tracing        = { workspace = true }
@@ -27,5 +31,3 @@ tower    = { workspace = true }
 tempfile = { workspace = true }
 # Fixtures only: a test seeds a catalog file directly, since `Catalog::conn` is crate-private.
 rusqlite = { workspace = true }
-# Parity tests only (tests/protocol_*.rs): today's router against the v2 operation catalog.
-lodestash-protocol = { workspace = true }

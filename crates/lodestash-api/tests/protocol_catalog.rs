@@ -100,20 +100,47 @@ fn shape(path: &str) -> String {
         .join("/")
 }
 
+/// A value of the type a schema property declares. `Option<T>` is `["T", "null"]`: the `T`.
+fn sample(op: &OpSpec, field: &str, property: &Value) -> Value {
+    let kind = match &property["type"] {
+        Value::String(kind) => Some(kind.as_str()),
+        Value::Array(kinds) => kinds
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|kind| *kind != "null"),
+        _ => None,
+    };
+    match kind {
+        Some("integer") => json!(1),
+        Some("number") => json!(1.0),
+        Some("string") => json!("x1"),
+        Some("array") => json!([]),
+        Some("boolean") => json!(false),
+        other => panic!("{}.{field}: no sample for type {other:?}", op.name),
+    }
+}
+
 /// The smallest input the operation's schema accepts: each required field with a value of its type.
 fn minimal_input(op: &OpSpec) -> Value {
     let s = serde_json::to_value((op.input_schema)()).unwrap();
     let mut input = Map::new();
     for field in s["required"].as_array().into_iter().flatten() {
         let field = field.as_str().unwrap();
-        let value = match s["properties"][field]["type"].as_str() {
-            Some("integer") => json!(1),
-            Some("string") => json!("x1"),
-            Some("array") => json!([]),
-            Some("boolean") => json!(false),
-            other => panic!("{}.{field}: no sample for type {other:?}", op.name),
-        };
-        input.insert(field.to_string(), value);
+        input.insert(
+            field.to_string(),
+            sample(op, field, &s["properties"][field]),
+        );
+    }
+    Value::Object(input)
+}
+
+/// The largest: every field the schema offers, optional ones included — what a model that fills
+/// in everything sends.
+fn full_input(op: &OpSpec) -> Value {
+    let s = serde_json::to_value((op.input_schema)()).unwrap();
+    let mut input = Map::new();
+    for (field, property) in s["properties"].as_object().into_iter().flatten() {
+        input.insert(field.clone(), sample(op, field, property));
     }
     Value::Object(input)
 }
@@ -122,19 +149,87 @@ fn minimal_input(op: &OpSpec) -> Value {
 async fn every_catalog_operation_reaches_its_route_in_todays_router() {
     let (_dir, state, _) = state();
     for op in OPERATIONS {
-        let request = op
-            .request(&minimal_input(op))
-            .unwrap_or_else(|e| panic!("{}: {e}", op.name));
-        let (status, matched, body) = send(&state, &request).await;
-        assert_eq!(
-            matched.as_deref().map(shape),
-            Some(shape(op.route_path())),
-            "{} → {} {} answered {status} from no route of its own: {body}",
-            op.name,
-            request.method.as_str(),
-            request.target
+        for input in [minimal_input(op), full_input(op)] {
+            let request = op
+                .request(&input)
+                .unwrap_or_else(|e| panic!("{} {input}: {e}", op.name));
+            let (status, matched, body) = send(&state, &request).await;
+            assert_eq!(
+                matched.as_deref().map(shape),
+                Some(shape(op.route_path())),
+                "{} → {} {} answered {status} from no route of its own: {body}",
+                op.name,
+                request.method.as_str(),
+                request.target
+            );
+            assert_ne!(status, StatusCode::METHOD_NOT_ALLOWED, "{}", op.name);
+            // Matching the route is not reaching the handler. axum answers a query or body its
+            // extractor cannot decode by itself — 400, 415 or 422, in plain text — before any
+            // handler runs, and that used to count here as "reached". The handler took the
+            // request only if the answer is a success or carries the app's own error envelope.
+            assert!(
+                status.is_success() || body["error"]["code"].is_string(),
+                "{} → {} {} {:?} matched its route and was refused before its handler \
+                 ({status}, no envelope): today's handler does not read what the catalog sends",
+                op.name,
+                request.method.as_str(),
+                request.target,
+                request.body.as_ref().map(Value::to_string)
+            );
+        }
+    }
+}
+
+/// The allow-list gate knows every agent operation by the catalog's name for it: with one tool
+/// switched off, exactly that operation's request is refused `tool_disabled`, and with only that
+/// tool switched on it is the one request that is not. The gate is derived from the catalog, so
+/// an operation added there is gated without anyone remembering to list it — this is the test
+/// that would say so if it were not.
+#[tokio::test]
+async fn every_agent_operation_is_gated_under_its_own_name() {
+    let (_dir, state, _) = state();
+    let agent: Vec<&OpSpec> = OPERATIONS
+        .iter()
+        .filter(|op| op.audience == Audience::Agent)
+        .collect();
+    assert!(agent.len() > 20, "the catalog lost its agent operations");
+    let disabled = |status: StatusCode, body: &Value| {
+        status == StatusCode::FORBIDDEN && body["error"]["code"] == "tool_disabled"
+    };
+    for op in &agent {
+        let request = op.request(&minimal_input(op)).unwrap();
+
+        state.set_allowed(
+            agent
+                .iter()
+                .filter(|other| other.name != op.name)
+                .map(|other| other.name.to_string())
+                .collect(),
         );
-        assert_ne!(status, StatusCode::METHOD_NOT_ALLOWED, "{}", op.name);
+        let (status, _, body) = send(&state, &request).await;
+        assert!(
+            disabled(status, &body),
+            "{} is switched off and its request was let through: {status} {body}",
+            op.name
+        );
+
+        state.set_allowed([op.name.to_string()].into());
+        let (status, _, body) = send(&state, &request).await;
+        assert!(
+            !disabled(status, &body),
+            "{} is the one tool switched on and its request was refused",
+            op.name
+        );
+    }
+    // Plumbing that is not an agent operation has no switch: it is never `tool_disabled`.
+    state.set_allowed(Default::default());
+    for op in OPERATIONS
+        .iter()
+        .filter(|op| op.audience != Audience::Agent)
+    {
+        let request = op.request(&minimal_input(op)).unwrap();
+        let (status, _, body) = send(&state, &request).await;
+        assert!(!disabled(status, &body), "{} was gated as a tool", op.name);
     }
 }
 
