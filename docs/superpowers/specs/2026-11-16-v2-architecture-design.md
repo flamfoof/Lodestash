@@ -126,6 +126,13 @@ to top-level `web/`: it is a client of `/v1`, not a Tauri frontend.
 - **Engine status** is a value the UI and agents can read (`GET /v1/status`):
   `starting | migrating{from,to} | ready | failed{code,message}`. Every failure here renders as a
   blocking screen in the UI with the message and what to do — never an empty library.
+- *As built (2026-11-17):* until `GET /v1/status` exists the old shell reads `Engine::report()`
+  through one Tauri command, `engine_status` (it also records the dismissal of
+  `config_recovered`), and `App.svelte` draws a blocking notice with the code and message while
+  the state is not `ready`, and a dismissible line for a recovered config. **A read from an engine
+  that is not `ready` is an error** (`Engine::read` → `ReadError::NotReady(status)`), not an empty
+  library — so every shell read, and the `lodestash://` byte routes (`503`), say why instead of
+  drawing nothing.
 
 ### 4.3 Read model
 
@@ -135,6 +142,16 @@ generation it was built at with the current one and rebuilds lazily if they diff
 background writes therefore become visible to the UI without a "Refresh" banner (fixes R2's
 backend half). Every read response carries the generation it reflects
 (`X-Lodestash-Gen` header).
+
+**A rebuild is all or nothing, and a failed one is never served.** The snapshot is built from a
+dozen queries; `Library::reload` returns an error if any of them fails and leaves the previous
+snapshot untouched, and `Engine::read` then answers `ReadError::Rebuild` **without stamping** the
+generation — so the next read tries again, where a failed query used to be logged, skipped and the
+half-built result served as current. A panic while the read lock is held costs one rebuild: the
+poison is cleared, where it used to make every later read rebuild the whole library and
+`Engine::reload` a no-op. Counts read through the model's reader for a decision (the tagging queue
+behind the cloud cost estimate, the workspace paths the reclaim must keep) are `Result`s for the
+same reason: a failed count is not zero.
 
 A SQL-backed paged/faceted listing replaces the snapshot later (§13); the snapshot's tests are
 its contract.

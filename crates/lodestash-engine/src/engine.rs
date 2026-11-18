@@ -171,6 +171,51 @@ impl std::ops::Deref for ReadModelGuard<'_> {
     }
 }
 
+/// Why the library cannot be read right now (v2 spec §4.2–§4.3).
+///
+/// A read used to answer in every state — an empty library while the engine was starting or had
+/// failed, the last snapshot when a rebuild failed — so "no assets" and "I could not look" were
+/// the same answer, and the callers that *delete by what a read says is unreferenced* could not
+/// tell them apart (integrity review, findings 1, 8 and 9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadError {
+    /// The engine is not `Ready`: still starting or migrating, or it failed. The status says
+    /// which, and for a failure carries the code and what to do.
+    NotReady(EngineStatus),
+    /// The catalog is open but its snapshot could not be rebuilt. Nothing stale is served, the
+    /// failed build is not stamped current, and the next read tries again.
+    Rebuild(String),
+}
+
+impl ReadError {
+    /// The stable kind an adapter maps (`lodestash_protocol::codes`).
+    pub fn code(&self) -> &'static str {
+        match self {
+            ReadError::NotReady(_) => lodestash_protocol::codes::UNAVAILABLE,
+            ReadError::Rebuild(_) => lodestash_protocol::codes::INTERNAL,
+        }
+    }
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadError::NotReady(EngineStatus::Failed { code, message }) => {
+                write!(f, "the library is not open ({code}): {message}")
+            }
+            ReadError::NotReady(EngineStatus::Migrating { from, to }) => write!(
+                f,
+                "the catalog is being upgraded (schema {from} to {to}) — the library opens when \
+                 that finishes"
+            ),
+            ReadError::NotReady(_) => f.write_str("the library is still opening"),
+            ReadError::Rebuild(why) => write!(f, "the library could not be read: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for ReadError {}
+
 struct Inner {
     cfg: EngineConfig,
     config: Arc<ConfigStore>,
@@ -267,7 +312,7 @@ impl Engine {
     }
 
     /// An engine that could not even be configured — no catalog location on this system. It
-    /// reports `Failed { code, message }`, refuses every write with the message and reads empty.
+    /// reports `Failed { code, message }`, and refuses every write and every read with it.
     pub fn failed(code: &str, message: &str) -> Engine {
         let status = Arc::new(StatusCell::new(EngineStatus::Failed {
             code: code.into(),
@@ -381,34 +426,54 @@ impl Engine {
     /// The read model, rebuilt first if the catalog generation moved since it was built — so a
     /// write by anyone (the user, an agent, the background lane) shows on the next read without a
     /// refresh (v2 spec §4.3).
-    pub fn read(&self) -> ReadModelGuard<'_> {
-        let mut slot = match self.inner.read.lock() {
-            Ok(slot) => slot,
-            // A panic mid-read may have left the snapshot half-built: rebuild it.
-            Err(poisoned) => {
-                let mut slot = poisoned.into_inner();
-                slot.built_at = None;
-                slot
-            }
-        };
+    ///
+    /// An `Err` — never an empty or stale library — when the engine is not `Ready` or the
+    /// snapshot could not be rebuilt ([`ReadError`]). A rebuild that fails is **not stamped**:
+    /// the generation it was for stays unseen, so the next read tries again.
+    pub fn read(&self) -> Result<ReadModelGuard<'_>, ReadError> {
+        let mut slot = self.read_slot();
+        let status = self.status();
+        if status != EngineStatus::Ready {
+            return Err(ReadError::NotReady(status));
+        }
         if !slot.model.is_attached() {
-            self.attach_reader(&mut slot);
+            self.attach_reader(&mut slot)?;
         }
         // Read before the rebuild, so a write landing during it makes the next read rebuild again
         // rather than be mistaken for already seen.
         let generation = self.catalog_generation();
-        if slot.model.is_attached() && slot.built_at != Some(generation) {
-            slot.model.reload();
+        if slot.built_at != Some(generation) {
+            if let Err(why) = slot.model.reload() {
+                tracing::error!(%why, generation, "read model: rebuild failed; not serving it");
+                slot.built_at = None;
+                return Err(ReadError::Rebuild(why));
+            }
             slot.built_at = Some(generation);
         }
-        ReadModelGuard { slot }
+        Ok(ReadModelGuard { slot })
     }
 
-    /// Rebuild the read model now, whatever the generation says — for a change the catalog
-    /// generation does not see (a settings edit that moves the size tiers).
+    /// Rebuild the read model on the next read, whatever the generation says — for a change the
+    /// catalog generation does not see (a settings edit that moves the size tiers).
     pub fn reload(&self) {
-        if let Ok(mut slot) = self.inner.read.lock() {
-            slot.built_at = None;
+        self.read_slot().built_at = None;
+    }
+
+    /// The read slot, whatever happened to the last thread that held it.
+    ///
+    /// A panic while the slot was held poisons its mutex, and may have left the snapshot
+    /// half-built — so it is rebuilt **once**, and the poison is cleared. It used to stay set:
+    /// every later read then took this path and rebuilt the whole library again, and
+    /// [`Self::reload`], which gave up on a poisoned lock, never ran at all (review finding 10).
+    fn read_slot(&self) -> MutexGuard<'_, ReadSlot> {
+        match self.inner.read.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => {
+                let mut slot = poisoned.into_inner();
+                slot.built_at = None;
+                self.inner.read.clear_poison();
+                slot
+            }
         }
     }
 
@@ -440,25 +505,25 @@ impl Engine {
         }
     }
 
-    /// Open the read model's connection once the writer has the catalog ready.
-    fn attach_reader(&self, slot: &mut ReadSlot) {
-        if self.status() != EngineStatus::Ready {
-            return;
-        }
+    /// Open the read model's connection once the writer has the catalog ready. The snapshot is
+    /// built — and stamped — by the read that asked for this.
+    fn attach_reader(&self, slot: &mut ReadSlot) -> Result<(), ReadError> {
         match Catalog::open_reader(&self.inner.cfg.catalog) {
             Ok(reader) => {
-                let generation = self.catalog_generation();
                 slot.model.attach(reader);
-                slot.built_at = Some(generation);
+                slot.built_at = None;
+                Ok(())
             }
             Err(e) => {
                 // The writer has the catalog open and current, so this is a real fault — say so
                 // rather than serve an empty library.
                 tracing::error!(%e, "read model: catalog reader failed to open");
-                self.inner.status.set(EngineStatus::Failed {
+                let failed = EngineStatus::Failed {
                     code: "catalog_unreadable".into(),
                     message: format!("the catalog opened for writing but not for reading: {e}"),
-                });
+                };
+                self.inner.status.set(failed.clone());
+                Err(ReadError::NotReady(failed))
             }
         }
     }

@@ -30,7 +30,7 @@ pub mod writer;
 
 pub use changes::{ChangedEvent, Origin};
 pub use config_store::ConfigStore;
-pub use engine::{Engine, EngineConfig, EngineReport, EngineStatus, ReadModelGuard};
+pub use engine::{Engine, EngineConfig, EngineReport, EngineStatus, ReadError, ReadModelGuard};
 /// What a [`Engine::subscribe`] receiver answers when it fell behind or the engine is gone.
 pub use tokio::sync::broadcast::error::RecvError as ChangeRecvError;
 pub use writer::{Op, WriteError, WriteResult, WriterHandle};

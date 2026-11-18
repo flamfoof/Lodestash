@@ -53,6 +53,13 @@ fn split_route(path: &str) -> (&str, &str) {
     }
 }
 
+/// The library cannot be read right now — the engine is not Ready, or its snapshot could not be
+/// rebuilt. `503` with the reason: answering `404 unknown asset` here would tell the client an
+/// asset does not exist when it is the *library* that is unavailable.
+fn unreadable(e: &lodestash_engine::ReadError) -> Response<Vec<u8>> {
+    status(StatusCode::SERVICE_UNAVAILABLE, &e.to_string())
+}
+
 /// The status each media failure answers with.
 fn media_status(e: &MediaError) -> Response<Vec<u8>> {
     let code = match e {
@@ -70,7 +77,10 @@ fn preview(engine: &Engine, rest: &str) -> Response<Vec<u8>> {
     let Some(id) = rest.trim_end_matches(".svg").parse::<i64>().ok() else {
         return status(StatusCode::BAD_REQUEST, "preview: bad asset id");
     };
-    let svg = engine.read().preview_svg(id);
+    let svg = match engine.read() {
+        Ok(lib) => lib.preview_svg(id),
+        Err(e) => return unreadable(&e),
+    };
     match svg {
         Some(svg) => reply(StatusCode::OK)
             .header("Content-Type", "image/svg+xml")
@@ -99,7 +109,10 @@ fn thumb(engine: &Engine, rest: &str) -> Response<Vec<u8>> {
         return status(StatusCode::BAD_REQUEST, "thumb: bad asset id");
     };
     let (job, cache_dir) = {
-        let lib = engine.read();
+        let lib = match engine.read() {
+            Ok(lib) => lib,
+            Err(e) => return unreadable(&e),
+        };
         (
             lib.thumb_job(id),
             lib.thumb_cache_dir().map(Path::to_path_buf),
@@ -142,7 +155,10 @@ fn mesh(engine: &Engine, rest: &str) -> Response<Vec<u8>> {
         return status(StatusCode::BAD_REQUEST, "mesh: bad asset id");
     };
     let (path, known, media_type, cache, job) = {
-        let lib = engine.read();
+        let lib = match engine.read() {
+            Ok(lib) => lib,
+            Err(e) => return unreadable(&e),
+        };
         (
             lib.asset_path(id).map(Path::to_path_buf),
             lib.knows(id),
@@ -212,7 +228,10 @@ fn slot_texture(engine: &Engine, rest: &str) -> Response<Vec<u8>> {
         return status(StatusCode::BAD_REQUEST, "slottex: bad asset id or slot");
     };
     let (path, slots, cache) = {
-        let lib = engine.read();
+        let lib = match engine.read() {
+            Ok(lib) => lib,
+            Err(e) => return unreadable(&e),
+        };
         (
             lib.asset_path(id).map(Path::to_path_buf),
             lib.slot_textures(id),
@@ -243,7 +262,10 @@ fn file(engine: &Engine, rest: &str, req: &Request<Vec<u8>>) -> Response<Vec<u8>
         return status(StatusCode::BAD_REQUEST, "file: bad asset id");
     };
     let (path, known, cache_dir, job) = {
-        let lib = engine.read();
+        let lib = match engine.read() {
+            Ok(lib) => lib,
+            Err(e) => return unreadable(&e),
+        };
         (
             lib.asset_path(id).map(Path::to_path_buf),
             lib.knows(id),

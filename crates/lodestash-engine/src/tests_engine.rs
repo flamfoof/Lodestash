@@ -9,7 +9,7 @@ use lodestash_core::catalog::{Catalog, CrawlRecord};
 
 use crate::types::PersistBatch;
 use crate::writer::{Op, Probe, ProbeEnd, WriteError};
-use crate::{Engine, EngineConfig, EngineStatus, Origin};
+use crate::{Engine, EngineConfig, EngineStatus, Origin, ReadError};
 
 const SETTLE: Duration = Duration::from_secs(5);
 
@@ -64,6 +64,7 @@ fn seed(engine: &Engine, root: &Path, names: &[&str]) -> (String, Vec<i64>) {
         .expect("seed");
     let mut items = engine
         .read()
+        .expect("read")
         .page(&crate::read_model::GridQuery {
             page_size: 1000,
             ..Default::default()
@@ -90,6 +91,7 @@ fn a_fresh_install_creates_its_catalog_and_takes_writes() {
         .expect("the first write lands");
     let names: Vec<String> = engine
         .read()
+        .expect("read")
         .collections()
         .into_iter()
         .map(|c| c.name)
@@ -155,7 +157,7 @@ fn a_panicking_command_answers_internal_and_the_writer_keeps_serving() {
             name: "after".into(),
         })
         .expect("the writer survived the panic");
-    assert_eq!(engine.read().collections().len(), 1);
+    assert_eq!(engine.read().expect("read").collections().len(), 1);
 }
 
 /// Review findings 7, 11 and 13: a command that fails or panics **after** it has committed, with a
@@ -168,7 +170,7 @@ fn a_command_that_fails_or_panics_after_committing_is_still_seen_and_ends_its_jo
     let dir = tempfile::tempdir().expect("tmp");
     let (engine, _) = started(dir.path());
     let (_, ids) = seed(&engine, dir.path(), &["a.png", "b.png"]);
-    assert_eq!(engine.read().status().favorites, 0);
+    assert_eq!(engine.read().expect("read").status().favorites, 0);
     let jobs_before = engine.jobs().snapshot().recent.len();
 
     for (end, id) in [(ProbeEnd::Fail, ids[0]), (ProbeEnd::Panic, ids[1])] {
@@ -190,7 +192,7 @@ fn a_command_that_fails_or_panics_after_committing_is_still_seen_and_ends_its_jo
         );
     }
     assert_eq!(
-        engine.read().status().favorites,
+        engine.read().expect("read").status().favorites,
         2,
         "the read model is serving the snapshot from before the commands that failed"
     );
@@ -299,7 +301,7 @@ fn a_command_still_running_when_its_caller_stops_waiting_says_so_and_finishes() 
         .run(Op::ClearStaged)
         .expect("the next command runs once the slow one is done");
     assert_eq!(
-        engine.read().status().favorites,
+        engine.read().expect("read").status().favorites,
         1,
         "the command its caller stopped waiting for still landed"
     );
@@ -341,8 +343,12 @@ fn rows_minted_by_an_extract_request_show_even_when_the_extraction_fails() {
             }],
         })
         .expect("the pack is browsable");
-    assert_eq!(engine.read().status().in_pack, 0, "nothing minted yet");
-    let package_id = engine.read().packages()[0].id;
+    assert_eq!(
+        engine.read().expect("read").status().in_pack,
+        0,
+        "nothing minted yet"
+    );
+    let package_id = engine.read().expect("read").packages()[0].id;
 
     engine
         .writer()
@@ -359,7 +365,7 @@ fn rows_minted_by_an_extract_request_show_even_when_the_extraction_fails() {
     }
     engine.writer().run(Op::ClearStaged).expect("drained");
     assert_eq!(
-        engine.read().status().in_pack,
+        engine.read().expect("read").status().in_pack,
         1,
         "the minted in-pack row is in the catalog and not in the read model"
     );
@@ -374,8 +380,8 @@ fn an_agent_write_moves_the_read_model_without_a_reload() {
     let (engine, _) = started(dir.path());
     let (_, ids) = seed(&engine, dir.path(), &["a.png", "b.png"]);
     assert_eq!(ids.len(), 2, "the persist's own connection was seen");
-    let before = engine.read().generation();
-    assert_eq!(engine.read().status().favorites, 0);
+    let before = engine.read().expect("read").generation();
+    assert_eq!(engine.read().expect("read").status().favorites, 0);
 
     engine
         .writer()
@@ -387,7 +393,7 @@ fn an_agent_write_moves_the_read_model_without_a_reload() {
             Origin::Agent,
         )
         .expect("agent write");
-    let read = engine.read();
+    let read = engine.read().expect("read");
     assert_eq!(read.status().favorites, 1, "the agent's write is visible");
     assert!(read.generation() > before, "at a newer generation");
 }
@@ -402,7 +408,7 @@ fn remove_from_library_needs_no_open_project() {
     let (engine, cfg) = started(dir.path());
     let (lib, ids) = seed(&engine, dir.path(), &["keep.png", "drop.png"]);
     let drop_id = ids[0]; // "drop.png" sorts first
-    let targets = engine.read().write_targets(&[drop_id]);
+    let targets = engine.read().expect("read").write_targets(&[drop_id]);
     assert_eq!(targets.len(), 1);
 
     let out = engine
@@ -411,7 +417,7 @@ fn remove_from_library_needs_no_open_project() {
         .expect("Remove from Library succeeds without a project");
     assert_eq!(out.changed, 1);
     assert_eq!(
-        engine.read().status().total_assets,
+        engine.read().expect("read").status().total_assets,
         1,
         "the removed asset left the library view"
     );
@@ -460,7 +466,7 @@ fn remove_from_library_mirrors_into_the_open_projects_config() {
     let engine = Engine::start(cfg.clone());
     assert_eq!(engine.wait_settled(SETTLE), EngineStatus::Ready);
     let (_, ids) = seed(&engine, dir.path(), &["drop.png"]);
-    let targets = engine.read().write_targets(&ids);
+    let targets = engine.read().expect("read").write_targets(&ids);
     engine
         .writer()
         .run(Op::RemoveFromLibrary { targets })
@@ -530,7 +536,7 @@ fn undoing_a_trash_restores_only_what_it_changed() {
         })
         .expect("trash both");
     assert_eq!(both.changed, 1, "only b changed");
-    let op = engine.read().recent_ops(1)[0].id;
+    let op = engine.read().expect("read").recent_ops(1)[0].id;
     w.run(Op::RevertOp { op_id: op }).expect("undo");
 
     let reader = Catalog::open_reader(&cfg.catalog).expect("separate read");
@@ -708,7 +714,10 @@ fn removing_a_root_level_file_excludes_only_that_file() {
     engine.config_store().on_change(move |_| {
         seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     });
-    let targets = engine.read().write_targets(&[root_level, other]);
+    let targets = engine
+        .read()
+        .expect("read")
+        .write_targets(&[root_level, other]);
     engine
         .writer()
         .run(Op::RemoveFromLibrary { targets })
@@ -782,9 +791,9 @@ fn undo_never_restores_a_deleted_or_removed_asset() {
         trashed: true,
     })
     .expect("trash a");
-    let trash_a = engine.read().recent_ops(1)[0].id;
-    let targets = engine.read().write_targets(&[a]);
-    let roots = engine.read().roots();
+    let trash_a = engine.read().expect("read").recent_ops(1)[0].id;
+    let targets = engine.read().expect("read").write_targets(&[a]);
+    let roots = engine.read().expect("read").roots();
     let out = w
         .run(Op::DeleteFromDisk {
             targets,
@@ -809,8 +818,8 @@ fn undo_never_restores_a_deleted_or_removed_asset() {
         trashed: true,
     })
     .expect("trash b and c");
-    let trash_bc = engine.read().recent_ops(1)[0].id;
-    let targets = engine.read().write_targets(&[b]);
+    let trash_bc = engine.read().expect("read").recent_ops(1)[0].id;
+    let targets = engine.read().expect("read").write_targets(&[b]);
     w.run(Op::RemoveFromLibrary { targets })
         .expect("remove b from the library");
     w.run(Op::RevertOp { op_id: trash_bc }).expect("undo");
@@ -821,6 +830,136 @@ fn undo_never_restores_a_deleted_or_removed_asset() {
     assert!(
         !trashed_on_disk(&cfg, &lib, c),
         "the rest of that trash still undoes"
+    );
+}
+
+/// Review finding 8: an engine that is not Ready answered every read with an empty library, so a
+/// failed start looked exactly like a library with nothing in it. A read now says why, and the
+/// report the shell shows carries the same code and message.
+#[test]
+fn a_read_from_an_engine_that_is_not_ready_says_why() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (first, cfg) = started(dir.path());
+    seed(&first, dir.path(), &["a.png"]);
+
+    let second = Engine::start(cfg.clone());
+    match second.read().map(|l| l.status().total_assets) {
+        Err(ReadError::NotReady(EngineStatus::Failed { code, .. })) => {
+            assert_eq!(code, "catalog_locked")
+        }
+        other => panic!("an engine with no catalog answered a read: {other:?}"),
+    }
+    let said = second.read().map(|_| ()).unwrap_err().to_string();
+    assert!(
+        said.contains("catalog_locked") && said.contains("already using"),
+        "the error names the failure: {said}"
+    );
+    let report = serde_json::to_value(second.report()).expect("report");
+    assert_eq!(report["state"], "failed");
+    assert_eq!(report["code"], "catalog_locked");
+    assert!(report["message"].as_str().is_some_and(|m| !m.is_empty()));
+
+    let nowhere = Engine::failed("no_catalog_location", "nowhere to keep a catalog");
+    assert!(matches!(
+        nowhere.read().map(|_| ()),
+        Err(ReadError::NotReady(EngineStatus::Failed { .. }))
+    ));
+    assert_eq!(
+        first.read().expect("the owner reads").status().total_assets,
+        1
+    );
+}
+
+/// Review finding 9: the snapshot is rebuilt from a dozen queries, and one that failed used to be
+/// logged and skipped — then the half-built result was stamped as the current generation and
+/// served. A failed rebuild is an error, is not stamped, and the next read tries again. The same
+/// goes for the tagging-queue count behind the cloud cost estimate, which read 0 on failure.
+#[test]
+fn a_failed_rebuild_is_an_error_and_is_not_stamped_current() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (engine, cfg) = started(dir.path());
+    seed(&engine, dir.path(), &["a.png", "b.png"]);
+    assert_eq!(engine.read().expect("read").status().total_assets, 2);
+    let raw = rusqlite::Connection::open(&cfg.catalog).expect("raw");
+
+    // One of the snapshot's queries now fails, and the catalog moves on.
+    raw.execute_batch("ALTER TABLE asset_preview RENAME TO asset_preview_gone;")
+        .expect("break the previews query");
+    engine
+        .writer()
+        .run(Op::CreateCollection { name: "x".into() })
+        .expect("a write that still works");
+    match engine.read().map(|l| l.status().total_assets) {
+        Err(ReadError::Rebuild(why)) => assert!(why.contains("preview"), "{why}"),
+        other => panic!("a snapshot missing its previews was served: {other:?}"),
+    }
+    assert!(
+        engine.read().is_err(),
+        "the failed build was stamped: the second read served it"
+    );
+
+    // Repaired, the very next read rebuilds — nothing else had to change.
+    raw.execute_batch("ALTER TABLE asset_preview_gone RENAME TO asset_preview;")
+        .expect("repair");
+    let read = engine.read().expect("read after the repair");
+    assert_eq!(read.status().total_assets, 2);
+    assert_eq!(read.generation(), engine.catalog_generation());
+    assert_eq!(read.count_needing_tags().expect("queue"), 2);
+    drop(read);
+
+    // The queue count behind "this run will make N API calls": an error, never a free run.
+    raw.execute_batch("ALTER TABLE asset_file RENAME TO asset_file_gone;")
+        .expect("break the queue count");
+    assert!(
+        engine
+            .read()
+            .expect("the snapshot is still current")
+            .count_needing_tags()
+            .is_err(),
+        "a queue that could not be counted read as empty"
+    );
+}
+
+/// Review finding 10: a panic while the read lock is held poisons it. The snapshot may be
+/// half-built, so it is rebuilt — once. The poison used to stay set, so *every* later read
+/// rebuilt the whole library, and `reload()`, which gave up on a poisoned lock, did nothing.
+#[test]
+fn a_panic_under_the_read_lock_costs_one_rebuild_not_one_per_read() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (engine, _) = started(dir.path());
+    seed(&engine, dir.path(), &["a.png", "b.png"]);
+    let built = engine.read().expect("read").rebuilds();
+    assert_eq!(
+        engine.read().expect("read").rebuilds(),
+        built,
+        "a read at the current generation rebuilds nothing"
+    );
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _held = engine.read().expect("read");
+        panic!("a reader panicked with the snapshot in hand");
+    }));
+    assert!(unwound.is_err());
+
+    assert_eq!(
+        engine.read().expect("read").rebuilds(),
+        built + 1,
+        "the snapshot a panic may have left half-built is rebuilt"
+    );
+    let read = engine.read().expect("read");
+    assert_eq!(
+        read.rebuilds(),
+        built + 1,
+        "every read after one panic rebuilds the whole library"
+    );
+    assert_eq!(read.status().total_assets, 2);
+    drop(read);
+
+    engine.reload();
+    assert_eq!(
+        engine.read().expect("read").rebuilds(),
+        built + 2,
+        "reload() became a no-op after a panic"
     );
 }
 

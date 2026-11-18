@@ -23,6 +23,8 @@ import JobTray from "./lib/JobTray.svelte";
   import PackStats from "./lib/PackStats.svelte";
   import {
     libraryStatus,
+    engineStatus,
+    type EngineReport,
     onChanged,
     reloadLibrary,
     assetDetail,
@@ -59,6 +61,29 @@ import JobTray from "./lib/JobTray.svelte";
 
   let status = $state<LibraryStatus | null>(null);
   let reloading = $state(false);
+
+  // Engine status (v2 spec §4.2). A start that failed used to draw as an empty library, and a
+  // config reset to defaults drew nothing at all: now the first blocks the shell with its code
+  // and message, and the second is said once. Deliberately small — this shell goes in P5.
+  let engine = $state<EngineReport | null>(null);
+  function watchEngine() {
+    engineStatus()
+      .then((report) => {
+        const opening = engine !== null && engine.state !== "ready";
+        engine = report;
+        if (report.state === "starting" || report.state === "migrating") {
+          setTimeout(watchEngine, 1000);
+        } else if (report.state === "ready" && opening) {
+          // It opened while we watched: everything read before then was an error.
+          libraryStatus()
+            .then((s) => (status = s))
+            .catch(() => {});
+          view.dataVersion += 1;
+        }
+      })
+      .catch(() => {});
+  }
+  watchEngine();
 
   /**
    * UI-SPEC §13.2: "switching … screens stops playback". Leaving the Library with a sound still
@@ -790,6 +815,44 @@ import JobTray from "./lib/JobTray.svelte";
     <p class="action-error" data-testid="action-error">{actionError}</p>
   {/if}
 
+  {#if engine && engine.state !== "ready"}
+    <div
+      class="engine-block"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="engine-block-title"
+      data-testid="engine-notice"
+    >
+      <div class="engine-card">
+        {#if engine.state === "failed"}
+          <h2 id="engine-block-title">The library could not be opened</h2>
+          <p class="engine-code" data-testid="engine-code">{engine.code}</p>
+          <p data-testid="engine-message">{engine.message}</p>
+        {:else if engine.state === "migrating"}
+          <h2 id="engine-block-title">
+            Upgrading the catalog (schema {engine.from} → {engine.to})…
+          </h2>
+          <p>A backup was taken first. The library opens when this finishes.</p>
+        {:else}
+          <h2 id="engine-block-title">Opening the library…</h2>
+        {/if}
+      </div>
+    </div>
+  {:else if engine?.config_recovered}
+    <p class="engine-recovered" role="status" data-testid="config-recovered">
+      <span>
+        Your settings file could not be read, so Lodestash started on its defaults. The old file is
+        kept at <code>{engine.config_recovered}</code>.
+      </span>
+      <button
+        onclick={() =>
+          engineStatus(true)
+            .then((report) => (engine = report))
+            .catch(() => {})}>Dismiss</button
+      >
+    </p>
+  {/if}
+
   <footer class="statusbar">
     {#if status?.open}
       <span class="num">{status.total_assets.toLocaleString()} assets</span>
@@ -922,6 +985,52 @@ import JobTray from "./lib/JobTray.svelte";
     border-top: 1px solid var(--ls-danger);
     color: var(--ls-danger);
     font-size: var(--fs-sm);
+  }
+  /* The engine is not ready (v2 spec §4.2): over everything, because nothing behind it is true. */
+  .engine-block {
+    position: fixed;
+    inset: 0;
+    z-index: 200;
+    display: grid;
+    place-items: center;
+    padding: var(--sp-4);
+    background: var(--ls-bg);
+  }
+  .engine-card {
+    max-width: 520px;
+    padding: var(--sp-4);
+    background: var(--ls-surface);
+    border: 1px solid var(--ls-border);
+    border-radius: var(--r-md);
+    color: var(--ls-text);
+  }
+  .engine-card h2 {
+    margin: 0 0 var(--sp-2);
+    font-size: var(--fs-md);
+  }
+  .engine-card p {
+    margin: var(--sp-2) 0 0;
+    font-size: var(--fs-sm);
+    overflow-wrap: anywhere;
+  }
+  .engine-code {
+    color: var(--ls-danger);
+    font-family: ui-monospace, monospace;
+  }
+  .engine-recovered {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+    margin: 0;
+    padding: var(--sp-2) var(--sp-3);
+    background: var(--ls-surface);
+    border-top: 1px solid var(--ls-warning);
+    color: var(--ls-text);
+    font-size: var(--fs-sm);
+  }
+  .engine-recovered code {
+    overflow-wrap: anywhere;
   }
 
   .statusbar {

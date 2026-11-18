@@ -64,14 +64,21 @@ impl AppState {
         self.engine.writer().run(op).map_err(|e| e.to_string())
     }
 
-    fn targets(&self, ids: &[i64]) -> Vec<lodestash_engine::writer::Target> {
-        self.engine.read().write_targets(ids)
+    /// The read model — or why there is none to read: the engine is not Ready, or its snapshot
+    /// could not be rebuilt (v2 spec §4.2–§4.3). Every read command answers that error rather
+    /// than an empty library, which is what a failed start used to look like.
+    fn read(&self) -> Result<lodestash_engine::ReadModelGuard<'_>, String> {
+        self.engine.read().map_err(|e| e.to_string())
+    }
+
+    fn targets(&self, ids: &[i64]) -> Result<Vec<lodestash_engine::writer::Target>, String> {
+        Ok(self.read()?.write_targets(ids))
     }
 }
 
 #[tauri::command]
 fn app_info(state: tauri::State<'_, AppState>) -> AppInfo {
-    let open = state.engine.status() == EngineStatus::Ready && state.engine.read().status().open;
+    let open = state.read().is_ok_and(|library| library.status().open);
     AppInfo {
         name: "Lodestash",
         version: env!("CARGO_PKG_VERSION"),
@@ -79,45 +86,65 @@ fn app_info(state: tauri::State<'_, AppState>) -> AppInfo {
     }
 }
 
+/// What the engine is doing, and what the user still has to be told (v2 spec §4.2, §4.5).
+///
+/// The one read that answers in every state: until the engine is `ready` every other read is an
+/// error, and this is what says why. `failed` carries the stable code and a message saying what
+/// to do; `config_recovered` is where a `config.json` that did not parse was moved (the engine
+/// ran on defaults). `dismiss_config_recovered: true` records that the user has seen that notice.
+///
+/// Nothing exposed either before: a failed start drew an empty library, and a reset config drew
+/// nothing at all (integrity review, finding 8).
+#[tauri::command]
+fn engine_status(
+    state: tauri::State<'_, AppState>,
+    dismiss_config_recovered: Option<bool>,
+) -> lodestash_engine::EngineReport {
+    if dismiss_config_recovered == Some(true) {
+        state.engine.dismiss_config_recovered();
+    }
+    state.engine.report()
+}
+
 #[tauri::command]
 fn library_status(state: tauri::State<'_, AppState>) -> Result<LibraryStatus, String> {
-    Ok(state.engine.read().status())
+    Ok(state.read()?.status())
 }
 
 #[tauri::command]
 fn grid_page(state: tauri::State<'_, AppState>, query: GridQuery) -> Result<GridPage, String> {
-    Ok(state.engine.read().page(&query))
+    Ok(state.read()?.page(&query))
 }
 
 /// The trait vocabulary (UI-SPEC §9). Read-only — authoring is a write this shell has no op for.
 #[tauri::command]
 fn vocabulary(state: tauri::State<'_, AppState>) -> Result<Vec<VocabRow>, String> {
-    Ok(state.engine.read().vocabulary())
+    Ok(state.read()?.vocabulary())
 }
 
 /// Every pack, publisher → pack (UI-SPEC §4). Counts come from the indexed rows, not from
 /// `package.asset_count`, which is populated for 1 of 87 packs on a real cache.
 #[tauri::command]
 fn packages(state: tauri::State<'_, AppState>) -> Result<Vec<PackageRow>, String> {
-    Ok(state.engine.read().packages())
+    Ok(state.read()?.packages())
 }
 
 /// The Stats overview (UI-SPEC §8.1), derived from rows already in memory — no stats query.
 #[tauri::command]
 fn library_stats(state: tauri::State<'_, AppState>) -> Result<Stats, String> {
-    Ok(state.engine.read().stats())
+    Ok(state.read()?.stats())
 }
 
 /// Exact-duplicate groups (UI-SPEC §5). A review queue — nothing here resolves itself.
 #[tauri::command]
 fn duplicate_groups(state: tauri::State<'_, AppState>) -> Result<Vec<DupGroup>, String> {
-    Ok(state.engine.read().duplicates())
+    Ok(state.read()?.duplicates())
 }
 
 /// Near-duplicate review (DATA-MODEL §5): same picture, different bytes — dHash within 6 bits.
 #[tauri::command]
 fn near_duplicate_groups(state: tauri::State<'_, AppState>) -> Result<Vec<DupGroup>, String> {
-    Ok(state.engine.read().near_duplicates())
+    Ok(state.read()?.near_duplicates())
 }
 
 /// One level of the Folders view (DESIGN-GUIDELINES §7). `source: null` is the top level, where
@@ -127,14 +154,14 @@ fn folder_page(
     state: tauri::State<'_, AppState>,
     query: FolderQuery,
 ) -> Result<FolderPage, String> {
-    Ok(state.engine.read().folder_page(&query))
+    Ok(state.read()?.folder_page(&query))
 }
 
 /// The chips the ⚑ Filters popover draws (UI-SPEC §2.3). Fetched once per library load, not per
 /// keystroke — it changes only when the catalog does.
 #[tauri::command]
 fn filter_facets(state: tauri::State<'_, AppState>) -> Result<Facets, String> {
-    Ok(state.engine.read().facets())
+    Ok(state.read()?.facets())
 }
 
 /// Everything the Inspector shows for one asset (UI-SPEC §13).
@@ -143,7 +170,7 @@ fn asset_detail(
     state: tauri::State<'_, AppState>,
     asset_id: i64,
 ) -> Result<Option<AssetDetail>, String> {
-    Ok(state.engine.read().detail(asset_id))
+    Ok(state.read()?.detail(asset_id))
 }
 
 /// Re-derive source availability from disk (UI-SPEC §11.1, M18).
@@ -171,7 +198,7 @@ async fn relink_preview(
     if !path.is_dir() {
         return Err(format!("{new_root} is not a folder"));
     }
-    state.engine.read().relink_preview(source_id, &path)
+    state.read()?.relink_preview(source_id, &path)
 }
 
 /// Point a source at a new root (UI-SPEC §11.1).
@@ -205,7 +232,7 @@ fn relink_source(
 /// re-sorted mid-flight; it is bounded to seconds, so the new order lands almost immediately.
 #[tauri::command]
 fn set_appraise_focus(state: tauri::State<'_, AppState>, query: GridQuery) -> Result<(), String> {
-    let order = state.engine.read().focus_order(&query);
+    let order = state.read()?.focus_order(&query);
     state.engine.set_appraise_focus(order);
     Ok(())
 }
@@ -224,7 +251,7 @@ fn recent_folder_exports(
     state: tauri::State<'_, AppState>,
     limit: usize,
 ) -> Result<Vec<ExportBatchRow>, String> {
-    state.engine.read().recent_exports(limit.clamp(1, 50))
+    state.read()?.recent_exports(limit.clamp(1, 50))
 }
 
 /// Undo one export run — delete the files it copied out, then forget it (FEATURES §7.1).
@@ -274,10 +301,7 @@ fn similar_assets(
     asset_id: i64,
     limit: Option<usize>,
 ) -> Result<Vec<lodestash_engine::read_model::GridItem>, String> {
-    Ok(state
-        .engine
-        .read()
-        .similar_assets(asset_id, limit.unwrap_or(3)))
+    Ok(state.read()?.similar_assets(asset_id, limit.unwrap_or(3)))
 }
 
 /// What a workspace reclaim would remove, without removing it (UI-SPEC §11.4).
@@ -312,7 +336,7 @@ fn reclaim_workspace(
 fn workspace_packs(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<lodestash_engine::read_model::WorkspacePackRow>, String> {
-    Ok(state.engine.read().workspace_packs())
+    Ok(state.read()?.workspace_packs())
 }
 
 /// Keep a pack's extracted bytes (UI-SPEC §15). A pack that is *not* kept stays fully searchable
@@ -352,7 +376,7 @@ fn retarget_preview(
         .into_iter()
         .map(|e| e.guid)
         .collect();
-    let lib = state.engine.read();
+    let lib = state.read()?;
     let (matched, total) = lib
         .retarget_match(package_id, &guids)
         .ok_or_else(|| "no catalog on disk".to_string())?;
@@ -412,7 +436,7 @@ fn remove_from_library(
     state: tauri::State<'_, AppState>,
     asset_ids: Vec<i64>,
 ) -> Result<WriteResult, String> {
-    let targets = state.targets(&asset_ids);
+    let targets = state.targets(&asset_ids)?;
     state.write(Op::RemoveFromLibrary { targets })
 }
 
@@ -424,8 +448,8 @@ fn delete_from_disk(
     state: tauri::State<'_, AppState>,
     asset_ids: Vec<i64>,
 ) -> Result<WriteResult, String> {
-    let targets = state.targets(&asset_ids);
-    let roots = state.engine.read().roots();
+    let targets = state.targets(&asset_ids)?;
+    let roots = state.read()?.roots();
     let workspace = Some(state.engine.config().workspace_dir.clone());
     state.write(Op::DeleteFromDisk {
         targets,
@@ -482,8 +506,7 @@ fn import_root(state: &tauri::State<'_, AppState>, path: &str) -> Result<WriteRe
         // Incremental diff (DATA-MODEL §6): re-adding an already-indexed folder skips re-hashing
         // files the catalog knows at the same (size, mtime) — one stat per file, not a re-read.
         let known = state
-            .engine
-            .read()
+            .read()?
             .known_sizes(&lodestash_engine::config::stem_name(&root));
         lodestash_engine::scan::crawl_source(0, &root, &excludes, &known)
     };
@@ -573,8 +596,7 @@ fn unity_cache_candidates(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<CacheCandidate>, String> {
     let known: Vec<String> = state
-        .engine
-        .read()
+        .read()?
         .status()
         .sources
         .iter()
@@ -714,8 +736,7 @@ fn discover_package_folder(
 
     // §5.6 duplicate check: normalized-name match against what the catalog already holds.
     let known: std::collections::HashMap<String, String> = state
-        .engine
-        .read()
+        .read()?
         .packages()
         .into_iter()
         .map(|p| (lodestash_engine::scan::normalize_pack_name(&p.name), p.name))
@@ -840,7 +861,7 @@ fn import_packages(
 #[tauri::command]
 fn reload_library(state: tauri::State<'_, AppState>) -> Result<LibraryStatus, String> {
     state.engine.reload();
-    Ok(state.engine.read().status())
+    Ok(state.read()?.status())
 }
 
 /// The pack browser's left tree (PACK-DIRECTORY-NAV §5). Rooted at one package — derived from
@@ -850,7 +871,7 @@ fn pack_dir_tree(
     state: tauri::State<'_, AppState>,
     package: String,
 ) -> Result<Vec<PackDirNode>, String> {
-    Ok(state.engine.read().pack_tree(&package))
+    Ok(state.read()?.pack_tree(&package))
 }
 
 /// The Svelte shell's persisted view prefs (FEATURES §10). Read once at startup; the frontend
@@ -952,7 +973,8 @@ fn cloud_run_estimate(
     if !configured || lodestash_ai::openai::is_free_endpoint(&cfg.api_base_url) {
         return Ok(None);
     }
-    let queued = state.engine.read().count_needing_tags();
+    // An error, not a zero: a queue that cannot be counted must not read as a free run.
+    let queued = state.read()?.count_needing_tags()?;
     // One API call per asset (the cloud path is single-call — no caption pre-step), so the cap and
     // the queue depth together are the honest ceiling.
     let calls = if cfg.api_max_per_run == 0 {
@@ -1014,7 +1036,7 @@ fn test_api_tagger(state: tauri::State<'_, AppState>) -> Result<String, String> 
 /// Bytes + file count under the preview cache root (Settings' CACHE card).
 #[tauri::command]
 fn preview_cache_usage(state: tauri::State<'_, AppState>) -> Result<(u64, usize), String> {
-    let lib = state.engine.read();
+    let lib = state.read()?;
     Ok(lib.preview_cache_usage())
 }
 
@@ -1022,7 +1044,7 @@ fn preview_cache_usage(state: tauri::State<'_, AppState>) -> Result<(u64, usize)
 /// read-model lock; the workspace (extracted assets) is never touched.
 #[tauri::command]
 fn clear_preview_cache(state: tauri::State<'_, AppState>) -> Result<usize, String> {
-    let lib = state.engine.read();
+    let lib = state.read()?;
     Ok(lib.clear_preview_cache())
 }
 
@@ -1057,7 +1079,7 @@ fn set_source_watch(
 fn collections(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<lodestash_core::catalog::CollectionRow>, String> {
-    Ok(state.engine.read().collections())
+    Ok(state.read()?.collections())
 }
 
 /// The member ids of one collection — what a collection-filtered grid matches on (UI-SPEC §6).
@@ -1066,7 +1088,7 @@ fn collection_members(
     state: tauri::State<'_, AppState>,
     collection_id: i64,
 ) -> Result<Vec<i64>, String> {
-    Ok(state.engine.read().collection_members(collection_id))
+    Ok(state.read()?.collection_members(collection_id))
 }
 
 #[tauri::command]
@@ -1099,7 +1121,7 @@ fn related_assets(
     state: tauri::State<'_, AppState>,
     asset_id: i64,
 ) -> Result<Vec<lodestash_core::catalog::RelatedAsset>, String> {
-    Ok(state.engine.read().related_assets(asset_id))
+    Ok(state.read()?.related_assets(asset_id))
 }
 
 /// Stage asset ids into the tray (UI-SPEC §16.2).
@@ -1129,7 +1151,7 @@ fn clear_staged(state: tauri::State<'_, AppState>) -> Result<WriteResult, String
 /// that still exist.
 #[tauri::command]
 fn staged(state: tauri::State<'_, AppState>) -> Result<Vec<i64>, String> {
-    Ok(state.engine.read().staged_ids())
+    Ok(state.read()?.staged_ids())
 }
 
 /// The Stats Tag Graph (UI-SPEC §8.2): tag nodes, tag↔tag co-occurrence edges and the
@@ -1138,7 +1160,7 @@ fn staged(state: tauri::State<'_, AppState>) -> Result<Vec<i64>, String> {
 fn tag_graph(
     state: tauri::State<'_, AppState>,
 ) -> Result<lodestash_core::catalog::TagGraph, String> {
-    Ok(state.engine.read().tag_graph())
+    Ok(state.read()?.tag_graph())
 }
 
 /// Every resolved asset→asset edge (DATA-MODEL §10) — the set behind the LINKS filter and the
@@ -1147,7 +1169,7 @@ fn tag_graph(
 fn asset_edges(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<lodestash_core::catalog::AssetEdge>, String> {
-    Ok(state.engine.read().asset_edges())
+    Ok(state.read()?.asset_edges())
 }
 
 /// One source's blacklist (UI-SPEC §11.1): every `{kind, value}` exclusion the crawler skips.
@@ -1156,7 +1178,7 @@ fn source_excludes(
     state: tauri::State<'_, AppState>,
     source_id: i64,
 ) -> Result<Vec<lodestash_core::catalog::SourceExclude>, String> {
-    Ok(state.engine.read().source_excludes(source_id))
+    Ok(state.read()?.source_excludes(source_id))
 }
 
 /// Add one `{kind, value}` exclusion to a source's blacklist (UI-SPEC §11.1 ⊘ add buttons).
@@ -1194,7 +1216,7 @@ fn remove_source_exclude(
 fn taxonomies(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<lodestash_core::catalog::TaxonomyRow>, String> {
-    Ok(state.engine.read().taxonomies())
+    Ok(state.read()?.taxonomies())
 }
 
 /// Make `id` the single active taxonomy (UI-SPEC §9.2 `● active` marker).
@@ -1249,7 +1271,7 @@ fn list_rules(
     state: tauri::State<'_, AppState>,
     taxonomy_id: i64,
 ) -> Result<Vec<lodestash_core::catalog::MappingRuleRow>, String> {
-    Ok(state.engine.read().list_rules(taxonomy_id))
+    Ok(state.read()?.list_rules(taxonomy_id))
 }
 
 /// Run the deterministic mapping engine over one taxonomy (UI-SPEC §9.2 ⚙ Apply). Returns the
@@ -1609,8 +1631,10 @@ fn cancel_job(state: tauri::State<'_, AppState>, job_id: u64) -> bool {
 
 /// Registered Unity editors, active first (ENGINE-API §5.1) — the Connect wizard's app half.
 #[tauri::command]
-fn projects(state: tauri::State<'_, AppState>) -> Vec<lodestash_core::catalog::ProjectRow> {
-    state.engine.read().projects()
+fn projects(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<lodestash_core::catalog::ProjectRow>, String> {
+    Ok(state.read()?.projects())
 }
 
 /// Switch which registered Unity editor is active (ENGINE-API §5.1, UI-SPEC §16.1). A write,
@@ -1643,12 +1667,10 @@ fn recent_exports(
     state: tauri::State<'_, AppState>,
     limit: usize,
 ) -> Result<Vec<ImportBatch>, String> {
-    if state.engine.status() != EngineStatus::Ready {
-        return Ok(Vec::new());
-    }
+    // Not Ready is an error here like everywhere else — it used to answer an empty list, which
+    // reads as "nothing was ever imported".
     Ok(state
-        .engine
-        .read()
+        .read()?
         .recent_import_batches(limit.clamp(1, 100))?
         .into_iter()
         .map(|b| ImportBatch {
@@ -1717,7 +1739,7 @@ fn recent_ops(
     state: tauri::State<'_, AppState>,
     limit: usize,
 ) -> Result<Vec<lodestash_core::catalog::OpLogRow>, String> {
-    Ok(state.engine.read().recent_ops(limit))
+    Ok(state.read()?.recent_ops(limit))
 }
 
 /// The redo stack (UI-SPEC §2 Shift-Z): the newest undone ops, newest first.
@@ -1726,7 +1748,7 @@ fn redo_ops(
     state: tauri::State<'_, AppState>,
     limit: usize,
 ) -> Result<Vec<lodestash_core::catalog::OpLogRow>, String> {
-    Ok(state.engine.read().redo_candidates(limit))
+    Ok(state.read()?.redo_candidates(limit))
 }
 
 /// Undo the logged operation `op_id` (UI-SPEC §2 / DESIGN-GUIDELINES §7 L5). Runs on the writer
@@ -2098,18 +2120,22 @@ pub fn run() {
         ),
     };
     let status = engine.wait_settled(Duration::from_secs(600));
-    {
-        let lib = engine.read();
-        let summary = lib.status();
-        tracing::info!(
-            ?status,
-            assets = summary.total_assets,
-            in_pack = summary.in_pack,
-            favorites = summary.favorites,
-            previews = summary.with_preview,
-            sources = summary.sources.len(),
-            "catalog"
-        );
+    match engine.read() {
+        Ok(lib) => {
+            let summary = lib.status();
+            tracing::info!(
+                ?status,
+                assets = summary.total_assets,
+                in_pack = summary.in_pack,
+                favorites = summary.favorites,
+                previews = summary.with_preview,
+                sources = summary.sources.len(),
+                "catalog"
+            );
+        }
+        // The window still opens: the shell asks `engine_status` and shows this instead of a
+        // library (v2 spec §4.2).
+        Err(why) => tracing::error!(?status, %why, "the library is not readable"),
     }
 
     tauri::Builder::default()
@@ -2201,6 +2227,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             app_info,
+            engine_status,
             library_status,
             grid_page,
             filter_facets,

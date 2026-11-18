@@ -179,22 +179,16 @@ pub struct ReclaimOutcome {
 /// (review finding 1): an engine with no catalog — a second Lodestash refused the lock — planned
 /// to delete every folder in a workspace it shares with the one that holds it.
 pub fn workspace_reclaim_plan(engine: &crate::Engine) -> Result<ReclaimPlan, String> {
-    let status = engine.status();
-    if let crate::EngineStatus::Failed { code, message } = &status {
-        return Err(format!(
-            "the library is not open ({code}): {message} — nothing in the workspace was measured"
-        ));
-    }
-    if status != crate::EngineStatus::Ready {
-        return Err(
-            "the library is still opening — the workspace is measured once it is ready".into(),
-        );
-    }
+    // Not Ready, or a snapshot that could not be rebuilt, is an error here — never a library
+    // that happens to reference nothing.
+    let library = engine
+        .read()
+        .map_err(|e| format!("{e} — nothing in the workspace was measured"))?;
     let workspace = engine.config().workspace_dir.clone();
     if workspace.as_os_str().is_empty() {
         return Err("no workspace folder is configured".into());
     }
-    let referenced = engine.read().referenced_workspace_paths()?;
+    let referenced = library.referenced_workspace_paths()?;
     Ok(plan_reclaim(&workspace, &referenced))
 }
 

@@ -929,6 +929,21 @@ export const deleteFromDisk = (assetIds: number[]) =>
 /** The chips the popover draws. Changes only when the catalog does — fetch per load, not per keystroke. */
 export const filterFacets = () => invoke<Facets>("filter_facets");
 
+/**
+ * What the engine is doing (v2 spec §4.2). The one read that answers in every state: until it is
+ * `ready` every other read rejects, and this says why. `failed` carries the stable code and what
+ * to do about it; `config_recovered` is where a `config.json` that did not parse was moved.
+ */
+export type EngineReport = { config_recovered: string | null } & (
+  | { state: "starting" | "ready" }
+  | { state: "migrating"; from: number; to: number }
+  | { state: "failed"; code: string; message: string }
+);
+
+/** Pass `true` once the user has seen the reset-config notice. */
+export const engineStatus = (dismissConfigRecovered = false) =>
+  invoke<EngineReport>("engine_status", { dismissConfigRecovered });
+
 export const libraryStatus = () => invoke<LibraryStatus>("library_status");
 export const gridPage = (query: GridQuery) => invoke<GridPage>("grid_page", { query });
 export const reloadLibrary = () => invoke<LibraryStatus>("reload_library");
