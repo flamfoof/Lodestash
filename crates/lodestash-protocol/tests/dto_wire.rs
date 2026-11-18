@@ -159,3 +159,100 @@ fn the_old_shells_settings_object_round_trips_flat() {
     assert_eq!(s.cloud.api_key, None, "absent is 'keep the stored key'");
     assert!(s.cloud.remote_image_bytes && s.agents.mcp_bytes_enabled);
 }
+
+/// What a Settings write leaves out must not open anything (ADR-0024). An omitted
+/// `api_max_per_run` used to read as `0` — uncapped — while the config's default is a cap.
+///
+/// The optional fields are found by leaving each one out, so a field that becomes optional (a
+/// new `#[serde(default)]`) fails here until someone decides what its absence means, makes that
+/// the closed direction, and lists it.
+#[test]
+fn every_field_a_settings_write_may_omit_fails_closed() {
+    use std::collections::BTreeSet;
+
+    use lodestash_protocol::dto::Settings;
+
+    // Every field, write-only ones included.
+    let full = json!({
+        "m_kb": 1024, "l_kb": 4096, "xl_kb": 8192, "cap_kb": 10240,
+        "preview_quality": "medium",
+        "skip_onboarding": true, "watch_sources": true, "auto_identify": true,
+        "cache_extracted": true, "preview_cache_cap_gb": 8, "auto_purge_preview_cache": true,
+        "confirm_before_trash": true, "mcp_disabled_tools": ["export_asset"],
+        "tagger_model": "llama", "tagger_vision_model": "llava",
+        "api_tagging_enabled": true, "api_base_url": "http://127.0.0.1:1234/v1",
+        "api_model": "gemini-flash", "api_key": "sk-typed", "clear_api_key": true,
+        "api_key_configured": true, "api_max_per_run": 40,
+        "remote_image_bytes": true, "mcp_bytes_enabled": true,
+    });
+    let fields = full.as_object().unwrap();
+    let parsed: Settings = serde_json::from_value(full.clone()).unwrap();
+    let written = serde_json::to_value(&parsed).unwrap();
+    assert_eq!(
+        written.as_object().unwrap().keys().collect::<Vec<_>>(),
+        fields.keys().collect::<Vec<_>>(),
+        "the fixture above must name every Settings field"
+    );
+
+    let optional: BTreeSet<&str> = fields
+        .keys()
+        .filter(|field| {
+            let mut without = full.clone();
+            without.as_object_mut().unwrap().remove(field.as_str());
+            serde_json::from_value::<Settings>(without).is_ok()
+        })
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        optional,
+        BTreeSet::from([
+            // Absent changes nothing.
+            "api_key",
+            "api_base_url",
+            "api_max_per_run",
+            // Absent is "no": nothing is removed, enabled or released.
+            "clear_api_key",
+            "api_tagging_enabled",
+            "remote_image_bytes",
+            "mcp_bytes_enabled",
+            // Absent is "none configured": that tagger does not run.
+            "api_model",
+            "tagger_model",
+            "tagger_vision_model",
+            // Read-only: ignored on a write.
+            "api_key_configured",
+        ]),
+        "a Settings field became optional (or required): decide what leaving it out means"
+    );
+
+    let mut minimal = full.clone();
+    for field in &optional {
+        minimal.as_object_mut().unwrap().remove(*field);
+    }
+    let s: Settings = serde_json::from_value(minimal).unwrap();
+    assert_eq!(
+        s.cloud.api_max_per_run, None,
+        "unchanged — never 'uncapped'"
+    );
+    assert_eq!(s.cloud.api_base_url, None, "unchanged");
+    assert_eq!(s.cloud.api_key, None, "unchanged");
+    assert!(!s.cloud.clear_api_key);
+    assert!(!s.cloud.api_tagging_enabled);
+    assert!(!s.cloud.remote_image_bytes);
+    assert!(!s.agents.mcp_bytes_enabled);
+    assert_eq!(s.cloud.api_model, None);
+    assert_eq!(s.identify.tagger_model, None);
+    assert_eq!(s.identify.tagger_vision_model, None);
+    // The allow-list is not optional: a write cannot re-enable every tool by leaving it out.
+    assert!(!optional.contains("mcp_disabled_tools"));
+
+    // An explicit null is an absent field, not a zero.
+    let mut nulled = full;
+    nulled["api_max_per_run"] = Value::Null;
+    nulled["api_base_url"] = Value::Null;
+    let s: Settings = serde_json::from_value(nulled).unwrap();
+    assert_eq!(
+        (s.cloud.api_max_per_run, s.cloud.api_base_url),
+        (None, None)
+    );
+}

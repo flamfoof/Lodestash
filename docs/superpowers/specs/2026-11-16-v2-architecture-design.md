@@ -104,7 +104,9 @@ to top-level `web/`: it is a client of `/v1`, not a Tauri frontend.
 
 - **Create if missing** (fixes S1). `catalog_db_path()` resolves; the engine creates the file.
 - **Exclusive lock:** the engine holds `std::fs::File::try_lock` on `<catalog>.lock` for its
-  lifetime. A second engine on the same catalog fails fast with `catalog_locked`.
+  lifetime. A second engine on the same catalog fails fast with `catalog_locked`. The lock is
+  taken before the config is opened, and an engine that does not get it reads the config but
+  cannot write it (§4.5, ADR-0024).
 - **Migration:** `BEGIN IMMEDIATE`, re-read `user_version` inside the transaction, then migrate.
   Before the first migration step on an existing file, copy it to
   `<catalog>.v<from>.bak` (kept: the last two). A schema newer than this build is refused for
@@ -149,16 +151,42 @@ HTTP mapping: 404/422/409/403/503/429/413/500, body `{error:{code,message,detail
 - *As built (Task 2.4):* `crates/lodestash-engine/src/config_store.rs`. The store loads the file
   once and serves reads from memory (an edit made by hand while the app runs is not seen, and the
   next save replaces it); `update` saves temp → `sync_all` → rename under the store's one mutex and
-  leaves memory unchanged when the save fails. A file that does not parse (or cannot be read) is
+  leaves memory unchanged when the save fails. A file that was read and does not parse is
   renamed to `config.json.corrupt-<unix-ts>`; `Engine::report()` carries `config_recovered` (that
   path) beside the status until `Engine::dismiss_config_recovered`. `Settings` is sectioned in Rust
   (`appearance`, `library`, `identify`, `cloud`, `agents`, `storage`, each applied on its own) and
   flat on the wire — the sections are `#[serde(flatten)]`, so the object is the one the old
-  shell's `get_settings`/`set_settings` already exchange. The secret is write-only as two fields:
-  a read carries `api_key_configured: bool` and no `api_key`; a write's `api_key` absent keeps
-  the key, `""` clears it, a value replaces it. Live application: `ConfigStore::on_change`
+  shell's `get_settings`/`set_settings` already exchange. The secret is write-only: a read carries
+  `api_key_configured: bool` and no `api_key`. Live application: `ConfigStore::on_change`
   observers; the agent planes subscribe with `ServerState::follow_config` (allow-list, byte
   release, agent producer), and every appraise pass reads the consent from the store when it starts.
+- *As built (boundary review, 2026-11-17;
+  [ADR-0024](../../decisions/ADR-0024-the-boundary-fails-closed.md)):*
+  - **What a write does not say changes nothing.** `api_key` absent, `null`, empty or blank keeps
+    the stored key, a value replaces it, and only `clear_api_key: true` removes it (an empty key
+    used to clear it, so a field typed into and erased wiped the key on the next save).
+    `api_max_per_run` and `api_base_url` are optional on a write and absent keeps the stored value
+    — the DTO has no default of its own (an omitted cap used to read as `0`, uncapped). Every
+    other optional field is "off" or "none" when absent; `lodestash-protocol`'s
+    `tests/dto_wire.rs` lists them and fails when one is added.
+  - **A file that was not read is never written over.** Only a file that was read and fails to
+    parse is corrupt. One that cannot be read (held open by another program, access denied), or
+    that is corrupt and cannot be moved aside, leaves the store *blocked*: it holds a fallback
+    that switches nothing on (every agent tool off, no background identification, no rescans),
+    `Engine::report()` carries `config_unreadable` (why), and every update is refused until the
+    file loads. The read is retried briefly at open and again at each update; the update that
+    finds the file readable takes its config, tells the observers and is itself refused
+    (`ConfigError::Reloaded`) — it was decided against the fallback.
+  - **Only the catalog's owner writes the config.** `Engine::start` takes the catalog lock before
+    it opens the config; an engine that is refused the lock gets `ConfigStore::open_read_only`,
+    which reads the file and answers every update `ConfigError::ReadOnly`. A second instance used
+    to save its start-time copy over the first instance's changes.
+  - **Observers hear commits in commit order.** One thread tells them at a time; a commit that
+    lands meanwhile is delivered next, and an older config is never delivered after a newer one
+    (it used to be possible, leaving a just-revoked consent live in the agent planes).
+  - **A save and its key change succeed or fail together.** The credential store is changed
+    before the file is written, and put back when the write fails. On Linux and macOS, where the
+    key rests in the file, the file is created `0600`.
 
 ### 4.6 Identification plan
 

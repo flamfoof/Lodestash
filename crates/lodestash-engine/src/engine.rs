@@ -117,6 +117,10 @@ pub struct EngineReport {
     /// Set when `config.json` did not parse at start: where the bad file was moved. The engine ran
     /// on defaults; reported until [`Engine::dismiss_config_recovered`] (review B12).
     pub config_recovered: Option<PathBuf>,
+    /// Set while `config.json` is there and could not be loaded, with why. The engine runs on a
+    /// fallback that switches nothing on, the file is left as it is, and settings are not saved
+    /// until it loads ([`crate::ConfigStore::unreadable`]).
+    pub config_unreadable: Option<String>,
 }
 
 /// The status, shared with the writer thread that moves it.
@@ -207,16 +211,32 @@ impl Engine {
     /// creating or migrating — the catalog and reports `Ready`; [`Self::wait_settled`] waits for it.
     pub fn start(cfg: EngineConfig) -> Engine {
         let status = Arc::new(StatusCell::new(EngineStatus::Starting));
-        // Opened first and once: the writer, the read model and the shell all read this one.
-        let config = Arc::new(cfg.open_config());
+        // The lock first: only the engine that owns the catalog may write the config. A second
+        // instance that was refused reads `config.json` but cannot save it — its copy goes stale
+        // as the owner changes settings, and one save from it would put the stale copy back
+        // (ADR-0024).
+        let lock = take_lock(&cfg);
+        // Opened once: the writer, the read model and the shell all read this one.
+        let config = Arc::new(match &lock {
+            Ok(_) => cfg.open_config(),
+            Err(_) => ConfigStore::open_read_only(
+                cfg.config_path(),
+                cfg.os_keychain,
+                "this Lodestash did not get the catalog, so it does not save settings — the \
+                 Lodestash that has it does",
+            ),
+        });
         if let Some(moved) = config.recovered() {
             tracing::error!(to = %moved.display(), "config.json did not parse; running on defaults");
+        }
+        if let Some(why) = config.unreadable() {
+            tracing::error!(%why, "config.json could not be loaded; it is left as it is and nothing is saved over it");
         }
         let jobs = JobRegistry::default();
         let pump = Arc::new(AtomicBool::new(false));
         let appraise = Arc::new(JobProgress::default());
         let focus = Arc::new(Mutex::new(AppraiseFocus::default()));
-        let writer = match take_lock(&cfg) {
+        let writer = match lock {
             Ok(lock) => crate::writer::spawn(WriterSetup {
                 db_path: cfg.catalog.clone(),
                 cache_dir: Some(cfg.cache_dir.clone()),
@@ -314,6 +334,7 @@ impl Engine {
         EngineReport {
             status: self.status(),
             config_recovered: self.config_recovered(),
+            config_unreadable: self.inner.config.unreadable(),
         }
     }
 
