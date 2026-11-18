@@ -165,8 +165,8 @@ fn to_value(error: ApiError) -> Value {
         .unwrap_or_else(|e| json!({ "error": { "code": "internal", "message": e.to_string() } }))
 }
 
-/// `get_server_info`: add `mcp` — this server's version, the handshake file it read and the port it
-/// reached — to the app's answer.
+/// `get_server_info`: add `mcp` — this server's version, the handshake file it read (the home
+/// directory shown as `~`) and the port it reached — to the app's answer.
 fn describe_this_server(result: &mut CallToolResult, app: &App, port: u16) {
     if result.is_error == Some(true) {
         return;
@@ -179,7 +179,7 @@ fn describe_this_server(result: &mut CallToolResult, app: &App, port: u16) {
         json!({
             "version": env!("CARGO_PKG_VERSION"),
             "transport": "stdio",
-            "handshake": app.handshake_path().map(|p| p.display().to_string()),
+            "handshake": app.handshake_path().map(crate::launch::shown),
             "port": port,
         }),
     );

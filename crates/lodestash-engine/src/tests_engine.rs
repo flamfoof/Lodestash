@@ -135,6 +135,43 @@ fn a_second_engine_on_the_same_catalog_is_refused() {
     }
 }
 
+/// A second instance that was refused the catalog must not be able to write the config either.
+/// It read `config.json` as it started; its copy goes stale the moment the first instance
+/// changes a setting, and a write from it — the shell saving its window prefs is enough — put
+/// the whole stale copy back over the first instance's change. It still reads the config; every
+/// write is refused, and the file is the first instance's.
+#[test]
+fn a_refused_second_engine_cannot_write_the_config() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (first, cfg) = started(dir.path());
+    let second = Engine::start(cfg.clone());
+    assert!(
+        matches!(second.status(), EngineStatus::Failed { ref code, .. } if code == "catalog_locked"),
+        "{:?}",
+        second.status()
+    );
+    assert!(
+        !second.config_store().get().auto_identify,
+        "it still reads the config that is there"
+    );
+
+    first
+        .config_store()
+        .update(|c| c.mcp_disabled_tools = vec!["export_asset".into()])
+        .expect("the instance that owns the catalog saves");
+    let refused = second.config_store().update(|c| c.volume = 0.25);
+    assert!(refused.is_err(), "the refused instance wrote the config");
+    assert_ne!(second.config_store().get().volume, 0.25, "nor in memory");
+
+    let on_disk = cfg.open_config().get();
+    assert_eq!(
+        on_disk.mcp_disabled_tools,
+        ["export_asset"],
+        "the first instance's change was overwritten"
+    );
+    assert_ne!(on_disk.volume, 0.25);
+}
+
 /// Review U9: a panic on the writer thread used to end every write for the session. Now the
 /// command that panicked answers `internal`, and the next one runs.
 #[test]

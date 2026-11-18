@@ -3,10 +3,14 @@
 
 mod common;
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use common::{refused_port, text_json, write_handshake, App, Mcp, FILE, PNG};
+use common::{
+    gone_process, handshake_json_for, refused_port, text_json, write_handshake, App, Behaviour,
+    Mcp, RawListener, FILE, PNG, STEP,
+};
 use serde_json::{json, Value};
 
 fn connected() -> (App, Mcp) {
@@ -15,6 +19,21 @@ fn connected() -> (App, Mcp) {
     let mut mcp = Mcp::spawn(&app.handshake, &app.no_app());
     mcp.initialize();
     (app, mcp)
+}
+
+/// The home directory, if `path` is inside it.
+fn home_of(path: &Path) -> Option<String> {
+    dirs::home_dir()
+        .filter(|home| path.starts_with(home))
+        .map(|home| home.display().to_string())
+}
+
+/// `path` as this server shows it to a model: `~` for the home directory.
+fn without_home(path: &Path) -> String {
+    match dirs::home_dir().and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf)) {
+        Some(rest) => Path::new("~").join(rest).display().to_string(),
+        None => path.display().to_string(),
+    }
 }
 
 /// A JSON answer is the structured content, and the same JSON as text for hosts that read only
@@ -124,11 +143,21 @@ fn a_stopped_app_with_nothing_to_launch_is_app_unavailable_within_a_second() {
             error["message"].as_str().unwrap().contains("LODESTASH_APP"),
             "{case}: the message should say which binary it tried: {result}"
         );
+        // The model reads this: the file is named without the home directory (and the OS user
+        // name in it).
         assert_eq!(
             error["detail"]["handshake"],
-            handshake.display().to_string(),
+            without_home(&handshake),
             "{case}"
         );
+        if let Some(home) = home_of(&handshake) {
+            for text in [&error["message"], &error["detail"]["handshake"]] {
+                assert!(
+                    !text.as_str().unwrap().contains(&home),
+                    "{case}: the home directory is named: {text}"
+                );
+            }
+        }
         assert!(took < Duration::from_secs(1), "{case}: took {took:?}");
         std::fs::remove_file(&handshake).ok();
     }
@@ -159,10 +188,7 @@ fn server_info_names_this_server_and_the_app_it_reached() {
     assert_eq!(info["api"], "v1", "{info}");
     assert!(info["schema"].is_number(), "{info}");
     assert_eq!(info["mcp"]["version"], env!("CARGO_PKG_VERSION"), "{info}");
-    assert_eq!(
-        info["mcp"]["handshake"],
-        app.handshake.display().to_string()
-    );
+    assert_eq!(info["mcp"]["handshake"], without_home(&app.handshake));
     assert_eq!(info["mcp"]["port"], app.port);
 }
 
@@ -184,4 +210,249 @@ fn the_asset_file_resource_reads_through_the_app() {
 
     let reply = mcp.request("resources/read", json!({"uri": "file:///etc/passwd"}));
     assert!(reply["error"].is_object(), "{reply}");
+}
+
+/// A handshake left behind by an app that is gone — its process no longer exists — is not an
+/// address: whoever holds its port now is sent no request and no token, and is not even
+/// connected to.
+#[test]
+fn a_handshake_whose_process_is_gone_is_sent_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = dir.path().join("engine.json");
+    let squatter = RawListener::start(Behaviour::Answer(r#"{"results":[]}"#));
+    let gone = gone_process();
+    std::fs::write(
+        &handshake,
+        handshake_json_for(squatter.port, "the-session-token", gone.pid(), "v1"),
+    )
+    .unwrap();
+    let mut mcp = Mcp::spawn(&handshake, &dir.path().join("no-such-app.exe"));
+    mcp.initialize();
+
+    let result = mcp.call("search_assets", json!({"query": "rock"}));
+    assert_eq!(result["isError"], true, "{result}");
+    let error = &result["structuredContent"]["error"];
+    assert_eq!(error["code"], "app_unavailable", "{result}");
+    assert_eq!(error["detail"]["sent"], false, "{result}");
+    assert!(
+        squatter.connections().is_empty(),
+        "the port's new holder was contacted: {:?}",
+        squatter.requests()
+    );
+}
+
+/// Never retried (ADR-0022): the app takes the request and dies with it. Exactly one request
+/// went out — for a read an HTTP client would happily repeat, and for a write — and the result
+/// says it was sent, because a write may have been applied.
+#[test]
+fn a_request_the_app_drops_is_sent_once_and_reported_as_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = dir.path().join("engine.json");
+    let app = RawListener::start(Behaviour::Drop);
+    write_handshake(&handshake, app.port, "t");
+    let mut mcp = Mcp::spawn(&handshake, &dir.path().join("no-such-app.exe"));
+    mcp.initialize();
+
+    for (tool, args) in [
+        ("search_assets", json!({"query": "rock"})),
+        ("add_tag", json!({"asset_id": 7, "value": "rusty"})),
+    ] {
+        let result = mcp.call(tool, args);
+        assert_eq!(result["isError"], true, "{tool}: {result}");
+        let error = &result["structuredContent"]["error"];
+        assert_eq!(error["code"], "app_unavailable", "{tool}: {result}");
+        assert_eq!(error["detail"]["sent"], true, "{tool}: {result}");
+    }
+    // A retry would follow its failure at once; give one time to show.
+    std::thread::sleep(Duration::from_millis(400));
+    let requests = app.requests();
+    assert_eq!(requests.len(), 2, "one request per call: {requests:#?}");
+    assert!(requests[0].starts_with("GET /v1/search?"), "{requests:#?}");
+    assert!(
+        requests[1].starts_with("POST /v1/assets/7/tags "),
+        "{requests:#?}"
+    );
+}
+
+/// A running app that serves another API version is refused, and the request — with the token —
+/// stays here. (Launching would not help: that app is the one running.)
+#[test]
+fn a_running_app_of_another_api_version_is_refused_and_sent_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = dir.path().join("engine.json");
+    let app = RawListener::start(Behaviour::Answer("{}"));
+    std::fs::write(
+        &handshake,
+        handshake_json_for(app.port, "t", std::process::id(), "v2"),
+    )
+    .unwrap();
+    let mut mcp = Mcp::spawn(&handshake, &dir.path().join("no-such-app.exe"));
+    mcp.initialize();
+
+    let result = mcp.call("search_assets", json!({"query": "rock"}));
+    assert_eq!(result["isError"], true, "{result}");
+    let error = &result["structuredContent"]["error"];
+    assert_eq!(error["code"], "app_unavailable", "{result}");
+    assert_eq!(error["detail"]["sent"], false, "{result}");
+    let message = error["message"].as_str().unwrap();
+    assert!(
+        message.contains("v2") && message.contains("v1"),
+        "{message}"
+    );
+    assert!(app.requests().is_empty(), "{:?}", app.requests());
+}
+
+/// The host closed stdin while a call was waiting on the app: the server leaves now, not when
+/// that call's two-minute timeout runs out. Nobody is left to read the answer.
+#[test]
+fn the_server_leaves_when_the_host_closes_stdin_even_mid_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = dir.path().join("engine.json");
+    let app = RawListener::start(Behaviour::Hold(Duration::from_secs(60)));
+    write_handshake(&handshake, app.port, "t");
+    let mut mcp = Mcp::spawn(&handshake, &dir.path().join("no-such-app.exe"));
+    mcp.initialize();
+
+    mcp.start_call("search_assets", json!({"query": "rock"}));
+    assert!(app.wait_for_request(STEP), "the call never reached the app");
+    let log = mcp.stderr.clone();
+    let left = mcp.close_and_time_exit(Duration::from_secs(3));
+    assert!(
+        left.is_some(),
+        "still running 3 s after stdin closed, waiting on a call nobody will read; stderr:\n{}",
+        log.lock().unwrap()
+    );
+}
+
+/// What a model reads names the handshake file without the home directory — and so without the
+/// OS user name. The file here is under the real home directory and does not exist; nothing is
+/// read from or written to it.
+#[test]
+fn an_error_names_the_handshake_file_without_the_home_directory() {
+    let home = dirs::home_dir().expect("a home directory");
+    let dir = tempfile::tempdir().unwrap();
+    let folder = ".lodestash-mcp-test-no-such-folder";
+    let handshake = home.join(folder).join("engine.json");
+    assert!(!handshake.exists());
+    let mut mcp = Mcp::spawn(&handshake, &dir.path().join("no-such-app.exe"));
+    mcp.initialize();
+
+    let result = mcp.call("search_assets", json!({"query": "rock"}));
+    let error = &result["structuredContent"]["error"];
+    assert_eq!(error["code"], "app_unavailable", "{result}");
+    assert_eq!(
+        error["detail"]["handshake"],
+        Path::new("~")
+            .join(folder)
+            .join("engine.json")
+            .display()
+            .to_string()
+    );
+    let home = home.display().to_string();
+    for text in [&error["message"], &error["detail"]["handshake"]] {
+        assert!(
+            !text.as_str().unwrap().contains(&home),
+            "the home directory is named: {text}"
+        );
+    }
+    assert!(!handshake.parent().unwrap().exists(), "nothing was created");
+}
+
+/// `POST /v1/import` on the app, as a plain REST client sends it: the JSON `body` and the token.
+fn rest_import(app: &App, body: Value) -> Value {
+    let response = ureq::post(&format!("http://127.0.0.1:{}/v1/import", app.port))
+        .set("Authorization", &format!("Bearer {}", app.token))
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+        .expect("the import is accepted");
+    assert_eq!(response.status(), 202);
+    serde_json::from_str(&response.into_string().unwrap()).unwrap()
+}
+
+/// `with_dependencies` left out means the same thing on both planes: bring the dependency
+/// closure (ENGINE-API §5.2). REST alone used to read an absent field as `false`, so the same
+/// import brought a model's textures through the MCP tool and left them behind over REST.
+///
+/// Four imports of the wall — the field absent and `false`, through the MCP tool and as a raw
+/// REST body — are approved, and the queue says what each would import.
+#[test]
+fn an_import_brings_its_dependencies_by_default_on_both_planes() {
+    let (app, mut mcp) = connected();
+    let (project, _) = app
+        .state
+        .register_project("C:/dev/Game", None, None)
+        .expect("an editor is registered");
+    let wall = json!([app.asset]);
+
+    let job = |parked: &Value| parked["job_id"].as_str().expect("a parked job").to_string();
+    let mcp_default = job(body(
+        &mcp.call("import_to_project", json!({ "asset_ids": wall })),
+    ));
+    let rest_default = job(&rest_import(&app, json!({ "asset_ids": wall })));
+    let mcp_alone = job(body(&mcp.call(
+        "import_to_project",
+        json!({ "asset_ids": wall, "with_dependencies": false }),
+    )));
+    let rest_alone = job(&rest_import(
+        &app,
+        json!({ "asset_ids": wall, "with_dependencies": false }),
+    ));
+    for id in [&mcp_default, &rest_default, &mcp_alone, &rest_alone] {
+        app.state.approve_job(id);
+    }
+
+    // The approved imports are queued for the plugin on worker threads; a poll hands each out once.
+    let mut queued = std::collections::HashMap::new();
+    let until = Instant::now() + STEP;
+    while queued.len() < 4 {
+        for request in app.state.poll_import_queue(project).expect("the queue") {
+            let mut ids: Vec<i64> = request.assets.iter().map(|a| a.id).collect();
+            ids.sort_unstable();
+            queued.insert(request.job_id, ids);
+        }
+        assert!(Instant::now() < until, "only {queued:?} was queued");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut with_texture = vec![app.asset, app.dependency];
+    with_texture.sort_unstable();
+    assert_eq!(queued[&mcp_default], with_texture, "MCP, field absent");
+    assert_eq!(queued[&rest_default], with_texture, "REST, field absent");
+    assert_eq!(queued[&mcp_alone], [app.asset], "MCP, false");
+    assert_eq!(queued[&rest_alone], [app.asset], "REST, false");
+}
+
+/// A tool's description is a promise to the model. `get_asset_preview` answers the image and
+/// nothing else (v2 spec §7: the app's REST answer is the tool's answer), so its description
+/// must not promise a resource link beside it — and does say where the link is.
+#[test]
+fn the_preview_tool_describes_what_it_returns() {
+    let (app, mut mcp) = connected();
+    let listed = mcp.request("tools/list", json!({}));
+    let description = listed["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|t| t["name"] == "get_asset_preview")
+        .expect("the preview tool")["description"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let result = mcp.call("get_asset_preview", json!({"id": app.asset}));
+    let blocks = result["content"].as_array().expect("content");
+    assert_eq!(blocks.len(), 1, "{result}");
+    assert_eq!(blocks[0]["type"], "image");
+    assert!(
+        !description.contains("plus a resource link"),
+        "the description promises a link the answer does not carry: {description}"
+    );
+
+    // The link it points to instead is really there.
+    assert!(description.contains("file_resource_uri"), "{description}");
+    let detail = mcp.call("get_asset", json!({"id": app.asset}));
+    assert_eq!(
+        body(&detail)["file_resource_uri"],
+        format!("asset://{}/file", app.asset),
+        "{detail}"
+    );
 }

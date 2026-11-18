@@ -184,8 +184,8 @@ operations! {
     get_asset: GET "/v1/assets/{id}" (AssetArgs) -> Value, Agent, Read,
         "Full metadata for one asset, including technical facets.";
     get_asset_preview: GET "/v1/assets/{id}/preview" (AssetArgs) -> Value, Agent, Read,
-        "A rendered preview image of the asset (3D turntable, texture, or audio waveform), plus a \
-         resource link to the source file.";
+        "A rendered preview image of the asset (3D turntable, texture, or audio waveform). The \
+         answer is the image alone; the source file's link is file_resource_uri in get_asset.";
     find_similar: GET "/v1/assets/{id}/similar" (SimilarArgs) -> Value, Agent, Read,
         "Assets most visually (or sonically) similar to the given one. Empty if the library has \
          not been embedded yet.";

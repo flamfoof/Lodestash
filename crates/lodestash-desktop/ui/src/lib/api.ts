@@ -290,9 +290,12 @@ export type Settings = {
   api_tagging_enabled: boolean;
   api_base_url: string;
   api_model: string | null;
-  /** Write-only (review U8): never present in what `getSettings` returns. Leave it out to keep
-   * the stored key, send `""` to clear it, anything else replaces it. */
+  /** Write-only (review U8): never present in what `getSettings` returns. A value replaces the
+   * stored key; left out — or empty — it keeps the stored key. To remove the key, send
+   * `clear_api_key`. */
   api_key?: string;
+  /** Write-only: `true` removes the stored key — the only thing that does (ADR-0024). */
+  clear_api_key?: boolean;
   /** Read-only: whether a key is stored. */
   api_key_configured: boolean;
   /** Hard per-run cap on cloud-tagged assets (AI-PIPELINE §5.1). 0 = uncapped. */

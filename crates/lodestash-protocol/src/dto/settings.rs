@@ -6,9 +6,16 @@
 //! the whole object.
 //!
 //! **The cloud API key is write-only** (review U8). A read never carries it: `api_key` is absent
-//! and `api_key_configured` says whether one is stored. On a write, an absent (or `null`)
-//! `api_key` keeps the stored key, `""` clears it, and any other value replaces it;
-//! `api_key_configured` is ignored.
+//! and `api_key_configured` says whether one is stored. On a write, an absent, `null`, empty or
+//! blank `api_key` leaves the stored key alone and any other value replaces it; only
+//! `clear_api_key: true` removes it (ADR-0024). `api_key_configured` is ignored.
+//!
+//! **What a write leaves out must not open anything** (ADR-0024). Most fields are required. The
+//! ones a write may omit either turn something *off* when absent (`api_tagging_enabled`,
+//! `remote_image_bytes`, `mcp_bytes_enabled`, the model ids) or change nothing (`api_key`,
+//! `api_max_per_run`, `api_base_url`). None has a default of its own that could disagree with the
+//! config's — an omitted cap used to read as `0`, uncapped. `tests/dto_wire.rs` lists every
+//! optional field and what its absence means; a new one fails that test until it is listed.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -81,24 +88,38 @@ pub struct IdentifySettings {
 pub struct CloudSettings {
     #[serde(default)]
     pub api_tagging_enabled: bool,
+    /// The OpenAI-compatible endpoint. Always present on a read. On a write, absent (or `null`)
+    /// keeps the stored endpoint — it is never swapped for another the stored key would then be
+    /// sent to.
     #[serde(default)]
-    pub api_base_url: String,
+    pub api_base_url: Option<String>,
     /// The vision model id at that endpoint; `null` = not configured.
     #[serde(default)]
     pub api_model: Option<String>,
-    /// Write-only: never present on a read. Absent or `null` keeps the stored key, `""` clears it.
+    /// Write-only: never present on a read. A value replaces the stored key; absent, `null`,
+    /// empty or blank leaves it as it is. To remove the key, send `clear_api_key`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Write-only: `true` removes the stored key — the only thing that does. It wins over an
+    /// `api_key` sent in the same write. Never present on a read.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub clear_api_key: bool,
     /// Read-only: whether a key is stored. Ignored on a write.
     #[serde(default)]
     pub api_key_configured: bool,
-    /// Hard per-run cap on cloud-tagged assets (AI-PIPELINE §5.1); `0` = uncapped.
+    /// Hard per-run cap on cloud-tagged assets (AI-PIPELINE §5.1); `0` = uncapped. Always present
+    /// on a read. On a write, absent (or `null`) keeps the stored cap: leaving it out never
+    /// uncaps a run.
     #[serde(default)]
-    pub api_max_per_run: u32,
+    pub api_max_per_run: Option<u32>,
     /// May image bytes, and pixels rendered from models, materials and sprites, go to a remote
     /// endpoint? Off by default; a loopback endpoint never needs it.
     #[serde(default)]
     pub remote_image_bytes: bool,
+}
+
+fn is_false(flag: &bool) -> bool {
+    !*flag
 }
 
 /// MODEL CONTEXT PROTOCOL (UI-SPEC §11.5): what an agent plane may call and receive.

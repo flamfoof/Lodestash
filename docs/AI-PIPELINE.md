@@ -305,7 +305,15 @@ throttle hard — Gemini free is on the order of ~15 requests/minute. A naive ti
 - **Key at rest.** `api_key` is the one secret this local-first app holds; store it in the **OS
   credential store** (Windows Credential Manager) when available, with a plaintext-config fallback so
   the app still works headless. Never logged, never sent anywhere but the chosen endpoint — not to
-  the UI either: a Settings read reports only `api_key_configured` (v2 spec §4.5).
+  the UI either: a Settings read reports only `api_key_configured` (v2 spec §4.5). A Settings write
+  replaces the key only when it carries one; an empty key field means *unchanged*, and removing the
+  key is the explicit `clear_api_key` ([ADR-0024](decisions/ADR-0024-the-boundary-fails-closed.md)).
+  A save and its key change succeed or fail together: a save that fails puts the credential store
+  back as it was. Where the key does rest in `config.json` (Linux, macOS, or an unavailable
+  credential store) the file is the owner's alone (`0600`; on Windows, the profile's ACL).
+- **The cap and the endpoint do not change by omission.** A Settings write that leaves out
+  `api_max_per_run` or `api_base_url` keeps the stored value — it never uncaps a run, and never
+  points the stored key at a different endpoint. `0` (uncapped) has to be said (ADR-0024).
 - **The idle lane never spends money.** A cloud pass is always an explicit, scoped, capped kick —
   the background auto-identify slice does not tag when an API model is configured. Two reasons, and
   either alone is sufficient: a lane that bills an endpoint while the user is not looking is not

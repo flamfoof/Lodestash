@@ -106,8 +106,9 @@ OpenAI unless you deliberately pick it. Pick the **Endpoint preset** and the bas
    - **Custom…** — type any OpenAI-compatible base URL (for anything not preset).
 3. **Model** — a **vision-capable** model id at that endpoint (verify the current name on the provider).
 4. **API key** — paste it. Kept in your OS credential store (Windows Credential Manager) where
-   available, never logged. (A local server usually accepts any non-empty string; the free tiers hand
-   you a key with no card.)
+   available, never logged. Once saved the field shows empty again — type to replace the key, or
+   press **Remove saved key** to delete it; leaving the field empty keeps it. (A local server
+   usually accepts any non-empty string; the free tiers hand you a key with no card.)
 5. Press **Test** — it tags one sample image and shows the result or the exact error, so a wrong
    endpoint / non-vision model / dead key is caught *before* a bulk run.
 6. Press **Run on New**. Watch the job tray; cancel anytime — it resumes where it stopped, and

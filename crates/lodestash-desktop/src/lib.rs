@@ -2327,6 +2327,11 @@ pub fn run() {
             if matches!(event, tauri::RunEvent::Exit) {
                 devserver::shutdown();
             }
-            let _ = &event;
+            // A clean exit takes `engine.json` with it (ENGINE-API §1): a client must not be left
+            // holding this session's port and token after the port is someone else's. Only this
+            // process's own file is removed — one a newer instance wrote stays.
+            if matches!(event, tauri::RunEvent::Exit) {
+                lodestash_api::remove_handshake();
+            }
         });
 }

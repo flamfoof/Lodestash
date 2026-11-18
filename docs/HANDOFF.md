@@ -804,9 +804,10 @@ Each is recorded with rationale in [`TECH-STACK.md`](TECH-STACK.md) §7 and the 
 - **No job engine until something long-running needs it** — and now that `export_asset` does, it is
   in `lodestash-api::jobs`: in-memory, atomics, cooperative cancel. Resist adding job *persistence*
   or a priority queue before an operation actually demands them.
-- **The agent planes share one ops layer.** Adding an operation means adding a `ServerState` method
-  plus a route plus a tool plus a row in `AGENT_OPERATIONS`. Skipping the last one fails the parity
-  test, which is the point.
+- **The agent planes share one ops layer.** Adding an operation means declaring it once in
+  `lodestash-protocol`'s `operations!` list and adding a `ServerState` method plus a route. The MCP
+  tool and the allow-list gate are read from the declaration (v2); a route without a declaration,
+  or the reverse, fails `lodestash-api/tests/protocol_catalog.rs`, which is the point.
 - **The local tagger is two models, and the drain is staged — both forced by measurement.** Asked
   for facet JSON directly, `moondream` answers with arrays of *numbers* (its JSON mode is trained for
   grounding boxes) while captioning the same preview correctly in prose; so the VLM captions and a

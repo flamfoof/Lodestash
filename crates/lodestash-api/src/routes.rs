@@ -5,12 +5,13 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{MatchedPath, Path, Query, Request, State};
-use axum::http::{header, HeaderMap, Method, StatusCode};
+use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use lodestash_core::catalog::AssetSummaryRow;
+use lodestash_protocol::{Audience, OpSpec, OPERATIONS};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -59,46 +60,63 @@ pub fn router(state: Shared) -> Router {
         .with_state(state)
 }
 
-/// The MCP tool name a request maps to, or `None` for a route with no tool (`…/file` is
-/// REST-only by design — always available behind auth, never on the per-tool allow-list). `search`
-/// splits on `?mode=ai`, mirroring the handler, so `semantic_search` and `search_assets` gate
-/// independently.
-fn tool_for(method: &Method, path: &str, query: Option<&str>) -> Option<&'static str> {
-    Some(match (method.as_str(), path) {
-        ("GET", "/v1/server-info") => "get_server_info",
-        ("GET", "/v1/search") => {
-            if query.unwrap_or("").split('&').any(|kv| kv == "mode=ai") {
-                "semantic_search"
-            } else {
-                "search_assets"
-            }
+/// The catalog operation a request is: the one declared for this method on the route axum
+/// matched and — where two operations share a route — the one whose fixed query the request
+/// carries (`semantic_search` is `GET /v1/search?mode=ai`).
+///
+/// **One decision, asked twice.** The allow-list gate asks it to learn which tool is being called;
+/// the search handler asks it to learn which search to run. They used to decide separately — the
+/// gate on the raw text `mode=ai`, the handler on the decoded, last `mode` — so `?mode=%61i` ran
+/// semantic search under `search_assets`'s permission. Both now read the query through
+/// [`Params::of`] and so cannot disagree.
+///
+/// **Derived, not listed.** The operations come from `lodestash_protocol::OPERATIONS`: one added
+/// to the catalog is gated here with nothing to remember. A route parameter's name is not part of
+/// its address (`/v1/jobs/{id}` is the catalog's `/v1/jobs/{job_id}`).
+fn operation_for(method: &Method, route: &str, uri: &Uri) -> Option<&'static OpSpec> {
+    let mut sent: Option<Params> = None;
+    let mut plain = None;
+    let on_route = OPERATIONS
+        .iter()
+        .filter(|op| op.method.as_str() == method.as_str() && same_route(op.route_path(), route));
+    for op in on_route {
+        let Some(fixed) = op.fixed_query() else {
+            plain = plain.or(Some(op));
+            continue;
+        };
+        let sent = sent.get_or_insert_with(|| Params::of(uri));
+        let selected = fixed.split('&').all(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            sent.get(key) == Some(value)
+        });
+        if selected {
+            return Some(op);
         }
-        ("GET", "/v1/assets/{id}") => "get_asset",
-        ("GET", "/v1/assets/{id}/preview") => "get_asset_preview",
-        ("GET", "/v1/assets/{id}/similar") => "find_similar",
-        ("GET", "/v1/packages") => "list_packages",
-        ("POST", "/v1/projects/register") => "register_project",
-        ("GET", "/v1/projects") => "list_projects",
-        ("POST", "/v1/import") => "import_to_project",
-        ("POST", "/v1/export") => "export_asset",
-        ("GET", "/v1/jobs/{id}") => "get_job_status",
-        ("POST", "/v1/jobs/{id}/cancel") => "cancel_job",
-        ("GET", "/v1/tags") => "list_tags",
-        ("POST", "/v1/assets/{id}/tags") => "add_tag",
-        ("POST", "/v1/tags/batch") => "write_tags",
-        ("GET", "/v1/collections") => "list_collections",
-        ("POST", "/v1/mapping/apply") => "apply_mapping",
-        ("POST", "/v1/identify") => "identify_asset",
-        ("GET", "/v1/assets/{id}/suggest-tags") => "suggest_tags",
-        ("POST", "/v1/packages/unpack") => "unpack_package",
-        ("POST", "/v1/stage") => "stage_asset",
-        ("GET", "/v1/stage") => "list_staged",
-        ("POST", "/v1/stage/import") => "import_staged",
-        ("GET", "/v1/libraries") => "list_libraries",
-        ("GET", "/v1/assets") => "list_assets",
-        ("POST", "/v1/assets/read") => "get_assets",
-        _ => return None,
-    })
+    }
+    plain
+}
+
+/// Two route templates with the same address: equal segment for segment, any `{parameter}`
+/// standing for any other.
+fn same_route(a: &str, b: &str) -> bool {
+    let is_param = |segment: &str| segment.starts_with('{') && segment.ends_with('}');
+    let (mut a, mut b) = (a.split('/'), b.split('/'));
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) if x == y || (is_param(x) && is_param(y)) => {}
+            _ => return false,
+        }
+    }
+}
+
+/// The MCP tool a request is a call of, or `None` when it is not an agent operation: the
+/// plugin's plumbing (`…/file`, the import queue) is always available behind auth and never on
+/// the per-tool allow-list.
+fn tool_for(method: &Method, route: &str, uri: &Uri) -> Option<&'static str> {
+    operation_for(method, route, uri)
+        .filter(|op| op.audience == Audience::Agent)
+        .map(|op| op.name)
 }
 
 /// Run a handler on the blocking pool (v1 plan S11).
@@ -141,7 +159,7 @@ async fn gate(
 ) -> Response {
     if let Some(tool) = matched
         .as_ref()
-        .and_then(|m| tool_for(&method, m.as_str(), req.uri().query()))
+        .and_then(|m| tool_for(&method, m.as_str(), req.uri()))
     {
         if !state.allows(tool) {
             return err(
@@ -228,6 +246,18 @@ async fn server_info(State(state): State<Shared>) -> Response {
 struct Params(Vec<(String, String)>);
 
 impl Params {
+    /// A request's query, decoded — percent-escapes, `+` and all — by the same extractor the
+    /// handlers use. The gate and the search handler both come through here, so the query one of
+    /// them judged is the query the other acts on.
+    fn of(uri: &Uri) -> Params {
+        Params(
+            Query::<Vec<(String, String)>>::try_from_uri(uri)
+                .map(|Query(pairs)| pairs)
+                .unwrap_or_default(),
+        )
+    }
+
+    /// The value of `key` — the last one, when it is repeated.
     fn get(&self, key: &str) -> Option<&str> {
         self.0
             .iter()
@@ -266,11 +296,13 @@ fn agent_err(e: crate::AgentError) -> Response {
 
 /// `search_assets` / `semantic_search` — with the optional scope of ENGINE-API §8.1 applied before
 /// ranking. The historical default (50) and cap (500) stay as they were.
-async fn search(
-    State(state): State<Shared>,
-    Query(pairs): Query<Vec<(String, String)>>,
-) -> Response {
-    let p = Params(pairs);
+///
+/// Which of the two this request is, is [`operation_for`]'s answer — the one the allow-list gate
+/// was given for the same request.
+async fn search(State(state): State<Shared>, matched: MatchedPath, uri: Uri) -> Response {
+    let semantic = operation_for(&Method::GET, matched.as_str(), &uri)
+        .is_some_and(|op| op.name == "semantic_search");
+    let p = Params::of(&uri);
     let parsed = (|| {
         let limit = p.parsed::<usize>("limit")?.unwrap_or(50).clamp(1, 500);
         let scope = state.search_scope(&crate::SearchScope {
@@ -286,7 +318,7 @@ async fn search(
         Err(e) => return agent_err(e),
     };
     let q = p.get("q").unwrap_or("");
-    if p.get("mode") == Some("ai") {
+    if semantic {
         return match state.semantic_search(q, limit, &scope) {
             Some(Ok(rows)) => {
                 let out: Vec<Value> = rows.iter().map(|r| state.summary(r)).collect();
@@ -1581,12 +1613,7 @@ mod tests {
         let token = st.token.clone();
 
         // Everything except get_server_info and semantic_search.
-        let enabled: std::collections::HashSet<String> = crate::AGENT_OPERATIONS
-            .iter()
-            .map(|(t, _)| t.to_string())
-            .filter(|t| t != "get_server_info" && t != "semantic_search")
-            .collect();
-        st.set_allowed(enabled);
+        st.set_allowed(all_tools_but(&["get_server_info", "semantic_search"]));
 
         let (s, b) = send(
             router(st.clone()),
@@ -1646,6 +1673,80 @@ mod tests {
             StatusCode::NOT_FOUND,
             "with bytes released the route is ungated (404 for a missing asset, not 403)"
         );
+    }
+
+    /// Every agent tool except `off`.
+    fn all_tools_but(off: &[&str]) -> std::collections::HashSet<String> {
+        lodestash_engine::config::agent_tool_names()
+            .filter(|tool| !off.contains(tool))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The allow-list gate and the search handler must read the query the same way. The gate
+    /// used to look for the literal text `mode=ai` while the handler decoded the query and took
+    /// the last `mode`, so `?mode=%61i` ran semantic search under `search_assets`'s permission —
+    /// a disabled tool, called anyway. One function now decides for both: the decoded, last
+    /// `mode`.
+    #[tokio::test]
+    async fn the_search_gate_and_the_handler_agree_on_which_tool_a_query_is() {
+        let (_d, st) = state();
+        let token = st.token.clone();
+        let call = |query: &'static str| {
+            let st = st.clone();
+            let req = get_req(&format!("/v1/search?{query}"), Some(&token), None);
+            async move {
+                let (status, body) = send(router(st), req).await;
+                (status, body["error"]["code"].as_str().map(str::to_string))
+            }
+        };
+        let disabled = (StatusCode::FORBIDDEN, Some("tool_disabled".to_string()));
+        // What the semantic branch answers here: no embedder is loaded in this state.
+        let semantic = (
+            StatusCode::NOT_IMPLEMENTED,
+            Some("ai_unavailable".to_string()),
+        );
+        let plain = (StatusCode::OK, None);
+
+        // Semantic search is switched off; plain search is not.
+        st.set_allowed(all_tools_but(&["semantic_search"]));
+        for query in [
+            "mode=ai&q=dog",
+            "mode=%61i&q=dog", // percent-encoded value
+            "mode=a%69&q=dog",
+            "m%6Fde=ai&q=dog",         // percent-encoded key
+            "q=dog&mode=text&mode=ai", // the last `mode` is the one the handler reads
+            "mode=text&mode=%61%69",
+        ] {
+            assert_eq!(
+                call(query).await,
+                disabled,
+                "{query} reached semantic search"
+            );
+        }
+        for query in [
+            "q=dog",
+            "mode=text&q=dog",
+            "mode=ai&mode=text&q=dog", // the last `mode` is not `ai`: plain search, and allowed
+            "mode=AI&q=dog",           // the handler matches `ai` exactly
+            "q=mode%3Dai",             // `mode=ai` as a value, not a parameter
+        ] {
+            assert_eq!(call(query).await, plain, "{query} is a plain search");
+        }
+
+        // The other way round: plain search is off, semantic is on — and no encoding of a
+        // semantic query is mistaken for the disabled one.
+        st.set_allowed(all_tools_but(&["search_assets"]));
+        for query in [
+            "mode=ai&q=dog",
+            "mode=%61i&q=dog",
+            "mode=text&mode=ai&q=dog",
+        ] {
+            assert_eq!(call(query).await, semantic, "{query}");
+        }
+        for query in ["q=dog", "mode=ai&mode=text&q=dog", "q=mode%3Dai"] {
+            assert_eq!(call(query).await, disabled, "{query}");
+        }
     }
 
     /// Review S2 / v2 spec §4.5: a Settings write reaches both agent planes at once, with no

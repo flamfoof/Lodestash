@@ -1,6 +1,8 @@
 # ADR-0022 — The MCP server is a standalone thin client of the app
 
 - **Status:** accepted (2026-11-16), implemented on branch `rewrite/v2`
+- **Amended by:** [ADR-0024](ADR-0024-the-boundary-fails-closed.md) (2026-11-17) — the handshake
+  is trusted only while its process is alive, the launch order, one launched app at a time
 - **Supersedes:** [ADR-0011](ADR-0011-headless-mcp-forwards-writes.md) and its 2026-09-12 amendment
 - **Relates to:** [ADR-0021](ADR-0021-engine-owns-the-catalog-ui-is-a-web-client.md),
   [`ENGINE-API.md`](../ENGINE-API.md) §2, [`MCP-AND-ENGINES.md`](../MCP-AND-ENGINES.md) §2

@@ -5,7 +5,11 @@
 //! temp handshake file with `LODESTASH_ENGINE_JSON`, and at an app binary of the test's choosing
 //! with `LODESTASH_APP` — so a test can never launch the real desktop app sitting next to the MCP
 //! binary in `target/`.
-#![allow(dead_code)]
+// Each test binary uses its own part of this module.
+#![allow(dead_code, unused_imports)]
+
+pub mod fake_app;
+pub mod raw;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -15,6 +19,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub use fake_app::{gone_process, handshake_json_for, launches, FakeApp};
+pub use raw::{Behaviour, RawListener};
 use serde_json::{json, Value};
 
 /// The PNG the test app serves as every asset's preview (only the signature is real — the route
@@ -108,6 +114,31 @@ impl Mcp {
             if message["id"] == id {
                 return message;
             }
+        }
+    }
+
+    /// Send `tools/call` and return without waiting for its answer.
+    pub fn start_call(&mut self, tool: &str, arguments: Value) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                         "params": {"name": tool, "arguments": arguments}}));
+    }
+
+    /// Close stdin (the host went away) and report how long the process took to exit, or `None`
+    /// if it was still running after `within` (it is then killed).
+    pub fn close_and_time_exit(mut self, within: Duration) -> Option<Duration> {
+        let start = Instant::now();
+        drop(self.stdin.take());
+        loop {
+            if self.child.try_wait().unwrap().is_some() {
+                return Some(start.elapsed());
+            }
+            if start.elapsed() > within {
+                let _ = self.child.kill();
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -220,8 +251,8 @@ pub fn refused_port() -> u16 {
     l.local_addr().unwrap().port()
 }
 
-/// Today's app, minus the window: the `/v1` router over a temp catalog seeded with one asset, on a
-/// listener this test bound — `lodestash_api::serve` is not used because it writes the platform
+/// Today's app, minus the window: the `/v1` router over a temp catalog seeded with one asset and
+/// the texture it depends on, on a listener this test bound — `lodestash_api::serve` is not used because it writes the platform
 /// handshake file.
 pub struct App {
     pub dir: tempfile::TempDir,
@@ -229,8 +260,13 @@ pub struct App {
     pub token: String,
     /// `mossy_wall.png`'s id.
     pub asset: i64,
+    /// `lichen_albedo.png`'s id — the texture `mossy_wall.png` depends on.
+    pub dependency: i64,
     /// Where this app's handshake goes. Not written until a test asks (`publish`).
     pub handshake: PathBuf,
+    /// The app's side of things a test plays the person for: approving a parked job, registering
+    /// an editor, reading the import queue.
+    pub state: Arc<lodestash_api::ServerState>,
 }
 
 impl App {
@@ -239,24 +275,41 @@ impl App {
 
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("catalog.db");
+        let dependency;
         {
             let mut c = Catalog::open(&db).unwrap();
             c.seed_media_types().unwrap();
             let src = c
                 .upsert_import_source("Lib", dir.path().to_str().unwrap(), "folder")
                 .unwrap();
+            let file = |name: &str| CrawlRecord {
+                workspace_rel: None,
+                content_hash: None,
+                rel_path: name.into(),
+                name: name.into(),
+                media_type: "image".into(),
+                size_bytes: FILE.len() as i64,
+                mtime: 1,
+            };
             c.record_crawl(
                 src,
                 None,
-                &[CrawlRecord {
-                    workspace_rel: None,
-                    content_hash: None,
-                    rel_path: "mossy_wall.png".into(),
-                    name: "mossy_wall.png".into(),
-                    media_type: "image".into(),
-                    size_bytes: FILE.len() as i64,
-                    mtime: 1,
-                }],
+                &[file("mossy_wall.png"), file("lichen_albedo.png")],
+            )
+            .unwrap();
+            // The wall depends on the lichen texture: an import or export "with dependencies"
+            // brings both.
+            let recent = c.recent_asset_ids(10).unwrap();
+            let rows = c.asset_summaries(&recent).unwrap();
+            let id = |name: &str| rows.iter().find(|r| r.name == name).unwrap().id;
+            dependency = id("lichen_albedo.png");
+            c.record_dependencies(dependency, Some("11aa"), "uses_texture", &[])
+                .unwrap();
+            c.record_dependencies(
+                id("mossy_wall.png"),
+                Some("22bb"),
+                "uses_texture",
+                &["11aa".to_string()],
             )
             .unwrap();
         }
@@ -275,6 +328,7 @@ impl App {
         let asset = state.search("mossy", 10, &Default::default()).unwrap()[0].id;
         let token = state.token().to_string();
         let state = Arc::new(state);
+        let served = state.clone();
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -286,7 +340,7 @@ impl App {
                 .unwrap();
             rt.block_on(async move {
                 let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-                axum::serve(listener, lodestash_api::router(state))
+                axum::serve(listener, lodestash_api::router(served))
                     .await
                     .unwrap();
             });
@@ -297,7 +351,9 @@ impl App {
             port,
             token,
             asset,
+            dependency,
             handshake,
+            state,
         }
     }
 
@@ -346,43 +402,27 @@ fn writer(db: PathBuf) -> lodestash_api::AgentWriteFn {
             })
             .map(|o| o.changed_assets.len())
             .map_err(|e| e.to_string()),
+        lodestash_api::AgentWrite::RegisterProject {
+            project_path,
+            unity_version,
+            pipeline,
+        } => Catalog::open(&db)
+            .and_then(|c| {
+                c.register_project(&project_path, unity_version.as_deref(), pipeline.as_deref())
+            })
+            .map(|_| 1)
+            .map_err(|e| e.to_string()),
         other => Err(format!("the test writer does not do {other:?}")),
     })
 }
 
-/// A stand-in for the app binary: refuses to run without `--background` (exit 3), writes
-/// `handshake` (if any) to the file named by `LODESTASH_ENGINE_JSON` — the one the launcher waits
-/// on — and then stays alive for `linger_secs`, as a background app would.
+/// A stand-in for the app binary that publishes `handshake` (if any) at once and then stays alive
+/// for `linger_secs`, as a background app would. See [`FakeApp`] for the other things one can do.
 pub fn fake_app(dir: &Path, name: &str, handshake: Option<&str>, linger_secs: u32) -> PathBuf {
-    #[cfg(windows)]
-    {
-        let path = dir.join(format!("{name}.cmd"));
-        let mut script =
-            String::from("@echo off\r\nif not \"%~1\"==\"--background\" exit /b 3\r\n");
-        if let Some(json) = handshake {
-            script.push_str(&format!("> \"%LODESTASH_ENGINE_JSON%\" echo {json}\r\n"));
-        }
-        if linger_secs > 0 {
-            script.push_str(&format!("ping -n {} 127.0.0.1 >nul\r\n", linger_secs + 1));
-        }
-        std::fs::write(&path, script).unwrap();
-        path
+    FakeApp {
+        handshake: handshake.map(str::to_string),
+        linger_secs,
+        ..FakeApp::default()
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join(name);
-        let mut script = String::from("#!/bin/sh\n[ \"$1\" = \"--background\" ] || exit 3\n");
-        if let Some(json) = handshake {
-            script.push_str(&format!(
-                "printf '%s' '{json}' > \"$LODESTASH_ENGINE_JSON\"\n"
-            ));
-        }
-        if linger_secs > 0 {
-            script.push_str(&format!("sleep {linger_secs}\n"));
-        }
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
-    }
+    .write(dir, name)
 }

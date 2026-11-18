@@ -716,10 +716,11 @@ enabled: **ENDPOINT** (`http://127.0.0.1:<port>/mcp`, ⧉ Copy) on a **stable co
 (default 4319)** — distinct from the engine API's ephemeral port; **ACCESS TOKEN** (mono, ↻
 Regenerate rotates it; per-session token semantics per ENGINE-API §1); **ALLOWED ACTIONS** — a
 **literal per-tool allow-list** (card 178, **superseding** the earlier three-permission-group
-resolution): one toggle per real agent tool from the canonical inventory
-(`lodestash_api::AGENT_OPERATIONS` — `get_server_info`, `search_assets`, `semantic_search`,
-`get_asset`, `get_asset_preview`, `find_similar`, `list_packages`, `export_asset`, `get_job_status`,
-`cancel_job`; the list grows as tools land). **Default: every tool enabled** — a fresh install
+resolution): one toggle per real agent tool from the canonical inventory — the operation catalog's
+`Agent` operations (`lodestash_protocol::OPERATIONS`, as `agent_tool_names()`): `get_server_info`,
+`search_assets`, `semantic_search`, `get_asset`, `get_asset_preview`, `find_similar`,
+`list_packages`, `export_asset`, `get_job_status`, `cancel_job` and the rest; the list is whatever
+the catalog declares. **Default: every tool enabled** — a fresh install
 behaves exactly as before, and the user switches tools **off**. A disabled tool is gated on **both**
 planes at once: REST answers `403 tool_disabled`, MCP refuses the tool — because both consult one
 allow-list on `ServerState` (`set_allowed` / `allows`), which is what keeps the gate MCP↔REST 1:1

@@ -4,9 +4,12 @@
 
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use common::{fake_app, handshake_json, App, Mcp};
+use common::{
+    fake_app, gone_process, handshake_json, handshake_json_for, refused_port, App, Behaviour,
+    FakeApp, Mcp, RawListener, STEP,
+};
 use serde_json::json;
 
 /// No handshake, so the server launches `LODESTASH_APP` with `--background` (the fake refuses to
@@ -97,5 +100,92 @@ fn the_launched_app_does_not_keep_the_hosts_pipe_open() {
     assert!(
         eof.is_some(),
         "stdout stayed open after the server exited: the background app holds the host's pipe"
+    );
+}
+
+/// Liveness before version: a handshake left by a dead app of an older API version is a stale
+/// file, not a running app to refuse — the app is launched and the call goes through.
+#[test]
+fn a_dead_apps_handshake_of_another_api_version_does_not_block_the_launch() {
+    let app = App::start();
+    let gone = gone_process();
+    std::fs::write(
+        &app.handshake,
+        handshake_json_for(refused_port(), "old-token", gone.pid(), "v0"),
+    )
+    .unwrap();
+    let exe = fake_app(
+        app.dir.path(),
+        "fake-app",
+        Some(&handshake_json(app.port, &app.token)),
+        0,
+    );
+    let mut mcp = Mcp::spawn(&app.handshake, &exe);
+    mcp.initialize();
+
+    let result = mcp.call("search_assets", json!({"query": "mossy"}));
+    assert_eq!(result["isError"], false, "{result}");
+    assert_eq!(
+        result["structuredContent"]["results"][0]["id"], app.asset,
+        "{result}"
+    );
+}
+
+/// The launched app turns out to serve another API version: said at once, naming both versions,
+/// and the request is not sent to it.
+#[test]
+fn a_launched_app_of_another_api_version_is_reported_and_sent_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let newer = RawListener::start(Behaviour::Answer("{}"));
+    let exe = FakeApp {
+        handshake: Some(handshake_json_for(
+            newer.port,
+            "t",
+            std::process::id(),
+            "v2",
+        )),
+        ..FakeApp::default()
+    }
+    .write(dir.path(), "newer-app");
+    let mut mcp = Mcp::spawn(&dir.path().join("engine.json"), &exe);
+    mcp.initialize();
+
+    let start = Instant::now();
+    let result = mcp.call("list_packages", json!({}));
+    assert!(start.elapsed() < STEP, "{result}");
+    assert_eq!(result["isError"], true, "{result}");
+    let error = &result["structuredContent"]["error"];
+    assert_eq!(error["code"], "app_unavailable", "{result}");
+    let message = error["message"].as_str().unwrap();
+    assert!(
+        message.contains("v2") && message.contains("v1"),
+        "{message}"
+    );
+    assert!(newer.requests().is_empty(), "{:?}", newer.requests());
+}
+
+/// The app is started in its own directory, not wherever the MCP host happened to be — an app
+/// that outlives the host should not pin the host's working directory, or resolve a relative path
+/// against it.
+#[test]
+fn the_launched_app_starts_in_its_own_directory() {
+    let app = App::start();
+    let install = app.dir.path().join("install");
+    std::fs::create_dir(&install).unwrap();
+    let exe = FakeApp {
+        record_cwd: true,
+        handshake: Some(handshake_json(app.port, &app.token)),
+        ..FakeApp::default()
+    }
+    .write(&install, "fake-app");
+    let mut mcp = Mcp::spawn(&app.handshake, &exe);
+    mcp.initialize();
+    let result = mcp.call("list_packages", json!({}));
+    assert_eq!(result["isError"], false, "{result}");
+
+    let started_in = std::fs::read_to_string(install.join("cwd.txt")).expect("the app ran");
+    assert_eq!(
+        std::fs::canonicalize(started_in.trim()).unwrap(),
+        std::fs::canonicalize(&install).unwrap()
     );
 }

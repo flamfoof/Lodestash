@@ -158,10 +158,30 @@
     }
   }
 
+  /**
+   * What a save sends. The key field is write-only state: it goes out only when something was
+   * typed into it. An empty field is "unchanged" — the engine reads it that way too — so a key
+   * typed and erased again can no longer wipe the stored one on the next save of anything.
+   */
+  function settingsToSave(): Settings {
+    const out: Settings = { ...s };
+    delete out.clear_api_key;
+    const key = out.api_key?.trim();
+    if (key) out.api_key = key;
+    else delete out.api_key;
+    return out;
+  }
+
   async function save() {
     saved = false;
     try {
-      await setSettings(s);
+      const sent = settingsToSave();
+      await setSettings(sent);
+      if (sent.api_key) {
+        // Stored. The field goes back to empty — the key is not kept here to be re-sent.
+        s.api_key = undefined;
+        s.api_key_configured = true;
+      }
       saved = true;
       setTimeout(() => (saved = false), 1500);
       // The size tiers feed the badges and the ⚑ size facet — re-ask so every screen follows.
@@ -169,6 +189,19 @@
       // The preview-quality change re-keys the thumb URLs (api.ts thumbKey) so the webview
       // cache re-requests at the new size instead of serving the old PNGs.
       setThumbKey(s.preview_quality);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  /** Remove the stored API key — the one explicit way to, now that an empty field means "keep". */
+  async function removeApiKey() {
+    try {
+      const sent = settingsToSave();
+      delete sent.api_key;
+      await setSettings({ ...sent, clear_api_key: true });
+      s.api_key = undefined;
+      s.api_key_configured = false;
     } catch (e) {
       error = String(e);
     }
@@ -801,6 +834,12 @@
             data-testid="api-key"
           />
         </label>
+        {#if s.api_key_configured}
+          <!-- Emptying the field keeps the key; removing it is its own action. -->
+          <div class="row">
+            <button onclick={removeApiKey} data-testid="api-key-remove">Remove saved key</button>
+          </div>
+        {/if}
         <label class="field">
           <span>Max assets per run</span>
           <input
