@@ -359,6 +359,82 @@ fn undoing_a_trash_restores_only_what_it_changed() {
     assert!(!trashed(b), "undo restored the one it did");
 }
 
+/// Is `asset_id` in the Trash, read through a connection of its own?
+fn trashed_on_disk(cfg: &EngineConfig, lib: &str, asset_id: i64) -> bool {
+    let reader = Catalog::open_reader(&cfg.catalog).expect("separate read");
+    let source = reader.source_info_by_root(lib).unwrap().unwrap();
+    reader
+        .entries_for_source(source.id)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.asset_id == asset_id)
+        .expect("the row exists")
+        .trashed
+}
+
+/// Review finding 6: Delete from disk and Remove from library trashed through an unlogged write,
+/// so the undo of an *earlier* "move to Trash" flipped the row back — resurrecting an asset whose
+/// file the app had just deleted, or one the user had removed from the library. Driven through
+/// the writer, read back through a separate connection.
+#[test]
+fn undo_never_restores_a_deleted_or_removed_asset() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (engine, cfg) = started(dir.path());
+    let (lib, ids) = seed(&engine, dir.path(), &["a.png", "b.png", "c.png"]);
+    let (a, b, c) = (ids[0], ids[1], ids[2]);
+    std::fs::create_dir_all(&lib).expect("lib");
+    let file_a = Path::new(&lib).join("a.png");
+    std::fs::write(&file_a, b"bytes").expect("a on disk");
+    let w = engine.writer();
+
+    // Trash a (undoable), then delete its file from disk.
+    w.run(Op::SetTrashed {
+        ids: vec![a],
+        trashed: true,
+    })
+    .expect("trash a");
+    let trash_a = engine.read().recent_ops(1)[0].id;
+    let targets = engine.read().write_targets(&[a]);
+    let roots = engine.read().roots();
+    let out = w
+        .run(Op::DeleteFromDisk {
+            targets,
+            roots,
+            workspace: Some(cfg.workspace_dir.clone()),
+        })
+        .expect("delete from disk");
+    assert_eq!((out.refused, out.failed), (0, 0), "the delete went through");
+    assert!(!file_a.exists(), "the file left the disk");
+    assert!(
+        w.run(Op::RevertOp { op_id: trash_a }).is_err(),
+        "the trash of a deleted file is no longer an undoable op"
+    );
+    assert!(
+        trashed_on_disk(&cfg, &lib, a),
+        "undo un-trashed an asset whose file was deleted"
+    );
+
+    // Trash {b, c} (undoable), then remove b from the library: undo restores c only.
+    w.run(Op::SetTrashed {
+        ids: vec![b, c],
+        trashed: true,
+    })
+    .expect("trash b and c");
+    let trash_bc = engine.read().recent_ops(1)[0].id;
+    let targets = engine.read().write_targets(&[b]);
+    w.run(Op::RemoveFromLibrary { targets })
+        .expect("remove b from the library");
+    w.run(Op::RevertOp { op_id: trash_bc }).expect("undo");
+    assert!(
+        trashed_on_disk(&cfg, &lib, b),
+        "undo brought back an asset the user removed from the library"
+    );
+    assert!(
+        !trashed_on_disk(&cfg, &lib, c),
+        "the rest of that trash still undoes"
+    );
+}
+
 /// A catalog written by a newer build is refused — reported, not opened, not changed.
 #[test]
 fn a_catalog_newer_than_this_build_is_refused_untouched() {

@@ -2920,7 +2920,9 @@ fn remove_from_library(
     targets: Vec<Target>,
 ) -> Result<WriteResult, String> {
     let ids: Vec<i64> = targets.iter().map(|t| t.asset_id).collect();
-    let changed = catalog.set_trashed(&ids, true).map_err(|e| e.to_string())?;
+    // Retired, not merely trashed: removing is not undoable, so the undo of an earlier trash
+    // must not bring the asset back either (DATA-MODEL §9).
+    let changed = catalog.retire_assets(&ids).map_err(|e| e.to_string())?;
 
     let mut excluded = 0;
     for t in &targets {
@@ -3038,10 +3040,10 @@ fn delete_from_disk(
             }
         }
     }
+    // Retired, not merely trashed: the file is gone, so no earlier trash or restore of this
+    // asset may be undone or redone back into a live row (DATA-MODEL §9).
     if !deleted.is_empty() {
-        out.changed = catalog
-            .set_trashed(&deleted, true)
-            .map_err(|e| e.to_string())?;
+        out.changed = catalog.retire_assets(&deleted).map_err(|e| e.to_string())?;
     }
     Ok(out)
 }

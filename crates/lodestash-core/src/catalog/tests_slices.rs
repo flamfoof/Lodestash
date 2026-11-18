@@ -585,13 +585,139 @@ fn a_failed_project_registration_changes_nothing() {
     assert_eq!(c.active_project_id().expect("active"), Some(first));
 }
 
+/// Delete from disk and Remove from library take an asset out for good, and the undo history must
+/// not be a way back (review finding 6): the trash that came before them is no longer undoable for
+/// that asset, in either direction, and an op left with nothing to flip is gone.
 #[test]
-fn redo_applies_the_forward_payload_then_consumes_the_op() {
+fn undo_and_redo_never_restore_a_retired_asset() {
+    let (mut c, ids) = tagged_catalog(&[
+        ("a.fbx", "model_3d"),
+        ("b.png", "image"),
+        ("c.png", "image"),
+    ]);
+    let (a, b, keep) = (ids[0], ids[1], ids[2]);
+
+    // Trash {a, keep} (logged), then the file behind `a` is deleted: undo restores only `keep`.
+    assert_eq!(c.set_trashed_recorded(&[a, keep], true).expect("trash"), 2);
+    let trash = c.recent_ops(1).expect("ops")[0].id;
+    assert_eq!(
+        c.retire_assets(&[a]).expect("retire"),
+        0,
+        "already in the Trash"
+    );
+    c.revert_op(trash).expect("undo");
+    assert!(
+        is_trashed(&c, a),
+        "undo un-trashed an asset whose file the app deleted"
+    );
+    assert!(!is_trashed(&c, keep), "the rest of that trash still undoes");
+    c.redo_op(trash).expect("redo");
+    assert!(is_trashed(&c, a) && is_trashed(&c, keep));
+
+    // Restore `b` from the Trash, undo that restore (so it sits on the redo stack), then remove
+    // `b` from the library: the redo must not bring it back, and has nothing left to do.
+    c.set_trashed(&[b], true).expect("b in the Trash");
+    assert_eq!(c.set_trashed_recorded(&[b], false).expect("restore"), 1);
+    let restore = c.recent_ops(1).expect("ops")[0].id;
+    c.revert_op(restore).expect("undo the restore");
+    assert!(is_trashed(&c, b));
+    c.retire_assets(&[b]).expect("retire b");
+    assert!(
+        c.redo_candidates(10)
+            .expect("redo")
+            .iter()
+            .all(|r| r.id != restore),
+        "an op with nothing left to flip stayed on the redo stack"
+    );
+    assert!(
+        c.redo_op(restore).is_err(),
+        "the emptied op is gone, not replayable"
+    );
+    assert!(is_trashed(&c, b), "redo resurrected a retired asset");
+
+    // Retiring a live asset trashes it and reports the change.
+    c.set_trashed(&[keep], false).expect("keep is live");
+    assert_eq!(c.retire_assets(&[keep]).expect("retire live"), 1);
+    assert!(is_trashed(&c, keep));
+    assert_eq!(c.retire_assets(&[]).expect("no-op"), 0);
+}
+
+/// Undo → redo → undo acts on the **same** op (review finding 6). Redo used to delete the row, so
+/// the second undo reached past it and reverted whatever the user had done before.
+#[test]
+fn undo_after_a_redo_reverts_the_op_that_was_redone() {
+    let (mut c, ids) = tagged_catalog(&[("a.fbx", "model_3d"), ("b.png", "image")]);
+    let (a, b) = (ids[0], ids[1]);
+    c.set_trashed_recorded(&[a], true).expect("earlier op");
+    let earlier = c.recent_ops(1).expect("ops")[0].id;
+    c.set_trashed_recorded(&[b], true).expect("later op");
+    let later = c.recent_ops(1).expect("ops")[0].id;
+
+    c.revert_op(later).expect("undo");
+    c.redo_op(later).expect("redo");
+    assert_eq!(
+        c.recent_ops(1).expect("ops")[0].id,
+        later,
+        "after a redo the next undo is the op just redone"
+    );
+    c.revert_op(c.recent_ops(1).expect("ops")[0].id)
+        .expect("undo again");
+    assert!(!is_trashed(&c, b), "the redone op was not undone");
+    assert!(
+        is_trashed(&c, a),
+        "undo → redo → undo reverted an unrelated earlier op"
+    );
+    assert_eq!(c.recent_ops(1).expect("ops")[0].id, earlier);
+}
+
+/// The redo stack is a stack: the op undone last is redone first. It was read newest-id-first, so
+/// after undoing two ops the redo button replayed them in the wrong order.
+#[test]
+fn redo_offers_the_most_recently_undone_op_first() {
+    let (mut c, ids) = tagged_catalog(&[("a.fbx", "model_3d"), ("b.png", "image")]);
+    c.set_trashed_recorded(&[ids[0]], true).expect("first");
+    let first = c.recent_ops(1).expect("ops")[0].id;
+    c.set_trashed_recorded(&[ids[1]], true).expect("second");
+    let second = c.recent_ops(1).expect("ops")[0].id;
+    c.revert_op(second).expect("undo second");
+    c.revert_op(first).expect("undo first");
+    let stack: Vec<i64> = c
+        .redo_candidates(10)
+        .expect("redo")
+        .iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(
+        stack,
+        vec![first, second],
+        "the last undone is the first redone"
+    );
+}
+
+/// Redoing a collection create makes a new row with a new id; the op must follow it, or the next
+/// undo would try to delete the id that no longer exists.
+#[test]
+fn a_redone_collection_create_can_be_undone_again() {
+    let mut c = Catalog::open_in_memory().expect("open");
+    let id = c.create_collection("Temp").expect("create");
+    let op = c.record_collection_create_op(id, "Temp").expect("record");
+    c.revert_op(op).expect("undo");
+    c.redo_op(op).expect("redo");
+    assert_eq!(c.list_collections().expect("list").len(), 1);
+    c.revert_op(op).expect("undo the redone create");
+    assert!(
+        c.list_collections().expect("list").is_empty(),
+        "the re-created collection was left behind"
+    );
+}
+
+#[test]
+fn redo_applies_the_forward_payload_and_re_arms_the_op() {
     let (mut c, ids) = tagged_catalog(&[("a.fbx", "model_3d")]);
     let a = ids[0];
 
-    // Trash → undo → redo: the trash lands twice, the row is consumed, and the undo
-    // button's view (recent_ops) shows nothing again.
+    // Trash → undo → redo: the trash lands twice, and the op is back on the undo stack — it is
+    // the last thing that happened, so it is what the next undo reverts.
     let op = c.record_trash_op(&[a], true).expect("record trash");
     assert_eq!(c.set_trashed(&[a], true).expect("trash"), 1);
     c.revert_op(op).expect("undo");
@@ -605,13 +731,22 @@ fn redo_applies_the_forward_payload_then_consumes_the_op() {
     );
     c.redo_op(op).expect("redo");
     assert!(is_trashed(&c, a), "redo re-applies the trashed state");
-    assert!(
-        c.recent_ops(10).expect("recent").is_empty(),
-        "redo consumes the row"
+    assert_eq!(
+        c.recent_ops(10)
+            .expect("recent")
+            .iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>(),
+        vec![op],
+        "redo puts the op back on the undo stack"
     );
     assert!(
         c.redo_candidates(10).expect("redo stack").is_empty(),
         "nothing left to redo"
+    );
+    assert!(
+        c.redo_op(op).is_err(),
+        "an op that is not undone is not redone"
     );
 
     // New work clears the redo stack.

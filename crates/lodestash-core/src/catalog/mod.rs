@@ -2387,7 +2387,7 @@ CREATE INDEX IF NOT EXISTS idx_oplog_created ON op_log(created_at);
 
 const MIGRATION_17_OP_LOG_REDO: &str = "
 ALTER TABLE op_log ADD COLUMN forward_json TEXT;  -- the redo payload; NULL = payload_json IS the forward too
-ALTER TABLE op_log ADD COLUMN undone_at INTEGER;  -- set on undo; redo applies the forward then deletes the row
+ALTER TABLE op_log ADD COLUMN undone_at INTEGER;  -- set on undo; redo applies the forward and clears it again
 CREATE INDEX IF NOT EXISTS idx_oplog_undone ON op_log(undone_at);
 ";
 

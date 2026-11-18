@@ -765,7 +765,8 @@ impl Catalog {
         self.replay_tag_batch(op_id, payload, true)
     }
 
-    /// Redo an undone `tag_batch` op, under the same conflict rule, then consume it (ADR-0006).
+    /// Redo an undone `tag_batch` op, under the same conflict rule, then put it back on the undo
+    /// stack (ADR-0006, amended 2026-11-17).
     pub(super) fn redo_tag_batch(&mut self, op_id: i64, payload: &str) -> Result<()> {
         self.replay_tag_batch(op_id, payload, false)
     }
@@ -811,7 +812,10 @@ impl Catalog {
                 params![op_id, unix_now()],
             )
         } else {
-            tx.execute("DELETE FROM op_log WHERE id = ?1", params![op_id])
+            tx.execute(
+                "UPDATE op_log SET undone_at = NULL WHERE id = ?1",
+                params![op_id],
+            )
         }
         .map_err(|e| CoreError::Catalog(format!("tag replay log: {e}")))?;
         tx.commit()

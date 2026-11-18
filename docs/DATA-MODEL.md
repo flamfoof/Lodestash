@@ -631,6 +631,16 @@ refuses any path outside the user's source roots and the app's own extraction wo
 catalog row is marked trashed **only after** the file actually left the disk, so a failed delete
 cannot leave the catalog claiming otherwise.
 
+**Delete from disk and Remove from library are not undoable, and undo is never a way around them.**
+Both record through `Catalog::retire_assets`: the rows are trashed and, in the same transaction,
+those asset ids are removed from every `set_trashed` row in `op_log` — live or on the redo stack —
+and a row left with nothing to flip is deleted. Undoing an earlier "move to Trash" after the file
+was deleted used to un-trash a row whose file no longer exists; now that undo restores only the
+assets of that trash that are still merely trashed. Undo and redo apply their flip and their
+`undone_at` change in one transaction. Redo re-arms the row (`undone_at = NULL`) instead of
+deleting it, so the op just redone is the next one undone, and the redo stack is read
+last-undone-first ([ADR-0006](decisions/ADR-0006-redo-forward-payloads.md), amended).
+
 **Favourites** (`asset.favorite`, M12) are a **pin, not a rating**: "I want to find this again" is
 a different question from "how good is this", and folding the two together would make every 5-star
 asset a favourite by accident. Catalog-only like ratings and the Trash — the file on disk is never

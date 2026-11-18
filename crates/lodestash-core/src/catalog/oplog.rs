@@ -52,14 +52,16 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("recent_ops row: {e}")))
     }
 
-    /// The newest undone ops (the redo stack), newest first, capped at `limit`.
+    /// The redo stack, top first, capped at `limit`: the op undone **last** leads. Undo always
+    /// takes the newest live op, so the undone ops are the newest ones and the one undone last
+    /// has the lowest id — ascending id is the order they are redone in.
     pub fn redo_candidates(&self, limit: usize) -> Result<Vec<OpLogRow>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT id, op_kind, payload_json, created_at FROM op_log
                  WHERE undone_at IS NOT NULL AND origin != 'background'
-                 ORDER BY id DESC LIMIT ?1",
+                 ORDER BY id ASC LIMIT ?1",
             )
             .map_err(|e| CoreError::Catalog(format!("redo_candidates prep: {e}")))?;
         let rows = stmt
@@ -152,6 +154,66 @@ impl Catalog {
         Ok(changing.len())
     }
 
+    /// Take assets out of the library **for good**: move them to the Trash and retire them from
+    /// the undo history, in one transaction. Returns how many rows the trash changed.
+    ///
+    /// This is what **Delete from disk** (for the files that actually left) and **Remove from
+    /// library** record. Neither is undoable, and an earlier logged trash or restore of the same
+    /// asset must not become a way back: undoing "move to Trash" after the file was deleted
+    /// un-trashed a row whose file no longer exists. So every `set_trashed` op — live or on the
+    /// redo stack — forgets these ids, and an op left with nothing to flip is removed.
+    pub fn retire_assets(&self, asset_ids: &[i64]) -> Result<usize> {
+        if asset_ids.is_empty() {
+            return Ok(0);
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| CoreError::Catalog(format!("retire begin: {e}")))?;
+        let changed = self.set_trashed(asset_ids, true)?;
+        let retired: std::collections::HashSet<i64> = asset_ids.iter().copied().collect();
+        let ops: Vec<(i64, String)> = {
+            let mut stmt = tx
+                .prepare("SELECT id, payload_json FROM op_log WHERE op_kind = 'set_trashed'")
+                .map_err(|e| CoreError::Catalog(format!("retire history prep: {e}")))?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(|e| CoreError::Catalog(format!("retire history: {e}")))?;
+            rows.collect::<std::result::Result<_, _>>()
+                .map_err(|e| CoreError::Catalog(format!("retire history row: {e}")))?
+        };
+        for (op_id, payload) in ops {
+            // A payload this build cannot read is left alone: its undo refuses on its own.
+            let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&payload) else {
+                continue;
+            };
+            let Some(ids) = v["asset_ids"].as_array() else {
+                continue;
+            };
+            let kept: Vec<i64> = ids
+                .iter()
+                .filter_map(|x| x.as_i64())
+                .filter(|id| !retired.contains(id))
+                .collect();
+            if kept.len() == ids.len() {
+                continue;
+            }
+            if kept.is_empty() {
+                tx.execute("DELETE FROM op_log WHERE id = ?1", params![op_id])
+            } else {
+                v["asset_ids"] = serde_json::json!(kept);
+                tx.execute(
+                    "UPDATE op_log SET payload_json = ?2 WHERE id = ?1",
+                    params![op_id, v.to_string()],
+                )
+            }
+            .map_err(|e| CoreError::Catalog(format!("retire history write: {e}")))?;
+        }
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("retire commit: {e}")))?;
+        Ok(changed)
+    }
+
     /// Record a collection-create op (id + name) so the created collection can be deleted
     /// on undo. Call after [`Self::create_collection`] returns its id.
     pub fn record_collection_create_op(&self, collection_id: i64, name: &str) -> Result<i64> {
@@ -198,8 +260,22 @@ impl Catalog {
         Ok(())
     }
 
+    /// Put a redone op back on the undo stack. It is the last thing that happened, so it is what
+    /// the next undo must revert: redo used to delete the row instead, and undo → redo → undo
+    /// then reverted whatever the user had done *before* it (ADR-0006, amended 2026-11-17).
+    fn mark_redone(&self, op_id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE op_log SET undone_at = NULL WHERE id = ?1",
+                params![op_id],
+            )
+            .map_err(|e| CoreError::Catalog(format!("mark_redone: {e}")))?;
+        Ok(())
+    }
+
     /// Redo one undone op (Shift-Z): apply its forward payload — `forward_json` when the op
-    /// recorded one, else the payload itself (the change-shaped ops) — then consume the row.
+    /// recorded one, else the payload itself (the change-shaped ops) — then put the op back on
+    /// the undo stack.
     pub fn redo_op(&mut self, op_id: i64) -> Result<()> {
         let undone: i64 = self
             .conn
@@ -237,7 +313,8 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("op_forward: {e}")))
     }
 
-    /// Redo a `set_trashed` op: re-apply the recorded direction, then consume the row.
+    /// Redo a `set_trashed` op: re-apply the recorded direction and re-arm the op — both or
+    /// neither.
     pub fn redo_set_trashed(&self, op_id: i64, payload: &str) -> Result<()> {
         let v: serde_json::Value = serde_json::from_str(payload)
             .map_err(|e| CoreError::Catalog(format!("redo_set_trashed payload: {e}")))?;
@@ -250,25 +327,44 @@ impl Catalog {
             .iter()
             .filter_map(|x| x.as_i64())
             .collect();
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| CoreError::Catalog(format!("redo_set_trashed begin: {e}")))?;
         self.set_trashed(&ids, trashed)?;
-        self.delete_ops(&[op_id])?;
-        Ok(())
+        self.mark_redone(op_id)?;
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("redo_set_trashed commit: {e}")))
     }
 
-    /// Redo a `create_collection` op: re-create it (a fresh id is fine), then consume the row.
+    /// Redo a `create_collection` op: re-create it, point the op at the new row (a re-created
+    /// collection has a fresh id, and the next undo deletes by id), then re-arm the op.
     pub fn redo_create_collection(&self, op_id: i64, payload: &str) -> Result<()> {
         let v: serde_json::Value = serde_json::from_str(payload)
             .map_err(|e| CoreError::Catalog(format!("redo_create_collection payload: {e}")))?;
         let name = v["name"]
             .as_str()
             .ok_or_else(|| CoreError::Catalog("redo_create_collection: missing name".into()))?;
-        self.create_collection(name)?;
-        self.delete_ops(&[op_id])?;
-        Ok(())
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| CoreError::Catalog(format!("redo_create_collection begin: {e}")))?;
+        let collection_id = self.create_collection(name)?;
+        let payload = serde_json::json!({ "collection_id": collection_id, "name": name });
+        tx.execute(
+            "UPDATE op_log SET payload_json = ?2 WHERE id = ?1",
+            params![op_id, payload.to_string()],
+        )
+        .map_err(|e| CoreError::Catalog(format!("redo_create_collection log: {e}")))?;
+        self.mark_redone(op_id)?;
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("redo_create_collection commit: {e}")))
     }
 
     /// Undo a `set_trashed` op: re-run [`Self::set_trashed`] with the opposite direction
-    /// (an untrash is undone by trashing again and vice versa), then drop the op.
+    /// (an untrash is undone by trashing again and vice versa) and mark the op undone — both or
+    /// neither. The ids are the ones the toggle changed, less any retired since
+    /// ([`Self::retire_assets`]).
     pub fn revert_set_trashed(&self, op_id: i64) -> Result<()> {
         let (kind, payload) = self.op_payload(op_id)?;
         if kind != "set_trashed" {
@@ -286,9 +382,14 @@ impl Catalog {
             .iter()
             .filter_map(|x| x.as_i64())
             .collect();
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| CoreError::Catalog(format!("revert_set_trashed begin: {e}")))?;
         self.set_trashed(&ids, !trashed)?;
         self.mark_undone(op_id)?;
-        Ok(())
+        tx.commit()
+            .map_err(|e| CoreError::Catalog(format!("revert_set_trashed commit: {e}")))
     }
 
     /// Undo a `create_collection` op: delete the collection the op created (reuses
