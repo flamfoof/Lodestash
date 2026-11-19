@@ -1981,7 +1981,7 @@ impl Library {
         if needle.is_empty() {
             return None;
         }
-        let spaces = crate::drains::query_spaces(needle);
+        let spaces = crate::appraise::query_spaces(needle);
         if spaces.is_empty() {
             return None;
         }

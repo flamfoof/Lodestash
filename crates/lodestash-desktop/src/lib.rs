@@ -2061,7 +2061,7 @@ fn build_engine_state(
     // grid's AI mode does — SigLIP and CLAP, resolved lazily on the first ai search (model load is
     // seconds; a startup resolve would slow every launch). No spaces means no model → the route
     // answers `ai_unavailable` instead of degrading.
-    state.set_query_embedder(Box::new(lodestash_engine::drains::query_spaces));
+    state.set_query_embedder(Box::new(lodestash_engine::appraise::query_spaces));
     let token = state.token().to_string();
     Ok((state, token))
 }

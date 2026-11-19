@@ -190,7 +190,7 @@ Two stages, so the embedding does the semantic lift while constraints stay cheap
    genuinely own nothing close.
 
    *As built:* the query is embedded into every installed text space — SigLIP's and CLAP's — by one
-   function (`drains::query_spaces`) that the grid and both agent planes call. Until v1 plan S11 both
+   function (`appraise::query_spaces`) that the grid and both agent planes call. Until v1 plan S11 both
    surfaces embedded it in SigLIP's space only, so audio could be found by name and never by
    description.
 

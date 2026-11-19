@@ -33,11 +33,11 @@ use lodestash_ingest::unitypackage::{
     extract_at_offsets_with_progress, read_manifest_with_progress, EntryLocator, ExtractedAsset,
 };
 
-use crate::config_store::ConfigStore;
-use crate::drains::{
+use crate::appraise::{
     drain_audio_tags, drain_previews, drain_promote_resync, drain_tags, resolve_audio_embedder,
     resolve_embedder,
 };
+use crate::config_store::ConfigStore;
 use crate::engine::EngineStatus;
 use crate::jobs::JobProgress as AppJobProgress;
 use crate::types::PersistBatch;
@@ -474,13 +474,13 @@ pub(crate) enum WriterMsg {
     /// (a `POST /v1/stage` went from 25 ms to ~18 s the moment an embedder actually loaded).
     EmbeddingsDone {
         model_id: String,
-        done: Vec<crate::drains::ComputedEmbedding>,
+        done: Vec<crate::appraise::ComputedEmbedding>,
     },
     /// A background tag worker finished a slice — same split, same reason: a caption is a whole
     /// VLM inference (~13 s here) and the writer only persists the result.
     TagsDone {
-        producers: crate::drains::TagProducers,
-        done: Vec<crate::drains::ComputedTags>,
+        producers: crate::appraise::TagProducers,
+        done: Vec<crate::appraise::ComputedTags>,
     },
 }
 
@@ -1558,7 +1558,7 @@ fn writer_main(
                 // the next idle tick.
                 let before = Stamp::of(&catalog);
                 guarded("embeddings store", || {
-                    crate::drains::store_visual_embeddings(&mut catalog, &model_id, &done)
+                    crate::appraise::store_visual_embeddings(&mut catalog, &model_id, &done)
                 });
                 embed_inflight.store(false, Ordering::Relaxed);
                 // By what was written, not by the count returned: a store that panicked after
@@ -1568,7 +1568,7 @@ fn writer_main(
             Ok(WriterMsg::TagsDone { producers, done }) => {
                 let before = Stamp::of(&catalog);
                 let n = guarded("tags store", || {
-                    crate::drains::store_tags(&mut catalog, &producers, &done)
+                    crate::appraise::store_tags(&mut catalog, &producers, &done)
                 })
                 .unwrap_or(0);
                 tag_inflight.store(false, Ordering::Relaxed);
@@ -1668,7 +1668,7 @@ fn writer_main(
                             if !embed_inflight.load(Ordering::Relaxed) {
                                 const SLICE: usize = 8;
                                 let (jobs, albedo) =
-                                    crate::drains::visual_embed_batch(&catalog, SLICE);
+                                    crate::appraise::visual_embed_batch(&catalog, SLICE);
                                 if !jobs.is_empty() {
                                     // Raised here and lowered by whoever ends the slice: the
                                     // writer when `EmbeddingsDone` lands, or the guard itself when
@@ -1677,7 +1677,7 @@ fn writer_main(
                                     let (ws, cd) =
                                         (ctx.workspace_dir.clone(), ctx.cache_dir.clone());
                                     spawn_slice(slice, ctx.tx.clone(), move || {
-                                        let done = crate::drains::compute_visual_embeddings(
+                                        let done = crate::appraise::compute_visual_embeddings(
                                             jobs,
                                             &albedo,
                                             emb.as_ref(),
@@ -1696,7 +1696,7 @@ fn writer_main(
                         // (ADR-0002), which still all land right here.
                         if !tag_inflight.load(Ordering::Relaxed) {
                             const TAG_SLICE: usize = 4;
-                            let jobs = crate::drains::tag_batch(&catalog, TAG_SLICE, None);
+                            let jobs = crate::appraise::tag_batch(&catalog, TAG_SLICE, None);
                             if !jobs.is_empty() {
                                 let slice = Inflight::raise(&tag_inflight);
                                 let (ws, cd) = (ctx.workspace_dir.clone(), ctx.cache_dir.clone());
@@ -1773,7 +1773,7 @@ fn rescan_watched(catalog: &mut Catalog, ctx: &WriterCtx) -> bool {
             continue;
         }
         let root = PathBuf::from(&info.root_path);
-        prefab_scopes.push(crate::drains::PrefabScope {
+        prefab_scopes.push(crate::appraise::PrefabScope {
             root: root.clone(),
             absent_is_empty: false,
         });
@@ -1793,7 +1793,7 @@ fn rescan_watched(catalog: &mut Catalog, ctx: &WriterCtx) -> bool {
     }
     // A prefab is not an asset, so the crawl above never sees one change — yet the watch fired.
     // Re-read the watched trees' prefab evidence; only files whose revision moved are parsed.
-    if crate::drains::refresh_prefab_evidence(catalog, &prefab_scopes, false) > 0 {
+    if crate::appraise::refresh_prefab_evidence(catalog, &prefab_scopes, false) > 0 {
         changed = true;
     }
     changed
@@ -1855,11 +1855,11 @@ fn tag_worker_slice(
     };
     // Resolved here, on the read connection: the compute phase below runs off the writer and has
     // no catalog to ask what a model wears (v1 plan S08).
-    let slots = crate::drains::slot_textures_for(&jobs, |id| {
+    let slots = crate::appraise::slot_textures_for(&jobs, |id| {
         cat.model_slot_texture_paths(id, workspace_dir.as_deref())
             .ok()
     });
-    let done = crate::drains::compute_tags(
+    let done = crate::appraise::compute_tags(
         jobs,
         tagger.as_ref(),
         zero_shot.as_ref(),
@@ -1868,7 +1868,7 @@ fn tag_worker_slice(
         &slots,
     );
     Some(WriterMsg::TagsDone {
-        producers: crate::drains::TagProducers {
+        producers: crate::appraise::TagProducers {
             tagger: (tagger.producer_id(), tagger.model_id().to_string()),
             zero_shot: zero_shot
                 .as_ref()
@@ -1972,7 +1972,7 @@ fn appraise_pass(
             Some(model) => {
                 let api = OpenAiTagger::new(cfg.api_base_url.clone(), cfg.api_key.clone(), model)
                     .with_teaching(teach.clone());
-                crate::drains::drain_api_tags(
+                crate::appraise::drain_api_tags(
                     catalog,
                     &cfg,
                     &api,
@@ -2245,12 +2245,12 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, Re
                 // queued would re-read it: re-read the scanned trees' prefab evidence here.
                 let scopes: Vec<_> = batches
                     .iter()
-                    .map(|b| crate::drains::PrefabScope {
+                    .map(|b| crate::appraise::PrefabScope {
                         root: PathBuf::from(&b.root),
                         absent_is_empty: false,
                     })
                     .collect();
-                crate::drains::refresh_prefab_evidence(catalog, &scopes, false);
+                crate::appraise::refresh_prefab_evidence(catalog, &scopes, false);
                 Ok(WriteResult {
                     changed,
                     ..Default::default()
@@ -3266,9 +3266,9 @@ fn materialize_extract(
     }
     // The extraction landed prefabs beside the assets, and they are evidence about those assets.
     if let Some(ws) = workspace {
-        crate::drains::refresh_prefab_evidence(
+        crate::appraise::refresh_prefab_evidence(
             catalog,
-            &[crate::drains::PrefabScope {
+            &[crate::appraise::PrefabScope {
                 root: ws,
                 absent_is_empty: true,
             }],

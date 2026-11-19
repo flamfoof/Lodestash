@@ -762,7 +762,7 @@ rasterises the SVG anyway; the artifact is native in a webview.
 **Open defects found by review 2026-08-01, not fixed** — all pre-date this session's work, none
 are in the preview/decimation path, and each wants its own card:
 
-- `drains.rs` `resolve_job_path` pulls an in-pack payload **wholly into RAM** with no size check,
+- `appraise/resolve.rs` `resolve_job_path` pulls an in-pack payload **wholly into RAM** with no size check,
   though `read_payload_at`'s own doc says the caller must decide. A 3 GB in-pack asset allocates
   3 GB in the identify drain. `PULL_CAP_HINT` only bounds the capacity hint, not the read.
 - `lodestash-api` `poll_import_queue` never removes entries — only `ack_import` does. A plugin that

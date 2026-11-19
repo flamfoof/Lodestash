@@ -95,7 +95,7 @@ pub trait Tagger {
     /// on that path, and saying so is the difference between "refused" and "silently tagged
     /// nothing": the API tagger was routed through it for weeks, returned an empty result without
     /// making one HTTP request, and the caller wrote that emptiness to the catalog as a finished
-    /// answer. Such a tagger needs the drain built for it (`drains::drain_api_tags`).
+    /// answer. Such a tagger needs the drain built for it (`appraise::drain_api_tags`).
     fn needs_image(&self) -> bool {
         false
     }

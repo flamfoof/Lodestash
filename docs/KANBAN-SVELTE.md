@@ -400,7 +400,7 @@ this file stays the live board.
       tagger never overrode `caption()`. So `try_tag` short-circuited, returned empty, and
       `store_tags` wrote `set_tags(id, "ai", Some(model), &[])`, which clears `tags_dirty`.
       Every reliability mandate in AI-PIPELINE §5.1 was already **implemented** in
-      `drains::drain_api_tags` — `Retry-After` backoff with jitter, cancel-polled sleep, local
+      `appraise::drain_api_tags` — `Retry-After` backoff with jitter, cancel-polled sleep, local
       fallback, the `api_max_per_run` cap — and that function had **zero callers**.
       Three parts to the fix. The kick path routes to `drain_api_tags` when an API model is
       configured (which also makes `api_max_per_run` load-bearing for the first time). That drain
