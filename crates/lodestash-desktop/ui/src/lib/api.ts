@@ -526,20 +526,30 @@ export const extractPackage = (packageId: number) =>
 
 // ── Job tray (B2b) ─────────────────────────────────────────────────────────────────────────
 
+/** One job of the engine's registry — the app's own or an agent's (`origin`). */
 export interface JobSnapshot {
   id: number;
+  /** The same job at `GET /v1/jobs/{job_id}`. */
+  job_id: string;
   label: string;
   kind: string;
-  /** `(done, total)` bytes for extract; `null` = indeterminate (spinner). */
+  origin: "user" | "agent" | "background";
+  state: "queued" | "running" | "awaiting_approval";
+  /** `(done, total)`; `null` = indeterminate (spinner). */
   progress: [number, number] | null;
   cancellable: boolean;
 }
 export interface RecentJob {
   id: number;
+  job_id: string;
   label: string;
   kind: string;
+  origin: "user" | "agent" | "background";
+  state: "done" | "failed" | "cancelled";
   ok: boolean;
   cancelled: boolean;
+  /** Why it failed; `null` unless `state` is `failed`. */
+  error: string | null;
   changed: number;
   at_unix: number;
 }

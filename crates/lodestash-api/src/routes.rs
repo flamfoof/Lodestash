@@ -15,6 +15,8 @@ use lodestash_protocol::{Audience, OpSpec, OPERATIONS};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::jobs::JobWire;
+
 use crate::ServerState;
 
 type Shared = Arc<ServerState>;
@@ -2358,5 +2360,176 @@ mod tests {
             .map(|r| r["value"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(values, vec!["stone"], "only the approved write landed");
+    }
+
+    /// Review R1: a job that failed on the app's own side — the writer's tray — had no id an
+    /// agent could ask about and nowhere to keep its reason. It is one job in one registry now:
+    /// `get_job_status` answers it by id with why it failed, and a job that was asked to stop
+    /// says `cancelled`, not `error`, once its worker has stopped.
+    #[tokio::test]
+    async fn get_job_status_answers_why_a_job_failed_and_that_one_was_cancelled() {
+        use lodestash_engine::jobs::{JobRegistry, Outcome};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        lodestash_core::catalog::Catalog::open(&db).unwrap();
+        let registry = JobRegistry::default();
+        let st = Arc::new(
+            ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None))
+                .unwrap()
+                .with_jobs(registry.clone()),
+        );
+        let token = st.token.clone();
+        let status = |id: String| {
+            let (st, token) = (st.clone(), token.clone());
+            async move {
+                send(
+                    router(st),
+                    get_req(&format!("/v1/jobs/{id}"), Some(&token), None),
+                )
+                .await
+            }
+        };
+
+        // The app's own job, as the writer opens one — and it fails.
+        let (unpack, guard) = registry.open("Extract Rocks".into(), "extract", true);
+        let (s, running) = status(unpack.job.id.clone()).await;
+        assert_eq!(
+            (s, running["state"].as_str()),
+            (StatusCode::OK, Some("running"))
+        );
+        assert!(running["error"].is_null());
+        guard.finish(Outcome::Failed(
+            "the archive is truncated at byte 512".into(),
+        ));
+        let (s, failed) = status(unpack.job.id.clone()).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            failed["state"], "error",
+            "ENGINE-API §3 spells a failure `error`"
+        );
+        assert_eq!(failed["error"], "the archive is truncated at byte 512");
+        assert_eq!(failed["kind"], "extract");
+
+        // A running job is asked to stop over the API; it says so once its worker has stopped.
+        let (scan, guard) = registry.open("Extract Trees".into(), "extract", true);
+        let (s, asked) = send(
+            router(st.clone()),
+            post_req(
+                &format!("/v1/jobs/{}/cancel", scan.job.id),
+                Some(&token),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            (s, asked["state"].as_str()),
+            (StatusCode::OK, Some("running"))
+        );
+        assert!(scan.job.is_cancelled(), "the worker was not told to stop");
+        // The worker notices and reports what it had extracted by then — with an error on the
+        // way out, which is not what the job is remembered for.
+        guard.finish(Outcome::of(
+            Err("interrupted".into()),
+            scan.job.is_cancelled(),
+        ));
+        let (_, cancelled) = status(scan.job.id.clone()).await;
+        assert_eq!(cancelled["state"], "cancelled");
+        assert!(cancelled["error"].is_null(), "a cancel is not a failure");
+
+        // Dropped without an outcome — the work panicked — is a failure that says so.
+        let (lost, guard) = registry.open("Import Lib".into(), "import", false);
+        drop(guard);
+        let (_, abandoned) = status(lost.job.id.clone()).await;
+        assert_eq!(abandoned["state"], "error");
+        assert!(
+            abandoned["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("without reporting")),
+            "{abandoned}"
+        );
+    }
+
+    /// One registry, through the real engine: a job the writer starts is on the API's listing
+    /// and answers `get_job_status`; a job an agent starts through the API is in the shell's tray.
+    #[tokio::test]
+    async fn a_writer_job_is_on_the_api_and_an_api_job_is_in_the_tray() {
+        use lodestash_engine::types::PersistBatch;
+        use lodestash_engine::{Engine, EngineConfig, EngineStatus, Op};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = EngineConfig::under(dir.path());
+        // No background identification and no watch: this test says what runs.
+        cfg.open_config()
+            .update(|c| {
+                c.auto_identify = false;
+                c.watch_sources = false;
+            })
+            .unwrap();
+        let engine = Engine::start(cfg.clone());
+        assert_eq!(
+            engine.wait_settled(std::time::Duration::from_secs(5)),
+            EngineStatus::Ready
+        );
+        let st = Arc::new(
+            ServerState::new(&cfg.catalog, cfg.workspace_dir.clone(), Box::new(|_| None))
+                .unwrap()
+                .with_jobs(engine.jobs().clone()),
+        );
+        let token = st.token.clone();
+
+        // Through the writer: a scan opens an `import` job.
+        engine
+            .writer()
+            .run(Op::PersistScan {
+                batches: vec![PersistBatch {
+                    root: dir.path().join("lib").to_string_lossy().into_owned(),
+                    name: "lib".into(),
+                    excludes_json: None,
+                    records: Vec::new(),
+                }],
+                packs: Vec::new(),
+            })
+            .unwrap();
+        let listed = st.jobs.list();
+        let scan = listed
+            .iter()
+            .find(|j| j.kind == "import")
+            .expect("the writer's job is not on the API's listing");
+        let (s, body) = send(
+            router(st.clone()),
+            get_req(&format!("/v1/jobs/{}", scan.id), Some(&token), None),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            (body["state"].as_str(), body["summary"].as_str()),
+            (Some("done"), Some("Import lib"))
+        );
+
+        // Through the API: an export parks on the approval gate — and is in the tray.
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        let (s, parked) = send(
+            router(st.clone()),
+            post_req(
+                "/v1/export",
+                Some(&token),
+                json!({"asset_ids": [1], "dest_path": dest.to_string_lossy()}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{parked}");
+        let job_id = parked["job_id"].as_str().unwrap();
+        let tray = engine.jobs().snapshot();
+        let row = tray
+            .active
+            .iter()
+            .find(|j| j.job_id == job_id)
+            .expect("the agent's job is not in the tray");
+        assert_eq!(
+            (row.kind.as_str(), row.state, row.origin),
+            ("export", "awaiting_approval", "agent")
+        );
     }
 }

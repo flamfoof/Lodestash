@@ -16,9 +16,9 @@ use lodestash_core::catalog::{AppraiseFocus, Catalog};
 use crate::appraise::Models;
 use crate::changes::{ChangedEvent, PUBLISH_WINDOW};
 use crate::config_store::ConfigStore;
-use crate::jobs::JobProgress;
+use crate::jobs::{JobProgress, JobRegistry};
 use crate::read_model::Library;
-use crate::writer::{JobRegistry, WriterHandle, WriterSetup};
+use crate::writer::{WriterHandle, WriterSetup};
 
 /// Every path one engine uses. The engine reads no process-wide location itself: the desktop
 /// passes the OS defaults ([`Self::os_default`]), a test passes a temp dir ([`Self::under`]).
@@ -517,7 +517,7 @@ impl Engine {
         self.inner.jobs.changes().catalog_generation()
     }
 
-    /// The job tray (B2b).
+    /// The one job registry (v2 spec §4.1): the tray reads it, and so does the HTTP API.
     pub fn jobs(&self) -> &JobRegistry {
         &self.inner.jobs
     }

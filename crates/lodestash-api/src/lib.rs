@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+use jobs::JobWire;
+
 use lodestash_core::catalog::{
     AssetSummaryRow, Catalog, CatalogReader, ImportSpec, PackageListing, ProjectRow,
 };
@@ -571,6 +573,15 @@ impl ServerState {
             heavy_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             heavy_deadline: Mutex::new(discovery::HEAVY_DEADLINE),
         })
+    }
+
+    /// Read and write the engine's job registry instead of one of this state's own, so the
+    /// shell's tray and the agent planes see one set of jobs (v2 spec §4.1). The app does this as
+    /// it builds the state; a state built without it — a test, a headless server — keeps a
+    /// registry to itself.
+    pub fn with_jobs(mut self, registry: lodestash_engine::jobs::JobRegistry) -> Self {
+        self.jobs = jobs::Jobs::over(registry);
+        self
     }
 
     pub fn token(&self) -> &str {

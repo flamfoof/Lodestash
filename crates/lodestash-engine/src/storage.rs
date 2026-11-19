@@ -218,7 +218,7 @@ pub fn reclaim_workspace(engine: &crate::Engine) -> Result<ReclaimOutcome, Strin
 pub(crate) fn reclaim_on_writer(
     catalog: &lodestash_core::catalog::Catalog,
     workspace: Option<&Path>,
-    jobs: &crate::writer::JobRegistry,
+    jobs: &crate::jobs::JobRegistry,
 ) -> Result<ReclaimOutcome, String> {
     let workspace = workspace
         .filter(|w| !w.as_os_str().is_empty())

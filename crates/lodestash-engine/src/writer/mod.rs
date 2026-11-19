@@ -16,7 +16,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 
@@ -31,7 +31,7 @@ use lodestash_ingest::unitypackage::{
 use crate::appraise::{AppraisePlan, Models, Scope, Stage};
 use crate::config_store::ConfigStore;
 use crate::engine::EngineStatus;
-use crate::jobs::JobProgress as AppJobProgress;
+use crate::jobs::{JobGuard, JobProgress, JobRegistry, Outcome};
 use crate::types::PersistBatch;
 
 mod identify;
@@ -624,83 +624,12 @@ fn backfill_package_pipelines(catalog: &Catalog) -> usize {
     written
 }
 
-// ── Job tray (B2b) ─────────────────────────────────────────────────────────────────────────
-
-/// Shared tray state: active jobs (progress + cooperative cancel) and a session ring of
-/// finished ones. The writer thread owns the mutations; commands read snapshots.
-#[derive(Clone, Default)]
-pub struct JobRegistry {
-    inner: std::sync::Arc<std::sync::Mutex<JobState>>,
-    /// Marked on every start and finish, and by workers as their progress moves — the tray is
-    /// one of the two domains the shell is told about.
-    changes: Changes,
-}
-
-#[derive(Default)]
-struct JobState {
-    next_id: u64,
-    active: Vec<ActiveJob>,
-    recent: VecDeque<RecentJob>,
-}
-
-/// Extract byte progress, read by the tray without taking the registry lock.
-#[derive(Default)]
-pub struct JobProgress {
-    pub done: AtomicU64,
-    pub total: AtomicU64,
-}
-
-struct ActiveJob {
-    id: u64,
-    label: String,
-    kind: String,
-    cancel: Arc<AtomicBool>,
-    progress: Option<Arc<JobProgress>>,
-}
-
-/// Handles a caller holds after `start`, without touching the registry lock again.
-pub struct JobHandles {
-    pub id: u64,
-    pub cancel: Arc<AtomicBool>,
-    pub progress: Option<Arc<JobProgress>>,
-}
-
-/// Ends a tray job when dropped — as **failed**, unless [`JobGuard::finish`] reported how it
-/// really ended (review finding 11).
-///
-/// A job used to be opened and closed by two separate calls with the work between them, so a
-/// panic in that work — caught by the writer's supervision, which is the point of supervising —
-/// left the job spinning in the tray for the rest of the session, and one of kind `extract`
-/// blocked every later extraction. Open jobs through [`JobRegistry::open`] and the end is owned.
-pub struct JobGuard {
-    jobs: JobRegistry,
-    id: u64,
-    open: bool,
-}
-
-impl JobGuard {
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-
-    /// Report how the job ended.
-    pub fn finish(mut self, ok: bool, cancelled: bool, changed: usize) {
-        self.open = false;
-        self.jobs.finish(self.id, ok, cancelled, changed);
-    }
-
-    /// Someone else ends this job now: the writer, once a worker's report has reached it.
-    fn hand_over(mut self) {
-        self.open = false;
-    }
-}
-
-impl Drop for JobGuard {
-    fn drop(&mut self) {
-        if self.open {
-            self.jobs.finish(self.id, false, false, 0);
-        }
-    }
+/// How a tray job ended, from what its work returned and the count the tray reports for it.
+fn ended(result: &Result<WriteResult, String>, changed: usize, cancelled: bool) -> Outcome {
+    Outcome::of(
+        result.as_ref().map(|_| changed).map_err(Clone::clone),
+        cancelled,
+    )
 }
 
 /// Holds an in-flight flag up for one off-writer slice and lowers it when dropped (review
@@ -829,154 +758,6 @@ impl Drop for PackReport {
         // which must not block on its own full inbox. Unsent, `job` drops and ends itself.
         if self.tx.try_send(msg).is_ok() {
             job.hand_over();
-        }
-    }
-}
-
-#[derive(Clone, serde::Serialize)]
-pub struct JobSnapshot {
-    pub id: u64,
-    pub label: String,
-    pub kind: String,
-    /// `(done, total)` bytes for extract; `None` = indeterminate (spinner).
-    pub progress: Option<(u64, u64)>,
-    pub cancellable: bool,
-}
-
-#[derive(Clone, serde::Serialize)]
-pub struct RecentJob {
-    pub id: u64,
-    pub label: String,
-    pub kind: String,
-    pub ok: bool,
-    pub cancelled: bool,
-    pub changed: usize,
-    pub at_unix: i64,
-}
-
-#[derive(Default, serde::Serialize)]
-pub struct JobsView {
-    pub active: Vec<JobSnapshot>,
-    pub recent: Vec<RecentJob>,
-}
-
-const RECENT_CAP: usize = 20;
-
-impl JobRegistry {
-    /// Register an active job; returns the handles the worker uses for progress/cancel.
-    /// Public: model downloads (which never touch the catalog) register through this.
-    pub fn start(&self, label: String, kind: &str, cancellable: bool) -> JobHandles {
-        let mut state = self.inner.lock().expect("job registry lock");
-        let id = state.next_id;
-        state.next_id += 1;
-        let cancel = Arc::new(AtomicBool::new(false));
-        let progress = cancellable.then(|| Arc::new(JobProgress::default()));
-        state.active.push(ActiveJob {
-            id,
-            label,
-            kind: kind.to_string(),
-            cancel: cancel.clone(),
-            progress: progress.clone(),
-        });
-        drop(state);
-        self.changes.jobs();
-        JobHandles {
-            id,
-            cancel,
-            progress,
-        }
-    }
-
-    /// [`Self::start`], with the job's end owned: the guard finishes it as failed if it is
-    /// dropped without [`JobGuard::finish`] — on a panic, an early return, a thread that never
-    /// ran. Prefer this to `start` + `finish` wherever work happens between the two.
-    pub fn open(&self, label: String, kind: &str, cancellable: bool) -> (JobHandles, JobGuard) {
-        let handles = self.start(label, kind, cancellable);
-        let guard = JobGuard {
-            jobs: self.clone(),
-            id: handles.id,
-            open: true,
-        };
-        (handles, guard)
-    }
-
-    /// Move an active job to the session ring. `changed` is what the tray reports. Public for
-    /// the same reason as `start`.
-    pub fn finish(&self, id: u64, ok: bool, cancelled: bool, changed: usize) {
-        let mut state = self.inner.lock().expect("job registry lock");
-        let Some(pos) = state.active.iter().position(|j| j.id == id) else {
-            return;
-        };
-        let job = state.active.remove(pos);
-        state.recent.push_front(RecentJob {
-            id: job.id,
-            label: job.label,
-            kind: job.kind,
-            ok,
-            cancelled,
-            changed,
-            at_unix: unix_now(),
-        });
-        state.recent.truncate(RECENT_CAP);
-        drop(state);
-        self.changes.jobs();
-    }
-
-    /// Is a pack being analysed or extracted right now? The one-at-a-time queue gates on it, and
-    /// the workspace reclaim refuses under it.
-    pub(crate) fn has_active_extract(&self) -> bool {
-        self.inner
-            .lock()
-            .expect("job registry lock")
-            .active
-            .iter()
-            .any(|j| j.kind == "extract")
-    }
-
-    /// The process's change publication, which this registry marks whenever the tray changes.
-    pub fn changes(&self) -> &Changes {
-        &self.changes
-    }
-
-    /// A running job's progress moved. Coalesced by the publisher, so a worker can call this per
-    /// chunk read without flooding the shell.
-    pub fn progressed(&self) {
-        self.changes.jobs();
-    }
-
-    /// Request cancellation. The extract worker checks the flag between reads; everything
-    /// else finishes on its own and ignores it.
-    pub fn cancel(&self, id: u64) -> bool {
-        let state = self.inner.lock().expect("job registry lock");
-        match state.active.iter().find(|j| j.id == id) {
-            Some(j) => {
-                j.cancel.store(true, Ordering::Relaxed);
-                true
-            }
-            None => false,
-        }
-    }
-
-    pub fn snapshot(&self) -> JobsView {
-        let state = self.inner.lock().expect("job registry lock");
-        JobsView {
-            active: state
-                .active
-                .iter()
-                .map(|j| JobSnapshot {
-                    id: j.id,
-                    label: j.label.clone(),
-                    kind: j.kind.clone(),
-                    progress: j.progress.as_ref().map(|p| {
-                        (
-                            p.done.load(Ordering::Relaxed),
-                            p.total.load(Ordering::Relaxed),
-                        )
-                    }),
-                    cancellable: j.progress.is_some(),
-                })
-                .collect(),
-            recent: state.recent.iter().cloned().collect(),
         }
     }
 }
@@ -1151,7 +932,7 @@ pub(crate) struct WriterSetup {
     pub models: Models,
     /// Raised while an appraise pass runs (B11d).
     pub pump: Arc<AtomicBool>,
-    pub appraise: Arc<AppJobProgress>,
+    pub appraise: Arc<JobProgress>,
     /// Where the user is looking (UI-SPEC §3). Shared rather than sent as an op: it changes on
     /// every scroll, and a browse must never queue behind a running appraise pass.
     pub focus: Arc<Mutex<AppraiseFocus>>,
@@ -1163,7 +944,7 @@ pub(crate) struct WriterCtx {
     tx: SyncSender<WriterMsg>,
     jobs: JobRegistry,
     models: Models,
-    appraise: Arc<AppJobProgress>,
+    appraise: Arc<JobProgress>,
     focus: Arc<Mutex<AppraiseFocus>>,
     cache_dir: Option<PathBuf>,
     workspace_dir: Option<PathBuf>,
@@ -1251,13 +1032,6 @@ impl Inbox {
         }
         self.held.is_some()
     }
-}
-
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// Spawn the writer over `setup.db_path`. The connection is opened **on the thread that owns it**,
@@ -1528,9 +1302,8 @@ fn writer_main(
                     materialize_extract(&mut catalog, &ctx, package_id, outcome, cancelled)
                 })
                 .unwrap_or_else(|| Err("materializing the pack's files panicked".into()));
-                let ok = result.is_ok();
                 let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
-                jobs.finish(job_id, ok, cancelled, changed);
+                jobs.finish(job_id, ended(&result, changed, cancelled));
                 start_next_extract(&mut catalog, &mut extract_queue, &ctx);
                 // Background: the unpack was asked for minutes ago, and its outcome is in the
                 // tray — not a reason to re-read the page under the user.
@@ -1616,9 +1389,8 @@ fn writer_main(
                     })
                 })
                 .unwrap_or_else(|| Err("recording the pack's manifest panicked".into()));
-                let ok = result.is_ok();
                 let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
-                jobs.finish(job_id, ok, cancelled, changed);
+                jobs.finish(job_id, ended(&result, changed, cancelled));
                 if !spawned {
                     start_next_extract(&mut catalog, &mut extract_queue, &ctx);
                 }
@@ -1763,8 +1535,10 @@ fn drain_to_first_spawn(
             Ok(()) => return failures, // a worker is running; its report drains the rest
             Err(e) => {
                 failures += 1;
+                // The reason is the job's error; it stays in the label too, which is all the
+                // old tray draws.
                 let h = jobs.start(format!("Extract failed — {e}"), "extract-failed", false);
-                jobs.finish(h.id, false, false, 0);
+                h.job.fail(e);
             }
         }
     }
@@ -1944,7 +1718,7 @@ fn run(
                     ..Default::default()
                 })
             })();
-            job.finish(result.is_ok(), false, changed);
+            job.finish(ended(&result, changed, false));
             result
         }
 
@@ -1993,7 +1767,7 @@ fn run(
                 })
             })();
             let inserted = result.as_ref().map(|r| r.changed).unwrap_or(0);
-            job.finish(result.is_ok(), false, inserted);
+            job.finish(ended(&result, inserted, false));
             result
         }
 
@@ -2180,7 +1954,7 @@ fn run(
             let (_, job) = jobs.open("Identify all".into(), "appraise", false);
             let result = identify::kick(catalog, ctx, &AppraisePlan::kick(Scope::All, origin));
             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
-            job.finish(result.is_ok(), false, changed);
+            job.finish(ended(&result, changed, false));
             result
         }
 
@@ -2193,7 +1967,7 @@ fn run(
             let (_, job) = jobs.open(format!("Identify asset {asset_id}"), "appraise", false);
             let result = identify::kick(catalog, ctx, &AppraisePlan::kick(Scope::All, origin));
             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
-            job.finish(result.is_ok(), false, changed);
+            job.finish(ended(&result, changed, false));
             result
         }
 
@@ -2212,7 +1986,7 @@ fn run(
             let plan = AppraisePlan::kick(Scope::Assets(asset_ids), origin);
             let result = identify::kick(catalog, ctx, &plan);
             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
-            job.finish(result.is_ok(), false, changed);
+            job.finish(ended(&result, changed, false));
             result
         }
 
@@ -2308,8 +2082,8 @@ fn run(
                 // Moved into the worker: it reports back when the work is done, and by itself —
                 // as a failure — if the worker unwinds or the thread below never starts.
                 let report_back = PackReport::new(&ctx.tx, job, package_id, true);
-                let wcancel = handles.cancel;
                 let wprogress = handles.progress.expect("manifest jobs carry progress");
+                let wcancel = wprogress.clone();
                 let wpath = PathBuf::from(&pkg.package_path);
                 let wjobs = jobs.clone();
                 let spawned = std::thread::Builder::new()
@@ -2324,7 +2098,7 @@ fn run(
                                     wprogress.done.store(done, Ordering::Relaxed);
                                     wprogress.total.store(total, Ordering::Relaxed);
                                     wjobs.progressed();
-                                    !report_cancel.load(Ordering::Relaxed)
+                                    !report_cancel.is_cancelled()
                                 };
                                 let read = read_manifest_with_progress(&wpath, &report)
                                     .map_err(|e| e.to_string())
@@ -2338,7 +2112,7 @@ fn run(
                                             })
                                             .collect::<Vec<_>>()
                                     });
-                                let cancelled = wcancel.load(Ordering::Relaxed);
+                                let cancelled = wcancel.is_cancelled();
                                 // `read_manifest_with_progress` reports a cancel as an **error**, not as a
                                 // partial `Ok` (`read_manifest_with_progress_reports_and_cancels` asserts
                                 // exactly that) — so a `!cancelled` guard on the empty case alone was dead
@@ -2572,7 +2346,7 @@ fn run(
                 ProbeEnd::Panic => panic!("a command panicked on purpose"),
             };
             if let Some(job) = job {
-                job.finish(result.is_ok(), false, changed);
+                job.finish(ended(&result, changed, false));
             }
             result
         }
@@ -2820,8 +2594,8 @@ fn spawn_extract_worker(
     // Moved into the worker: it reports back when the work is done, and by itself — as a
     // failure — if the worker unwinds or the thread below never starts.
     let report_back = PackReport::new(tx, job, pkg.id, false);
-    let wcancel = handles.cancel;
     let wprogress = handles.progress.expect("extract jobs carry progress");
+    let wcancel = wprogress.clone();
     let wpath = PathBuf::from(&pkg.package_path);
     let wworkspace = workspace_dir.to_path_buf();
     let wjobs = jobs.clone();
@@ -2839,11 +2613,11 @@ fn spawn_extract_worker(
                     wprogress.done.store(done, Ordering::Relaxed);
                     wprogress.total.store(total, Ordering::Relaxed);
                     wjobs.progressed();
-                    !report_cancel.load(Ordering::Relaxed)
+                    !report_cancel.is_cancelled()
                 };
                 let placed = extract_at_offsets_with_progress(&wpath, &wworkspace, wanted, &report)
                     .map_err(|e| e.to_string());
-                let cancelled = wcancel.load(Ordering::Relaxed);
+                let cancelled = wcancel.is_cancelled();
                 // "Extracted nothing" is a failure — unless the user cancelled before the first
                 // payload landed, which is a cancel, not a fault, and must not surface as an error
                 // toast for pressing Cancel.
@@ -3809,7 +3583,7 @@ mod tests {
             "start is a jobs change: {started:?}"
         );
         jobs.progressed();
-        jobs.finish(h.id, true, false, 3);
+        jobs.finish(h.id, Outcome::Done { changed: 3 });
         let finished = jobs.changes().take_pending();
         assert!(finished.jobs && !finished.catalog, "{finished:?}");
         assert_eq!(
@@ -3849,7 +3623,7 @@ mod tests {
 
         // Reported, it ends as reported — and only once.
         let (_, job) = jobs.open("Import".into(), "import", false);
-        job.finish(true, false, 7);
+        job.finish(Outcome::Done { changed: 7 });
         let tray = jobs.snapshot();
         assert_eq!(tray.recent.len(), 2);
         assert!(tray.recent[0].ok && tray.recent[0].changed == 7);

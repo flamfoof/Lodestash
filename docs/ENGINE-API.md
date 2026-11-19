@@ -226,11 +226,19 @@ than redefining, so summaries/details never diverge.
   "license": "Unity Asset Store EULA", "license_url": "https://unity.com/legal/as-terms",
   "attribution": "AcmeArt", "pipeline": "urp" }   // pipeline: built_in|urp|hdrp|mixed|null
 
-// Job — get_job_status (job engine; see ARCHITECTURE.md §3.1)
+// Job — get_job_status (the engine's one job registry; see ARCHITECTURE.md §5)
 { "job_id": "imp_9f…", "kind": "import", "state": "running",   // queued|running|done|error|cancelled
-  "progress": 0.66, "result": null, "error": null,
+  "summary": "3 assets → MyGame", "progress": 0.66, "result": null,
+  "error": null,                    // why it failed — a string exactly when state is "error"
   "detail": null }                  // what an approval shows beyond the summary (write_tags: the diff)
 ```
+
+`get_job_status` answers **any job of the app's session** by its id — an agent's own, and the
+app's own (a scan is `import`, an unpack `extract`, an appraisal kick `appraise`, a model download
+`download`): they are one registry (v2 plan Task 2.5). A job that failed says why in `error`; a
+job that was asked to stop and did says `cancelled`, with no `error`. `cancel_job` flips a job
+that has not started straight to `cancelled`; a running one is asked, and flips when its worker
+has stopped — a job whose work cannot be interrupted finishes as `done`.
 
 `media_type`, `status`, and `content_kind` use the exact enums in [`DATA-MODEL.md`](DATA-MODEL.md) §2.
 

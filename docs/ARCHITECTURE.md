@@ -274,8 +274,13 @@ surfaces as an error rather than a silently stale answer.
   connection — a scan's persist runs on the writer's own since v2 plan Task 2.5, and a test reads
   the source for another `Catalog::open` — but a commit from outside the writer during a turn still
   counts, by SQLite's `data_version`.
-- **Job engine** with bounded queues and progress events; the UI shows placeholders and swaps in
-  results as jobs finish (what makes a 10k-grid feel instant).
+- **One job registry** (v2 spec §4.1; `crates/lodestash-engine/src/jobs.rs`). Every long-running
+  piece of work — a scan, an unpack, an appraisal kick, a model download, an agent's export
+  waiting for approval — is one job in the engine's `JobRegistry`: a public id, a kind, who asked,
+  progress, a state (`queued | running | awaiting_approval | done | failed | cancelled`) and, when
+  it failed, why. The shell's tray and the HTTP API's `get_job_status` are two views of it, so
+  each sees the other's jobs. A job is opened through a guard that ends it as failed if its work
+  unwinds. In memory by design: a crash loses the queue, never the catalog.
 - **GPU work** (live viewport + offscreen thumbnail render-to-texture + image texture upload) shares
   one wgpu device; thumbnail renders run on worker tasks into an on-disk cache keyed by
   `content_hash + params`.

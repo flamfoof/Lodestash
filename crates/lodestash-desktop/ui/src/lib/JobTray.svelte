@@ -130,11 +130,11 @@
               class="outcome"
               class:bad={!r.ok}
               aria-hidden="true"
-              title={r.cancelled ? "Cancelled" : r.ok ? "Done" : "Failed"}
+              title={r.cancelled ? "Cancelled" : r.ok ? "Done" : (r.error ?? "Failed")}
             >
               {r.cancelled ? "⊘" : r.ok ? "✓" : "✕"}
             </span>
-            <span class="label">{r.label}</span>
+            <span class="label" title={r.error ?? undefined}>{r.label}</span>
             {#if r.changed > 0}
               <span class="num">{r.changed.toLocaleString()}</span>
             {/if}

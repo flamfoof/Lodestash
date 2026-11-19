@@ -109,6 +109,18 @@ to top-level `web/`: it is a client of `/v1`, not a Tauri frontend.
   (hash + mtime) still matches what the lane read (fixes B7).
 - **One job registry** (replaces three): id, kind, origin, progress, state
   (`queued|running|awaiting_approval|done|failed|cancelled`), error text on failure.
+  - *As built (2026-11-19, plan Task 2.5):* `crates/lodestash-engine/src/jobs.rs` —
+    `JobRegistry`, `Job`, `JobState`, `Outcome`, and the R.2 guard (`JobGuard`), which now ends
+    an abandoned job as failed *with a reason*. A job has a public id (`<kind>_<uuid>`, what
+    `/v1/jobs/{id}` takes) and a number (the tray's). The tray (`JobRegistry::snapshot`) and
+    `lodestash-api`'s `Jobs` are views over it; the app hands its registry to the API state
+    (`ServerState::with_jobs`). The wire keeps `error` for `failed` (`/v1` only grows). The
+    registry keeps every job of the session; the tray shows the unfinished ones and the last 20.
+    **Still two records for one piece of work:** `identify_asset` and `unpack_package` open an
+    agent job, and the writer command they send opens its own (`appraise`, `extract`) — and the
+    `unpack` job is `done` when the unpack is *accepted*; the outcome is the `extract` job's.
+    Making the writer adopt the caller's job needs the command to carry it, which belongs with
+    Task 3.1 (the agent plane's domain half moving into the engine).
 - **Change bus:** the existing mark-then-publish design (ADR-0016) moves here unchanged in
   behaviour: catalog and job generations, origins, at most one publication per 250 ms. It feeds
   `/v1/events` and the read model.
