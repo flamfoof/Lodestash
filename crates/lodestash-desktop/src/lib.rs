@@ -1408,7 +1408,7 @@ fn engine_import(
             job,
             pipeline_mismatch,
         }) => Ok(EngineImportOutcome::AwaitingApproval {
-            job: job.to_json(),
+            job: lodestash_api::jobs::JobWire::to_json(job.as_ref()),
             pipeline_mismatch,
         }),
         Ok(lodestash_api::ImportKickoff::AllAlreadyImported {
@@ -1494,7 +1494,9 @@ fn engine_approvals(state: tauri::State<'_, AppState>) -> Vec<serde_json::Value>
         return Vec::new();
     };
     let jobs = engine.jobs.awaiting_approval();
-    jobs.iter().map(|j| j.to_json()).collect()
+    jobs.iter()
+        .map(|j| lodestash_api::jobs::JobWire::to_json(j.as_ref()))
+        .collect()
 }
 
 /// One row of the Settings MODELS section — installed vs not, per model.
@@ -1539,57 +1541,31 @@ fn models_status() -> Vec<ModelStatus> {
 /// needs an app restart before search actually uses it (noted in the UI).
 #[tauri::command]
 fn model_download(state: tauri::State<'_, AppState>, model: String) -> bool {
-    use std::sync::atomic::Ordering;
     // The job's end is owned by `job`: moved into the download thread, it finishes the job as
     // failed if that thread panics instead of leaving it spinning in the tray.
     let (handles, job) = state
         .engine
         .jobs()
         .open(format!("Download {model}"), "download", true);
-    // The tray renders the writer's own progress atomics; the downloader writes the app's.
-    // A pump copies one into the other while the download runs.
-    let app_progress: std::sync::Arc<lodestash_engine::jobs::JobProgress> =
-        std::sync::Arc::new(lodestash_engine::jobs::JobProgress::default());
-    let writer_progress = handles.progress.clone();
-    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    {
-        let done = done.clone();
-        let writer_progress = writer_progress.clone();
-        let app_progress = app_progress.clone();
-        std::thread::spawn(move || {
-            while !done.load(Ordering::Relaxed) {
-                if let Some(w) = &writer_progress {
-                    w.done
-                        .store(app_progress.done.load(Ordering::Relaxed), Ordering::Relaxed);
-                    w.total.store(
-                        app_progress.total.load(Ordering::Relaxed),
-                        Ordering::Relaxed,
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-        });
-    }
+    // The downloader writes the job's own counters and polls its cancel flag — the tray's ✕
+    // reaches it. (It used to write a second set, copied across by a pump thread that carried
+    // progress one way and the cancel neither.)
+    let progress = handles.job.progress_handle().clone();
     std::thread::spawn(move || {
-        // Stops the progress pump above however this thread ends — it used to be told only on
-        // the way out, so a panicking download left it copying counters for the session.
-        struct Stop(std::sync::Arc<std::sync::atomic::AtomicBool>);
-        impl Drop for Stop {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::Relaxed);
-            }
-        }
-        let _stop = Stop(done);
         let result = match model.as_str() {
-            "siglip" => lodestash_engine::models::download_siglip(app_progress.clone()),
-            "clap" => lodestash_engine::models::download_clap(app_progress.clone()),
-            "ort" => lodestash_engine::models::download_ort(app_progress.clone()),
+            "siglip" => lodestash_engine::models::download_siglip(progress),
+            "clap" => lodestash_engine::models::download_clap(progress),
+            "ort" => lodestash_engine::models::download_ort(progress),
             other => Err(format!("unknown model {other:?}")),
         };
         if let Err(e) = &result {
             tracing::error!(%e, "model download failed");
         }
-        job.finish(result.is_ok(), false, 0);
+        let cancelled = job.job().is_cancelled();
+        job.finish(lodestash_engine::jobs::Outcome::of(
+            result.map(|()| 0),
+            cancelled,
+        ));
     });
     true
 }
@@ -1617,9 +1593,10 @@ fn extract_package(
     state.write(Op::ExtractPackage { package_id })
 }
 
-/// The job tray (B2b): active jobs (progress, cancellable) + the session ring of finished ones.
+/// The job tray (B2b): every job that has not finished + the session ring of finished ones —
+/// the app's own and the agents', from the engine's one registry.
 #[tauri::command]
-fn jobs(state: tauri::State<'_, AppState>) -> lodestash_engine::writer::JobsView {
+fn jobs(state: tauri::State<'_, AppState>) -> lodestash_engine::jobs::JobsView {
     state.engine.jobs().snapshot()
 }
 
@@ -2035,7 +2012,9 @@ fn build_engine_state(
         paths.workspace_dir.clone(),
         engine_preview_fn(cache_root, config.clone()),
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())?
+    // One set of jobs: an agent's job is in the tray, and the app's own answer `get_job_status`.
+    .with_jobs(engine.jobs().clone());
     // In-pack files are served from a verified pull of just their payload (ENGINE-API §8.2, v1 plan
     // S12b) — never an unpack, never a catalog write.
     let cache = paths.cache_dir.clone();
@@ -2061,7 +2040,7 @@ fn build_engine_state(
     // grid's AI mode does — SigLIP and CLAP, resolved lazily on the first ai search (model load is
     // seconds; a startup resolve would slow every launch). No spaces means no model → the route
     // answers `ai_unavailable` instead of degrading.
-    state.set_query_embedder(Box::new(lodestash_engine::drains::query_spaces));
+    state.set_query_embedder(Box::new(lodestash_engine::appraise::query_spaces));
     let token = state.token().to_string();
     Ok((state, token))
 }

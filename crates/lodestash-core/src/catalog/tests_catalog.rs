@@ -111,96 +111,264 @@ fn a_reader_cannot_write_and_never_migrates() {
     );
 }
 
-/// Every queue an appraise pass drains must respect the set the caller named.
+/// Every queue an appraise pass drains must respect the scope the caller named.
 ///
 /// This bug was found four separate times, one queue at a time, and each discovery cost a
 /// measurement: an `identify_asset` kick on 64 images ran **20 minutes** while its own tagging
 /// took 342 ms, because the audio-tag, visual-embed and audio-embed queues all ignored the scope
-/// and happily worked the rest of the library. One test over all four, so a fifth queue added
-/// later has an obvious place to be checked.
+/// and happily worked the rest of the library. One test over every queue and every kind of scope,
+/// so a queue added later has an obvious place to be checked.
+///
+/// It also pins which media each queue hands out: the generic tag queue never holds audio (review
+/// B5), and the preview queue holds models only.
 #[test]
-fn every_appraise_queue_respects_an_explicit_scope() {
+fn every_appraise_queue_respects_its_scope() {
+    let mut c = Catalog::open_in_memory().expect("open");
+    c.seed_media_types().expect("seed");
+    let lib = c
+        .upsert_import_source("Lib", "C:/lib", "folder")
+        .expect("source");
+    let other = c
+        .upsert_import_source("Other", "C:/other", "folder")
+        .expect("source");
+    let pack = c
+        .upsert_package(lib, "C:/lib/P.unitypackage", "P", None, None)
+        .expect("package");
+    // One asset of each kind a queue tells apart: a picture, a clip, a model.
+    const KINDS: [(&str, &str); 3] = [
+        ("a.png", "image"),
+        ("a.wav", "audio"),
+        ("a.fbx", "model_3d"),
+    ];
+    let mut mk = |source: i64, package: Option<i64>| -> [i64; 3] {
+        KINDS.map(|(rel, code)| {
+            c.record_crawl(
+                source,
+                package,
+                &[CrawlRecord {
+                    media_type: code.to_string(),
+                    // Out of a package means extracted to the workspace.
+                    workspace_rel: package.map(|_| format!("p/{rel}")),
+                    ..rec(&format!("{}{rel}", package.map_or("", |_| "p/")), 1, 1)
+                }],
+            )
+            .expect("crawl");
+            c.conn
+                .query_row("SELECT id FROM asset ORDER BY id DESC LIMIT 1", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .expect("id")
+        })
+    };
+    let in_lib = mk(lib, None);
+    let in_other = mk(other, None);
+    let in_pack = mk(lib, Some(pack));
+    c.conn
+        .execute(
+            "UPDATE asset SET tags_dirty = 1, embedding_dirty = 1, metrics_dirty = 1, deps_dirty = 1",
+            [],
+        )
+        .expect("dirty");
+
+    type Queue = fn(&Catalog, &AppraiseScope) -> Vec<VisualEmbedJob>;
+    // Each queue, and which of [picture, clip, model] it hands out.
+    let queues: [(&str, Queue, [bool; 3]); 7] = [
+        (
+            "generic tags",
+            |c, s| c.assets_needing_tags_within(10, s).unwrap(),
+            [true, false, true],
+        ),
+        (
+            "audio tags",
+            |c, s| c.audio_assets_needing_tags_within(10, s).unwrap(),
+            [false, true, false],
+        ),
+        (
+            "visual embeddings",
+            |c, s| c.visual_assets_needing_embedding_within(10, s).unwrap(),
+            [true, false, true],
+        ),
+        (
+            "audio embeddings",
+            |c, s| c.audio_assets_needing_embedding_within(10, s).unwrap(),
+            [false, true, false],
+        ),
+        (
+            "metrics",
+            |c, s| c.assets_needing_metrics_within(10, s).unwrap(),
+            [true, true, true],
+        ),
+        (
+            "dependencies",
+            |c, s| c.assets_needing_dep_scan_within(10, s).unwrap(),
+            [true, true, true],
+        ),
+        (
+            "previews",
+            |c, s| c.assets_needing_preview_within(&[], 10, s).unwrap(),
+            [false, false, true],
+        ),
+    ];
+    for (name, queue, hands_out) in queues {
+        let got = |scope: AppraiseScope| -> Vec<i64> {
+            let mut ids: Vec<i64> = queue(&c, &scope).into_iter().map(|j| j.asset_id).collect();
+            ids.sort();
+            ids
+        };
+        let of = |groups: &[[i64; 3]]| -> Vec<i64> {
+            let mut ids: Vec<i64> = groups
+                .iter()
+                .flat_map(|g| {
+                    g.iter()
+                        .zip(hands_out)
+                        .filter(|(_, on)| *on)
+                        .map(|(id, _)| *id)
+                })
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(
+            got(AppraiseScope::All),
+            of(&[in_lib, in_other, in_pack]),
+            "{name}: the whole library"
+        );
+        assert_eq!(
+            got(AppraiseScope::Assets(in_lib.to_vec())),
+            of(&[in_lib]),
+            "{name}: an explicit set"
+        );
+        assert_eq!(
+            got(AppraiseScope::Source(other)),
+            of(&[in_other]),
+            "{name}: one source"
+        );
+        assert_eq!(
+            got(AppraiseScope::Package(pack)),
+            of(&[in_pack]),
+            "{name}: one package"
+        );
+        assert_eq!(
+            got(AppraiseScope::Assets(Vec::new())),
+            Vec::<i64>::new(),
+            "{name}: an empty set is no assets, never everything"
+        );
+    }
+    assert_eq!(
+        c.count_needing_tags().expect("count"),
+        6,
+        "the count is the generic queue's: the three clips are the audio stage's"
+    );
+}
+
+/// Review B3: a model whose bytes are still inside its package cannot be given a vector preview,
+/// so the preview queue must not hand it out — it did, on every pass, and each pass pulled the
+/// payload out of the archive to skip it. Extracted, the same model queues.
+#[test]
+fn the_preview_queue_leaves_out_a_model_still_inside_its_package() {
     let mut c = Catalog::open_in_memory().expect("open");
     c.seed_media_types().expect("seed");
     let src = c
         .upsert_import_source("Lib", "C:/lib", "folder")
         .expect("source");
-    let mk = |c: &mut Catalog, rel: &str, code: &str| {
-        c.record_crawl(
-            src,
-            None,
-            &[CrawlRecord {
-                media_type: code.to_string(),
-                ..rec(rel, 1, 1)
-            }],
-        )
+    let pack = c
+        .upsert_package(src, "C:/lib/P.unitypackage", "P", None, None)
+        .expect("package");
+    c.record_package_entries(
+        pack,
+        &[PackageEntryRecord {
+            guid: "g1".into(),
+            pathname: Some("Assets/crate.fbx".into()),
+            tar_offset: Some(512),
+            size_bytes: Some(64),
+        }],
+    )
+    .expect("entries");
+    let classes = HashMap::from([(
+        "g1".to_string(),
+        InPackClass {
+            name: "crate".into(),
+            media_type: "model_3d".into(),
+        },
+    )]);
+    c.mint_in_pack_assets(pack, &classes).expect("mint");
+    let queued = |c: &Catalog| c.assets_needing_preview(&[], 10).expect("queue").len();
+    assert_eq!(queued(&c), 0, "an in-pack model was queued for a preview");
+    // The stages that can read it in place still see it.
+    assert_eq!(c.assets_needing_metrics(10).expect("metrics").len(), 1);
+
+    // Extracted: the file has a path of its own now.
+    c.conn
+        .execute("UPDATE asset_file SET workspace_rel = 'ab/crate.fbx'", [])
+        .expect("extract");
+    assert_eq!(queued(&c), 1, "the extracted model must queue");
+}
+
+/// A pass asked about some assets reconciles the status of those assets, and reports as promoted
+/// only those: the list it returns is what the Identify screen shows as "just appraised".
+#[test]
+fn promotion_stays_inside_its_scope() {
+    let mut c = Catalog::open_in_memory().expect("open");
+    c.seed_media_types().expect("seed");
+    let src = c
+        .upsert_import_source("Lib", "C:/lib", "folder")
+        .expect("source");
+    c.record_crawl(src, None, &[rec("x.png", 1, 1), rec("y.png", 2, 2)])
         .expect("crawl");
+    let id_of = |c: &Catalog, name: &str| -> i64 {
         c.conn
-            .query_row("SELECT id FROM asset ORDER BY id DESC LIMIT 1", [], |r| {
-                r.get::<_, i64>(0)
+            .query_row("SELECT id FROM asset WHERE name = ?1", params![name], |r| {
+                r.get(0)
             })
             .expect("id")
     };
-    let img = mk(&mut c, "a.png", "image");
-    let other_img = mk(&mut c, "b.png", "image");
-    let snd = mk(&mut c, "a.wav", "audio");
-    let other_snd = mk(&mut c, "b.wav", "audio");
-    c.conn
-        .execute("UPDATE asset SET tags_dirty = 1, embedding_dirty = 1", [])
-        .expect("dirty");
-
-    let ids = |v: Vec<VisualEmbedJob>| -> Vec<i64> {
-        let mut out: Vec<i64> = v.into_iter().map(|j| j.asset_id).collect();
-        out.sort();
-        out
+    let status_of = |c: &Catalog, id: i64| -> String {
+        c.conn
+            .query_row("SELECT status FROM asset WHERE id = ?1", params![id], |r| {
+                r.get(0)
+            })
+            .expect("status")
     };
-    // Scoped to one asset of each kind: the sibling of the same kind must not appear.
-    assert_eq!(
-        ids(c.assets_needing_tags_within(10, Some(&[img])).unwrap()),
-        vec![img]
-    );
-    assert_eq!(
-        ids(c
-            .audio_assets_needing_tags_within(10, Some(&[snd]))
-            .unwrap()),
-        vec![snd]
-    );
-    assert_eq!(
-        ids(c
-            .visual_assets_needing_embedding_within(10, Some(&[img]))
-            .unwrap()),
-        vec![img]
-    );
-    assert_eq!(
-        ids(c
-            .audio_assets_needing_embedding_within(10, Some(&[snd]))
-            .unwrap()),
-        vec![snd]
-    );
-
-    // Unscoped still sees everything — the scope must not leak into the general pass. The visual
-    // tag queue is deliberately *not* media-filtered (audio falls out later, on `Tagger::supports`),
-    // so it returns all four; the audio queues are filtered by `mt.code`.
-    assert_eq!(
-        ids(c.assets_needing_tags(10).unwrap()),
-        vec![img, other_img, snd, other_snd]
-    );
-    assert_eq!(
-        ids(c.audio_assets_needing_tags(10).unwrap()),
-        vec![snd, other_snd]
-    );
-
-    // And an explicit *empty* set means nothing, never everything.
-    for q in [
-        c.assets_needing_tags_within(10, Some(&[])).unwrap(),
-        c.audio_assets_needing_tags_within(10, Some(&[])).unwrap(),
-        c.visual_assets_needing_embedding_within(10, Some(&[]))
-            .unwrap(),
-        c.audio_assets_needing_embedding_within(10, Some(&[]))
-            .unwrap(),
-    ] {
-        assert!(q.is_empty(), "an empty scope asked for nothing");
+    let (x, y) = (id_of(&c, "x.png"), id_of(&c, "y.png"));
+    // Both are ready to be promoted: measured, embedded, tagged.
+    c.conn
+        .execute("UPDATE asset SET metrics_dirty = 0", [])
+        .expect("measured");
+    for id in [x, y] {
+        c.upsert_embedding(id, "m", "image", None, None, &[0.5, 0.5])
+            .expect("embed");
+        c.set_tags(
+            id,
+            "ai",
+            Some("m"),
+            &[TagAssignment::exact("subject", "rock")],
+        )
+        .expect("tag");
     }
+
+    assert_eq!(
+        c.promote_statuses_within(&AppraiseScope::Assets(vec![x]))
+            .expect("scoped"),
+        vec![x]
+    );
+    assert_eq!(status_of(&c, x), "identified");
+    assert_eq!(
+        status_of(&c, y),
+        "discovered",
+        "a scoped reconcile moved an asset outside its scope"
+    );
+    assert!(c
+        .promote_statuses_within(&AppraiseScope::Assets(Vec::new()))
+        .expect("empty")
+        .is_empty());
+    assert_eq!(
+        status_of(&c, y),
+        "discovered",
+        "an empty scope is no assets"
+    );
+
+    assert_eq!(c.promote_statuses().expect("library-wide"), vec![y]);
+    assert_eq!(status_of(&c, y), "identified");
 }
 
 /// An **Identify** kick must not invalidate a vector it cannot replace.
@@ -4619,7 +4787,7 @@ fn the_tag_queue_can_be_restricted_to_an_explicit_set() {
         .expect("fixture");
 
     let all: Vec<i64> = c
-        .assets_needing_tags_within(10, None)
+        .assets_needing_tags_within(10, &AppraiseScope::All)
         .unwrap()
         .iter()
         .map(|j| j.asset_id)
@@ -4627,7 +4795,7 @@ fn the_tag_queue_can_be_restricted_to_an_explicit_set() {
     assert_eq!(all.len(), 3, "the whole dirty queue: {all:?}");
 
     let some: Vec<i64> = c
-        .assets_needing_tags_within(10, Some(&[3, 1]))
+        .assets_needing_tags_within(10, &AppraiseScope::Assets(vec![3, 1]))
         .unwrap()
         .iter()
         .map(|j| j.asset_id)
@@ -4636,13 +4804,13 @@ fn the_tag_queue_can_be_restricted_to_an_explicit_set() {
     assert!(some.contains(&1) && some.contains(&3));
 
     assert!(
-        c.assets_needing_tags_within(10, Some(&[4]))
+        c.assets_needing_tags_within(10, &AppraiseScope::Assets(vec![4]))
             .unwrap()
             .is_empty(),
         "an asset that is not dirty is not appraised just because it was named"
     );
     assert!(
-        c.assets_needing_tags_within(10, Some(&[]))
+        c.assets_needing_tags_within(10, &AppraiseScope::Assets(Vec::new()))
             .unwrap()
             .is_empty(),
         "an explicit empty set asks for nothing - it must not mean everything"

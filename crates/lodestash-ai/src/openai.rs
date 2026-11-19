@@ -288,7 +288,7 @@ impl Tagger for OpenAiTagger {
     }
 
     /// This tagger sends the pixels itself, so the generic two-phase batch path — which never fills
-    /// `TagInput::image` — cannot drive it. `drains::drain_api_tags` is the drain that can.
+    /// `TagInput::image` — cannot drive it. `appraise::drain_api_tags` is the drain that can.
     fn needs_image(&self) -> bool {
         true
     }

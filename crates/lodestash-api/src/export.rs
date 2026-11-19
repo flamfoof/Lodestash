@@ -120,7 +120,8 @@ mod tests {
 mod flow_tests {
     use std::sync::Arc;
 
-    use crate::{jobs::JobState, ServerState};
+    use crate::jobs::{JobState, JobWire};
+    use crate::ServerState;
 
     /// `with_dependencies` copies the closure, not just the named asset: exporting a material
     /// brings its textures (DATA-MODEL §10 → ENGINE-API §4).

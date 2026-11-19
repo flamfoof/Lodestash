@@ -84,9 +84,10 @@ impl Lib {
 
     /// One rescan, through the function the watcher calls. Returns whether it persisted.
     fn rescan(&self) -> bool {
-        let catalog = Catalog::open(&self.db).expect("open");
-        crate::persist::rescan_source(&self.db, &catalog, &self.root_str(), "lib", &[])
-            .expect("rescan")
+        // The writer's connection, as the engine opens it.
+        let mut catalog = Catalog::open(&self.db).expect("open");
+        catalog.seed_media_types().expect("seed");
+        crate::persist::rescan_source(&mut catalog, &self.root_str(), "lib", &[]).expect("rescan")
     }
 
     /// A writing connection, for what a person does between scans.

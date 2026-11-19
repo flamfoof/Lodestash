@@ -1,254 +1,127 @@
-//! The job registry behind every long-running agent operation (ENGINE-API §4 "Async",
+//! The agent planes' view of the engine's job registry (ENGINE-API §4 "Async",
 //! MCP-AND-ENGINES §5). A long op returns a `job_id` immediately; the client polls
 //! `GET /v1/jobs/{id}` and may `POST /v1/jobs/{id}/cancel`.
+//!
+//! **A view, not a registry** (v2 spec §4.1, review R1). The jobs are the engine's
+//! ([`lodestash_engine::jobs::JobRegistry`]) — the same ones the shell's tray draws. A job an
+//! agent starts here is in the tray; a job the writer starts (a scan, an unpack, an appraisal)
+//! answers `get_job_status` by its id, with why it failed when it did. This used to be a second
+//! registry that knew only its own jobs.
 //!
 //! Side-effecting jobs start in `awaiting_approval` and do nothing until the desktop app says
 //! yes. That's the spec's "confirm mutating ops **server-side**, don't rely on the client's
 //! human-in-the-loop" — an agent can ask to write files; only the person at the machine can
 //! actually let it.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use lodestash_engine::jobs::JobRegistry;
+pub use lodestash_engine::jobs::{Job, JobState};
+use lodestash_engine::Origin;
 use serde_json::{json, Value};
 
-/// Job lifecycle. `awaiting_approval` extends the ENGINE-API §3 set (`queued|running|done|
-/// error|cancelled`) with the server-side confirmation gate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JobState {
-    AwaitingApproval,
-    Queued,
-    Running,
-    Done,
-    Error,
-    Cancelled,
-}
-
-impl JobState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            JobState::AwaitingApproval => "awaiting_approval",
-            JobState::Queued => "queued",
-            JobState::Running => "running",
-            JobState::Done => "done",
-            JobState::Error => "error",
-            JobState::Cancelled => "cancelled",
-        }
-    }
-
-    fn from_u8(v: u8) -> Self {
-        match v {
-            0 => JobState::AwaitingApproval,
-            1 => JobState::Queued,
-            2 => JobState::Running,
-            3 => JobState::Done,
-            4 => JobState::Error,
-            _ => JobState::Cancelled,
-        }
-    }
-
-    pub fn is_terminal(self) -> bool {
-        matches!(self, JobState::Done | JobState::Error | JobState::Cancelled)
+/// The state as `/v1` spells it (ENGINE-API §3): `queued|running|done|error|cancelled`, plus
+/// `awaiting_approval`. The engine calls a failed job `failed`; the wire has always said `error`,
+/// and `/v1` only grows.
+pub fn wire_state(state: JobState) -> &'static str {
+    match state {
+        JobState::Failed => "error",
+        other => other.as_str(),
     }
 }
 
-/// One job. Workers hold an `Arc<Job>` and only touch the atomics + the two mutexes, so
-/// progress reporting never blocks a reader.
-pub struct Job {
-    pub id: String,
-    pub kind: String,
-    /// One line describing what will happen, shown in the desktop approval prompt.
-    pub summary: String,
-    state: AtomicU8,
-    done: AtomicU64,
-    total: AtomicU64,
-    cancelled: AtomicBool,
-    error: Mutex<Option<String>>,
-    result: Mutex<Option<Value>>,
-    /// What the approval prompt shows beyond the one-line summary — for `write_tags`, the tag and
-    /// caption diff (ENGINE-API §8.3). `null` for every other job.
-    detail: Mutex<Option<Value>>,
+/// ENGINE-API §3 `Job` — what `get_job_status` answers.
+pub trait JobWire {
+    fn to_json(&self) -> Value;
 }
 
-impl Job {
-    pub fn state(&self) -> JobState {
-        JobState::from_u8(self.state.load(Ordering::Relaxed))
-    }
-
-    pub fn set_state(&self, s: JobState) {
-        self.state.store(s as u8, Ordering::Relaxed);
-    }
-
-    pub fn set_total(&self, total: u64) {
-        self.total.store(total, Ordering::Relaxed);
-    }
-
-    pub fn advance(&self) {
-        self.done.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// `0.0..=1.0`, or `0.0` while the total is unknown.
-    pub fn progress(&self) -> f32 {
-        let total = self.total.load(Ordering::Relaxed);
-        if total == 0 {
-            return 0.0;
-        }
-        (self.done.load(Ordering::Relaxed) as f32 / total as f32).clamp(0.0, 1.0)
-    }
-
-    /// Cooperative: workers check this between units of work.
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
-    }
-
-    pub fn finish(&self, result: Value) {
-        *self.result.lock().unwrap() = Some(result);
-        self.set_state(JobState::Done);
-    }
-
-    pub fn set_detail(&self, detail: Value) {
-        *self.detail.lock().unwrap() = Some(detail);
-    }
-
-    pub fn fail(&self, message: impl Into<String>) {
-        *self.error.lock().unwrap() = Some(message.into());
-        self.set_state(JobState::Error);
-    }
-
-    /// ENGINE-API §3 `Job`.
-    pub fn to_json(&self) -> Value {
+impl JobWire for Job {
+    fn to_json(&self) -> Value {
         json!({
             "job_id": self.id,
             "kind": self.kind,
-            "state": self.state().as_str(),
-            "summary": self.summary,
+            "state": wire_state(self.state()),
+            "summary": self.label,
             "progress": self.progress(),
-            "result": self.result.lock().unwrap().clone(),
-            "error": self.error.lock().unwrap().clone(),
-            "detail": self.detail.lock().unwrap().clone(),
+            "result": self.result(),
+            "error": self.error(),
+            "detail": self.detail(),
         })
     }
 }
 
-/// All jobs of a session. In-memory by design (ENGINE-API §5 "Transient vs durable"): a crash
-/// loses the queue, never the catalog.
-#[derive(Default)]
+/// The agent planes' handle on the engine's jobs. In memory by design (ENGINE-API §5 "Transient
+/// vs durable"): a crash loses the queue, never the catalog.
+#[derive(Clone, Default)]
 pub struct Jobs {
-    jobs: Mutex<HashMap<String, Arc<Job>>>,
+    registry: JobRegistry,
 }
 
 impl Jobs {
-    /// Register a job in `state`. Side-effecting work passes `AwaitingApproval`.
-    pub fn create(&self, kind: &str, summary: String, state: JobState) -> Arc<Job> {
-        let job = Arc::new(Job {
-            id: format!("{}_{}", kind, uuid::Uuid::new_v4().simple()),
-            kind: kind.to_string(),
-            summary,
-            state: AtomicU8::new(state as u8),
-            done: AtomicU64::new(0),
-            total: AtomicU64::new(0),
-            cancelled: AtomicBool::new(false),
-            error: Mutex::new(None),
-            result: Mutex::new(None),
-            detail: Mutex::new(None),
-        });
-        self.jobs
-            .lock()
-            .unwrap()
-            .insert(job.id.clone(), job.clone());
-        job
+    /// A view over `registry` — the engine's, so the shell and the agents see one set of jobs.
+    pub fn over(registry: JobRegistry) -> Self {
+        Self { registry }
     }
 
+    /// Register a job an agent asked for, in `state`. Side-effecting work passes
+    /// `AwaitingApproval`.
+    pub fn create(&self, kind: &str, summary: String, state: JobState) -> Arc<Job> {
+        self.registry
+            .create(kind, summary, Origin::Agent, state, true)
+    }
+
+    /// Any job of the session by its id — an agent's, or one the app started itself.
     pub fn get(&self, id: &str) -> Option<Arc<Job>> {
-        self.jobs.lock().unwrap().get(id).cloned()
+        self.registry.get(id)
+    }
+
+    /// Every job of the session, in the order they started.
+    pub fn list(&self) -> Vec<Arc<Job>> {
+        self.registry.list()
     }
 
     /// Idempotent. A job that hasn't started yet flips straight to `cancelled`; a running one is
     /// asked to stop and flips when its worker notices. A finished job is left alone.
     pub fn cancel(&self, id: &str) -> Option<Arc<Job>> {
         let job = self.get(id)?;
-        if !job.state().is_terminal() {
-            job.cancelled.store(true, Ordering::Relaxed);
-            if job.state() != JobState::Running {
-                job.set_state(JobState::Cancelled);
-            }
-        }
+        job.cancel();
         Some(job)
     }
 
     /// Jobs waiting on the person at the machine.
     pub fn awaiting_approval(&self) -> Vec<Arc<Job>> {
-        let mut out: Vec<Arc<Job>> = self
-            .jobs
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|j| j.state() == JobState::AwaitingApproval)
-            .cloned()
-            .collect();
-        out.sort_by(|a, b| a.id.cmp(&b.id));
-        out
+        self.registry.awaiting_approval()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lodestash_engine::jobs::Outcome;
 
+    /// One registry, two views: a job the app's own side starts is the agent planes' to read,
+    /// with its failure text; a job an agent starts is in the tray.
     #[test]
-    fn cancel_is_idempotent_and_never_resurrects_a_finished_job() {
-        let jobs = Jobs::default();
+    fn the_view_and_the_tray_show_the_same_jobs() {
+        let registry = JobRegistry::default();
+        let jobs = Jobs::over(registry.clone());
 
-        let queued = jobs.create("export", "2 files".into(), JobState::Queued);
-        jobs.cancel(&queued.id);
-        jobs.cancel(&queued.id);
-        assert_eq!(queued.state(), JobState::Cancelled);
+        let (handles, scan) = registry.open("Import Rocks".into(), "import", false);
+        scan.finish(Outcome::Failed("the source folder is gone".into()));
+        let seen = jobs.get(&handles.job.id).expect("the tray's job, by id");
+        let body = seen.to_json();
+        assert_eq!(body["state"], "error", "`failed` is `error` on the wire");
+        assert_eq!(body["error"], "the source folder is gone");
+        assert_eq!(body["kind"], "import");
 
-        let running = jobs.create("export", "2 files".into(), JobState::Running);
-        jobs.cancel(&running.id);
-        assert_eq!(
-            running.state(),
-            JobState::Running,
-            "a running job stays running until its worker notices"
+        let export = jobs.create("export", "2 files".into(), JobState::AwaitingApproval);
+        let tray = registry.snapshot();
+        assert!(
+            tray.active
+                .iter()
+                .any(|j| j.job_id == export.id && j.state == "awaiting_approval"),
+            "an agent's job is missing from the tray"
         );
-        assert!(running.is_cancelled(), "but it has been asked to stop");
-
-        let done = jobs.create("export", "2 files".into(), JobState::Queued);
-        done.finish(json!({"written": 2}));
-        jobs.cancel(&done.id);
-        assert_eq!(done.state(), JobState::Done, "finished work is not undone");
-
-        assert!(jobs.get("nope").is_none());
-    }
-
-    #[test]
-    fn approval_queue_lists_only_unapproved_jobs() {
-        let jobs = Jobs::default();
-        let waiting = jobs.create("export", "1 file".into(), JobState::AwaitingApproval);
-        let _running = jobs.create("export", "1 file".into(), JobState::Running);
-
-        let ids: Vec<String> = jobs
-            .awaiting_approval()
-            .iter()
-            .map(|j| j.id.clone())
-            .collect();
-        assert_eq!(ids, vec![waiting.id.clone()]);
-
-        waiting.set_state(JobState::Queued);
-        assert!(jobs.awaiting_approval().is_empty());
-    }
-
-    #[test]
-    fn progress_is_bounded_and_zero_until_the_total_is_known() {
-        let jobs = Jobs::default();
-        let j = jobs.create("export", "3 files".into(), JobState::Running);
-        j.advance();
-        assert_eq!(j.progress(), 0.0, "unknown total reads as 0, not NaN");
-        j.set_total(2);
-        assert_eq!(j.progress(), 0.5);
-        j.advance();
-        j.advance();
-        assert_eq!(j.progress(), 1.0, "over-reporting clamps");
+        assert_eq!(jobs.list().len(), 2, "both views list both jobs");
     }
 }

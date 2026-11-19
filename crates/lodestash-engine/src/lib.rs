@@ -7,11 +7,11 @@
 //! (absorbed from `lodestash-app`, v2 plan Task 2.2) and media generation. The desktop shell and
 //! the HTTP API are adapters over it; nothing here may depend on a UI framework or an HTTP server.
 
+pub mod appraise;
 pub mod audio;
 pub mod changes;
 pub mod config;
 pub mod config_store;
-pub mod drains;
 pub mod egress;
 mod engine;
 pub mod grid;
@@ -35,6 +35,8 @@ pub use engine::{Engine, EngineConfig, EngineReport, EngineStatus, ReadError, Re
 pub use tokio::sync::broadcast::error::RecvError as ChangeRecvError;
 pub use writer::{Op, WriteError, WriteResult, WriterHandle};
 
+#[cfg(test)]
+mod tests_appraise;
 #[cfg(test)]
 mod tests_engine;
 #[cfg(test)]

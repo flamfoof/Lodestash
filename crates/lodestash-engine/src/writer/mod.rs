@@ -16,15 +16,10 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 
-use lodestash_ai::clap_tags::AudioZeroShot;
-use lodestash_ai::image_tags::ImageZeroShot;
-use lodestash_ai::ollama::OllamaTagger;
-use lodestash_ai::openai::OpenAiTagger;
-use lodestash_ai::tagger::{FilenameTagger, Tagger, TeachTrait};
 use lodestash_core::catalog::{
     AppraiseFocus, Catalog, HistoryOrigin, PackageEntryRecord, TagBatch, TagBatchItem, TagMode,
 };
@@ -33,27 +28,13 @@ use lodestash_ingest::unitypackage::{
     extract_at_offsets_with_progress, read_manifest_with_progress, EntryLocator, ExtractedAsset,
 };
 
+use crate::appraise::{AppraisePlan, Models, Scope, Stage};
 use crate::config_store::ConfigStore;
-use crate::drains::{
-    drain_audio_tags, drain_previews, drain_promote_resync, drain_tags, resolve_audio_embedder,
-    resolve_embedder,
-};
 use crate::engine::EngineStatus;
-use crate::jobs::JobProgress as AppJobProgress;
+use crate::jobs::{JobGuard, JobProgress, JobRegistry, Outcome};
 use crate::types::PersistBatch;
 
-/// Bounded tag work per appraise pass (AI-PIPELINE §5.1): a writer-thread kick never blocks
-/// writes on a long backlog; the remainder stays queued for the next kick / idle slice.
-const TAG_BUDGET_PER_PASS: u32 = 64;
-const AUDIO_TAG_BUDGET_PER_PASS: u32 = 48;
-
-/// How often the idle backlog lane takes a turn: one tick in four, each tick a second.
-///
-/// Every tick used to do a slice, which is a 100% duty cycle dressed up as "idle work" — an
-/// app showing a grid and being asked for nothing sat at 0.57 cores indefinitely. Four is the
-/// tradeoff: the backlog converges ~4× slower in wall-clock terms, and the machine stays the
-/// user's. Raise it to be politer, lower it to drain faster.
-const IDLE_DUTY_PERIOD: u32 = 4;
+mod identify;
 
 /// One asset the write path needs to act on, resolved from the library while its lock is held so
 /// the writer thread never reaches back into it.
@@ -369,6 +350,9 @@ pub enum Op {
     /// then succeed, fail or panic.
     #[cfg(test)]
     Probe(Probe),
+    /// One working turn of the idle lane, now, without waiting for its tick.
+    #[cfg(test)]
+    IdleTurn,
 }
 
 /// What an [`Op::Probe`] does, in this order.
@@ -472,15 +456,19 @@ pub(crate) enum WriterMsg {
     /// happened off-thread, which is the point: a four-view render plus four SigLIP passes is
     /// ~17 s per 3D model, and doing that on the writer made every user write queue behind it
     /// (a `POST /v1/stage` went from 25 ms to ~18 s the moment an embedder actually loaded).
+    /// `stage` is the embed stage it was a slice of — visual or audio.
     EmbeddingsDone {
+        stage: Stage,
         model_id: String,
-        done: Vec<crate::drains::ComputedEmbedding>,
+        done: Vec<crate::appraise::ComputedEmbedding>,
     },
     /// A background tag worker finished a slice — same split, same reason: a caption is a whole
-    /// VLM inference (~13 s here) and the writer only persists the result.
+    /// VLM inference (~13 s here) and the writer only persists the result. `stage` is the tag
+    /// stage it was a slice of — the generic one or the audio one.
     TagsDone {
-        producers: crate::drains::TagProducers,
-        done: Vec<crate::drains::ComputedTags>,
+        stage: Stage,
+        producers: crate::appraise::TagProducers,
+        done: Vec<crate::appraise::ComputedTags>,
     },
 }
 
@@ -636,83 +624,12 @@ fn backfill_package_pipelines(catalog: &Catalog) -> usize {
     written
 }
 
-// ── Job tray (B2b) ─────────────────────────────────────────────────────────────────────────
-
-/// Shared tray state: active jobs (progress + cooperative cancel) and a session ring of
-/// finished ones. The writer thread owns the mutations; commands read snapshots.
-#[derive(Clone, Default)]
-pub struct JobRegistry {
-    inner: std::sync::Arc<std::sync::Mutex<JobState>>,
-    /// Marked on every start and finish, and by workers as their progress moves — the tray is
-    /// one of the two domains the shell is told about.
-    changes: Changes,
-}
-
-#[derive(Default)]
-struct JobState {
-    next_id: u64,
-    active: Vec<ActiveJob>,
-    recent: VecDeque<RecentJob>,
-}
-
-/// Extract byte progress, read by the tray without taking the registry lock.
-#[derive(Default)]
-pub struct JobProgress {
-    pub done: AtomicU64,
-    pub total: AtomicU64,
-}
-
-struct ActiveJob {
-    id: u64,
-    label: String,
-    kind: String,
-    cancel: Arc<AtomicBool>,
-    progress: Option<Arc<JobProgress>>,
-}
-
-/// Handles a caller holds after `start`, without touching the registry lock again.
-pub struct JobHandles {
-    pub id: u64,
-    pub cancel: Arc<AtomicBool>,
-    pub progress: Option<Arc<JobProgress>>,
-}
-
-/// Ends a tray job when dropped — as **failed**, unless [`JobGuard::finish`] reported how it
-/// really ended (review finding 11).
-///
-/// A job used to be opened and closed by two separate calls with the work between them, so a
-/// panic in that work — caught by the writer's supervision, which is the point of supervising —
-/// left the job spinning in the tray for the rest of the session, and one of kind `extract`
-/// blocked every later extraction. Open jobs through [`JobRegistry::open`] and the end is owned.
-pub struct JobGuard {
-    jobs: JobRegistry,
-    id: u64,
-    open: bool,
-}
-
-impl JobGuard {
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-
-    /// Report how the job ended.
-    pub fn finish(mut self, ok: bool, cancelled: bool, changed: usize) {
-        self.open = false;
-        self.jobs.finish(self.id, ok, cancelled, changed);
-    }
-
-    /// Someone else ends this job now: the writer, once a worker's report has reached it.
-    fn hand_over(mut self) {
-        self.open = false;
-    }
-}
-
-impl Drop for JobGuard {
-    fn drop(&mut self) {
-        if self.open {
-            self.jobs.finish(self.id, false, false, 0);
-        }
-    }
+/// How a tray job ended, from what its work returned and the count the tray reports for it.
+fn ended(result: &Result<WriteResult, String>, changed: usize, cancelled: bool) -> Outcome {
+    Outcome::of(
+        result.as_ref().map(|_| changed).map_err(Clone::clone),
+        cancelled,
+    )
 }
 
 /// Holds an in-flight flag up for one off-writer slice and lowers it when dropped (review
@@ -841,154 +758,6 @@ impl Drop for PackReport {
         // which must not block on its own full inbox. Unsent, `job` drops and ends itself.
         if self.tx.try_send(msg).is_ok() {
             job.hand_over();
-        }
-    }
-}
-
-#[derive(Clone, serde::Serialize)]
-pub struct JobSnapshot {
-    pub id: u64,
-    pub label: String,
-    pub kind: String,
-    /// `(done, total)` bytes for extract; `None` = indeterminate (spinner).
-    pub progress: Option<(u64, u64)>,
-    pub cancellable: bool,
-}
-
-#[derive(Clone, serde::Serialize)]
-pub struct RecentJob {
-    pub id: u64,
-    pub label: String,
-    pub kind: String,
-    pub ok: bool,
-    pub cancelled: bool,
-    pub changed: usize,
-    pub at_unix: i64,
-}
-
-#[derive(Default, serde::Serialize)]
-pub struct JobsView {
-    pub active: Vec<JobSnapshot>,
-    pub recent: Vec<RecentJob>,
-}
-
-const RECENT_CAP: usize = 20;
-
-impl JobRegistry {
-    /// Register an active job; returns the handles the worker uses for progress/cancel.
-    /// Public: model downloads (which never touch the catalog) register through this.
-    pub fn start(&self, label: String, kind: &str, cancellable: bool) -> JobHandles {
-        let mut state = self.inner.lock().expect("job registry lock");
-        let id = state.next_id;
-        state.next_id += 1;
-        let cancel = Arc::new(AtomicBool::new(false));
-        let progress = cancellable.then(|| Arc::new(JobProgress::default()));
-        state.active.push(ActiveJob {
-            id,
-            label,
-            kind: kind.to_string(),
-            cancel: cancel.clone(),
-            progress: progress.clone(),
-        });
-        drop(state);
-        self.changes.jobs();
-        JobHandles {
-            id,
-            cancel,
-            progress,
-        }
-    }
-
-    /// [`Self::start`], with the job's end owned: the guard finishes it as failed if it is
-    /// dropped without [`JobGuard::finish`] — on a panic, an early return, a thread that never
-    /// ran. Prefer this to `start` + `finish` wherever work happens between the two.
-    pub fn open(&self, label: String, kind: &str, cancellable: bool) -> (JobHandles, JobGuard) {
-        let handles = self.start(label, kind, cancellable);
-        let guard = JobGuard {
-            jobs: self.clone(),
-            id: handles.id,
-            open: true,
-        };
-        (handles, guard)
-    }
-
-    /// Move an active job to the session ring. `changed` is what the tray reports. Public for
-    /// the same reason as `start`.
-    pub fn finish(&self, id: u64, ok: bool, cancelled: bool, changed: usize) {
-        let mut state = self.inner.lock().expect("job registry lock");
-        let Some(pos) = state.active.iter().position(|j| j.id == id) else {
-            return;
-        };
-        let job = state.active.remove(pos);
-        state.recent.push_front(RecentJob {
-            id: job.id,
-            label: job.label,
-            kind: job.kind,
-            ok,
-            cancelled,
-            changed,
-            at_unix: unix_now(),
-        });
-        state.recent.truncate(RECENT_CAP);
-        drop(state);
-        self.changes.jobs();
-    }
-
-    /// Is a pack being analysed or extracted right now? The one-at-a-time queue gates on it, and
-    /// the workspace reclaim refuses under it.
-    pub(crate) fn has_active_extract(&self) -> bool {
-        self.inner
-            .lock()
-            .expect("job registry lock")
-            .active
-            .iter()
-            .any(|j| j.kind == "extract")
-    }
-
-    /// The process's change publication, which this registry marks whenever the tray changes.
-    pub fn changes(&self) -> &Changes {
-        &self.changes
-    }
-
-    /// A running job's progress moved. Coalesced by the publisher, so a worker can call this per
-    /// chunk read without flooding the shell.
-    pub fn progressed(&self) {
-        self.changes.jobs();
-    }
-
-    /// Request cancellation. The extract worker checks the flag between reads; everything
-    /// else finishes on its own and ignores it.
-    pub fn cancel(&self, id: u64) -> bool {
-        let state = self.inner.lock().expect("job registry lock");
-        match state.active.iter().find(|j| j.id == id) {
-            Some(j) => {
-                j.cancel.store(true, Ordering::Relaxed);
-                true
-            }
-            None => false,
-        }
-    }
-
-    pub fn snapshot(&self) -> JobsView {
-        let state = self.inner.lock().expect("job registry lock");
-        JobsView {
-            active: state
-                .active
-                .iter()
-                .map(|j| JobSnapshot {
-                    id: j.id,
-                    label: j.label.clone(),
-                    kind: j.kind.clone(),
-                    progress: j.progress.as_ref().map(|p| {
-                        (
-                            p.done.load(Ordering::Relaxed),
-                            p.total.load(Ordering::Relaxed),
-                        )
-                    }),
-                    cancellable: j.progress.is_some(),
-                })
-                .collect(),
-            recent: state.recent.iter().cloned().collect(),
         }
     }
 }
@@ -1159,9 +928,11 @@ pub(crate) struct WriterSetup {
     pub lock: std::fs::File,
     pub status: Arc<crate::engine::StatusCell>,
     pub jobs: JobRegistry,
+    /// Where passes get their embedders.
+    pub models: Models,
     /// Raised while an appraise pass runs (B11d).
     pub pump: Arc<AtomicBool>,
-    pub appraise: Arc<AppJobProgress>,
+    pub appraise: Arc<JobProgress>,
     /// Where the user is looking (UI-SPEC §3). Shared rather than sent as an op: it changes on
     /// every scroll, and a browse must never queue behind a running appraise pass.
     pub focus: Arc<Mutex<AppraiseFocus>>,
@@ -1172,11 +943,15 @@ pub(crate) struct WriterCtx {
     db_path: PathBuf,
     tx: SyncSender<WriterMsg>,
     jobs: JobRegistry,
-    appraise: Arc<AppJobProgress>,
+    models: Models,
+    appraise: Arc<JobProgress>,
     focus: Arc<Mutex<AppraiseFocus>>,
     cache_dir: Option<PathBuf>,
     workspace_dir: Option<PathBuf>,
     config: Arc<ConfigStore>,
+    /// A dependency harvest has not been followed by the library's graph reconcile yet
+    /// ([`crate::appraise::drain_dependencies`]).
+    graph_due: AtomicBool,
 }
 
 /// How a command on the writer thread refuses. Most say why in words ([`WriteError::Failed`],
@@ -1259,13 +1034,6 @@ impl Inbox {
     }
 }
 
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 /// Spawn the writer over `setup.db_path`. The connection is opened **on the thread that owns it**,
 /// never handed across, because that is the whole point of the rule — and so is the migration:
 /// the engine is the only code that opens the catalog for writing (v2 spec §4.2).
@@ -1312,16 +1080,22 @@ fn open_catalog(path: &Path, status: &crate::engine::StatusCell) -> Result<Catal
             _ => {}
         }
     }
-    Catalog::open(path).map_err(|e| match e {
+    let open_failed = |why: CoreError| EngineStatus::Failed {
+        code: "catalog_open_failed".into(),
+        message: format!(
+            "the catalog at {} could not be opened: {why}",
+            path.display()
+        ),
+    };
+    let catalog = Catalog::open(path).map_err(|e| match e {
         CoreError::SchemaTooNew { found, supported } => too_new(found, supported),
-        other => EngineStatus::Failed {
-            code: "catalog_open_failed".into(),
-            message: format!(
-                "the catalog at {} could not be opened: {other}",
-                path.display()
-            ),
-        },
-    })
+        other => open_failed(other),
+    })?;
+    // The media types every asset row names. Seeded here, once, rather than by the first scan:
+    // importing packs into a catalog no folder had been scanned into answered "unknown
+    // media_type code", because only the scan's persist seeded them.
+    catalog.seed_media_types().map_err(open_failed)?;
+    Ok(catalog)
 }
 
 /// No catalog to write to: answer every command with why, until the engine stops.
@@ -1369,11 +1143,13 @@ fn writer_main(
         db_path: setup.db_path.clone(),
         tx: writer_tx,
         jobs: setup.jobs.clone(),
+        models: setup.models.clone(),
         appraise: setup.appraise.clone(),
         focus: setup.focus.clone(),
         cache_dir: setup.cache_dir.clone(),
         workspace_dir: setup.workspace_dir.clone(),
         config: setup.config.clone(),
+        graph_due: AtomicBool::new(false),
     };
     let pump = setup.pump;
     let jobs = &ctx.jobs;
@@ -1407,35 +1183,19 @@ fn writer_main(
     }
     mark_committed(&changes, &catalog, before, Origin::Background);
 
-    // Model preview backfill (M15) is time-boxed and durable, and this thread is the one place it
-    // may write (single-writer rule). Ops preempt it within a few seconds; the queue is durable,
-    // so it converges over idle moments.
-    let proxy = display.preview_quality.proxy_budget();
-    // B11c: when auto-identify is on and the local models are present, the idle pass appraises
-    // (metrics → previews → deps → embeddings → promote) instead of only backfilling previews.
-    // The embedders are resolved once here — model files load at startup only when the user
-    // opted in — and borrowed per slice.
-    let auto = display.auto_identify;
-    let (idle_embedder, idle_audio) = if auto {
-        (resolve_embedder(), resolve_audio_embedder())
-    } else {
-        (None, None)
-    };
-    let idle_appraises = auto && (idle_embedder.is_some() || idle_audio.is_some());
-    // Test/CI escape hatch: the preview backfill is CPU-heavy (each model render is a decimate +
+    // The backlog lane (ADR-0008, ADR-0014): what this thread does with a quiet second. It
+    // resolves the embedders once, here — model files load at startup, and only when the user
+    // opted into automatic identification.
+    let mut lane = identify::IdleLane::new(&ctx);
+    // Test/CI escape hatch: the backlog lane is CPU-heavy (each model render is a decimate +
     // 4-view raster), and an e2e run that launches the app dozens of times would otherwise grind
-    // the machine. LODESTASH_NO_PREVIEW_DRAIN=1 skips it; the grid then shows type marks for
-    // models without previews.
+    // the machine. LODESTASH_NO_PREVIEW_DRAIN=1 skips the lane and the source watch; the grid
+    // then shows type marks for models without previews.
     let drain_enabled = std::env::var("LODESTASH_NO_PREVIEW_DRAIN").is_err();
     // UI-SPEC §5: ticked packs unpack **one at a time**. An ExtractPackage op that arrives while a
     // worker is running (or already queued) waits here; each op's reply resolves to the real
     // outcome when its reconcile runs.
     let mut extract_queue: VecDeque<Job> = VecDeque::new();
-    // One embed slice in flight at a time. The worker owns the encode; this flag is how the idle
-    // tick knows not to start a second one, and it is cleared when the slice's `EmbeddingsDone`
-    // lands (or when its worker gives up).
-    let embed_inflight = Arc::new(AtomicBool::new(false));
-    let tag_inflight = Arc::new(AtomicBool::new(false));
     // DATA-MODEL §6 watch: live notify over the watched source roots, debounced by the ingest
     // helper. A signal means "something changed, rescan when convenient" — the rescan is the
     // incremental crawl (needs_rehash skips unchanged files), so it is cheap. Skipped under the
@@ -1445,17 +1205,6 @@ fn writer_main(
     } else {
         None
     };
-    // The backlog lane works one tick in `IDLE_DUTY_PERIOD`, not every tick.
-    //
-    // Measured on the reference library: an idle app — window open, nothing asked of it — burned
-    // **0.57 cores continuously**, forever, because each 1 s timeout started a 1 s slice. This is
-    // an asset viewer; housekeeping does not get half the machine. Duty-cycling here throttles all
-    // three lanes at once: the embed and tag workers gate on their `*_inflight` flags, and only
-    // this thread clears them.
-    //
-    // Op latency is unaffected — a skipped tick still waits on the channel, so a user write is
-    // picked up the moment it arrives (the point of 147d4b5).
-    let mut idle_tick: u32 = 0;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -1473,6 +1222,15 @@ fn writer_main(
                     tracing::info!("skipped a command its caller withdrew while it was queued");
                     continue;
                 }
+                #[cfg(test)]
+                if matches!(op, Op::IdleTurn) {
+                    let before = Stamp::of(&catalog);
+                    guarded("idle pass", || lane.work(&mut catalog, &ctx, &pump));
+                    pump.store(false, Ordering::Relaxed);
+                    mark_committed(&changes, &catalog, before, Origin::Background);
+                    let _ = reply.send(Ok(WriteResult::default()));
+                    continue;
+                }
                 if matches!(op, Op::ExtractPackage { .. }) {
                     // Extract answers **"accepted"**, not "finished" — the unpack runs for minutes
                     // on a multi-GB pack, and its progress, outcome and cancel button live in the
@@ -1484,7 +1242,7 @@ fn writer_main(
                         // is marked like any other: it never was, and when the extraction then
                         // failed nothing told the read model the rows existed.
                         let before = Stamp::of(&catalog);
-                        let result = supervised(|| run(&mut catalog, op, &ctx));
+                        let result = supervised(|| run(&mut catalog, op, origin, &ctx));
                         mark_committed(&changes, &catalog, before, origin);
                         let _ = reply.send(result);
                     } else {
@@ -1509,7 +1267,7 @@ fn writer_main(
                 let source_set_changed =
                     matches!(op, Op::PersistScan { .. } | Op::SetSourceWatch { .. });
                 let before = Stamp::of(&catalog);
-                let result = supervised(|| run(&mut catalog, op, &ctx));
+                let result = supervised(|| run(&mut catalog, op, origin, &ctx));
                 if appraising {
                     pump.store(false, Ordering::Relaxed);
                 }
@@ -1544,34 +1302,42 @@ fn writer_main(
                     materialize_extract(&mut catalog, &ctx, package_id, outcome, cancelled)
                 })
                 .unwrap_or_else(|| Err("materializing the pack's files panicked".into()));
-                let ok = result.is_ok();
                 let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
-                jobs.finish(job_id, ok, cancelled, changed);
+                jobs.finish(job_id, ended(&result, changed, cancelled));
                 start_next_extract(&mut catalog, &mut extract_queue, &ctx);
                 // Background: the unpack was asked for minutes ago, and its outcome is in the
                 // tray — not a reason to re-read the page under the user.
                 mark_committed(&changes, &catalog, before, Origin::Background);
             }
-            Ok(WriterMsg::EmbeddingsDone { model_id, done }) => {
+            Ok(WriterMsg::EmbeddingsDone {
+                stage,
+                model_id,
+                done,
+            }) => {
                 // Cheap: N `upsert_embedding` calls, no inference. Clearing `embedding_dirty`
                 // here is what lets `promote_statuses` move the asset on, so the promote runs on
                 // the next idle tick.
                 let before = Stamp::of(&catalog);
                 guarded("embeddings store", || {
-                    crate::drains::store_visual_embeddings(&mut catalog, &model_id, &done)
+                    crate::appraise::store_embeddings(&mut catalog, &model_id, &done)
                 });
-                embed_inflight.store(false, Ordering::Relaxed);
+                lane.landed(stage);
                 // By what was written, not by the count returned: a store that panicked after
                 // its first rows returns nothing, and those rows are still in the catalog.
                 mark_committed(&changes, &catalog, before, Origin::Background);
             }
-            Ok(WriterMsg::TagsDone { producers, done }) => {
+            Ok(WriterMsg::TagsDone {
+                stage,
+                producers,
+                done,
+            }) => {
                 let before = Stamp::of(&catalog);
                 let n = guarded("tags store", || {
-                    crate::drains::store_tags(&mut catalog, &producers, &done)
+                    crate::appraise::store_tags(&mut catalog, &producers, &done)
                 })
+                .flatten()
                 .unwrap_or(0);
-                tag_inflight.store(false, Ordering::Relaxed);
+                lane.landed(stage);
                 if n > 0 {
                     tracing::info!(tags = n, producer = %producers.tagger.0, "idle tagging slice stored");
                 }
@@ -1623,19 +1389,25 @@ fn writer_main(
                     })
                 })
                 .unwrap_or_else(|| Err("recording the pack's manifest panicked".into()));
-                let ok = result.is_ok();
                 let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
-                jobs.finish(job_id, ok, cancelled, changed);
+                jobs.finish(job_id, ended(&result, changed, cancelled));
                 if !spawned {
                     start_next_extract(&mut catalog, &mut extract_queue, &ctx);
                 }
                 mark_committed(&changes, &catalog, before, Origin::Background);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Quiet for a second. Backfill previews in short slices, and only when nothing is
-                // queued — a long pass would make every write wait for it (measured: a 5s slice
-                // pushed a tag-create past the UI's own timeouts). 1s slices keep op latency under
-                // ~1.2s while still filling most idle time; the queue is durable, so it converges.
+                // Quiet for a second. The backlog lane works in short slices, and only when
+                // nothing is queued — a long pass would make every write wait for it (measured: a
+                // 5s slice pushed a tag-create past the UI's own timeouts). A 1s slice keeps op
+                // latency near a second; the queues are durable, so they converge.
+                //
+                // And only one tick in `IDLE_DUTY_PERIOD` (ADR-0014). Measured on the reference
+                // library: an idle app — window open, nothing asked of it — burned **0.57 cores
+                // continuously** while every 1 s timeout started a 1 s slice. This is an asset
+                // viewer; housekeeping does not get half the machine. Op latency is unaffected:
+                // a skipped tick still waits on the channel, so a user write is picked up the
+                // moment it arrives (the point of 147d4b5).
                 if !drain_enabled {
                     continue;
                 }
@@ -1654,83 +1426,7 @@ fn writer_main(
                             rescan_watched(&mut catalog, &ctx);
                         }
                     }
-                    idle_tick = idle_tick.wrapping_add(1);
-                    if !idle_tick.is_multiple_of(IDLE_DUTY_PERIOD) {
-                        return;
-                    }
-                    if idle_appraises {
-                        // The encode goes to a worker; the writer keeps only the two cheap ends
-                        // (read the queue slice here, persist the result when `EmbeddingsDone`
-                        // arrives). Passing `None` for the embedders below is what keeps the
-                        // pass's own embed drain out of this thread — the kick paths still run it
-                        // inline, because there the user asked for it and is watching a bar.
-                        if let Some(emb) = idle_embedder.clone() {
-                            if !embed_inflight.load(Ordering::Relaxed) {
-                                const SLICE: usize = 8;
-                                let (jobs, albedo) =
-                                    crate::drains::visual_embed_batch(&catalog, SLICE);
-                                if !jobs.is_empty() {
-                                    // Raised here and lowered by whoever ends the slice: the
-                                    // writer when `EmbeddingsDone` lands, or the guard itself when
-                                    // the worker panics, cannot send, or never starts.
-                                    let slice = Inflight::raise(&embed_inflight);
-                                    let (ws, cd) =
-                                        (ctx.workspace_dir.clone(), ctx.cache_dir.clone());
-                                    spawn_slice(slice, ctx.tx.clone(), move || {
-                                        let done = crate::drains::compute_visual_embeddings(
-                                            jobs,
-                                            &albedo,
-                                            emb.as_ref(),
-                                            ws.as_deref(),
-                                            cd.as_deref(),
-                                        );
-                                        let model_id = emb.model_id().to_string();
-                                        Some(WriterMsg::EmbeddingsDone { model_id, done })
-                                    });
-                                }
-                            }
-                        }
-                        // Tagging takes the same lane. The worker opens its own **read-only**
-                        // catalog connection for the user's taught vocabulary — WAL admits any
-                        // number of readers, and the single-writer rule is about writes
-                        // (ADR-0002), which still all land right here.
-                        if !tag_inflight.load(Ordering::Relaxed) {
-                            const TAG_SLICE: usize = 4;
-                            let jobs = crate::drains::tag_batch(&catalog, TAG_SLICE, None);
-                            if !jobs.is_empty() {
-                                let slice = Inflight::raise(&tag_inflight);
-                                let (ws, cd) = (ctx.workspace_dir.clone(), ctx.cache_dir.clone());
-                                let db = ctx.db_path.clone();
-                                let emb = idle_embedder.clone();
-                                let config = ctx.config.clone();
-                                spawn_slice(slice, ctx.tx.clone(), move || {
-                                    tag_worker_slice(&db, jobs, emb, ws, cd, &config)
-                                });
-                            }
-                        }
-                        pump.store(true, Ordering::Relaxed);
-                        // Its outcome is the catalog's: the mark below reads what it wrote.
-                        let _ = appraise_pass(
-                            &mut catalog,
-                            &ctx,
-                            None,
-                            idle_audio.clone(),
-                            std::time::Duration::from_secs(1),
-                            // The idle pass no longer tags inline — the worker above does it. An
-                            // empty explicit set means "no assets", which is the one thing it
-                            // cannot be confused with "everything".
-                            Some(&[]),
-                        );
-                        pump.store(false, Ordering::Relaxed);
-                    } else {
-                        drain_previews(
-                            &mut catalog,
-                            ctx.workspace_dir.as_deref(),
-                            ctx.cache_dir.as_deref(),
-                            proxy,
-                            std::time::Duration::from_secs(1),
-                        );
-                    }
+                    lane.tick(&mut catalog, &ctx, &pump);
                 });
                 // A panic inside the pass may have left the flag up; the next pass resets it.
                 pump.store(false, Ordering::Relaxed);
@@ -1760,8 +1456,7 @@ fn rebuild_watch(catalog: &Catalog) -> Option<lodestash_ingest::watch::RootWatch
 }
 
 /// One watch-driven rescan of every watched source: the incremental crawl (unchanged files skip
-/// BLAKE3 via `needs_rehash`), then the standard persist on this thread (single-writer rule —
-/// `persist_to_catalog` opens its own connection here exactly as `Op::PersistScan` does).
+/// BLAKE3 via `needs_rehash`), then the standard persist on this thread's own connection.
 /// Returns whether anything actually changed, so the UI only reloads when it did.
 fn rescan_watched(catalog: &mut Catalog, ctx: &WriterCtx) -> bool {
     let cfg = ctx.config.get();
@@ -1773,263 +1468,24 @@ fn rescan_watched(catalog: &mut Catalog, ctx: &WriterCtx) -> bool {
             continue;
         }
         let root = PathBuf::from(&info.root_path);
-        prefab_scopes.push(crate::drains::PrefabScope {
+        prefab_scopes.push(crate::appraise::PrefabScope {
             root: root.clone(),
             absent_is_empty: false,
         });
         let excludes = project
             .map(|p| cfg.source_excludes(p, &root))
             .unwrap_or_default();
-        match crate::persist::rescan_source(
-            &ctx.db_path,
-            catalog,
-            &info.root_path,
-            &info.name,
-            &excludes,
-        ) {
+        match crate::persist::rescan_source(catalog, &info.root_path, &info.name, &excludes) {
             Ok(persisted) => changed |= persisted,
             Err(e) => tracing::warn!(%e, root = %info.root_path, "watch rescan failed"),
         }
     }
     // A prefab is not an asset, so the crawl above never sees one change — yet the watch fired.
     // Re-read the watched trees' prefab evidence; only files whose revision moved are parsed.
-    if crate::drains::refresh_prefab_evidence(catalog, &prefab_scopes, false) > 0 {
+    if crate::appraise::refresh_prefab_evidence(catalog, &prefab_scopes, false) > 0 {
         changed = true;
     }
     changed
-}
-
-/// One bounded appraise pass (metrics → previews → deps → embeddings → promote) on the/// writer thread. Shared by the ✦ kicks and the auto-identify idle pass (B11a–c): embedders
-/// are resolved by the caller (the idle pass resolved them once at startup), everything else
-/// is re-derived here because it can change between passes. `progress` is the shared
-/// B11d surface the Identify screen polls — reset at pass start, filled by the tag/embed
-/// drains as they work.
-/// Compute one idle tagging slice off the writer thread: the `TagsDone` for the writer, or
-/// `None` when the slice has nothing to store. [`spawn_slice`] sends it and keeps the in-flight
-/// flag honest whichever it is — or if this panics.
-fn tag_worker_slice(
-    db_path: &std::path::Path,
-    jobs: Vec<lodestash_core::catalog::VisualEmbedJob>,
-    embedder: Option<std::sync::Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
-    workspace_dir: Option<std::path::PathBuf>,
-    cache_dir: Option<std::path::PathBuf>,
-    config: &ConfigStore,
-) -> Option<WriterMsg> {
-    // A read connection, only for the user's taught vocabulary — WAL admits any number of
-    // readers, and every write still lands on the writer thread (ADR-0002). Read-only by type:
-    // this used to be the migrating `Catalog::open` (review R5).
-    let Ok(cat) = Catalog::open_reader(db_path) else {
-        tracing::warn!("tag worker could not open a read connection; slice skipped");
-        return None;
-    };
-    let teach = cat
-        .teaching_traits()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(namespace, value, scope, usage_note)| TeachTrait {
-            namespace,
-            value,
-            scope,
-            usage_note,
-        })
-        .collect::<Vec<_>>();
-    let zero_shot = embedder.and_then(|e| ImageZeroShot::new(e, &teach));
-    let cfg = config.get();
-    // **The idle lane never spends money.** Cloud tagging needs `drain_api_tags` (backoff, local
-    // fallback, per-run cap) and that drain writes through `&mut Catalog`, so it belongs to the
-    // writer's kick path — this slice runs off-writer and can only reach `compute_tags`, which
-    // hands `OpenAiTagger` no image and would write empty tags. Beyond correctness it is the rule
-    // AI-PIPELINE §5.1 wants anyway: a background lane must not quietly bill an API, so a cloud
-    // pass is always an explicit, scoped, capped kick.
-    if cfg.api_tagging_enabled && !cfg.api_key.is_empty() && cfg.api_model.is_some() {
-        return None;
-    }
-    let tagger: Box<dyn Tagger> = if let Some(model) = cfg.tagger_model.clone() {
-        let mut t = OllamaTagger::new(model);
-        if let Some(vision) = cfg.tagger_vision_model.clone() {
-            t = t.with_vision(vision);
-        }
-        Box::new(t.with_teaching(teach.clone()))
-    } else {
-        Box::new(FilenameTagger)
-    };
-    // Resolved here, on the read connection: the compute phase below runs off the writer and has
-    // no catalog to ask what a model wears (v1 plan S08).
-    let slots = crate::drains::slot_textures_for(&jobs, |id| {
-        cat.model_slot_texture_paths(id, workspace_dir.as_deref())
-            .ok()
-    });
-    let done = crate::drains::compute_tags(
-        jobs,
-        tagger.as_ref(),
-        zero_shot.as_ref(),
-        workspace_dir.as_deref(),
-        cache_dir.as_deref(),
-        &slots,
-    );
-    Some(WriterMsg::TagsDone {
-        producers: crate::drains::TagProducers {
-            tagger: (tagger.producer_id(), tagger.model_id().to_string()),
-            zero_shot: zero_shot
-                .as_ref()
-                .map(|z| (z.producer_id().to_string(), z.model_id().to_string())),
-        },
-        done,
-    })
-}
-
-fn appraise_pass(
-    catalog: &mut Catalog,
-    ctx: &WriterCtx,
-    embedder: Option<std::sync::Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
-    audio_embedder: Option<std::sync::Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>>,
-    budget: std::time::Duration,
-    // The explicit set `identify_asset` was asked about, or `None` for the idle slice over
-    // the whole queue. Without it the op flagged the requested assets and then appraised the
-    // front of the global queue instead — 8,155 rows deep here, so the assets an agent asked
-    // about came back untouched while the call reported success.
-    only: Option<&[i64]>,
-) -> Result<WriteResult, String> {
-    // UI-SPEC §3: what the user is looking at goes first. Refreshed here rather than at each call
-    // site because every pass — the idle slice, ✦ Identify all, a per-card kick — must read the
-    // *current* focus: the one thing that makes the backlog follow the user is that it is re-read
-    // after they have moved. A poisoned lock is not worth failing an appraisal over; the queue then
-    // keeps whatever order it had, which is the pre-D3b behaviour and still correct.
-    if let Ok(f) = ctx.focus.lock() {
-        catalog.set_appraise_focus(f.clone());
-    }
-    let progress = ctx.appraise.as_ref();
-    progress.done.store(0, Ordering::Relaxed);
-    progress.total.store(0, Ordering::Relaxed);
-    progress.failed.store(0, Ordering::Relaxed);
-    progress.cancelled.store(false, Ordering::Relaxed);
-    let (cache_dir, workspace_dir) = (ctx.cache_dir.clone(), ctx.workspace_dir.clone());
-    let proxy = ctx.config.read(|c| c.preview_quality.proxy_budget());
-    let roots = catalog
-        .source_infos()
-        .map(|infos| {
-            infos
-                .into_iter()
-                .map(|i| (i.name, i.root_path))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    // B11 tail — the tagging half of the appraise pass (was unreachable: the desktop had no
-    // tagger resolver). The SigLIP embedder resolved above drives the visual zero-shot tagger,
-    // CLAP drives the audio one, and taught traits (Traits screen, AI-PIPELINE §6) become
-    // candidate labels. The captioning tagger resolves from settings: OpenAI-compatible endpoint
-    // (opt-in, AI-PIPELINE §5) → local Ollama VLM (AI-PIPELINE §2) → filename stub.
-    // Bounded per pass so a writer-thread kick never blocks writes on a long backlog — the
-    // remainder stays queued for the next kick / idle auto-identify slice.
-    // Nothing to tag → build no taggers. The block below encodes the **whole** zero-shot label
-    // vocabulary (67 labels, one SigLIP text pass each) and it used to run on every pass,
-    // including the once-a-second idle tick that usually has no work at all. That was free while
-    // no embedder would load; the moment one did, a trivial user write — staging an asset —
-    // went from 25 ms to **16.6 s**, because the single writer (ARCHITECTURE §5) was busy
-    // re-encoding the same 67 labels when the op arrived. One `LIMIT 1` query is the whole fix.
-    let has_tag_work = catalog
-        .assets_needing_tags_within(1, only)
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    if has_tag_work {
-        let teach = catalog
-            .teaching_traits()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(namespace, value, scope, usage_note)| TeachTrait {
-                namespace,
-                value,
-                scope,
-                usage_note,
-            })
-            .collect::<Vec<_>>();
-        let zero_shot = embedder.clone().and_then(|e| ImageZeroShot::new(e, &teach));
-        let audio_shot = audio_embedder.clone().and_then(AudioZeroShot::new);
-        let cfg = ctx.config.get();
-        let api_model = cfg
-            .api_model
-            .clone()
-            .filter(|_| cfg.api_tagging_enabled && !cfg.api_key.is_empty());
-        // The local tagger, built either way: on its own when no API model is configured, or as the
-        // cloud drain's per-asset fallback (AI-PIPELINE §5.1 "Local fallback on failure").
-        let local: Box<dyn Tagger> = if let Some(model) = cfg.tagger_model.clone() {
-            let mut t = OllamaTagger::new(model);
-            if let Some(vision) = cfg.tagger_vision_model.clone() {
-                t = t.with_vision(vision);
-            }
-            Box::new(t.with_teaching(teach.clone()))
-        } else {
-            Box::new(FilenameTagger)
-        };
-        match api_model {
-            // Cloud tagging goes through `drain_api_tags`, **not** the generic `drain_tags`.
-            // `drain_tags` → `compute_tags` passes `image: None` (the two-phase shape expects
-            // `caption()` to carry the picture) and `OpenAiTagger` has no `caption()` override, so
-            // that path made no HTTP request at all and wrote an empty tag set that cleared
-            // `tags_dirty` — assets marked done, never seen by any model. `drain_api_tags` is the
-            // drain written for this: it passes the image, honours `Retry-After` with backoff, falls
-            // back to the local model on a hard error, and caps the run.
-            Some(model) => {
-                let api = OpenAiTagger::new(cfg.api_base_url.clone(), cfg.api_key.clone(), model)
-                    .with_teaching(teach.clone());
-                crate::drains::drain_api_tags(
-                    catalog,
-                    &cfg,
-                    &api,
-                    Some(local.as_ref()),
-                    zero_shot.as_ref(),
-                    cfg.api_max_per_run,
-                    workspace_dir.as_deref(),
-                    cache_dir.as_deref(),
-                    progress,
-                    only,
-                );
-            }
-            None => drain_tags(
-                catalog,
-                local.as_ref(),
-                zero_shot.as_ref(),
-                workspace_dir.as_deref(),
-                cache_dir.as_deref(),
-                progress,
-                TAG_BUDGET_PER_PASS,
-                only,
-            ),
-        }
-        if let Some(az) = audio_shot.as_ref() {
-            drain_audio_tags(
-                catalog,
-                az,
-                workspace_dir.as_deref(),
-                progress,
-                AUDIO_TAG_BUDGET_PER_PASS,
-                // Same scope the visual drain gets. A kick on 64 images used to drag 48 unrelated
-                // audio clips through CLAP: the visual half took 328 ms and the slice took 20 min.
-                only,
-                Some(budget),
-            );
-        }
-    }
-    // Promotion and the vector/preview backfill still run every pass — they are the cheap,
-    // budgeted half, and promotion is what a pass exists to do.
-    let (counts, _assets, promoted) = drain_promote_resync(
-        catalog,
-        embedder,
-        audio_embedder,
-        workspace_dir.as_deref(),
-        cache_dir.as_deref(),
-        proxy,
-        &roots,
-        Some(budget),
-        only,
-    );
-    // changed = the appraised backlog size the pass reconciled; when counts are None
-    // (nothing moved) report 1 so the frontend toasts a real kick, not a silent no-op.
-    Ok(WriteResult {
-        changed: counts.map(|c| c.identified + c.unidentified).unwrap_or(1),
-        promoted,
-        ..Default::default()
-    })
 }
 
 /// Start the next queued `ExtractPackage`, **skipping any that fail before spawning a worker**.
@@ -2052,7 +1508,8 @@ fn start_next_extract(catalog: &mut Catalog, queue: &mut VecDeque<Job>, ctx: &Wr
     // Each failure is recorded as a failed job, and the registry publishes that itself. Each start
     // runs under the same supervision as any command, so a panicking one is a failed job too.
     drain_to_first_spawn(queue, &ctx.jobs, |op| {
-        supervised(|| run(catalog, op, ctx))
+        // A queued unpack runs when its turn comes, whoever asked for it.
+        supervised(|| run(catalog, op, Origin::Background, ctx))
             .map(|_| ())
             .map_err(|e| e.to_string())
     });
@@ -2078,15 +1535,22 @@ fn drain_to_first_spawn(
             Ok(()) => return failures, // a worker is running; its report drains the rest
             Err(e) => {
                 failures += 1;
+                // The reason is the job's error; it stays in the label too, which is all the
+                // old tray draws.
                 let h = jobs.start(format!("Extract failed — {e}"), "extract-failed", false);
-                jobs.finish(h.id, false, false, 0);
+                h.job.fail(e);
             }
         }
     }
     failures
 }
 
-fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, Refusal> {
+fn run(
+    catalog: &mut Catalog,
+    op: Op,
+    origin: Origin,
+    ctx: &WriterCtx,
+) -> Result<WriteResult, Refusal> {
     let jobs = &ctx.jobs;
     let done: Result<WriteResult, String> = match op {
         Op::SetFavorite { ids, on } => catalog
@@ -2203,9 +1667,8 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, Re
             })
         }
 
-        // `persist_to_catalog` opens its **own** connection, which would be a second writer
-        // anywhere else. Running it on this thread is what keeps the rule true: this thread's own
-        // connection sits idle for the duration, and no other job can interleave with it.
+        // A scan's rows are written through this thread's own connection, like every other
+        // write (it used to open a second one — review R5).
         // Browse persistence (INGESTION §2): the crawl already captured each `.unitypackage`'s
         // manifest locators — upsert the `package` row + record them, so the pack appears on
         // Unity Assets and extracts surgically without re-reading the archive.
@@ -2217,8 +1680,7 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, Re
                 .unwrap_or_else(|| "Import".to_string());
             let (_, job) = jobs.open(label, "import", false);
             let result = (|| {
-                crate::persist::persist_to_catalog(&ctx.db_path, &batches)
-                    .map_err(|e| e.to_string())?;
+                crate::persist::persist_scan(catalog, &batches)?;
                 for pack in packs {
                     let Some(source) = catalog
                         .source_info_by_root(&pack.root)
@@ -2245,18 +1707,18 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, Re
                 // queued would re-read it: re-read the scanned trees' prefab evidence here.
                 let scopes: Vec<_> = batches
                     .iter()
-                    .map(|b| crate::drains::PrefabScope {
+                    .map(|b| crate::appraise::PrefabScope {
                         root: PathBuf::from(&b.root),
                         absent_is_empty: false,
                     })
                     .collect();
-                crate::drains::refresh_prefab_evidence(catalog, &scopes, false);
+                crate::appraise::refresh_prefab_evidence(catalog, &scopes, false);
                 Ok(WriteResult {
                     changed,
                     ..Default::default()
                 })
             })();
-            job.finish(result.is_ok(), false, changed);
+            job.finish(ended(&result, changed, false));
             result
         }
 
@@ -2305,7 +1767,7 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, Re
                 })
             })();
             let inserted = result.as_ref().map(|r| r.changed).unwrap_or(0);
-            job.finish(result.is_ok(), false, inserted);
+            job.finish(ended(&result, inserted, false));
             result
         }
 
@@ -2485,60 +1947,34 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, Re
             })
             .map_err(|e| e.to_string()),
 
+        // The kicks. Each builds a plan and runs it inline, bounded so a long pass never holds
+        // every other write; what is left stays queued for the next kick or the idle lane.
         Op::IdentifyAll => {
-            // Manual appraise kick (✦ Identify all): resolve the embedders even when
-            // auto-identify is off — the user explicitly asked. No local models (SigLIP/CLAP
-            // absent) means nothing can be appraised; the pass still runs metrics/previews/
-            // promote and reports honestly. Bounded so a long pass never blocks writes.
+            // ✦ Identify all: the whole library.
             let (_, job) = jobs.open("Identify all".into(), "appraise", false);
-            let embedder = resolve_embedder();
-            let audio_embedder = resolve_audio_embedder();
-            if embedder.is_none() && audio_embedder.is_none() {
-                tracing::warn!("Identify all: no local embedder models — nothing can be appraised");
-            }
-            let result = appraise_pass(
-                catalog,
-                ctx,
-                embedder,
-                audio_embedder,
-                std::time::Duration::from_secs(20),
-                None,
-            );
+            let result = identify::kick(catalog, ctx, &AppraisePlan::kick(Scope::All, origin));
             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
-            job.finish(result.is_ok(), false, changed);
+            job.finish(ended(&result, changed, false));
             result
         }
 
         Op::IdentifyOne { asset_id } => {
-            // Per-card ✦ (B11b): the asset is flagged dirty, so the bounded pass picks it up
-            // (and whatever else was already pending — the pass reconciles the whole backlog,
-            // which is what "identify now" means honestly). No embedders → the flags still
-            // get set, so a later pass (or auto-identify) completes the appraise.
+            // Per-card ✦ (B11b): the asset is flagged, and the pass reconciles the whole backlog
+            // — the card the user clicked is on screen, so the focus order puts it first.
             catalog
                 .mark_for_identify(asset_id)
                 .map_err(|e| e.to_string())?;
             let (_, job) = jobs.open(format!("Identify asset {asset_id}"), "appraise", false);
-            let embedder = resolve_embedder();
-            let audio_embedder = resolve_audio_embedder();
-            if embedder.is_none() && audio_embedder.is_none() {
-                tracing::warn!("Identify asset {asset_id}: no local embedder models — flagged for a later pass");
-            }
-            let result = appraise_pass(
-                catalog,
-                ctx,
-                embedder,
-                audio_embedder,
-                std::time::Duration::from_secs(20),
-                None,
-            );
+            let result = identify::kick(catalog, ctx, &AppraisePlan::kick(Scope::All, origin));
             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
-            job.finish(result.is_ok(), false, changed);
+            job.finish(ended(&result, changed, false));
             result
         }
 
         Op::IdentifyIds { asset_ids } => {
-            // ENGINE-API §2 `identify_asset`: flag an explicit set, then ONE bounded pass so
-            // a bulk agent call is a single reconcile, not N kicks.
+            // ENGINE-API §2 `identify_asset`: flag an explicit set, then ONE pass confined to it,
+            // so a bulk agent call is a single reconcile of what it named — not N kicks, and not
+            // the front of the library's queue.
             for id in &asset_ids {
                 catalog.mark_for_identify(*id).map_err(|e| e.to_string())?;
             }
@@ -2547,24 +1983,10 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, Re
                 "appraise",
                 false,
             );
-            let embedder = resolve_embedder();
-            let audio_embedder = resolve_audio_embedder();
-            if embedder.is_none() && audio_embedder.is_none() {
-                tracing::warn!(
-                    "Identify {} assets: no local embedder models — flagged for a later pass",
-                    asset_ids.len()
-                );
-            }
-            let result = appraise_pass(
-                catalog,
-                ctx,
-                embedder,
-                audio_embedder,
-                std::time::Duration::from_secs(20),
-                Some(&asset_ids),
-            );
+            let plan = AppraisePlan::kick(Scope::Assets(asset_ids), origin);
+            let result = identify::kick(catalog, ctx, &plan);
             let changed = result.as_ref().map(|r| r.changed).unwrap_or(0);
-            job.finish(result.is_ok(), false, changed);
+            job.finish(ended(&result, changed, false));
             result
         }
 
@@ -2660,8 +2082,8 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, Re
                 // Moved into the worker: it reports back when the work is done, and by itself —
                 // as a failure — if the worker unwinds or the thread below never starts.
                 let report_back = PackReport::new(&ctx.tx, job, package_id, true);
-                let wcancel = handles.cancel;
                 let wprogress = handles.progress.expect("manifest jobs carry progress");
+                let wcancel = wprogress.clone();
                 let wpath = PathBuf::from(&pkg.package_path);
                 let wjobs = jobs.clone();
                 let spawned = std::thread::Builder::new()
@@ -2676,7 +2098,7 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, Re
                                     wprogress.done.store(done, Ordering::Relaxed);
                                     wprogress.total.store(total, Ordering::Relaxed);
                                     wjobs.progressed();
-                                    !report_cancel.load(Ordering::Relaxed)
+                                    !report_cancel.is_cancelled()
                                 };
                                 let read = read_manifest_with_progress(&wpath, &report)
                                     .map_err(|e| e.to_string())
@@ -2690,7 +2112,7 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, Re
                                             })
                                             .collect::<Vec<_>>()
                                     });
-                                let cancelled = wcancel.load(Ordering::Relaxed);
+                                let cancelled = wcancel.is_cancelled();
                                 // `read_manifest_with_progress` reports a cancel as an **error**, not as a
                                 // partial `Ok` (`read_manifest_with_progress_reports_and_cancels` asserts
                                 // exactly that) — so a `!cancelled` guard on the empty case alone was dead
@@ -2790,9 +2212,7 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, Re
             })
             .map_err(|e| e.to_string()),
 
-        // Batch undo opens its own connection on this thread (the same pattern as
-        // persist_to_catalog): the single-writer rule is about which *thread* writes, and this
-        // is still the writer — no other job can interleave with the delete.
+        // Batch undo runs on this thread's connection, like every other write.
         Op::UndoImportBatch { batch_id } => undo_import_batch(catalog, &batch_id),
 
         Op::DeleteCategory { id } => catalog
@@ -2900,6 +2320,10 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, Re
             })
             .map_err(|e| e.to_string()),
 
+        // Taken by the writer loop, which has the lane; never reaches here.
+        #[cfg(test)]
+        Op::IdleTurn => Ok(WriteResult::default()),
+
         #[cfg(test)]
         Op::Probe(p) => {
             if let Some(started) = &p.started {
@@ -2922,7 +2346,7 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, Re
                 ProbeEnd::Panic => panic!("a command panicked on purpose"),
             };
             if let Some(job) = job {
-                job.finish(result.is_ok(), false, changed);
+                job.finish(ended(&result, changed, false));
             }
             result
         }
@@ -2931,10 +2355,8 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, Re
 }
 
 /// Undo one import batch (UI-SPEC §16.1): delete the batch's copied files from the project,
-/// then its import_record rows — catalog assets are never touched. Runs on the writer thread
-/// over its own short-lived connection, so the single-writer rule holds (same pattern as
-/// persist_to_catalog); the connection does not run migrations (the writer's own catalog already
-/// did at spawn).
+/// then its import_record rows — catalog assets are never touched. Runs on the writer thread,
+/// over the writer's connection.
 /// Delete what one export run wrote, then forget the run (FEATURES §7.1).
 ///
 /// Every delete here is a file **this app created**, in a folder the user pointed it at, named in
@@ -3172,8 +2594,8 @@ fn spawn_extract_worker(
     // Moved into the worker: it reports back when the work is done, and by itself — as a
     // failure — if the worker unwinds or the thread below never starts.
     let report_back = PackReport::new(tx, job, pkg.id, false);
-    let wcancel = handles.cancel;
     let wprogress = handles.progress.expect("extract jobs carry progress");
+    let wcancel = wprogress.clone();
     let wpath = PathBuf::from(&pkg.package_path);
     let wworkspace = workspace_dir.to_path_buf();
     let wjobs = jobs.clone();
@@ -3191,11 +2613,11 @@ fn spawn_extract_worker(
                     wprogress.done.store(done, Ordering::Relaxed);
                     wprogress.total.store(total, Ordering::Relaxed);
                     wjobs.progressed();
-                    !report_cancel.load(Ordering::Relaxed)
+                    !report_cancel.is_cancelled()
                 };
                 let placed = extract_at_offsets_with_progress(&wpath, &wworkspace, wanted, &report)
                     .map_err(|e| e.to_string());
-                let cancelled = wcancel.load(Ordering::Relaxed);
+                let cancelled = wcancel.is_cancelled();
                 // "Extracted nothing" is a failure — unless the user cancelled before the first
                 // payload landed, which is a cancel, not a fault, and must not surface as an error
                 // toast for pressing Cancel.
@@ -3266,9 +2688,9 @@ fn materialize_extract(
     }
     // The extraction landed prefabs beside the assets, and they are evidence about those assets.
     if let Some(ws) = workspace {
-        crate::drains::refresh_prefab_evidence(
+        crate::appraise::refresh_prefab_evidence(
             catalog,
-            &[crate::drains::PrefabScope {
+            &[crate::appraise::PrefabScope {
                 root: ws,
                 absent_is_empty: true,
             }],
@@ -4161,7 +3583,7 @@ mod tests {
             "start is a jobs change: {started:?}"
         );
         jobs.progressed();
-        jobs.finish(h.id, true, false, 3);
+        jobs.finish(h.id, Outcome::Done { changed: 3 });
         let finished = jobs.changes().take_pending();
         assert!(finished.jobs && !finished.catalog, "{finished:?}");
         assert_eq!(
@@ -4201,7 +3623,7 @@ mod tests {
 
         // Reported, it ends as reported — and only once.
         let (_, job) = jobs.open("Import".into(), "import", false);
-        job.finish(true, false, 7);
+        job.finish(Outcome::Done { changed: 7 });
         let tray = jobs.snapshot();
         assert_eq!(tray.recent.len(), 2);
         assert!(tray.recent[0].ok && tray.recent[0].changed == 7);
@@ -4277,6 +3699,7 @@ mod tests {
 
         let db = dir.path().join("catalog.db");
         let mut catalog = Catalog::open(&db).expect("open");
+        catalog.seed_media_types().expect("seed");
         catalog
             .upsert_import_source("lib", &root_str, "folder")
             .expect("source");
@@ -4285,11 +3708,13 @@ mod tests {
             db_path: db.clone(),
             tx,
             jobs: JobRegistry::default(),
+            models: Models::fixed(None, None),
             appraise: Default::default(),
             focus: Default::default(),
             cache_dir: None,
             workspace_dir: None,
             config: Arc::new(ConfigStore::in_memory()),
+            graph_due: AtomicBool::new(false),
         };
 
         assert!(
@@ -4331,6 +3756,70 @@ mod tests {
         );
     }
 
+    /// ADR-0014: the backlog lane takes one quiet second in four — the backfills it gained with
+    /// the plan (review B4) included. Three ticks leave a freshly scanned model unmeasured; the
+    /// fourth measures it.
+    #[test]
+    fn the_idle_lane_works_one_tick_in_four() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let root = dir.path().join("lib");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        crate::appraise::testkit::write_obj(&root.join("crate.obj"));
+
+        let db = dir.path().join("catalog.db");
+        let mut catalog = Catalog::open(&db).expect("open");
+        catalog.seed_media_types().expect("seed");
+        let source = catalog
+            .upsert_import_source("lib", &root.to_string_lossy(), "folder")
+            .expect("source");
+        catalog
+            .record_crawl(
+                source,
+                None,
+                &[lodestash_core::catalog::CrawlRecord {
+                    rel_path: "crate.obj".into(),
+                    name: "crate.obj".into(),
+                    media_type: "model_3d".into(),
+                    size_bytes: 1,
+                    mtime: 1,
+                    workspace_rel: None,
+                    content_hash: None,
+                }],
+            )
+            .expect("crawl");
+        let (tx, _inbox) = mpsc::sync_channel(4);
+        let ctx = WriterCtx {
+            db_path: db.clone(),
+            tx,
+            jobs: JobRegistry::default(),
+            models: Models::fixed(None, None),
+            appraise: Default::default(),
+            focus: Default::default(),
+            cache_dir: Some(dir.path().join("cache")),
+            workspace_dir: None,
+            config: Arc::new(ConfigStore::in_memory()),
+            graph_due: AtomicBool::new(false),
+        };
+        let mut lane = identify::IdleLane::new(&ctx);
+        let pump = AtomicBool::new(false);
+        let queued = |catalog: &Catalog| catalog.assets_needing_metrics(1).expect("queue").len();
+
+        for tick in 1..identify::IDLE_DUTY_PERIOD {
+            lane.tick(&mut catalog, &ctx, &pump);
+            assert_eq!(
+                queued(&catalog),
+                1,
+                "tick {tick} of four did the lane's work"
+            );
+        }
+        lane.tick(&mut catalog, &ctx, &pump);
+        assert_eq!(
+            queued(&catalog),
+            0,
+            "the fourth tick did not measure the model"
+        );
+    }
+
     /// The embed and tag lanes run one slice at a time behind an in-flight flag that only the
     /// slice's result landing on the writer used to lower. A worker that panicked, had nothing
     /// to send, or found the writer gone must lower it too, or the lane never runs again.
@@ -4355,6 +3844,7 @@ mod tests {
         // Handed to the writer, the flag stays up: the writer lowers it when the result lands.
         let msg = || {
             Some(WriterMsg::EmbeddingsDone {
+                stage: Stage::VisualEmbed,
                 model_id: "m".into(),
                 done: Vec::new(),
             })

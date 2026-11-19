@@ -13,11 +13,12 @@ use std::time::{Duration, Instant};
 
 use lodestash_core::catalog::{AppraiseFocus, Catalog};
 
+use crate::appraise::Models;
 use crate::changes::{ChangedEvent, PUBLISH_WINDOW};
 use crate::config_store::ConfigStore;
-use crate::jobs::JobProgress;
+use crate::jobs::{JobProgress, JobRegistry};
 use crate::read_model::Library;
-use crate::writer::{JobRegistry, WriterHandle, WriterSetup};
+use crate::writer::{WriterHandle, WriterSetup};
 
 /// Every path one engine uses. The engine reads no process-wide location itself: the desktop
 /// passes the OS defaults ([`Self::os_default`]), a test passes a temp dir ([`Self::under`]).
@@ -262,6 +263,11 @@ impl Engine {
     /// `catalog_locked` instead of migrating it concurrently. Then the writer thread opens —
     /// creating or migrating — the catalog and reports `Ready`; [`Self::wait_settled`] waits for it.
     pub fn start(cfg: EngineConfig) -> Engine {
+        Self::start_with(cfg, Models::installed())
+    }
+
+    /// [`Self::start`], with the embedders given rather than loaded from the model directory.
+    pub(crate) fn start_with(cfg: EngineConfig, models: Models) -> Engine {
         let status = Arc::new(StatusCell::new(EngineStatus::Starting));
         // The lock first: only the engine that owns the catalog may write the config. A second
         // instance that was refused reads `config.json` but cannot save it — its copy goes stale
@@ -297,6 +303,7 @@ impl Engine {
                 lock,
                 status: status.clone(),
                 jobs: jobs.clone(),
+                models,
                 pump: pump.clone(),
                 appraise: appraise.clone(),
                 focus: focus.clone(),
@@ -510,7 +517,7 @@ impl Engine {
         self.inner.jobs.changes().catalog_generation()
     }
 
-    /// The job tray (B2b).
+    /// The one job registry (v2 spec §4.1): the tray reads it, and so does the HTTP API.
     pub fn jobs(&self) -> &JobRegistry {
         &self.inner.jobs
     }

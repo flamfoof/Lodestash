@@ -19,6 +19,8 @@ lodestash-ai     = { workspace = true }
 lodestash-protocol = { workspace = true }
 serde            = { workspace = true }
 serde_json       = { workspace = true }
+# A job's public id (`<kind>_<uuid>`) — the one job registry lives here (v2 spec §4.1).
+uuid             = { workspace = true }
 tracing          = { workspace = true }
 # The change feed (`Engine::subscribe`): a broadcast channel any number of listeners — the shell's
 # event bridge now, the SSE route from P3 — can hold. Only `tokio::sync` is used; no runtime runs

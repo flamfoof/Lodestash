@@ -1,6 +1,9 @@
 # ADR-0013 — Model inference runs off the writer thread
 
 - **Status:** accepted (2026-08-30)
+- **Amended by:** [ADR-0026](ADR-0026-one-appraisal-plan-and-a-stage-owns-its-media.md) — the
+  decision stands; the idle pass is no longer told with an empty scope, the audio stages leave the
+  writer too, and the store phase is `store_embeddings`
 - **Relates to:** [ADR-0002](ADR-0002-single-writer-thread.md) (one writer),
   [ADR-0008](ADR-0008-appraisal-is-a-background-job.md) (appraisal is a background job),
   [`ARCHITECTURE.md`](../ARCHITECTURE.md) §5, [`AI-PIPELINE.md`](../AI-PIPELINE.md) §2

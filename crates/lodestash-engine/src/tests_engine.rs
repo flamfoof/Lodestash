@@ -709,7 +709,9 @@ fn workspace_reclaim_waits_for_a_running_extraction() {
     );
     assert!(landed.exists() && partial.exists());
 
-    engine.jobs().finish(job.id, true, false, 0);
+    engine
+        .jobs()
+        .finish(job.id, crate::jobs::Outcome::Done { changed: 0 });
     let out = crate::storage::reclaim_workspace(&engine).expect("reclaim after the extraction");
     assert_eq!(out.removed, 2);
     assert!(!landed.exists());
@@ -1322,4 +1324,108 @@ fn the_default_catalog_keeps_its_workspace_however_its_path_is_spelled() {
         folder.join("other.db.workspace"),
         "a different file in the same folder is a different catalog"
     );
+}
+
+/// Review R1: the tray recorded that a job failed and dropped why — an unpack that could not
+/// read its archive was a ✕ with no reason. The worker's own words are on the job now, and it is
+/// the same job `get_job_status` is asked about, by its public id.
+#[test]
+fn an_unpack_that_fails_says_why_on_its_job() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (engine, cfg) = started(dir.path());
+    let packs = dir.path().join("packs");
+    std::fs::create_dir_all(&packs).expect("packs");
+    // Catalogued, and gone from disk before anyone unpacked it.
+    let gone = packs.join("Gone.unitypackage");
+    engine
+        .writer()
+        .run(Op::ImportPacks {
+            root: packs.to_string_lossy().into_owned(),
+            packs: vec![crate::writer::ImportPack {
+                abs_path: gone.to_string_lossy().into_owned(),
+                name: "Gone".into(),
+                publisher: None,
+                category: None,
+                entries: Vec::new(),
+            }],
+        })
+        .expect("import");
+    let package_id = Catalog::open_reader(&cfg.catalog)
+        .expect("reader")
+        .list_packages()
+        .expect("packages")[0]
+        .id;
+
+    engine
+        .writer()
+        .run(Op::ExtractPackage { package_id })
+        .expect("an unpack is accepted; its outcome is its job's");
+    let deadline = std::time::Instant::now() + SETTLE;
+    while !engine.jobs().snapshot().active.is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the unpack never ended"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let tray = engine.jobs().snapshot();
+    let unpack = tray
+        .recent
+        .iter()
+        .find(|j| j.kind == "extract")
+        .expect("the unpack's job");
+    assert_eq!((unpack.state, unpack.ok), ("failed", false));
+    let why = unpack.error.clone().expect("a failed job says why");
+    assert!(!why.trim().is_empty());
+    let by_id = engine.jobs().get(&unpack.job_id).expect("by its public id");
+    assert_eq!(by_id.error(), Some(why));
+}
+
+/// Review R5, made a check: the engine opens **one** writing connection — the writer's — and
+/// everything else reads. A scan's persist used to open a second, migrating `Catalog::open` on
+/// every scan and every watch rescan (v2 plan Task 2.5). The rule is a property of the source, so
+/// this reads the source: outside test code, `Catalog::open(` appears once, where the writer
+/// opens its catalog.
+#[test]
+fn the_engine_opens_one_writing_connection() {
+    fn sources(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("src") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    sources(&src, &mut files);
+
+    let mut opens = Vec::new();
+    for file in files {
+        let name = file.file_name().expect("name").to_string_lossy();
+        if name.starts_with("tests") || name == "testkit.rs" {
+            continue;
+        }
+        // A file's own unit tests open scratch catalogs freely; they follow its code.
+        let text = std::fs::read_to_string(&file)
+            .expect("read")
+            .replace("\r\n", "\n");
+        let code = text.split("#[cfg(test)]\nmod tests").next().unwrap_or("");
+        for (i, line) in code.lines().enumerate() {
+            let line = line.trim_start();
+            if line.contains("Catalog::open(") && !line.starts_with("//") {
+                let rel = file.strip_prefix(&src).expect("under src");
+                opens.push(format!("{}:{}", rel.display(), i + 1).replace('\\', "/"));
+            }
+        }
+    }
+    assert_eq!(
+        opens.len(),
+        1,
+        "writing opens outside the writer's own: {opens:?}"
+    );
+    assert!(opens[0].starts_with("writer/mod.rs:"), "{opens:?}");
 }

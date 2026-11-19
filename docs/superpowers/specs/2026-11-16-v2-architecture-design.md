@@ -109,6 +109,18 @@ to top-level `web/`: it is a client of `/v1`, not a Tauri frontend.
   (hash + mtime) still matches what the lane read (fixes B7).
 - **One job registry** (replaces three): id, kind, origin, progress, state
   (`queued|running|awaiting_approval|done|failed|cancelled`), error text on failure.
+  - *As built (2026-11-19, plan Task 2.5):* `crates/lodestash-engine/src/jobs.rs` —
+    `JobRegistry`, `Job`, `JobState`, `Outcome`, and the R.2 guard (`JobGuard`), which now ends
+    an abandoned job as failed *with a reason*. A job has a public id (`<kind>_<uuid>`, what
+    `/v1/jobs/{id}` takes) and a number (the tray's). The tray (`JobRegistry::snapshot`) and
+    `lodestash-api`'s `Jobs` are views over it; the app hands its registry to the API state
+    (`ServerState::with_jobs`). The wire keeps `error` for `failed` (`/v1` only grows). The
+    registry keeps every job of the session; the tray shows the unfinished ones and the last 20.
+    **Still two records for one piece of work:** `identify_asset` and `unpack_package` open an
+    agent job, and the writer command they send opens its own (`appraise`, `extract`) — and the
+    `unpack` job is `done` when the unpack is *accepted*; the outcome is the `extract` job's.
+    Making the writer adopt the caller's job needs the command to carry it, which belongs with
+    Task 3.1 (the agent plane's domain half moving into the engine).
 - **Change bus:** the existing mark-then-publish design (ADR-0016) moves here unchanged in
   behaviour: catalog and job generations, origins, at most one publication per 250 ms. It feeds
   `/v1/events` and the read model.
@@ -233,6 +245,27 @@ origin }` replaces the overloaded `only: Option<&[i64]>`. Stage order is fixed i
 metrics → dependencies → previews → audio embed → audio tags → image/3D embed → tags → promote.
 Audio rows are excluded from the generic tag stage (fixes B5). The idle lane builds a plan with
 all backfill stages (fixes B4).
+
+*As built (2026-11-19, plan Task 2.5;
+[ADR-0026](../../decisions/ADR-0026-one-appraisal-plan-and-a-stage-owns-its-media.md);
+`AI-PIPELINE.md` §2.2 owns the behaviour):* `crates/lodestash-engine/src/appraise/plan.rs` —
+`AppraisePlan`, `Scope` (core's `AppraiseScope`, where the SQL is), `Stage`, `Stages`, `Budget`,
+and `run`, the one function that orders stages (`Stage::ORDER`).
+
+- **Scope confines every stage**, promotion included; an empty set runs nothing. A scoped pass
+  runs the backfills for its assets. The dependency graph reconcile alone is library-wide: a
+  scoped pass harvests and leaves it due.
+- **Budget** is `Unbounded`, `PerStage` (a kick: 20 s each) or `Pass` (an idle slice: one second
+  in all), tested before every unit; the generic tag stage is bounded by a count.
+- **The idle lane** builds `AppraisePlan::idle(identify)`: metrics, dependencies, previews and
+  promote always — with `auto_identify` off too — and the four model stages when it is on and a
+  model is installed. The plan hands model stages to the lane (`Offload`), which runs each as one
+  off-writer slice; the empty-scope signal is gone. The audio stages gained the read / compute /
+  store split the visual ones had.
+- **B3 is fixed here, not in P8:** the preview queue leaves out a model still inside its package,
+  and the preview stage resolves a job without pulling.
+- Not built: recording a stage's *failure* (B6) and stamping results against the content they were
+  computed from (B7) — both need a schema addition (P8).
 
 ## 5. The operation catalog (`lodestash-protocol`)
 
@@ -483,7 +516,7 @@ declares a longer budget (the existing CSV report per run is kept).
 | S2 dead consent toggles | §4.5 typed Settings DTO from protocol |
 | S3 Remove from Library errors | engine port of the op, regression test |
 | B1, B2 move/rename | core `reconcile_moves` fix (repoint present set; one-to-one hash matching) |
-| B4, B5 idle lane, audio tags | §4.6 AppraisePlan |
+| B3, B4, B5 in-pack previews, idle lane, audio tags | §4.6 AppraisePlan |
 | B6, B7 failures recorded as done | §4.1 content stamp; per-stage failure state (phase 8) |
 | B8 IPv6/underscore producer | canonical producer id in `lodestash-ai` |
 | B11 `./` archives | ingest path normalisation |
@@ -499,7 +532,8 @@ declares a longer budget (the existing CSV report per run is kept).
 | U11 | §6 bytes |
 | R6 UI-thread IPC | §2/§6: the UI talks async HTTP |
 
-B3 (in-pack preview re-inflation) and B9 (zero vectors) are fixed in phase 8 with R8.
+B9 (zero vectors) is fixed in phase 8 with R8. (B3, in-pack preview re-inflation, was planned for
+phase 8 and is fixed with the plan — §4.6.)
 
 ## 13. Phases
 

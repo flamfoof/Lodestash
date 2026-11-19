@@ -382,24 +382,53 @@ const KEEP_GOOD_VECTOR: &str = "embedding_dirty = CASE
      WHEN EXISTS (SELECT 1 FROM asset_embedding e WHERE e.asset_id = asset.id)
              THEN embedding_dirty ELSE 1 END";
 
-/// The `AND a.id IN (...)` clause an `identify_asset` kick needs, or empty for a general pass.
+/// Which assets an appraisal pass may work on (v2 spec §4.6).
 ///
-/// Four queues have now needed this — visual tags, audio tags, visual embeddings, audio
-/// embeddings — because one appraise pass drains all of them and a *scoped* kick must not drag the
-/// rest of the library through. Each one was found separately, the expensive way: a kick on 64
-/// images spent 20 minutes on unrelated audio and previews while its own work took 342 ms.
-///
-/// Ids are inlined rather than bound: an id list is a variable-length set of `i64`s the caller
-/// already holds, never user text.
-fn scope_clause(only: Option<&[i64]>) -> String {
-    match only {
-        Some(ids) if !ids.is_empty() => format!(
-            "AND a.id IN ({})",
-            ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
-        ),
-        // An explicit *empty* set asks for nothing, which is not the same as "everything".
-        Some(_) => "AND 0".to_string(),
-        None => String::new(),
+/// Every appraisal queue takes one, and so does the status reconcile — because one pass drains
+/// all of them and a *scoped* kick must not drag the rest of the library through. Each queue
+/// learned that separately, the expensive way: a kick on 64 images spent 20 minutes on unrelated
+/// audio and previews while its own work took 342 ms.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AppraiseScope {
+    /// The whole library.
+    #[default]
+    All,
+    /// Exactly these assets. An empty list is **no** assets — never "everything".
+    Assets(Vec<i64>),
+    /// The assets of one `import_source`.
+    Source(i64),
+    /// The assets that came out of one `package`.
+    Package(i64),
+}
+
+impl AppraiseScope {
+    /// Does this scope name the whole library?
+    pub fn is_all(&self) -> bool {
+        matches!(self, Self::All)
+    }
+
+    /// Can no asset be in this scope? Only an explicit empty set is known to be empty without
+    /// asking the catalog.
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Assets(ids) if ids.is_empty())
+    }
+
+    /// The `AND …` clause that keeps a query inside this scope, over the `asset` table named
+    /// `asset` (its alias, or `asset` itself). Empty for the whole library.
+    ///
+    /// Ids are inlined rather than bound: they are `i64`s the caller already holds, never user
+    /// text, and a bound list would need placeholders generated per call.
+    fn clause(&self, asset: &str) -> String {
+        match self {
+            Self::All => String::new(),
+            Self::Assets(ids) if ids.is_empty() => "AND 0".to_string(),
+            Self::Assets(ids) => format!(
+                "AND {asset}.id IN ({})",
+                ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+            ),
+            Self::Source(id) => format!("AND {asset}.source_id = {id}"),
+            Self::Package(id) => format!("AND {asset}.package_id = {id}"),
+        }
     }
 }
 
@@ -1590,7 +1619,14 @@ impl Catalog {
     /// and that still reads as `identified` here. Filter those out when a zero vector
     /// starts costing something (a wrong search hit, a wrong count).
     pub fn promote_statuses(&self) -> Result<Vec<i64>> {
+        self.promote_statuses_within(&AppraiseScope::All)
+    }
+
+    /// [`Self::promote_statuses`] over the assets in `scope` only: a pass asked about three
+    /// assets reconciles — and reports as promoted — those three.
+    pub fn promote_statuses_within(&self, scope: &AppraiseScope) -> Result<Vec<i64>> {
         let now = unix_now();
+        let scope = scope.clause("asset");
         let mut changed = 0usize;
         for sql in [
             // Demote first: a stale embedding means the asset is no longer identified.
@@ -1606,7 +1642,7 @@ impl Catalog {
         ] {
             changed += self
                 .conn
-                .execute(sql, params![now])
+                .execute(&format!("{sql} {scope}"), params![now])
                 .map_err(|e| CoreError::Catalog(format!("promote_statuses: {e}")))?;
         }
         // Capture the promotion candidates first so the pass can hand the appraised set to the
@@ -1614,13 +1650,14 @@ impl Catalog {
         let promoted: Vec<i64> = {
             let mut stmt = self
                 .conn
-                .prepare(
+                .prepare(&format!(
                     "SELECT id FROM asset
                      WHERE deleted_at IS NULL AND status IN ('discovered', 'indexed')
                        AND embedding_dirty = 0
                        AND EXISTS (SELECT 1 FROM asset_embedding e WHERE e.asset_id = asset.id)
-                       AND EXISTS (SELECT 1 FROM asset_tag t WHERE t.asset_id = asset.id)",
-                )
+                       AND EXISTS (SELECT 1 FROM asset_tag t WHERE t.asset_id = asset.id)
+                     {scope}"
+                ))
                 .map_err(|e| CoreError::Catalog(format!("promote candidates: {e}")))?;
             let ids = stmt
                 .query_map([], |r| r.get(0))
@@ -1631,11 +1668,14 @@ impl Catalog {
         changed += self
             .conn
             .execute(
-                "UPDATE asset SET status = 'identified', updated_at = ?1
-                 WHERE deleted_at IS NULL AND status IN ('discovered', 'indexed')
-                   AND embedding_dirty = 0
-                   AND EXISTS (SELECT 1 FROM asset_embedding e WHERE e.asset_id = asset.id)
-                   AND EXISTS (SELECT 1 FROM asset_tag t WHERE t.asset_id = asset.id)",
+                &format!(
+                    "UPDATE asset SET status = 'identified', updated_at = ?1
+                     WHERE deleted_at IS NULL AND status IN ('discovered', 'indexed')
+                       AND embedding_dirty = 0
+                       AND EXISTS (SELECT 1 FROM asset_embedding e WHERE e.asset_id = asset.id)
+                       AND EXISTS (SELECT 1 FROM asset_tag t WHERE t.asset_id = asset.id)
+                     {scope}"
+                ),
                 params![now],
             )
             .map_err(|e| CoreError::Catalog(format!("promote_statuses: {e}")))?;
@@ -3021,16 +3061,16 @@ impl Catalog {
     /// (`disk_path = root_path/rel_path`) *and* package-extracted files (`workspace_rel` set —
     /// the caller joins it onto the workspace dir). `missing` rows excluded.
     pub fn visual_assets_needing_embedding(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
-        self.visual_assets_needing_embedding_within(limit, None)
+        self.visual_assets_needing_embedding_within(limit, &AppraiseScope::All)
     }
 
-    /// The visual embed queue, optionally restricted to an explicit set — see [`scope_clause`].
+    /// The visual embed queue within `scope`.
     pub fn visual_assets_needing_embedding_within(
         &self,
         limit: usize,
-        only: Option<&[i64]>,
+        scope: &AppraiseScope,
     ) -> Result<Vec<VisualEmbedJob>> {
-        let scope = scope_clause(only);
+        let scope = scope.clause("a");
         let mut stmt = self
             .conn
             .prepare(&format!(
@@ -3080,7 +3120,7 @@ impl Catalog {
     /// §110). Its own queue rather than a filter over `assets_needing_tags`, so the audio pass loops
     /// to completion instead of spinning on a batch of non-audio rows it can't clear.
     pub fn audio_assets_needing_tags(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
-        self.audio_assets_needing_tags_within(limit, None)
+        self.audio_assets_needing_tags_within(limit, &AppraiseScope::All)
     }
 
     /// The audio tag queue, optionally **restricted to an explicit set** — the sibling of
@@ -3094,9 +3134,9 @@ impl Catalog {
     pub fn audio_assets_needing_tags_within(
         &self,
         limit: usize,
-        only: Option<&[i64]>,
+        scope: &AppraiseScope,
     ) -> Result<Vec<VisualEmbedJob>> {
-        let scope = scope_clause(only);
+        let scope = scope.clause("a");
         let mut stmt = self
             .conn
             .prepare(&format!(
@@ -3140,16 +3180,16 @@ impl Catalog {
     }
 
     pub fn audio_assets_needing_embedding(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
-        self.audio_assets_needing_embedding_within(limit, None)
+        self.audio_assets_needing_embedding_within(limit, &AppraiseScope::All)
     }
 
-    /// The audio embed queue, optionally restricted to an explicit set — see [`scope_clause`].
+    /// The audio embed queue within `scope`.
     pub fn audio_assets_needing_embedding_within(
         &self,
         limit: usize,
-        only: Option<&[i64]>,
+        scope: &AppraiseScope,
     ) -> Result<Vec<VisualEmbedJob>> {
-        let scope = scope_clause(only);
+        let scope = scope.clause("a");
         let mut stmt = self
             .conn
             .prepare(&format!(
@@ -3196,6 +3236,16 @@ impl Catalog {
     /// dispatches per type. Same path rules and job shape as the embedding queues (on-disk
     /// `disk_path`, or `workspace_rel` for package-extracted payloads); `missing` rows excluded.
     pub fn assets_needing_metrics(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
+        self.assets_needing_metrics_within(limit, &AppraiseScope::All)
+    }
+
+    /// The metrics queue within `scope`.
+    pub fn assets_needing_metrics_within(
+        &self,
+        limit: usize,
+        scope: &AppraiseScope,
+    ) -> Result<Vec<VisualEmbedJob>> {
+        let scope = scope.clause("a");
         let mut stmt = self
             .conn
             .prepare(&format!(
@@ -3212,6 +3262,7 @@ impl Catalog {
                  LEFT JOIN package pk       ON pk.id = pe.package_id
                  WHERE a.metrics_dirty = 1 AND a.deleted_at IS NULL
                    AND af.missing = 0
+                 {scope}
                  {order} LIMIT ?1",
                 order = self.appraise_focus.order_by("a.id")
             ))
@@ -3240,6 +3291,16 @@ impl Catalog {
     /// rules as the other queues; `missing` rows excluded. The scanner needs the on-disk path
     /// because the `.meta` lives *beside* the asset, not inside the catalog.
     pub fn assets_needing_dep_scan(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
+        self.assets_needing_dep_scan_within(limit, &AppraiseScope::All)
+    }
+
+    /// The dependency-scan queue within `scope`.
+    pub fn assets_needing_dep_scan_within(
+        &self,
+        limit: usize,
+        scope: &AppraiseScope,
+    ) -> Result<Vec<VisualEmbedJob>> {
+        let scope = scope.clause("a");
         let mut stmt = self
             .conn
             .prepare(&format!(
@@ -3256,6 +3317,7 @@ impl Catalog {
                  LEFT JOIN package pk       ON pk.id = pe.package_id
                  WHERE a.deps_dirty = 1 AND a.deleted_at IS NULL
                    AND af.missing = 0
+                 {scope}
                  {order} LIMIT ?1",
                 order = self.appraise_focus.order_by("a.id")
             ))
@@ -4791,14 +4853,17 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("set_description: {e}")))
     }
 
-    /// How many assets still await tagging — the job tray's total, so a run shows a real bar
-    /// instead of a spinner.
+    /// How many assets still await the generic tag stage — the job tray's total, so a run shows
+    /// a real bar instead of a spinner, and the number a cloud cost estimate multiplies. The same
+    /// queue [`Self::assets_needing_tags`] hands out: audio is the audio stage's, not counted here.
     pub fn count_needing_tags(&self) -> Result<i64> {
         self.conn
             .query_row(
                 "SELECT COUNT(*) FROM asset a
                    JOIN asset_file af ON af.id = a.primary_file_id
-                  WHERE a.tags_dirty = 1 AND a.deleted_at IS NULL AND af.missing = 0",
+                   JOIN media_type mt ON mt.id = a.media_type_id
+                  WHERE a.tags_dirty = 1 AND a.deleted_at IS NULL AND af.missing = 0
+                    AND mt.code <> 'audio'",
                 [],
                 |r| r.get(0),
             )
@@ -5381,24 +5446,30 @@ impl Catalog {
             .map_err(|e| CoreError::Catalog(format!("set_trait_style: {e}")))
     }
 
-    /// Assets still awaiting identification (`tags_dirty`), for the tagging drain. Same job shape
-    /// and path rules as the other queues.
+    /// Assets still awaiting the **generic** tag stage (`tags_dirty`). Same job shape and path
+    /// rules as the other queues.
+    ///
+    /// **Audio is not in it** (review B5). A clip's tags come from the audio stage
+    /// ([`Self::audio_assets_needing_tags`]), and one flag serves both stages: while audio sat in
+    /// this queue, whichever tagger ran first — one that reads file names, or a vision model that
+    /// answers "nothing" for a sound — finished the clip, and the audio stage then found nothing
+    /// queued. A clip no audio model has tagged stays queued until one does.
     pub fn assets_needing_tags(&self, limit: usize) -> Result<Vec<VisualEmbedJob>> {
-        self.assets_needing_tags_within(limit, None)
+        self.assets_needing_tags_within(limit, &AppraiseScope::All)
     }
 
-    /// The tag queue, optionally **restricted to an explicit set** of assets.
+    /// The generic tag queue within `scope`.
     ///
-    /// `identify_asset(ids)` needs this. Without it the op flagged the requested assets and then
-    /// ran a generic bounded pass, which takes the front of the *global* queue — 8,155 rows deep
-    /// on the reference library, ordered by the appraise focus — so the three assets an agent
+    /// `identify_asset(ids)` needs the scope. Without it the op flagged the requested assets and
+    /// then ran a generic bounded pass, which takes the front of the *global* queue — 8,155 rows
+    /// deep on the reference library, ordered by the appraise focus — so the three assets an agent
     /// asked about were nowhere near it and came back untouched while the call reported success.
     pub fn assets_needing_tags_within(
         &self,
         limit: usize,
-        only: Option<&[i64]>,
+        scope: &AppraiseScope,
     ) -> Result<Vec<VisualEmbedJob>> {
-        let scope = scope_clause(only);
+        let scope = scope.clause("a");
         let mut stmt = self
             .conn
             .prepare(&format!(
@@ -5415,6 +5486,7 @@ impl Catalog {
                  LEFT JOIN package pk       ON pk.id = pe.package_id
                  WHERE a.tags_dirty = 1 AND a.deleted_at IS NULL
                    AND af.missing = 0
+                   AND mt.code <> 'audio'
                  {scope}
                  {order} LIMIT ?1",
                 order = self.appraise_focus.order_by("a.id")
@@ -5896,11 +5968,27 @@ impl Catalog {
     /// while the queue is ordered by ascending id, and since D3b (UI-SPEC §3) the order is whatever
     /// the user is looking at. A cursor under a reordered queue silently returns nothing, which
     /// looks exactly like "the backlog is drained".
+    ///
+    /// **A model still inside its package is not in this queue** (review B3). Its bytes have no
+    /// stable path to key a preview on, so the stage cannot give it one — and while it was listed
+    /// here it never left: every pass pulled its payload out of the archive and then skipped it.
+    /// It joins the queue when its pack is extracted and the file has a path of its own.
     pub fn assets_needing_preview(
         &self,
         attempted: &[i64],
         limit: usize,
     ) -> Result<Vec<VisualEmbedJob>> {
+        self.assets_needing_preview_within(attempted, limit, &AppraiseScope::All)
+    }
+
+    /// The preview queue within `scope`.
+    pub fn assets_needing_preview_within(
+        &self,
+        attempted: &[i64],
+        limit: usize,
+        scope: &AppraiseScope,
+    ) -> Result<Vec<VisualEmbedJob>> {
+        let scope = scope.clause("a");
         let mut stmt = self
             .conn
             .prepare(&format!(
@@ -5921,6 +6009,8 @@ impl Catalog {
                    {skip}
                    AND a.deleted_at IS NULL
                    AND af.missing = 0
+                   AND (af.package_entry_id IS NULL OR af.workspace_rel IS NOT NULL)
+                 {scope}
                  {order} LIMIT ?1",
                 skip = if attempted.is_empty() {
                     String::new()

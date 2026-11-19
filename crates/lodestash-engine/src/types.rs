@@ -110,22 +110,6 @@ pub struct PendingPackage {
     pub entries: Vec<PackageEntryRecord>,
 }
 
-/// Per-root asset identity maps: root → (rel_path → (asset id, status, content_hash)).
-pub type AssetIdentityMaps = Vec<(
-    String,
-    std::collections::HashMap<
-        String,
-        (
-            i64,
-            AssetStatus,
-            bool,
-            Option<u8>,
-            lodestash_core::catalog::AssetMetrics,
-            Option<String>,
-        ),
-    >,
-)>;
-
 /// One source's worth of persist work handed to the catalog thread.
 pub struct PersistBatch {
     pub root: String,
