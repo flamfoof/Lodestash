@@ -1780,33 +1780,14 @@ fn rescan_watched(catalog: &mut Catalog, ctx: &WriterCtx) -> bool {
         let excludes = project
             .map(|p| cfg.source_excludes(p, &root))
             .unwrap_or_default();
-        let known = catalog
-            .known_sizes_for_source(&info.root_path)
-            .unwrap_or_default();
-        let crawled = crate::scan::crawl_source(0, &root, &excludes, &known);
-        if crawled.entries.is_empty() && crawled.pending_packages.is_empty() {
-            continue;
-        }
-        let records = crate::persist::crawl_records(crawled.entries.iter().map(|(_, f)| f));
-        // Cheap in-memory diff against the catalog's last-known (size, mtime): nothing moved on
-        // disk means nothing to persist (and no spurious `last_scanned_at` write + UI reload).
-        let same = records.len() == known.len()
-            && records.iter().all(|r| {
-                known
-                    .get(&r.rel_path)
-                    .is_some_and(|&(s, m)| s == r.size_bytes as u64 && m == r.mtime)
-            });
-        if same {
-            continue;
-        }
-        let batch = crate::types::PersistBatch {
-            root: info.root_path.clone(),
-            name: info.name.clone(),
-            excludes_json: None,
-            records,
-        };
-        match crate::persist::persist_to_catalog(&ctx.db_path, &[batch]) {
-            Ok(_) => changed = true,
+        match crate::persist::rescan_source(
+            &ctx.db_path,
+            catalog,
+            &info.root_path,
+            &info.name,
+            &excludes,
+        ) {
+            Ok(persisted) => changed |= persisted,
             Err(e) => tracing::warn!(%e, root = %info.root_path, "watch rescan failed"),
         }
     }

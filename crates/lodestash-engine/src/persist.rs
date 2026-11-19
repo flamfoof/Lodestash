@@ -127,6 +127,45 @@ pub fn read_back_assets(
         .collect()
 }
 
+/// One rescan of one source, as the watcher runs it (DATA-MODEL §6): what the catalog knows of
+/// each file → the incremental crawl (a file at its known `(size, mtime)` is not read) → the
+/// records → [`persist_to_catalog`]. `Ok(false)` when nothing was persisted: the walk found no
+/// files at all (an unplugged drive must not flag a library missing), or every file is exactly as
+/// the catalog has it (no spurious `last_scanned_at` write and UI reload).
+///
+/// `catalog` is only read here; the persist opens its own connection, on the calling thread —
+/// which must be the writer's (single-writer rule).
+pub fn rescan_source(
+    db_path: &std::path::Path,
+    catalog: &Catalog,
+    root: &str,
+    name: &str,
+    excludes: &[lodestash_core::types::Exclude],
+) -> Result<bool, String> {
+    let known = catalog.known_sizes_for_source(root).unwrap_or_default();
+    let crawled = crate::scan::crawl_source(0, std::path::Path::new(root), excludes, &known);
+    if crawled.entries.is_empty() && crawled.pending_packages.is_empty() {
+        return Ok(false);
+    }
+    let records = crawl_records(crawled.entries.iter().map(|(_, f)| f));
+    let same = records.len() == known.len()
+        && records.iter().all(|r| {
+            known
+                .get(&r.rel_path)
+                .is_some_and(|&(s, m)| s == r.size_bytes as u64 && m == r.mtime)
+        });
+    if same {
+        return Ok(false);
+    }
+    let batch = PersistBatch {
+        root: root.to_string(),
+        name: name.to_string(),
+        excludes_json: None,
+        records,
+    };
+    persist_to_catalog(db_path, &[batch]).map(|_| true)
+}
+
 /// Runs on the persist thread: open the catalog, upsert each source, record its crawl
 /// incrementally, adopt any config blacklists (one-time M5 data step), and read back
 /// the per-status counts + asset identities for exactly these sources.
@@ -147,17 +186,19 @@ pub fn persist_to_catalog(
         if let Some(json) = &batch.excludes_json {
             blacklists.push((batch.root.clone(), json.clone()));
         }
-        // Move/rename detection (DATA-MODEL §6) runs **before** record_crawl: a vanished row
-        // whose hash reappeared at a new path is the same file moved — rel_path updated in
-        // place (asset_id, tags, embeddings, mappings preserved) — and the consumed records
-        // are dropped so they don't insert a duplicate. Trashed assets are exempt.
-        let moved = catalog
+        // Identity follows content (DATA-MODEL §6.1), decided **before** record_crawl: each
+        // file of this scan is matched to the row it is — a row follows its bytes to another
+        // path, or takes over an untouched duplicate of them — and the records that settled
+        // are dropped, so they neither insert a second row nor re-queue an unchanged file.
+        let matched = catalog
             .reconcile_moves(id, &batch.records)
             .map_err(|e| e.to_string())?;
+        let consumed: std::collections::HashSet<&str> =
+            matched.consumed.iter().map(String::as_str).collect();
         let remaining: Vec<CrawlRecord> = batch
             .records
             .iter()
-            .filter(|r| !moved.contains(&r.rel_path))
+            .filter(|r| !consumed.contains(r.rel_path.as_str()))
             .cloned()
             .collect();
         let stats = catalog
@@ -177,7 +218,9 @@ pub fn persist_to_catalog(
             inserted = stats.inserted,
             updated = stats.updated,
             unchanged = stats.unchanged,
-            moved = moved.len(),
+            moved = matched.moved,
+            absorbed = matched.absorbed,
+            superseded = matched.superseded,
             gone,
             back,
             "catalog sync"

@@ -37,3 +37,5 @@ pub use writer::{Op, WriteError, WriteResult, WriterHandle};
 
 #[cfg(test)]
 mod tests_engine;
+#[cfg(test)]
+mod tests_identity;

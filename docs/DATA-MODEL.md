@@ -381,16 +381,116 @@ CREATE TABLE asset_category (
 - **Incremental scan**: diff crawl results against DB by `(size, mtime)`; only re-hash on change.
 - **Watch**: `notify` crate for live updates, **always paired with a periodic full reconcile** (watchers
   drop events under bursts).
-- **Move/rename**: a path that vanished + a new path with the **same `content_hash`** ⇒ same file
-  moved — update `rel_path` in place, preserving `asset_id`, tags, embeddings, and mappings
-  (`Catalog::reconcile_moves`). Matching is **one to one**: a "new path" is one no row of the source
-  holds (never two rows on one path); within one hash, rows and paths with the same file name pair
-  first, and the leftovers pair only when both sides are the same size — otherwise nothing is
-  guessed and they fall to the missing/new handling below. Trashed assets (`deleted_at`) never
-  move. The moved paths count as present for the missing pass. Missing with no hash match ⇒
-  `missing=1` (grace period, no hard delete — resilient to unplugged drives).
+- **Move/rename**: an asset's identity — its `asset_id`, and everything keyed by it — follows its
+  **content**, not its path. §6.1 is the rule (`Catalog::reconcile_moves`,
+  [ADR-0025](decisions/ADR-0025-identity-follows-content.md)).
 - **Perf at 100k**: FTS5 BM25 sub-10 ms; sqlite-vec KNN tens-of-ms (less with partition keys +
   pre-filter). Past ~500k–1M vectors, flip the `VectorIndex` seam to LanceDB (HNSW).
+
+### 6.1 Identity follows content
+
+One scan of one source is one matching problem, solved before the crawl is recorded
+(`reconcile_moves`, then `record_crawl`, then `reconcile_missing`). The catalog's side is every
+`asset_file` row of the source; the disk's side is the crawl's records. A record carries a hash
+only for a file the crawl **read** — one at a path the catalog does not know, or whose
+`(size, mtime)` changed. A file that passed that gate carries none and is taken to hold what its
+row recorded, so the matching never needs a hash the crawl skipped: a row brings its recorded
+hash, and a path can only be somewhere to move *to* if its file was read.
+
+**1. Sort the rows.**
+
+- **Settled** — its path is in the crawl and still holds its recorded hash (the record's hash
+  equals it, or the file passed the gate). It stays.
+- **Displaced** — a *movable* row whose path is gone from the crawl (**vanished**; a row already
+  flagged `missing` is one) or now holds a different hash (**overwritten**). Movable means: loose
+  (not a package's), not in the Trash, with a recorded hash, and the only row on its path.
+- Every other row **holds its path** and is outside the matching: a trashed row (trash is a
+  decision about the asset, and a scan does not carry it elsewhere), a package's row (in-pack or
+  extracted — its bytes are not under the source root), a row with no recorded hash, and a row
+  whose file could not be read this scan.
+
+**2. Find the open paths**: crawl paths with a hash that no row holds, or whose one holder is
+displaced.
+
+**3. Match by content.** Per hash, displaced rows pair with open paths **one to one** by the
+pairing rule below.
+
+**4. A path that still exists is given up only to another identity.** An overwritten row takes
+its match only if another row's match lands on its path. Otherwise it stays where it is — an
+in-place edit — and the path its old bytes turned up at is a new asset. Applied until nothing
+changes, so chains and cycles resolve whole: a swap or a rotation moves every row in it; a file
+copied aside and then edited moves nothing. (From the disk alone, "copied aside, then edited" and
+"renamed aside, then replaced by a new file of the same name" are the same picture. Neither is
+guessed: the name keeps the identity, as it did before this rule.)
+
+**5. What is left.**
+
+| after steps 3–4 | becomes |
+|---|---|
+| a vanished row with no match | `missing=1` at its path — a grace period, never a hard delete (an unplugged drive looks like this) |
+| an overwritten row with no match, its path not taken | an **in-place edit**: same identity, the new hash, re-queued for metrics, embedding, tags and dependencies |
+| an overwritten row with no match, its path taken by another row | **superseded**: its bytes are nowhere. Kept, flagged `missing`, at `.lodestash-superseded/<asset id>/<file name>` — a path no crawl produces (a dot-directory is never walked), so nothing but its bytes turning up again brings it back |
+| an open path with no match | a new asset |
+
+**6. A row with no file left takes over an untouched duplicate.** A cross-volume move under the
+watcher arrives as two scans: the copy first — a new row, since the original is still there — and
+the delete second, when the bytes are at a path a row already holds, which step 3 cannot match.
+So a vanished or superseded row that **carries user data** takes the place of a settled row of
+the same source with the same hash that **carries none**: it takes that row's path, size and
+mtime, and the duplicate is deleted, in the same transaction as every move of the scan. Pairs
+are chosen by the pairing rule. A hash that still has an unmatched open path is skipped — the
+bytes also turned up somewhere new, and step 3 could not tell where the row went. A row with no
+user data takes over nothing: it has nothing to carry.
+
+**No user data** means nothing a person, or an agent they approved, did to the asset. All of:
+live (not trashed), not a favourite, unrated, not `confirmed`; no description; no licence
+override; no tag from a source other than `ai` / `ai:*`; in no collection and no staging tray;
+no `import_record` and no `export_record`; no manually assigned or pinned category; no ignored
+link; and named by no interactive (`user` / `agent`) `op_log` row and no `tag_request` receipt.
+If that history cannot be read, nothing is absorbed. What the machine made — AI tags,
+embeddings, previews, metrics, harvested edges, rule-assigned categories — is not user data, and
+goes with the duplicate.
+
+**The pairing rule — never guess.** Within one hash, one row and one place pair. With more on
+either side, a row and a place pair when they share a trailing run of path components that no
+other row and no other place of that hash shares — the longest runs first, down to the file name
+alone — and then, if exactly one row and one place are left, they pair. Whatever remains is
+**left unmatched**: the rows go missing, the places become new assets. Path order never decides.
+(It used to: the first same-named path in sort order, and leftovers of equal count in sort
+order.)
+
+**Nothing puts two rows on one path.** Every match has its own target; a path is entered only
+when it is free or its holder leaves in the same transaction; trashed and package rows keep
+theirs. A path that already has two rows — damage from before this rule — is left alone.
+
+**What follows the identity.** A move or a take-over changes only the surviving row's
+`asset_file` (`rel_path`, `ext`, `size_bytes`, `mtime`, `missing=0`) and `asset.name` (the file
+stem). Everything keyed by `asset_id` stays with it and needs no rewrite:
+
+| | what happens |
+|---|---|
+| tags, description, status, rating, favourite | unchanged — they are the identity's |
+| FTS (`asset_fts`) | rowid is the asset id; the rename of `asset.name` re-indexes it by trigger |
+| embeddings, previews, metrics | kept, not re-queued: the bytes did not change (an in-place edit re-queues, as before) |
+| collections, staging trays | membership is by asset id |
+| import and export records | still point at the asset; `✓ in <project>` follows it |
+| undo / redo (`op_log`) | payloads name asset ids, so an earlier tag edit or trash still undoes on the moved row. A scan is not an operation and logs nothing |
+| dependency edges, categories | edges are by asset id and GUID; pinned and manual categories stay; a `glob_path` rule is re-evaluated at the next mapping run |
+| the absorbed duplicate | its asset row is deleted and its machine-made rows cascade; each embedding model it had a vector in has its generation bumped, so a resident snapshot is rebuilt. Background `op_log` rows naming it stay and can no longer be replayed — they refuse as a conflict, and are never offered for undo |
+
+**Limits, on purpose.**
+
+- **The gate's blind spot.** Two files of the same size and the same mtime (to the second) that
+  exchange names pass the gate at both paths, so nothing is displaced and each row keeps its
+  path with the other's bytes. Closing it means reading every file on every scan.
+- **Renamed and edited between two scans**, a file has neither its path nor its bytes to be
+  known by: the old row goes missing and the file is a new asset.
+- **Moves between sources are not matched.** Each source is its own problem; a file moved from
+  one source to another goes missing in the first and is new in the second.
+- **A duplicate that carries user data is never absorbed**, and neither is one of two equal
+  candidates: the vanished row goes missing with its data intact, and comes back if its bytes
+  turn up at a new path (step 3) or the ambiguity goes away (step 6 runs on every scan).
+- **A trashed or package row's path is never taken.** A row whose bytes land on one goes missing.
 
 ---
 

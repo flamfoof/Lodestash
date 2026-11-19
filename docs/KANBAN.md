@@ -790,3 +790,12 @@ tracking; these cards track phases).
   `Catalog::file_location`, `WriteError::Conflict`); the REST plane answers a catalog error by
   its kind — an ack with a path outside the project is `422 invalid`, not 500 (`db_err`); the old
   shell shows `config_unreadable`.
+- [ ] **V2-R3** Identity follows content
+  ([ADR-0025](decisions/ADR-0025-identity-follows-content.md), `DATA-MODEL.md` §6.1) — a scan
+  matches each file to the row it *is* before recording the crawl *(2026-11-18; v2 plan Task
+  R.3; awaiting merge)*. A swap, a rotation and a rename onto a held path move every row with its
+  bytes; a copy-then-delete seen as two scans leaves the tagged row at the copy's path
+  (`Catalog::reconcile_moves`, `Reconciled`); a file moved over another takes the path and the
+  old row is superseded (`SUPERSEDED_DIR`); nothing is paired on sort order
+  (`pair_by_evidence`); the watcher's rescan is `rescan_source`. Left open, stated in §6.1: two
+  files of one size and mtime that exchange names, and moves between sources.
