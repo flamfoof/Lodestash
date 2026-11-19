@@ -36,6 +36,8 @@ pub use tokio::sync::broadcast::error::RecvError as ChangeRecvError;
 pub use writer::{Op, WriteError, WriteResult, WriterHandle};
 
 #[cfg(test)]
+mod tests_appraise;
+#[cfg(test)]
 mod tests_engine;
 #[cfg(test)]
 mod tests_identity;

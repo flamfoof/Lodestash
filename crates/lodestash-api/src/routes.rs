@@ -2110,7 +2110,7 @@ mod tests {
                 }],
             )
             .unwrap();
-            c.assets_needing_tags_within(1, None).unwrap()[0].asset_id
+            c.assets_needing_tags(1).unwrap()[0].asset_id
         };
         let s =
             Arc::new(ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap());

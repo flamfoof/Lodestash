@@ -1,8 +1,11 @@
 //! The visual embedding stage: read a slice of the queue, encode it (decode for 2D, multiview
 //! render for 3D, a shader ball for a material), store the vectors. Three phases, so the encode
 //! can run off the writer (ADR-0013).
+use std::time::Instant;
+
 use lodestash_core::catalog::Catalog;
 
+use super::plan::{past, Scope};
 use super::resolve::{resolve_job_image, resolve_job_path};
 
 /// Encode one 3D model by rendering it from a few orbit views and mean-pooling the per-view
@@ -98,22 +101,16 @@ pub struct ComputedEmbedding {
 /// on this CPU. Every user write queued behind it: a `POST /v1/stage` measured 25 ms on an idle
 /// app and ~18 s once an embedder was actually loaded. Splitting read / compute / write lets the
 /// heavy middle run anywhere, and the writer only ever does the two cheap ends.
+///
+/// Confined to `scope`, so an `identify_asset` kick embeds the assets it was asked about rather
+/// than the front of the global queue.
 pub fn visual_embed_batch(
     cat: &Catalog,
     limit: usize,
-) -> (Vec<lodestash_core::catalog::VisualEmbedJob>, AlbedoPaths) {
-    visual_embed_batch_within(cat, limit, None)
-}
-
-/// [`visual_embed_batch`], restricted to an explicit set — what an `identify_asset` kick needs so
-/// it embeds the assets it was asked about rather than the front of the global queue.
-pub fn visual_embed_batch_within(
-    cat: &Catalog,
-    limit: usize,
-    only: Option<&[i64]>,
+    scope: &Scope,
 ) -> (Vec<lodestash_core::catalog::VisualEmbedJob>, AlbedoPaths) {
     let jobs = cat
-        .visual_assets_needing_embedding_within(limit, only)
+        .visual_assets_needing_embedding_within(limit, scope)
         .unwrap_or_else(|e| {
             tracing::warn!(%e, "visual embed queue query failed; retries next pass");
             Vec::new()
@@ -175,12 +172,9 @@ pub fn compute_visual_embeddings(
         .collect()
 }
 
-/// Phase 3: **write**. Fast, catalog-only. Returns how many landed.
-pub fn store_visual_embeddings(
-    cat: &mut Catalog,
-    model_id: &str,
-    done: &[ComputedEmbedding],
-) -> usize {
+/// Phase 3: **write**. Fast, catalog-only. Returns how many landed. Serves the audio stage too:
+/// a computed embedding names its own modality.
+pub fn store_embeddings(cat: &mut Catalog, model_id: &str, done: &[ComputedEmbedding]) -> usize {
     let mut n = 0;
     for d in done {
         if let Err(e) = cat.upsert_embedding(
@@ -191,13 +185,13 @@ pub fn store_visual_embeddings(
             Some(d.source_id),
             &d.vector,
         ) {
-            tracing::warn!(%e, "upsert_embedding failed; stopping visual store");
+            tracing::warn!(%e, "upsert_embedding failed; stopping the store");
             break;
         }
         n += 1;
     }
     if n > 0 {
-        tracing::info!(embedded = n, "siglip image embeddings written");
+        tracing::debug!(embedded = n, model = model_id, "embeddings written");
     }
     n
 }
@@ -208,33 +202,31 @@ pub fn store_visual_embeddings(
 pub fn drain_image_embeddings(
     cat: &mut Catalog,
     emb: &(dyn lodestash_ai::embedder::Embedder + Send + Sync),
+    scope: &Scope,
     workspace_dir: Option<&std::path::Path>,
     cache_dir: Option<&std::path::Path>,
-    budget: Option<std::time::Duration>,
-    // The explicit set an `identify_asset` kick named, or `None` for the whole queue.
-    only: Option<&[i64]>,
+    deadline: Option<Instant>,
 ) {
     // **Slice size follows the budget.** One unit is a four-view render plus four SigLIP passes
     // (~17 s here), so a fixed batch of 64 overshoots a 20 s budget by minutes no matter where the
     // deadline is tested — a batch is atomic once started. Measured 2026-09-03: an `identify` kick
     // on 64 images finished its own tagging in 481 ms and then spent **>3 minutes** in here.
-    // Unbudgeted callers (the old pump, which drains to empty) keep the big batch.
-    let batch = if budget.is_some() { 4 } else { 64 };
-    let deadline = budget.map(|b| std::time::Instant::now() + b);
+    // A pass with no deadline drains to empty and keeps the big batch.
+    let batch = if deadline.is_some() { 4 } else { 64 };
     loop {
-        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        if past(deadline) {
             break;
         }
-        let (jobs, albedo) = visual_embed_batch_within(cat, batch, only);
+        let (jobs, albedo) = visual_embed_batch(cat, batch, scope);
         let n = jobs.len();
         if n == 0 {
             break;
         }
         let done = compute_visual_embeddings(jobs, &albedo, emb, workspace_dir, cache_dir);
-        if store_visual_embeddings(cat, emb.model_id(), &done) < done.len() {
+        if store_embeddings(cat, emb.model_id(), &done) < done.len() {
             break; // a write failed — it logged, and the queue is durable
         }
-        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        if past(deadline) {
             tracing::debug!("visual embed pass hit its time budget");
             break;
         }

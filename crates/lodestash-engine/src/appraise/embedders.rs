@@ -81,7 +81,47 @@ pub fn query_spaces(query: &str) -> Vec<(String, Vec<f32>)> {
 /// How long a failed embedder resolve is remembered before [`query_spaces`] tries again.
 pub const EMBEDDER_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 
-type SharedEmbedder = Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>;
+/// An embedder a pass and its workers share.
+pub type SharedEmbedder = Arc<dyn lodestash_ai::embedder::Embedder + Send + Sync>;
+
+type Resolve = Arc<dyn Fn() -> Option<SharedEmbedder> + Send + Sync>;
+
+/// Where the engine gets its embedders: the models installed on this machine
+/// ([`Models::installed`]), or whatever a test hands it. Resolving loads the model, so callers
+/// resolve once per pass (a kick) or once per run (the idle lane) and keep the result.
+#[derive(Clone)]
+pub struct Models {
+    visual: Resolve,
+    audio: Resolve,
+}
+
+impl Models {
+    /// SigLIP and CLAP from the model directory, when their files and a runtime are there.
+    pub fn installed() -> Self {
+        Self {
+            visual: Arc::new(resolve_embedder),
+            audio: Arc::new(resolve_audio_embedder),
+        }
+    }
+
+    /// These embedders, whatever is installed — `None` for a space with no model.
+    pub fn fixed(visual: Option<SharedEmbedder>, audio: Option<SharedEmbedder>) -> Self {
+        Self {
+            visual: Arc::new(move || visual.clone()),
+            audio: Arc::new(move || audio.clone()),
+        }
+    }
+
+    /// The pixel space (images, models, materials).
+    pub fn visual(&self) -> Option<SharedEmbedder> {
+        (self.visual)()
+    }
+
+    /// The audio space.
+    pub fn audio(&self) -> Option<SharedEmbedder> {
+        (self.audio)()
+    }
+}
 
 struct EmbedderSlot(std::sync::Mutex<(Option<SharedEmbedder>, Option<std::time::Instant>)>);
 

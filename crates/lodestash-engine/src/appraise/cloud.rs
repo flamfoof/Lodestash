@@ -2,13 +2,14 @@
 //! backoff, a per-run cap and a local fallback (AI-PIPELINE §5).
 use lodestash_core::catalog::Catalog;
 
+use super::plan::Scope;
 use super::resolve::resolve_job_path;
 use super::tag::{tag_preview_with, write_groups, zeroshot_tags};
 
 /// Tag dirty **visual** assets through an OpenAI-compatible cloud VLM (AI-PIPELINE §5). One call per
 /// asset — a capable cloud model holds the schema, so no local caption pre-step. Single pass (no
-/// weight-residency concern), keyed on `tags_dirty`, audio excluded (`tagger.supports`). Forward
-/// progress preserved: a request that fails or a preview that won't render still clears the flag.
+/// weight-residency concern), over the generic tag queue — which never holds audio (review B5).
+/// Forward progress preserved: a preview that won't render still clears the flag.
 pub fn drain_api_tags(
     cat: &mut Catalog,
     // The consent this pass runs under. Taken from the caller rather than re-read here: the gate
@@ -22,11 +23,11 @@ pub fn drain_api_tags(
     workspace_dir: Option<&std::path::Path>,
     cache_dir: Option<&std::path::Path>,
     progress: &crate::jobs::JobProgress,
-    // Restrict the pass to these assets, exactly as [`drain_tags`] does. `None` = the whole queue.
-    // Without this an `identify_asset(ids)` routed to the cloud would take the front of the
-    // **global** queue instead of the ids asked about — the same defect already fixed once on the
-    // local path, and far more expensive here because every wrong asset is a paid API call.
-    only: Option<&[i64]>,
+    // Confined to the pass's scope, exactly as [`super::drain_tags`] is. Without it an
+    // `identify_asset(ids)` routed to the cloud would take the front of the **global** queue
+    // instead of the ids asked about — the same defect already fixed once on the local path, and
+    // far more expensive here because every wrong asset is a paid API call.
+    scope: &Scope,
 ) {
     use lodestash_ai::openai::ApiError;
     use lodestash_ai::tagger::{TagInput, Tagger};
@@ -62,7 +63,7 @@ pub fn drain_api_tags(
         if progress.is_cancelled() {
             return;
         }
-        let jobs = match cat.assets_needing_tags_within(BATCH, only) {
+        let jobs = match cat.assets_needing_tags_within(BATCH, scope) {
             Ok(j) => j,
             Err(e) => {
                 tracing::warn!(%e, "tag queue query failed; retries next run");
@@ -84,9 +85,9 @@ pub fn drain_api_tags(
                 );
                 return;
             }
-            // Audio has no cloud path. If the CLAP pass already tagged it, it isn't in this queue;
-            // if it couldn't run, clear the flag with an empty set (as the local drain does) rather
-            // than skipping — skipping would return the same audio-only batch forever.
+            // A kind this endpoint cannot look at (audio never reaches here — it is not in this
+            // queue): clear the flag with an empty set, as the local drain does, rather than
+            // skipping — skipping would return the same batch forever.
             if !tagger.supports(&job.media_code) {
                 if !write_groups(
                     cat,

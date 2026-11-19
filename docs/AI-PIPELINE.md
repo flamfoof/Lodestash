@@ -1,6 +1,7 @@
 # AI Tagging & Embeddings
 
-> Last reviewed: 2026-08-11 (check-docs verified every citation resolves)
+> Last reviewed: 2026-11-19 (§2.2 added: the appraisal plan, its stage order and what the idle
+> lane runs — v2 plan Task 2.5, [ADR-0026](decisions/ADR-0026-one-appraisal-plan-and-a-stage-owns-its-media.md))
 
 How assets are auto-identified (tags) and made semantically searchable (embeddings), with a clean
 **local ↔ online-API** switch. Embeddings power the "search by description" that makes retrieval fast,
@@ -40,17 +41,20 @@ come from the **same model**.
 
 ## 2. The local-vs-API abstraction
 
-**Identification is manual by default.** Both embeddings (SigLIP/CLAP) and local-LLM tagging run on
-the CPU here, so a hydrate never auto-identifies unless the user opts in (`config.auto_identify`,
-Settings ▸ AI · IDENTIFY, default off). With it off, a scan/hydrate runs only the cheap drains
-(technical facets, dependency graph, status promotion); embeddings and tags run when the user presses
-**Identify** — which does embeddings *then* tags in one pass. With it on, new unidentified assets are
-drained in the background as they appear. This matters most for in-pack libraries (DATA-MODEL §7 /
-M14): importing/opening a pack mints thousands of dirty assets at once, and auto-embedding them all
-would peg a core for minutes.
+**Identification is a switch; measuring is not.** Both embeddings (SigLIP/CLAP) and local-LLM
+tagging run on the CPU here, so they run in the background only while `config.auto_identify`
+(Settings ▸ AI · IDENTIFY) is on — it is on for a fresh install, because appraisal is a background
+job ([ADR-0008](decisions/ADR-0008-appraisal-is-a-background-job.md)). With it off, the background
+lane runs only the stages that need no model (technical facets, dependency graph, vector previews,
+status promotion); embeddings and tags run when the user presses **Identify**, which runs every
+stage in one pass (§2.2). With it on, new unidentified assets are also identified in the background
+as they appear. This matters most for in-pack libraries (DATA-MODEL §7 / M14): importing a pack
+mints thousands of dirty assets at once, and embedding them all at full speed would peg a core for
+minutes — the background lane takes one second in four
+([ADR-0014](decisions/ADR-0014-the-backlog-lane-is-duty-cycled.md)).
 
-**The manual pass has three scopes** (the drains always run over whatever is `embedding_dirty`/
-`tags_dirty`, so a scope simply re-flags the subset it wants redone before draining):
+**The manual pass has three scopes** (the stages always run over whatever is `embedding_dirty`/
+`tags_dirty`, so a scope simply re-flags the subset it wants redone before the pass):
 
 - **Run on New** — the default; no re-flag. A freshly minted asset is dirty until first processed, so
   this drains only assets that have never been through identification.
@@ -173,6 +177,75 @@ These are **union, not exclusive** — WD gives recall, zero-shot enforces the c
 vocabulary, the VLM adds description; `validate` + `set_tags` dedupe and cap across all of them. The
 API path (§5) is a fourth strategy the user can switch *in* per modality, never a prerequisite.
 
+### 2.2 One pass, one plan
+
+Every appraisal pass — a kick or a slice of the background lane — is one **plan**
+(`AppraisePlan { scope, stages, budget, origin }`, `crates/lodestash-engine/src/appraise/plan.rs`;
+[ADR-0026](decisions/ADR-0026-one-appraisal-plan-and-a-stage-owns-its-media.md)). The caller says
+*what*; one function decides the order.
+
+**The stages, in the order every pass runs them:**
+
+| # | Stage | Writes | Needs a model |
+|---|---|---|---|
+| 1 | metrics | technical facets, perceptual hash — and a model's vector preview while its mesh is parsed | no |
+| 2 | dependencies | GUIDs, declared references; then the graph reconcile (DATA-MODEL §10) | no |
+| 3 | previews | vector previews for models the metrics stage will not revisit | no |
+| 4 | audio embed | CLAP vectors | CLAP |
+| 5 | audio tags | CLAP zero-shot tags — **the only stage that tags audio** | CLAP |
+| 6 | image / 3D embed | SigLIP vectors: pictures, models, materials | SigLIP |
+| 7 | tags | the generic tag stage: the local tagger, or the endpoint (§5) | the tagger |
+| 8 | promote | `status` (DATA-MODEL §8) | no |
+
+Measurements come first because they need nothing and metrics is what moves an asset to `indexed`;
+dependencies before anything paints with a material's textures; promotion last because it reads
+what the others wrote. A stage whose model is not installed does nothing and **leaves its assets
+queued**.
+
+**Scope.** `All`, `Assets(ids)`, `Source(id)` or `Package(id)`. A scope confines *every* stage,
+promotion included: a pass asked about three assets measures, embeds, tags and promotes those
+three and reports only those as promoted. An explicit empty set is no assets — such a pass reads
+and writes nothing. One thing is the library's and not a scope's: the dependency **graph** reconcile
+(prefab evidence, the naming heuristic, late binding) reads every source, so a scoped pass harvests
+its assets' GUIDs and references and leaves the reconcile to the next library-wide pass whose
+dependency queue has run dry.
+
+**Who builds which plan.**
+
+| Caller | Scope | Stages | Budget |
+|---|---|---|---|
+| ✦ Identify all, per-card ✦ | `All` (the card's asset is flagged first, and the focus order — UI-SPEC §3 — puts what is on screen first) | all | 20 s per stage; 64 assets through the tag stage, 48 clips through the audio tag stage |
+| `identify_asset(ids)` (ENGINE-API §2) | `Assets(ids)` | all | the same |
+| the background lane, `auto_identify` off or no model installed | `All` | metrics, dependencies, previews, promote | one second for the whole pass |
+| the background lane, `auto_identify` on and a model installed | `All` | all | one second for the inline stages; the model stages are sliced off the writer |
+
+Budgets are tested **before every unit of work**, never per batch
+([ADR-0013](decisions/ADR-0013-inference-off-the-writer.md)). A kick's clock is per stage, so one
+slow stage cannot take the others' turn. The background slice's clock is for the whole pass: the
+stages take it in order, and what is left waits for the next slice. The generic tag stage is bounded
+by a count rather than a clock — one unit is a whole model call — and a cloud pass by the user's own
+`api_max_per_run` (§5.1).
+
+**Audio belongs to the audio stage.** `tags_dirty` is one flag, and the generic tag queue used to
+hold every flagged asset: whichever tagger ran first — one that reads file names, or a vision model
+answering "nothing" for a sound — finished the clip, and the audio stage then found nothing queued
+(review B5). The generic queue, and the count behind the cloud cost estimate (§5.1), no longer hold
+audio at all. A clip stays queued until an audio model tags it; it is not tagged from its file name
+in the meantime (its name is still searchable as text).
+
+**The background lane keeps the writer for the cheap ends only.** In one working turn it runs the
+model-free stages inline for at most a second, and for each model stage it reads one small slice of
+the queue, hands the compute to a worker thread, and stores the result when it comes back — one
+slice of each stage in flight at a time (ADR-0013; the audio stages too, since ADR-0026). A kick
+runs every stage inline: there the user asked and is watching a bar. The lane never tags through an
+endpoint (§5.1).
+
+**A model still inside its package gets no vector preview, and is not asked for one.** Its bytes
+have no stable path to key a preview on, so it joins the preview queue when its pack is extracted.
+It used to sit in the queue for ever, and every background pass pulled its payload out of the
+archive only to skip it (review B3). The stages that *can* work in place — metrics, embeddings,
+tags — still pull it, once each.
+
 ---
 
 ## 3. Per-modality defaults
@@ -281,8 +354,9 @@ throttle hard — Gemini free is on the order of ~15 requests/minute. A naive ti
 - **Rate-limit backoff + resume.** On `429`/`503` (honour `Retry-After` when present), back off
   exponentially with jitter and retry a bounded number of times; a call that still fails leaves the
   asset **`tags_dirty` = 1** so the next run picks it up. An asset is only cleared once it is actually
-  tagged — a drain must never mark a rate-limited asset "done, no tags." (Contrast the *unsupported*
-  case, e.g. audio through a vision API, which is cleared deliberately to avoid a spin loop.)
+  tagged — a drain must never mark a rate-limited asset "done, no tags." (Contrast a media type the
+  endpoint cannot look at, which is cleared deliberately to avoid a spin loop. Audio is not such a
+  case: it is never in this queue — §2.2.)
 - **Attribution survives the fallback.** When the endpoint fails and a local model substitutes, its
   tags are stored under the *local* producer and model, never the failed endpoint's; the SigLIP
   zero-shot proposals always go under their own producer (`ai:siglip-zeroshot`). Before M26 both
@@ -301,8 +375,9 @@ throttle hard — Gemini free is on the order of ~15 requests/minute. A naive ti
   that a **hard per-run asset cap** and, for any **non-free preset**, a pre-run confirm showing
   *N assets ≈ M API calls* (and an est. cost line when the provider's pricing is known) prevent a
   mis-clicked **Full Run** on a paid endpoint from becoming a surprise bill. Free/local presets skip
-  the confirm. *N* is the `tags_dirty` queue the drain walks; when it cannot be counted the
-  estimate is an **error**, never `0` — a zero reads as "this run costs nothing".
+  the confirm. *N* is the generic tag queue the drain walks — audio is not in it (§2.2) — and when
+  it cannot be counted the estimate is an **error**, never `0`: a zero reads as "this run costs
+  nothing".
 - **Key at rest.** `api_key` is the one secret this local-first app holds; store it in the **OS
   credential store** (Windows Credential Manager) when available, with a plaintext-config fallback so
   the app still works headless. Never logged, never sent anywhere but the chosen endpoint — not to

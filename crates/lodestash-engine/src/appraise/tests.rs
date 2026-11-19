@@ -1,5 +1,7 @@
-//! The stage tests that moved with `drains.rs`.
+//! Stage tests: each drives one stage directly.
 use super::*;
+use std::sync::atomic::AtomicBool;
+
 use lodestash_core::catalog::{Catalog, VisualEmbedJob};
 
 use super::resolve::{in_pack_pull_ok, IN_PACK_PULL_MAX_BYTES};
@@ -102,7 +104,7 @@ fn catalog_with_image(dir: &std::path::Path, name: &str) -> (Catalog, i64) {
         }],
     )
     .expect("crawl");
-    let id = cat.assets_needing_tags_within(16, None).expect("queue")[0].asset_id;
+    let id = cat.assets_needing_tags(16).expect("queue")[0].asset_id;
     (cat, id)
 }
 
@@ -127,7 +129,7 @@ fn a_fallback_is_credited_to_the_fallback_not_the_failed_endpoint() {
         None,
         Some(cache.path()),
         &progress,
-        None,
+        &Scope::All,
     );
     let rows = cat.asset_tag_rows(id).expect("rows");
     assert!(!rows.is_empty(), "the fallback wrote nothing");
@@ -173,7 +175,7 @@ fn a_remote_pass_without_consent_makes_no_attempt_at_all() {
             None,
             Some(cache.path()),
             &progress,
-            None,
+            &Scope::All,
         );
         progress.failed.load(std::sync::atomic::Ordering::Relaxed)
     };
@@ -221,7 +223,7 @@ fn a_slice_stores_each_producer_under_its_own_source() {
             zero_shot: vec![subject("brick", 0.6)],
         }],
     );
-    assert_eq!(stored, 2);
+    assert_eq!(stored, Some(2));
     let rows: Vec<_> = cat
         .asset_tag_rows(id)
         .expect("rows")
@@ -350,7 +352,7 @@ fn prefab_evidence_follows_the_prefab_and_nothing_else() {
     };
 
     // The dependency drain harvests the GUIDs and reads the prefab: two pairings, not four.
-    drain_dependencies(&mut cat, None);
+    drain_dependencies(&mut cat, &Scope::All, None, None, &AtomicBool::new(false));
     assert_eq!(closure(&cat, rock), sorted(vec![rock, rock_mat]));
     assert_eq!(closure(&cat, tree), sorted(vec![tree, tree_mat]));
     assert!(
@@ -517,7 +519,7 @@ fn a_material_harvest_keeps_each_texture_role() {
         })
         .collect();
     assert!(ids["t_a.png"] < ids["t_b.png"]);
-    drain_dependencies(&mut cat, None);
+    drain_dependencies(&mut cat, &Scope::All, None, None, &AtomicBool::new(false));
     assert_eq!(
         cat.material_albedo_texture(ids["rock.mat"]).unwrap(),
         Some(ids["t_b.png"])

@@ -575,8 +575,10 @@ CREATE INDEX idx_file_pkgentry ON asset_file(package_entry_id) WHERE package_ent
   path-based extractors, so the pulled payload is spilled to an **ephemeral OS-temp scratch file**
   (`resolve_job_path`) that is deleted the instant the drain finishes with it — still not a workspace
   copy and not the persistent extract cache, just a decode buffer that happens to live on disk because
-  those decoders take a path. Serial by design (the persist thread is the sole writer), and identify
-  does not need to be fast.
+  those decoders take a path. Serial by design (the writer thread is the sole writer), and identify
+  does not need to be fast. **Vector previews are the exception:** an in-pack model has no stable
+  path to key one on, so it is not in the preview queue until its pack is extracted, and the preview
+  stage never pulls a payload (AI-PIPELINE §2.2).
 - **Extraction is demoted to *materialize*.** `extract_at_offsets` fills `workspace_rel` on rows that
   already exist; it is only needed to leave a **persistent file on disk** (Add to project, or the
   "keep extracted" cache). Un-materializing (unpin/evict) clears `workspace_rel` and deletes the cached
@@ -607,9 +609,9 @@ backlog. **Recommended user-facing terms: Identified vs Unidentified** (alternat
   Re-running AI (e.g. after a model upgrade) cycles an asset back through `identified`.
 
 **How the status actually moves.** `status` is *derived*, not hand-set: `Catalog::promote_statuses`
-reconciles every live row against the ingest work recorded on it, and runs on the writer connection
-right after the drains (facets, then vectors), so a scan, a package extraction and a backlog drain
-all land the same transitions:
+reconciles every live row against the ingest work recorded on it. It is the last stage of every
+appraisal pass (AI-PIPELINE §2.2) and runs on the writer connection, confined to the pass's scope
+(`promote_statuses_within`), so a kick and a background slice land the same transitions:
 
 | Transition | Earned by |
 |---|---|
@@ -939,8 +941,8 @@ clears either way, so an asset with no Unity bookkeeping isn't rescanned forever
 An edge is recorded even when its target isn't catalogued yet — `to_asset_id NULL`, `state='missing'`,
 `declared_path` holding the GUID — because ordering is not guaranteed (a texture may be indexed after
 the material that uses it, or live in a package extracted later). `Catalog::resolve_pending_relationships`
-late-binds those in one statement after every drain, which is why a `missing` edge is kept rather than
-dropped. An edge that never resolves is an honest record of a reference the library doesn't hold.
+late-binds those in one statement once the library's dependency queue has run dry after a harvest,
+which is why a `missing` edge is kept rather than dropped. An edge that never resolves is an honest record of a reference the library doesn't hold.
 
 **Two exceptions to "record it and let it resolve later".** A reference to Unity's own built-in
 resource libraries — the default material a fresh prefab paints with, the white/bump fallback
@@ -986,9 +988,10 @@ material GUID) the bindings name — so a mesh catalogued after its prefab was r
 the next pass — and removes an edge no binding backs any more, except a muted one, which is never
 deleted or duplicated. A walk re-reads only prefabs whose revision moved. A walk that completed
 forgets the prefabs it no longer found; one that did not — a source whose drive is gone, a directory
-it could not open — keeps what it said before. The pass runs after a dependency drain that scanned
-something, after a watch rescan and a manual scan over their roots (a prefab-only edit changes no
-asset row), and after an extraction over the workspace. Nested prefab instances and variant
+it could not open — keeps what it said before. The pass runs once the library's dependency queue
+has run dry after a harvest (a pass confined to some assets harvests and leaves it due —
+AI-PIPELINE §2.2), after a watch rescan and a manual scan over their roots (a prefab-only edit
+changes no asset row), and after an extraction over the workspace. Nested prefab instances and variant
 overrides are counted and left unresolved: an override is a property modification on another
 prefab's renderer, not a binding. A material the model file embeds names the model's own GUID and
 mints no self-edge.

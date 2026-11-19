@@ -4,7 +4,9 @@
 - **Date:** 2026-09-04
 - **Amends:** [ADR-0008](ADR-0008-appraisal-is-a-background-job.md) (appraisal is a background job)
 - **Amended by:** [ADR-0016](ADR-0016-coalesced-change-publication.md) (how the lane's results reach
-  the shell)
+  the shell) and [ADR-0026](ADR-0026-one-appraisal-plan-and-a-stage-owns-its-media.md) (what the
+  duty cycle gates: the model-free backfills, and four model stages each behind its own in-flight
+  flag)
 
 ## Context
 

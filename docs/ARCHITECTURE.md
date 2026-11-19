@@ -218,12 +218,17 @@ Query (text, optional semantic toggle, filters)
 
 ### 4.3 Tag / identify
 ```
-Background job per asset:
-  modality → Embedder.embed_asset (local) → upsert vec_asset, clear embedding_dirty
-           → Tagger.tag (local ONNX/Ollama  OR  cloud API) → asset_tag (source, confidence, model_id)
+One appraisal pass = one plan { scope, stages, budget, origin }   (AI-PIPELINE §2.2)
+  metrics → dependencies → previews            (no model; always, also in the background lane)
+  → audio embed → audio tags                   (CLAP; the only stages that touch a clip's tags)
+  → image/3D embed → tags                      (SigLIP; local ONNX/Ollama  OR  cloud API)
+  → promote                                    (status lifecycle, DATA-MODEL §8)
+  each stage: asset_embedding / asset_tag (source, confidence, model_id), its dirty flag cleared
   → mapping engine maps raw/AI tags → asset_category (skips pinned manual overrides)
 User edits tags (accept/reject chips) → recorded as training signal + immediate search improvement
 ```
+A kick runs the plan inline on the writer; the background lane runs the model-free stages inline
+and each model stage as read-here / compute-on-a-worker / store-here ([ADR-0013](decisions/ADR-0013-inference-off-the-writer.md)).
 
 ---
 
@@ -288,8 +293,9 @@ lodestash/
 │  ├─ lodestash-ingest/    # crawl, detect, untar, meta-parse, normalize, thumbnail
 │  ├─ lodestash-ai/        # Tagger/Embedder traits + ONNX/Ollama/cloud impls
 │  ├─ lodestash-protocol/  # the operation catalog + wire DTOs (no I/O)
-│  ├─ lodestash-engine/    # the service: config, models, scan/persist, identify drains
-│  │                       #   (absorbed lodestash-app, v2 plan Task 2.2)
+│  ├─ lodestash-engine/    # the service: config, models, scan/persist, appraisal
+│  │                       #   (appraise/: the plan and one file per stage; writer/: the one
+│  │                       #    writer thread; absorbed lodestash-app, v2 plan Task 2.2)
 │  ├─ lodestash-api/       # loopback HTTP/JSON API
 │  ├─ lodestash-mcp/       # MCP server binary — a thin client of /v1 (ADR-0022)
 │  └─ lodestash-desktop/  # Tauri 2 + Svelte shell — the current app (egui retired at B7)

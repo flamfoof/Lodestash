@@ -1,56 +1,52 @@
 //! The preview stage: vector previews for models that have none (M15).
+use std::time::Instant;
+
 use lodestash_core::catalog::Catalog;
 
-use super::resolve::resolve_job_path;
+use super::plan::{past, Scope};
+use super::resolve::local_job_path;
 
-/// How long one pass may spend backfilling previews.
+/// Generate vector previews for the models in `scope` that have none.
 ///
-/// Four 256px CPU renders per model is tens of milliseconds each, so the whole backlog is minutes
-/// and cannot run in one go without starving scans and mutations. At 20s a pass a 3,400-model
-/// library needed dozens of launches to converge, which in practice meant it never did — the grid
-/// sat at 6% coverage. 90s still yields the thread promptly but actually finishes a library over a
-/// handful of sessions.
-///
-/// ponytail: a fixed slice, not adaptive. If this ever competes with a scan, make it a Settings
-/// action rather than growing the constant.
-pub const PREVIEW_BACKFILL_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
-
-/// Generate vector previews for models that have none.
-///
-/// The metrics drain also produces previews, because it is the one place that already has the mesh
-/// parsed — but it only visits `metrics_dirty` rows. That leaves every model indexed *before*
+/// The metrics stage also produces previews, because it is the one place that already has the
+/// mesh parsed — but it only visits `metrics_dirty` rows. That leaves every model indexed *before*
 /// previews existed with no preview and no path to ever getting one, since nothing re-dirties an
-/// unchanged file. This drain closes that hole: it asks the catalog which models lack a preview
+/// unchanged file. This stage closes that hole: it asks the catalog which models lack a preview
 /// and fills them in, so an existing library converges instead of staying blank forever.
 ///
-/// Runs on the persist thread with the writer connection, like every other drain (ARCHITECTURE §5).
-/// In-pack assets are skipped for the same reason as in the metrics path — a scratch file has no
-/// stable identity to key a preview on.
+/// **It never pulls a payload out of an archive** (review B3). A model still inside its package
+/// has no stable path to key a preview on, so the queue does not list it — and should one reach
+/// here anyway, it is skipped by where its bytes are, before anything is read. This stage used to
+/// resolve every job first, which for an in-pack model means inflating its archive up to the
+/// payload, and then skip the result: on every pass, for ever, because a model that gets no
+/// preview never left the queue.
+///
+/// Returns how many previews it attempted.
 pub fn drain_previews(
     cat: &mut Catalog,
+    scope: &Scope,
     workspace_dir: Option<&std::path::Path>,
     cache_dir: Option<&std::path::Path>,
     proxy: lodestash_ingest::decimate::Budget,
-    budget: std::time::Duration,
+    deadline: Option<Instant>,
 ) -> usize {
     const BATCH: usize = 16;
     let Some(dir) = cache_dir else {
         return 0;
     };
-    let started = std::time::Instant::now();
     let mut total = 0usize;
     // Every id this pass has looked at, so a model that fails to render cannot be handed back
     // forever. A set rather than a high-water id: since D3b the queue is ordered by where the user
     // is looking, and "greater than the last id" no longer means "not yet tried" (UI-SPEC §3).
     let mut attempted: Vec<i64> = Vec::new();
-    loop {
+    'queue: loop {
         // Time-boxed rather than run-to-completion: four CPU renders per model over a few
-        // thousand models is minutes of work, and it must not hold the persist thread away from
+        // thousand models is minutes of work, and it must not hold the writer thread away from
         // scans and mutations. The queue is durable, so the next pass picks up where this left off.
-        if started.elapsed() >= budget {
+        if past(deadline) {
             break;
         }
-        let jobs = match cat.assets_needing_preview(&attempted, BATCH) {
+        let jobs = match cat.assets_needing_preview_within(&attempted, BATCH, scope) {
             Ok(j) => j,
             Err(e) => {
                 tracing::warn!(%e, "preview queue query failed; retries next pass");
@@ -67,21 +63,16 @@ pub fn drain_previews(
             // ~17 s, and every user write queued behind it (a `POST /v1/stage` measured 16 s on an
             // idle app, against 2 ms when the drain had not started). The budget is a promise about
             // latency; checking it once per sixteen units is not keeping it.
-            if started.elapsed() >= budget {
-                break;
+            if past(deadline) {
+                break 'queue;
             }
             // Record every id we look at, successful or not, so a model that fails to render
             // cannot wedge the queue ahead of the ones behind it.
             attempted.push(job.asset_id);
-            let resolved = resolve_job_path(&job, workspace_dir);
-            let is_scratch = resolved.as_ref().is_some_and(|(_, g)| g.is_some());
-            let Some((p, _)) = resolved.as_ref() else {
+            let Some(path) = local_job_path(&job, workspace_dir) else {
                 continue;
             };
-            if is_scratch {
-                continue;
-            }
-            store_vector_preview(cat, job.asset_id, p, &job.media_code, dir, proxy);
+            store_vector_preview(cat, job.asset_id, &path, &job.media_code, dir, proxy);
             total += 1;
         }
         if n < BATCH {

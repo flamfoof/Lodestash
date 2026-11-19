@@ -124,7 +124,7 @@ all verified: `cargo test --workspace` green, svelte-check 0/0, e2e **52/52**, `
 - **B7 cutover landed (`6e22417`, 2026-08-07).** `crates/lodestash-ui` (egui) is deleted — the
   Tauri 2 + Svelte 5 shell (`crates/lodestash-desktop` + `ui/`) is the only app. `--mcp` untouched
   (`lodestash-mcp` is its own crate). The **Identify engine is wired** (`a2f675e`, `d94b5d1`):
-  `appraise_pass` resolves local SigLIP/CLAP zero-shot taggers (taught traits become candidate
+  the appraisal pass (`appraise::run` since v2 Task 2.5) resolves local SigLIP/CLAP zero-shot taggers (taught traits become candidate
   labels) → Ollama/OpenAI-compatible captioner → `FilenameTagger`, with `max_assets` budget guards;
   AI search (`GridQuery.search_mode` → `hybrid_search`), real progress bar, per-asset ✦ Identify,
   and the **session set** (`promote_statuses` returns promoted ids → `WriteResult.promoted` →
@@ -500,9 +500,9 @@ The category tabs are now five: Materials split out of Models.
 **The status lifecycle is live** (P3, [`DATA-MODEL.md`](DATA-MODEL.md) §8). `status` is *derived*,
 not hand-set: `Catalog::promote_statuses` reads the ingest state already on the row — facets
 extracted ⇒ `indexed`; an embedding **and** at least one tag ⇒ `identified`; embedding re-dirtied
-(file changed) or no tags ⇒ back to `indexed` — and `confirmed` stays human-set. All three writer paths (scan persist, package
-persist, backlog drain) funnel through one `drain_promote_resync`: drain facets, drain vectors,
-promote, then re-read counts + identities and send them, because a drain is no longer count-neutral.
+(file changed) or no tags ⇒ back to `indexed` — and `confirmed` stays human-set. Every appraisal pass
+— a kick or a background slice — is one `AppraisePlan` run by `appraise::run` (AI-PIPELINE §2.2),
+whose last stage is the promote; a pass that promoted something reports fresh status counts.
 Since tags became part of the definition (2026-07-23) the meter reads the *tagged* count — 19
 on this machine until a full Identify pass runs, which is the honest number.
 

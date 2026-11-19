@@ -1,21 +1,41 @@
 //! The dependency stage: each asset's GUID and declared references, the prefab evidence that
 //! pairs meshes with materials, and the naming heuristic for raw exports (DATA-MODEL §10).
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
 use lodestash_core::catalog::Catalog;
 
-/// Harvest Unity's own bookkeeping for the rows marked `deps_dirty` (DATA-MODEL §10): each asset's
-/// GUID from its `.meta` sidecar, and — for materials — the texture GUIDs it declares, which become
-/// `asset_relationship` edges. Same sole-writer connection and forward-progress rule as the other
-/// drains: an asset with no `.meta` still clears its flag.
+use super::plan::{past, Scope};
+
+/// Harvest Unity's own bookkeeping for the rows marked `deps_dirty` (DATA-MODEL §10) within
+/// `scope`: each asset's GUID from its `.meta` sidecar, and — for materials — the texture GUIDs
+/// it declares, which become `asset_relationship` edges. Same forward-progress rule as the other
+/// stages: an asset with no `.meta` still clears its flag.
 ///
-/// Order matters within a drain but not across them: an edge whose target isn't catalogued yet is
+/// Order matters within a pass but not across them: an edge whose target isn't catalogued yet is
 /// stored `missing` and late-bound by `resolve_pending_relationships`, so a texture indexed after
 /// its material still connects.
-pub fn drain_dependencies(cat: &mut Catalog, workspace_dir: Option<&std::path::Path>) {
+///
+/// **The harvest is per asset; the graph is the library's.** Prefab evidence, the naming
+/// heuristic and late binding read every source, so they run once the *library's* queue has run
+/// dry — not after every timed slice of it, which would walk every source tree once a slice, and
+/// not in a scoped pass, which is confined to the assets it was given. A pass that harvests
+/// without reconciling raises `graph_due`, and the next library-wide pass that finds the queue
+/// empty reconciles and lowers it. That reconcile is not timed: it happens once per harvest, and
+/// half a graph is worse than a late one.
+pub fn drain_dependencies(
+    cat: &mut Catalog,
+    scope: &Scope,
+    workspace_dir: Option<&std::path::Path>,
+    deadline: Option<Instant>,
+    graph_due: &AtomicBool,
+) {
     const BATCH: usize = 256;
     let mut total = 0usize;
     let mut edges = 0usize;
-    loop {
-        let jobs = match cat.assets_needing_dep_scan(BATCH) {
+    let mut drained = false;
+    'queue: loop {
+        let jobs = match cat.assets_needing_dep_scan_within(BATCH, scope) {
             Ok(j) => j,
             Err(e) => {
                 tracing::warn!(%e, "dependency queue query failed; retries next scan");
@@ -23,10 +43,14 @@ pub fn drain_dependencies(cat: &mut Catalog, workspace_dir: Option<&std::path::P
             }
         };
         if jobs.is_empty() {
+            drained = true;
             break;
         }
         let n = jobs.len();
         for job in jobs {
+            if past(deadline) {
+                break 'queue;
+            }
             let path = match (&job.disk_path, &job.workspace_rel) {
                 (Some(p), _) => Some(std::path::PathBuf::from(p)),
                 (None, Some(rel)) => workspace_dir.map(|w| w.join(rel)),
@@ -58,28 +82,42 @@ pub fn drain_dependencies(cat: &mut Catalog, workspace_dir: Option<&std::path::P
                 &refs,
             ) {
                 tracing::warn!(%e, "record_dependencies failed; stopping dependency drain");
-                return;
+                break 'queue;
             }
             total += 1;
         }
         if n < BATCH {
+            drained = true;
             break;
         }
+    }
+    if total > 0 {
+        graph_due.store(true, Ordering::Relaxed);
+        tracing::info!(scanned = total, edges, "dependency graph harvested");
+        // Out of time on the very last row is still a queue run dry.
+        drained = drained
+            || cat
+                .assets_needing_dep_scan_within(1, scope)
+                .is_ok_and(|q| q.is_empty());
+    }
+    if !scope.is_all() || !drained {
+        return;
     }
     // M28 left the pre-S06 prefab edges as `legacy` evidence until a walk that completes everywhere
     // replaces it. That reharvest is tried once per process: a source whose drive stays unplugged
     // keeps it pending, and re-walking the library on every idle tick for that would cost more than
     // waiting for the next change.
-    static REHARVEST_TRIED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-    let reharvest = !REHARVEST_TRIED.load(std::sync::atomic::Ordering::Relaxed)
-        && cat.prefab_reharvest_pending().unwrap_or(false);
-    if total > 0 || reharvest {
-        REHARVEST_TRIED.store(true, std::sync::atomic::Ordering::Relaxed);
-        let (scopes, whole_library) = library_prefab_scopes(cat, workspace_dir);
-        refresh_prefab_evidence(cat, &scopes, whole_library);
+    static REHARVEST_TRIED: AtomicBool = AtomicBool::new(false);
+    let reharvest =
+        !REHARVEST_TRIED.load(Ordering::Relaxed) && cat.prefab_reharvest_pending().unwrap_or(false);
+    let due = graph_due.load(Ordering::Relaxed);
+    if !(due || reharvest) {
+        return;
     }
-    if total > 0 {
+    REHARVEST_TRIED.store(true, Ordering::Relaxed);
+    let (scopes, whole_library) = library_prefab_scopes(cat, workspace_dir);
+    refresh_prefab_evidence(cat, &scopes, whole_library);
+    if due {
         drain_inferred_texture_edges(cat);
     }
     match cat.resolve_pending_relationships() {
@@ -87,9 +125,7 @@ pub fn drain_dependencies(cat: &mut Catalog, workspace_dir: Option<&std::path::P
         Ok(_) => {}
         Err(e) => tracing::warn!(%e, "resolving pending dependency edges failed"),
     }
-    if total > 0 {
-        tracing::info!(scanned = total, edges, "dependency graph harvested");
-    }
+    graph_due.store(false, Ordering::Relaxed);
 }
 
 /// One tree of `.prefab` files the evidence pass walks — a source root, or the package workspace.

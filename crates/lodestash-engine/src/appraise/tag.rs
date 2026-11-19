@@ -1,9 +1,112 @@
 //! The generic tag stage: read a slice of the queue, caption and tag it, store each producer's
 //! tags under its own source (ADR-0017). Three phases, so the inference can run off the writer
 //! (ADR-0013).
-use lodestash_core::catalog::Catalog;
+use lodestash_ai::image_tags::ImageZeroShot;
+use lodestash_ai::ollama::OllamaTagger;
+use lodestash_ai::openai::OpenAiTagger;
+use lodestash_ai::tagger::{FilenameTagger, Tagger, TeachTrait};
+use lodestash_core::catalog::{Catalog, TeachRow};
 
+use super::cloud::drain_api_tags;
+use super::plan::{Budget, Env, Scope};
 use super::resolve::resolve_job_path;
+use crate::config::AppConfig;
+
+/// The user's taught vocabulary (Traits screen, AI-PIPELINE §6) as the taggers take it: candidate
+/// labels for the zero-shot pass, and words the captioning models are told to prefer.
+pub fn teaching(rows: Vec<TeachRow>) -> Vec<TeachTrait> {
+    rows.into_iter()
+        .map(|(namespace, value, scope, usage_note)| TeachTrait {
+            namespace,
+            value,
+            scope,
+            usage_note,
+        })
+        .collect()
+}
+
+/// The local tagger settings name: the Ollama two-stage tagger when a model is configured, the
+/// filename tagger when none is (AI-PIPELINE §2).
+pub fn local_tagger(cfg: &AppConfig, teach: &[TeachTrait]) -> Box<dyn Tagger> {
+    match cfg.tagger_model.clone() {
+        Some(model) => {
+            let mut tagger = OllamaTagger::new(model);
+            if let Some(vision) = cfg.tagger_vision_model.clone() {
+                tagger = tagger.with_vision(vision);
+            }
+            Box::new(tagger.with_teaching(teach.to_vec()))
+        }
+        None => Box::new(FilenameTagger),
+    }
+}
+
+/// Is cloud tagging switched on, with a key and a model to call?
+pub fn cloud_configured(cfg: &AppConfig) -> bool {
+    cfg.api_tagging_enabled && !cfg.api_key.is_empty() && cfg.api_model.is_some()
+}
+
+/// The endpoint tagger, when cloud tagging is switched on **and** has a key and a model
+/// (AI-PIPELINE §5). Whether its bytes may leave is the egress gate's question, asked by the
+/// drain before its first request.
+pub fn cloud_tagger(cfg: &AppConfig, teach: &[TeachTrait]) -> Option<OpenAiTagger> {
+    let model = cfg.api_model.clone().filter(|_| cloud_configured(cfg))?;
+    Some(
+        OpenAiTagger::new(cfg.api_base_url.clone(), cfg.api_key.clone(), model)
+            .with_teaching(teach.to_vec()),
+    )
+}
+
+/// The generic tag stage of a pass, inline: through the endpoint when one is configured, with
+/// the local tagger as its fallback; otherwise the local tagger alone.
+///
+/// Nothing queued → no tagger is built. Building one encodes the **whole** zero-shot label
+/// vocabulary (67 labels, one SigLIP text pass each), and that used to happen on every pass —
+/// which was free while no embedder would load, and the moment one did, a trivial user write went
+/// from 25 ms to **16.6 s** because the single writer was re-encoding the same labels when the op
+/// arrived. One `LIMIT 1` query is the whole fix.
+pub(super) fn tag_stage(cat: &mut Catalog, scope: &Scope, env: &Env<'_>, budget: Budget) {
+    if tag_batch(cat, 1, scope).is_empty() {
+        return;
+    }
+    let teach = teaching(cat.teaching_traits().unwrap_or_default());
+    let zero_shot = env
+        .embedder
+        .clone()
+        .and_then(|e| ImageZeroShot::new(e, &teach));
+    // Built either way: on its own when no endpoint is configured, or as the cloud drain's
+    // per-asset fallback (AI-PIPELINE §5.1 "Local fallback on failure").
+    let local = local_tagger(env.config, &teach);
+    match cloud_tagger(env.config, &teach) {
+        // Cloud tagging goes through `drain_api_tags`, **not** `drain_tags`. `drain_tags` →
+        // `compute_tags` passes `image: None` (the two-phase shape expects `caption()` to carry
+        // the picture) and `OpenAiTagger` has no `caption()`, so that path made no HTTP request
+        // at all and wrote an empty tag set that cleared `tags_dirty` — assets marked done, never
+        // seen by any model. `drain_api_tags` passes the image, honours `Retry-After`, falls
+        // back to the local model on a hard error, and caps the run.
+        Some(api) => drain_api_tags(
+            cat,
+            env.config,
+            &api,
+            Some(local.as_ref()),
+            zero_shot.as_ref(),
+            env.config.api_max_per_run,
+            env.workspace_dir,
+            env.cache_dir,
+            env.progress,
+            scope,
+        ),
+        None => drain_tags(
+            cat,
+            local.as_ref(),
+            zero_shot.as_ref(),
+            scope,
+            env.workspace_dir,
+            env.cache_dir,
+            env.progress,
+            budget.tagged,
+        ),
+    }
+}
 
 /// Zero-shot tags for one asset (AI-PIPELINE §2.1/§3). For a `model_3d` asset it scores the stored
 /// **multiview** embedding (four orbit views pooled by the embedding drain) rather than the single
@@ -91,12 +194,15 @@ pub(super) fn write_groups(
 /// Phase 1 of tagging: **read** a slice of the queue. Same split, and for the same reason, as
 /// [`visual_embed_batch`] — a caption is a whole VLM inference (~13 s here) and the writer must
 /// not be inside it.
+///
+/// The queue never holds audio (review B5): a clip is the audio stage's, whichever tagger is
+/// configured here.
 pub fn tag_batch(
     cat: &Catalog,
     limit: usize,
-    only: Option<&[i64]>,
+    scope: &Scope,
 ) -> Vec<lodestash_core::catalog::VisualEmbedJob> {
-    cat.assets_needing_tags_within(limit, only)
+    cat.assets_needing_tags_within(limit, scope)
         .unwrap_or_else(|e| {
             tracing::warn!(%e, "tag queue query failed; retries next run");
             Vec::new()
@@ -197,13 +303,19 @@ pub fn compute_tags(
 }
 
 /// Phase 3: **write** — the whole slice as one atomic batch, each producer's tags under its own
-/// source, the configured captioner's caption with them. Returns the number of tag rows proposed.
-pub fn store_tags(cat: &mut Catalog, producers: &TagProducers, results: &[ComputedTags]) -> usize {
+/// source, the configured captioner's caption with them. `Some` with the number of tag rows
+/// proposed when the slice was stored (an empty slice is stored trivially), `None` when the
+/// catalog refused it — its assets stay queued, and a caller that loops must stop.
+pub fn store_tags(
+    cat: &mut Catalog,
+    producers: &TagProducers,
+    results: &[ComputedTags],
+) -> Option<usize> {
     use lodestash_core::catalog::{
         ai_source, HistoryOrigin, TagBatch, TagBatchItem, TagMode, MAX_DESCRIPTION_CHARS,
     };
     if results.is_empty() {
-        return 0;
+        return Some(0);
     }
     let mut items = Vec::with_capacity(results.len() * 2);
     for r in results {
@@ -242,13 +354,15 @@ pub fn store_tags(cat: &mut Catalog, producers: &TagProducers, results: &[Comput
         history: Some(HistoryOrigin::Background),
         receipt: None,
     }) {
-        Ok(_) => results
-            .iter()
-            .map(|r| r.tags.len() + r.zero_shot.len())
-            .sum(),
+        Ok(_) => Some(
+            results
+                .iter()
+                .map(|r| r.tags.len() + r.zero_shot.len())
+                .sum(),
+        ),
         Err(e) => {
             tracing::warn!(%e, "tag slice refused; its assets stay queued");
-            0
+            None
         }
     }
 }
@@ -259,9 +373,9 @@ pub fn store_tags(cat: &mut Catalog, producers: &TagProducers, results: &[Comput
 /// grid shows, produced by the same `thumb::generate` (decode for 2D, hero render for 3D), so the
 /// model sees what the user sees and no second rendering path exists to drift.
 ///
-/// Forward progress is unconditional: an asset the tagger refuses (audio), one whose preview can't
-/// be made, and one the model answers nothing for all still clear `tags_dirty` via an empty write.
-/// Otherwise the queue would hand back the same rows forever.
+/// Forward progress is unconditional: an asset the tagger does not support, one whose preview
+/// can't be made, and one the model answers nothing for all still clear `tags_dirty` via an
+/// empty write. Otherwise the queue would hand back the same rows forever.
 ///
 /// The three phases back-to-back on one thread — the **kick** path, where the user asked for it
 /// and is watching a progress bar. The idle path drives the phases separately so the inference
@@ -270,13 +384,12 @@ pub fn drain_tags(
     cat: &mut Catalog,
     tagger: &dyn lodestash_ai::tagger::Tagger,
     zero_shot: Option<&lodestash_ai::image_tags::ImageZeroShot>,
+    scope: &Scope,
     workspace_dir: Option<&std::path::Path>,
     cache_dir: Option<&std::path::Path>,
     progress: &crate::jobs::JobProgress,
+    // `0` = no cap.
     max_assets: u32,
-    // Restrict the pass to these assets. `None` = the whole queue (the idle slice);
-    // `Some(ids)` = exactly what `identify_asset` was asked about.
-    only: Option<&[i64]>,
 ) {
     use std::sync::atomic::Ordering;
     const BATCH: usize = 16;
@@ -305,7 +418,7 @@ pub fn drain_tags(
         if room == 0 {
             break;
         }
-        let jobs = tag_batch(cat, room, only);
+        let jobs = tag_batch(cat, room, scope);
         let n = jobs.len();
         if n == 0 {
             break;
@@ -317,7 +430,15 @@ pub fn drain_tags(
         if progress.is_cancelled() {
             return;
         }
-        tagged += store_tags(cat, &producers, &done);
+        // Nothing computed (a tagger this path cannot serve) or a slice the catalog refused:
+        // the same rows would come straight back, so stop rather than spin on them.
+        let Some(stored) = Some(&done)
+            .filter(|d| !d.is_empty())
+            .and_then(|d| store_tags(cat, &producers, d))
+        else {
+            break;
+        };
+        tagged += stored;
         tagged_assets += done.len();
         progress
             .done

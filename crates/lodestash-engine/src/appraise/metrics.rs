@@ -1,25 +1,33 @@
 //! The metrics stage: technical facets, perceptual hashes, and a model's vector preview while
 //! its mesh is parsed anyway (DATA-MODEL §14).
+use std::time::Instant;
+
 use lodestash_core::catalog::Catalog;
 
 use super::audio::audio_duration_ms;
+use super::plan::{past, Scope};
 use super::preview::store_vector_preview;
 use super::resolve::resolve_job_path;
 
 /// Extract technical facets (tri counts, dimensions, duration) for the rows `record_crawl` marked
-/// `metrics_dirty` (DATA-MODEL §14). Runs on the persist thread's own connection like the embedding
-/// drains, but unconditionally — facets are plain measurements and must not depend on the AI stack
-/// being installed. A file we can't measure still gets its flag cleared (forward progress).
+/// `metrics_dirty` (DATA-MODEL §14), within `scope`. Facets are plain measurements and do not
+/// depend on the AI stack being installed. A file we can't measure still gets its flag cleared
+/// (forward progress).
+///
+/// `deadline` is tested before every file: one unit is a full parse of a model, and this runs in
+/// the idle lane's slice of the writer.
 pub fn drain_metrics(
     cat: &mut Catalog,
+    scope: &Scope,
     workspace_dir: Option<&std::path::Path>,
     cache_dir: Option<&std::path::Path>,
     proxy: lodestash_ingest::decimate::Budget,
+    deadline: Option<Instant>,
 ) {
     const BATCH: usize = 64;
     let mut total = 0usize;
-    loop {
-        let jobs = match cat.assets_needing_metrics(BATCH) {
+    'queue: loop {
+        let jobs = match cat.assets_needing_metrics_within(BATCH, scope) {
             Ok(j) => j,
             Err(e) => {
                 tracing::warn!(%e, "metrics queue query failed; retries next scan");
@@ -31,6 +39,10 @@ pub fn drain_metrics(
         }
         let n = jobs.len();
         for job in jobs {
+            if past(deadline) {
+                tracing::debug!(measured = total, "metrics pass hit its time budget");
+                break 'queue;
+            }
             // In-pack payloads pull to a scratch file; keep the guard alive while `path` is read.
             let resolved = resolve_job_path(&job, workspace_dir);
             let path = resolved.as_ref().map(|(p, _)| p.clone());
@@ -65,7 +77,7 @@ pub fn drain_metrics(
                 }
             }
             // The mesh is parsed and cached right here, so this is the one place that can produce
-            // the vector preview without a second parse — and it is already the persist thread, so
+            // the vector preview without a second parse — and it is already the writer thread, so
             // the write respects the single-writer rule (ARCHITECTURE §5).
             // An in-pack payload resolves to a *scratch* file with a random stem, so it has no
             // stable identity to key a preview on — see `store_vector_preview`.

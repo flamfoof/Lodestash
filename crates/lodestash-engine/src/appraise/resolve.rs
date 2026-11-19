@@ -47,6 +47,8 @@ pub fn resolve_job_image(
         if !in_pack_pull_ok(sz, pack) {
             return None;
         }
+        #[cfg(test)]
+        pulls::record(pack);
         let bytes = lodestash_ingest::unitypackage::read_payload_at(
             std::path::Path::new(pack),
             off as u64,
@@ -59,6 +61,19 @@ pub fn resolve_job_image(
             .ok();
     }
     None
+}
+
+/// Where a job's file is on this machine — on disk, or extracted to the workspace — and `None`
+/// for an asset whose bytes are still inside its package. Never reads anything: for a stage that
+/// needs a file with a path of its own and has no use for a scratch copy.
+pub fn local_job_path(
+    job: &lodestash_core::catalog::VisualEmbedJob,
+    workspace_dir: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    if let Some(p) = &job.disk_path {
+        return Some(std::path::PathBuf::from(p));
+    }
+    Some(workspace_dir?.join(job.workspace_rel.as_ref()?))
 }
 
 /// Resolve a drain job to a readable on-disk path from whichever §7 byte-source applies. On-disk and
@@ -82,6 +97,8 @@ pub fn resolve_job_path(
         if !in_pack_pull_ok(sz, pack) {
             return None;
         }
+        #[cfg(test)]
+        pulls::record(pack);
         let bytes = lodestash_ingest::unitypackage::read_payload_at(
             std::path::Path::new(pack),
             off as u64,
@@ -108,4 +125,30 @@ pub fn resolve_job_path(
         return Some((pathbuf, Some(temp_path)));
     }
     None
+}
+
+/// How many times each archive has had a payload pulled out of it, so a test can tell a pull
+/// from none. Keyed by archive path: every test has its own, so tests do not see each other's.
+#[cfg(test)]
+pub(crate) mod pulls {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    static PULLS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+    pub(super) fn record(pack: &str) {
+        let mut pulls = PULLS.lock().unwrap_or_else(|p| p.into_inner());
+        *pulls
+            .get_or_insert_with(HashMap::new)
+            .entry(pack.to_string())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn count(pack: &std::path::Path) -> usize {
+        let pulls = PULLS.lock().unwrap_or_else(|p| p.into_inner());
+        pulls
+            .as_ref()
+            .and_then(|m| m.get(pack.to_string_lossy().as_ref()).copied())
+            .unwrap_or(0)
+    }
 }
