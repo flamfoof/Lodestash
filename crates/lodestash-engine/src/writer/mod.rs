@@ -1684,8 +1684,7 @@ fn rebuild_watch(catalog: &Catalog) -> Option<lodestash_ingest::watch::RootWatch
 }
 
 /// One watch-driven rescan of every watched source: the incremental crawl (unchanged files skip
-/// BLAKE3 via `needs_rehash`), then the standard persist on this thread (single-writer rule —
-/// `persist_to_catalog` opens its own connection here exactly as `Op::PersistScan` does).
+/// BLAKE3 via `needs_rehash`), then the standard persist on this thread's own connection.
 /// Returns whether anything actually changed, so the UI only reloads when it did.
 fn rescan_watched(catalog: &mut Catalog, ctx: &WriterCtx) -> bool {
     let cfg = ctx.config.get();
@@ -1704,13 +1703,7 @@ fn rescan_watched(catalog: &mut Catalog, ctx: &WriterCtx) -> bool {
         let excludes = project
             .map(|p| cfg.source_excludes(p, &root))
             .unwrap_or_default();
-        match crate::persist::rescan_source(
-            &ctx.db_path,
-            catalog,
-            &info.root_path,
-            &info.name,
-            &excludes,
-        ) {
+        match crate::persist::rescan_source(catalog, &info.root_path, &info.name, &excludes) {
             Ok(persisted) => changed |= persisted,
             Err(e) => tracing::warn!(%e, root = %info.root_path, "watch rescan failed"),
         }
@@ -1900,9 +1893,8 @@ fn run(
             })
         }
 
-        // `persist_to_catalog` opens its **own** connection, which would be a second writer
-        // anywhere else. Running it on this thread is what keeps the rule true: this thread's own
-        // connection sits idle for the duration, and no other job can interleave with it.
+        // A scan's rows are written through this thread's own connection, like every other
+        // write (it used to open a second one — review R5).
         // Browse persistence (INGESTION §2): the crawl already captured each `.unitypackage`'s
         // manifest locators — upsert the `package` row + record them, so the pack appears on
         // Unity Assets and extracts surgically without re-reading the archive.
@@ -1914,8 +1906,7 @@ fn run(
                 .unwrap_or_else(|| "Import".to_string());
             let (_, job) = jobs.open(label, "import", false);
             let result = (|| {
-                crate::persist::persist_to_catalog(&ctx.db_path, &batches)
-                    .map_err(|e| e.to_string())?;
+                crate::persist::persist_scan(catalog, &batches)?;
                 for pack in packs {
                     let Some(source) = catalog
                         .source_info_by_root(&pack.root)
@@ -2447,9 +2438,7 @@ fn run(
             })
             .map_err(|e| e.to_string()),
 
-        // Batch undo opens its own connection on this thread (the same pattern as
-        // persist_to_catalog): the single-writer rule is about which *thread* writes, and this
-        // is still the writer — no other job can interleave with the delete.
+        // Batch undo runs on this thread's connection, like every other write.
         Op::UndoImportBatch { batch_id } => undo_import_batch(catalog, &batch_id),
 
         Op::DeleteCategory { id } => catalog
@@ -2592,10 +2581,8 @@ fn run(
 }
 
 /// Undo one import batch (UI-SPEC §16.1): delete the batch's copied files from the project,
-/// then its import_record rows — catalog assets are never touched. Runs on the writer thread
-/// over its own short-lived connection, so the single-writer rule holds (same pattern as
-/// persist_to_catalog); the connection does not run migrations (the writer's own catalog already
-/// did at spawn).
+/// then its import_record rows — catalog assets are never touched. Runs on the writer thread,
+/// over the writer's connection.
 /// Delete what one export run wrote, then forget the run (FEATURES §7.1).
 ///
 /// Every delete here is a file **this app created**, in a folder the user pointed it at, named in
@@ -3938,6 +3925,7 @@ mod tests {
 
         let db = dir.path().join("catalog.db");
         let mut catalog = Catalog::open(&db).expect("open");
+        catalog.seed_media_types().expect("seed");
         catalog
             .upsert_import_source("lib", &root_str, "folder")
             .expect("source");

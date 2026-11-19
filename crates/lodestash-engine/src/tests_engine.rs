@@ -1323,3 +1323,51 @@ fn the_default_catalog_keeps_its_workspace_however_its_path_is_spelled() {
         "a different file in the same folder is a different catalog"
     );
 }
+
+/// Review R5, made a check: the engine opens **one** writing connection — the writer's — and
+/// everything else reads. A scan's persist used to open a second, migrating `Catalog::open` on
+/// every scan and every watch rescan (v2 plan Task 2.5). The rule is a property of the source, so
+/// this reads the source: outside test code, `Catalog::open(` appears once, where the writer
+/// opens its catalog.
+#[test]
+fn the_engine_opens_one_writing_connection() {
+    fn sources(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("src") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    sources(&src, &mut files);
+
+    let mut opens = Vec::new();
+    for file in files {
+        let name = file.file_name().expect("name").to_string_lossy();
+        if name.starts_with("tests") || name == "testkit.rs" {
+            continue;
+        }
+        // A file's own unit tests open scratch catalogs freely; they follow its code.
+        let text = std::fs::read_to_string(&file)
+            .expect("read")
+            .replace("\r\n", "\n");
+        let code = text.split("#[cfg(test)]\nmod tests").next().unwrap_or("");
+        for (i, line) in code.lines().enumerate() {
+            let line = line.trim_start();
+            if line.contains("Catalog::open(") && !line.starts_with("//") {
+                let rel = file.strip_prefix(&src).expect("under src");
+                opens.push(format!("{}:{}", rel.display(), i + 1).replace('\\', "/"));
+            }
+        }
+    }
+    assert_eq!(
+        opens.len(),
+        1,
+        "writing opens outside the writer's own: {opens:?}"
+    );
+    assert!(opens[0].starts_with("writer/mod.rs:"), "{opens:?}");
+}

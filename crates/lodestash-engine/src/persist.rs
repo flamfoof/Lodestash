@@ -1,9 +1,6 @@
 //! Crawl-record building + catalog persistence for scans, split out of the egui `app.rs` (B1);
 //! carries no renderer.
-use lodestash_core::catalog::{
-    Catalog, CrawlRecord, InPackClass, PackageEntryRecord, StatusCounts,
-};
-use lodestash_core::types::AssetStatus;
+use lodestash_core::catalog::{Catalog, CrawlRecord, InPackClass, PackageEntryRecord};
 use lodestash_ingest::crawler::CrawledFile;
 use lodestash_ingest::detect;
 
@@ -93,51 +90,15 @@ pub fn crawl_records_in_workspace<'a>(
         .collect()
 }
 
-/// Read every live asset row back for the given `(root, source_id)` pairs, keyed for
-/// the UI-side join (unknown status strings are dropped, not fatal).
-pub fn read_back_assets(
-    catalog: &Catalog,
-    sources: &[(String, i64)],
-) -> Result<AssetIdentityMaps, String> {
-    sources
-        .iter()
-        .map(|(root, id)| {
-            let map = catalog
-                .assets_for_source(*id)
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .filter_map(|a| {
-                    AssetStatus::from_code(&a.status).map(|s| {
-                        (
-                            a.rel_path,
-                            (
-                                a.asset_id,
-                                s,
-                                a.trashed,
-                                a.rating,
-                                a.metrics,
-                                a.content_hash,
-                            ),
-                        )
-                    })
-                })
-                .collect();
-            Ok((root.clone(), map))
-        })
-        .collect()
-}
-
 /// One rescan of one source, as the watcher runs it (DATA-MODEL §6): what the catalog knows of
 /// each file → the incremental crawl (a file at its known `(size, mtime)` is not read) → the
-/// records → [`persist_to_catalog`]. `Ok(false)` when nothing was persisted: the walk found no
+/// records → [`persist_scan`]. `Ok(false)` when nothing was persisted: the walk found no
 /// files at all (an unplugged drive must not flag a library missing), or every file is exactly as
 /// the catalog has it (no spurious `last_scanned_at` write and UI reload).
 ///
-/// `catalog` is only read here; the persist opens its own connection, on the calling thread —
-/// which must be the writer's (single-writer rule).
+/// `catalog` is the writer's connection: the read and the persist both go through it.
 pub fn rescan_source(
-    db_path: &std::path::Path,
-    catalog: &Catalog,
+    catalog: &mut Catalog,
     root: &str,
     name: &str,
     excludes: &[lodestash_core::types::Exclude],
@@ -163,26 +124,24 @@ pub fn rescan_source(
         excludes_json: None,
         records,
     };
-    persist_to_catalog(db_path, &[batch]).map(|_| true)
+    persist_scan(catalog, &[batch]).map(|_| true)
 }
 
-/// Runs on the persist thread: open the catalog, upsert each source, record its crawl
-/// incrementally, adopt any config blacklists (one-time M5 data step), and read back
-/// the per-status counts + asset identities for exactly these sources.
-pub fn persist_to_catalog(
-    db_path: &std::path::Path,
-    batches: &[PersistBatch],
-) -> Result<(StatusCounts, AssetIdentityMaps, Catalog), String> {
-    let mut catalog = Catalog::open(db_path).map_err(|e| e.to_string())?;
-    catalog.seed_media_types().map_err(|e| e.to_string())?;
-
-    let mut sources = Vec::with_capacity(batches.len());
+/// Record a scan: upsert each source, settle which file is which row, record the crawl
+/// incrementally, flag what went missing, and adopt any config blacklists (one-time M5 data
+/// step).
+///
+/// On `catalog` — **the writer's own connection**. This used to open a second writing connection
+/// of its own (a migrating `Catalog::open`) on every scan and every watch rescan: on the writer
+/// thread, so never concurrent, but a second writer all the same, and one whose commits the
+/// writer's connection could only see sideways (review R5). The media types it relies on are
+/// seeded when the writer opens the catalog.
+pub fn persist_scan(catalog: &mut Catalog, batches: &[PersistBatch]) -> Result<(), String> {
     let mut blacklists = Vec::new();
     for batch in batches {
         let id = catalog
             .upsert_import_source(&batch.name, &batch.root, "folder")
             .map_err(|e| e.to_string())?;
-        sources.push((batch.root.clone(), id));
         if let Some(json) = &batch.excludes_json {
             blacklists.push((batch.root.clone(), json.clone()));
         }
@@ -231,14 +190,7 @@ pub fn persist_to_catalog(
             .adopt_config_blacklists(&blacklists)
             .map_err(|e| e.to_string())?;
     }
-    let ids: Vec<i64> = sources.iter().map(|(_, id)| *id).collect();
-    let counts = catalog
-        .status_counts_for_sources(&ids)
-        .map_err(|e| e.to_string())?;
-    let assets = read_back_assets(&catalog, &sources)?;
-    // Hand the open connection back so the caller can drain `embedding_dirty` on this same
-    // thread — keeps the single-writer rule (ARCHITECTURE §5) with no extra writer thread.
-    Ok((counts, assets, catalog))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -265,10 +217,17 @@ mod tests {
         }
     }
 
+    /// The writer's connection, as the engine opens it: migrated, media types seeded.
+    fn writer(db: &std::path::Path) -> Catalog {
+        let catalog = Catalog::open(db).unwrap();
+        catalog.seed_media_types().unwrap();
+        catalog
+    }
+
     /// `(rel_path, asset_id)` the grid would show for the source after a persist: live rows only,
     /// read back through a separate connection.
     fn shown(db: &std::path::Path) -> Vec<(String, i64)> {
-        let c = Catalog::open(db).unwrap();
+        let c = Catalog::open_reader(db).unwrap();
         let src = c.source_info_by_root("C:/lib").unwrap().unwrap().id;
         let mut rows: Vec<(String, i64)> = c
             .entries_for_source(src)
@@ -287,17 +246,15 @@ mod tests {
     fn a_renamed_file_keeps_its_identity_and_stays_visible() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("catalog.db");
-        persist_to_catalog(&db, &[batch(&[("rock.png", "H1"), ("tree.png", "H2")])]).unwrap();
+        let mut c = writer(&db);
+        persist_scan(&mut c, &[batch(&[("rock.png", "H1"), ("tree.png", "H2")])]).unwrap();
         let before = shown(&db);
         let rock = before.iter().find(|(p, _)| p == "rock.png").unwrap().1;
-        {
-            let mut c = Catalog::open(&db).unwrap();
-            c.add_asset_tag(rock, "manual", "subject", "boulder")
-                .unwrap();
-        }
+        c.add_asset_tag(rock, "manual", "subject", "boulder")
+            .unwrap();
 
-        persist_to_catalog(
-            &db,
+        persist_scan(
+            &mut c,
             &[batch(&[("stones/big rock.png", "H1"), ("tree.png", "H2")])],
         )
         .unwrap();
@@ -311,7 +268,10 @@ mod tests {
             2,
             "nothing went missing, nothing was duplicated"
         );
-        let tags = Catalog::open(&db).unwrap().tags_for_asset(rock).unwrap();
+        let tags = Catalog::open_reader(&db)
+            .unwrap()
+            .tags_for_asset(rock)
+            .unwrap();
         assert_eq!(tags[0].value, "boulder", "its tags came with it");
     }
 
@@ -321,17 +281,15 @@ mod tests {
     fn a_moved_folder_of_identical_files_keeps_both_identities() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("catalog.db");
-        persist_to_catalog(&db, &[batch(&[("old/a.png", "H"), ("old/b.png", "H")])]).unwrap();
+        let mut c = writer(&db);
+        persist_scan(&mut c, &[batch(&[("old/a.png", "H"), ("old/b.png", "H")])]).unwrap();
         let before = shown(&db);
         let labels = ["alpha", "beta"];
-        {
-            let mut c = Catalog::open(&db).unwrap();
-            for ((_, id), label) in before.iter().zip(labels) {
-                c.add_asset_tag(*id, "manual", "subject", label).unwrap();
-            }
+        for ((_, id), label) in before.iter().zip(labels) {
+            c.add_asset_tag(*id, "manual", "subject", label).unwrap();
         }
 
-        persist_to_catalog(&db, &[batch(&[("new/a.png", "H"), ("new/b.png", "H")])]).unwrap();
+        persist_scan(&mut c, &[batch(&[("new/a.png", "H"), ("new/b.png", "H")])]).unwrap();
         let after = shown(&db);
         let ids = |rows: &[(String, i64)]| rows.iter().map(|r| r.1).collect::<Vec<_>>();
         assert_eq!(
@@ -339,9 +297,9 @@ mod tests {
             vec!["new/a.png", "new/b.png"]
         );
         assert_eq!(ids(&after), ids(&before), "each file kept its id");
-        let c = Catalog::open(&db).unwrap();
+        let reader = Catalog::open_reader(&db).unwrap();
         for ((_, id), label) in before.iter().zip(labels) {
-            let tag = c.tags_for_asset(*id).unwrap()[0].value.clone();
+            let tag = reader.tags_for_asset(*id).unwrap()[0].value.clone();
             assert_eq!(tag, label, "asset {id} kept its own tag");
         }
     }

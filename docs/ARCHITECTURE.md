@@ -270,8 +270,10 @@ surfaces as an error rather than a silently stale answer.
   `ls:changed` per 250 ms window, carrying every origin in that window and a generation per domain.
   Fifty writes inside a window are one event; a continuous drain is one event per window, never one
   per commit. The bus lives in the engine (`Engine::subscribe`); the publisher starts with the first
-  subscriber, so an engine nobody listens to publishes nothing. A turn that committed through a
-  second connection (a crawl's persist) counts too, by SQLite's `data_version`.
+  subscriber, so an engine nobody listens to publishes nothing. The engine opens no second writing
+  connection — a scan's persist runs on the writer's own since v2 plan Task 2.5, and a test reads
+  the source for another `Catalog::open` — but a commit from outside the writer during a turn still
+  counts, by SQLite's `data_version`.
 - **Job engine** with bounded queues and progress events; the UI shows placeholders and swaps in
   results as jobs finish (what makes a 10k-grid feel instant).
 - **GPU work** (live viewport + offscreen thumbnail render-to-texture + image texture upload) shares

@@ -151,7 +151,9 @@ impl Changes {
 }
 
 /// Where the catalog stood before a writer turn: this connection's own change count, and SQLite's
-/// `data_version`, which moves when **another** connection commits (a crawl's persist opens its own).
+/// `data_version`, which moves when **another** connection commits. The engine opens no second
+/// writing connection (a scan's persist was the last one, v2 plan Task 2.5); the check stays so
+/// that a commit from outside the writer — another tool on the file — is still a change.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Stamp {
     total: u64,
@@ -291,8 +293,9 @@ mod tests {
         assert_eq!(changes.catalog_generation(), 1);
     }
 
-    /// A writer turn that commits through a second connection — `persist_to_catalog` opens its own
-    /// — is still a change: the writer's own `total_changes` cannot see it, `data_version` can.
+    /// A commit through a second connection during a writer turn is still a change: the writer's
+    /// own `total_changes` cannot see it, `data_version` can. (A scan's persist used to be such a
+    /// connection; nothing in the engine is any more.)
     /// Before the read model rebuilt on the generation, an added source showed up only because the
     /// shell reloaded after every command.
     #[test]
