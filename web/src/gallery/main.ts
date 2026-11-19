@@ -27,6 +27,8 @@ const LIBRARY: Record<string, LibraryProps> = {
   "#library-filters": { filters: { traits: ["rock"], tris: ["low"], sizes: ["M"] }, open: "filters" },
   // `library+picks`: the first three cards picked — the bulk bar
   "#library-picks": { picks: [1, 2, 3] },
+  // `library+list`: the view toggle's second stop
+  "#library-list": { layout: "list" },
 };
 
 // `#shell` is the frame alone; anything else that is not a Library page is the primitive sheet.

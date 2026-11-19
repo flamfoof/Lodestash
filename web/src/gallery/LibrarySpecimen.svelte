@@ -19,7 +19,7 @@
    * contract at 1440 × 900. Each `gallery.html#…` page is this component started in one contract
    * state (gallery/main.ts lists them): `#library`, `#library-inspector` (the first asset
    * selected), `#library-filters` (⚑ open with rock ∧ ≤ 1k ∧ M chosen), `#library-picks` (three
-   * cards picked: the bulk bar).
+   * cards picked: the bulk bar), `#library-list` (the ☰ stop).
    *
    * This is the only owner of data on the page: it stands in for the resource cache, the library
    * query and the mutation layer of plan P6b. Intents change its copy of the fixture, and the
@@ -30,8 +30,11 @@
     select = null,
     filters: startFilters = NO_FILTERS,
     picks = [],
+    layout = "grid",
     open = null,
   }: {
+    /** The view toggle's stop when the page loads. */
+    layout?: LibraryView["layout"];
     /** The asset the inspector describes when the page loads. */
     select?: number | null;
     /** The ⚑ filter in effect when the page loads. */
@@ -50,7 +53,7 @@
 
   let assets = $state<AssetDetail[]>(ASSETS.map((a) => ({ ...a })));
   let shell = $state<ShellData>(shellData());
-  let view = $state<LibraryView>({ ...DEFAULT_VIEW });
+  let view = $state<LibraryView>(untrack(() => ({ ...DEFAULT_VIEW, layout })));
   let filters = $state<LibraryFilters>(untrack(() => startFilters));
   let nudgeDismissed = $state(false);
   let said = $state<string | null>(null);

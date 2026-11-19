@@ -80,6 +80,7 @@ const PAGES = [
   // The Library's overlays (plan P7b), each page the whole of its state, with positions.
   screen("filters", "#library-filters", "library+filters"),
   screen("picks", "#library-picks", "library+picks"),
+  screen("list", "#library-list", "library+list"),
 ];
 
 /** A screen specimen: one page that reproduces every anchor of one state, positions included. */
@@ -97,7 +98,6 @@ const defer = (state, task) => Object.fromEntries(Object.keys(ANCHORS[state]).ma
  * docs/superpowers/plans/2026-11-18-v2-p7b-library-overlays.md).
  */
 const DEFERRED = {
-  "library+list": defer("library+list", "gallery.html#library-list — plan P7b Task 7b.4"),
   quicklook: defer("quicklook", "gallery.html#quicklook — plan P7b Task 7b.5"),
   "quicklook+sound": defer("quicklook+sound", "gallery.html#quicklook-sound — plan P7b Task 7b.5"),
   "quicklook+image": defer("quicklook+image", "gallery.html#quicklook-image — plan P7b Task 7b.5"),

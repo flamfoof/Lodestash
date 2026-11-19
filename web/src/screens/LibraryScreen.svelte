@@ -18,7 +18,7 @@
 
   /**
    * The Library: the Unidentified nudge, the toolbar, the active-filter bar, and one page of the
-   * result as a grid (UI-SPEC §2). A thin composition — it places features and wires them; every
+   * result as a grid of cards or a list of rows — the view toggle's two stops (UI-SPEC §2). A thin composition — it places features and wires them; every
    * look is a primitive's and nothing here fetches. Data comes in as props (the page, already
    * filtered and sorted by whoever owns the query); what the person asks for goes out as intents
    * and as changes to the view and the filters. The one state it shares is the `selection`, which
@@ -173,7 +173,7 @@
   />
   <ActiveFilterBar filters={active} shown={count} {total} onremove={removeFilter} onclear={() => onclearfilters?.()} />
   <BulkBar targets={picked} {project} onintent={dispatch} onclear={() => selection.picks.clear()} />
-  <div class="body">
+  <div class="body" class:list={view.layout === "list" && assets.length > 0}>
     {#if assets.length === 0}
       <EmptyState
         icon="search"
@@ -185,10 +185,6 @@
           {#if unidentified > 0}<Button onclick={() => onidentify?.()}>Open Identify mode</Button>{/if}
         {/snippet}
       </EmptyState>
-    {:else if view.layout === "list"}
-      <EmptyState icon="view-list" title="The list view is not built yet" line="Rows arrive with the list view; the grid shows the same result.">
-        {#snippet action()}<Button onclick={() => onview?.({ layout: "grid" })}>Back to the grid</Button>{/snippet}
-      </EmptyState>
     {:else}
       <AssetGrid
         {assets}
@@ -197,6 +193,7 @@
         {traits}
         {thresholds}
         size={view.size}
+        layout={view.layout}
         anchored
         onintent={dispatch}
         onmenu={(asset: AssetSummary, at) => {
@@ -231,5 +228,10 @@
     min-height: 0;
     overflow-y: auto;
     padding: var(--space-16);
+  }
+
+  /* The list sits a little closer to the toolbar than the grid does. */
+  .list {
+    padding: var(--space-12) var(--space-16);
   }
 </style>

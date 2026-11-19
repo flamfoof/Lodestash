@@ -138,6 +138,22 @@ describe("LibraryScreen — composition", () => {
     expect(onidentify).toHaveBeenCalledOnce();
   });
 
+  it("the ☰ stop draws the same page as rows, with the grid-size control gone and the keys unchanged", () => {
+    const { intents, selection } = render({ view: { ...DEFAULT_VIEW, layout: "list" } });
+    const grid = document.querySelector<HTMLElement>('[role="grid"]')!;
+    expect(grid.dataset.layout).toBe("list");
+    expect(grid.querySelectorAll('[role="gridcell"]').length).toBe(19);
+    expect(grid.querySelector(".chips")).toBeNull();
+    expect(document.querySelector('[role="toolbar"] [title="Large"]')).toBeNull();
+    cell(3).focus();
+    press("ArrowDown");
+    expect(selection.lead).toBe(4);
+    press("f");
+    rightClick(4);
+    choose("stage");
+    expect(intents).toEqual([intentFor("favorite", targets(4)), intentFor("stage", targets(4))]);
+  });
+
   it("the toolbar reports view changes and changes nothing itself", () => {
     const { onview } = render({ favoriteCount: 2 });
     const toolbar = document.querySelector('[role="toolbar"]')!;

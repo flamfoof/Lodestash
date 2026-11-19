@@ -18,6 +18,7 @@
     ImportedBadge,
     Input,
     ItemCard,
+    ItemRow,
     Kbd,
     LinkRow,
     ListRow,
@@ -29,6 +30,7 @@
     Provenance,
     Rail,
     RailHeading,
+    RowFrame,
     SearchField,
     SectionCard,
     SectionHeading,
@@ -85,6 +87,7 @@
   let lastAction = $state("—");
   let view = $state<"grid" | "list">("grid");
   let cardPicked = $state(false);
+  let rowPicked = $state(false);
   let cardStaged = $state(false);
   let inCollection = $state(false);
 </script>
@@ -329,6 +332,48 @@
           </ItemCard>
         </div>
       </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Item row</h2>
+    <div role="grid" aria-label="Specimen rows">
+      <RowFrame role="row">
+        <ItemRow status="confirmed" title="Beaver_LowPoly" tabStop pin={rowPicked} onopen={() => (lastAction = "open row")}>
+          {#snippet media()}<Thumb size="row" />{/snippet}
+          {#snippet pick()}<Checkbox bind:checked={rowPicked} label="Select for bulk actions" hideLabel tabindex={-1} />{/snippet}
+          {#snippet mark()}<TypeMark tone="model" label="Model" />{/snippet}
+          {#snippet pack()}<TextLink tabindex={-1} onclick={() => (lastAction = "pack")}>Forest Pack</TextLink>{/snippet}
+          {#snippet size()}<SizeTier variant="text" tier="L" size="4.1 MB" />{/snippet}
+          {#snippet stats()}1.2k tris · 4.1 MB{/snippet}
+          {#snippet state()}<StatusLine status="confirmed" inline />{/snippet}
+          {#snippet actions()}
+            <Button variant="favorite" size="xs" icon="nav-favorites" iconBox="12" aria-label="Favorite" tabindex={-1} />
+            <Button size="xs" accent="arcane" icon="action-fullsize" iconSize="10" iconBox="8" aria-label="Quick Look" tabindex={-1} />
+            <Button size="xs" accent="gold" tabindex={-1}>+ stage</Button>
+          {/snippet}
+        </ItemRow>
+        <ItemRow status="identified" title="rock_pickup_01" alt selected>
+          {#snippet media()}<Thumb size="row"><Icon name="type-sound" size="12" /></Thumb>{/snippet}
+          {#snippet mark()}<TypeMark tone="sound" label="Sound" />{/snippet}
+          {#snippet pack()}RPG SFX{/snippet}
+          {#snippet size()}<SizeTier variant="text" tier="S" size="210 KB" />{/snippet}
+          {#snippet stats()}0:01 · 44.1 kHz{/snippet}
+          {#snippet state()}<StatusLine status="identified" inline />{/snippet}
+          {#snippet actions()}
+            <Button variant="favorite" size="xs" icon="nav-favorites" iconBox="12" active aria-label="Favorite" tabindex={-1} />
+            <Button size="xs" accent="gold" active tabindex={-1}>✓ staged</Button>
+          {/snippet}
+        </ItemRow>
+        <ItemRow status="unidentified" title="SM_Asset_0117">
+          {#snippet media()}<Thumb size="row" unknown />{/snippet}
+          {#snippet mark()}<TypeMark tone="model" label="Model" />{/snippet}
+          {#snippet pack()}POLYGON City{/snippet}
+          {#snippet size()}<SizeTier variant="text" tier="XL" size="9.4 MB" />{/snippet}
+          {#snippet stats()}5.1k tris · 9.4 MB{/snippet}
+          {#snippet state()}<StatusLine status="unidentified" inline />{/snippet}
+        </ItemRow>
+      </RowFrame>
     </div>
   </section>
 

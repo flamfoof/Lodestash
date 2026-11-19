@@ -2,9 +2,12 @@
   import { untrack } from "svelte";
   import type { Selection } from "../../state/selection.svelte";
   import { intentFor, type AssetActionId, type AssetIntent } from "./actions";
+  import { RowFrame } from "../../ui";
   import AssetCard from "./AssetCard.svelte";
+  import AssetRow from "./AssetRow.svelte";
   import { columnsFor, moveIndex } from "./grid";
   import type { AssetSummary, PackageRef, ProjectRef, SizeThresholds, TraitDef } from "./model";
+  import { userStatus } from "./present";
 
   /**
    * The asset grid (UI-SPEC §2.5, DESIGN-GUIDELINES §9): one page of cards in an ARIA grid —
@@ -36,9 +39,15 @@
    * this `size` and the gap (`columnsFor`) — the arithmetic the browser's `auto-fill` does — and
    * the count is what the layout uses, so the keyboard's rows cannot differ from the drawn ones.
    * The two lengths are read from the grid's own style when the size changes, never per key press.
-   * `columns` fixes the count (a one-column list; tests, where nothing is laid out).
+   * `columns` fixes the count (tests, where nothing is laid out).
    *
-   * One page is rendered (UI-SPEC §2 pagination bounds it), so the grid is not virtualised.
+   * **Two layouts, one model.** `layout="list"` draws each asset as a row (`AssetRow`) in a single
+   * column instead of a card. Nothing else changes: the same `grid` → `row` → `gridcell`, the same
+   * selection, the one tab stop, every key above (← → then step by one, as ↑ ↓ do), F2 into a
+   * row's buttons, and the focus hand-over — it is this code, not a copy of it.
+   *
+   * One page is rendered (UI-SPEC §2 pagination bounds it), so the grid is not virtualised; the
+   * list renders the rows it is handed, and windowing joins it with paged data (plan P6b).
    */
   let {
     assets,
@@ -47,6 +56,7 @@
     traits = [],
     thresholds,
     size = "cozy",
+    layout = "grid",
     columns,
     label = "Assets",
     anchored = false,
@@ -61,9 +71,11 @@
     traits?: readonly TraitDef[];
     thresholds: SizeThresholds;
     size?: "compact" | "cozy" | "large";
+    /** Cards in a grid, or rows in one column. */
+    layout?: "grid" | "list";
     columns?: number;
     label?: string;
-    /** Mark the grid and its first card for the contract gate. */
+    /** Mark the grid (or the list) and its first cells for the contract gate. */
     anchored?: boolean;
     onintent?: (intent: AssetIntent) => void;
     /** Open the context menu for `asset`: at the pointer (`event`) or at the card (`anchor`). */
@@ -80,7 +92,12 @@
   let interacting = $state<number | null>(null);
 
   const order = $derived(assets.map((a) => a.id));
-  const cols = $derived(columns ?? measured ?? undefined);
+  const list = $derived(layout === "list");
+  /** A list is one column; a grid's count is given, or measured. */
+  const fixed = $derived(list ? 1 : columns);
+  const cols = $derived(fixed ?? measured ?? undefined);
+  /** The first Unidentified asset: the gate marks one unknown name in the list. */
+  const firstUnknown = $derived(assets.find((a) => userStatus(a.status) === "unidentified")?.id);
   /** Until the width is measured the grid is one row as far as it can tell. */
   const perRow = $derived(cols ?? Math.max(1, assets.length));
   const tabStop = $derived.by(() => {
@@ -91,7 +108,7 @@
 
   $effect(() => {
     void size; // the minimum width depends on it: measure again when it changes
-    if (columns !== undefined || !grid || typeof ResizeObserver === "undefined") return;
+    if (fixed !== undefined || !grid || typeof ResizeObserver === "undefined") return;
     const el = grid;
     const style = getComputedStyle(el);
     const min = parseFloat(style.getPropertyValue("--grid-min"));
@@ -230,24 +247,27 @@
   }
 </script>
 
-<div
-  class="grid"
-  role="grid"
-  tabindex={-1}
-  aria-label={label}
-  aria-multiselectable="true"
-  aria-rowcount={Math.ceil(assets.length / perRow)}
-  aria-colcount={cols}
-  data-size={size}
-  data-anchor={anchored ? "library.grid" : undefined}
-  style:--cols={cols}
-  bind:this={grid}
-  {onkeydown}
-  {onfocusin}
-  {onfocusout}
->
-  <div class="row" role="row">
-    {#each assets as asset, i (asset.id)}
+{#snippet cells()}
+  {#each assets as asset, i (asset.id)}
+    {#if list}
+      <AssetRow
+        {asset}
+        row={i + 1}
+        col={1}
+        alt={i % 2 === 1}
+        selected={selection.lead === asset.id}
+        picked={selection.picks.has(asset.id)}
+        picking={selection.picking}
+        tabStop={tabStop === asset.id}
+        {thresholds}
+        anchors={!anchored ? undefined : i === 0 ? "first" : i === 1 ? "alt" : asset.id === firstUnknown ? "unknown" : undefined}
+        onopen={(event) => open(asset, event)}
+        onpick={() => selection.toggle(asset.id)}
+        onaction={(id) => emit(id, asset)}
+        onmenu={(event) => onmenu?.(asset, { event })}
+        {onpack}
+      />
+    {:else}
       <AssetCard
         {asset}
         row={Math.floor(i / perRow) + 1}
@@ -267,8 +287,32 @@
         {onpack}
         {ontag}
       />
-    {/each}
-  </div>
+    {/if}
+  {/each}
+{/snippet}
+
+<div
+  class={list ? "list" : "grid"}
+  role="grid"
+  tabindex={-1}
+  aria-label={label}
+  aria-multiselectable="true"
+  aria-rowcount={Math.ceil(assets.length / perRow)}
+  aria-colcount={cols}
+  data-layout={layout}
+  data-size={list ? undefined : size}
+  data-anchor={anchored && !list ? "library.grid" : undefined}
+  style:--cols={list ? undefined : cols}
+  bind:this={grid}
+  {onkeydown}
+  {onfocusin}
+  {onfocusout}
+>
+  {#if list}
+    <RowFrame role="row" data-anchor={anchored ? "list" : undefined}>{@render cells()}</RowFrame>
+  {:else}
+    <div class="row" role="row">{@render cells()}</div>
+  {/if}
 </div>
 
 <style>

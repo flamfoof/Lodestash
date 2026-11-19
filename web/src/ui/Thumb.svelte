@@ -49,10 +49,12 @@
     height: var(--preview-h);
   }
 
+  /* With no picture a row's thumb holds one glyph — the sound mark — in the sound's colour. */
   .row {
     width: var(--space-26);
     height: var(--space-26);
     border-radius: var(--r-4);
+    color: var(--ls-type-sound);
   }
 
   img {

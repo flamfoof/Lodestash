@@ -121,6 +121,7 @@
   --ls-project-lime: #b8e07a;
   --ls-render-sky-bottom: #222b3e;
   --ls-render-sky-top: #121722;
+  --ls-row-alt: #1a2130; /* zebra: every second list row (the same value as the stage's centre) */
   --ls-stage-center: #1a2130;
   --ls-success-a18: #5bd8972e;
   --ls-success-a30: #5bd8974d;
@@ -348,6 +349,16 @@
   --filters-w: 328px; /* the ⚑ popover's content width */
   --filters-search-w: 160px; /* its trait search field */
   --bulk-tag-w: 150px; /* the bulk bar's tag-name field */
+  --list-row-h: 38px; /* a list row, and its fixed columns: name · pack · size · status */
+  --list-name-w: 170px;
+  --list-pack-w: 140px;
+  --list-size-w: 74px;
+  --list-status-w: 96px;
+  /* A list row's rings are drawn inside it: the list frame clips what is outside a row, so the
+     prototype's outer selection ring shows only above and below. Focus has no prototype at all. */
+  --ring-inset-gold-2: inset 0 0 0 2px #e7b765;
+  --ring-inset-focus: inset 0 0 0 2px #ffd98a;
+  --ring-inset-focus-selected: inset 0 0 0 2px #ffd98a, inset 0 0 0 4px #e7b765;
   --field-h-sm: 19px; /* fields the prototype left as unstyled inputs: their heights as drawn */
   --field-h-bar: 22px;
   --field-h-dense: 24px;

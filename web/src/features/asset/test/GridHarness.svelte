@@ -10,6 +10,7 @@
     assets,
     selection,
     columns = 5,
+    layout = "grid",
     onintent = () => {},
     onmenu = () => {},
     onpack = () => {},
@@ -18,6 +19,7 @@
     assets: AssetSummary[];
     selection: Selection;
     columns?: number;
+    layout?: "grid" | "list";
     onintent?: (intent: AssetIntent) => void;
     onmenu?: (asset: AssetSummary, at: { event?: MouseEvent; anchor?: HTMLElement }) => void;
     onpack?: (pack: PackageRef) => void;
@@ -26,5 +28,5 @@
 </script>
 
 <button id="before">before</button>
-<AssetGrid {assets} {selection} project={PROJECT} traits={TRAITS} thresholds={SIZE_THRESHOLDS} {columns} {onintent} {onmenu} {onpack} {ontag} />
+<AssetGrid {assets} {selection} project={PROJECT} traits={TRAITS} thresholds={SIZE_THRESHOLDS} {columns} {layout} {onintent} {onmenu} {onpack} {ontag} />
 <button id="after">after</button>

@@ -185,11 +185,32 @@ size, `Input` the `bar` size, `Text` the `selection` variant.
 - `AssetGrid` renders rows instead of cards when `layout="list"`, with one column. The selection,
   the one tab stop, the arrow / Shift / Home / End / Enter / Space / F2 / Menu-key handling and the
   focus hand-over are the same code for both layouts — which is the point.
-- [ ] Vitest: in list layout there is one tab stop and none inside rows; ↑ ↓ move the lead by one;
+- [x] Vitest: in list layout there is one tab stop and none inside rows; ↑ ↓ move the lead by one;
   Shift extends the pick set; F2 enters a row's buttons and Escape returns; a row's buttons emit
   the intents the card's do; switching layout keeps the lead and the picks
-- [ ] Gate: `#library-list` passes every `library+list` anchor with positions
-- [ ] Commit `feat(web): the list view — rows on the grid's selection and focus model`
+- [x] Gate: `#library-list` passes every `library+list` anchor with positions
+- [x] Commit `feat(web): the list view — rows on the grid's selection and focus model`
+
+*As built:* 17/17 `library+list` anchors with positions and no measured exemption. Three rows
+for what the contract does not measure: the pick box over a row's thumb, "Unidentified" in full,
+and the rings drawn inside the row.
+
+- **The model is proved, not asserted.** `AssetGrid.layouts.test.ts` runs one set of
+  expectations over both layouts (`describe.each`); the only thing stated per layout is how far ↓
+  reaches. `AssetGrid` renders `AssetRow` or `AssetCard` from one loop; the key handling, the tab
+  stop and the focus hand-over did not gain a branch.
+- **Picking in list view.** The prototype's rows cannot be picked at all. The row carries the
+  card's pick box over its 26 px thumb — on hover, with focus inside, and on every row while
+  anything is picked — so no measured column moves.
+- **Rings are inside the row.** The frame's `overflow: hidden` cuts the prototype's outer ring off
+  at both ends; three app-only inset ring tokens draw selection, focus, and both together.
+- `Button` learned two things rows need: `accent` without `onMedia` (⤢ turns arcane, stage turns
+  gold, with no backdrop) and the `favorite` variant (the ☆/★ pin). "✓ staged" is one rule for
+  cards and rows now (`.accent.active`), with the thumbnail's backdrop added on top.
+- New primitives `ItemRow` and `RowFrame`; `StatusLine` has `inline`; the zebra tone is the token
+  `--ls-row-alt`. Fixed column widths are app-only metrics (`--list-*`).
+- Not virtualised: it renders the rows it is handed. Windowing needs a row source with a total,
+  which is P6b's library query (see "Not built here").
 
 ### Task 7b.5: Quick Look
 

@@ -9,7 +9,8 @@
     | "outline-gold"
     | "outline-arcane"
     | "arcane"
-    | "quiet-gold";
+    | "quiet-gold"
+    | "favorite";
   export type ButtonSize = "xs" | "sm" | "md" | "lg" | "pill" | "block" | "block-sm" | "bar";
 </script>
 
@@ -35,7 +36,9 @@
    * rounded "⤢ full size" on a preview (4/12, 11 px); `block` / `block-sm` fill their column (8 px
    * and 7 px tall padding, 13 and 12 px type).
    * `onMedia` puts the translucent backdrop behind it that keeps it legible over a thumbnail;
-   * `accent` is what it turns under the pointer there (gold: stage; arcane: looking closer).
+   * `accent` is what an asset's own action turns under the pointer (gold: stage; arcane: looking
+   * closer) — on a thumbnail (gold unless said), and in a list row, where it is given without
+   * `onMedia`. `favorite` is the ☆/★ pin of a list row: slate until `active`, then gold.
    * `active` is the gold "this is filtering the view" state: `true` is the Filters button with
    * filters set, `"pressed"` the brighter on-state of a toggle (★ Favorites on).
    * An icon replaces the prototype's leading Unicode glyph at the glyph's advance (`iconBox`).
@@ -47,7 +50,7 @@
     iconSize = "12",
     iconBox,
     onMedia = false,
-    accent = "gold",
+    accent,
     active = false,
     type = "button",
     children,
@@ -75,6 +78,7 @@
   {type}
   class="btn {variant} {size}"
   class:on-media={onMedia}
+  class:accent={onMedia || accent !== undefined}
   class:arcane-accent={accent === "arcane"}
   class:active={!!active}
   class:pressed={active === "pressed"}
@@ -270,14 +274,26 @@
     color: var(--ls-text);
   }
 
-  .secondary.on-media:hover:not(:disabled) {
+  .secondary.accent:hover:not(:disabled) {
     border-color: var(--ls-gold);
     color: var(--ls-gold-bright);
   }
 
-  .secondary.on-media.arcane-accent:hover:not(:disabled) {
+  .secondary.accent.arcane-accent:hover:not(:disabled) {
     border-color: var(--ls-arcane);
     color: var(--ls-arcane-bright);
+  }
+
+  /* The ☆/★ pin in a list row: slate until it is set, the row's 12 px glyph. */
+  .favorite {
+    border: 1px solid var(--ls-border-strong);
+    color: var(--ls-status-unidentified);
+    font-size: var(--fs-12);
+  }
+
+  .favorite:hover:not(:disabled) {
+    border-color: var(--ls-gold);
+    color: var(--ls-gold-bright);
   }
 
   .active {
@@ -292,10 +308,22 @@
     color: var(--ls-gold-bright);
   }
 
-  /* On a thumbnail the backdrop stays: "✓ staged" is the brighter text on a gold hairline. */
-  .on-media.active {
-    background: var(--ls-bg-a78);
+  /* An asset's own action that is on ("✓ staged"): the brighter text on a gold hairline, without
+     the fill that says "this is filtering the view". On a thumbnail the backdrop stays. */
+  .accent.active {
+    background: transparent;
     border-color: var(--ls-gold-a50);
     color: var(--ls-gold-bright);
+  }
+
+  .on-media.active {
+    background: var(--ls-bg-a78);
+  }
+
+  /* A pin that is set is gold and nothing else changes: the row keeps its hairline. */
+  .favorite.active {
+    background: transparent;
+    border-color: var(--ls-border-strong);
+    color: var(--ls-gold);
   }
 </style>
