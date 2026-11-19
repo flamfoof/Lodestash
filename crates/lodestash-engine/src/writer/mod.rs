@@ -1009,8 +1009,12 @@ pub const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteError {
     /// The command ran and refused — the message is the one the caller shows. Its finer kind
-    /// (`not_found`, `invalid`, `conflict`) arrives when the commands carry typed errors (P3).
+    /// (`not_found`, `invalid`) arrives when the commands carry typed errors (P3).
     Failed(String),
+    /// The command was decided against a view of the catalog that no longer holds, so it was
+    /// refused whole and changed nothing — Delete from disk naming a file its asset has since
+    /// moved away from. The message says what moved; looking again and asking again is safe.
+    Conflict(String),
     /// The command **did not run and will not**: the inbox was full, or it was still queued when
     /// its caller's wait ran out and was withdrawn. Nothing was written; asking again is safe.
     Busy,
@@ -1031,6 +1035,7 @@ impl WriteError {
     pub fn code(&self) -> &'static str {
         match self {
             WriteError::Failed(_) => "failed",
+            WriteError::Conflict(_) => lodestash_protocol::codes::CONFLICT,
             WriteError::Busy | WriteError::StillRunning => lodestash_protocol::codes::BUSY,
             WriteError::Internal(_) => lodestash_protocol::codes::INTERNAL,
             WriteError::Unavailable(_) => lodestash_protocol::codes::UNAVAILABLE,
@@ -1042,7 +1047,9 @@ impl std::fmt::Display for WriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             // Verbatim: the old shell showed these strings to the user, and still does.
-            WriteError::Failed(m) | WriteError::Unavailable(m) => f.write_str(m),
+            WriteError::Failed(m) | WriteError::Unavailable(m) | WriteError::Conflict(m) => {
+                f.write_str(m)
+            }
             WriteError::Busy => f.write_str(
                 "busy: the catalog writer is occupied and this command was not run — nothing \
                  was written; try again",
@@ -1172,12 +1179,27 @@ pub(crate) struct WriterCtx {
     config: Arc<ConfigStore>,
 }
 
+/// How a command on the writer thread refuses. Most say why in words ([`WriteError::Failed`],
+/// until P3 types them all); the ones whose callers must tell the kinds apart name theirs.
+enum Refusal {
+    Failed(String),
+    /// [`WriteError::Conflict`].
+    Conflict(String),
+}
+
+impl From<String> for Refusal {
+    fn from(why: String) -> Self {
+        Refusal::Failed(why)
+    }
+}
+
 /// Run one command under `catch_unwind` (v2 spec §4.1, review U9): a panic fails that command
 /// with `internal` instead of ending the thread — and with it every write for the session.
-fn supervised(f: impl FnOnce() -> Result<WriteResult, String>) -> Result<WriteResult, WriteError> {
+fn supervised(f: impl FnOnce() -> Result<WriteResult, Refusal>) -> Result<WriteResult, WriteError> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(Ok(result)) => Ok(result),
-        Ok(Err(e)) => Err(WriteError::Failed(e)),
+        Ok(Err(Refusal::Failed(e))) => Err(WriteError::Failed(e)),
+        Ok(Err(Refusal::Conflict(e))) => Err(WriteError::Conflict(e)),
         Err(payload) => {
             let msg = panic_text(payload.as_ref());
             tracing::error!(%msg, "a writer command panicked; the writer keeps serving");
@@ -1758,33 +1780,14 @@ fn rescan_watched(catalog: &mut Catalog, ctx: &WriterCtx) -> bool {
         let excludes = project
             .map(|p| cfg.source_excludes(p, &root))
             .unwrap_or_default();
-        let known = catalog
-            .known_sizes_for_source(&info.root_path)
-            .unwrap_or_default();
-        let crawled = crate::scan::crawl_source(0, &root, &excludes, &known);
-        if crawled.entries.is_empty() && crawled.pending_packages.is_empty() {
-            continue;
-        }
-        let records = crate::persist::crawl_records(crawled.entries.iter().map(|(_, f)| f));
-        // Cheap in-memory diff against the catalog's last-known (size, mtime): nothing moved on
-        // disk means nothing to persist (and no spurious `last_scanned_at` write + UI reload).
-        let same = records.len() == known.len()
-            && records.iter().all(|r| {
-                known
-                    .get(&r.rel_path)
-                    .is_some_and(|&(s, m)| s == r.size_bytes as u64 && m == r.mtime)
-            });
-        if same {
-            continue;
-        }
-        let batch = crate::types::PersistBatch {
-            root: info.root_path.clone(),
-            name: info.name.clone(),
-            excludes_json: None,
-            records,
-        };
-        match crate::persist::persist_to_catalog(&ctx.db_path, &[batch]) {
-            Ok(_) => changed = true,
+        match crate::persist::rescan_source(
+            &ctx.db_path,
+            catalog,
+            &info.root_path,
+            &info.name,
+            &excludes,
+        ) {
+            Ok(persisted) => changed |= persisted,
             Err(e) => tracing::warn!(%e, root = %info.root_path, "watch rescan failed"),
         }
     }
@@ -2083,9 +2086,9 @@ fn drain_to_first_spawn(
     failures
 }
 
-fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, String> {
+fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, Refusal> {
     let jobs = &ctx.jobs;
-    match op {
+    let done: Result<WriteResult, String> = match op {
         Op::SetFavorite { ids, on } => catalog
             .set_favorite(&ids, on)
             .map(|changed| WriteResult {
@@ -2180,11 +2183,13 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, St
 
         Op::RemoveFromLibrary { targets } => remove_from_library(catalog, ctx, targets),
 
+        // The one command with a typed refusal so far: a conflict, when an asset has moved since
+        // the delete was confirmed.
         Op::DeleteFromDisk {
             targets,
             roots,
             workspace,
-        } => delete_from_disk(catalog, targets, &roots, workspace.as_deref()),
+        } => return delete_from_disk(catalog, targets, &roots, workspace.as_deref()),
 
         Op::ReclaimWorkspace { outcome } => {
             let done =
@@ -2921,7 +2926,8 @@ fn run(catalog: &mut Catalog, op: Op, ctx: &WriterCtx) -> Result<WriteResult, St
             }
             result
         }
-    }
+    };
+    done.map_err(Refusal::Failed)
 }
 
 /// Undo one import batch (UI-SPEC §16.1): delete the batch's copied files from the project,
@@ -3404,12 +3410,78 @@ fn deletable(t: &Target, roots: &[PathBuf], workspace: Option<&Path>) -> bool {
     true
 }
 
+/// The file `asset_id` names **now**, composed the way the read model composes the paths it
+/// hands out (`read_model::Library::reload`) — so the two are equal whenever nothing has moved.
+/// `None`: no such asset, or one with no file of its own (in a pack, or extracted with no
+/// workspace to resolve against).
+fn current_path(
+    catalog: &Catalog,
+    asset_id: i64,
+    workspace: Option<&Path>,
+) -> Result<Option<PathBuf>, String> {
+    use lodestash_core::catalog::FileLocation;
+    let location = catalog.file_location(asset_id).map_err(|e| {
+        format!("where asset {asset_id} is now could not be read ({e}) — nothing was deleted")
+    })?;
+    Ok(match location {
+        Some(FileLocation::Source {
+            root_path,
+            rel_path,
+        }) => Some(PathBuf::from(root_path).join(rel_path)),
+        Some(FileLocation::Workspace { workspace_rel }) => workspace.map(|w| w.join(workspace_rel)),
+        Some(FileLocation::InPack) | None => None,
+    })
+}
+
+/// Refuse the whole delete when any asset is no longer at the path that was confirmed.
+///
+/// The confirmation named files, and the caller resolved them from a read-model snapshot some
+/// time before the writer reached the command. A rescan in between can move an asset's row
+/// (DATA-MODEL §6) — and then the confirmed path names whatever sits there now, which the user
+/// was never shown. Nothing is deleted on a mismatch, not even the targets that still match: the
+/// selection the user agreed to is no longer the one on disk, so they look again.
+fn confirm_unmoved(
+    catalog: &Catalog,
+    targets: &[Target],
+    workspace: Option<&Path>,
+) -> Result<(), Refusal> {
+    for t in targets {
+        // An in-pack target has no file to delete; `deletable` refuses it below.
+        let Some(confirmed) = t.abs_path.as_deref() else {
+            continue;
+        };
+        let now = current_path(catalog, t.asset_id, workspace)?;
+        if now.as_deref() == Some(confirmed) {
+            continue;
+        }
+        let now = match now {
+            Some(path) => format!("it is at {} now", path.display()),
+            None => "it has no file of its own in the catalog now".to_string(),
+        };
+        tracing::warn!(
+            asset_id = t.asset_id,
+            confirmed = %confirmed.display(),
+            %now,
+            "refused to delete: the asset moved after the delete was confirmed"
+        );
+        return Err(Refusal::Conflict(format!(
+            "{} is no longer the file of the asset it was confirmed for ({now}) — the library \
+             changed after you confirmed, so nothing was deleted. Check the selection and \
+             delete again.",
+            confirmed.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Delete files from disk, then record only what actually left.
 ///
-/// Two guards, in this order:
-/// 1. `abs_path` is used as-is. Recomposing `source_root + rel_path` is wrong for extracted assets
+/// Three guards, in this order:
+/// 1. [`confirm_unmoved`]: every target's path is still the one its asset has in the catalog,
+///    resolved on this thread in this turn. Otherwise the command is refused whole, as a conflict.
+/// 2. `abs_path` is used as-is. Recomposing `source_root + rel_path` is wrong for extracted assets
 ///    and can name an unrelated real file — that is the primary protection.
-/// 2. [`under_known_root`] bounds the blast radius if (1) is ever got wrong. It is fenced by
+/// 3. [`under_known_root`] bounds the blast radius if (2) is ever got wrong. It is fenced by
 ///    `only_paths_under_known_roots_may_be_deleted`, which is mutation-checked and must stay that way.
 ///
 /// Trashing happens **after** the delete and only for files that succeeded: doing it first lets a
@@ -3419,7 +3491,8 @@ fn delete_from_disk(
     targets: Vec<Target>,
     roots: &[PathBuf],
     workspace: Option<&Path>,
-) -> Result<WriteResult, String> {
+) -> Result<WriteResult, Refusal> {
+    confirm_unmoved(catalog, &targets, workspace)?;
     let mut out = WriteResult::default();
     let mut deleted = Vec::new();
     for t in &targets {

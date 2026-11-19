@@ -165,7 +165,9 @@ in-editor import (§5). Both reuse the **same dependency-closure resolution** de
 > **Export sandbox (shipped).** `dest_path` must be absolute, free of `..` (`400 path_traversal`),
 > and outside every registered library source root (`400 forbidden_destination`) — the library is
 > read-only by invariant, so an agent can never turn an export into a write into the user's own
-> asset folders.
+> asset folders. The rule is a fence only while the roots are known: when they cannot be read the
+> export is refused (`503 unavailable`, §4) on both paths, before a job exists. A failed roots
+> query used to read as *no roots*, which admits every folder (fixed 2026-11-18).
 
 > **Implementation status (interim).** Until the remaining slices land:
 > `GET /v1/search?mode=ai` answers `501 ai_unavailable` **only while no embedding model is
@@ -248,6 +250,17 @@ than redefining, so summaries/details never diverge.
   `path_traversal` (400), `project_not_registered` (409), `editor_unavailable` (409),
   `job_failed` (500). **`already_imported` is advisory, not an error** — it is a field in the `200`
   body of `/v1/import` (§5.4), letting callers warn before duplicating rather than fail.
+
+  **A catalog failure answers the status of its kind** (v2 spec §4.4; `routes::db_err`). Core
+  names the failures a caller can act on, and each maps to one status with core's sentence as
+  the `message`: `not_found` (404), `invalid` (422 — the request breaks a rule and nothing was
+  written), `conflict` (409 — the catalog moved on since the caller's view of it) and
+  `unavailable` (503 — locked, on a disk that is not there, or at a schema this build cannot
+  read). Anything else is a server fault: `job_failed` (500), its text logged and not sent. So
+  an import ack whose `dest_path` is not a path inside the project (§5.6) is `422 invalid`
+  naming the path, and the request stays queued for a corrected ack. `export_asset` answers
+  `503 unavailable` when the library's source roots cannot be read: the sandbox could not judge
+  the destination, which is not the `400` of a destination it judged and refused.
 - **Server-side guards (never trust the client):** validate and **sandbox** every write path
   (`/v1/export`, `/v1/import`, `apply_mapping`) against traversal; **confirm mutating ops
   server-side**; rate-limit. Mirrors [`MCP-AND-ENGINES.md`](MCP-AND-ENGINES.md) §5.
@@ -394,9 +407,9 @@ dup-guard applies at that write. This is exercised end-to-end headless by a simu
 **An acked `dest_path` must be a plain project-relative path** (`Assets/Wildlife/Beaver.fbx`):
 no root (`/x`, `\x`, `\\server\x`), no drive or stream (`C:x`), no `.`/`..` or empty component.
 Batch undo joins that path onto the project root and deletes what it finds
-([`DATA-MODEL.md`](DATA-MODEL.md) §9), so an ack carrying any other shape is refused whole —
-before the queue entry is taken, so the plugin can ack again — and `Catalog::record_imports`
-refuses it a second time at the write.
+([`DATA-MODEL.md`](DATA-MODEL.md) §9), so an ack carrying any other shape is refused whole
+(`422 invalid`, the message naming the path — §4) — before the queue entry is taken, so the
+plugin can ack again — and `Catalog::record_imports` refuses it a second time at the write.
 
 Still interim until the real **UPM plugin** lands:
 

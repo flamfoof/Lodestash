@@ -804,6 +804,13 @@ async fn export(
     }
     match state.request_export(req) {
         Ok(job) => (StatusCode::ACCEPTED, Json(job.to_json())).into_response(),
+        // Not the caller's mistake: the server could not check the path at all (§4, 503).
+        Err(e @ crate::export::SandboxError::RootsUnknown) => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            e.code(),
+            e.message(),
+            "Retry once the library is readable.",
+        ),
         Err(e) => err(StatusCode::BAD_REQUEST, e.code(), e.message(), ""),
     }
 }
@@ -947,14 +954,33 @@ fn not_found() -> Response {
     )
 }
 
+/// A catalog error as the response its **kind** calls for (ENGINE-API §4, v2 spec §4.4).
+///
+/// Core names the failures a caller can act on — the thing is not there, the request breaks a
+/// rule, the catalog moved on, the catalog cannot serve right now — and those answer their own
+/// status with core's sentence as the message. Everything else is a fault of ours: `500
+/// job_failed`, the text logged and not sent. It all used to be the 500, so a plugin that acked
+/// a path outside the project was told the server had failed.
 fn db_err(e: lodestash_core::error::CoreError) -> Response {
-    tracing::warn!(%e, "api query failed");
-    err(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "job_failed",
-        "The catalog query failed.",
-        "",
-    )
+    use lodestash_core::error::ErrorKind;
+    use lodestash_protocol::codes;
+    let (status, code) = match e.kind() {
+        ErrorKind::NotFound => (StatusCode::NOT_FOUND, codes::NOT_FOUND),
+        ErrorKind::Invalid => (StatusCode::UNPROCESSABLE_ENTITY, codes::INVALID),
+        ErrorKind::Conflict => (StatusCode::CONFLICT, codes::CONFLICT),
+        ErrorKind::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, codes::UNAVAILABLE),
+        ErrorKind::Internal => {
+            tracing::warn!(%e, "api query failed");
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "job_failed",
+                "The catalog query failed.",
+                "",
+            );
+        }
+    };
+    tracing::debug!(%e, code, "api request refused");
+    err(status, code, &e.to_string(), "")
 }
 
 /// ENGINE-API §4 error envelope.
@@ -1601,6 +1627,173 @@ mod tests {
             }) => assert_eq!(imported_existing, vec![asset_id]),
             _ => panic!("the ack did not persist an import_record"),
         }
+    }
+
+    /// R.4: an ack whose `dest_path` is not a path inside the project is the caller's mistake,
+    /// and core says so with a typed error — which `db_err` answered `500 job_failed`, the status
+    /// of a server fault, with the reason thrown away. It is `422 invalid` with the reason, and
+    /// the request is still queued, so the plugin can ack again with the real paths.
+    #[tokio::test]
+    async fn an_ack_with_a_path_outside_the_project_is_422_with_the_envelope() {
+        use lodestash_core::catalog::{Catalog, CrawlRecord};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        let asset_id = {
+            let mut cat = Catalog::open(&db).unwrap();
+            cat.seed_media_types().unwrap();
+            let src = cat
+                .upsert_import_source("Lib", &dir.path().join("lib").to_string_lossy(), "folder")
+                .unwrap();
+            cat.record_crawl(
+                src,
+                None,
+                &[CrawlRecord {
+                    workspace_rel: None,
+                    rel_path: "beaver.fbx".into(),
+                    name: "beaver.fbx".into(),
+                    media_type: "model_3d".into(),
+                    size_bytes: 4,
+                    mtime: 1,
+                    content_hash: None,
+                }],
+            )
+            .unwrap();
+            cat.assets_for_source(src).unwrap()[0].asset_id
+        };
+        let st: Shared =
+            Arc::new(ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap());
+        st.set_write(crate::test_writes(&db));
+        let token = st.token.clone();
+        let (project_id, _) = st.register_project("C:/dev/Game", None, None).unwrap();
+        let job = match st.request_import(crate::ImportRequest {
+            project_id: Some(project_id),
+            asset_ids: vec![asset_id],
+            dest_subfolder: None,
+            with_dependencies: false,
+        }) {
+            Ok(crate::ImportKickoff::Awaiting { job, .. }) => job,
+            _ => panic!("expected an awaiting-approval job"),
+        };
+        st.approve_job(&job.id);
+        let mut reqs = Vec::new();
+        for _ in 0..200 {
+            reqs = st.poll_import_queue(project_id).unwrap();
+            if !reqs.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let request_id = reqs.first().expect("queued").request_id.clone();
+        let ack = |dest_path: &str| {
+            post_req(
+                &format!("/v1/import-queue/{request_id}/ack"),
+                Some(&token),
+                json!({ "imported": [{ "asset_id": asset_id, "dest_path": dest_path }] }),
+            )
+        };
+
+        let (s, body) = send(router(st.clone()), ack("../outside.txt")).await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"]["code"], "invalid", "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("../outside.txt")),
+            "the envelope does not say which path was refused: {body}"
+        );
+
+        let (s, body) = send(router(st.clone()), ack("Assets/beaver.fbx")).await;
+        assert_eq!(
+            s,
+            StatusCode::OK,
+            "the refused ack consumed the request: {body}"
+        );
+    }
+
+    /// `db_err` is what every catalog failure on the REST plane goes through, so it maps each
+    /// kind core can name to its status (ENGINE-API §4) — and keeps an internal fault's text out
+    /// of the response.
+    #[tokio::test]
+    async fn a_catalog_error_answers_the_status_of_its_kind() {
+        use lodestash_core::error::CoreError;
+
+        async fn parts(e: CoreError) -> (StatusCode, Value) {
+            let res = db_err(e);
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+
+        let cases = [
+            (
+                CoreError::NotFound("no project has id 9".into()),
+                StatusCode::NOT_FOUND,
+                "not_found",
+            ),
+            (
+                CoreError::Invalid("dest_path is not inside the project".into()),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid",
+            ),
+            (
+                CoreError::Conflict("the tray changed".into()),
+                StatusCode::CONFLICT,
+                "conflict",
+            ),
+            (
+                CoreError::SchemaTooOld {
+                    found: 3,
+                    supported: 32,
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+            ),
+        ];
+        for (e, status, code) in cases {
+            let said = e.to_string();
+            let (s, body) = parts(e).await;
+            assert_eq!(s, status, "{said}");
+            assert_eq!(body["error"]["code"], code, "{said}");
+            assert_eq!(body["error"]["message"], said, "the reason is the message");
+        }
+
+        let (s, body) = parts(CoreError::Catalog("no such table: asset_file".into())).await;
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["code"], "job_failed");
+        assert!(
+            !body.to_string().contains("asset_file"),
+            "an internal fault's text reached the client: {body}"
+        );
+    }
+
+    /// The HTTP face of the export sandbox's refusal when the roots cannot be read (R.4): `503
+    /// unavailable`, because the path was never judged — not the `400` of a path that was.
+    #[tokio::test]
+    async fn an_export_with_unreadable_roots_is_503_not_a_queued_job() {
+        let (dir, st) = state();
+        let token = st.token.clone();
+        rusqlite::Connection::open(dir.path().join("catalog.db"))
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO import_source (uuid, name, root_path, kind)
+                 VALUES ('damaged', 'Damaged', x'00ff', 'folder');",
+            )
+            .unwrap();
+        let (s, body) = send(
+            router(st.clone()),
+            post_req(
+                "/v1/export",
+                Some(&token),
+                json!({ "asset_ids": [1], "dest_path": dir.path().join("out").to_string_lossy() }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "unavailable", "{body}");
+        assert!(st.jobs.awaiting_approval().is_empty());
     }
 
     #[tokio::test]

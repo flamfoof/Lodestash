@@ -2863,7 +2863,8 @@ fn reconcile_moves_repoints_vanished_path_keeping_asset_id() {
     let moved = c
         .reconcile_moves(src, &[rec_h("assets/rocks/a.png", 10, 100, "H1")])
         .expect("moves");
-    assert_eq!(moved, vec!["assets/rocks/a.png".to_string()]);
+    assert_eq!(moved.consumed, vec!["assets/rocks/a.png".to_string()]);
+    assert_eq!((moved.moved, moved.absorbed, moved.superseded), (1, 0, 0));
     let stats = c.record_crawl(src, None, &[]).expect("crawl 2");
     assert_eq!(
         stats.inserted, 0,
@@ -2903,7 +2904,7 @@ fn full_crawl(c: &mut Catalog, src: i64, records: &[CrawlRecord]) {
     let moved = c.reconcile_moves(src, records).expect("moves");
     let rest: Vec<CrawlRecord> = records
         .iter()
-        .filter(|r| !moved.contains(&r.rel_path))
+        .filter(|r| !moved.consumed.contains(&r.rel_path))
         .cloned()
         .collect();
     c.record_crawl(src, None, &rest).expect("crawl");

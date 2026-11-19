@@ -777,6 +777,25 @@ tracking; these cards track phases).
   redo re-arms its op; a migration never prunes the backup it just wrote; a read is an error
   when the engine is not Ready or a rebuild failed (`ReadError`, `engine_status`); nothing a
   `.unitypackage` declares sizes a read (`for_each_member`, `read_capped`). *Left open, reported:*
-  the workspace folder is shared by every catalog (`LODESTASH_CATALOG`), `lodestash-api`'s export
-  sandbox still runs on `source_roots().unwrap_or_default()`, delete-from-disk trusts the path
-  its caller resolved, and the Trash view can restore a row whose file was deleted from disk.
+  the Trash view can restore a row whose file was deleted from disk. (The other three residuals
+  reported here — the shared workspace, the export sandbox's roots, delete-from-disk trusting
+  its caller's path — are V2-R4.)
+- [ ] **V2-R4** Residuals the integrity review left open — five items, each with a test that
+  failed first *(2026-11-18; v2 plan Task R.4; awaiting merge)*. A catalog that is not the
+  default one extracts into its own workspace beside itself, so its Reclaim cannot delete
+  another catalog's files (`workspace_for`, `EngineConfig::for_catalog`); an export refuses when
+  the library's source roots cannot be read (`check_dest_against`, `SandboxError::RootsUnknown`);
+  Delete from disk resolves each asset's path again on the writer and refuses the whole command
+  as a conflict when one moved after it was confirmed (`confirm_unmoved`,
+  `Catalog::file_location`, `WriteError::Conflict`); the REST plane answers a catalog error by
+  its kind — an ack with a path outside the project is `422 invalid`, not 500 (`db_err`); the old
+  shell shows `config_unreadable`.
+- [ ] **V2-R3** Identity follows content
+  ([ADR-0025](decisions/ADR-0025-identity-follows-content.md), `DATA-MODEL.md` §6.1) — a scan
+  matches each file to the row it *is* before recording the crawl *(2026-11-18; v2 plan Task
+  R.3; awaiting merge)*. A swap, a rotation and a rename onto a held path move every row with its
+  bytes; a copy-then-delete seen as two scans leaves the tagged row at the copy's path
+  (`Catalog::reconcile_moves`, `Reconciled`); a file moved over another takes the path and the
+  old row is superseded (`SUPERSEDED_DIR`); nothing is paired on sort order
+  (`pair_by_evidence`); the watcher's rescan is `rescan_source`. Left open, stated in §6.1: two
+  files of one size and mtime that exchange names, and moves between sources.

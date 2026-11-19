@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 /// The destination rule lives in the engine — its writer re-checks it before undoing an export —
 /// and is re-exported here under the path the API has always used.
-pub use lodestash_engine::sandbox::{check_dest, SandboxError};
+pub use lodestash_engine::sandbox::{check_dest, check_dest_against, SandboxError};
 
 /// What an export actually did (UI-SPEC §16.2 / ENGINE-API §2).
 ///
@@ -308,6 +308,86 @@ mod flow_tests {
             b"aaa",
             "the original was modified or moved"
         );
+    }
+
+    /// R.4: "never inside a library source root" needs the roots. Both entry points read them
+    /// with `unwrap_or_default()`, so a roots query that failed was an empty list — and with no
+    /// roots the sandbox admits every folder, the library's own included. An unreadable root
+    /// list refuses, on the gated path and on the desktop's own, before a job exists.
+    #[test]
+    fn an_export_refuses_when_the_library_roots_cannot_be_read() {
+        use lodestash_core::catalog::{Catalog, CrawlRecord};
+
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("a.png"), b"aaa").unwrap();
+        let db = dir.path().join("catalog.db");
+        {
+            let mut cat = Catalog::open(&db).unwrap();
+            cat.seed_media_types().unwrap();
+            let src = cat
+                .upsert_import_source("Lib", &lib.to_string_lossy(), "folder")
+                .unwrap();
+            cat.record_crawl(
+                src,
+                None,
+                &[CrawlRecord {
+                    workspace_rel: None,
+                    rel_path: "a.png".into(),
+                    name: "a.png".into(),
+                    media_type: "image".into(),
+                    size_bytes: 3,
+                    mtime: 1,
+                    content_hash: None,
+                }],
+            )
+            .unwrap();
+        }
+        let state =
+            Arc::new(ServerState::new(&db, dir.path().to_path_buf(), Box::new(|_| None)).unwrap());
+        let ids = state.catalog.lock().unwrap().recent_asset_ids(10).unwrap();
+        // The roots query now fails — one source row whose path is not text — while every other
+        // read the export makes still works, so nothing but the sandbox stands in its way.
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO import_source (uuid, name, root_path, kind)
+                 VALUES ('damaged', 'Damaged', x'00ff', 'folder');",
+            )
+            .unwrap();
+        assert!(
+            state.catalog.lock().unwrap().source_roots().is_err(),
+            "the fixture must break the roots query"
+        );
+
+        // Inside the library: the one place an export must never write.
+        let inside = lib.join("out");
+        let request = || super::ExportRequest {
+            asset_ids: ids.clone(),
+            dest_path: inside.to_string_lossy().into(),
+            with_dependencies: false,
+        };
+        let refused = state
+            .request_export(request())
+            .err()
+            .expect("an export was queued without knowing the library roots");
+        assert_eq!(refused, super::SandboxError::RootsUnknown);
+        assert_eq!(refused.code(), "unavailable");
+        assert!(
+            state.jobs.awaiting_approval().is_empty(),
+            "a refused export left a job waiting for approval"
+        );
+
+        let said = state
+            .export_now(request())
+            .expect_err("the desktop's export ran without knowing the library roots");
+        assert!(
+            said.contains("source roots"),
+            "the refusal does not say why: {said}"
+        );
+        assert!(!inside.exists(), "a refused export wrote into the library");
+        assert_eq!(std::fs::read_dir(&lib).unwrap().count(), 1);
     }
 
     /// The whole gate: an export request writes nothing until it is approved, and denial is
