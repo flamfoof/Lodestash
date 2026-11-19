@@ -111,7 +111,9 @@
   $effect.pre(() => {
     void order;
     hadFocus = !!grid && grid.contains(document.activeElement);
-    lostAt = hadFocus && cursor !== null ? lastOrder.indexOf(cursor) : -1;
+    // Read where focus was without depending on it: only the page changing re-runs this.
+    const at = untrack(() => cursor);
+    lostAt = hadFocus && at !== null ? lastOrder.indexOf(at) : -1;
   });
   $effect(() => {
     const shown = order;

@@ -181,13 +181,25 @@ A **Favorites screen** sits second in the nav (§0.2), header `★ Favorites` + 
 | `← → ↑ ↓` | grid | move the lead selection (↑↓ by one row); focus follows it |
 | `Shift` + arrow / click | grid | extend the **pick set** (what the bulk bar acts on) from the lead |
 | `Home` / `End` | grid | first / last of the visible page |
+| `Enter` | grid, focus on a card | open it: the card becomes the lead (the inspector describes it) |
+| `F2` | grid, focus on a card | move focus to the card's own buttons; inside, `← → ↑ ↓` step through them, `Home`/`End` jump to the ends, `Esc` or `F2` returns to the card |
+| `Menu` key / `Shift-F10` | grid, focus on a card | open the context menu at the card |
 | `Ctrl/Cmd-Z / Shift-Z` | catalog mutations | undo / redo (DESIGN-GUIDELINES §7) |
 | `Ctrl/Cmd-K` | anywhere | open the command palette: asset search + navigation (ROADMAP P7) |
 | `/` | anywhere | focus the search box |
 | `Delete` | asset selected | move it to Trash (through the §11.7 confirm gate) |
 
 Keys never fire while an input/textarea has focus — **except `Ctrl/Cmd-K`**, since the search
-box is where people press it.
+box is where people press it. `Space` is also left to a focused button or link, which it activates.
+
+*(v2 web UI, 2026-11-18 — plan
+[P7 Library](superpowers/plans/2026-11-17-v2-p7-library.md).)* `Space`, `F` and `Delete` are
+bindings in the keymap's global scope, so an open menu, popover or dialog — each pushes a blocking
+scope — stops them; `Esc` then closes only that overlay. With no overlay, `Esc` clears the pick
+set first and the lead second. The grid is **one tab stop** and a card's buttons are never tab
+stops: `F2` is how the keyboard reaches them, and every one of them is also a key or a
+context-menu item (DESIGN-GUIDELINES §9 has the pattern). A right-click does not move the lead —
+the inspector would open and shift the grid under the menu.
 
 Three of these rows were reconciled on 2026-08-26, after an audit found the two docs disagreeing
 about what the keyboard does and the app implementing neither answer:
@@ -335,9 +347,11 @@ The browse-everything grid. Composition top→bottom:
 4. **Bulk bar** (when ≥1 card is check-picked): `N selected` + tag-name input + **+ Add tag** /
    **− Remove tag** (skips Unidentified) + **⟡ Stage all** + ✕ Clear. Bulk tag edits are undoable.
 5. **The grid / list** (virtualized):
-   - **Card** (DESIGN-GUIDELINES §7 anatomy): **1px** status left-border (this said 3px until
-     2026-08-22; DESIGN-GUIDELINES §6 says 1px, the app renders 1px, and DG wins on pixel details
-     per `docs/design/README.md` — ALIGNMENT-AUDIT F1); thumbnail region (104px, dark
+   - **Card** (DESIGN-GUIDELINES §7 anatomy): **3px** status left-border — the prototype's, which
+     is the one visual authority since [ADR-0023](decisions/ADR-0023-one-visual-authority-and-a-contract-gate.md)
+     and what the contract measures (`card.thumb` starts 3 px in). *(It read 1px from 2026-08-22,
+     when DESIGN-GUIDELINES won on pixel details under the precedence chain ADR-0023 retired; the
+     old `ui/` still draws 1px until it is deleted at v2 P5.)* Thumbnail region (104px, dark
      recess) with: status gem badge (top-right), **pick checkbox** (top-left, appears on
      hover/when any pick is active), `✦ NN%` AI-match pill (top-left, AI results only),
      **S/M/L/XL size badge** (the **letter only** — it sits on the artwork and has nowhere to
