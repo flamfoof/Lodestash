@@ -1,5 +1,5 @@
 import "../styles/app.css";
-import { mount } from "svelte";
+import { mount, type ComponentProps } from "svelte";
 import Gallery from "./Gallery.svelte";
 import LibrarySpecimen from "./LibrarySpecimen.svelte";
 import ShellSpecimen from "./ShellSpecimen.svelte";
@@ -12,21 +12,27 @@ if (!target) throw new Error("#gallery missing from gallery.html");
 keymap.attach(window);
 setAppRoot(target);
 
-// The specimen pages the gate measures full-window, by hash; anything else is the primitive sheet.
-//   #shell               the frame alone
-//   #library             the Library screen in the frame (contract state `library`)
-//   #library-inspector   the same with the first asset selected (`library+inspector`)
+type LibraryProps = ComponentProps<typeof LibrarySpecimen>;
+
+/**
+ * The Library specimen pages, by hash: each starts the screen in one state of the design contract
+ * (docs/design/contract.json), which the gate measures full-window with positions.
+ */
+const LIBRARY: Record<string, LibraryProps> = {
+  // contract state `library`
+  "#library": {},
+  // `library+inspector`: the first asset selected
+  "#library-inspector": { select: 1 },
+  // `library+filters`: ⚑ open with one value chosen in each group
+  "#library-filters": { filters: { traits: ["rock"], tris: ["low"], sizes: ["M"] }, open: "filters" },
+};
+
+// `#shell` is the frame alone; anything else that is not a Library page is the primitive sheet.
 function page() {
-  switch (location.hash) {
-    case "#shell":
-      return mount(ShellSpecimen, { target: target! });
-    case "#library":
-      return mount(LibrarySpecimen, { target: target! });
-    case "#library-inspector":
-      return mount(LibrarySpecimen, { target: target!, props: { select: 1 } });
-    default:
-      return mount(Gallery, { target: target! });
-  }
+  const library = LIBRARY[location.hash];
+  if (library) return mount(LibrarySpecimen, { target: target!, props: library });
+  if (location.hash === "#shell") return mount(ShellSpecimen, { target: target! });
+  return mount(Gallery, { target: target! });
 }
 
 export default page();

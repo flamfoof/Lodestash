@@ -4,6 +4,8 @@ import { keymap } from "../app/keymap.svelte";
 import { resetOverlays } from "../app/overlay";
 import { intentFor, type AssetIntent } from "../features/asset/actions";
 import type { AssetSummary, ProjectRef } from "../features/asset/model";
+import type { Constraints } from "../features/filters/active";
+import { NO_FILTERS, traitCounts, type LibraryFilters } from "../features/filters/filters";
 import { DEFAULT_VIEW, type LibraryView } from "../features/library/view";
 import { ASSETS, PROJECT, SIZE_THRESHOLDS, TRAITS } from "../fixtures/library";
 import { Selection } from "../state/selection.svelte";
@@ -34,7 +36,9 @@ interface Options {
   nudgeDismissed?: boolean;
   project?: ProjectRef | null;
   favoriteCount?: number;
-  filterCount?: number;
+  filters?: LibraryFilters;
+  constraints?: Constraints;
+  total?: number;
 }
 
 function render(options: Options = {}) {
@@ -43,16 +47,21 @@ function render(options: Options = {}) {
   const onview = vi.fn();
   const onidentify = vi.fn();
   const ondismissnudge = vi.fn();
-  const onfilters = vi.fn();
+  const onfilterschange = vi.fn();
+  const onunconstrain = vi.fn();
+  const onclearfilters = vi.fn();
   app = mount(LibraryScreen, {
     target: document.body,
     props: {
       assets: options.assets ?? ASSETS,
+      total: options.total ?? ASSETS.length,
       unidentified: options.unidentified ?? 5,
       nudgeDismissed: options.nudgeDismissed ?? false,
       view: options.view ?? DEFAULT_VIEW,
       favoriteCount: options.favoriteCount ?? 0,
-      filterCount: options.filterCount ?? 0,
+      filters: options.filters ?? NO_FILTERS,
+      traitOptions: traitCounts(ASSETS),
+      constraints: options.constraints ?? {},
       selection,
       project: options.project === undefined ? PROJECT : options.project,
       traits: TRAITS,
@@ -61,11 +70,13 @@ function render(options: Options = {}) {
       onview,
       onidentify,
       ondismissnudge,
-      onfilters,
+      onfilterschange,
+      onunconstrain,
+      onclearfilters,
     },
   });
   flushSync();
-  return { selection, intents, onview, onidentify, ondismissnudge, onfilters };
+  return { selection, intents, onview, onidentify, ondismissnudge, onfilterschange, onunconstrain, onclearfilters };
 }
 
 const cell = (id: number) => document.querySelector<HTMLElement>(`[role="gridcell"][data-id="${id}"]`)!;
@@ -128,7 +139,7 @@ describe("LibraryScreen — composition", () => {
   });
 
   it("the toolbar reports view changes and changes nothing itself", () => {
-    const { onview, onfilters } = render({ favoriteCount: 2 });
+    const { onview } = render({ favoriteCount: 2 });
     const toolbar = document.querySelector('[role="toolbar"]')!;
     const select = toolbar.querySelector("select")!;
     select.value = "name";
@@ -136,10 +147,8 @@ describe("LibraryScreen — composition", () => {
     toolbar.querySelector<HTMLElement>('[title="Show only favorites"]')!.click();
     toolbar.querySelector<HTMLElement>('[title="Large"]')!.click();
     toolbar.querySelector<HTMLElement>('[title="List view"]')!.click();
-    [...toolbar.querySelectorAll("button")].find((b) => b.textContent?.includes("Filters"))!.click();
     flushSync();
     expect(onview.mock.calls.map((c) => c[0])).toEqual([{ sort: "name" }, { favoritesOnly: true }, { size: "large" }, { layout: "list" }]);
-    expect(onfilters).toHaveBeenCalledOnce();
     expect(toolbar.querySelector('[title="Show only favorites"]')?.textContent).toContain("2");
     // The grid is still the size it was given.
     expect(document.querySelector('[role="grid"]')?.getAttribute("data-size")).toBe("cozy");
@@ -284,5 +293,120 @@ describe("LibraryScreen — keys act on the selection, never behind an overlay",
     press("f");
     expect(intents).toEqual([]);
     expect(keymap.scopes).toEqual(["global"]);
+  });
+});
+
+describe("LibraryScreen — the ⚑ filters and the active-filter bar", () => {
+  const filtersButton = () => [...document.querySelectorAll<HTMLElement>('[role="toolbar"] button')].find((b) => b.textContent?.includes("Filters"))!;
+  const popover = () => document.querySelector<HTMLElement>('[role="dialog"][aria-label="Filter library"]');
+  const chip = (text: string) => [...popover()!.querySelectorAll<HTMLButtonElement>("button[aria-pressed]")].find((b) => b.textContent?.trim().startsWith(text))!;
+  const bar = () => document.querySelector<HTMLElement>("[data-active-filters]");
+  const tokens = () => [...bar()!.querySelectorAll<HTMLElement>("[data-axis]")];
+  const remove = (axis: string, nth = 0) => tokens().filter((t) => t.dataset.axis === axis)[nth].querySelector<HTMLElement>("button")!.click();
+
+  function openFilters() {
+    filtersButton().click();
+    flushSync();
+  }
+
+  it("⚑ opens the popover; a chip reports the whole next set and the screen keeps none", () => {
+    const { onfilterschange } = render();
+    expect(popover()).toBeNull();
+    openFilters();
+    expect(filtersButton().getAttribute("aria-expanded")).toBe("true");
+    expect(popover()!.id).toBe(filtersButton().getAttribute("aria-controls"));
+    chip("rock").click();
+    flushSync();
+    expect(onfilterschange).toHaveBeenLastCalledWith({ traits: ["rock"], tris: [], sizes: [] });
+    // Nobody handed it a changed set, so nothing is chosen yet.
+    expect(chip("rock").getAttribute("aria-pressed")).toBe("false");
+    expect(bar()).toBeNull();
+  });
+
+  it("filters compose across groups, and Clear all hands back the empty set", () => {
+    const { onfilterschange } = render({ filters: { traits: ["rock"], tris: ["low"], sizes: [] } });
+    expect(filtersButton().textContent).toContain("2");
+    openFilters();
+    expect([chip("rock"), chip("≤ 1k"), chip("moss"), chip("M")].map((c) => c.getAttribute("aria-pressed"))).toEqual(["true", "true", "false", "false"]);
+    chip("M").click();
+    expect(onfilterschange).toHaveBeenLastCalledWith({ traits: ["rock"], tris: ["low"], sizes: ["M"] });
+    chip("rock").click();
+    expect(onfilterschange).toHaveBeenLastCalledWith({ traits: [], tris: ["low"], sizes: [] });
+    [...popover()!.querySelectorAll<HTMLElement>("button")].find((b) => b.textContent?.trim() === "Clear all")!.click();
+    expect(onfilterschange).toHaveBeenLastCalledWith(NO_FILTERS);
+  });
+
+  it("the trait search narrows the chips, and says so when none match", () => {
+    render();
+    openFilters();
+    const search = popover()!.querySelector<HTMLInputElement>('input[placeholder="search traits…"]')!;
+    const traits = () => [...popover()!.querySelectorAll('[aria-label="Trait"] button')].map((b) => b.textContent?.trim());
+    expect(traits()).toHaveLength(32);
+    search.value = "MOS";
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+    flushSync();
+    expect(traits()).toEqual(["moss"]);
+    search.value = "zzz";
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+    flushSync();
+    expect(traits()).toEqual([]);
+    expect(popover()!.textContent).toContain("No traits match.");
+  });
+
+  it("Escape closes the popover only, and no asset key fires behind it", () => {
+    const { intents, selection } = render();
+    selection.moveTo(6);
+    selection.toggle(2);
+    openFilters();
+    ["f", "Delete", " "].forEach((k) => press(k));
+    expect(intents).toEqual([]);
+    press("Escape");
+    expect(popover()).toBeNull();
+    expect([selection.lead, selection.picks.size]).toEqual([6, 1]);
+    expect(document.activeElement?.closest("[role=toolbar]")).not.toBeNull();
+  });
+
+  it("the bar is absent with nothing active, and lists every constraint in composition order", () => {
+    render();
+    expect(bar()).toBeNull();
+    if (app) unmount(app);
+    render({
+      assets: ASSETS.slice(0, 2),
+      total: 19,
+      view: { ...DEFAULT_VIEW, favoritesOnly: true },
+      filters: { traits: ["rock"], tris: ["low"], sizes: ["M"] },
+      constraints: { query: "moss", category: { id: "model", label: "Models" }, status: "identified", library: { id: 1, name: "Synty" } },
+    });
+    expect(tokens().map((t) => t.dataset.axis)).toEqual(["query", "type", "status", "library", "trait", "tris", "size", "favorite"]);
+    expect(bar()!.textContent).toContain("2 of 19 shown");
+    expect(tokens()[3].textContent).toContain("lib");
+  });
+
+  it("removing a chip tells the owner of that axis — ⚑, ★ or the shell", () => {
+    const { onfilterschange, onview, onunconstrain, onclearfilters } = render({
+      view: { ...DEFAULT_VIEW, favoritesOnly: true },
+      filters: { traits: ["rock", "moss"], tris: ["low"], sizes: ["M"] },
+      constraints: { query: "moss", status: "identified" },
+    });
+    remove("trait", 1);
+    expect(onfilterschange).toHaveBeenLastCalledWith({ traits: ["rock"], tris: ["low"], sizes: ["M"] });
+    remove("tris");
+    expect(onfilterschange).toHaveBeenLastCalledWith({ traits: ["rock", "moss"], tris: [], sizes: ["M"] });
+    remove("size");
+    expect(onfilterschange).toHaveBeenLastCalledWith({ traits: ["rock", "moss"], tris: ["low"], sizes: [] });
+    remove("favorite");
+    expect(onview).toHaveBeenLastCalledWith({ favoritesOnly: false });
+    remove("status");
+    remove("query");
+    expect(onunconstrain.mock.calls.map((c) => c[0])).toEqual(["status", "query"]);
+    [...bar()!.querySelectorAll<HTMLElement>("button")].find((b) => b.textContent?.trim() === "Clear all")!.click();
+    expect(onclearfilters).toHaveBeenCalledOnce();
+  });
+
+  it("an empty result under a filter offers the reset, not only the Identify backlog", () => {
+    const { onclearfilters } = render({ assets: [], filters: { traits: ["rock"], tris: ["ultra"], sizes: [] } });
+    expect(document.body.textContent).toContain("Nothing matches");
+    [...document.querySelectorAll<HTMLElement>("button")].find((b) => b.textContent?.trim() === "Clear all filters")!.click();
+    expect(onclearfilters).toHaveBeenCalledOnce();
   });
 });

@@ -77,7 +77,14 @@ const PAGES = [
   { label: "library", hash: "#library", state: "library", anchors: Object.keys(ANCHORS.library), skip: [] },
   // The same with the first asset selected: the Inspector, and what its column moves.
   { label: "inspector", hash: "#library-inspector", state: "library+inspector", anchors: Object.keys(ANCHORS["library+inspector"]), skip: [] },
+  // The Library's overlays (plan P7b), each page the whole of its state, with positions.
+  screen("filters", "#library-filters", "library+filters"),
 ];
+
+/** A screen specimen: one page that reproduces every anchor of one state, positions included. */
+function screen(label, hash, state) {
+  return { label, hash, state, anchors: Object.keys(ANCHORS[state]), skip: [] };
+}
 
 /** Every anchor of `state`, deferred to one plan task. */
 const defer = (state, task) => Object.fromEntries(Object.keys(ANCHORS[state]).map((name) => [name, task]));
@@ -89,7 +96,6 @@ const defer = (state, task) => Object.fromEntries(Object.keys(ANCHORS[state]).ma
  * docs/superpowers/plans/2026-11-18-v2-p7b-library-overlays.md).
  */
 const DEFERRED = {
-  "library+filters": defer("library+filters", "gallery.html#library-filters — plan P7b Task 7b.2"),
   "library+picks": defer("library+picks", "gallery.html#library-picks — plan P7b Task 7b.3"),
   "library+list": defer("library+list", "gallery.html#library-list — plan P7b Task 7b.4"),
   quicklook: defer("quicklook", "gallery.html#quicklook — plan P7b Task 7b.5"),
@@ -103,9 +109,16 @@ const deferredCount = Object.values(DEFERRED).reduce((n, d) => n + Object.keys(d
 
 const args = process.argv.slice(2).filter((a) => a !== "--");
 if (!args.includes("--gallery")) {
-  console.error("usage: node web/e2e/gate.mjs --gallery   (--app arrives with plan P6 Task 6.8)");
+  console.error("usage: node web/e2e/gate.mjs --gallery [--only <page>]   (--app arrives with plan P6 Task 6.8)");
   process.exit(2);
 }
+// While building one page: measure it alone. A partial run says so and is never a gate result.
+const only = args.includes("--only") ? args[args.indexOf("--only") + 1] : null;
+if (only && !PAGES.some((p) => p.label === only)) {
+  console.error(`--only: no page "${only}" (${PAGES.map((p) => p.label).join(", ")})`);
+  process.exit(2);
+}
+const RUN = only ? PAGES.filter((p) => p.label === only) : PAGES;
 
 const report = createReport({ origin: "web/e2e/gate.mjs", root: ROOT });
 const contract = JSON.parse(fs.readFileSync(path.join(ROOT, "docs", "design", "contract.json"), "utf8"));
@@ -224,7 +237,7 @@ async function measureAll({ label, hash, state, anchors: names, skip }) {
 }
 
 const passed = [];
-for (const page of PAGES) passed.push(await measureAll(page));
+for (const page of RUN) passed.push(await measureAll(page));
 
 // The window floor (ADR-0009): at 900 × 600 nothing in the frame overflows and the rail is the
 // 48 px icon rail; below the floor the frame stops shrinking and the page scrolls instead.
@@ -308,7 +321,7 @@ const FLOOR = [
     },
   },
 ];
-for (const f of FLOOR) {
+for (const f of only ? [] : FLOOR) {
   if (setupError) {
     report.notRun(f.name, setupError);
     continue;
@@ -327,10 +340,11 @@ site?.close();
 const file = report.write();
 // (floor checks are counted among report.rows / failures)
 const failures = report.failures;
-const tally = PAGES.map((p, i) => `${passed[i]}/${p.anchors.length} ${p.label}${p.skip.includes("pos") ? "" : " (with positions)"}`);
+const tally = RUN.map((p, i) => `${passed[i]}/${p.anchors.length} ${p.label}${p.skip.includes("pos") ? "" : " (with positions)"}`);
 console.log(
   `\n${tally.join(", ")} match the contract; ${deferredCount} deferred.\n` +
-    `${report.rows.length} checks, ${failures.length} failed — ${path.relative(process.cwd(), file)}\n`,
+    `${report.rows.length} checks, ${failures.length} failed — ${path.relative(process.cwd(), file)}\n` +
+    (only ? `PARTIAL RUN (--only ${only}): the other pages and the floor checks did not run — this is not a gate result.\n` : ""),
 );
-const allPassed = PAGES.every((p, i) => passed[i] === p.anchors.length);
+const allPassed = RUN.every((p, i) => passed[i] === p.anchors.length);
 process.exit(failures.length || report.rows.length === 0 || !allPassed ? 1 : 0);

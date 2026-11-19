@@ -16,6 +16,7 @@
     favoriteCount = 0,
     filterCount = 0,
     filtersOpen = false,
+    filtersId,
     sortDisabled = false,
     onview,
     onfilters,
@@ -27,10 +28,12 @@
     /** Active ⚑ filters. */
     filterCount?: number;
     filtersOpen?: boolean;
+    /** The id of the popover the ⚑ button opens (`aria-controls`). */
+    filtersId?: string;
     /** AI-ranked results have their own order (UI-SPEC §2.2). */
     sortDisabled?: boolean;
     onview?: (patch: Partial<LibraryView>) => void;
-    /** Open the ⚑ Filters popover at this element. */
+    /** The ⚑ button was pressed: open the Filters popover at this element, or close it. */
     onfilters?: (anchor: HTMLElement) => void;
   } = $props();
 
@@ -99,12 +102,13 @@
       title="Filter by trait, triangles, or file size"
       aria-expanded={filtersOpen}
       aria-haspopup="dialog"
+      aria-controls={filtersOpen ? filtersId : undefined}
       onclick={() => filtersAnchor && onfilters?.(filtersAnchor)}
       data-anchor="library.filters"
     >
       Filters
       {#snippet trailing()}
-        {#if filterCount > 0}<Badge tone="gold" label="{filterCount} active filters">{filterCount}</Badge>{/if}
+        {#if filterCount > 0}<Badge tone="gold" label="{filterCount} active filters" data-anchor="library.filters.count">{filterCount}</Badge>{/if}
       {/snippet}
     </Button>
   </span>

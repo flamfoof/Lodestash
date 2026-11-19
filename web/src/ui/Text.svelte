@@ -9,19 +9,23 @@
    * - `hint` — a keyboard hint in a toolbar: 11 px, dim;
    * - `note` — a line under a group ("quick-tag from your trait library"): 10 px, dim;
    * - `empty` — what a group says when it has nothing ("No traits yet — run Identify."): italic;
+   * - `nothing` — the same for a list a search narrowed to nothing ("No traits match."): 11 px;
    * - `warning` — a note that asks for attention (missing links are skipped on export).
+   * `center` centres a block variant in its container (a caption under a full-width button).
    */
   let {
     variant = "label",
+    center = false,
     children,
     ...rest
   }: HTMLAttributes<HTMLSpanElement> & {
-    variant?: "label" | "hint" | "note" | "empty" | "warning";
+    variant?: "label" | "hint" | "note" | "empty" | "nothing" | "warning";
+    center?: boolean;
     children: Snippet;
   } = $props();
 </script>
 
-<span class="text {variant}" {...rest}>{@render children()}</span>
+<span class="text {variant}" class:center {...rest}>{@render children()}</span>
 
 <style>
   .label {
@@ -37,8 +41,19 @@
 
   .note,
   .empty,
+  .nothing,
   .warning {
     display: block;
+  }
+
+  .center {
+    text-align: center;
+  }
+
+  .nothing {
+    font-size: var(--fs-11);
+    color: var(--ls-text-dim);
+    font-style: italic;
   }
 
   .note {

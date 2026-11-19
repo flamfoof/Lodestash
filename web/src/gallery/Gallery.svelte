@@ -10,6 +10,8 @@
     Dialog,
     Divider,
     EmptyState,
+    FilterChip,
+    FilterToken,
     Icon,
     IconButton,
     ICON_NAMES,
@@ -221,13 +223,37 @@
     </Toolbar>
     <Popover bind:open={filtersOpen} anchor={filtersButton} id="filters-panel" label="Filter library">
       <div class="stack">
-        <Input label="TRAIT" placeholder="search traits…" size="sm" />
-        <div class="row">
-          <Chip label="rock" tone="ai" size="md" selected onclick={() => {}} />
-          <Chip label="moss" tone="ai" size="md" onclick={() => {}} />
-        </div>
+        <SectionHeading text="FILTER LIBRARY" flush />
+        <Input label="Search traits" hideLabel placeholder="search traits…" size="sm" />
+        <SectionHeading text="TRIANGLES" size="sm" note="· models only" flush />
       </div>
     </Popover>
+    <div class="row wide">
+      <FilterChip label="rock" selected />
+      <FilterChip label="moss" />
+      <FilterChip kind="tris" label="≤ 1k" selected />
+      <FilterChip kind="tris" label="1k–3k" />
+      <FilterChip kind="size" tier="S" label="S" detail="0–1.0 MB" />
+      <FilterChip kind="size" tier="S" label="S" detail="0–1.0 MB" selected />
+      <FilterChip kind="size" tier="M" label="M" detail="1.0 MB–4.0 MB" selected />
+      <FilterChip kind="size" tier="L" label="L" detail="4.0 MB–8.0 MB" selected />
+      <FilterChip kind="size" tier="XL" label="XL" detail="8.0 MB+" selected />
+      <Text variant="nothing">No traits match.</Text>
+    </div>
+    <div class="row wide">
+      <FilterToken label="moss" tone="gold" icon="search" onremove={() => (lastAction = "remove query")} />
+      <FilterToken label="Models" tone="model" diamond />
+      <FilterToken label="Identified" tone="identified" icon="status-identified" />
+      <FilterToken label="Synty" prefix="lib" />
+      <FilterToken label="Forest Pack" prefix="pack" />
+      <FilterToken label="rock" />
+      <FilterToken label="≤ 1k tris" tone="violet" />
+      <FilterToken label="M 1.0 MB–4.0 MB" tone="M" />
+      <FilterToken label="Favorites" tone="gold" icon="nav-favorites" />
+      <Text variant="hint">2 of 19 shown</Text>
+      <TextLink tone="muted" hover="danger" size="11" onclick={() => (lastAction = "clear all")}>Clear all</TextLink>
+      <TextLink tone="dim" hover="text" size="12" onclick={() => (lastAction = "clear")}>✕ Clear</TextLink>
+    </div>
   </section>
 
   <section>

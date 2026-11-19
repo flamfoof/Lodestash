@@ -343,6 +343,18 @@
   /* A focused card that is also selected: the focus ring stacks outside the selection ring
      (DESIGN-GUIDELINES §9); the prototype is mouse-only. */
   --ring-focus-selected: 0 0 0 2px #e7b765, 0 0 0 4px #ffd98a;
+  /* Overlay metrics (plan P7b) — fixed box sizes again, named by hand; the contract checks the
+     rendered result (filters, filters.search, bulk.tag, staging.dest, …). */
+  --filters-w: 328px; /* the ⚑ popover's content width */
+  --filters-search-w: 160px; /* its trait search field */
+  --field-h-sm: 19px; /* fields the prototype left as unstyled inputs: their heights as drawn */
+  --field-h-bar: 22px;
+  --field-h-dense: 24px;
+  --token-label-max-w: 180px; /* an active-filter chip's label before it is cut (UI-SPEC §2 item 7) */
+  /* A chosen size-filter chip is tinted with its tier's colour at 15 %. The prototype derives the
+     tint at run time (colour + "26") and only ever draws M chosen, so S and XL have no instance. */
+  --ls-success-a15: #5bd89726;
+  --ls-danger-a15: #f2666e26;
   /* Window floor (ADR-0009): below it the shell scrolls. */
   --window-min-w: 900px;
   --window-min-h: 600px;

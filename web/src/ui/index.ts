@@ -12,6 +12,8 @@ export { default as ContextMenu } from "./ContextMenu.svelte";
 export { default as Dialog } from "./Dialog.svelte";
 export { default as Divider } from "./Divider.svelte";
 export { default as EmptyState } from "./EmptyState.svelte";
+export { default as FilterChip } from "./FilterChip.svelte";
+export { default as FilterToken, type TokenTone } from "./FilterToken.svelte";
 export { default as Icon, type IconBox, type IconSize } from "./Icon.svelte";
 export { default as IconButton } from "./IconButton.svelte";
 export { default as ImportedBadge } from "./ImportedBadge.svelte";

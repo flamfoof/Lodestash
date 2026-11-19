@@ -65,10 +65,23 @@ Components take typed props and emit intents; wiring to `/v1` is P6b.
   its first chip, the bar and its right-aligned ✕ Clear, the first and second row, the dialog and
   its action row, the tray. Anchors of `library` that a state moves are measured again in that
   state (`library.grid` under the bulk bar; `library.view` in list view).
-- [ ] `extract-contract.mjs` writes the new states; `--check` clean; `check-tokens` 0
-- [ ] Gate green with every new anchor in `DEFERRED`, keyed `state/anchor` to the task below that
+- [x] `extract-contract.mjs` writes the new states; `--check` clean; `check-tokens` 0
+- [x] Gate green with every new anchor in `DEFERRED`, keyed `state/anchor` to the task below that
   removes it
-- [ ] Commit `feat(design): contract states for filters, picks, list view, Quick Look and staging`
+- [x] Commit `feat(design): contract states for filters, picks, list view, Quick Look and staging`
+
+*As built:* 107 anchors over the seven states (17 `library+filters`, 9 `library+picks`, 17
+`library+list`, 21 `quicklook`, 17 `quicklook+sound`, 10 `quicklook+image`, 16 `staging`); 181 in
+all. The vocabulary gained no value without a token — the source walk had already named what the
+overlays draw. Two things about the ruler itself:
+
+- **A radius of 99 px and up is one value.** The prototype writes "fully rounded" as `99px`
+  (waveform bars, the play button, the project dot) and as `999px` (chips); `tokens.css` has one
+  `--r-pill` and `check-tokens.mjs` already folds both into it. The gate's comparator now does the
+  same (`scripts/design/lib/compare.mjs`, with a test) — otherwise `--r-pill` could never match a
+  99 px anchor.
+- **`gate.mjs --only <page>`** measures one page while it is being built. It prints that it is a
+  partial run and is not a gate result.
 
 ### Task 7b.2: Filters — the predicate, the popover, the active-filter bar
 
@@ -95,13 +108,32 @@ Components take typed props and emit intents; wiring to `/v1` is P6b.
   from.
 - `LibraryScreen` gains `filters`, `traitOptions`, `constraints`, `total`; events `onfilterschange`,
   `onunconstrain(axis)`, `onclearfilters`. `onfilters(anchor)` goes: the screen opens the popover.
-- [ ] Vitest: filters compose (OR within, AND across) and clear; the count on ⚑ is the number of
+- [x] Vitest: filters compose (OR within, AND across) and clear; the count on ⚑ is the number of
   chosen values; an unmeasured model fails an active triangles filter; the bar lists constraints in
   the documented order, is absent with none, and removing a chip emits the axis it came from; the
   popover closes on Escape and no global key fires behind it
-- [ ] Gate: `#library-filters` passes every `library+filters` anchor with positions or has a
+- [x] Gate: `#library-filters` passes every `library+filters` anchor with positions or has a
   DEVIATIONS row; its deferrals are gone
-- [ ] Commit `feat(web): the Filters popover and the active-filter bar`
+- [x] Commit `feat(web): the Filters popover and the active-filter bar`
+
+*As built:* 17/17 `library+filters` anchors with positions; one measured exemption
+(`filters.search` `fontFamily` — the prototype's input is unstyled Arial, as its `<select>` is).
+Two more rows for what the contract cannot measure: the active-filter bar itself, and the XL
+chip's range ("8.0 MB+", where the prototype prints its Settings track's "50+").
+
+- New primitives: `FilterChip` (the popover's three kinds of toggle) and `FilterToken` (a removable
+  chip in the bar, in the prototype's pack-pill look). `SectionHeading` has a 9 px size and a
+  note; `TextLink` can be a quiet action of its own ("Clear all"); `Input` has stated heights for
+  the fields the prototype left unstyled; `Text` has `nothing`. The bar is a second `Toolbar`.
+- The strip was planned as `FilterStrip`; `Toolbar` already is that strip (and gives it ← →).
+- The screen's `filterCount` and `onfilters(anchor)` props are gone: the count is derived from
+  `filters`, and the screen opens the popover it owns. `onclearfilters` is the bar's Clear all —
+  the owner resets every axis, because the screen owns only two of them.
+- `Popover` returned focus to its anchor even when the anchor was a wrapper `<span>`, which cannot
+  take it, so Escape left focus on the document. It now returns it to the button inside. Found by
+  the test, not by the gate.
+- The bar's overflow is measured, not a fixed head: the row is one chip tall and clips; the chips
+  that wrapped are counted from their `offsetTop` and offered under `+N more ▾`.
 
 ### Task 7b.3: The bulk bar
 

@@ -10,7 +10,8 @@
    * switcher): placed below it by measurement and flipped above when it would not fit, clamped to
    * the viewport. Non-modal — the page stays interactive — but it pushes a blocking keymap scope
    * while open, closes on Escape (focus back to the anchor), on a click outside, and when focus
-   * leaves it. The anchor should carry `aria-expanded` and `aria-controls` = `id`.
+   * leaves it. The anchor should carry `aria-expanded` and `aria-controls` = `id`. `data-*` attributes
+   * reach the panel (the contract gate marks it).
    */
   let {
     open = $bindable(false),
@@ -21,7 +22,8 @@
     flush = false,
     onclose,
     children,
-  }: {
+    ...rest
+  }: Record<`data-${string}`, string | undefined> & {
     open?: boolean;
     anchor: HTMLElement | null | undefined;
     label: string;
@@ -79,7 +81,10 @@
       const hadFocus = layer.contains(document.activeElement);
       layer.remove();
       pos = null;
-      if (hadFocus || document.activeElement === document.body) restoreFocus(anchorEl ?? null);
+      // Back to the control that opened it: the anchor, or the button inside an anchor that is a
+      // wrapper (a span cannot take focus, and focus must not be left on the document).
+      const opener = anchorEl ? (focusables(anchorEl)[0] ?? anchorEl) : null;
+      if (hadFocus || document.activeElement === document.body) restoreFocus(opener);
     };
   }
 </script>
@@ -96,6 +101,7 @@
     style:left="{pos?.x ?? 0}px"
     style:top="{pos?.y ?? 0}px"
     style:visibility={pos ? "visible" : "hidden"}
+    {...rest}
     {@attach float}
   >
     {@render children()}
