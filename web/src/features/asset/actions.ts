@@ -27,6 +27,8 @@ export type AssetActionId =
   | "export"
   | "collect"
   | "edit-tags"
+  | "tag-add"
+  | "tag-remove"
   | "identify"
   | "find-similar"
   | "trash"
@@ -40,6 +42,8 @@ export interface AssetIntent {
   readonly ids: readonly number[];
   /** `favorite` and `stage`: the state to set (a toggle resolved against the targets). */
   readonly on?: boolean;
+  /** `tag-add` and `tag-remove`: the tag's name, trimmed. Its normal form is the engine's to decide. */
+  readonly tag?: string;
   readonly [brand]: true;
 }
 
@@ -50,6 +54,12 @@ export interface ActionContext {
   project: ProjectRef | null;
 }
 
+/** What an action needs beyond its targets. */
+export interface ActionArgs {
+  /** `tag-add` and `tag-remove`: the tag's name as typed. */
+  tag?: string;
+}
+
 export interface ActionDef {
   label(ctx: ActionContext): string;
   icon?: IconName;
@@ -57,16 +67,23 @@ export interface ActionDef {
   shortcut?: string;
   danger?: boolean;
   /** Why it cannot run now — a disabled menu item's tooltip. Undefined when it can. */
-  unavailable?(ctx: ActionContext): string | undefined;
+  unavailable?(ctx: ActionContext, args: ActionArgs): string | undefined;
   /** The state a toggle sets. */
   on?(ctx: ActionContext): boolean;
+  /** The targets it leaves out: an intent carries only the assets this is true for. */
+  applies?(asset: AssetSummary): boolean;
 }
 
 const isMac = () => typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
 const one = (ctx: ActionContext) => (ctx.targets.length === 1 ? undefined : "Select a single asset");
 const every = (ctx: ActionContext, flag: "favorite" | "staged") => ctx.targets.every((a) => a[flag]);
 const unidentified = (a: AssetSummary) => userStatus(a.status) === "unidentified";
+const identified = (a: AssetSummary) => !unidentified(a);
 const plural = (ctx: ActionContext, singular: string) => (ctx.targets.length > 1 ? `${singular}s` : singular);
+// A bulk tag edit skips Unidentified assets (UI-SPEC §2 item 4): what they are is not known yet,
+// and a tag written now would be overwritten by the identification that is still to come.
+const taggable = (ctx: ActionContext, args: ActionArgs) =>
+  !args.tag?.trim() ? "Type a tag name first" : ctx.targets.some(identified) ? undefined : "Unidentified assets are skipped — identify them first";
 
 export const ACTIONS: Record<AssetActionId, ActionDef> = {
   open: { label: () => "Open", shortcut: "Enter", unavailable: one },
@@ -101,6 +118,9 @@ export const ACTIONS: Record<AssetActionId, ActionDef> = {
   export: { label: () => "Export to folder…", icon: "download" },
   collect: { label: () => "Add to collection…", icon: "nav-collections" },
   "edit-tags": { label: () => "Edit tags…", icon: "tag-add" },
+  // The bulk bar's two: a named tag onto, or off, every identified asset in the set.
+  "tag-add": { label: () => "Add tag", icon: "tag-add", unavailable: taggable, applies: identified },
+  "tag-remove": { label: () => "Remove tag", unavailable: taggable, applies: identified },
   identify: {
     label: (ctx) => (ctx.targets.every(unidentified) ? "Identify" : "Re-identify"),
     icon: "action-ai-sieve",
@@ -115,16 +135,27 @@ export const ACTIONS: Record<AssetActionId, ActionDef> = {
 };
 
 /** Why `id` cannot run for `ctx`, or undefined when it can. */
-export function whyNot(id: AssetActionId, ctx: ActionContext): string | undefined {
+export function whyNot(id: AssetActionId, ctx: ActionContext, args: ActionArgs = {}): string | undefined {
   if (ctx.targets.length === 0) return "Nothing is selected";
-  return ACTIONS[id].unavailable?.(ctx);
+  return ACTIONS[id].unavailable?.(ctx, args);
 }
 
-/** The intent `id` produces for `ctx` — null when the action cannot run. */
-export function intentFor(id: AssetActionId, ctx: ActionContext): AssetIntent | null {
-  if (whyNot(id, ctx) !== undefined) return null;
-  const on = ACTIONS[id].on?.(ctx);
-  const intent = { action: id, ids: Object.freeze(ctx.targets.map((a) => a.id)), ...(on === undefined ? {} : { on }) };
+/**
+ * The intent `id` produces for `ctx` — null when the action cannot run. An action that does not
+ * apply to every target (`applies`) carries the ids of those it does.
+ */
+export function intentFor(id: AssetActionId, ctx: ActionContext, args: ActionArgs = {}): AssetIntent | null {
+  if (whyNot(id, ctx, args) !== undefined) return null;
+  const def = ACTIONS[id];
+  const targets = def.applies ? ctx.targets.filter(def.applies) : ctx.targets;
+  const on = def.on?.(ctx);
+  const tag = args.tag?.trim();
+  const intent = {
+    action: id,
+    ids: Object.freeze(targets.map((a) => a.id)),
+    ...(on === undefined ? {} : { on }),
+    ...(tag ? { tag } : {}),
+  };
   return Object.freeze(intent) as AssetIntent;
 }
 

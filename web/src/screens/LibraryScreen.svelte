@@ -9,6 +9,7 @@
   import ActiveFilterBar from "../features/filters/ActiveFilterBar.svelte";
   import FilterPanel from "../features/filters/FilterPanel.svelte";
   import { filterCount, NO_FILTERS, toggleFilter, type LibraryFilters, type TraitCount, type TriBucket } from "../features/filters/filters";
+  import BulkBar from "../features/library/BulkBar.svelte";
   import LibraryToolbar from "../features/library/LibraryToolbar.svelte";
   import UnidentifiedBanner from "../features/library/UnidentifiedBanner.svelte";
   import type { LibraryView } from "../features/library/view";
@@ -27,6 +28,9 @@
    * the type tabs, the sidebar facets) are handed in. The screen opens the ⚑ popover, and the
    * active-filter bar lists every constraint; removing one reports it to whoever owns that axis —
    * `onfilterschange` for ⚑, `onview` for ★, `onunconstrain` for the shell's.
+   *
+   * **Picks.** While anything is picked the bulk bar sits under the toolbar and acts on the pick
+   * set; its intents go the way every intent goes.
    *
    * Keys (UI-SPEC §0.4): Space, F and Delete are bound in the keymap's global scope for as long as
    * the screen is mounted, so they act on the selection from anywhere in the window and never behind
@@ -107,6 +111,8 @@
   const order = $derived(assets.map((a) => a.id));
   const resolve = (ids: readonly number[]) => assets.filter((a) => ids.includes(a.id));
   const menuTargets = $derived(menuId === null ? [] : resolve(selection.targets(menuId)));
+  /** The pick set as assets, in the page's order: what the bulk bar acts on. */
+  const picked = $derived(assets.filter((a) => selection.picks.has(a.id)));
   const active = $derived(activeFilters(constraints, filters, view.favoritesOnly, thresholds));
 
   /** "Open" is the selection's business; everything else is the owner's. */
@@ -166,6 +172,7 @@
     }}
   />
   <ActiveFilterBar filters={active} shown={count} {total} onremove={removeFilter} onclear={() => onclearfilters?.()} />
+  <BulkBar targets={picked} {project} onintent={dispatch} onclear={() => selection.picks.clear()} />
   <div class="body">
     {#if assets.length === 0}
       <EmptyState

@@ -347,6 +347,7 @@
      rendered result (filters, filters.search, bulk.tag, staging.dest, …). */
   --filters-w: 328px; /* the ⚑ popover's content width */
   --filters-search-w: 160px; /* its trait search field */
+  --bulk-tag-w: 150px; /* the bulk bar's tag-name field */
   --field-h-sm: 19px; /* fields the prototype left as unstyled inputs: their heights as drawn */
   --field-h-bar: 22px;
   --field-h-dense: 24px;

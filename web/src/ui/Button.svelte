@@ -1,6 +1,16 @@
 <script lang="ts" module>
-  export type ButtonVariant = "primary" | "secondary" | "ghost" | "danger" | "link" | "dashed" | "outline-gold" | "outline-arcane" | "arcane";
-  export type ButtonSize = "xs" | "sm" | "md" | "lg" | "pill" | "block" | "block-sm";
+  export type ButtonVariant =
+    | "primary"
+    | "secondary"
+    | "ghost"
+    | "danger"
+    | "link"
+    | "dashed"
+    | "outline-gold"
+    | "outline-arcane"
+    | "arcane"
+    | "quiet-gold";
+  export type ButtonSize = "xs" | "sm" | "md" | "lg" | "pill" | "block" | "block-sm" | "bar";
 </script>
 
 <script lang="ts">
@@ -16,7 +26,10 @@
    * - `ghost` — text only until hovered; `danger` — outlined red; `link` — inline text action;
    * - `dashed` — the dashed, full-width "+ Add source…" row at the foot of a rail;
    * - `outline-gold` / `outline-arcane` / `arcane` — the inspector's actions: ⟡ Stage (gold
-   *   outline), ✦ Re-identify (arcane outline), ✦ Identify now (arcane fill).
+   *   outline), ✦ Re-identify (arcane outline), ✦ Identify now (arcane fill);
+   * - `quiet-gold` — an action in the bulk bar ("+ Add tag", "⟡ Stage all"): gold text on a faint
+   *   gold hairline, regular weight — one of several in a row, none of them the call to action.
+   * `bar` is the size of a button in that bar (2/10 px, the bar's 12 px type, a 4 px corner).
    * `md` is the toolbar size (5/11 px padding, 12 px type); `xs` the on-thumbnail size (2/8, 11 px);
    * `sm` the settings-row size (2/9, 10 px); `lg` the screen-header size (7/16, 13 px); `pill` the
    * rounded "⤢ full size" on a preview (4/12, 11 px); `block` / `block-sm` fill their column (8 px
@@ -132,6 +145,12 @@
     min-width: 0;
   }
 
+  .bar {
+    padding: var(--space-2) var(--space-10);
+    font-size: var(--fs-12);
+    border-radius: var(--r-4);
+  }
+
   .block {
     padding: var(--space-8) 0;
     font-size: var(--fs-13);
@@ -211,6 +230,15 @@
   .outline-gold:hover:not(:disabled) {
     border-color: var(--ls-gold);
     box-shadow: var(--glow-gold-10-a25);
+  }
+
+  .quiet-gold {
+    color: var(--ls-gold);
+    border: 1px solid var(--ls-gold-a40);
+  }
+
+  .quiet-gold:hover:not(:disabled) {
+    border-color: var(--ls-gold);
   }
 
   .outline-arcane {

@@ -18,7 +18,8 @@
    * The Library in the shell, on the prototype's data — what the gate measures against the
    * contract at 1440 × 900. Each `gallery.html#…` page is this component started in one contract
    * state (gallery/main.ts lists them): `#library`, `#library-inspector` (the first asset
-   * selected), `#library-filters` (⚑ open with rock ∧ ≤ 1k ∧ M chosen).
+   * selected), `#library-filters` (⚑ open with rock ∧ ≤ 1k ∧ M chosen), `#library-picks` (three
+   * cards picked: the bulk bar).
    *
    * This is the only owner of data on the page: it stands in for the resource cache, the library
    * query and the mutation layer of plan P6b. Intents change its copy of the fixture, and the
@@ -28,18 +29,24 @@
   let {
     select = null,
     filters: startFilters = NO_FILTERS,
+    picks = [],
     open = null,
   }: {
     /** The asset the inspector describes when the page loads. */
     select?: number | null;
     /** The ⚑ filter in effect when the page loads. */
     filters?: LibraryFilters;
+    /** Assets picked for bulk actions when the page loads. */
+    picks?: readonly number[];
     /** An overlay to open once the page is up, the way a person would. */
     open?: "filters" | null;
   } = $props();
 
   const selection = new Selection();
-  untrack(() => select !== null && selection.moveTo(select));
+  untrack(() => {
+    if (select !== null) selection.moveTo(select);
+    for (const id of picks) selection.toggle(id);
+  });
 
   let assets = $state<AssetDetail[]>(ASSETS.map((a) => ({ ...a })));
   let shell = $state<ShellData>(shellData());
@@ -143,6 +150,16 @@
     } else if (intent.action === "trash") {
       assets = assets.filter((a) => !hit(a));
       say(`Moved ${intent.ids.length} to Trash`);
+    } else if (intent.action === "tag-add" || intent.action === "tag-remove") {
+      // The engine decides a tag's normal form; this stand-in lowercases, as the prototype does.
+      const tag = (intent.tag ?? "").toLowerCase();
+      const add = intent.action === "tag-add";
+      assets = assets.map((a) => {
+        if (!hit(a) || a.tags.some((t) => t.value === tag) === add) return a;
+        const tags = add ? [...a.tags, { namespace: null, value: tag, confidence: null, source: "manual" }] : a.tags.filter((t) => t.value !== tag);
+        return { ...a, tags };
+      });
+      say(`${add ? "Added" : "Removed"} "${tag}" ${add ? "to" : "from"} ${intent.ids.length} ${intent.ids.length === 1 ? "asset" : "assets"}`);
     } else say(`${intent.action} · ${intent.ids.join(", ")}`);
   }
 </script>

@@ -194,6 +194,38 @@ describe("the asset keys", () => {
   });
 });
 
+describe("tag-add and tag-remove — a named tag onto, or off, the identified assets of a set", () => {
+  it("carry the trimmed name and only the assets they apply to", () => {
+    const intent = intentFor("tag-add", ctx([beaver, unidentified, rock]), { tag: "  Hero Prop " })!;
+    expect([intent.action, intent.ids, intent.tag]).toEqual(["tag-add", [beaver.id, rock.id], "Hero Prop"]);
+    expect(Object.isFrozen(intent)).toBe(true);
+    expect(intentFor("tag-remove", ctx([sword]), { tag: "weapon" })!.ids).toEqual([sword.id]);
+  });
+
+  it("cannot run without a name, and say so", () => {
+    for (const tag of [undefined, "", "   "]) {
+      expect(intentFor("tag-add", ctx([beaver]), { tag })).toBeNull();
+      expect(whyNot("tag-remove", ctx([beaver]), { tag })).toBe("Type a tag name first");
+    }
+  });
+
+  it("cannot run on a set with nothing identified in it", () => {
+    expect(intentFor("tag-add", ctx([unidentified]), { tag: "prop" })).toBeNull();
+    expect(whyNot("tag-add", ctx([unidentified]), { tag: "prop" })).toMatch(/Unidentified assets are skipped/);
+  });
+
+  it("are not in the context menu — Edit tags… is the single-asset road", () => {
+    expect(MENU).not.toContain("tag-add");
+    expect(MENU).not.toContain("tag-remove");
+    expect(isActionId("tag-add")).toBe(true);
+  });
+
+  it("no other action's intent grows a tag", () => {
+    expect(intentFor("stage", ctx([beaver]))!.tag).toBeUndefined();
+    expect("tag" in intentFor("favorite", ctx([beaver]))!).toBe(false);
+  });
+});
+
 describe("actions.ts is the only place an intent is defined", () => {
   const sources = import.meta.glob<string>("/src/**/*.{ts,svelte}", { query: "?raw", import: "default", eager: true });
   const others = Object.entries(sources).filter(([file]) => !/features\/asset\/actions(\.test)?\.ts$/.test(file));
@@ -205,7 +237,7 @@ describe("actions.ts is the only place an intent is defined", () => {
 
   it("no other module casts to AssetIntent or writes an intent literal", () => {
     const offenders = others
-      .filter(([, text]) => /\bas\s+(unknown\s+as\s+)?AssetIntent\b/.test(text) || /\baction:\s*["'`](open|quick-look|play|reveal|favorite|stage|import|export|identify|trash|restore)["'`]/.test(text))
+      .filter(([, text]) => /\bas\s+(unknown\s+as\s+)?AssetIntent\b/.test(text) || /\baction:\s*["'`](open|quick-look|play|reveal|favorite|stage|import|export|identify|trash|restore|tag-add|tag-remove)["'`]/.test(text))
       .map(([file]) => file);
     expect(offenders).toEqual([]);
   });

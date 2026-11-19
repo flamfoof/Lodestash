@@ -106,7 +106,7 @@
       label="Select {asset.name} for bulk actions"
       hideLabel
       tabindex={-1}
-      boxAttrs={{ "data-anchor": anchor("card.pick") }}
+      boxAttrs={{ "data-anchor": anchor(picked ? "card.pick.on" : "card.pick") }}
     />
   {/snippet}
 

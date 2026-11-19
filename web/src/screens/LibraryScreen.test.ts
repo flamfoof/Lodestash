@@ -410,3 +410,61 @@ describe("LibraryScreen — the ⚑ filters and the active-filter bar", () => {
     expect(onclearfilters).toHaveBeenCalledOnce();
   });
 });
+
+describe("LibraryScreen — the bulk bar acts on the pick set", () => {
+  const bulk = () => document.querySelector<HTMLElement>('[role="toolbar"][aria-label="Bulk actions"]');
+  const bulkButton = (text: string) => [...bulk()!.querySelectorAll<HTMLElement>("button")].find((b) => b.textContent?.includes(text))!;
+
+  it("appears with the first pick and goes with the last", () => {
+    const { selection } = render();
+    expect(bulk()).toBeNull();
+    selection.toggle(2);
+    flushSync();
+    expect(bulk()!.textContent).toContain("1 selected");
+    selection.toggle(9);
+    flushSync();
+    expect(bulk()!.textContent).toContain("2 selected");
+    selection.toggle(2);
+    selection.toggle(9);
+    flushSync();
+    expect(bulk()).toBeNull();
+  });
+
+  it("its buttons emit for the picks in page order, whatever order they were picked in — never for the lead", () => {
+    const { intents, selection } = render();
+    selection.moveTo(6);
+    [9, 2, 3].forEach((id) => selection.toggle(id));
+    flushSync();
+    bulkButton("Stage all").click();
+    const field = bulk()!.querySelector<HTMLInputElement>("input")!;
+    field.value = "keeper";
+    field.dispatchEvent(new Event("input", { bubbles: true }));
+    flushSync();
+    bulkButton("Add tag").click();
+    expect(intents).toEqual([intentFor("stage", targets(2, 3, 9)), intentFor("tag-add", targets(2, 3, 9), { tag: "keeper" })]);
+  });
+
+  it("✕ Clear empties the pick set and leaves the lead", () => {
+    const { intents, selection } = render();
+    selection.moveTo(6);
+    selection.toggle(2);
+    selection.toggle(3);
+    flushSync();
+    bulkButton("Clear").click();
+    flushSync();
+    expect([selection.picks.size, selection.lead]).toEqual([0, 6]);
+    expect(bulk()).toBeNull();
+    expect(intents).toEqual([]);
+  });
+
+  it("typing a tag name does not trigger the asset keys", () => {
+    const { intents, selection } = render();
+    selection.moveTo(6);
+    selection.toggle(2);
+    flushSync();
+    const field = bulk()!.querySelector<HTMLInputElement>("input")!;
+    field.focus();
+    ["f", " ", "Delete"].forEach((k) => press(k));
+    expect(intents).toEqual([]);
+  });
+});

@@ -149,11 +149,27 @@ chip's range ("8.0 MB+", where the prototype prints its Settings track's "50+").
   The tag name is the bar's own draft (nobody else's business until it is submitted). Enter in the
   field adds.
 - The screen shows it while anything is picked; ✕ Clear empties the pick set.
-- [ ] Vitest: each button emits the intent `actions.ts` produces for the pick set; Unidentified
+- [x] Vitest: each button emits the intent `actions.ts` produces for the pick set; Unidentified
   assets are left out of a tag intent; an empty name emits nothing and says why; Stage all on a
   fully staged set unstages (the one stage toggle); ✕ Clear clears picks only
-- [ ] Gate: `#library-picks` passes every `library+picks` anchor with positions
-- [ ] Commit `feat(web): the bulk bar acts on the pick set`
+- [x] Gate: `#library-picks` passes every `library+picks` anchor with positions
+- [x] Commit `feat(web): the bulk bar acts on the pick set`
+
+*As built:* 9/9 `library+picks` anchors with positions; `bulk.tag` joins the `fontFamily` row
+(the same unstyled input). The strip is `Toolbar` with `tone="selection"` rather than a `Banner`
+variant — it is a toolbar, and gets ← → for free. `Button` gained `quiet-gold` and the `bar`
+size, `Input` the `bar` size, `Text` the `selection` variant.
+
+- **An intent can leave targets out.** `ActionDef.applies` narrows what an intent carries, so
+  "skips Unidentified" is a property of the action, not of the bar: `tag-add` on a set of five
+  with two Unidentified carries three ids. `intentFor` and `whyNot` take `{ tag }`.
+- **The intent's tag is trimmed, not normalised.** Case and the vocabulary are the engine's; the
+  specimen's stand-in lowercases, as the prototype does.
+- **The tag buttons are never disabled for an empty name** (the prototype's are not): the name is
+  typed after the picks are made, so the bar would open with two dead buttons. Pressing one
+  without a name says why in a status line beside the buttons and puts focus in the field.
+- **Picks reach the bar in page order**, whatever order they were picked in, so an intent's ids
+  read the way the grid does.
 
 ### Task 7b.4: List view
 

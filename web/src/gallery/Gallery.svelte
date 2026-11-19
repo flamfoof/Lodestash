@@ -254,6 +254,16 @@
       <TextLink tone="muted" hover="danger" size="11" onclick={() => (lastAction = "clear all")}>Clear all</TextLink>
       <TextLink tone="dim" hover="text" size="12" onclick={() => (lastAction = "clear")}>✕ Clear</TextLink>
     </div>
+    <div class="wide">
+      <Toolbar tone="selection" label="Bulk actions specimen">
+        <Text variant="selection">3 selected</Text>
+        <Input label="Tag name" hideLabel size="bar" placeholder="tag name…" />
+        <Button variant="quiet-gold" size="bar">+ Add tag</Button>
+        <Button size="bar">− Remove tag</Button>
+        <Button variant="quiet-gold" size="bar" icon="action-stage" iconBox="8">Stage all</Button>
+        <Text variant="warning">Type a tag name first</Text>
+      </Toolbar>
+    </div>
   </section>
 
   <section>
