@@ -148,3 +148,22 @@ export async function clickText(page, text, nth = 0) {
   if (!ok) throw new Error(`clickText: no visible element with own text "${text}" (#${nth})`);
   await settle(page);
 }
+
+/** Click the nth visible element matching `css` — for controls that are a bare glyph (⤢, a pick box). */
+export async function clickCss(page, css, nth = 0) {
+  const ok = await page.evaluate(
+    ([css, nth]) => {
+      const hits = [...document.querySelectorAll(css)].filter((e) => {
+        const r = e.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
+      const el = hits[nth];
+      if (!el) return false;
+      el.click();
+      return true;
+    },
+    [css, nth],
+  );
+  if (!ok) throw new Error(`clickCss: no visible element matching "${css}" (#${nth})`);
+  await settle(page);
+}

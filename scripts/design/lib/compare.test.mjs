@@ -32,6 +32,13 @@ test("colour, type and edges are exact", () => {
   assert.deepEqual(props(compare(contract, app({ backgroundImage: "linear-gradient(red, blue)" }), ALL)), ["backgroundImage"]);
 });
 
+test("99px and 999px are the same fully rounded radius; a real radius is still exact", () => {
+  const pill = { ...contract, style: { ...contract.style, radius: 99 } };
+  assert.deepEqual(compare(pill, app({ radius: 999 }), ALL), []);
+  assert.deepEqual(props(compare(pill, app({ radius: 98 }), ALL)), ["radius"]);
+  assert.deepEqual(props(compare(pill, app({ radius: 6 }), ALL)), ["radius"]);
+});
+
 test("spacing is ±0.5 px, and no gap is not a zero gap", () => {
   assert.deepEqual(compare(contract, app({ padding: [4.5, 8, 3.5, 8] }), ALL), []);
   assert.deepEqual(props(compare(contract, app({ padding: [5, 8, 4, 8] }), ALL)), ["padding"]);

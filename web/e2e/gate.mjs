@@ -79,12 +79,24 @@ const PAGES = [
   { label: "inspector", hash: "#library-inspector", state: "library+inspector", anchors: Object.keys(ANCHORS["library+inspector"]), skip: [] },
 ];
 
+/** Every anchor of `state`, deferred to one plan task. */
+const defer = (state, task) => Object.fromEntries(Object.keys(ANCHORS[state]).map((name) => [name, task]));
+
 /**
  * Anchors no page reproduces yet, per state, and the plan task that will measure them:
- * `{ "<state>": { "<anchor>": "<what will measure it — plan task>" } }`. Empty since plan P7
- * Task 7.7; a new screen's anchors start here and leave when its specimen page exists.
+ * `{ "<state>": { "<anchor>": "<what will measure it — plan task>" } }`. A new screen's anchors
+ * start here and leave when its specimen page exists (the plan is
+ * docs/superpowers/plans/2026-11-18-v2-p7b-library-overlays.md).
  */
-const DEFERRED = {};
+const DEFERRED = {
+  "library+filters": defer("library+filters", "gallery.html#library-filters — plan P7b Task 7b.2"),
+  "library+picks": defer("library+picks", "gallery.html#library-picks — plan P7b Task 7b.3"),
+  "library+list": defer("library+list", "gallery.html#library-list — plan P7b Task 7b.4"),
+  quicklook: defer("quicklook", "gallery.html#quicklook — plan P7b Task 7b.5"),
+  "quicklook+sound": defer("quicklook+sound", "gallery.html#quicklook-sound — plan P7b Task 7b.5"),
+  "quicklook+image": defer("quicklook+image", "gallery.html#quicklook-image — plan P7b Task 7b.5"),
+  staging: defer("staging", "gallery.html#staging — plan P7b Task 7b.6"),
+};
 const deferredCount = Object.values(DEFERRED).reduce((n, d) => n + Object.keys(d).length, 0);
 
 // ---- run ----

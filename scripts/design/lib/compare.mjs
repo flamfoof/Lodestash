@@ -4,7 +4,7 @@
 //   box   → w, h (±1 px)                   pos → x, y (±1 px)
 //   type  → fontFamily, fontSize, fontWeight, letterSpacing, textTransform (exact)
 //   color → color (exact)                  fill → background, backgroundImage (exact)
-//   edge  → borderWidth, borderColor, radius (exact)
+//   edge  → borderWidth, borderColor, radius (exact; 99 px and up is one "fully rounded")
 //   space → padding, gap (±0.5 px)
 // A difference is allowed only when docs/design/DEVIATIONS.md has a row naming that exact
 // (state, anchor, property); `readDeviations` turns the table into those triples.
@@ -23,7 +23,15 @@ const TOLERANCE = { w: 1, h: 1, x: 1, y: 1, padding: 0.5, gap: 0.5 };
 export const PROPERTIES = new Set(Object.values(GROUPS).flat());
 
 const GEOMETRY = new Set([...GROUPS.box, ...GROUPS.pos]);
-const read = (m, prop) => (GEOMETRY.has(prop) ? m.box?.[prop] : m.style?.[prop]);
+
+/**
+ * The prototype writes "fully rounded" two ways, `99px` and `999px`. They draw the same and
+ * tokens.css names both `--r-pill` (check-tokens.mjs folds every radius of 99 px and up into it),
+ * so the gate reads them as one value too.
+ */
+const PILL = 99;
+const canon = (prop, value) => (prop === "radius" && typeof value === "number" && value >= PILL ? "pill" : value);
+const read = (m, prop) => canon(prop, GEOMETRY.has(prop) ? m.box?.[prop] : m.style?.[prop]);
 
 function same(a, b, tol) {
   if (a === b) return true;
