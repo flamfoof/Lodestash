@@ -260,7 +260,7 @@ The single most important visual language. Every asset shows status three ways (
 | Status | Token | Gem icon | Card treatment |
 |---|---|---|---|
 | **Unidentified** | `--ls-status-unidentified` | `ls-status-unidentified` (`?`) | Muted card, dashed/slate border, name shown as `???`-styled until identified |
-| **Identified** | `--ls-status-identified` | `ls-status-identified` (✓) | Normal card, 1px verdant left-border |
+| **Identified** | `--ls-status-identified` | `ls-status-identified` (✓) | Normal card, 3px verdant left-border (`--bw-3`, the prototype's — ADR-0023) |
 | **Confirmed** | `--ls-status-confirmed` | `ls-status-confirmed` (★) | Gold left-border + faint gold aura on hover |
 
 - **Identify mode** filters to Unidentified and offers batch "Identify." On completion, play a brief
@@ -459,15 +459,20 @@ import.
   Ctrl/Cmd-A selects all within the current filter. Selected cards get a 2px `--ls-gold` border + a
   check overlay (top-left); a selection count shows in the top bar. Bulk actions operate on the set.
 - **Right-click context menu** (`--ls-overlay`, §4 elevation 2): Open, **Quick Look** (Space),
-  **Reveal in Explorer/Finder**, **Open with default app**, **Copy name**, **Copy path**, Stage,
-  Import…, Add to collection, Edit tags, Re-identify, Find similar, **Move to Trash**. Engine actions
-  gray out (with a tooltip) when no project is active. The same menu serves single and multi
-  selection.
+  **Reveal in Explorer/Finder**, **Open with default app**, **Copy name**, **Copy path**,
+  Add to / Remove from Favorites (F), Stage, Import…, **Export to folder…** (UI-SPEC §16.2 — it
+  needs no project), Add to collection, Edit tags, Re-identify, Find similar, **Move to Trash**.
+  Engine actions gray out (with a tooltip) when no project is active. The same menu serves single
+  and multi selection: opened on a card in the pick set it acts on the whole set, on any other card
+  on that card alone; items that need exactly one asset (Open, Reveal, Open with, Find similar) gray
+  out for a set. In the v2 web UI the items, their order and their reasons are defined once, in
+  `web/src/features/asset/actions.ts`.
 - **Text selection: content yes, chrome no.** The shell sets `user-select: none` so dragging across
   a grid never paints a selection, and content opts back in — the inspector, Quick Look, dialogs,
-  settings, stat blocks and mono paths. Cards and list rows are `<button>` elements, so a drag over
-  one can never produce a text selection whatever the CSS says: for those, **Copy name / Copy path**
-  in the context menu is the route that actually reaches the text. Finding an asset ends in using it
+  settings, stat blocks and mono paths. A card's name is a `<button>` (in the v2 web UI the card
+  itself is a container and its name is the button stretched over it), so a drag over one can never
+  produce a text selection whatever the CSS says: for those, **Copy name / Copy path** in the
+  context menu is the route that actually reaches the text. Finding an asset ends in using it
   somewhere else, and a catalog whose names must be retyped by hand has not finished the job.
 
 ### View / sort toolbar
@@ -620,10 +625,11 @@ Progress meters animate smoothly; never spin gratuitously.
   above on `--ls-surface`/`--ls-surface-raised`.
 - **Never color-only:** status, type, provenance always also carry an icon/label/shape.
 - **Focus:** one ring, everywhere — a single global `:focus-visible` rule sets
-  `box-shadow: var(--el-focus-ring)` (`0 0 0 2px #FFD98A`), so card, list row, trait chip, facet row,
-  nav row, type tab, icon button, select and the search box all inherit it, including the
-  `role="button"` spans the app uses where a nested `<button>` would be invalid HTML. Three rules
-  that are the whole recipe:
+  `box-shadow: var(--ring-focus)` (`0 0 0 2px #FFD98A`; `--el-focus-ring` in the old `ui/`), so
+  card, list row, trait chip, facet row, nav row, type tab, icon button, select and the search box
+  all inherit it. *(The old `ui/` used `role="button"` spans where a nested `<button>` would be
+  invalid HTML. The v2 web UI has none: a card is a container whose controls are siblings, each a
+  real `<button>` — spec §9.2 rule 4.)* Three rules that are the whole recipe:
   - **`:focus-visible` only, never `:focus`.** A mouse click must not leave a ring behind it — that
     is what makes people reach for `outline: none` and lose keyboard focus altogether.
   - **Never layout-shifting.** It is a shadow, so nothing reflows when it appears; on a card it
@@ -636,9 +642,20 @@ Progress meters animate smoothly; never spin gratuitously.
   names the keys the accessibility contract depends on, and it drifted from that table until
   2026-08-26 (`Del` and `/` were here, absent there, and implemented in neither). The **grid is one tab stop** — a roving `tabindex` keeps exactly
   one card tabbable and the arrow keys move within it, so Tab never walks 50–100 cards to leave the
-  grid. Arrows move the lead selection (↑↓ by a whole row, read off the resolved
-  `grid-template-columns` rather than recomputed), **Home/End** jump to the ends, and **Shift**
-  with an arrow or a click extends the *pick set* the bulk bar acts on.
+  grid. Arrows move the lead selection (↑↓ by a whole row), **Home/End** jump to the ends, and
+  **Shift** with an arrow or a click extends the *pick set* the bulk bar acts on.
+  *(The old `ui/` read the row length off the resolved `grid-template-columns`. The v2 grid counts
+  its columns once per resize from its observed width — the arithmetic `auto-fill` does — and lays
+  out with that count, so the keyboard's rows are the drawn rows and no style is read per key
+  press.)*
+  **A card's own buttons** (pick box, ☆, ⤢, stage, the pack link, chips) follow one pattern, the
+  ARIA grid's "cell that contains widgets": they are never tab stops; **F2** on a card moves focus
+  to its first button, the arrows step through that card's buttons, **Esc** or **F2** returns to
+  the card. Each button's action is also a key or a context-menu item (Menu key / Shift-F10 opens
+  it at the card), so F2 is a convenience and never the only road. The grid is an ARIA `grid`; each
+  card is a `gridcell` that states its own `aria-rowindex` / `aria-colindex`, because the cards
+  must not change parent when the column count changes — the inspector opening changes it, and a
+  card rebuilt under the keyboard loses focus.
   **Focus follows the lead**: if the two came apart, Tab would return you to a card the inspector is
   not describing, and the ring would point at the wrong asset.
 - **Hit targets:** ≥ 28px in compact, ≥ 32px comfortable. In mockup content ≥ 44px.

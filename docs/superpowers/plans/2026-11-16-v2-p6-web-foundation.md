@@ -150,7 +150,8 @@ symbols sat after `</svg>` (invalid XML — no icon could load); they moved insi
 *As built:* 29 anchors have specimens (the list above plus `topbar.wordmark`, `topbar.meter(.label)`,
 `sidebar.heading`, `library.banner.action`). The gate first checks coverage: every contract anchor
 must be measured or listed in `DEFERRED` with the task that will measure it (container and card
-anchors → P7), so a new anchor cannot be silently skipped. **The first gate run found the contract
+anchors → P7; measured since [P7 Library](2026-11-17-v2-p7-library.md) Tasks 7.6–7.7, and
+`DEFERRED` is empty), so a new anchor cannot be silently skipped. **The first gate run found the contract
 itself was wrong:** the extractor served the bundled fonts from a second loopback origin without
 CORS, every `FontFace` failed, and the prototype was measured in Segoe UI / Consolas / Georgia —
 `measureInPage` reports the *declared* family, which hid it. `lib/prototype.mjs` now sends CORS

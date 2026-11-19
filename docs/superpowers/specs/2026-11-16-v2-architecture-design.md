@@ -369,9 +369,11 @@ web/src/
   data/      query.svelte.ts (resource cache), resources/*, mutations.ts
   state/     view (route, query, filter, sort, density), selection, player, toasts, prefs
   ui/        primitives — the only place with visual CSS
-  features/  asset, inspector, filters, staging, jobs, tags, settings/*, traits, mapping,
+  features/  asset, inspector, library, filters, staging, jobs, tags, settings/*, traits, mapping,
              onboarding, import, viewer3d
   screens/   thin compositions, one per nav destination
+  fixtures/  the prototype's data as typed values — what the specimen pages and tests render
+  gallery/   the primitive sheet and the screen specimens the gate measures (gallery.html#…)
   styles/    tokens.css (imported from docs/design), reset, layers, breakpoints
 ```
 
@@ -402,7 +404,8 @@ Switch, Slider, Tooltip, Popover, Menu/ContextMenu (positioned by measurement), 
 ConfirmDialog, Toast, Banner, EmptyState, ProgressBar, Spinner, Icon (typed names, one sprite,
 `currentColor`), Kbd, Stat, SectionCard, ListRow, TreeRow, Toolbar.
 
-Composites: AssetCard, AssetRow, AssetGrid (virtualised, roving focus), AssetContextMenu,
+Composites: AssetCard, AssetRow, AssetGrid (one page, roving focus — UI-SPEC §2's pagination
+bounds what it renders, so it is not virtualised; the list view is), AssetContextMenu,
 StatusGem, TypeMark, SizeTier, ImportedBadge, AudioTransport, Waveform, TagEditor, LinkedFiles,
 CollectionsPicker, ComparePane, FilterBar, FilterPanel, StagingTray, JobTray, SourceRow,
 ProjectSwitcher.

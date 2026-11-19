@@ -3,16 +3,18 @@
 //
 //   node web/e2e/gate.mjs --gallery
 //
-// Builds web/, serves the build on loopback, opens the gallery in headless Edge at the contract's
-// viewport (1440×900, DPR 1) and measures every specimen marked `data-anchor` with the same
-// in-page ruler the contract extractor used (scripts/design/lib/measure.mjs). Each anchor is
-// compared with docs/design/contract.json state `library` by the groups anchors.mjs lists for it,
-// exempting only the (state, anchor, property) triples docs/design/DEVIATIONS.md records.
+// Builds web/, serves the build on loopback, opens each specimen page in headless Edge at the
+// contract's viewport (1440×900, DPR 1) and measures every element marked `data-anchor` with the
+// same in-page ruler the contract extractor used (scripts/design/lib/measure.mjs). Each anchor is
+// compared with its page's state in docs/design/contract.json by the groups anchors.mjs lists for
+// it, exempting only the (state, anchor, property) triples docs/design/DEVIATIONS.md records.
 //   - primitive specimens (gallery.html): positions are not compared — a specimen is not where the
 //     prototype draws it;
-//   - the shell specimen (gallery.html#shell): every frame anchor, positions included.
-// Every contract anchor must be measured here or listed in DEFERRED with the plan task that will
-// measure it; a missing specimen is a failure, never a skip. Writes test-reports/MM-DD-HH-MM.csv.
+//   - screen specimens (gallery.html#shell, #library, …): the shell with fixture data, every
+//     anchor of the state, positions included.
+// Every contract anchor must be measured by a page of its state or listed in DEFERRED with the
+// plan task that will measure it; a missing specimen is a failure, never a skip. Writes
+// test-reports/MM-DD-HH-MM.csv.
 // Exit 1 on any failure. `LS_BROWSER_CHANNEL=""` uses Playwright's bundled Chromium.
 
 import fs from "node:fs";
@@ -27,7 +29,6 @@ import { createReport } from "./lib/report.mjs";
 
 const WEB = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ROOT = path.resolve(WEB, "..");
-const STATE = "library";
 
 // ---- which specimen measures which anchor ----
 
@@ -64,21 +65,27 @@ const GALLERY = [
   "card.status",
 ];
 
-/** The shell specimen (gallery.html#shell) at the contract viewport: every frame anchor. */
-const SHELL = [...FRAME_ANCHORS];
+/**
+ * The pages measured, each against one contract state. `skip` lists compare groups a page cannot
+ * answer for (a primitive on the specimen sheet is not where the prototype draws it).
+ */
+const PAGES = [
+  { label: "gallery", hash: "", state: "library", anchors: GALLERY, skip: ["pos"] },
+  // The shell alone: every frame anchor, with positions.
+  { label: "shell", hash: "#shell", state: "library", anchors: [...FRAME_ANCHORS], skip: [] },
+  // The Library screen in the shell, on the prototype's data: the whole state, with positions.
+  { label: "library", hash: "#library", state: "library", anchors: Object.keys(ANCHORS.library), skip: [] },
+  // The same with the first asset selected: the Inspector, and what its column moves.
+  { label: "inspector", hash: "#library-inspector", state: "library+inspector", anchors: Object.keys(ANCHORS["library+inspector"]), skip: [] },
+];
 
-/** Anchors no specimen here can reproduce yet, and the task that will measure them. */
-const DEFERRED = {
-  "library.banner": "spans the library's main column — LibraryScreen, plan P7",
-  "library.toolbar": "the library toolbar in place — LibraryScreen, plan P7",
-  "library.toolbar.count": "the result label's own text style — LibraryScreen, plan P7",
-  "library.grid": "the asset grid — AssetGrid, plan P7",
-  card: "the asset card — AssetCard, plan P7",
-  "card.thumb": "the asset card — AssetCard, plan P7",
-  "card.body": "the asset card — AssetCard, plan P7",
-  "card.name": "the asset card — AssetCard, plan P7",
-  "card.meta": "the asset card — AssetCard, plan P7",
-};
+/**
+ * Anchors no page reproduces yet, per state, and the plan task that will measure them:
+ * `{ "<state>": { "<anchor>": "<what will measure it — plan task>" } }`. Empty since plan P7
+ * Task 7.7; a new screen's anchors start here and leave when its specimen page exists.
+ */
+const DEFERRED = {};
+const deferredCount = Object.values(DEFERRED).reduce((n, d) => n + Object.keys(d).length, 0);
 
 // ---- run ----
 
@@ -90,10 +97,9 @@ if (!args.includes("--gallery")) {
 
 const report = createReport({ origin: "web/e2e/gate.mjs", root: ROOT });
 const contract = JSON.parse(fs.readFileSync(path.join(ROOT, "docs", "design", "contract.json"), "utf8"));
-const expected = contract.states[STATE]?.anchors ?? {};
-const defs = ANCHORS[STATE];
+const STATES = Object.keys(ANCHORS);
 
-console.log(`\ndesign gate — gallery against contract state "${STATE}"\n`);
+console.log(`\ndesign gate — ${PAGES.map((p) => p.label).join(", ")} against contract states ${STATES.join(", ")}\n`);
 
 let deviations = [];
 await report.check("DEVIATIONS.md parses", async () => {
@@ -101,16 +107,19 @@ await report.check("DEVIATIONS.md parses", async () => {
   return `${deviations.length} row(s) exempt measured properties`;
 });
 
-await report.check("every contract anchor has a specimen or a deferral", async () => {
-  const names = Object.keys(expected);
-  if (names.length === 0) throw new Error(`contract.json has no anchors for state "${STATE}"`);
-  const covered = new Set([...GALLERY, ...SHELL, ...Object.keys(DEFERRED)]);
-  const uncovered = names.filter((n) => !covered.has(n));
-  const unknown = [...GALLERY, ...SHELL].filter((n) => !(n in expected));
-  if (uncovered.length) throw new Error(`no specimen and no deferral: ${uncovered.join(", ")}`);
-  if (unknown.length) throw new Error(`not in the contract: ${unknown.join(", ")}`);
-  return `${names.length} anchors: ${new Set([...GALLERY, ...SHELL]).size} measured here, ${Object.keys(DEFERRED).length} deferred`;
-});
+for (const state of STATES) {
+  await report.check(`${state}: every contract anchor has a specimen or a deferral`, async () => {
+    const names = Object.keys(contract.states[state]?.anchors ?? {});
+    if (names.length === 0) throw new Error(`contract.json has no anchors for state "${state}"`);
+    const measured = new Set(PAGES.filter((p) => p.state === state).flatMap((p) => p.anchors));
+    const deferred = Object.keys(DEFERRED[state] ?? {});
+    const uncovered = names.filter((n) => !measured.has(n) && !deferred.includes(n));
+    const unknown = [...measured, ...deferred].filter((n) => !names.includes(n));
+    if (uncovered.length) throw new Error(`no specimen and no deferral: ${uncovered.join(", ")}`);
+    if (unknown.length) throw new Error(`not in the contract: ${unknown.join(", ")}`);
+    return `${names.length} anchors: ${measured.size} measured here, ${deferred.filter((n) => !measured.has(n)).length} deferred`;
+  });
+}
 
 // Building takes longer than a check's 5 s: vite compiles every component.
 const build = await report.check(
@@ -158,7 +167,9 @@ async function openPage(hash, viewport = contract.viewport) {
   return { page, errors };
 }
 
-async function measureAll(label, hash, names, skip) {
+async function measureAll({ label, hash, state, anchors: names, skip }) {
+  const expected = contract.states[state]?.anchors ?? {};
+  const defs = ANCHORS[state];
   let opened = null;
   if (!setupError) {
     const r = await report.check(`${label}: page loads cleanly`, async () => {
@@ -189,7 +200,7 @@ async function measureAll(label, hash, names, skip) {
     const r = await report.check(`${label}: ${name}`, async () => {
       const m = await opened.page.evaluate(measureInPage, { anchor: name });
       if (!m.ok) throw new Error(`specimen missing — ${m.reason}`);
-      const ignore = exemptionsFor(deviations, STATE, name);
+      const ignore = exemptionsFor(deviations, state, name);
       const diffs = compare(expected[name], m, defs[name].compare, { ignore: [...ignore], skip });
       if (diffs.length) throw new Error(describe(diffs));
       return ignore.size ? `exempt by DEVIATIONS: ${[...ignore].join(", ")}` : "";
@@ -200,8 +211,8 @@ async function measureAll(label, hash, names, skip) {
   return passed;
 }
 
-const galleryPassed = await measureAll("gallery", "", GALLERY, ["pos"]);
-const shellPassed = SHELL.length ? await measureAll("shell", "#shell", SHELL, []) : 0;
+const passed = [];
+for (const page of PAGES) passed.push(await measureAll(page));
 
 // The window floor (ADR-0009): at 900 × 600 nothing in the frame overflows and the rail is the
 // 48 px icon rail; below the floor the frame stops shrinking and the page scrolls instead.
@@ -236,6 +247,54 @@ const FLOOR = [
       return problems;
     },
   },
+  {
+    name: "library at 900×600: the toolbar fits, the hint is folded, the inspector overlays the grid",
+    hash: "#library-inspector",
+    viewport: { width: 900, height: 600 },
+    probe: () => {
+      const q = (name) => document.querySelector(`[data-anchor="${name}"]`);
+      const toolbar = q("library.toolbar");
+      const grid = q("library.grid");
+      const panel = q("inspector");
+      const problems = [];
+      if (!toolbar || !grid || !panel) return ["the library did not render"];
+      if (toolbar.scrollWidth > toolbar.clientWidth) problems.push(`toolbar overflows by ${toolbar.scrollWidth - toolbar.clientWidth} px`);
+      if (document.documentElement.scrollWidth > innerWidth) problems.push("the page scrolls sideways");
+      if (q("library.hint")?.getBoundingClientRect().width) problems.push("the keyboard hint is still shown below 1400 px");
+      const g = grid.getBoundingClientRect();
+      const p = panel.getBoundingClientRect();
+      // ADR-0009: below 1280 px the inspector overlays the grid instead of pushing it.
+      if (Math.abs(p.right - innerWidth) > 0.5) problems.push(`the inspector ends at ${p.right}, not the window's edge`);
+      if (g.right <= p.left) problems.push("the inspector pushes the grid instead of overlaying it");
+      const cards = [...grid.querySelectorAll('[role="gridcell"]')].map((c) => c.getBoundingClientRect());
+      if (cards.some((c) => c.width < 150)) problems.push("a card is narrower than its minimum");
+      return problems;
+    },
+  },
+  {
+    name: "library at 1280×720: the inspector pushes the grid, and each card states the row and column it is drawn in",
+    hash: "#library-inspector",
+    viewport: { width: 1280, height: 720 },
+    probe: () => {
+      const grid = document.querySelector('[data-anchor="library.grid"]');
+      const panel = document.querySelector('[data-anchor="inspector"]');
+      if (!grid || !panel) return ["the library did not render"];
+      const problems = [];
+      if (grid.getBoundingClientRect().right > panel.getBoundingClientRect().left) problems.push("the inspector overlaps the grid at 1280 px");
+      // The row and column a card states for itself must be the row and column it is drawn in:
+      // the count the grid measured is the count the browser laid out.
+      const cells = [...grid.querySelectorAll('[role="gridcell"]')].map((c) => {
+        const r = c.getBoundingClientRect();
+        return { row: c.getAttribute("aria-rowindex"), col: c.getAttribute("aria-colindex"), top: Math.round(r.top), left: Math.round(r.left) };
+      });
+      const tops = [...new Set(cells.map((c) => c.top))].sort((x, y) => x - y);
+      const lefts = [...new Set(cells.map((c) => c.left))].sort((x, y) => x - y);
+      const wrong = cells.filter((c) => Number(c.row) !== tops.indexOf(c.top) + 1 || Number(c.col) !== lefts.indexOf(c.left) + 1);
+      if (wrong.length) problems.push(`${wrong.length} card(s) state a row or column they are not drawn in`);
+      if (Number(grid.getAttribute("aria-colcount")) !== lefts.length) problems.push(`aria-colcount is ${grid.getAttribute("aria-colcount")}, drawn columns ${lefts.length}`);
+      return problems;
+    },
+  },
 ];
 for (const f of FLOOR) {
   if (setupError) {
@@ -243,7 +302,7 @@ for (const f of FLOOR) {
     continue;
   }
   await report.check(f.name, async () => {
-    const { page, errors } = await openPage("#shell", f.viewport);
+    const { page, errors } = await openPage(f.hash ?? "#shell", f.viewport);
     const problems = [...errors, ...(await page.evaluate(f.probe))];
     await page.close();
     if (problems.length) throw new Error(problems.join("; "));
@@ -254,11 +313,12 @@ if (browser) await browser.close();
 site?.close();
 
 const file = report.write();
-const total = GALLERY.length + SHELL.length;
 // (floor checks are counted among report.rows / failures)
 const failures = report.failures;
+const tally = PAGES.map((p, i) => `${passed[i]}/${p.anchors.length} ${p.label}${p.skip.includes("pos") ? "" : " (with positions)"}`);
 console.log(
-  `\n${galleryPassed}/${GALLERY.length} gallery anchors, ${shellPassed}/${SHELL.length} shell anchors (with positions) match the contract; ` +
-    `${Object.keys(DEFERRED).length} deferred.\n${report.rows.length} checks, ${failures.length} failed — ${path.relative(process.cwd(), file)}\n`,
+  `\n${tally.join(", ")} match the contract; ${deferredCount} deferred.\n` +
+    `${report.rows.length} checks, ${failures.length} failed — ${path.relative(process.cwd(), file)}\n`,
 );
-process.exit(failures.length || report.rows.length === 0 || galleryPassed + shellPassed !== total ? 1 : 0);
+const allPassed = PAGES.every((p, i) => passed[i] === p.anchors.length);
+process.exit(failures.length || report.rows.length === 0 || !allPassed ? 1 : 0);

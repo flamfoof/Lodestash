@@ -1,6 +1,7 @@
 import "../styles/app.css";
 import { mount } from "svelte";
 import Gallery from "./Gallery.svelte";
+import LibrarySpecimen from "./LibrarySpecimen.svelte";
 import ShellSpecimen from "./ShellSpecimen.svelte";
 import { keymap } from "../app/keymap.svelte";
 import { setAppRoot } from "../app/overlay";
@@ -11,5 +12,21 @@ if (!target) throw new Error("#gallery missing from gallery.html");
 keymap.attach(window);
 setAppRoot(target);
 
-// gallery.html#shell is the shell alone, full-window (the gate measures the frame there).
-export default location.hash === "#shell" ? mount(ShellSpecimen, { target }) : mount(Gallery, { target });
+// The specimen pages the gate measures full-window, by hash; anything else is the primitive sheet.
+//   #shell               the frame alone
+//   #library             the Library screen in the frame (contract state `library`)
+//   #library-inspector   the same with the first asset selected (`library+inspector`)
+function page() {
+  switch (location.hash) {
+    case "#shell":
+      return mount(ShellSpecimen, { target: target! });
+    case "#library":
+      return mount(LibrarySpecimen, { target: target! });
+    case "#library-inspector":
+      return mount(LibrarySpecimen, { target: target!, props: { select: 1 } });
+    default:
+      return mount(Gallery, { target: target! });
+  }
+}
+
+export default page();

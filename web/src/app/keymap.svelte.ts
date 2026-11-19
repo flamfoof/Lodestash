@@ -80,6 +80,15 @@ function isEditable(target: EventTarget | null): boolean {
   return false;
 }
 
+/**
+ * Is `target` (or an ancestor) a control that Space or Enter activates by itself? A global binding
+ * for those keys must leave it alone, or one key press would do two things.
+ */
+export function isControl(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) return false;
+  return target.closest('button, a[href], input, select, textarea, summary, [role="menuitem"], [contenteditable="true"]') !== null;
+}
+
 export class Keymap {
   #stack: Scope[] = [{ name: "global", blocking: false, bindings: [] }];
   /** How many blocking scopes are open — reactive, for UI that must know a modal is up. */

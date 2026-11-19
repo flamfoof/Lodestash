@@ -95,7 +95,8 @@
   .inspector {
     grid-area: inspector;
     container: inspector / size;
-    width: var(--inspector-w);
+    /* The panel's 300 px plus its hairline: the prototype's box is 301 px wide. */
+    width: calc(var(--inspector-w) + 1px);
     min-height: 0;
   }
 

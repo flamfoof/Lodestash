@@ -23,7 +23,8 @@
    * One choice out of a few, side by side in a well: the search mode (⟡ Tags / ✦ AI), the grid
    * density (▪ ▦ ▣), the view (⊞ ☰). Each segment is a `<button aria-pressed>`.
    * `md` is the mode toggle (5/12 px, weight 500, an inset ring when on); `sm` the toolbar size
-   * (3/9 px). `anchors` marks the selected and unselected segments for the contract gate.
+   * (3/9 px), `sm-wide` the view toggle (3/10 px). `anchors` marks the selected and unselected
+   * segments for the contract gate.
    */
   let {
     options,
@@ -40,7 +41,7 @@
     onchange?: (value: V) => void;
     /** Accessible name of the group. */
     label: string;
-    size?: "md" | "sm";
+    size?: "md" | "sm" | "sm-wide";
     anchors?: { on?: string; off?: string };
     /** In the app bar, show only the icons below this rung (AppBar). */
     collapse?: "xl" | "lg" | "md";
@@ -106,6 +107,10 @@
 
   .sm .item {
     padding: var(--space-3) var(--space-9);
+  }
+
+  .sm-wide .item {
+    padding: var(--space-3) var(--space-10);
   }
 
   @container appbar (width < 1000px) {
