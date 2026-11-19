@@ -9,8 +9,9 @@
   import { NO_FILTERS, passes, traitCounts, type LibraryFilters } from "../features/filters/filters";
   import Inspector from "../features/inspector/Inspector.svelte";
   import { DEFAULT_VIEW, type LibraryView } from "../features/library/view";
-  import { ASSETS, COLLECTIONS, PROJECT, SIZE_THRESHOLDS, TRAITS, shellData } from "../fixtures/library";
+  import { ASSETS, COLLECTIONS, PROJECT, SIZE_THRESHOLDS, TRAITS, shellData, wavePeaks } from "../fixtures/library";
   import LibraryScreen from "../screens/LibraryScreen.svelte";
+  import type { Playback } from "../state/playback";
   import { Selection } from "../state/selection.svelte";
   import { Toast } from "../ui";
 
@@ -19,7 +20,8 @@
    * contract at 1440 × 900. Each `gallery.html#…` page is this component started in one contract
    * state (gallery/main.ts lists them): `#library`, `#library-inspector` (the first asset
    * selected), `#library-filters` (⚑ open with rock ∧ ≤ 1k ∧ M chosen), `#library-picks` (three
-   * cards picked: the bulk bar), `#library-list` (the ☰ stop).
+   * cards picked: the bulk bar), `#library-list` (the ☰ stop), `#quicklook`,
+   * `#quicklook-sound` and `#quicklook-image` (Quick Look on a model, a sound, an image).
    *
    * This is the only owner of data on the page: it stands in for the resource cache, the library
    * query and the mutation layer of plan P6b. Intents change its copy of the fixture, and the
@@ -31,8 +33,11 @@
     filters: startFilters = NO_FILTERS,
     picks = [],
     layout = "grid",
+    quickLook: startQuickLook = null,
     open = null,
   }: {
+    /** The asset Quick Look shows when the page loads (it is selected too, as its ⤢ would). */
+    quickLook?: number | null;
     /** The view toggle's stop when the page loads. */
     layout?: LibraryView["layout"];
     /** The asset the inspector describes when the page loads. */
@@ -47,7 +52,8 @@
 
   const selection = new Selection();
   untrack(() => {
-    if (select !== null) selection.moveTo(select);
+    const lead = select ?? startQuickLook;
+    if (lead !== null) selection.moveTo(lead);
     for (const id of picks) selection.toggle(id);
   });
 
@@ -57,6 +63,9 @@
   let filters = $state<LibraryFilters>(untrack(() => startFilters));
   let nudgeDismissed = $state(false);
   let said = $state<string | null>(null);
+  // Quick Look and playback: view state the page's owner keeps (plan P6b: `state/player`).
+  let quickLook = $state<number | null>(untrack(() => startQuickLook));
+  let playback = $state<Playback | null>(null);
 
   const say = (message: string) => (said = message);
 
@@ -143,9 +152,23 @@
     view = { ...view, favoritesOnly: false };
   }
 
+  /** Showing another asset, or none, stops what was playing: one sound at a time (UI-SPEC §13.2). */
+  function showQuickLook(id: number | null) {
+    quickLook = id;
+    playback = null;
+  }
+
+  const peeked = $derived(assets.find((a) => a.id === quickLook) ?? null);
+
   function carryOut(intent: AssetIntent) {
     const hit = (a: AssetDetail) => intent.ids.includes(a.id);
-    if (intent.action === "favorite") {
+    if (intent.action === "quick-look") {
+      showQuickLook(intent.ids[0]);
+    } else if (intent.action === "play") {
+      // No audio here: the stand-in for the player only remembers what was asked.
+      const id = intent.ids[0];
+      playback = playback?.id === id ? { ...playback, playing: !playback.playing } : { id, playing: true, position: 0 };
+    } else if (intent.action === "favorite") {
       assets = assets.map((a) => (hit(a) ? { ...a, favorite: intent.on ?? !a.favorite } : a));
       say(intent.on ? "★ Added to Favorites" : "Removed from Favorites");
     } else if (intent.action === "stage") {
@@ -211,7 +234,12 @@
     project={PROJECT}
     traits={TRAITS}
     thresholds={SIZE_THRESHOLDS}
+    {quickLook}
+    {playback}
+    peaks={peeked?.media_type === "audio" ? wavePeaks(peeked.id) : null}
     onintent={carryOut}
+    onquicklook={showQuickLook}
+    onseek={(position) => quickLook !== null && (playback = { id: quickLook, playing: playback?.playing ?? false, position })}
     onview={(patch) => (view = { ...view, ...patch })}
     onfilterschange={(next) => (filters = next)}
     onunconstrain={unconstrain}

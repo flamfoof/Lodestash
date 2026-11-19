@@ -2,6 +2,7 @@
 // Screens and features compose these and carry layout only.
 
 export { default as AppBar } from "./AppBar.svelte";
+export { default as AudioTransport } from "./AudioTransport.svelte";
 export { default as Badge } from "./Badge.svelte";
 export { default as Banner } from "./Banner.svelte";
 export { default as Button, type ButtonSize, type ButtonVariant } from "./Button.svelte";
@@ -58,5 +59,6 @@ export { tooltip } from "./tooltip";
 export { default as TraitChip } from "./TraitChip.svelte";
 export { default as TreeRow } from "./TreeRow.svelte";
 export { default as TypeMark, type TypeTone } from "./TypeMark.svelte";
+export { default as Waveform } from "./Waveform.svelte";
 export { default as Wordmark } from "./Wordmark.svelte";
 export { ICON_NAMES, type IconName } from "./icons.generated";

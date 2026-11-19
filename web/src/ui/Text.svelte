@@ -11,7 +11,9 @@
    * - `note` — a line under a group ("quick-tag from your trait library"): 10 px, dim;
    * - `empty` — what a group says when it has nothing ("No traits yet — run Identify."): italic;
    * - `nothing` — the same for a list a search narrowed to nothing ("No traits match."): 11 px;
-   * - `warning` — a note that asks for attention (missing links are skipped on export).
+   * - `warning` — a note that asks for attention (missing links are skipped on export);
+   * - `caption` — a line laid over a picture, on a backdrop that keeps it legible ("low-res
+   *   pre-render · orbit viewport in app"): 10 px, dim.
    * `center` centres a block variant in its container (a caption under a full-width button).
    */
   let {
@@ -20,7 +22,7 @@
     children,
     ...rest
   }: HTMLAttributes<HTMLSpanElement> & {
-    variant?: "label" | "selection" | "hint" | "note" | "empty" | "nothing" | "warning";
+    variant?: "label" | "selection" | "hint" | "note" | "empty" | "nothing" | "warning" | "caption";
     center?: boolean;
     children: Snippet;
   } = $props();
@@ -78,5 +80,15 @@
   .warning {
     font-size: var(--fs-10);
     color: var(--ls-warning);
+  }
+
+  .caption {
+    display: block;
+    padding: var(--space-2) var(--space-8);
+    border-radius: var(--r-4);
+    background: var(--ls-bg-a70);
+    font-size: var(--fs-10);
+    color: var(--ls-text-dim);
+    white-space: nowrap;
   }
 </style>

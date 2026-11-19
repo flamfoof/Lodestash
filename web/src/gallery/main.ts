@@ -29,6 +29,10 @@ const LIBRARY: Record<string, LibraryProps> = {
   "#library-picks": { picks: [1, 2, 3] },
   // `library+list`: the view toggle's second stop
   "#library-list": { layout: "list" },
+  // `quicklook`, `quicklook+sound`, `quicklook+image`: Quick Look per media type
+  "#quicklook": { quickLook: 1 },
+  "#quicklook-sound": { quickLook: 8 },
+  "#quicklook-image": { quickLook: 13 },
 };
 
 // `#shell` is the frame alone; anything else that is not a Library page is the primitive sheet.

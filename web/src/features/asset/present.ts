@@ -58,6 +58,22 @@ function longDuration(s: number): string {
   return `0:${pad2(Math.floor(tenths / 10))}.${tenths % 10}`;
 }
 
+/**
+ * A playback position or length, to the tenth whatever its size: "0:00.0", "0:01.2", "1:24.0".
+ * A transport counts in tenths, so its readout keeps them — and keeps its width while it runs.
+ */
+export function formatClock(seconds: number): string {
+  const tenths = Math.max(0, Math.round(seconds * 10));
+  return `${Math.floor(tenths / 600)}:${pad2(Math.floor((tenths % 600) / 10))}.${tenths % 10}`;
+}
+
+/** What a media type is called in Quick Look, with what is being shown of it (UI-SPEC §14). */
+export function peekLabel(media: MediaType): string {
+  if (media === "model_3d") return "Model — low-res pre-render";
+  if (isPicture(media)) return `${TYPE[media].label} — full preview`;
+  return TYPE[media].label;
+}
+
 const isPicture = (m: MediaType) => m === "image" || m === "texture" || m === "sprite";
 
 /** The card's one-line stats: what distinguishes this asset among its neighbours. */

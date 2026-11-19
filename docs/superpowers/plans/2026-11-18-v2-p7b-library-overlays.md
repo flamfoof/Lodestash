@@ -231,12 +231,43 @@ and the rings drawn inside the row.
 - The screen owns which asset is shown as a prop (`quickLook`, `onquicklook`), steps through the
   visible page in order, moves the lead with it (UI-SPEC §14 "syncing selection"), and on close
   puts focus on the card or row of the asset last shown.
-- [ ] Vitest: Tab cycles inside; Escape and Space close; focus returns to the card that opened it,
+- [x] Vitest: Tab cycles inside; Escape and Space close; focus returns to the card that opened it,
   and to the card of the asset stepped to; ← → step and wrap; `F`, `Delete` and the grid's arrows
   do not act while it is open; Stage and Import emit `actions.ts` intents; an unidentified asset
   shows neither
-- [ ] Gate: `#quicklook`, `#quicklook-sound`, `#quicklook-image` pass their states with positions
-- [ ] Commit `feat(web): Quick Look`
+- [x] Gate: `#quicklook`, `#quicklook-sound`, `#quicklook-image` pass their states with positions
+- [x] Commit `feat(web): Quick Look`
+
+*As built:* 21/21 `quicklook`, 17/17 `quicklook+sound`, 10/10 `quicklook+image`, all with
+positions and no measured exemption. One row for what is not measured: the transport shows the
+set's pause mark where the prototype draws a stop square.
+
+- **Opening is an intent; stepping and closing are not.** A card, a row, the keyboard, the menu and
+  the inspector all ask for `quick-look`, and the owner opens it — one place hears them all. The
+  screen moves the lead when the request came from the page. ← → and close are view changes
+  (`onquicklook(id | null)`), because only the screen knows what "next on this page" is.
+- **Focus on close** goes to the cell of the asset last shown when Quick Look was opened from the
+  grid — also when the pointer opened it from a card's own ⤢ button, which would otherwise get
+  focus back and leave the arrows dead. Opened from elsewhere (the inspector), focus goes back
+  there. `AssetGrid` exports `focusCell` and `holds` for this.
+- **`Dialog` gained a bare form** (no title bar, no padding, `wide`), a `keys` prop that binds in
+  its own scope, and `scrimAttrs` / `panelAttrs`. Two faults found by driving the page in a real
+  browser: a bare dialog looked up `.body` to choose where focus starts and found Quick Look's own
+  `.body`, so focus began on ✕ instead of the panel; and a panel that holds focus traded its
+  drop shadow for the focus ring (the global `:focus-visible` rule). Both fixed in `Dialog`.
+- **Keys:** `Space` and `←` `→` are bound in the dialog's scope; each handler returns `false` when
+  the focused control uses that key itself (a button and Space, the scrubber and the arrows), so
+  the key is never taken from a control. Verified with real key presses, not only in jsdom.
+- **New primitives** `Waveform` and `AudioTransport`; `Thumb` has the `quicklook` stage and the
+  tray's `tile`; `PanelTitle` an `lg` size; `IconButton` the 40 px `round`; `Slider` the sound
+  tone; `Text` the `caption`. `present.ts` has `formatClock` and `peekLabel`.
+- **Playback is a prop.** `state/playback.ts` is the shape only (`id`, `playing`, `position`);
+  ▶ emits the existing `play` intent and the scrubber reports `onseek`. The specimen's stand-in
+  remembers what was asked and plays nothing. Waveform peaks are a prop too; the fixture
+  reproduces the prototype's generator so the measured bars are the prototype's.
+- **Traits are read-only here** (UI-SPEC §14); the prototype's Quick Look chips search on click.
+- The planned `QuickLook.test.ts` is `screens/LibraryScreen.quicklook.svelte.test.ts`: every
+  behaviour worth testing involves the grid that gets focus back.
 
 ### Task 7b.6: The staging tray
 

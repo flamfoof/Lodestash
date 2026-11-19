@@ -1,5 +1,6 @@
 <script lang="ts">
   import {
+    AudioTransport,
     Badge,
     Banner,
     Button,
@@ -24,6 +25,7 @@
     ListRow,
     Menu,
     MiniWave,
+    PanelTitle,
     Pill,
     Popover,
     ProgressBar,
@@ -55,6 +57,7 @@
     tooltip,
     TraitChip,
     TreeRow,
+    Waveform,
     TypeMark,
     Wordmark,
   } from "../ui";
@@ -88,6 +91,8 @@
   let view = $state<"grid" | "list">("grid");
   let cardPicked = $state(false);
   let rowPicked = $state(false);
+  let transportPlaying = $state(false);
+  let transportAt = $state(0.5);
   let cardStaged = $state(false);
   let inCollection = $state(false);
 </script>
@@ -378,6 +383,25 @@
   </section>
 
   <section>
+    <h2>Sound and Quick Look parts</h2>
+    <div class="row top">
+      <div class="sound-slot">
+        <Waveform peaks={[0.62, 0.26, 0.35, 0.36, 0.46, 0.66, 0.38, 0.7, 0.41, 0.62, 0.51, 0.72, 0.9, 0.55, 0.44, 0.6]} played={0.4} />
+        <AudioTransport name="rock_pickup_01" playing={transportPlaying} position={transportAt} duration={1.2} time={(s) => `0:0${s.toFixed(1)}`} ontoggle={() => (transportPlaying = !transportPlaying)} onseek={(s) => (transportAt = s)} />
+      </div>
+      <div class="stack narrow">
+        <PanelTitle text="Beaver_LowPoly" size="lg" />
+        <Text variant="caption">low-res pre-render · orbit viewport in app</Text>
+        <span class="row">
+          <TextLink tone="dim" hover="text" size="10">← prev</TextLink>
+          <Text variant="note">Esc closes · ← → step</Text>
+          <TextLink tone="dim" hover="text" size="10">next →</TextLink>
+        </span>
+      </div>
+    </div>
+  </section>
+
+  <section>
     <h2>Inspector parts</h2>
     <div class="row top">
       <div class="panel-slot">
@@ -656,6 +680,13 @@
 
   .slider {
     width: var(--meter-w);
+  }
+
+  .sound-slot {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-22);
+    width: var(--quicklook-stage-w);
   }
 
   .context-target {

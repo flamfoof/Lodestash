@@ -279,6 +279,26 @@ function build(row: Row): AssetDetail {
 /** The 19 assets, in the prototype's order. A detail is a summary, so the grid takes these too. */
 export const ASSETS: AssetDetail[] = ROWS.map(build);
 
+/** The band Quick Look's waveform is drawn in, in px: the prototype states bar heights in px. */
+const WAVE_BAND = 130;
+
+/**
+ * A sound's waveform as 30 peaks, each a share of the band — the prototype's own generator
+ * (`qlWave`: a seeded LCG under a half-sine envelope), so a specimen draws the bars the prototype
+ * draws for the same asset. A stand-in: the app's peaks come from the audio itself.
+ */
+export function wavePeaks(id: number, bars = 30): number[] {
+  let seed = (id * 48271) >>> 0;
+  const next = () => {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    return seed / 4294967296;
+  };
+  return Array.from({ length: bars }, (_, i) => {
+    const envelope = Math.sin(((i + 1) / bars) * Math.PI);
+    return Math.round(12 + (next() * 0.7 + envelope * 0.5) * 100) / WAVE_BAND;
+  });
+}
+
 const count = (status: AssetStatus[]) => ASSETS.filter((a) => status.includes(a.status)).length;
 
 /** The shell's data in the prototype's `library` state, derived from the assets above. */

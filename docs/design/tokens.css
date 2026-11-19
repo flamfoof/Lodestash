@@ -331,6 +331,7 @@
   --meter-w: 180px; /* the top-bar health meter's minimum width */
   --dialog-w-sm: 460px; /* "Add a source" */
   --dialog-w-md: 540px; /* "Connect a Unity project" */
+  --dialog-w-wide: 780px; /* Quick Look: the content's width, inside the hairline */
   --toast-max-w: 340px;
   /* Library metrics: fixed box sizes the prototype draws but the vocabulary cannot collect (it has
      no width/height or filter category). Named by hand, as the frame metrics above are; the
@@ -354,6 +355,11 @@
   --list-pack-w: 140px;
   --list-size-w: 74px;
   --list-status-w: 96px;
+  --quicklook-stage-w: 440px; /* Quick Look's left pane: what is being looked at */
+  --quicklook-h: 420px;
+  --wave-h: 130px; /* the band a waveform's bars stand in */
+  --transport-play: 40px; /* the transport's play button: 38 px inside its hairline */
+  --tile-size: 34px; /* a staged pick's tile, inside its hairline */
   /* A list row's rings are drawn inside it: the list frame clips what is outside a row, so the
      prototype's outer selection ring shows only above and below. Focus has no prototype at all. */
   --ring-inset-gold-2: inset 0 0 0 2px #e7b765;

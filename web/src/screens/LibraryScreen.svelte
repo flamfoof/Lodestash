@@ -13,6 +13,9 @@
   import LibraryToolbar from "../features/library/LibraryToolbar.svelte";
   import UnidentifiedBanner from "../features/library/UnidentifiedBanner.svelte";
   import type { LibraryView } from "../features/library/view";
+  import QuickLook from "../features/quicklook/QuickLook.svelte";
+  import { stepId } from "../features/quicklook/step";
+  import type { Playback } from "../state/playback";
   import type { Selection } from "../state/selection.svelte";
   import { Button, EmptyState, Popover, type Tier } from "../ui";
 
@@ -31,6 +34,10 @@
    *
    * **Picks.** While anything is picked the bulk bar sits under the toolbar and acts on the pick
    * set; its intents go the way every intent goes.
+   *
+   * **Quick Look.** Which asset it shows is the owner's (`quickLook`) — the inspector opens it too.
+   * The screen knows the page, so it resolves the asset, steps through the page in the order
+   * shown, moves the lead along, and puts focus back on that asset's cell when it closes.
    *
    * Keys (UI-SPEC §0.4): Space, F and Delete are bound in the keymap's global scope for as long as
    * the screen is mounted, so they act on the selection from anywhere in the window and never behind
@@ -52,11 +59,16 @@
     project,
     traits = [],
     thresholds,
+    quickLook = null,
+    playback = null,
+    peaks = null,
     onintent,
     onview,
     onfilterschange,
     onunconstrain,
     onclearfilters,
+    onquicklook,
+    onseek,
     onidentify,
     ondismissnudge,
     onpack,
@@ -85,6 +97,12 @@
     project: ProjectRef | null;
     traits?: readonly TraitDef[];
     thresholds: SizeThresholds;
+    /** The asset Quick Look is showing; null when it is closed. */
+    quickLook?: number | null;
+    /** What is playing, for Quick Look's transport. */
+    playback?: Playback | null;
+    /** The waveform of the sound Quick Look is showing. */
+    peaks?: readonly number[] | null;
     onintent?: (intent: AssetIntent) => void;
     onview?: (patch: Partial<LibraryView>) => void;
     onfilterschange?: (next: LibraryFilters) => void;
@@ -92,6 +110,9 @@
     onunconstrain?: (axis: ShellAxis) => void;
     /** Reset every constraint: the shell's, ⚑ and ★ (the bar's Clear all). */
     onclearfilters?: () => void;
+    /** Quick Look stepped to another asset of the page, or closed (null). Opening is an intent. */
+    onquicklook?: (id: number | null) => void;
+    onseek?: (seconds: number) => void;
     onidentify?: () => void;
     ondismissnudge?: () => void;
     onpack?: (pack: PackageRef) => void;
@@ -114,12 +135,53 @@
   /** The pick set as assets, in the page's order: what the bulk bar acts on. */
   const picked = $derived(assets.filter((a) => selection.picks.has(a.id)));
   const active = $derived(activeFilters(constraints, filters, view.favoritesOnly, thresholds));
+  /** The asset Quick Look shows — looked up on the page every time, never kept. */
+  const peeked = $derived(quickLook === null ? null : (assets.find((a) => a.id === quickLook) ?? null));
 
-  /** "Open" is the selection's business; everything else is the owner's. */
+  let grid = $state<{ focusCell(id: number): boolean; holds(node: Node | null): boolean }>();
+
+  /**
+   * "Open" is the selection's business; everything else is the owner's. Quick Look is both: the
+   * asset looked at becomes the lead (UI-SPEC §14 "syncing selection"), and the owner — who also
+   * hears the inspector ask for it — opens it.
+   */
   function dispatch(intent: AssetIntent) {
-    if (intent.action === "open") selection.moveTo(intent.ids[0]);
-    else onintent?.(intent);
+    if (intent.action === "open") {
+      selection.moveTo(intent.ids[0]);
+      return;
+    }
+    if (intent.action === "quick-look") selection.moveTo(intent.ids[0]);
+    onintent?.(intent);
   }
+
+  /** ← → in Quick Look: the next asset of this page, in the order shown; the lead goes with it. */
+  function stepQuickLook(dir: 1 | -1) {
+    const next = stepId(order, quickLook, dir);
+    if (next === null) return;
+    selection.moveTo(next);
+    onquicklook?.(next);
+  }
+
+  // Quick Look shows an asset of this page: if the page loses it, there is nothing to show.
+  $effect(() => {
+    if (quickLook !== null && !order.includes(quickLook)) untrack(() => onquicklook?.(null));
+  });
+
+  // When Quick Look closes the dialog hands focus back to what opened it. If that was in the grid
+  // (or is gone), focus belongs on the cell of the asset last shown — stepping moved the lead
+  // there, and focus follows the lead. Opened from elsewhere (the inspector), it stays there.
+  let lastPeeked: number | null = null;
+  $effect(() => {
+    if (peeked) {
+      lastPeeked = peeked.id;
+      return;
+    }
+    if (lastPeeked === null) return;
+    const last = lastPeeked;
+    lastPeeked = null;
+    const at = document.activeElement;
+    if (at === null || at === document.body || grid?.holds(at)) grid?.focusCell(last);
+  });
 
   /** A chip's ✕: each axis has one owner, and it is told. */
   function removeFilter(filter: ActiveFilter) {
@@ -187,6 +249,7 @@
       </EmptyState>
     {:else}
       <AssetGrid
+        bind:this={grid}
         {assets}
         {selection}
         {project}
@@ -208,6 +271,8 @@
 </section>
 
 <AssetContextMenu bind:at={menuAt} targets={menuTargets} {project} onintent={dispatch} />
+
+<QuickLook asset={peeked} {project} {traits} {playback} {peaks} onintent={dispatch} onstep={stepQuickLook} {onseek} onclose={() => onquicklook?.(null)} />
 
 <Popover bind:open={filtersOpen} anchor={filtersAnchor} id={filtersId} label="Filter library" data-anchor="filters">
   <FilterPanel {filters} traits={traitOptions} {thresholds} anchored onchange={(next) => onfilterschange?.(next)} />

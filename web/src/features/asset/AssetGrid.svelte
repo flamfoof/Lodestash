@@ -146,6 +146,21 @@
   const cellOf = (id: number) => grid?.querySelector<HTMLElement>(`[role="gridcell"][data-id="${id}"]`) ?? null;
   const controlsOf = (cell: HTMLElement) => [...cell.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), a[href]")];
 
+  /**
+   * Put keyboard focus on `id`'s cell — for an overlay handing focus back to the asset it was
+   * showing. False when that asset is not on the page.
+   */
+  export function focusCell(id: number): boolean {
+    const cell = cellOf(id);
+    cell?.focus();
+    return cell !== null;
+  }
+
+  /** Is `node` this grid, or inside it? */
+  export function holds(node: Node | null): boolean {
+    return !!grid && !!node && grid.contains(node);
+  }
+
   function emit(id: AssetActionId, asset: AssetSummary) {
     const intent = intentFor(id, { targets: [asset], project });
     if (intent) onintent?.(intent);

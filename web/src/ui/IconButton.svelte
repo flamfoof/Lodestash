@@ -9,13 +9,14 @@
    * - `tile` — the 20 px tile on a thumbnail (☆ favourite), on the translucent backdrop;
    * - `plain` — the 22 px dialog close / row action, on the overlay surface;
    * - `media` — the 22 px close on a preview, on the translucent backdrop;
-   * - `round` — the 30 px arcane play button of a sound.
+   * - `round` — the 30 px arcane play button of a sound; `size="lg"` is the transport's 40 px one.
    * `pressed` makes it a toggle (`aria-pressed`) drawn gold when on.
    */
   let {
     icon,
     label,
     variant = "plain",
+    size = "md",
     iconSize = "12",
     pressed,
     title,
@@ -24,6 +25,8 @@
     icon: IconName;
     label: string;
     variant?: "tile" | "plain" | "media" | "round";
+    /** `round` only. */
+    size?: "md" | "lg";
     iconSize?: IconSize;
     pressed?: boolean;
   } = $props();
@@ -32,6 +35,7 @@
 <button
   type="button"
   class="icon-btn {variant}"
+  class:lg={size === "lg"}
   class:pressed
   aria-label={label}
   aria-pressed={pressed}
@@ -86,8 +90,19 @@
     transition: box-shadow var(--dur-120) ease;
   }
 
+  .round.lg {
+    width: var(--transport-play);
+    height: var(--transport-play);
+    background: var(--ls-arcane-a14);
+    font-size: var(--fs-14);
+  }
+
   .icon-btn:hover:not(:disabled) {
     color: var(--ls-text);
+  }
+
+  .round.lg:hover:not(:disabled) {
+    box-shadow: var(--glow-arcane-12-a40);
   }
 
   .round:hover:not(:disabled) {

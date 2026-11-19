@@ -81,6 +81,9 @@ const PAGES = [
   screen("filters", "#library-filters", "library+filters"),
   screen("picks", "#library-picks", "library+picks"),
   screen("list", "#library-list", "library+list"),
+  screen("quicklook", "#quicklook", "quicklook"),
+  screen("quicklook-sound", "#quicklook-sound", "quicklook+sound"),
+  screen("quicklook-image", "#quicklook-image", "quicklook+image"),
 ];
 
 /** A screen specimen: one page that reproduces every anchor of one state, positions included. */
@@ -98,9 +101,6 @@ const defer = (state, task) => Object.fromEntries(Object.keys(ANCHORS[state]).ma
  * docs/superpowers/plans/2026-11-18-v2-p7b-library-overlays.md).
  */
 const DEFERRED = {
-  quicklook: defer("quicklook", "gallery.html#quicklook — plan P7b Task 7b.5"),
-  "quicklook+sound": defer("quicklook+sound", "gallery.html#quicklook-sound — plan P7b Task 7b.5"),
-  "quicklook+image": defer("quicklook+image", "gallery.html#quicklook-image — plan P7b Task 7b.5"),
   staging: defer("staging", "gallery.html#staging — plan P7b Task 7b.6"),
 };
 const deferredCount = Object.values(DEFERRED).reduce((n, d) => n + Object.keys(d).length, 0);
